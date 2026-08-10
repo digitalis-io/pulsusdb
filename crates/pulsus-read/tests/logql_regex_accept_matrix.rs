@@ -2178,27 +2178,27 @@ fn the_enumeration_is_self_consistent_and_says_why_each_entry_exists() {
 /// keeping the whole decode table here would be a second copy of both.
 #[test]
 fn the_parsed_pattern_value_is_committed_where_the_escape_changes_it() {
-    /// `(pattern id, what the lexer does with the source, what the
-    /// REFERENCE's own unquoting produces)`.
-    enum Decoded {
-        /// The planner receives this exact value.
-        Value(&'static str),
-        /// The lexer refuses the literal; the `&str` names the reason.
-        Refused(&'static str),
-    }
-    const DECODED: &[(&str, Decoded, &str)] = &[(
+    /// `(pattern id, the substring the lexer's refusal must name, what
+    /// the REFERENCE's own unquoting produces)`.
+    ///
+    /// Every `LogqlSource` pattern in the set is a REFUSAL here since
+    /// #400 Stage 1, so this table has no "decodes to" arm. A future
+    /// `LogqlSource` pattern that decodes rather than being refused
+    /// needs one added — the assertion below names that case rather than
+    /// carrying a variant nothing constructs.
+    const DECODED: &[(&str, &str, &str)] = &[(
         "invalid_utf8",
         // Stage 1: `\xff` is the byte 0xFF here as it is there, and a
         // literal whose decoded bytes are not valid UTF-8 is a
         // `NonUtf8StringLiteral`. Before Stage 1 this committed the
         // string `"xff"` — backslash dropped, `x` kept — which is the
         // wrong-pattern defect #400 was filed on.
-        Decoded::Refused("not valid UTF-8"),
+        "not valid UTF-8",
         // Go's `strutil.Unquote` decodes `\xff` to the single byte 0xFF,
         // which is why the reference's parser raises `ErrInvalidUTF8`
         // wherever the pattern reaches it at all — and why the six
         // `NewFastRegexMatcher` positions, which never parse it, are the
-        // whole of `engine_dir_a_non_utf8_string_literal`.
+        // bulk of `engine_dir_a_non_utf8_string_literal`.
         "one 0xFF byte",
     )];
 
@@ -2207,62 +2207,47 @@ fn the_parsed_pattern_value_is_committed_where_the_escape_changes_it() {
             continue;
         };
         let entry = DECODED.iter().find(|(id, _, _)| *id == pattern.id);
-        let Some((_, decoded, reference_sees)) = entry else {
+        let Some((_, reason, reference_sees)) = entry else {
             panic!(
-                "`{}` is a LogqlSource pattern with no committed decoded value — its escape is \
-                 the construct under test, and a verdict alone cannot show what it became",
+                "`{}` is a LogqlSource pattern with no committed entry — its escape is the \
+                 construct under test, and a verdict alone cannot show what it became",
                 pattern.id
             );
         };
         assert!(!reference_sees.is_empty());
 
         // Through the real parser, at a position whose pattern slot is the
-        // whole matcher value, so the decoded text is readable directly.
+        // whole matcher value, so the decoded text would be readable
+        // directly if it decoded at all.
         let query = format!(r#"{{app=~"{source}"}}"#);
-        let parsed = parse(&query);
-        match decoded {
-            Decoded::Refused(reason) => {
-                let err = parsed.as_ref().err().unwrap_or_else(|| {
-                    panic!(
-                        "`{}`: the lexer must refuse {query} — if it decodes again, re-record \
-                         BOTH this entry and the mechanism sentence in \
-                         `engine_dir_a_non_utf8_string_literal`",
-                        pattern.id
-                    )
-                });
-                let text = err.to_string();
-                assert!(
-                    text.contains(reason),
-                    "`{}`: the refusal says {text:?}, which does not name {reason:?}",
-                    pattern.id
-                );
-            }
-            Decoded::Value(expected) => {
-                let Ok(pulsus_logql::Expr::Log(log)) = parsed else {
-                    panic!("{query}: expected a log query, got {parsed:?}");
-                };
-                let value = &log.selector.matchers[0].value;
-                assert_eq!(
-                    value, expected,
-                    "`{}`: the planner receives {value:?}, not the committed {expected:?}. If \
-                     the lexer changed, re-record the value AND the divergence's mechanism.",
-                    pattern.id
-                );
-            }
-        }
+        let err = parse(&query).err().unwrap_or_else(|| {
+            panic!(
+                "`{}`: the lexer must refuse {query}. If it decodes again, this table needs a \
+                 decodes-to arm AND the mechanism sentence in \
+                 `engine_dir_a_non_utf8_string_literal` has to be re-recorded — the two moved \
+                 together last time and one of them was written from memory.",
+                pattern.id
+            )
+        });
+        let text = err.to_string();
+        assert!(
+            text.contains(reason),
+            "`{}`: the refusal says {text:?}, which does not name {reason:?}",
+            pattern.id
+        );
     }
 }
 
 /// **What the members of `engine_dir_b_read_as_a_different_pattern`
 /// actually do**, because the row's own sentence got one of them wrong
-/// for three releases and no check could contradict it.
+/// and no check could contradict it.
 ///
-/// The claim was that `(?R)` is read as the Rust crate's CRLF flag "so
-/// the pattern silently matches everything". Measured here: `(?R)a`
-/// matches `"a"` and does NOT match `""`, `"b"` or `"x\r\ny"` — the flag
-/// changes what `.` and `(?m)^$` mean, not what the rest of the pattern
-/// is. The member that really does match everything is `a**`, which the
-/// crate reads as `(a*)*`.
+/// The claim was that `(?R)` is read as the Rust crate's line-terminator
+/// flag "so the pattern silently matches everything". Measured here:
+/// `(?R)a` matches `"a"` and does NOT match `""`, `"b"` or `"x\r\ny"` —
+/// the flag changes what `.` and `(?m)^$` mean, not what the rest of the
+/// pattern is. The member that really does match everything is `a**`,
+/// which the crate reads as `(a*)*`.
 ///
 /// It is the same shape as the template-boundary defect this issue
 /// recorded: an inference from a CATEGORY ("it is a flag we do not
@@ -2279,8 +2264,8 @@ fn the_wrong_pattern_row_says_what_each_member_actually_does() {
     for subject in ["", "b", "x\r\ny", ":", "101"] {
         assert!(
             !perl_r.is_match(subject),
-            "`(?R)a` must NOT match {subject:?} — the CRLF flag does not make the pattern \
-             match everything, and saying it does was this row's false claim"
+            "`(?R)a` must NOT match {subject:?} — the line-terminator flag does not make the \
+             pattern match everything, and saying it did was this row's false claim"
         );
     }
     // The member the claim was true of.
@@ -2296,9 +2281,9 @@ fn the_wrong_pattern_row_says_what_each_member_actually_does() {
         .iter()
         .find(|d| d.id == "engine_dir_b_read_as_a_different_pattern")
         .expect("the row exists");
-    let flat: String = row.why.chars().filter(|c| !c.is_whitespace()).collect();
+    let flat = row.why.to_lowercase();
     assert!(
-        !flat.to_lowercase().contains("crlf"),
+        !flat.contains("crlf"),
         "this row named the CRLF flag as the reason a pattern matches everything; it is not — \
          see this test's own probes"
     );
