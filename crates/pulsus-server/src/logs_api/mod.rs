@@ -1093,9 +1093,22 @@ mod tests {
     /// **Part D, routed.** The ten-digit unix-SECONDS spelling of a window
     /// and its nineteen-digit nanosecond spelling are the same request:
     /// same status, byte-identical body, on every route that reads
-    /// `start`/`end`. Pre-change they differed on every one — the seconds
-    /// form collapsed to a microsecond window and answered `200` with no
-    /// data.
+    /// `start`/`end`.
+    ///
+    /// **What the per-route table can and cannot see.** Against the
+    /// poolless `test_state()` most of these rows land on the engine `503`
+    /// whatever the window is, so the table alone would stay green with
+    /// `parse_ts` reverted — it is a REGRESSION PIN, not the proof. The
+    /// discriminating row is the last one, `step=1ns`: a 3,600-**second**
+    /// window at a one-nanosecond step is far past the 11,000-point
+    /// resolution fence and is a `400` from request parsing, while the
+    /// same digits read as 3,600 **nanoseconds** are 3,600 points and sail
+    /// through to the `503`. That row differs before the change and agrees
+    /// after it, so this test fails on `ff0fb09` for the reason it is
+    /// about. The parse itself is gated by `params.rs`'s
+    /// `parse_ts_follows_the_references_length_and_fraction_rules`, the
+    /// masking by `a_six_year_seconds_window_reaches_the_span_cap`, and
+    /// the end-to-end answer by `logs_api_live.rs` against a seeded store.
     #[tokio::test]
     async fn a_seconds_window_and_the_same_window_in_nanoseconds_answer_identically() {
         const START_S: &str = "1786342706";
@@ -1154,6 +1167,29 @@ mod tests {
         )
         .await;
         assert_eq!(secs_status, nanos_status);
+        assert_eq!(secs_body, nanos_body);
+
+        // The discriminating row (see the doc comment): a one-nanosecond
+        // step makes the WIDTH of the parsed window observable without a
+        // pool. Both spellings must now be the same 400.
+        let step_probe = |start: &str, end: &str| {
+            uri(
+                "/api/logs/v1/query_range",
+                &format!("{SELECTOR_QUERY}&start={start}&end={end}&step=1ns"),
+            )
+        };
+        let (secs_status, secs_body) =
+            routed(router(), get_req(&step_probe(START_S, END_S))).await;
+        let (nanos_status, nanos_body) =
+            routed(router(), get_req(&step_probe(START_NS, END_NS))).await;
+        assert_eq!(
+            secs_status,
+            StatusCode::BAD_REQUEST,
+            "a 3600-SECOND window at a 1ns step is far past the 11,000-point fence, so the \
+             seconds spelling must be refused exactly as the nanosecond one is: {}",
+            String::from_utf8_lossy(&secs_body)
+        );
+        assert_eq!(nanos_status, secs_status);
         assert_eq!(secs_body, nanos_body);
     }
 
