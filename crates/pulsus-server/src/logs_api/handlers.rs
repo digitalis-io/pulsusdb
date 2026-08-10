@@ -217,10 +217,9 @@ pub(super) async fn read_form_pairs(
             params::FormBody::Ignore => Vec::new(),
         },
         None => {
-            let lossy = String::from_utf8_lossy(
-                raw_content_type.map(|v| v.as_bytes()).unwrap_or_default(),
-            )
-            .into_owned();
+            let lossy =
+                String::from_utf8_lossy(raw_content_type.map(|v| v.as_bytes()).unwrap_or_default())
+                    .into_owned();
             return Err(ApiError::Param(ParamError::MalformedContentType(lossy)));
         }
     };

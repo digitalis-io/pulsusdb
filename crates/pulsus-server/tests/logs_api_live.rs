@@ -3551,9 +3551,7 @@ async fn a_json_content_type_post_is_served_from_the_url_query() {
     let selector = urlencode(r#"{service_name="checkout"}"#);
     // Everything the request needs is in the URL; the body would set a
     // DIFFERENT limit, so whether it was read is visible in the count.
-    let path = format!(
-        "/api/logs/v1/query_range?query={selector}&start={start}&end={end}&limit=5"
-    );
+    let path = format!("/api/logs/v1/query_range?query={selector}&start={start}&end={end}&limit=5");
     let body = "limit=9";
 
     let entries = |res: &HttpResponse| -> usize {

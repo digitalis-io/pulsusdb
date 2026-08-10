@@ -875,10 +875,10 @@ fn parse_media_type(v: &str) -> Result<String, MediaTypeError> {
             Some((key, value, next)) => {
                 // `mediatype.go:178-181`: a repeated parameter is an error
                 // only when the values DISAGREE.
-                if let Some((_, prev)) = seen.iter().find(|(k, _)| *k == key) {
-                    if *prev != value {
-                        return Err(MediaTypeError::DuplicateParameterName);
-                    }
+                if let Some((_, prev)) = seen.iter().find(|(k, _)| *k == key)
+                    && *prev != value
+                {
+                    return Err(MediaTypeError::DuplicateParameterName);
                 }
                 seen.push((key, value));
                 rest = next;
@@ -1482,36 +1482,63 @@ mod tests {
         use FormBody::{Ignore, Parse};
 
         let cases: &[(&str, Option<FormBody>)] = &[
-            ("application/x-www-form-urlencoded; charset=\"utf-8\"", Some(Parse)),
+            (
+                "application/x-www-form-urlencoded; charset=\"utf-8\"",
+                Some(Parse),
+            ),
             // No closing quote: `consumeValue` consumes nothing.
             ("application/x-www-form-urlencoded; charset=\"utf-8", None),
             // Go's MSIE rule: a backslash escapes a `tspecial` and is a
             // literal byte before anything else. Both parse.
-            ("application/x-www-form-urlencoded; charset=\"a\\;b\"", Some(Parse)),
-            ("application/x-www-form-urlencoded; charset=\"a\\qb\"", Some(Parse)),
+            (
+                "application/x-www-form-urlencoded; charset=\"a\\;b\"",
+                Some(Parse),
+            ),
+            (
+                "application/x-www-form-urlencoded; charset=\"a\\qb\"",
+                Some(Parse),
+            ),
             // A bare `=` with nothing after it consumes no value.
             ("application/x-www-form-urlencoded; charset=", None),
             // An empty QUOTED value does.
-            ("application/x-www-form-urlencoded; charset=\"\"", Some(Parse)),
-            ("application/x-www-form-urlencoded ; charset=utf-8", Some(Parse)),
-            ("application/x-www-form-urlencoded;charset=utf-8;boundary=x", Some(Parse)),
+            (
+                "application/x-www-form-urlencoded; charset=\"\"",
+                Some(Parse),
+            ),
+            (
+                "application/x-www-form-urlencoded ; charset=utf-8",
+                Some(Parse),
+            ),
+            (
+                "application/x-www-form-urlencoded;charset=utf-8;boundary=x",
+                Some(Parse),
+            ),
             // RFC 2231 continuations: walked and duplicate-checked, never
             // stitched (the stitching pass cannot fail).
-            ("application/x-www-form-urlencoded; a*0=1; a*1=2", Some(Parse)),
+            (
+                "application/x-www-form-urlencoded; a*0=1; a*1=2",
+                Some(Parse),
+            ),
             ("application/x-www-form-urlencoded; a*0=1; a*0=2", None),
             // A repeat whose value agrees is allowed; one that disagrees
             // is not — and the name is compared case-folded.
             ("application/x-www-form-urlencoded; a=1; a=1", Some(Parse)),
             ("application/x-www-form-urlencoded; a=1; a=2", None),
             ("application/x-www-form-urlencoded; A=1; a=2", None),
-            ("application/x-www-form-urlencoded; charset=utf-8; charset=utf-8", Some(Parse)),
+            (
+                "application/x-www-form-urlencoded; charset=utf-8; charset=utf-8",
+                Some(Parse),
+            ),
             ("application/x-www-form-urlencoded; a=1; b=1", Some(Parse)),
             // One trailing `;` is deliberately not an error; a second is.
             ("application/x-www-form-urlencoded;", Some(Parse)),
             ("application/x-www-form-urlencoded;;", None),
             ("application/x-www-form-urlencoded; ;", None),
             ("application/x-www-form-urlencoded; bogus", None),
-            ("APPLICATION/X-WWW-FORM-URLENCODED; CHARSET=UTF-8", Some(Parse)),
+            (
+                "APPLICATION/X-WWW-FORM-URLENCODED; CHARSET=UTF-8",
+                Some(Parse),
+            ),
             // The walk applies to a type whose body would be ignored too.
             ("application/json; charset=utf-8", Some(Ignore)),
             ("application/json; charset", None),
