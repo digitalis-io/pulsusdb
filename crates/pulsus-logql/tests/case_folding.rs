@@ -570,6 +570,36 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str, &str)] = &[
     (r#"{BY="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
     (r#"{json="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
     (r#"{JSON="x"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
+    // OVER-ACCEPTANCE, issue #392. A non-ASCII label name in a STREAM
+    // SELECTOR. The oracle's lexer tokenises `éx` here exactly as it
+    // does at every pipeline position — the 400 comes from a round trip
+    // BELOW the parser: the query-frontend re-serialises the parsed AST
+    // and vendored Prometheus `labels.Matcher.String()` quotes any name
+    // outside `[A-Za-z_][A-Za-z0-9_]*`
+    // (`vendor/github.com/prometheus/prometheus/model/labels/matcher.go:81-104`,
+    // `shouldQuoteName` at `:97-104`), producing a query LogQL's own
+    // grammar has no production for. The proof that it is the round trip
+    // and not the lexer: `{"éx"="m"}` returns the BYTE-IDENTICAL error at
+    // the IDENTICAL column (`col 2: syntax error: unexpected STRING,
+    // expecting IDENTIFIER or }`). By the ruling on #392 we serve it —
+    // reproducing a re-serialisation defect would not be parity.
+    (r#"{éx="m"}"#, "reject", "accept", SAME, OVER_ACCEPTANCE),
+    // OVER-ACCEPTANCE, issue #392 — the SAME pre-existing mechanism as
+    // the four rows above, reached by a new spelling. The oracle folds
+    // with Go `strings.ToLower` at LEX time, so `İgnoring` (U+0130) is
+    // the keyword `ignoring` there and cannot be an identifier payload
+    // (`400 unexpected ignoring, expecting IDENTIFIER`); we resolve
+    // keywords only at grammar positions that expect one, so it stays an
+    // identifier here. The architecture behind that is explicitly NOT
+    // #392's to change (ruling): it is the remaining work the issue
+    // stays open for.
+    (
+        r#"{app="x"} | drop İgnoring"#,
+        "reject",
+        "accept",
+        SAME,
+        OVER_ACCEPTANCE,
+    ),
 ];
 
 /// **Counts are pinned, not just rows.** The census used to assert every
@@ -583,9 +613,9 @@ const KNOWN_RESIDUAL_DIVERGENCES: &[(&str, &str, &str, &str, &str)] = &[
 fn the_residual_census_totals_are_pinned() {
     assert_eq!(
         KNOWN_RESIDUAL_DIVERGENCES.len(),
-        7,
+        9,
         "the residual census changed size — update this total and every count quoted \
-         about it (issues #339, #350)"
+         about it (issues #339, #350, #392)"
     );
     for (class, expected) in [
         // Issue #350 emptied this class: the 19 byte-literal rows were
@@ -595,7 +625,11 @@ fn the_residual_census_totals_are_pinned() {
         // divergences. Their spellings live on in
         // [`BYTE_LITERAL_QUERY_REJECTS`] below.
         (VERSION_DIFFERENCE, 0),
-        (OVER_ACCEPTANCE, 7),
+        // 7 before issue #392, which added two: `{éx="m"}` (a reference
+        // round-trip defect we deliberately do not reproduce) and
+        // `| drop İgnoring` (the pre-existing lex-time-keyword
+        // architecture difference, reached by a Unicode spelling).
+        (OVER_ACCEPTANCE, 9),
         // Issue #343 emptied this class: `offset` is implemented — the
         // grammar, the `is_kw` fold, and the planner's window shift — so
         // both spellings agree with the reference on both axes and are
@@ -725,7 +759,44 @@ const FOLDING_PROBES: &[&str] = &[
     // reproduce.
     r#"{App="X", Env="Prod"}"#,
     r#"{app="x"} | json | RATE="R""#,
+    // Issue #392. The fold is Go `strings.ToLower`, not ASCII
+    // lowercasing, and exactly two non-ASCII identifier runes reach an
+    // ASCII letter through it: U+212A KELVIN SIGN -> `k` and U+0130
+    // LATIN CAPITAL LETTER I WITH DOT ABOVE -> `i`. Both spellings are a
+    // 200 at the reference (measured), so the live leg keeps checking
+    // that it still resolves them as keywords.
+    "{app=\"x\"} | \u{212a}EEP ax",
+    "{app=\"x\"} | logfmt | addr = \u{130}P(\"1.2.3.4\")",
 ];
+
+/// Issue #392: the two Unicode spellings that reach an ASCII keyword
+/// through Go's simple case mapping. `str::to_ascii_lowercase` — what
+/// `kw`/`is_kw` used before #392 — cannot fold either, and
+/// `char::to_lowercase` gets U+0130 wrong (it is the FULL mapping and
+/// yields `i\u{307}`), so this is the test that would fail if the fold
+/// were replaced by either obvious alternative.
+///
+/// Fails on `ff0fb09`: both reject in the lexer, which is what made the
+/// old ASCII-only claim in `parser.rs` true and is exactly what #392
+/// changed.
+#[test]
+fn a_unicode_folded_keyword_is_the_keyword() {
+    // U+212A in keyword position IS `keep`, and renders as `keep`.
+    assert_eq!(
+        round_trip("{app=\"x\"} | \u{212a}EEP ax"),
+        round_trip(r#"{app="x"} | keep ax"#),
+    );
+    // U+0130 in keyword position IS `ip`.
+    assert_eq!(
+        round_trip("{app=\"x\"} | logfmt | addr = \u{130}P(\"1.2.3.4\")"),
+        round_trip(r#"{app="x"} | logfmt | addr = ip("1.2.3.4")"#),
+    );
+    // And the fold does NOT reach an identifier payload: `İgnoring` in
+    // `drop` position stays an identifier here (the reference makes it
+    // the keyword `ignoring` at lex time and 400s — the residual census
+    // row above owns that divergence).
+    assert!(accepts(r#"{app="x"} | drop İgnoring"#));
+}
 
 /// Byte-literal query spellings the reference rejects — on BOTH v3.7.3
 /// and v3.7.4, probed exhaustively (issue #350; the versions agree, so

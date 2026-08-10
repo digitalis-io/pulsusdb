@@ -4,10 +4,23 @@
 //! token carries a byte-offset [`Span`]; malformed input always yields a
 //! [`LogQlError`], never a panic — this is the crate's primary fuzz
 //! surface (architect plan: "String forms").
+//!
+//! **Identifiers are Unicode, and the rule is the reference's** (issue
+//! #392). An identifier is `_` or a general-category-`L` rune, then any
+//! number of `_`, `L` or `Nd` runes — grafana/loki v3.7.4 builds its
+//! scanner on Go `text/scanner` and never assigns `IsIdentRune`, so the
+//! default predicate at `pkg/logql/syntax/query_scanner.go:338-343`
+//! applies verbatim (`ch == '_' || unicode.IsLetter(ch) ||
+//! unicode.IsDigit(ch) && i > 0`), with the leading rune taken through
+//! it at `i == 0` (`:675`). That is NARROWER than "non-ASCII is
+//! allowed": combining marks, `Nl` and `No` are refused, and a decimal
+//! digit may not lead. [`crate::unicode_ident`] holds the predicate and
+//! the measurements behind it.
 
 use crate::error::LogQlError;
 use crate::limits::CheckedQuery;
 use crate::token::{Span, Token, TokenKind};
+use crate::unicode_ident;
 
 /// Walks a `&str` by `char`, tracking byte offsets — indexing by `char`
 /// position (not raw byte index) keeps every slice operation on a valid
@@ -256,8 +269,15 @@ pub(crate) fn tokenize(input: CheckedQuery<'_>) -> Result<Vec<Token>, LogQlError
                 let kind = scan_number_or_duration(&mut sc, start);
                 push(&mut tokens, kind, start, sc.current_byte());
             }
-            c if c.is_ascii_alphabetic() || c == '_' => {
-                while matches!(sc.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_') {
+            // Identifier — the reference's rune set, not ASCII (issue
+            // #392; see the module header for the citation). This arm
+            // must stay BELOW the numeric arm above: a decimal digit may
+            // not lead an identifier at the reference either
+            // (`unicode.IsDigit(ch) && i > 0`), and `query_scanner.go`
+            // orders `case s.isIdentRune(ch, 0)` before
+            // `case isDecimal(ch)` for exactly that reason.
+            c if unicode_ident::is_ident_start(c) => {
+                while matches!(sc.peek(), Some(c) if unicode_ident::is_ident_continue(c)) {
                     sc.advance();
                 }
                 let end = sc.current_byte();
@@ -661,10 +681,25 @@ mod tests {
 
     #[test]
     fn multi_byte_utf8_never_panics_the_scanner() {
-        // Arbitrary non-ASCII input, including inside and outside
-        // strings — must error cleanly, never panic on a slice boundary.
-        assert!(tok("日本語").is_err());
+        // Issue #392. This used to assert `tok("日本語").is_err()` — it
+        // was the one place in the workspace pinning the behaviour that
+        // issue calls a defect, so it is rewritten rather than deleted.
+        // `日本語` is three general-category-`L` runes, so it is ONE
+        // identifier spanning bytes 0..9 (three bytes each), exactly as
+        // the reference's scanner tokenises it.
+        let tokens = tok("日本語").expect("a non-ASCII identifier lexes");
+        assert_eq!(tokens.len(), 2, "one Ident plus Eof: {tokens:?}");
+        assert_eq!(tokens[0].kind, TokenKind::Ident("日本語".to_string()));
+        assert_eq!(tokens[0].span, Span { start: 0, end: 9 });
+        assert!(matches!(tokens[1].kind, TokenKind::Eof));
+
+        // The panic-freedom half, which is what this test is named for:
+        // non-ASCII inside a string, and a non-ASCII rune that is NOT an
+        // identifier rune (U+00BD, general category No) still resolves to
+        // a clean error rather than a bad slice boundary.
         assert!(tok(r#"{app="日本語"}"#).is_ok());
+        assert!(tok("½").is_err());
+        assert!(tok("é½").is_err());
     }
 
     #[test]

@@ -24,6 +24,8 @@ mod lexer;
 mod limits;
 mod parser;
 mod token;
+mod unicode_ident;
+mod unicode_ident_tables;
 pub mod walk;
 
 pub use ast::{

@@ -79,6 +79,84 @@ fn pure_positive_selector_is_byte_exact_to_schemas_md_3_2() {
     );
 }
 
+/// **Issue #392 AC 13 — a non-ASCII identifier plans IDENTICALLY to an
+/// ASCII one.** Stated as an identity rather than a wall-time claim
+/// (Tier 1): the SQL for the non-ASCII spelling is the SQL for the ASCII
+/// spelling with `'ex'` rewritten to `'éx'`, byte for byte.
+///
+/// That is the whole performance argument, made checkable. A label name
+/// is always a ClickHouse STRING LITERAL, never an SQL identifier
+/// (`crates/pulsus-read/src/logql/escape.rs`), so the same
+/// `log_streams_idx` `(month, key, val)` access path serves it, the same
+/// `HAVING uniqExact(key, val) = N` prunes it, the same `PREWHERE
+/// service` engages the PK prefix, and no coordinator-side work is
+/// added. If a future change ever routed a non-ASCII name differently —
+/// a client-side filter, an extra probe, a different table — this stops
+/// being an identity and reddens.
+///
+/// Fails on `ff0fb09`: neither non-ASCII query parses there.
+#[test]
+fn a_non_ascii_label_name_plans_identically_to_an_ascii_one() {
+    // (a) A stream-selector matcher — the position whose key literal
+    // actually reaches stage 1. This is also the position the reference
+    // 400s for a round-trip defect of its own; we serve it, and this is
+    // what serving it costs at the plan: nothing.
+    let ascii = streams_plan(
+        r#"{ex="m", app="x"}"#,
+        &range_params(100, Direction::Backward),
+    );
+    let non_ascii = streams_plan(
+        r#"{éx="m", app="x"}"#,
+        &range_params(100, Direction::Backward),
+    );
+    assert!(
+        ascii.stage1_sql.contains("key = 'ex'"),
+        "non-vacuity: the ASCII twin must really carry the key literal, else the \
+         substitution below proves nothing:\n{}",
+        ascii.stage1_sql
+    );
+    assert_eq!(
+        ascii.stage1_sql.replace("'ex'", "'éx'"),
+        non_ascii.stage1_sql,
+        "the non-ASCII selector must plan to the same stage-1 SQL, modulo the key literal"
+    );
+    assert_eq!(ascii.samples_table, non_ascii.samples_table);
+    assert_eq!(ascii.scan_limit, non_ascii.scan_limit);
+
+    // (b) A grouping label. It never reaches SQL — grouping is applied
+    // above the scan — so the two plans' SQL is byte-identical with no
+    // substitution at all, and the grouping list is the ONLY difference.
+    let ascii = metric_plan(
+        r#"sum by (ex) (count_over_time({app="x"}[5m]))"#,
+        &range_params(100, Direction::Backward),
+    );
+    let non_ascii = metric_plan(
+        r#"sum by (éx) (count_over_time({app="x"}[5m]))"#,
+        &range_params(100, Direction::Backward),
+    );
+    let fps = [18374u64, 99120];
+    let services = ["'checkout'".to_string()];
+    assert_eq!(
+        sliding_sql(&ascii, &services, &fps),
+        sliding_sql(&non_ascii, &services, &fps),
+        "a non-ASCII grouping label must not change the scan SQL at all"
+    );
+    assert_eq!(ascii.table, non_ascii.table);
+    assert_eq!(ascii.rollup, non_ascii.rollup);
+    assert_eq!(ascii.routing.reason, non_ascii.routing.reason);
+    assert_eq!(ascii.extra_predicates, non_ascii.extra_predicates);
+    let grouping = |mp: &pulsus_read::logql::MetricPlan| {
+        mp.vector_aggs[0]
+            .1
+            .as_ref()
+            .expect("by grouping")
+            .labels
+            .clone()
+    };
+    assert_eq!(grouping(&ascii), vec!["ex".to_string()]);
+    assert_eq!(grouping(&non_ascii), vec!["éx".to_string()]);
+}
+
 #[test]
 fn single_equality_matcher_uses_n_equal_one() {
     let sp = streams_plan(
