@@ -2466,7 +2466,7 @@ fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
             // the pipeline compile every entry point runs before any I/O.
             // A bare `| logfmt` has no extractions, so the loop body never
             // runs and `detected.rs`'s `LOGFMT_PARSER` still cannot fail.
-            let mut compiled = Vec::with_capacity(extractions.len());
+            let mut compiled: Vec<(String, String)> = Vec::with_capacity(extractions.len());
             for e in extractions {
                 let key = logfmt_expr::parse_logfmt_expr(&e.expression).map_err(|msg| {
                     PipelineError::BadParserExpr(format!(
@@ -2474,7 +2474,26 @@ fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
                         e.expression
                     ))
                 })?;
-                compiled.push((e.label.clone(), key));
+                // `paths[exp.Identifier] = path` (`pkg/logql/log/parser.go:521
+                // @ v3.7.4`) is a MAP assignment, so a REPEATED identifier
+                // keeps only its LAST source key and is pre-seeded/scanned
+                // once. Every expression is still parsed first, so a later
+                // bad one is still refused. Measured on `grafana/loki:3.7.4`
+                // over `b=1 a-b=2 x=3`: `| logfmt a="b", a="nosuch"` answers
+                // `a=""` (the surviving expression misses) and
+                // `| logfmt a="nosuch", a="b"` answers `a="1"`.
+                //
+                // The slot keeps the FIRST declaration's POSITION. The
+                // reference has no position at all here (map iteration), and
+                // position is only ever consulted as the tie-break between
+                // two DIFFERENT identifiers sharing one source key — see
+                // `logfmt_target_for` and the
+                // `logfmt-expression-duplicate-source-key-tiebreak` ledger
+                // entry.
+                match compiled.iter_mut().find(|(id, _)| *id == e.label) {
+                    Some(slot) => slot.1 = key,
+                    None => compiled.push((e.label.clone(), key)),
+                }
             }
             Ok(CompiledStage::Logfmt {
                 strict: *strict,
@@ -5858,14 +5877,151 @@ struct LogfmtFlags {
     keep_empty: bool,
 }
 
-/// Applies the logfmt stage in a single streaming pass (issue #200): each
-/// decoded pair is dropped when its value is empty unless `keep_empty`,
-/// else committed through `to_cow` — the identity for the original body
-/// (captures stay borrowed slices) or a copy for a rewritten line. On the
-/// first decoder error the walk stops; under `strict` it tags
+/// `sanitizeLabelKey(raw, true)` (`pkg/logql/log/util.go:22-38 @ v3.7.4`)
+/// compared against `target`, WITHOUT materialising the sanitized key —
+/// this runs once per decoded line key per extraction, so it must not
+/// allocate.
+///
+/// **Equivalent to `sanitize_label_key(raw.trim_ascii()) == target`**, and
+/// pinned as that identity by
+/// `sanitized_key_eq_agrees_with_sanitize_label_key`. Keeping the two in
+/// step matters: the bare `| logfmt` arm renames a line key through
+/// [`sanitize_label_key`], and the targeted arm decides which extraction
+/// a line key writes to through this — a spelling difference between them
+/// would be a divergence with no reference behind it.
+///
+/// The trim is the reference's `strings.TrimSpace`, narrowed to ASCII
+/// because [`walk_logfmt`] can emit neither an empty key nor one holding
+/// ASCII whitespace (`walk_logfmt_never_emits_an_empty_or_whitespace_bearing_key`),
+/// so it is an identity on every reachable key; [`sanitize_label_key`]
+/// does not trim at all, and the two therefore cannot disagree on a key
+/// that actually arrives. A key bearing non-ASCII Unicode whitespace is
+/// the bare arm's pre-existing question (issue #200 ground), untouched
+/// here so both arms keep answering it the same way.
+///
+/// Rune-wise, not byte-wise: one multi-byte rune sanitizes to exactly one
+/// `_`, matching `strings.Map`.
+fn sanitized_key_eq(raw: &str, target: &str) -> bool {
+    let raw = raw.trim_ascii();
+    if raw.is_empty() {
+        return false;
+    }
+    let mut want = target.chars();
+    // `if isPrefix && key[0] >= '0' && key[0] <= '9' { key = "_" + key }`
+    // — the FIRST BYTE of the trimmed key, before the rune mapping.
+    if raw.as_bytes()[0].is_ascii_digit() && want.next() != Some('_') {
+        return false;
+    }
+    for c in raw.chars() {
+        let mapped = if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        };
+        if want.next() != Some(mapped) {
+            return false;
+        }
+    }
+    // Both sides exhausted together, or `target` is merely a prefix.
+    want.next().is_none()
+}
+
+/// Which extraction identifier a decoded line key writes to, if any.
+///
+/// The reference renames first (`pkg/logql/log/parser.go:594-599 @
+/// v3.7.4`: the SANITIZED line key equals some identifier's SOURCE key)
+/// and only then looks the result up in `l.expressions` (`:601`), so a
+/// source-key match beats a line key that merely spells an identifier.
+/// Measured on `grafana/loki:3.7.4` over `p=1 q=2`: `| logfmt q="p"`
+/// answers `q="2"` — `p` renames to `q` and writes `1`, then `q` matches
+/// no source key but IS an identifier and overwrites with `2`.
+///
+/// Ties across identifiers are broken by QUERY ORDER: `for id, orig :=
+/// range keys` (`:594`) ranges a Go map, so the reference has no answer
+/// to break — see the `logfmt-expression-duplicate-source-key-tiebreak`
+/// ledger entry for the measured split.
+fn logfmt_target_for<'e>(targets: &'e [(String, String)], raw_key: &str) -> Option<&'e str> {
+    for (id, source) in targets {
+        if sanitized_key_eq(raw_key, source) {
+            return Some(id.as_str());
+        }
+    }
+    for (id, _) in targets {
+        if sanitized_key_eq(raw_key, id) {
+            return Some(id.as_str());
+        }
+    }
+    None
+}
+
+/// `pkg/logql/log/parser.go:545-550 @ v3.7.4`: every extraction identifier
+/// the stream and the LIVE structured metadata do not already supply is
+/// `Set` to `""` **before the line is scanned** — an unconditional
+/// overwrite, so a later `| logfmt` stage resets an earlier stage's parsed
+/// value. A colliding identifier is skipped entirely (no `_extracted`
+/// rename here; that happens only on a hit, in [`add_extracted`]).
+///
+/// This is what makes a targeted MISS emit an empty label. The
+/// `--keep-empty` rule cannot reach it: `LogfmtExpressionParserExpr.Stage()`
+/// passes only `l.Strict` to `NewLogfmtExpressionParser`
+/// (`pkg/logql/syntax/ast.go:1073-1075 @ v3.7.4`), so the expression
+/// parser carries no `keepEmpty` field at all. Measured on
+/// `grafana/loki:3.7.4` over `b=1 a-b=2 x=3`: `| logfmt a="nosuch"` and
+/// `| logfmt --keep-empty a="nosuch"` both answer `a=""`.
+fn seed_logfmt_identifiers<'a>(
+    targets: &'a [(String, String)],
+    labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    st: &mut ExtractionState<'a, '_>,
+    dirty: &mut bool,
+) {
+    for (id, _) in targets {
+        // `!lbs.BaseHas(id) && !lbs.HasInCategory(id, StructuredMetadataLabel)`.
+        if st.collides(labels, id) {
+            continue;
+        }
+        // A `Set` dirties the builder (`labels.go:216-222`; issue #238).
+        *dirty = true;
+        let id = st.note_parsed_set(Cow::Borrowed(id.as_str()));
+        set_label(labels, id, Cow::Borrowed(""));
+    }
+}
+
+/// Applies the logfmt stage in a single streaming pass (issue #200). On
+/// the first decoder error the walk stops; under `strict` it tags
 /// `__error__="LogfmtParserErr"` plus the per-class detail, otherwise (the
 /// lenient default) it swallows the error, keeping the pairs already
-/// emitted before it (matching the reference's default best-effort logfmt).
+/// emitted before it (matching the reference's default best-effort
+/// logfmt). Values are committed through `to_cow` — the identity for the
+/// original body (captures stay borrowed slices) or a copy for a
+/// rewritten line.
+///
+/// **The two arms are different parsers in the reference, and they agree
+/// on almost nothing.** `LogfmtParser.Process`
+/// (`pkg/logql/log/parser.go:380-430 @ v3.7.4`) drops an empty value
+/// unless `keepEmpty` and maps a `U+FFFD` inside a value to a space;
+/// `LogfmtExpressionParser.Process` (`:531-624`) has neither rule and
+/// instead:
+///
+/// - pre-seeds every identifier to `""` before the line is read
+///   ([`seed_logfmt_identifiers`]) — which is why a miss emits an empty
+///   label and why `--keep-empty` is inert on this arm;
+/// - makes ONE document-order pass, choosing each pair's destination by
+///   SANITIZED line key ([`logfmt_target_for`]), so the last matching
+///   pair in the line wins — measured over `b=2 a=1`, `| logfmt a="b"`
+///   answers `a="1"`, not `a="2"`;
+/// - EMPTIES a value containing `U+FFFD` (`:590-592`, `val = nil`) where
+///   the implicit parser maps it to a space (`:417-419`) — measured over
+///   `a=x\u{FFFD}y b=2`, `| logfmt a="a"` answers `a=""` while bare
+///   `| logfmt` answers `a="x y"`.
+///
+/// Issue #393; every measurement above is from `grafana/loki:3.7.4`,
+/// digest `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+/// and is pinned by `logqltest/corpus/b24_logfmt_expr_eval.test`.
+///
+/// **One walk, not one per extraction**, which is also why this is
+/// cheaper than what it replaces: the targeted arm used to run a full
+/// [`walk_logfmt`] per extraction. Pinned by the E-independence gate in
+/// `tests/logql_pipeline_alloc.rs`.
 fn run_logfmt<'a, 't>(
     text: &'t str,
     flags: LogfmtFlags,
@@ -5892,36 +6048,32 @@ fn run_logfmt<'a, 't>(
             );
         })
     } else {
-        // Targeted extraction: resolve each requested source key to its
-        // first occurrence. The error verdict is identical across the
-        // per-key walks, so it is captured once (the first).
-        let mut err = Ok(());
-        for (label, source_key) in extractions {
-            let mut found: Option<Cow<'t, str>> = None;
-            let res = walk_logfmt(text, &mut |k, v| {
-                if found.is_none() && k == source_key {
-                    found = Some(v);
-                }
-            });
-            if err.is_ok() {
-                err = res;
-            }
-            let value = found.map(&to_cow).unwrap_or(Cow::Borrowed(""));
-            // The same empty-drop rule applies to a targeted miss/empty.
-            if !keep_empty && value.is_empty() {
-                continue;
-            }
+        // `LogfmtExpressionParser.Process` (`parser.go:531-624 @ v3.7.4`):
+        // pre-seed, then ONE document-order pass. `keep_empty` is
+        // deliberately not consulted — this parser has no such field.
+        seed_logfmt_identifiers(extractions, labels, st, &mut errs.dirty);
+        walk_logfmt(text, &mut |raw_key, val| {
+            let Some(id) = logfmt_target_for(extractions, raw_key) else {
+                return;
+            };
+            // `parser.go:590-592` — the EXPRESSION parser empties such a
+            // value; the implicit parser maps it to a space (`:417-419`),
+            // which the bare arm above keeps doing (issue #200 ground).
+            let val = if val.contains(char::REPLACEMENT_CHARACTER) {
+                Cow::Borrowed("")
+            } else {
+                to_cow(val)
+            };
             add_extracted(
                 labels,
                 st,
-                Cow::Borrowed(label.as_str()),
+                Cow::Borrowed(id),
                 KeyOrigin::QueryIdentifier,
-                value,
+                val,
                 OnAlreadyExtracted::Overwrite,
                 &mut errs.dirty,
             );
-        }
-        err
+        })
     };
     if let Err(err) = result
         && strict
@@ -6178,6 +6330,13 @@ mod tests {
     /// `a=""` there too (a miss on both sides; the reference joins with
     /// `fmt.Sprintf("%v", paths...)`, `pkg/logql/log/parser.go:546 @
     /// v3.7.4`, and compares against a sanitized key).
+    ///
+    /// **The `--keep-empty` flags below no longer do anything** (issue
+    /// #393): a targeted miss emits `a=""` either way, because the
+    /// expression parser pre-seeds its identifiers and carries no
+    /// `keepEmpty` field. They are kept as written so the row still reads
+    /// as the #247 case it was captured for; the flagless spellings are
+    /// asserted beside them.
     #[test]
     fn an_unmatchable_resolved_key_extracts_nothing() {
         const LINE: &str = "b=1 a-b=2 x=3";
@@ -6185,6 +6344,9 @@ mod tests {
             r#"{s="m"} | logfmt --keep-empty a="\"b c\"""#,
             r#"{s="m"} | logfmt --keep-empty a="b \"x\"""#,
             r#"{s="m"} | logfmt --keep-empty a="\"\"""#,
+            r#"{s="m"} | logfmt a="\"b c\"""#,
+            r#"{s="m"} | logfmt a="b \"x\"""#,
+            r#"{s="m"} | logfmt a="\"\"""#,
         ] {
             let compiled = CompiledPipeline::compile(&stages_of(query))
                 .unwrap_or_else(|e| panic!("{query}: {e}"));
@@ -6199,8 +6361,8 @@ mod tests {
             assert_eq!(
                 a,
                 Some(String::new()),
-                "{query} must extract nothing (the `--keep-empty` flag is what makes the miss \
-                 visible as an empty label rather than an absent one)"
+                "{query} must extract nothing — visible as an EMPTY label, which since #393 is \
+                 what a targeted miss emits with or without `--keep-empty`"
             );
         }
         // The control: a matchable key over the same line does extract.
@@ -6216,6 +6378,389 @@ mod tests {
                 .map(|(_, v)| v.to_string()),
             Some("1".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #393 — what a SURVIVING `| logfmt <id>="<expr>"` evaluates to.
+    //
+    // Every criterion below asserts EMITTED LABEL NAMES AND VALUES. Each
+    // expectation was captured from `grafana/loki:3.7.4` (buildinfo read
+    // from the running process: {"version":"3.7.4","revision":"b318f282",
+    // "branch":"release-3.7.x"}) on 2026-08-10 through
+    // `/loki/api/v1/query_range`, and each is also pinned end to end by
+    // `tests/logqltest/corpus/b24_logfmt_expr_eval.test`.
+    // -----------------------------------------------------------------
+
+    /// The label set `query` emits over `line`, with `base` as the stream
+    /// labels — sorted, so the assertion is about the SET and not about
+    /// the order the pre-seed happens to append in.
+    fn logfmt_labels(query: &str, line: &str, base: &[(&str, &str)]) -> Vec<(String, String)> {
+        let base: Vec<(String, String)> = base
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let compiled =
+            CompiledPipeline::compile(&stages_of(query)).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let mut out = Vec::new();
+        compiled
+            .run_into(line, &base, 0, &mut out)
+            .expect("within budget")
+            .unwrap_or_else(|| panic!("{query}: the line was dropped"));
+        let mut got: Vec<(String, String)> = out
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        got.sort();
+        got
+    }
+
+    fn sorted_pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = expected
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// **AC1.** A targeted MISS emits an EMPTY label, and `--keep-empty`
+    /// has nothing to do with it: `LogfmtExpressionParserExpr.Stage()`
+    /// passes only `l.Strict` (`pkg/logql/syntax/ast.go:1073-1075 @
+    /// v3.7.4`), so this parser carries no `keepEmpty` field — the label
+    /// comes from the unconditional pre-seed
+    /// (`pkg/logql/log/parser.go:545-550`).
+    ///
+    /// Fails on `ec774ee`: without the flag the label was absent
+    /// entirely, because the targeted arm consulted the bare arm's
+    /// empty-drop rule.
+    #[test]
+    fn a_targeted_miss_emits_an_empty_label_regardless_of_keep_empty() {
+        const LINE: &str = "b=1 a-b=2 x=3";
+        for query in [
+            r#"{s="m"} | logfmt a="nosuch""#,
+            r#"{s="m"} | logfmt --keep-empty a="nosuch""#,
+        ] {
+            assert_eq!(
+                logfmt_labels(query, LINE, &[]),
+                sorted_pairs(&[("a", "")]),
+                "{query}"
+            );
+        }
+        // A miss on an EMPTY line is the same case: the pre-seed runs
+        // before the decoder is even reset.
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="nosuch""#, "", &[]),
+            sorted_pairs(&[("a", "")])
+        );
+        // …and a line key whose VALUE is empty reaches the same answer by
+        // the other route (`b= x=3` → `a=""` on the container).
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="b""#, "b= x=3", &[]),
+            sorted_pairs(&[("a", "")])
+        );
+    }
+
+    /// **AC2.** The LINE key is sanitized before it is compared against a
+    /// source key (`parser.go:575` → `util.go:22-38`), and because the
+    /// pass is document-order with no first-hit latch, the LAST matching
+    /// pair wins.
+    ///
+    /// Fails on `ec774ee` with `a="1"`, `a="2"`, absent and absent
+    /// respectively — that commit compared the RAW line key.
+    ///
+    /// This also rules out the plausible "sanitize the SOURCE key at
+    /// compile time and keep comparing raw line keys" fix: that matches
+    /// only the literal `p_q` pair and answers `a="2"` on the second row,
+    /// and misses the third entirely.
+    #[test]
+    fn a_line_key_is_sanitized_before_it_is_compared() {
+        for (query, line, want) in [
+            (r#"{s="m"} | logfmt a="a_b""#, "a_b=1 a-b=2", "2"),
+            (r#"{s="m"} | logfmt a="p_q""#, "p.q=1 p_q=2 p-q=3", "3"),
+            (r#"{s="m"} | logfmt a="b_c""#, "b=1 a-b=2 x=3 b.c=4", "4"),
+            // A leading-digit line key gains the reference's `_` prefix.
+            (r#"{s="m"} | logfmt a="_1x""#, "1x=5 y=6", "5"),
+        ] {
+            assert_eq!(
+                logfmt_labels(query, line, &[]),
+                sorted_pairs(&[("a", want)]),
+                "{query} over {line:?}"
+            );
+        }
+        // The mirror the sanitization makes possible: a quoted path
+        // holding a `.` can no longer match the raw `b.c` pair, because
+        // the line key it would have to equal is `b_c`.
+        assert_eq!(
+            logfmt_labels(
+                r#"{s="m"} | logfmt a="\"b.c\"""#,
+                "b=1 a-b=2 x=3 b.c=4",
+                &[]
+            ),
+            sorted_pairs(&[("a", "")])
+        );
+    }
+
+    /// **AC3.** An extraction IDENTIFIER aliases a line key. The
+    /// reference renames a line key to an identifier when it equals that
+    /// identifier's SOURCE key (`parser.go:594-599`) and only then asks
+    /// whether the resulting name is an identifier at all (`:601`) — so a
+    /// pair the query never named as a source still lands, under its own
+    /// name, whenever that name is one of the destinations.
+    ///
+    /// Fails on `ec774ee` on all four rows.
+    #[test]
+    fn an_extraction_identifier_aliases_a_line_key() {
+        assert_eq!(
+            logfmt_labels(
+                r#"{s="m"} | logfmt a="x", b="nosuch""#,
+                "b=1 a-b=2 x=3",
+                &[]
+            ),
+            sorted_pairs(&[("a", "3"), ("b", "1")]),
+            "`b` is not the source of anything, but it IS an identifier"
+        );
+        // Source-key match BEATS identifier match: `p` renames to `q` and
+        // writes `1`, then `q` (an identifier, no source match) overwrites
+        // with `2`.
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt q="p""#, "p=1 q=2", &[]),
+            sorted_pairs(&[("q", "2")])
+        );
+        // The alias is compared SANITIZED too — `a-b` spells `a_b`.
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a_b="nosuch""#, "a-b=7", &[]),
+            sorted_pairs(&[("a_b", "7")])
+        );
+        // Two identifiers, one of which aliases nothing on this line.
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="b", b="a""#, "b=1 a-b=2 x=3", &[]),
+            sorted_pairs(&[("a", "1"), ("b", "")])
+        );
+    }
+
+    /// **AC4 — the discriminator.** Document order, last write wins.
+    ///
+    /// Over `b=2 a=1` the reference answers `a="1"`: the pair `b` renames
+    /// to `a` and writes `2`, then the pair `a` aliases the identifier and
+    /// OVERWRITES with `1`. `ec774ee` answers `a="2"`, and so does the
+    /// plausible "keep the per-extraction source-key lookup, just emit an
+    /// empty string on a miss" fix — which is exactly why this row is
+    /// here and why parts A, B and C cannot ship apart.
+    ///
+    /// The mirror line is the direction control: it is GREEN on
+    /// `ec774ee`, so the test cannot be passed by inverting a bias.
+    #[test]
+    fn the_last_matching_line_key_in_document_order_wins() {
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="b""#, "b=2 a=1", &[]),
+            sorted_pairs(&[("a", "1")])
+        );
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="b""#, "a=1 b=2", &[]),
+            sorted_pairs(&[("a", "2")])
+        );
+    }
+
+    /// **AC5.** A repeated identifier keeps only its LAST source key
+    /// (`parser.go:521`'s map assignment).
+    ///
+    /// Fails on `ec774ee` with `a="1"` and `a="1"`.
+    #[test]
+    fn a_repeated_identifier_keeps_only_its_last_source_key() {
+        assert_eq!(
+            logfmt_labels(
+                r#"{s="m"} | logfmt a="b", a="nosuch""#,
+                "b=1 a-b=2 x=3",
+                &[]
+            ),
+            sorted_pairs(&[("a", "")])
+        );
+        assert_eq!(
+            logfmt_labels(
+                r#"{s="m"} | logfmt a="nosuch", a="b""#,
+                "b=1 a-b=2 x=3",
+                &[]
+            ),
+            sorted_pairs(&[("a", "1")])
+        );
+    }
+
+    /// **AC5, second half.** The pre-seed is an UNCONDITIONAL `Set`
+    /// (`parser.go:547-549`), so a later `| logfmt` stage RESETS a label
+    /// an earlier stage parsed rather than leaving it standing.
+    ///
+    /// Fails on `ec774ee` with `a="3"`.
+    #[test]
+    fn a_later_logfmt_stage_reseeds_an_earlier_parsed_label() {
+        assert_eq!(
+            logfmt_labels(
+                r#"{s="m"} | logfmt a="x" | logfmt a="nosuch""#,
+                "b=1 a-b=2 x=3",
+                &[]
+            ),
+            sorted_pairs(&[("a", "")])
+        );
+    }
+
+    /// **AC6.** A `U+FFFD` anywhere in the value EMPTIES it on this arm
+    /// (`parser.go:590-592`, `val = nil`), where the implicit parser maps
+    /// it to a space (`:417-419`).
+    ///
+    /// The bare half is the containment control and must NOT change: the
+    /// implicit parser's space mapping is issue #200's ground, so we
+    /// still hand back the rune untouched there and that stays a
+    /// divergence (`a="x y"` on the container, `a="x\u{FFFD}y"` here).
+    ///
+    /// Fails on `ec774ee` on the first half only (`a="x\u{FFFD}y"`).
+    #[test]
+    fn a_replacement_rune_empties_a_targeted_value() {
+        const LINE: &str = "a=x\u{FFFD}y b=2";
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="a""#, LINE, &[]),
+            sorted_pairs(&[("a", "")])
+        );
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt"#, LINE, &[]),
+            sorted_pairs(&[("a", "x\u{FFFD}y"), ("b", "2")]),
+            "the BARE arm is #200's ground and must not move"
+        );
+    }
+
+    /// **AC7 — the #334 containment control.** An identifier the STREAM
+    /// supplies is not pre-seeded at all (`parser.go:547`'s `!BaseHas`
+    /// guard), and a hit on it renames to `_extracted` in the write path
+    /// (`:602-604`) exactly as before. Both rows already agreed with the
+    /// container on `ec774ee` and must keep agreeing.
+    #[test]
+    fn a_targeted_identifier_the_stream_supplies_is_not_pre_seeded() {
+        const LINE: &str = "b=1 a-b=2 x=3";
+        const STREAM: &[(&str, &str)] = &[("s", "m")];
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt s="nosuch""#, LINE, STREAM),
+            sorted_pairs(&[("s", "m")]),
+            "a colliding identifier is skipped by the pre-seed, not renamed by it"
+        );
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt s="b""#, LINE, STREAM),
+            sorted_pairs(&[("s", "m"), ("s_extracted", "1")])
+        );
+    }
+
+    /// **The tie-break, and why it is OURS.** Where two identifiers share
+    /// one source key the reference iterates a Go map (`for id, orig :=
+    /// range keys`, `parser.go:594`) and has no answer: measured on
+    /// `grafana/loki:3.7.4`, 30 repetitions of one query against one
+    /// pushed line split **25 / 5** between `{a="3", b=""}` and
+    /// `{a="", b="3"}`, and a second shape split **21 / 9**. (Command in
+    /// the `logfmt-expression-duplicate-source-key-tiebreak` ledger
+    /// entry; an independent earlier run of the same shapes split 23/7
+    /// and 16/14, which is the same finding.)
+    ///
+    /// We take QUERY ORDER — the one order a user can predict from what
+    /// they wrote. This is a determinism we are ADDING, not a divergence
+    /// we are choosing; do not "fix" it back toward a coin flip.
+    #[test]
+    fn two_identifiers_sharing_a_source_key_are_broken_by_query_order() {
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="x", b="x""#, "x=3 y=4", &[]),
+            sorted_pairs(&[("a", "3"), ("b", "")])
+        );
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt b="x", a="x""#, "x=3 y=4", &[]),
+            sorted_pairs(&[("a", ""), ("b", "3")]),
+            "swapping the declarations swaps the winner — that is what makes it query order"
+        );
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="x", b="y", c="x""#, "x=3 y=4", &[]),
+            sorted_pairs(&[("a", "3"), ("b", "4"), ("c", "")])
+        );
+    }
+
+    /// **A strict decoder error does not swallow the pre-seed.** The
+    /// seeding happens before `l.dec.Reset(line)` (`parser.go:545-552`),
+    /// so the empty labels survive a line that fails to decode at all.
+    /// Container-measured over `=x b=1`: `| logfmt --strict a="b"`
+    /// answers `__error__="LogfmtParserErr"` **and** `a=""`; `ec774ee`
+    /// answered with the error alone.
+    ///
+    /// The lenient half stays divergent and that is deliberate — the
+    /// reference's lenient decoder RESUMES after a recoverable error
+    /// (`parser.go:564-571`) and ours stops, which is issue #200's
+    /// ground, not this one's. So `| logfmt a="b"` over this line is
+    /// `a=""` here and `a="1"` there, and this test pins OUR answer
+    /// rather than pretending the gap is closed.
+    #[test]
+    fn a_pre_seeded_identifier_survives_a_strict_decoder_error() {
+        let got = logfmt_labels(r#"{s="m"} | logfmt --strict a="b""#, "=x b=1", &[]);
+        assert!(
+            got.contains(&("a".to_string(), String::new())),
+            "the pre-seeded empty label must survive the error: {got:?}"
+        );
+        assert!(
+            got.contains(&("__error__".to_string(), "LogfmtParserErr".to_string())),
+            "{got:?}"
+        );
+        assert_eq!(
+            logfmt_labels(r#"{s="m"} | logfmt a="b""#, "=x b=1", &[]),
+            sorted_pairs(&[("a", "")]),
+            "lenient recovery is issue #200's ground; the reference answers `a=\"1\"` here"
+        );
+    }
+
+    /// [`sanitized_key_eq`] IS [`sanitize_label_key`], compared — the two
+    /// arms must not drift apart, because the bare arm renames a line key
+    /// through the second while the targeted arm routes it through the
+    /// first.
+    ///
+    /// Replacing the non-alphanumeric branch's `'_'` with the character
+    /// itself reddens this on `a-b`; dropping the leading-digit `_`
+    /// reddens it on `1x`.
+    #[test]
+    fn sanitized_key_eq_agrees_with_sanitize_label_key() {
+        let raws = [
+            "b",
+            "a-b",
+            "a_b",
+            "b.c",
+            "p-q",
+            "1x",
+            "0",
+            "_",
+            "é",
+            "日本",
+            "a",
+            "abc",
+            "a1",
+            "a\u{00a0}b",
+            "x\u{1}y",
+            " a ",
+            "\ta\t",
+            " ",
+            "",
+            "a--b",
+            "__",
+            "9_9",
+            "aB9_",
+        ];
+        let targets = [
+            "b", "a_b", "a-b", "b_c", "p_q", "_1x", "_0", "_", "__", "a", "abc", "a1", "a__b",
+            "_9_9", "aB9_", "x_y", "",
+        ];
+        for raw in raws {
+            for target in targets {
+                let want = {
+                    let trimmed = raw.trim_ascii();
+                    !trimmed.is_empty() && sanitize_label_key(trimmed) == target
+                };
+                assert_eq!(
+                    sanitized_key_eq(raw, target),
+                    want,
+                    "sanitized_key_eq({raw:?}, {target:?}) disagrees with \
+                     sanitize_label_key({raw:?}) = {:?}",
+                    sanitize_label_key(raw.trim_ascii())
+                );
+            }
+        }
     }
 
     /// **Issue #392.** A non-ASCII extraction destination keeps its

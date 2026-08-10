@@ -115,19 +115,25 @@
 //! container over that same line: `a="\"b c\""`, `a="b \"x\""` and
 //! `a="\"\""` all give `a=""` — a miss on both sides.
 //!
-//! **One consequence is a NEW instance of #393's divergence, and it is
-//! measured rather than left to be found.** We compare the resolved key
-//! against RAW line keys; the reference compares it against SANITIZED
-//! ones. So for a quoted single-element path holding a character our
-//! walker can emit in a key but which is not `[A-Za-z0-9_]`, the two
-//! sides now differ: over `b=1 a-b=2 x=3 b.c=4`, `| logfmt a="\"b.c\""`
-//! is `a=""` on the container (measured) and `a="4"` here — asserted end
-//! to end by
-//! `the_resolved_key_of_a_quoted_path_is_the_unsanitized_element`, not
-//! merely described. The mechanism is the missing line-key sanitization,
-//! which is #393's second bullet — the same rule that already makes
-//! `| logfmt a="b_c"` give `a="4"` there (measured) and NOTHING here,
-//! with or without this change.
+//! **One consequence WAS a new instance of #393's divergence. Issue #393
+//! closed it, and the two assertions that recorded it flipped.** #247
+//! compared the resolved key against RAW line keys where the reference
+//! compares it against SANITIZED ones, so for a quoted single-element
+//! path holding a character our walker can emit in a key but which is not
+//! `[A-Za-z0-9_]`, the two sides differed. Both directions now agree with
+//! the container, over `b=1 a-b=2 x=3 b.c=4`:
+//!
+//! | query | was, here | is, here | container |
+//! |---|---|---|---|
+//! | `a="\"b.c\""` | `a="4"` | `a=""` | `a=""` |
+//! | `a="b_c"` | *(absent)* | `a="4"` | `a="4"` |
+//!
+//! The resolved key is still the element UNSANITIZED — that is this
+//! module's output and it did not move. What changed is the comparison on
+//! the other side: [`super::pipeline::sanitized_key_eq`] now sanitizes the
+//! LINE key before matching it, so `b.c` on the line spells `b_c` and the
+//! literal `b.c` a quoted path resolves to matches nothing. Asserted end
+//! to end by [`a_quoted_paths_key_is_compared_against_the_sanitized_line_key`].
 //!
 //! # Excluded from this module and from its matrix, by name
 //!
@@ -485,17 +491,23 @@ mod tests {
         assert_eq!(parse_logfmt_expr(r#""b""#), Ok("b".to_string()));
     }
 
-    /// The #393 consequence, pinned END TO END so it is visible and
-    /// breakable rather than only described: the resolved key is the
-    /// element UNSANITIZED, and we then compare it against RAW line keys.
-    /// Over `b=1 a-b=2 x=3 b.c=4` the container answers `a=""` for
-    /// `| logfmt a="\"b.c\""` (measured 2026-08-07) because it compares
-    /// against a key sanitized to `[A-Za-z0-9_]`; we answer `a="4"`,
-    /// which this test asserts. Same mechanism, opposite direction, as
-    /// `| logfmt a="b_c"`: measured `a="4"` there and NOTHING here, and
-    /// that one diverges the same way with or without this change.
+    /// **Both assertions here FLIPPED at issue #393**, and both flipped
+    /// TOWARD the container — this test used to be
+    /// `the_resolved_key_of_a_quoted_path_is_the_unsanitized_element` and
+    /// pinned a divergence #247 recorded as open. It is a place to look
+    /// hard.
+    ///
+    /// The resolved key is still the element UNSANITIZED (the first two
+    /// assertions are unchanged); what moved is that the LINE key is now
+    /// sanitized before the comparison, mirroring the reference
+    /// (`sanitizeLabelKey`, `pkg/logql/log/util.go:22-38 @ v3.7.4`,
+    /// applied at `parser.go:575`). Over `b=1 a-b=2 x=3 b.c=4`, captured
+    /// on `grafana/loki:3.7.4` (revision `b318f282`) 2026-08-10:
+    ///
+    /// - `| logfmt a="\"b.c\""` → `a=""` (we used to answer `a="4"`);
+    /// - `| logfmt a="b_c"` → `a="4"` (we used to answer nothing at all).
     #[test]
-    fn the_resolved_key_of_a_quoted_path_is_the_unsanitized_element() {
+    fn a_quoted_paths_key_is_compared_against_the_sanitized_line_key() {
         assert_eq!(parse_logfmt_expr(r#""b.c""#), Ok("b.c".to_string()));
         assert_eq!(parse_logfmt_expr(r#""a-b""#), Ok("a-b".to_string()));
 
@@ -515,14 +527,18 @@ mod tests {
                 .find(|(k, _)| k == "a")
                 .map(|(_, v)| v.to_string())
         };
-        // We match the raw line key `b.c`; the reference matches none.
+        // The literal `b.c` matches no SANITIZED line key, so the miss
+        // shows up as the pre-seeded empty label.
         assert_eq!(
             extract(r#"{s="m"} | logfmt a="\"b.c\"""#),
+            Some(String::new())
+        );
+        // And the mirror: `b.c` on the line spells `b_c`, which is what
+        // the source key has to be.
+        assert_eq!(
+            extract(r#"{s="m"} | logfmt a="b_c""#),
             Some("4".to_string())
         );
-        // And the mirror: the reference matches `a-b` through its
-        // sanitizer, we match nothing at all.
-        assert_eq!(extract(r#"{s="m"} | logfmt a="b_c""#), None);
     }
 
     /// E7 is NOT implemented, and this test is the argument for why —

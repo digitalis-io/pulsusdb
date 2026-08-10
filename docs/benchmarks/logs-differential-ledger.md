@@ -4508,3 +4508,77 @@ Issue #392 stays open for two things the ruling kept on it:
 - `crates/pulsus-read/tests/sql_snapshots.rs` — a non-ASCII label name
   plans to byte-identical SQL, so no index, projection or pushdown
   changes (Tier 1 identity, no wall-time claim).
+
+### `logfmt-expression-duplicate-source-key-tiebreak` (issue #393 — the reference has no answer here, so there is nothing to match)
+
+- **What issue #393 CLOSED, so this row is not read as covering it.**
+  `| logfmt <id>="<expr>"` now evaluates the way
+  `LogfmtExpressionParser.Process`
+  (`pkg/logql/log/parser.go:531-624 @ v3.7.4`) does: every identifier is
+  pre-seeded to `""` before the line is read, one document-order pass
+  chooses each pair's destination by SANITIZED line key (source keys
+  first, then identifiers), the last write wins, a repeated identifier
+  keeps only its last source key, and a value containing `U+FFFD` is
+  emptied. Those are parity, gated by
+  `crates/pulsus-read/tests/logqltest/corpus/b24_logfmt_expr_eval.test`
+  and by the `#393` block in
+  `crates/pulsus-read/src/logql/pipeline.rs`'s test module. What remains
+  is the single case below, which is not a behaviour of the reference at
+  all.
+- **The case.** Two DIFFERENT extraction identifiers naming the SAME
+  source key — `| logfmt a="x", b="x"` — leaves the reference choosing
+  which identifier a matching line key renames to, and it chooses by
+  iterating a Go map: `for id, orig := range keys`
+  (`parser.go:594-599`), whose order the Go runtime deliberately
+  randomises per iteration. There is no rule to port.
+- **Measured, on `grafana/loki:3.7.4` digest
+  `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+  (buildinfo read from the running process: version 3.7.4, revision
+  b318f282, branch release-3.7.x), 2026-08-10.** One line `x=3 y=4`
+  pushed once, then each query issued 30 times against
+  `/loki/api/v1/query_range` in one process, the answers tallied with
+  `collections.Counter` after dropping the container's injected
+  `detected_level`:
+
+  ```
+  for query in ['{service_name="lfe5"} | logfmt a="x", b="x"',
+                '{service_name="lfe5"} | logfmt b="x", a="x"',
+                '{service_name="lfe5"} | logfmt a="x", b="y", c="x"']:
+      c = Counter(q(query) for _ in range(30))
+  ```
+
+  | query | outcome A | outcome B | split (A/B) |
+  |---|---|---|---|
+  | `a="x", b="x"` | `{a="3", b=""}` | `{a="", b="3"}` | 29 / 1 |
+  | `b="x", a="x"` | `{a="", b="3"}` | `{a="3", b=""}` | 21 / 9 |
+  | `a="x", b="y", c="x"` | `{a="3", b="4", c=""}` | `{a="", b="4", c="3"}` | 23 / 7 |
+
+  An independent earlier run of the first and third shapes, same method,
+  split 25/5 and 21/9; a run before that split 23/7 and 16/14. The splits
+  do not converge and are not the point — the point is that BOTH outcomes
+  occur for every shape.
+
+- **PulsusDB's rule: QUERY ORDER.** The first-declared identifier whose
+  source key matches wins;
+  `crates/pulsus-read/src/logql/pipeline.rs`'s `logfmt_target_for`
+  scans the compiled extraction list in the order the user wrote it.
+- **Why this is the "be correct where they are wrong" case rather than a
+  divergence we are choosing.** A query cannot be given a stable answer
+  by a reference that does not have one. Query order is the only order a
+  user can predict from the text they typed, and it makes the answer
+  reproducible across repeats, replicas and versions, which the reference's
+  is not. **Do not "fix" this determinism back toward the reference's coin
+  flip.** Note in particular that the reference does not merely differ from
+  query order on average — a single capture of `b="x", a="x"` in the same
+  session answered `{a="3", b=""}`, i.e. the SECOND-declared identifier
+  won, so any attempt to reproduce it by rule will disagree with the next
+  measurement.
+- **Blast radius.** Only a query that names one source key from two
+  identifiers. A repeated IDENTIFIER (`a="x", a="y"`) is not this case:
+  the reference resolves it deterministically at construction
+  (`paths[exp.Identifier] = path`, `parser.go:521` — last declaration
+  wins) and PulsusDB ports that exactly.
+- Gated by `b24_logfmt_expr_eval.test`'s `lfe5` rows, each carrying
+  `# provenance: divergence(logfmt-expression-duplicate-source-key-tiebreak)`,
+  and by `pipeline.rs`'s
+  `two_identifiers_sharing_a_source_key_are_broken_by_query_order`.

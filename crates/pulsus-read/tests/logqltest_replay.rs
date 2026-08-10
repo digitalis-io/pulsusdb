@@ -719,12 +719,23 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// `our-error-text`. [`PROVENANCE_PERMITS`] and [`REACHABLE`] therefore
 /// do not move at all: the whole section is excluded before
 /// reachability is even asked.
-const TOTAL_DIRECTIVES: usize = 1_429;
+///
+/// Issue #393 adds `b24_logfmt_expr_eval.test`, captured against the
+/// same pinned image with no config delta. Its captured rows are streams
+/// queries at a single instant over a relative-offset load set, plus a
+/// single instant metric row (the grouping consequence of an
+/// empty-valued extracted label), so the streams share moves every
+/// figure here together and the metric row enlarges the `metric query`
+/// reason instead. Its rows where several extraction identifiers share a
+/// source key carry
+/// `divergence(logfmt-expression-duplicate-source-key-tiebreak)` and so
+/// enlarge `pinned-divergence`.
+const TOTAL_DIRECTIVES: usize = 1_459;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_105;
+const PROVENANCE_PERMITS: usize = 1_132;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -738,11 +749,13 @@ const PROVENANCE_PERMITS: usize = 1_105;
 /// permit in the first place. `b23_json_raw_read.test` (issue #389) is
 /// the same shape throughout: every permitted row is a streams query at
 /// a single instant over a relative-offset load set, so its whole
-/// captured share lands here.
-const REACHABLE: usize = 178;
+/// captured share lands here. `b24_logfmt_expr_eval.test` (issue #393)
+/// is that shape too, apart from its instant metric row, which
+/// [`TOTAL_DIRECTIVES`] names.
+const REACHABLE: usize = 204;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=154, not a capture claim (derived)=29, \
-not a capture claim (ported)=29, our-error-text (eval_fail)=87, pinned-divergence=25";
+not a capture claim (ported)=29, our-error-text (eval_fail)=87, pinned-divergence=28";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice
@@ -750,7 +763,7 @@ not a capture claim (ported)=29, our-error-text (eval_fail)=87, pinned-divergenc
 /// the ENUMERATED gap rather than the coverage. Both are levers the
 /// module docs already name.
 const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \
-metric query (slice: streams only)=239, range/matrix eval (slice: instant only)=10";
+metric query (slice: streams only)=240, range/matrix eval (slice: instant only)=10";
 // corpus-counts: end (replay-coverage-constants)
 
 /// How far back the first slot sits. Bounded above by
@@ -792,9 +805,13 @@ const FIRST_SLOT_AGE: Duration = Duration::from_secs(150 * 60);
 /// widen the window's own headroom deliberately.
 ///
 /// It was 60s until issue #389 widened the slice past what
-/// [`FIRST_SLOT_AGE`] could hold at that width. 45s satisfies both
-/// bounds with a 35s gap after the widest case.
-const SLOT_SECS: u64 = 45;
+/// [`FIRST_SLOT_AGE`] could hold at that width, then 45s until issue
+/// #393 added `b24_logfmt_expr_eval.test` and pushed
+/// `SLOT_SECS * REACHABLE` past [`FIRST_SLOT_AGE`] again. 40s satisfies
+/// both bounds with a 30s gap after the widest case, and leaves the
+/// upper bound room for the slice to grow further before
+/// [`FIRST_SLOT_AGE`] — the dangerous lever — has to move.
+const SLOT_SECS: u64 = 40;
 
 // ---------------------------------------------------------------------
 // The live replay (issue #352 step 3).
