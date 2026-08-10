@@ -176,9 +176,20 @@ pub(super) fn parse_bounds_ordered(pairs: &[(String, String)]) -> Result<(i64, i
 /// is empty" spelling); `?match[]={app="b"}` + body `match[]={app="a"}`
 /// returns both series.
 ///
-/// The content-type gate is unchanged here: the reference accepts a POST
-/// with any (or no) `Content-Type` and we still answer `400`, which is a
-/// separate widening recorded on issue #406 and not part of this change.
+/// **`Content-Type` decides whether the BODY is read, never whether the
+/// request is SERVED** (issue #406). A POST carrying every parameter in
+/// its URL is answered under `application/json`, under `text/plain`, and
+/// under no `Content-Type` at all, exactly as the reference answers it —
+/// the body is simply invisible. Only a header that cannot be PARSED is a
+/// `400`, and that verdict is [`params::form_body_disposition`]'s, which
+/// carries the port of Go's `mime.ParseMediaType` and the measurements
+/// behind it. Before #406 we refused every non-form type outright, which
+/// refused working clients: `application/json` is what plenty of HTTP
+/// clients send by default.
+///
+/// A header value that is not valid UTF-8 cannot be a well-formed media
+/// type (Go's grammar admits ASCII token characters only), so it takes the
+/// malformed branch rather than being read as absent.
 ///
 /// `pub(super)` (issue #170): the detected_labels/detected_fields POST
 /// handlers (`detected.rs`) reuse the same form-decode core.
@@ -187,18 +198,32 @@ pub(super) async fn read_form_pairs(
     raw_query: Option<&str>,
     body: Bytes,
 ) -> Result<Vec<(String, String)>, ApiError> {
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !content_type.starts_with("application/x-www-form-urlencoded") {
-        return Err(ApiError::Param(ParamError::UnsupportedContentType(
-            content_type.to_string(),
-        )));
-    }
-    let text =
-        std::str::from_utf8(&body).map_err(|_| ApiError::Param(ParamError::InvalidFormBody))?;
-    let mut pairs = params::parse_pairs(text);
+    let raw_content_type = headers.get(header::CONTENT_TYPE);
+    // An ABSENT header reads as `""`, which is what Go's `Header.Get`
+    // returns for one; `parsePostForm` then substitutes
+    // `application/octet-stream`. A present-but-not-UTF-8 value is
+    // malformed, not absent.
+    let content_type = match raw_content_type {
+        Some(value) => value.to_str().ok(),
+        None => Some(""),
+    };
+    let mut pairs = match content_type {
+        Some(content_type) => match params::form_body_disposition(Some(content_type))? {
+            params::FormBody::Parse => {
+                let text = std::str::from_utf8(&body)
+                    .map_err(|_| ApiError::Param(ParamError::InvalidFormBody))?;
+                params::parse_pairs(text)
+            }
+            params::FormBody::Ignore => Vec::new(),
+        },
+        None => {
+            let lossy = String::from_utf8_lossy(
+                raw_content_type.map(|v| v.as_bytes()).unwrap_or_default(),
+            )
+            .into_owned();
+            return Err(ApiError::Param(ParamError::MalformedContentType(lossy)));
+        }
+    };
     pairs.extend(params::parse_pairs(raw_query.unwrap_or("")));
     Ok(pairs)
 }
