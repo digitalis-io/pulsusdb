@@ -3534,6 +3534,10 @@ async fn entries_sharing_a_timestamp_come_back_in_a_stable_order() {
 /// corpus shape: `application/json` ⇒ the URL's limit; absent ⇒ the URL's
 /// limit; `application/x-www-form-urlencoded` ⇒ the body's limit;
 /// `application/` ⇒ `400`.
+///
+/// **The last section is the ORDERING**, which no complete-body probe can
+/// see: the answer must arrive without waiting for a body the request does
+/// not need. See [`partial_body_status`].
 #[tokio::test]
 async fn a_json_content_type_post_is_served_from_the_url_query() {
     if !should_run() {
@@ -3609,7 +3613,86 @@ async fn a_json_content_type_post_is_served_from_the_url_query() {
         res.body
     );
 
+    // -- the answer must not wait for a body it will not read ----------
+    //
+    // Issue #406, review round 2. Every assertion above sends a COMPLETE
+    // body and so cannot see the ordering: `Bytes` buffers the whole
+    // upload before the handler runs. Here the request ADVERTISES 100,000
+    // bytes and sends seven, exactly as the reference was probed, and the
+    // claim is that a response arrives anyway.
+    //
+    // Measured on `grafana/loki:3.7.4` (`b318f282`) 2026-08-10 with this
+    // same probe: `200` in under 10 ms for `application/json`, `text/plain`
+    // and an absent header; `400` as promptly for `application/`. PulsusDB
+    // answered none of the four before the fix.
+    for (content_type, expected) in [
+        (None, 200_u16),
+        (Some("application/json"), 200),
+        (Some("text/plain"), 200),
+        (Some("application/"), 400),
+    ] {
+        let answered = partial_body_status(port, &path, content_type, 100_000, b"limit=9");
+        assert_eq!(
+            answered,
+            Some(expected),
+            "Content-Type {content_type:?}: the answer must arrive without the rest of the \
+             body (advertised 100000, sent 7)"
+        );
+    }
+    // CONTROL: a form POST genuinely needs its body, so it must NOT answer
+    // early. Without this row the four above would pass against a server
+    // that had simply stopped reading request bodies at all.
+    assert_eq!(
+        partial_body_status(
+            port,
+            &path,
+            Some("application/x-www-form-urlencoded"),
+            100_000,
+            b"limit=9"
+        ),
+        None,
+        "a form POST must still wait for the body it was promised"
+    );
+
     drop_database(db).await;
+}
+
+/// Sends a POST that advertises `advertised` body bytes and then writes
+/// only `sent`, and reports the response status if one arrives within a
+/// few seconds — `None` meaning the server is still waiting for the rest
+/// of the body.
+///
+/// Raw socket rather than [`http_request`] because the whole point is a
+/// request that is never completed, which no buffering client can express.
+fn partial_body_status(
+    port: u16,
+    path: &str,
+    content_type: Option<&str>,
+    advertised: usize,
+    sent: &[u8],
+) -> Option<u16> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut head =
+        format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {advertised}\r\n");
+    if let Some(value) = content_type {
+        head.push_str(&format!("Content-Type: {value}\r\n"));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).ok()?;
+    stream.write_all(sent).ok()?;
+    stream.flush().ok();
+
+    let mut buf = [0u8; 1024];
+    let read = stream.read(&mut buf).ok()?;
+    if read == 0 {
+        return None;
+    }
+    String::from_utf8_lossy(&buf[..read])
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn read_rss_kb(pid: u32) -> Option<u64> {

@@ -1020,11 +1020,21 @@ mod tests {
         content_type: Option<&str>,
         form: String,
     ) -> Request<Body> {
+        post_with_content_type_body(uri, content_type, Body::from(form))
+    }
+
+    /// [`post_with_content_type`] over an arbitrary [`Body`] — for the
+    /// never-ending stream that pins the header-before-body ordering.
+    fn post_with_content_type_body(
+        uri: &str,
+        content_type: Option<&str>,
+        body: Body,
+    ) -> Request<Body> {
         let mut builder = Request::builder().method("POST").uri(uri);
         if let Some(value) = content_type {
             builder = builder.header("content-type", value);
         }
-        builder.body(Body::from(form)).expect("build request")
+        builder.body(body).expect("build request")
     }
 
     /// A body that is a `400` **if it is read at all** — so "the body was
@@ -1129,6 +1139,88 @@ mod tests {
                 "POST {path} must refuse for the HEADER, not for the poisoned body: {text}"
             );
         }
+    }
+
+    /// **The answer must arrive without waiting for the body** (issue
+    /// #406, review round 2). Every row above sends a COMPLETE body, so
+    /// none of them can see the defect this pins: the handlers used to
+    /// extract `Bytes`, which buffers the whole upload before the handler
+    /// runs, so a request answerable from its URL alone still paid for a
+    /// body it then discarded.
+    ///
+    /// The body here **never ends**. It is a stream that yields nothing
+    /// and never signals completion, so anything that awaits it hangs
+    /// forever; the test therefore states its claim as a `timeout` around
+    /// the handler, and a hang is a failure rather than a wedged suite.
+    ///
+    /// Measured against `grafana/loki:3.7.4` (`b318f282`) 2026-08-10 with
+    /// `Content-Length: 100000` and seven bytes actually sent: `200` in
+    /// under 10 ms under `application/json`, under `text/plain` and under
+    /// no `Content-Type`, and `400` just as promptly for `application/`.
+    /// PulsusDB answered none of those four before this change — it sat
+    /// waiting for the rest of the upload on every one.
+    ///
+    /// **The control is the last row**, and it is what stops this test
+    /// passing vacuously: under the form type the body IS the request, so
+    /// the same never-ending stream must NOT produce an answer. A "fix"
+    /// that simply stopped reading bodies would satisfy every other row
+    /// and fail that one.
+    #[tokio::test]
+    async fn a_post_answers_from_the_url_without_waiting_for_the_body() {
+        use std::time::Duration;
+
+        // A body that never yields and never ends.
+        fn endless_body() -> Body {
+            Body::from_stream(futures::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >())
+        }
+
+        let target = uri("/api/logs/v1/query_range", SELECTOR_QUERY);
+
+        // Answerable from the URL: the body is never polled, so the
+        // response goes out while the client is still sending.
+        for content_type in [None, Some("application/json"), Some("text/plain")] {
+            let request = post_with_content_type_body(&target, content_type, endless_body());
+            let answered =
+                tokio::time::timeout(Duration::from_secs(5), routed(router(), request)).await;
+            let (status, _body) = answered.unwrap_or_else(|_| {
+                panic!(
+                    "POST with Content-Type {content_type:?} must answer WITHOUT waiting for \
+                     the body; it is decided by the URL alone"
+                )
+            });
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Content-Type {content_type:?} must reach the engine (poolless: 503)"
+            );
+        }
+
+        // A malformed Content-Type is refused from the header alone, so it
+        // must not wait either.
+        let request = post_with_content_type_body(&target, Some("application/"), endless_body());
+        let answered =
+            tokio::time::timeout(Duration::from_secs(5), routed(router(), request)).await;
+        let (status, _body) = answered
+            .unwrap_or_else(|_| panic!("a malformed Content-Type must refuse without the body"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // CONTROL: under the form type the body IS the request, so the
+        // same endless stream must NOT be answered. Without this row, a
+        // handler that never read any body would pass everything above.
+        let request = post_with_content_type_body(
+            &target,
+            Some("application/x-www-form-urlencoded"),
+            endless_body(),
+        );
+        let answered =
+            tokio::time::timeout(Duration::from_secs(2), routed(router(), request)).await;
+        assert!(
+            answered.is_err(),
+            "a form POST must still WAIT for its body — otherwise this test would pass \
+             against a handler that simply never reads one"
+        );
     }
 
     /// **The `end < start` table, both positives and negatives.** The
