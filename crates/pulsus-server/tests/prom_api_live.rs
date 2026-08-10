@@ -421,7 +421,7 @@ async fn prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution() {
         "expected the fan-out-cap breach message, not the nameless-unresolvable one; body: {body}"
     );
 
-    drop_db(&db).await;
+    drop_db(db).await;
 }
 
 /// Issue #89 (retroactive re-review, plan v2 AC5b): a regex-`__name__`
@@ -546,7 +546,7 @@ async fn prom_api_name_regex_discovery_over_the_cache_scan_budget_is_422_executi
         );
     }
 
-    drop_db(&db).await;
+    drop_db(db).await;
 }
 
 // ---------------------------------------------------------------------
@@ -750,5 +750,5 @@ async fn promql_memory_breach_is_422_and_actually_dispatched() {
         "every dispatched metrics read must carry max_memory_usage"
     );
 
-    drop_db(&db).await;
+    drop_db(db).await;
 }
