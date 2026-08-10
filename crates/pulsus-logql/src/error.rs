@@ -84,6 +84,35 @@ pub enum LogQlError {
     #[error("unterminated string starting at byte {}", .span.start)]
     UnterminatedString { span: Span },
 
+    /// An escape sequence the reference's string grammar does not define
+    /// (`\d`, `\w`, `\q`, `\'`), or a malformed one it does (`\x8"`,
+    /// `\400`, `\U00110000`) — issue #400. `escape` is the offending
+    /// SOURCE text, from the backslash to wherever the scan stopped, so
+    /// the message names what the user has to change.
+    ///
+    /// The reference raises this at its LEXER
+    /// (`vendor/github.com/prometheus/prometheus/util/strutil/quote.go:66-231
+    /// @ v3.7.4`, called from `pkg/logql/syntax/lex.go:198`), before any
+    /// regex parser, so it applies to every construct carrying a string.
+    /// **Only the `400` status is claimed against it, not the message
+    /// text** — owner ruling on #246 (2026-07-26, 2026-08-08).
+    #[error("invalid char escape {escape:?} at byte {}", .span.start)]
+    InvalidCharEscape { escape: String, span: Span },
+
+    /// A string literal whose decoded BYTES are not valid UTF-8 — the
+    /// only way to reach it is a `\xHH`/`\NNN` escape above `0x7F` that
+    /// no neighbouring escape completes (`"\xff"`), since Go's byte
+    /// escapes are bytes and `"\xc3\xa9"` composes to `é`.
+    ///
+    /// **A deliberate narrowing** (issue #400, owner ruling 2026-08-10),
+    /// ledgered as `logql-string-escape-non-utf8`: the reference serves
+    /// such a pattern at its five `NewFastRegexMatcher` positions. It is
+    /// unreachable as a MATCH here regardless, because no mounted ingest
+    /// route can store invalid UTF-8 (`LogRow.body: String`,
+    /// `pulsus-write/src/protocols/otlp_logs.rs:37-55`).
+    #[error("string literal at byte {} decodes to bytes that are not valid UTF-8", .span.start)]
+    NonUtf8StringLiteral { span: Span },
+
     /// `{}` with zero label matchers. Match-everything selectors that
     /// *do* have a matcher (e.g. `{app=~".*"}`) are syntactically valid
     /// here — rejecting those is a planner/cost concern, deferred to #11
@@ -167,6 +196,8 @@ impl LogQlError {
             | LogQlError::NotYetSupported { span, .. }
             | LogQlError::InvalidDuration { span, .. }
             | LogQlError::UnterminatedString { span }
+            | LogQlError::InvalidCharEscape { span, .. }
+            | LogQlError::NonUtf8StringLiteral { span }
             | LogQlError::EmptySelector { span }
             | LogQlError::RecursionLimitExceeded { span, .. }
             | LogQlError::TrailingInput { span }
