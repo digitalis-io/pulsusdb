@@ -736,12 +736,12 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// exclusion; its `eval` rows are streams queries at a single instant
 /// over a relative-offset load set, so they move [`PROVENANCE_PERMITS`]
 /// and [`REACHABLE`] together.
-const TOTAL_DIRECTIVES: usize = 1_479;
+const TOTAL_DIRECTIVES: usize = 1_486;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_142;
+const PROVENANCE_PERMITS: usize = 1_149;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -763,7 +763,7 @@ const PROVENANCE_PERMITS: usize = 1_142;
 /// that shape too: every `eval` row is a streams query at a single
 /// instant over a relative-offset load set, so its whole permitted share
 /// lands here and its `eval_fail` rows never enter the question.
-const REACHABLE: usize = 214;
+const REACHABLE: usize = 221;
 
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=154, not a capture claim (derived)=29, \
 not a capture claim (ported)=29, our-error-text (eval_fail)=97, pinned-divergence=28";
@@ -799,9 +799,19 @@ const FIRST_SLOT_AGE: Duration = Duration::from_secs(150 * 60);
 ///   grows.
 /// * **Below, by the widest case.** A slot must hold its case's own
 ///   sample span with room to spare, or two neighbouring cases' entries
-///   interleave in one stream and the reference merges them. The widest
-///   committed case spans 10s, so the value must stay comfortably above
-///   that — the gap, not the slot, is what does the separating.
+///   interleave in one stream and the reference merges them — the gap,
+///   not the slot, is what does the separating.
+///
+///   **The widest REACHABLE case spans 20s, and that consumes this
+///   margin exactly**: the assertion is `2 * widest <= SLOT_SECS`, and
+///   `2 * 20 == 40`. So the lower lever is spent — a reachable case one
+///   sample-offset wider reddens
+///   [`slots_fit_inside_the_measured_ingestion_window`], and the next
+///   corpus addition has to narrow a case rather than shorten the slot.
+///   This sentence used to say the widest case spanned 10s; issue #400's
+///   `b24_string_escapes.test` sections are the 20s ones, and the figure
+///   is printed by that assertion's own message when it fires rather
+///   than being re-derived by hand.
 ///
 /// So the admissible range today is roughly `[10s + headroom,
 /// FIRST_SLOT_AGE / REACHABLE]`, and `FIRST_SLOT_AGE` is itself capped

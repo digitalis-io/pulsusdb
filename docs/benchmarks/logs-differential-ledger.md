@@ -3418,6 +3418,20 @@ often than they agree about it.
   examined once before, on
   `docs/decisions/0002-promql-parser-selection.md:110`.
 
+- **Class R has a SECOND root cause, and it is not the lexer** (issue #400, measured 2026-08-10 on the pinned container against this tree's `regex` crate). The escape fix above closes the lexer half completely. It does not touch the character-class **set algebra** of docs/api.md §9.2: `[a&&b]`, `[a~~b]` and `[a[b]]` are accepted by BOTH engines and read differently by each, so both stores answer `200` and return different lines. Measured at a `| decolorize |~` line filter (pushdown cleared, evaluated in process) over one stream carrying `a`, `b`, `&`, `~`, `-`, `[` and none of them:
+
+  | pattern | reference | PulsusDB, in process |
+  |---|---|---|
+  | `[a&&b]` | the `a`, `b` and `&` lines | nothing |
+  | `[a~~b]` | those plus the `~` line | those minus the `~` line |
+  | `[a[b]]` | nothing | five lines |
+
+  `[a--b]` is NOT in this group — the reference answers `400 error parsing regexp: invalid character class range` there, so it is an accept-surface class, not a wrong-rows one.
+
+  **The domain is narrower than the escape half's**: ClickHouse's RE2 evaluates every pushed-down predicate and agrees with the reference, so this is confined to §9.1's **as written** positions plus `label_replace`. **Recorded here because a fix that closes only the lexer looks complete.**
+
+- **Backtick raw strings agree, and this was checked rather than assumed.** Go's own `strconv.Unquote` STRIPS carriage returns from a raw string literal; the fork Loki calls does not (`quote.go:76-81` has no carriage-return branch), and neither does `scan_backtick`. Discriminated at the wire over a line carrying a raw CR: the filter whose backtick pattern contains a raw CR returns that line on the reference — so the CR survived into the pattern — while the control whose pattern has the CR removed returns nothing. This tree's parser yields the same bytes for the backtick and the double-quoted spelling alike (`63 72 0D 61 66 74 65 72`). A raw CR inside a double-quoted literal is likewise kept by both: `Unquote` refuses a raw newline (`quote.go:85-87`) and says nothing about a carriage return.
+
 - **Status parity, in contrast, holds everywhere.** Every rejection above
   is `400` on both sides — ours through `PipelineError::BadRegex` →
   `ReadError::PipelineInvalid` → `StatusCode::BAD_REQUEST`, and, for the

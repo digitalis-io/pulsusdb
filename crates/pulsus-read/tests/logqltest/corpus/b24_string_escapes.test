@@ -180,3 +180,53 @@ eval_fail instant at 60s {service_name="escc"} | decolorize |~ "\x41\xff"
   msg: not valid UTF-8
 
 clear
+
+load
+  {app="ctl", service_name="ctl"}
+  0s   x07--end
+  5s   x08--end
+  10s  x0c--end
+  15s  x0b--end
+  20s  letters-abfv-end
+
+# The short escapes `\a \b \f \v` — `quote.go:150-164`, decoding to
+# 0x07 0x08 0x0C 0x0B. Before Stage 1 the lexer kept the LETTER, so each
+# of these four filters was the pattern `a`, `b`, `f` or `v` and returned
+# the `letters-abfv-end` line. That is what the control line is for: the
+# old reading produced a different NON-EMPTY answer, so each row below is
+# a change of answer rather than a fall to nothing.
+#
+# The four decoded bytes sit INTERIOR to their bodies deliberately: the
+# DSL reads `<offset> <body>` off a `trim`ed line, and 0x0B and 0x0C are
+# whitespace to Rust, so a leading or trailing one would be eaten.
+#
+# `\n`, `\r`, `\t`, `\\` and `\"` are absent because Stage 1 does not
+# change them — the old arm decoded the first three and passed the last
+# two through as themselves.
+eval instant at 60s {service_name="ctl"} | decolorize |~ "\a"
+  {app="ctl", service_name="ctl"} 0s x07--end
+
+eval instant at 60s {service_name="ctl"} | decolorize |~ "\b"
+  {app="ctl", service_name="ctl"} 5s x08--end
+
+eval instant at 60s {service_name="ctl"} | decolorize |~ "\f"
+  {app="ctl", service_name="ctl"} 10s x0c--end
+
+eval instant at 60s {service_name="ctl"} | decolorize |~ "\v"
+  {app="ctl", service_name="ctl"} 15s x0b--end
+
+# The control: the LETTERS the old lexer produced still select the line
+# that carries them, so the four rows above moved rather than stopped
+# matching.
+eval instant at 60s {service_name="ctl"} | decolorize |~ "abfv"
+  {app="ctl", service_name="ctl"} 20s letters-abfv-end
+
+# The same bytes spelled as hex and octal escapes reach the same lines —
+# one grammar, not a short-escape special case.
+eval instant at 60s {service_name="ctl"} | decolorize |~ "\x07"
+  {app="ctl", service_name="ctl"} 0s x07--end
+
+eval instant at 60s {service_name="ctl"} | decolorize |~ "\013"
+  {app="ctl", service_name="ctl"} 15s x0b--end
+
+clear

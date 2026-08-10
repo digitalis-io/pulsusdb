@@ -1042,6 +1042,18 @@ Separately from evaluation, **every LogQL regex except `label_replace`'s is also
 
 (`[]a]` is *not* on this list: both engines read a leading `]` as a literal, measured on both.)
 
+**A SECOND wrong-rows cause, measured 2026-08-10 and NOT closed by the escape fix (issue #400).** The rows of the table above marked "set *intersection*", "symmetric difference" and "a nested class" are not merely different readings — at the **as written** positions they are the same severity as the string-escape defect §9.4 records: **both stores answer `200` and return different lines, with no error on either side.** Measured at a line filter after a `| decolorize` (which clears the pushdown, so the pattern is evaluated in process) over one stream of seven lines, each carrying one of `a`, `b`, `&`, `~`, `-`, `[`, or none of them:
+
+| pattern | the reference returns | PulsusDB in process returns |
+|---|---|---|
+| `[a&&b]` | the lines containing `a`, `b` or `&` | **nothing** — the crate intersects `[a]` with `[b]` |
+| `[a~~b]` | those, plus the line containing `~` | the same minus the `~` line — the crate takes a symmetric difference |
+| `[a[b]]` | **nothing** (the class is `a`, `[`, `b`, then a literal `]`, and no line carries one) | five lines — the crate reads a nested class, leaving no literal `]` to match |
+
+`[a--b]` is not in this group: the reference answers `400` there, so it is an accept-surface class rather than a wrong-rows one.
+
+The domain is narrower than the escape defect's was — at every position the planner pushes down, ClickHouse's own RE2 evaluates the pattern and agrees with the reference, so this is confined to §9.1's **as written** rows plus `label_replace`. It is still a query that silently reads different lines. Owned by issue #400 and **not** fixed by its Stage 1, which is the string-literal lexer and cannot see a construct inside the regex.
+
 **Where this table bites.** It applies to exactly the constructs §9.1 marks **as written** — every one of them a LogQL pipeline stage — and to nothing else. Two consequences:
 
 - **Known divergence, open and unfixed (issue #336).** The five **as written** rows of §9.1 do not apply the rewrite, so every row of the table above is live in them. The LogQL line filter appears in §9.1 twice, once on each side, and that is the whole of the problem: the same filter compiles in ClickHouse before a `line_format` and in process after one — so **the same pattern can mean two things in the same query language depending on whether the planner pushed it down**, and moving a filter across a `line_format`, or adding an `ip(…)` alternative to it, can silently change what it matches. Measured against Loki 3.7.4, which answers the opposite in each case (double-quoted LogQL strings take Go escapes, hence `"\\d"` for the regex `\d`): `{app="x"} | logfmt | a=~"\\d"` matches the line `a=٥`; `{app="x"} | logfmt | a=~"\\w"` matches `ｗ`; ``{app="x"} | logfmt | a=~`[a&&b]` `` does not match `&`; ``{app="x"} | logfmt | a=~`a{bbb}c` `` is rejected outright. Across the 4,315-pattern differential corpus, 120 of the 1,152 patterns both engines compile read differently at these sites.
