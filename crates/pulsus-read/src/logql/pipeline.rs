@@ -1644,6 +1644,7 @@ impl CompiledPipeline {
                                             labels,
                                             &mut st,
                                             Cow::Borrowed(name),
+                                            KeyOrigin::Line,
                                             Cow::Borrowed(m.as_str()),
                                             OnAlreadyExtracted::Skip,
                                             &mut errs.dirty,
@@ -1660,6 +1661,7 @@ impl CompiledPipeline {
                                             labels,
                                             &mut st,
                                             Cow::Borrowed(name),
+                                            KeyOrigin::Line,
                                             Cow::Owned(m.as_str().to_string()),
                                             OnAlreadyExtracted::Skip,
                                             &mut errs.dirty,
@@ -1684,6 +1686,7 @@ impl CompiledPipeline {
                                         labels,
                                         &mut st,
                                         Cow::Borrowed(name),
+                                        KeyOrigin::Line,
                                         Cow::Borrowed(value),
                                         OnAlreadyExtracted::Skip,
                                         &mut errs.dirty,
@@ -1698,6 +1701,7 @@ impl CompiledPipeline {
                                         labels,
                                         &mut st,
                                         Cow::Borrowed(name),
+                                        KeyOrigin::Line,
                                         Cow::Owned(value.to_string()),
                                         OnAlreadyExtracted::Skip,
                                         &mut errs.dirty,
@@ -3496,15 +3500,18 @@ impl<'a> ExtractionState<'a, '_> {
 /// SKIPPED extraction never reaches `Set` and therefore does not dirty,
 /// and a parser that writes nothing (e.g. a failed `json` parse) never
 /// reaches here at all.
+///
+/// `origin` decides whether the name is sanitized — see [`KeyOrigin`].
 fn add_extracted<'a>(
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     st: &mut ExtractionState<'a, '_>,
     key: Cow<'a, str>,
+    origin: KeyOrigin,
     value: Cow<'a, str>,
     mode: OnAlreadyExtracted,
     dirty: &mut bool,
 ) {
-    let sanitized: Cow<'a, str> = if key_needs_sanitizing(&key) {
+    let sanitized: Cow<'a, str> = if origin == KeyOrigin::Line && key_needs_sanitizing(&key) {
         Cow::Owned(sanitize_label_key(&key))
     } else {
         key
@@ -3526,6 +3533,38 @@ fn add_extracted<'a>(
     *dirty = true;
     let resolved = st.note_parsed_set(resolved);
     put_label_at(labels, at, resolved, value);
+}
+
+/// Where an extracted label's NAME came from, which is what decides
+/// whether it is sanitized (issue #392).
+///
+/// **The reference sanitizes only the first.** A key read out of the LINE
+/// goes through `sanitizeLabelKey`; the IDENTIFIER a user writes in the
+/// query as an extraction destination does not — `NewLogfmtExpressionParser`
+/// merely VALIDATES it (`model.UTF8Validation.IsValidLabelName(exp.Identifier)`,
+/// `pkg/logql/log/parser.go:518 @ v3.7.4`) and then uses it verbatim as
+/// the map key it later `Set`s.
+///
+/// Measured on the pinned v3.7.4 container over the line `ax=7 bx=8`:
+/// `sum by (éx) (count_over_time({…} | logfmt éx="ax" [1m]))` returns
+/// `{"metric":{"éx":""}}` — the label is named `éx` — while
+/// `sum by (_x) (…)` over the SAME query returns `{"metric":{}}`, so the
+/// sanitized spelling does not exist there.
+///
+/// **This is a no-op for every query that parsed before #392.** A
+/// query-side destination was `[A-Za-z_][A-Za-z0-9_]*` by construction
+/// until #392 widened the lexer, and `key_needs_sanitizing` is false for
+/// every such name — pinned by
+/// `sanitizing_a_query_destination_was_always_a_no_op_for_ascii_identifiers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyOrigin {
+    /// A key decoded from the LOG LINE — logfmt/json/regexp/pattern keys.
+    /// Sanitized, mirroring the reference's own line-key sanitizer.
+    Line,
+    /// An IDENTIFIER the user wrote in the QUERY as an extraction
+    /// destination (`| logfmt <id>="…"`, `| json <id>="…"`). Used
+    /// verbatim.
+    QueryIdentifier,
 }
 
 fn key_needs_sanitizing(key: &str) -> bool {
@@ -4631,6 +4670,7 @@ impl<'a> TargetWalk<'a, '_> {
             labels,
             st,
             Cow::Borrowed(self.extractions[i].0.as_str()),
+            KeyOrigin::QueryIdentifier,
             Cow::Owned(value),
             OnAlreadyExtracted::Overwrite,
             dirty,
@@ -5819,6 +5859,7 @@ fn run_logfmt<'a, 't>(
                 labels,
                 st,
                 to_cow(Cow::Borrowed(k)),
+                KeyOrigin::Line,
                 to_cow(v),
                 OnAlreadyExtracted::Skip,
                 &mut errs.dirty,
@@ -5848,6 +5889,7 @@ fn run_logfmt<'a, 't>(
                 labels,
                 st,
                 Cow::Borrowed(label.as_str()),
+                KeyOrigin::QueryIdentifier,
                 value,
                 OnAlreadyExtracted::Overwrite,
                 &mut errs.dirty,
@@ -6148,6 +6190,89 @@ mod tests {
                 .map(|(_, v)| v.to_string()),
             Some("1".to_string())
         );
+    }
+
+    /// **Issue #392.** A non-ASCII extraction destination keeps its
+    /// bytes. The destination is an IDENTIFIER written in the QUERY, not
+    /// a key read out of the line, and the reference does not sanitize
+    /// it — `NewLogfmtExpressionParser` only validates it
+    /// (`model.UTF8Validation.IsValidLabelName(exp.Identifier)`,
+    /// `pkg/logql/log/parser.go:518 @ v3.7.4`).
+    ///
+    /// Measured on the pinned v3.7.4 container over `ax=7 bx=8`:
+    /// `sum by (éx) (count_over_time({…} | logfmt éx="ax" [1m]))` yields
+    /// `{"metric":{"éx":""}}`, and `sum by (_x) (…)` over the same query
+    /// yields `{"metric":{}}` — so `_x` is NOT the name there.
+    ///
+    /// Fails on `ff0fb09` twice over: the query does not parse, and the
+    /// destination was routed through `sanitize_label_key` (which
+    /// rendered `éx` as `_x`) — the second half is what [`KeyOrigin`]
+    /// fixes, and reverting the `KeyOrigin::QueryIdentifier` argument to
+    /// `KeyOrigin::Line` reddens this with `got ["_x"]` (run while this
+    /// landed).
+    #[test]
+    fn a_non_ascii_extracted_label_keeps_its_bytes() {
+        for (query, line) in [
+            (r#"{s="m"} | logfmt éx="ax""#, "ax=7 bx=8"),
+            (r#"{s="m"} | json éx="ax""#, r#"{"ax":"7","bx":"8"}"#),
+        ] {
+            let compiled = CompiledPipeline::compile(&stages_of(query))
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let mut out = Vec::new();
+            compiled.run_into(line, &[], 0, &mut out).expect("budget");
+            let names: Vec<String> = out.iter().map(|(k, _)| k.to_string()).collect();
+            assert!(
+                names.iter().any(|k| k == "éx"),
+                "{query}: expected a label named `éx`, got {names:?}"
+            );
+            assert!(
+                !names.iter().any(|k| k == "_x"),
+                "{query}: the destination was sanitized to `_x`; the reference keeps the \
+                 identifier verbatim (parser.go:518)"
+            );
+            assert_eq!(
+                out.iter()
+                    .find(|(k, _)| k == "éx")
+                    .map(|(_, v)| v.to_string()),
+                Some("7".to_string()),
+                "{query}: the value must still come from the source key"
+            );
+        }
+    }
+
+    /// **The containment property for [`KeyOrigin`]** (issue #392): the
+    /// carve-out cannot change any query that parsed before #392,
+    /// because a query-side destination was `[A-Za-z_][A-Za-z0-9_]*` by
+    /// construction until the lexer widened, and `key_needs_sanitizing`
+    /// is false for every such name. Proved over the whole ASCII
+    /// identifier alphabet rather than argued, so "the exemption is where
+    /// the bug lives" has a failure mode here.
+    #[test]
+    fn sanitizing_a_query_destination_was_always_a_no_op_for_ascii_identifiers() {
+        let lead: Vec<char> = ('a'..='z').chain('A'..='Z').chain(['_']).collect();
+        let rest: Vec<char> = ('a'..='z')
+            .chain('A'..='Z')
+            .chain('0'..='9')
+            .chain(['_'])
+            .collect();
+        for &l in &lead {
+            assert!(
+                !key_needs_sanitizing(&l.to_string()),
+                "{l:?} is a legal pre-#392 identifier and must not need sanitizing"
+            );
+            for &r in &rest {
+                let name = format!("{l}{r}");
+                assert!(
+                    !key_needs_sanitizing(&name),
+                    "{name:?} is a legal pre-#392 identifier and must not need sanitizing"
+                );
+            }
+        }
+        // And the LINE origin is untouched: a line key still sanitizes.
+        assert!(key_needs_sanitizing("é"));
+        assert!(key_needs_sanitizing("a-b"));
+        assert!(key_needs_sanitizing("3a"));
+        assert_eq!(sanitize_label_key("é"), "_");
     }
 
     /// Issue #240 AC6: the `bad_regex` seam reports the USER's pattern —

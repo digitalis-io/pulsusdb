@@ -87,20 +87,45 @@ fn expect_eof(cursor: &Cursor<'_>) -> Result<(), LogQlError> {
 /// payload would silently change which series a query selects — strictly
 /// worse than the rejection this fixes.
 ///
-/// ASCII-only, matching the reference: a keyword is ASCII by
-/// construction, and `str::to_ascii_lowercase` cannot fold a non-ASCII
-/// identifier into one (no Kelvin-sign / dotless-i surprises).
+/// **Not ASCII-only** (issue #392). This paragraph used to argue that
+/// `str::to_ascii_lowercase` was safe here because a non-ASCII
+/// identifier could not lex — true only while the lexer was
+/// `[A-Za-z_][A-Za-z0-9_]*`, and falsified the moment #392 gave it the
+/// reference's Unicode rune set. The reference folds with Go
+/// `strings.ToLower` at lex time (`pkg/logql/syntax/lex.go:226` @
+/// v3.7.4), so the Kelvin-sign and dotless-i cases that comment
+/// dismissed are real and measured: `| <U+212A>EEP ax` is a 200 there,
+/// `| drop <U+212A>EEP` is `400 unexpected keep`, and
+/// `sum by (İGNORING)` is `400 unexpected ignoring`.
+/// [`crate::unicode_ident::fold_keyword_char`] carries the fold, with a
+/// whole-code-space enumeration proving U+0130 and U+212A are the only
+/// non-ASCII identifier runes that can reach an ASCII keyword.
 fn kw(name: &str) -> String {
-    name.to_ascii_lowercase()
+    name.chars()
+        .map(crate::unicode_ident::fold_keyword_char)
+        .collect()
 }
 
 /// `name` is the keyword `want`, compared the way the reference's lexer
 /// compares it. `want` must already be lowercase — asserted by
 /// [`tests::every_keyword_literal_in_this_file_is_lowercase`], since a
 /// mixed-case `want` could never match a folded name.
+///
+/// Char-by-char rather than `kw(name) == want`, so the hot path — every
+/// keyword probe in the parser — stays allocation-free (issue #392; it
+/// was `eq_ignore_ascii_case` before, which is no longer the reference's
+/// fold).
 fn is_kw(name: &str, want: &str) -> bool {
     debug_assert_eq!(want, want.to_ascii_lowercase(), "keyword must be lowercase");
-    name.eq_ignore_ascii_case(want)
+    let mut n = name.chars();
+    let mut w = want.chars();
+    loop {
+        match (n.next(), w.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) if crate::unicode_ident::fold_keyword_char(a) == b => {}
+            _ => return false,
+        }
+    }
 }
 
 /// A read-only cursor over the token stream. Tokens always end with

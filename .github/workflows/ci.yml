@@ -656,6 +656,30 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-logql --test logql_differential
 
+      # Issue #392: the identifier rune set — general category `L`, plus
+      # `Nd` in non-leading position, which is Go `text/scanner`'s default
+      # `isIdentRune` and therefore the reference's rule
+      # (`pkg/logql/syntax/query_scanner.go:338-343 @ v3.7.4`, never
+      # overridden). Replays the 29-row rune boundary and the 18 grammar
+      # positions against this container and compares them with the
+      # verdicts committed in the test. Status only, no pushes.
+      #
+      # IT MUST RUN BEFORE THE LEGS THAT PUSH. The container is shared,
+      # and `logql_regex_accept_matrix.rs` pushes `{"app":"x",…}` into it;
+      # any leg probing `{app=…} | logfmt <non-ascii>="…"` over a MATCHING
+      # stream gets a 500 (the reference cannot render a non-ASCII label
+      # name), which reads as a finding but is only step order. The test
+      # defends itself with its own selector plus an up-front assertion
+      # that the selector matches nothing, so a future push to it fails
+      # loudly rather than silently. The hermetic half (the parser's own
+      # verdict over the same tables, the committed Unicode tables, and
+      # the Unicode 16.0-vs-15.0 skew tripwire) runs in the `ci` job with
+      # the gate off.
+      - name: LogQL differential leg (identifier charset, issue #392)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-logql --test identifier_charset
+
       # Issue #248: the nested-`ip()` accept/reject matrix — every
       # position an `ip()` label filter can occupy x both operators x
       # well-formed and malformed patterns, put to this container and

@@ -1054,3 +1054,60 @@ Stated gaps:
 - Two of those fourteen were briefly recorded as *unreachable*, and the mistake is worth naming because its shape recurs. `ErrInvalidUTF8` was excused on a probe that put a **raw** `%FF` byte in the `query=` parameter, which the LogQL scanner refuses first (`pkg/logql/syntax/query_scanner.go:264 @ v3.7.4`) — but the string **escape** `"\xff"` reaches the regex parser normally, and `{app="x"} |~ "\xff"` is a `400 … invalid UTF-8` (only the `NewFastRegexMatcher` sites — the selector, label filters, `drop`/`keep` — serve it, because they short-circuit a plain literal before parsing it). `ErrLarge` was excused on a probe of a *nested* repeat, which the repeat-product cap pre-empts (`repeatIsValid(re, 1000)`, `parse.go:434-437`) — but 4,000 copies of `a{999}`, 24,000 characters, reaches `maxSize`, which is `128<<20 / instSize` with `instSize = 40` = **3,355,443** instructions (the 33,554,432 quoted at the time is `maxRunes`, a different limit). **An unreachability claim is a claim about every route into a rule, so the probe's domain has to be the claim's domain.**
 - ClickHouse's `match()` short-circuits some patterns to a plain substring search before compiling them, so a handful of syntactically invalid patterns (`x)(y`, `a\`) are neither rejected nor matched as regexes there. PulsusDB rejects both in process, matching the reference, so no query is known to reach that behaviour; it is recorded because it means ClickHouse is not, by itself, a complete acceptance oracle.
 - Whether the reference's *error text* matches PulsusDB's is out of scope here: only accept-versus-reject is claimed. That is now an **owner ruling** rather than a convenience (issue #246, 2026-07-26 and 2026-08-08): the prose is not reproduced, no translation table exists, and two measurements license it — nothing branches on the text (the reference's own four non-vendor occurrences of `error parsing regexp` are all in its `_test.go` files), and byte parity is structurally unreachable without porting Go's parser, which was refused on #331, because Go quotes the offending **sub-token** rather than the pattern and `label_replace` quotes the anchored form where every other site quotes the bare one. What IS claimed and pinned is the **status**: `400` on both sides at every one of the 792 points that fixture probes. Ledgered as `logql-error-envelope` (the wording) and `logql-regex-accept-surface-divergence` (the decisions), docs/benchmarks/logs-differential-ledger.md.
+
+## 10. Identifiers in a LogQL query
+
+An **identifier** is the bare word a LogQL query uses for a label name: `{éx="m"}`, `| logfmt éx="b"`, `| json éx="b"`, `| label_format éx=ax`, `| drop éx`, `| unwrap éx`, `| éx > 1s`, `sum by (éx)`. PulsusDB accepts the same rune set for all of them, and that rune set is **not** ASCII-only.
+
+Everything below was measured against the digest-pinned `grafana/loki:3.7.4` oracle (`.github/workflows/ci.yml`; the container's own `/loki/api/v1/status/buildinfo` reports `3.7.4` / `b318f282`) and is replayed on every CI run by `crates/pulsus-logql/tests/identifier_charset.rs`.
+
+### 10.1 The rule, and where it comes from
+
+An identifier is:
+
+- **first rune:** `_`, or any rune in Unicode general category **`L`** (letter);
+- **every later rune:** `_`, any rune in **`L`**, or any rune in general category **`Nd`** (decimal digit).
+
+That is the reference's rule verbatim. Loki v3.7.4 builds its LogQL scanner on a vendored Go `text/scanner` and never assigns `IsIdentRune` (`pkg/logql/syntax/query_scanner.go:157` declares the hook, `:339-340` is its only use, and it is never set anywhere in the tree), so `text/scanner`'s default predicate applies unchanged:
+
+```go
+// pkg/logql/syntax/query_scanner.go:338-343 @ v3.7.4
+return ch == '_' || unicode.IsLetter(ch) || unicode.IsDigit(ch) && i > 0
+```
+
+The leading rune goes through the same predicate at `i == 0` (`:675`), which is why a decimal digit may not lead.
+
+### 10.2 The boundary — narrower than "non-ASCII is allowed"
+
+The rule is **general category `L` and `Nd` only**. Three classes of rune that are commonly assumed to be letters or digits are not identifier runes, and PulsusDB refuses them exactly as the reference does:
+
+| Spelling | Category | PulsusDB | Reference |
+|---|---|---|---|
+| `\| drop éx`, `\| drop 日本語`, `\| drop ʰx`, `\| drop ǅx` | `L` (Ll/Lo/Lm/Lt) | accept | `200` |
+| `\| drop x٣`, `\| drop x३` | `Nd`, non-leading | accept | `200` |
+| `\| drop ٣x`, `\| drop 3x` | `Nd`, leading | reject | `400` |
+| `\| drop का` (U+0915 U+093E), `\| drop e\u{301}x` | `Mc` / `Mn` combining mark | reject | `400` |
+| `\| drop xⅧ` (U+2167) | `Nl` letter-number | reject | `400` |
+| `\| drop x½`, `\| drop x³` | `No` other-number | reject | `400` |
+| `\| drop x🙂`, `\| drop x\u{200d}y`, `\| drop x\u{e000}`, `\| drop x\u{378}` | `So` / `Cf` / `Co` / `Cn` | reject | `400` |
+
+No Rust standard-library predicate is this rule, which is why PulsusDB carries generated general-category tables rather than calling one: `char::is_alphabetic` covers 147,421 code points against Go's `L` 136,104 (it is true for U+093E and U+2167), and `char::is_numeric` covers 1,924 against Go's `Nd` 680 (true for U+00BD).
+
+**Keywords fold with Go's simple case mapping, not with ASCII lowercasing.** The reference resolves a keyword by lowercasing the scanned token at lex time (`pkg/logql/syntax/lex.go:226`), and exactly two non-ASCII identifier runes lower to an ASCII letter — U+0130 `İ` → `i` and U+212A `K` (KELVIN SIGN) → `k`, enumerated over the whole code space. So `| <U+212A>EEP ax` is the `keep` stage here as it is there, and `| logfmt | addr = İP("1.2.3.4")` is the `ip` filter.
+
+**Unicode version.** PulsusDB's tables are Unicode **16.0.0**; the reference's Go runtime is **15.0.0**. Measured across the whole code space, the difference is a strict one-directional superset — **+4,924** code points in `L` and **+80** in `Nd` here that are not there, and **zero** in the other direction — so no identifier the reference accepts is refused by PulsusDB. All of the extra code points are unassigned in Unicode 15.0. A committed 15.0.0 baseline (`crates/pulsus-logql/tests/unicode15/go-1.25.5-general-categories.txt`) makes that a test rather than a remembered measurement: it fails if the skew ever becomes two-directional.
+
+### 10.3 Two positions PulsusDB serves and the reference does not
+
+The reference tokenises a non-ASCII identifier at **every** position its grammar has (every production carrying `IDENTIFIER` in `pkg/logql/syntax/syntax.y`; the eighteen probed positions are enumerated in `crates/pulsus-logql/tests/identifier_charset.rs`), and then fails to serve two of them for reasons below its own lexer. PulsusDB serves both.
+
+- **`{éx="m"}` — the reference answers `400`.** Its query-frontend re-serialises the parsed AST, and vendored Prometheus `labels.Matcher.String()` quotes any name outside `[A-Za-z_][A-Za-z0-9_]*` (`vendor/github.com/prometheus/prometheus/model/labels/matcher.go:81-104`, `shouldQuoteName` at `:97-104`), producing `{"éx"="m"}` — a form LogQL's own grammar has no production for. The proof that this is the round trip and not the lexer: `{"éx"="m"}` returns the byte-identical error at the identical column, `parse error at line 1, col 2: syntax error: unexpected STRING, expecting IDENTIFIER or }`.
+- **`{app="x"} | éx="v"` — the reference does not answer at all.** The same re-serialisation, but here the rewritten query reaches the querier and `500`s, and the frontend retries it. Measured on the pinned container: the first probe returned `500` after 28.1 s; four further probes returned no HTTP status at all (`curl` exit 52, *Empty reply from server*) after 37.4, 37.5, 39.0 and 37.4 s. The container log shows `code=Code(500)` on `try=0` … `try=4` and then `(500) 37.39s Response: "failed to enqueue request"`.
+
+Both are the reference's own defects, so reproducing them would not be parity — and the second one is a ~40 s hang PulsusDB would never reproduce anyway. Both are recorded in `docs/benchmarks/logs-differential-ledger.md` under `lexer-identifier-charset` and censused in `crates/pulsus-logql/tests/case_folding.rs`.
+
+One further reference behaviour that "serves" must not paper over: with a **matching** stream, `{app="x"} | logfmt éx="b"` and `{app="x"} | label_format éx="y"` are a `500` there — `could not write JSON response: 1:75: parse error: unexpected character inside braces: 'é'` — because the response encoder re-parses the rendered label set. PulsusDB returns the label. The extraction destination keeps its bytes on both sides: the reference validates the identifier rather than sanitizing it (`pkg/logql/log/parser.go:518`), and over the line `ax=7 bx=8`, `sum by (éx) (count_over_time({…} | logfmt éx="ax" [1m]))` returns a series labelled `éx` there while `sum by (_x) (…)` returns none.
+
+### 10.4 What is still stricter here
+
+Keyword resolution. The reference resolves keywords at **lex** time, so a keyword spelling can never be an identifier payload there: `| drop json`, `| drop by`, `| drop ignoring`, `| drop KEEP` and `sum by (ignoring)` are all `400`, as is `| drop İgnoring` (U+0130 folds to `ignoring`). PulsusDB resolves keywords only at grammar positions that expect one, so it accepts all of them. This is an over-acceptance — a query that works here would fail against the reference, never the reverse — and it is recorded on issue #392, which stays open for it.

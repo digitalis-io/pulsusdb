@@ -4115,3 +4115,196 @@ two.
   and `an_otlp_near_miss_spelling_stores_an_over_wide_indexed_label` in
   `crates/pulsus-server/tests/loki_push_live.rs`, which read the `service`
   column, the stored labels JSON and the fingerprints back out of ClickHouse.
+
+### `lexer-identifier-charset` (issue #392, owner ruling 2026-08-10 — parity ADOPTED; two residuals, both reference defects)
+
+**What changed.** PulsusDB's LogQL lexer accepted `[A-Za-z_][A-Za-z0-9_]*`
+and nothing else, so `| logfmt éx="b"`, `| json éx="b"`,
+`| label_format éx="y"`, `| drop éx` and `sum by (éx)` were `400` here
+and `200` at the reference — a query that works there was broken here.
+The lexer now applies the reference's rule.
+
+**The rule, from the source.** Loki v3.7.4 builds its LogQL scanner on a
+vendored Go `text/scanner` and **never assigns `IsIdentRune`**
+(`pkg/logql/syntax/query_scanner.go:157` declares the hook, `:339-340` is
+its only use; `git grep IsIdentRune pkg/` @ v3.7.4 returns nothing else),
+so the default predicate at `:338-343` is the rule verbatim —
+`ch == '_' || unicode.IsLetter(ch) || unicode.IsDigit(ch) && i > 0` —
+with the leading rune taken through it at `i == 0` (`:675`). Go's
+`unicode.IsLetter` is general category `L` and `unicode.IsDigit` is `Nd`,
+nothing else.
+
+**It is narrower than "allow non-ASCII", and the boundary is measured.**
+29 rune classes were put to the pinned oracle at `| drop X`
+(`grafana/loki@sha256:87f0a067…`, buildinfo `3.7.4` / `b318f282`,
+`ci/logql/config.yaml`, two lines pushed into the store first). The rule
+above reproduces **all 29 verdicts with zero mismatches**:
+
+| class | example | reference |
+|---|---|---|
+| `L` — Ll, Lo, Lm, Lt | `éx`, `日本語`, `ʰx`, `ǅx` | `200` |
+| `Nd`, non-leading | `x٣` (U+0663), `x३` (U+0969) | `200` |
+| `Nd`, leading | `٣x`, `3x` | `400` |
+| `Mc` / `Mn` combining mark | `का` (U+0915 U+093E), `e` + U+0301 | `400` |
+| `Nl` letter-number | `x` + U+2167 | `400` |
+| `No` other-number | `x½`, `x³` | `400` |
+| `So` / `Cf` / `Co` / `Cn` | `x🙂`, `x` + U+200D + `y`, `x` + U+E000, `x` + U+0378 | `400` |
+
+**No Rust std predicate is this rule.** Measured code-point counts:
+`char::is_alphabetic` 147,421 vs Go `L` **136,104**; `char::is_numeric`
+1,924 vs Go `Nd` **680**. `is_alphabetic` is true for U+093E (`Mc`) and
+U+2167 (`Nl`); `is_numeric` is true for U+00BD (`No`). The tables are
+therefore committed general-category `L`/`Nd`, generated from
+`regex-syntax` 0.8.11 (`src/unicode_ident_tables.rs`, 677 + 71 ranges)
+with an ASCII fast path.
+
+**Keyword folding moved with it.** The reference folds a keyword with Go
+`strings.ToLower` at LEX time (`pkg/logql/syntax/lex.go:226`). Enumerated
+over the whole code space with Go 1.25.5, exactly **two** non-ASCII
+identifier runes lower to an ASCII letter: **U+0130** `İ` → `i` and
+**U+212A** (KELVIN SIGN) → `k`. Confirmed at the wire: `| <U+212A>EEP ax`
+`200`; `| drop <U+212A>EEP` `400 unexpected keep, expecting IDENTIFIER`;
+`sum by (İGNORING)` `400 unexpected ignoring, expecting IDENTIFIER or )`;
+`| logfmt | addr = İP("1.2.3.4")` `200`. Rust's `char::to_lowercase` is
+the FULL mapping and yields `"i\u{307}"` for U+0130, so it cannot be used
+— the fold is a two-entry table with the enumeration as its proof
+(`the_two_non_ascii_runes_that_fold_to_ascii_are_exactly_u0130_and_u212a`).
+This falsified `parser.rs:90-92`'s standing claim that ASCII folding was
+safe "because a non-ASCII identifier cannot lex"; the comment is corrected
+in the same change.
+
+#### Residual 1 — `{éx="m"}`: reference `400`, PulsusDB `200`. DELIBERATE.
+
+The reference's **lexer tokenises `éx` in a selector too**. The `400`
+comes from a round trip below the parser: the query-frontend
+re-serialises the parsed AST and vendored Prometheus
+`labels.Matcher.String()` quotes any name outside
+`[A-Za-z_][A-Za-z0-9_]*`
+(`vendor/github.com/prometheus/prometheus/model/labels/matcher.go:81-104`,
+`shouldQuoteName` at `:97-104`), producing `{"éx"="m"}` — which LogQL's
+own grammar has no production for.
+
+**The proof it is the round trip and not the lexer:** `{"éx"="m"}`
+returns the **byte-identical** error at the **identical** column as
+`{éx="m"}` — `parse error at line 1, col 2: syntax error: unexpected
+STRING, expecting IDENTIFIER or }`.
+
+Adopting a `shouldQuoteName`-shaped refusal would reproduce a defect
+deliberately, so we serve it (owner ruling, 2026-08-10). Censused as an
+`over-acceptance` row in `crates/pulsus-logql/tests/case_folding.rs`.
+
+#### Residual 2 — `{app="x"} | éx="v"`: the reference does not answer. DELIBERATE.
+
+The same re-serialisation, but this position's rewritten query reaches
+the querier and `500`s, and the frontend retries it. **Measured on the
+pinned container, five probes:**
+
+| probe | result | elapsed |
+|---|---|---|
+| 1 | `500` | 28.1 s |
+| 2 | no HTTP status — `curl` exit 52, *Empty reply from server* | 37.5 s |
+| 3 | no HTTP status — `curl` exit 52 | 39.0 s |
+| 4 | no HTTP status — `curl` exit 52 | 37.4 s |
+| 5 | no HTTP status — `curl` exit 52 | 37.4 s |
+
+The container log shows the re-serialised query and the retry storm:
+`caller=retry.go:107 … query="{app=\"…\"} | \"éx\"=\"b\"" … code=Code(500)`
+on `try=0` through `try=4`, then
+`(500) 37.397651986s Response: "failed to enqueue request"`.
+
+We serve it (`200`, empty). A future reader comparing us against the
+reference here needs to know **the reference does not answer**, which is
+why the measurement is recorded rather than the verdict alone. **This
+position is never probed by the live leg** — it burns ~40 s and floods
+the shared oracle's scheduler with retries, which perturbs the CI steps
+that run after it; the row carries
+`Skip("no HTTP status in ~40 s — measured five times")` and the skip
+count is pinned.
+
+#### A third reference behaviour, recorded so "serves" does not paper over it
+
+With a **matching** stream, `| logfmt éx="b"` and `| label_format éx="y"`
+are a **`500`** at the reference — `could not write JSON response:
+1:75: parse error: unexpected character inside braces: 'é'` — because the
+response encoder re-parses the rendered label set. The **extraction
+destination itself keeps its bytes on both sides**: the reference
+validates the identifier rather than sanitizing it
+(`model.UTF8Validation.IsValidLabelName(exp.Identifier)`,
+`pkg/logql/log/parser.go:518 @ v3.7.4`), measured over the line
+`ax=7 bx=8` —
+`sum by (éx) (count_over_time({…} | logfmt éx="ax" [1m]))` returns a
+series labelled `éx`, while `sum by (_x) (…)` over the same query returns
+none. PulsusDB matched the sanitizing behaviour before #392 and now
+matches the reference (`KeyOrigin::QueryIdentifier`,
+`crates/pulsus-read/src/logql/pipeline.rs`); line keys are still
+sanitized, which is also what the reference does.
+
+#### Unicode version skew — 16.0.0 here, 15.0.0 there. DELIBERATE, with a tripwire.
+
+`regex-syntax` 0.8.11 carries Unicode **16.0.0**; Go 1.25.5
+(`unicode.Version`) carries **15.0.0**. Measured across the whole code
+space, in **both** directions:
+
+| category | in 16.0.0 and not 15.0.0 | in 15.0.0 and not 16.0.0 |
+|---|---|---|
+| `L` | **4,924** | **0** |
+| `Nd` | **80** | **0** |
+
+A strict one-directional superset, so **nothing the reference accepts is
+refused here**; the only effect is that PulsusDB accepts code points
+Unicode 15.0 leaves unassigned. Pinning a 15.0-era table nothing in the
+Rust toolchain can regenerate was refused as a maintenance hazard traded
+for a difference that cannot currently reject a valid query (owner
+ruling, 2026-08-10).
+
+**The tripwire is what makes that a decision rather than an oversight.**
+The Unicode 15.0.0 baseline is committed
+(`crates/pulsus-logql/tests/unicode15/go-1.25.5-general-categories.txt`,
+659 `L` + 64 `Nd` maximal ranges) and
+`the_unicode_version_skew_is_one_directional` re-checks the claim on
+every run: it fails the moment a code point that is `L` or `Nd` at the
+reference stops being one here. `the_committed_unicode_tables_are_regex_syntax_general_category`
+fails first if a dependency bump leaves the committed tables stale, so a
+bump cannot widen the accept surface silently. The baseline was produced
+by walking `0..=0x10FFFF` with Go 1.25.5's `unicode.IsLetter` /
+`unicode.IsDigit` and coalescing maximal runs:
+
+```go
+for r := rune(0); r <= 0x10FFFF; r++ { if unicode.IsLetter(r) { /* coalesce */ } }
+```
+
+#### What is NOT closed by this entry
+
+Issue #392 stays open for two things the ruling kept on it:
+
+- **Keyword resolution at lex time.** The reference resolves keywords in
+  the lexer, so a keyword spelling can never be an identifier payload
+  there: `| drop json`, `| drop by`, `| drop ignoring`, `| drop KEEP`,
+  `sum by (ignoring)` and `| drop İgnoring` are all `400`; we accept all
+  of them. Only `{by="x"}` / `{json="x"}` were censused before #392,
+  which added `| drop İgnoring`; the other pipeline and grouping
+  positions are still uncensused.
+- **The `--flag` scan set.** `crates/pulsus-logql/src/lexer.rs:123-132`
+  scans ASCII alphanumerics plus `_`/`-`; the reference's `tryScanFlag`
+  scans `unicode.IsLetter(r) || r == '-'`
+  (`pkg/logql/syntax/lex.go:273-290 @ v3.7.4`). No verdict differs today
+  only because `parserFlags` is a fixed ASCII pair — the sets are not the
+  same and nothing checks that the equivalence still holds.
+
+#### Where this is gated
+
+- `crates/pulsus-logql/tests/identifier_charset.rs` — the 29-row rune
+  boundary, the 18-position grammar enumeration, the discriminators, the
+  committed-table check, the version-skew tripwire, and the live leg
+  (`PULSUSDB_LOGQL_DIFF_URL`, its own CI step).
+- `crates/pulsus-logql/src/unicode_ident.rs` — the ASCII fast-path
+  equivalence and the whole-code-space fold enumeration.
+- `crates/pulsus-logql/tests/case_folding.rs` — the two new
+  `over-acceptance` census rows and the two Unicode-folded keyword
+  spellings in the live `FOLDING_PROBES`.
+- `crates/pulsus-read/src/logql/pipeline.rs` — the extraction
+  destination keeps its bytes, and the `KeyOrigin` carve-out is proved a
+  no-op for every pre-#392 identifier.
+- `crates/pulsus-read/tests/sql_snapshots.rs` — a non-ASCII label name
+  plans to byte-identical SQL, so no index, projection or pushdown
+  changes (Tier 1 identity, no wall-time claim).

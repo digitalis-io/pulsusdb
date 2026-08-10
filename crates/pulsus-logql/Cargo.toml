@@ -9,6 +9,12 @@ rust-version.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# Issue #392: the general-category source for `src/unicode_ident_tables.rs`.
+# DEV-ONLY on purpose — the tables are committed, so the runtime
+# dependency set stays `thiserror` alone. `tests/identifier_charset.rs`
+# re-derives `\p{L}`/`\p{Nd}` from it and fails if the committed tables
+# have drifted.
+regex-syntax.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
