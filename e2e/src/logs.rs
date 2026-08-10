@@ -2816,6 +2816,54 @@ mod tests {
         }
     }
 
+    /// The shipped fixture's prose must not promise a flattened label the
+    /// corpus no longer emits (#259 reopen). `construct` is the only
+    /// place a case's expected response is written in words; prose rot
+    /// here is invisible to every other gate, and it is what would tempt
+    /// the next reader to put `emptyattr=""` back into
+    /// `logs_corpus::SCOPE_WITNESS_ATTRS`.
+    #[test]
+    fn the_scope_case_construct_does_not_promise_an_empty_attribute() {
+        let fixture = shipped_fixture();
+        let case = fixture
+            .cases
+            .iter()
+            .find(|c| c.case_id == "scope_structured_metadata")
+            .expect("the scope case is shipped");
+        assert!(
+            !case.construct.contains("emptyattr"),
+            "case {:?} still promises `emptyattr`, which the corpus no longer \
+             emits: the e2e oracle (grafana/loki:3.4.2) keeps an empty-valued \
+             attribute while the pinned reference (grafana/loki:3.7.4) and \
+             PulsusDB drop it. See docs/benchmarks/logs-differential-ledger.md \
+             `empty-value-oracle-version-skew`.\n{}",
+            case.case_id,
+            case.construct
+        );
+    }
+
+    /// The oracle-version skew is recorded where the divergence
+    /// discipline says it is recorded, and the entry names the artifacts
+    /// it governs — the corpus constant, the guard test, and both image
+    /// digests — so the close condition cannot be read without them
+    /// (#259 reopen).
+    #[test]
+    fn the_oracle_version_skew_is_recorded_in_the_committed_ledger() {
+        let ledger_path =
+            crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
+        let ledger = std::fs::read_to_string(&ledger_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", ledger_path.display()));
+        for needle in [
+            "empty-value-oracle-version-skew",
+            "SCOPE_WITNESS_ATTRS",
+            "sha256:58a6c186",
+            "sha256:87f0a067",
+            "the_shared_corpus_carries_no_empty_valued_attribute",
+        ] {
+            assert!(ledger.contains(needle), "ledger is missing {needle:?}");
+        }
+    }
+
     #[test]
     fn shipped_fixture_queries_are_run_scoped_and_substitutable() {
         let fixture = shipped_fixture();

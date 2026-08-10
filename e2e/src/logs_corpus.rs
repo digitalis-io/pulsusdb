@@ -222,15 +222,28 @@ pub const SCOPE_WITNESS_NAME: &str = "coll-scope";
 /// The witness scope version — non-empty, so it appears as `scope_version`.
 pub const SCOPE_WITNESS_VERSION: &str = "1.0";
 /// The witness scope attributes, in wire order — exercising Loki's
-/// collision rules (live-probe-pinned): `dup.key`/`dup_key` both sanitize
-/// to `dup_key` (last wins -> `v_us`), `scope.name` sanitizes onto the
-/// identity key (dropped -> identity `coll-scope` wins), `emptyattr` is an
-/// empty-valued attribute (kept verbatim).
+/// collision rules (live-probe-pinned). Three attributes, all non-empty:
+/// `dup.key`/`dup_key` both sanitize to `dup_key` (last wins -> `v_us`),
+/// and `scope.name` sanitizes onto the identity key (dropped -> identity
+/// `coll-scope` wins).
+///
+/// A fourth, `emptyattr=""`, was removed by the #259 reopen: an
+/// empty-valued attribute is KEPT by the e2e oracle
+/// (`grafana/loki@sha256:58a6c186…`, buildinfo `3.4.2`/`4fa045d3`,
+/// pinned at `deploy/e2e/compose.single.yaml`) and DROPPED by the pinned
+/// reference (`grafana/loki@sha256:87f0a067…`, `3.7.4`/`b318f282`,
+/// pinned at `.github/workflows/ci.yml`) and by PulsusDB, on every
+/// measured seam — OTLP scope attributes, OTLP resource attributes and
+/// Loki-push structured metadata alike. This corpus is scored against
+/// BOTH stores, so such an input can never match on both; it is what made
+/// `logs_pipeline_differential` time out on completeness daily from
+/// 2026-08-07. See docs/benchmarks/logs-differential-ledger.md
+/// `empty-value-oracle-version-skew` — including the close condition,
+/// which is the oracle digest moving to v3.7.4.
 pub const SCOPE_WITNESS_ATTRS: &[(&str, &str)] = &[
     ("dup.key", "v_dot"),
     ("dup_key", "v_us"),
     ("scope.name", "LOSE"),
-    ("emptyattr", ""),
 ];
 
 /// Sanitizes a label key the way `pulsus_model::canonicalize_label_key` /
@@ -252,9 +265,9 @@ fn sanitize_label_key(key: &str) -> String {
 /// Loki's last-write-wins rule over the ordered list
 /// `[attributes in wire order …, scope_name, scope_version]` (issue #109):
 /// `dup_key="v_us"` (last write), `scope_name="coll-scope"` (identity
-/// precedence — `scope.name="LOSE"` dropped), `scope_version="1.0"`,
-/// `emptyattr=""` (kept). The corpus's independent oracle, computed here
-/// with its own loop — never by calling `pulsus-write`.
+/// precedence — `scope.name="LOSE"` dropped), `scope_version="1.0"`. The
+/// corpus's independent oracle, computed here with its own loop — never
+/// by calling `pulsus-write`.
 pub fn scope_witness_sm_labels() -> BTreeMap<String, String> {
     let mut ordered: Vec<(String, String)> = SCOPE_WITNESS_ATTRS
         .iter()
@@ -1477,14 +1490,18 @@ pub fn naive_matches(case_id: &str, r: &GeneratedRecord) -> bool {
 mod tests {
     use super::*;
 
-    fn spec(record_count: usize) -> LogCorpusSpec {
+    fn spec_scaled(scale: Scale, record_count: usize) -> LogCorpusSpec {
         LogCorpusSpec {
-            scale: Scale::Ci,
+            scale,
             record_count,
             step_ns: 1_000_000_000,
             base_ns: 1_700_000_000_000_000_000,
             run_id: "e2e-logs-test-run".to_string(),
         }
+    }
+
+    fn spec(record_count: usize) -> LogCorpusSpec {
+        spec_scaled(Scale::Ci, record_count)
     }
 
     #[test]
@@ -1645,15 +1662,19 @@ mod tests {
         // svc-badunit is still LAST (the scope witness was inserted before it).
         assert_eq!(corpus.records.last().unwrap().service, SVC_BADUNIT);
 
-        // Last-write-wins collision resolution, live-Loki-3.4.2-pinned:
-        // dup_key=v_us (last write), scope_name=coll-scope (identity beats the
-        // colliding scope.name=LOSE), scope_version=1.0, emptyattr="" (kept).
+        // Last-write-wins collision resolution — live-pinned on
+        // `grafana/loki:3.7.4` (`b318f282`) and on `3.4.2` (`4fa045d3`) alike
+        // for the three surviving attributes: dup_key=v_us (last write),
+        // scope_name=coll-scope (identity beats the colliding
+        // scope.name=LOSE), scope_version=1.0. The fourth attribute,
+        // `emptyattr=""`, was removed by the #259 reopen — its treatment is
+        // the one thing the two oracle versions disagree on (see
+        // `the_shared_corpus_carries_no_empty_valued_attribute`).
         let sm = scope_witness_sm_labels();
         assert_eq!(
             sm,
             BTreeMap::from([
                 ("dup_key".to_string(), "v_us".to_string()),
-                ("emptyattr".to_string(), String::new()),
                 ("scope_name".to_string(), "coll-scope".to_string()),
                 ("scope_version".to_string(), "1.0".to_string()),
             ])
@@ -1668,7 +1689,11 @@ mod tests {
             Some("coll-scope")
         );
         assert_eq!(labels.get("dup_key").map(String::as_str), Some("v_us"));
-        assert_eq!(labels.get("emptyattr").map(String::as_str), Some(""));
+        assert!(
+            !labels.contains_key("emptyattr"),
+            "the corpus must not promise an empty-valued attribute: the e2e \
+             oracle keeps it, the pinned reference and PulsusDB drop it (#259)"
+        );
         assert!(!labels.contains_key("scope.name"));
         assert_eq!(entries.len(), 1);
 
@@ -1681,6 +1706,97 @@ mod tests {
                 case_projection(case, witnesses[0]).is_none(),
                 "case {case:?} must not project the scope witness record"
             );
+        }
+    }
+
+    /// Collects every `{"key": K, "value": {"stringValue": V}}` pair
+    /// reachable anywhere in an OTLP export document, with the JSON path
+    /// each was found at. Structural, not positional: it recurses the
+    /// whole `Value`, so a future corpus attribute added under a new
+    /// container (record attributes, a second scope, a nested map) is
+    /// covered without editing this walker.
+    fn collect_string_attributes(
+        node: &serde_json::Value,
+        path: &str,
+        out: &mut Vec<(String, String, String)>,
+    ) {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let (
+                    Some(serde_json::Value::String(key)),
+                    Some(serde_json::Value::String(val)),
+                ) = (
+                    map.get("key"),
+                    map.get("value")
+                        .and_then(|v| v.get("stringValue"))
+                        .filter(|v| v.is_string()),
+                ) {
+                    out.push((path.to_string(), key.clone(), val.clone()));
+                }
+                for (k, v) in map {
+                    collect_string_attributes(v, &format!("{path}.{k}"), out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    collect_string_attributes(v, &format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Guard for the #259 reopen. Walks the corpus's ACTUAL OTLP export
+    /// body — every `attributes` array under `resource` and under
+    /// `scopeLogs.scope`, at both scales — and refuses any empty
+    /// `stringValue`.
+    ///
+    /// Why: the e2e differential scores this corpus against a
+    /// `grafana/loki:3.4.2` oracle
+    /// (`deploy/e2e/compose.single.yaml`, digest `sha256:58a6c186…`)
+    /// while PulsusDB implements the pinned reference
+    /// `grafana/loki:3.7.4` (`.github/workflows/ci.yml`, digest
+    /// `sha256:87f0a067…`). 3.4.2 KEEPS an empty-valued attribute; 3.7.4
+    /// and PulsusDB DROP it. Measured on both images under this repo's own
+    /// `deploy/e2e/loki.yaml`, on OTLP scope attributes, OTLP resource
+    /// attributes and Loki-push structured metadata alike. So any empty
+    /// value in this shared corpus is a record the two stores can never
+    /// agree on, and `logs_pipeline_differential` times out on
+    /// completeness — which is exactly what happened daily from 2026-08-07.
+    ///
+    /// BOUNDARY, stated so this is not misread: it covers exactly the
+    /// empty-VALUE class, the one divergence measured between the e2e
+    /// oracle and the pinned reference. It is NOT a general
+    /// version-skew detector and cannot see any other behaviour that
+    /// changed between 3.4.2 and 3.7.4. It stops being needed the moment
+    /// the oracle digest moves to v3.7.4 — see the close condition on
+    /// `empty-value-oracle-version-skew` in
+    /// docs/benchmarks/logs-differential-ledger.md, which requires
+    /// deleting this test in the same commit.
+    #[test]
+    fn the_shared_corpus_carries_no_empty_valued_attribute() {
+        for (scale, record_count) in [(Scale::Ci, 60usize), (Scale::Full, 300usize)] {
+            let corpus = generate(&spec_scaled(scale, record_count));
+            let export = to_otlp_export_request(&corpus);
+            let mut pairs = Vec::new();
+            collect_string_attributes(&export, "$", &mut pairs);
+            assert!(
+                !pairs.is_empty(),
+                "{scale:?}: the walker found no string-valued attribute at all — \
+                 the export shape changed and this guard has gone vacuous"
+            );
+            for (path, key, value) in &pairs {
+                assert!(
+                    !value.is_empty(),
+                    "{scale:?}: empty-valued attribute {key:?} at {path} — the e2e \
+                     oracle (grafana/loki:3.4.2) KEEPS it while the pinned reference \
+                     (grafana/loki:3.7.4) and PulsusDB DROP it, so this record can \
+                     never match on both stores. See \
+                     docs/benchmarks/logs-differential-ledger.md \
+                     `empty-value-oracle-version-skew`; re-add it only when the \
+                     oracle digest in deploy/e2e/compose.single.yaml moves to v3.7.4."
+                );
+            }
         }
     }
 }
