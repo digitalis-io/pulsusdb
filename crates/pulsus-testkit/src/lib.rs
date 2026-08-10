@@ -311,8 +311,15 @@ const MAX_DATABASE_NAME_LEN: usize = 200;
 ///   child's environment, measured — `C="wt3 "` reaches `env` as
 ///   `C=wt3 `.
 ///
-/// Whitespace *inside* the prefix is not covered by either: `"wt 3"` and
-/// `"wt\n3"` panic like any other bad character.
+/// "Whitespace" here means whatever [`str::trim`] strips, whatever that
+/// is in the toolchain you are building with — the tests do not enumerate
+/// it, they derive it by running `trim` over every Unicode scalar value.
+/// Both halves are checked across that whole derived set: each such
+/// character is absorbed at an end
+/// (`every_character_trim_strips_is_absorbed_at_a_prefix_end`) and
+/// refused *inside* a prefix, where it would change the composed name
+/// (`every_character_trim_strips_is_refused_inside_a_prefix`). So this
+/// paragraph cannot go stale when Rust's definition of whitespace grows.
 pub fn test_db(name: &str) -> String {
     test_ident(name)
 }
@@ -554,31 +561,89 @@ mod tests {
         );
     }
 
-    /// Surrounding whitespace is trimmed rather than refused: `" wt3 "`
-    /// and `"wt3"` name the same database, so accepting both isolates two
-    /// checkouts exactly as well. Deliberate — see the note in
-    /// `test_db`'s docs, which also records the *false* justification a
-    /// previous revision gave for it.
+    // -----------------------------------------------------------------
+    // Trimming, over the whole set of characters `str::trim` strips.
+    //
+    // Review finding (PR #424, round 3): the previous version of these
+    // two tests used four hand-written spellings and claimed to cover
+    // "every whitespace character `str::trim` would have removed". It
+    // covered four of the twenty-five. A hand-written list beside an
+    // "every" is the defect this branch has now produced twice, so the
+    // set is derived instead of enumerated — nothing below names a
+    // whitespace character except as a sanity anchor, and a character
+    // added to Rust's definition in a future toolchain is picked up on
+    // the next run rather than silently falsifying the sentence.
+    // -----------------------------------------------------------------
+
+    /// The characters [`str::trim`] strips, **derived by running `trim`**
+    /// rather than copied out of its documentation.
+    ///
+    /// Every Unicode scalar value is tried; `c` is kept when the
+    /// one-character string `c` trims to nothing, which is exactly the
+    /// condition under which `trim` removes `c` from an end. The scan is
+    /// the whole scalar range — `char::from_u32` skips the surrogate gap
+    /// — so there is no boundary for a character to hide behind.
+    fn characters_trim_strips() -> Vec<char> {
+        (0..=u32::from(char::MAX))
+            .filter_map(char::from_u32)
+            .filter(|c| c.to_string().trim().is_empty())
+            .collect()
+    }
+
+    /// The derivation is only trustworthy if it finds something; these
+    /// four are anchors against a scan that silently returns nothing (or
+    /// everything), not a statement of what the set contains.
+    fn assert_derivation_is_sane(ws: &[char]) {
+        for anchor in [' ', '\t', '\n', '\r'] {
+            assert!(
+                ws.contains(&anchor),
+                "deriving the trim set found {} characters and not {anchor:?} — the derivation is \
+                 broken, so anything it appears to prove is vacuous",
+                ws.len()
+            );
+        }
+        assert!(
+            !ws.contains(&'w'),
+            "the derivation classified an ordinary letter as whitespace"
+        );
+    }
+
+    /// Every character `trim` strips is absorbed at a prefix end: the
+    /// composed database is the same one the bare prefix names, and a
+    /// prefix made only of such characters reads as unset. `" wt3 "` and
+    /// `"wt3"` naming the same database is the whole justification for
+    /// trimming rather than refusing — see the note in `test_db`'s docs,
+    /// which also records the *false* justification a previous revision
+    /// gave for it.
     #[test]
-    fn a_prefix_is_trimmed_before_use_rather_than_refused() {
-        for spelling in [" wt3 ", "wt3\n", "\twt3\r\n", "wt3 "] {
+    fn every_character_trim_strips_is_absorbed_at_a_prefix_end() {
+        let ws = characters_trim_strips();
+        assert_derivation_is_sane(&ws);
+        for c in &ws {
             assert_eq!(
-                compose_db_name(Some(spelling), "pulsus_x_it"),
+                compose_db_name(Some(&format!("{c}wt3{c}")), "pulsus_x_it"),
                 "wt3_pulsus_x_it",
-                "{spelling:?} must compose the same database as \"wt3\""
+                "a prefix wrapped in {c:?} must name the same database as \"wt3\""
+            );
+            assert_eq!(
+                compose_db_name(Some(&c.to_string()), "pulsus_x_it"),
+                "pulsus_x_it",
+                "a prefix of nothing but {c:?} must read as unset"
             );
         }
     }
 
-    /// Trimming reaches the ends and nothing else: whitespace *inside* a
-    /// prefix would change the composed name, so it panics like any other
-    /// bad character. One case per whitespace character that
-    /// [`str::trim`] would have removed at an end, so the two behaviours
-    /// cannot silently converge.
+    /// …and every one of them is refused *inside* a prefix, where it
+    /// would change the composed name. Derived from the same set, so the
+    /// two behaviours cannot silently converge on a character neither
+    /// test happens to mention.
     #[test]
-    fn whitespace_inside_a_prefix_is_still_refused() {
-        for spelling in ["wt 3", "wt\t3", "wt\n3", "wt\r\n3"] {
-            let err = std::panic::catch_unwind(|| compose_db_name(Some(spelling), "pulsus_x_it"))
+    fn every_character_trim_strips_is_refused_inside_a_prefix() {
+        let ws = characters_trim_strips();
+        assert_derivation_is_sane(&ws);
+        for c in &ws {
+            let spelling = format!("wt{c}3");
+            let err = std::panic::catch_unwind(|| compose_db_name(Some(&spelling), "pulsus_x_it"))
                 .expect_err("whitespace inside a prefix must panic");
             let msg = err
                 .downcast_ref::<String>()
@@ -586,7 +651,7 @@ mod tests {
                 .unwrap_or("<non-string panic payload>");
             assert!(
                 msg.contains("is not a usable database-name prefix"),
-                "{spelling:?}: {msg}"
+                "{c:?} inside a prefix: {msg}"
             );
         }
     }
