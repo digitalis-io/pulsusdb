@@ -78,7 +78,7 @@ async fn ping_succeeds_against_a_live_server() {
 async fn insert_block_then_query_stream_round_trips_rows() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let table = "pulsus_clickhouse_it_roundtrip";
+    let table = &pulsus_testkit::test_ident("pulsus_clickhouse_it_roundtrip");
 
     client
         .execute(
@@ -268,7 +268,7 @@ async fn query_stream_lease_is_released_on_drop_before_exhaustion() {
 async fn execute_rejects_ddl_against_a_nonexistent_database_as_poison() {
     skip_unless_live!();
     let mut cfg = test_config();
-    cfg.database = "pulsus_clickhouse_it_missing_db".to_string();
+    cfg.database = pulsus_testkit::test_db("pulsus_clickhouse_it_missing_db");
     // ChClient::new pings at startup; a missing database is itself a
     // startup-time poison error, which is the behavior under test.
     let result = ChClient::new(cfg).await;
@@ -320,7 +320,7 @@ async fn query_stream_enforces_overall_deadline_on_a_stalled_query() {
 #[tokio::test]
 async fn insert_block_returns_insert_uncertain_when_the_client_deadline_fires() {
     skip_unless_live!();
-    let table = "pulsus_clickhouse_it_insert_timeout";
+    let table = &pulsus_testkit::test_ident("pulsus_clickhouse_it_insert_timeout");
 
     // Create the table with a normally-configured client; only the
     // `insert_block` attempt below uses the pathological deadline.

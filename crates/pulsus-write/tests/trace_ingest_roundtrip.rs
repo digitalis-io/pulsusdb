@@ -196,7 +196,7 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
 #[tokio::test]
 async fn sync_post_round_trips_exact_counts_on_both_trace_tables() {
     skip_unless_live!();
-    let db = "pulsus_write_it_trace_roundtrip";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_trace_roundtrip");
     let client = fresh_db(db).await;
 
     let (req, span_count, attr_count) = fixture_request_rebased_to_now();
@@ -315,7 +315,7 @@ async fn sync_post_round_trips_exact_counts_on_both_trace_tables() {
 async fn status_message_round_trips_through_the_product_ingest_path() {
     skip_unless_live!();
     use opentelemetry_proto::tonic::trace::v1::Status;
-    let db = "pulsus_write_it_trace_status_msg";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_trace_status_msg");
     let client = fresh_db(db).await;
 
     let (mut req, span_count, _) = fixture_request_rebased_to_now();

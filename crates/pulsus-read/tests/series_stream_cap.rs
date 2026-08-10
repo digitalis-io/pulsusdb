@@ -184,7 +184,7 @@ async fn series_union_across_disjoint_selectors_trips_the_stream_cap_even_though
         );
         return;
     }
-    let db = "pulsus_read_it_series_stream_cap";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_series_stream_cap");
     let bootstrap = ChClient::new(test_config()).await.expect("connect");
     drop_database(&bootstrap, db).await;
     run_init(&bootstrap, &schema_params(db))
@@ -244,7 +244,7 @@ async fn series_union_at_or_under_the_cap_still_succeeds() {
         );
         return;
     }
-    let db = "pulsus_read_it_series_stream_cap_ok";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_series_stream_cap_ok");
     let bootstrap = ChClient::new(test_config()).await.expect("connect");
     drop_database(&bootstrap, db).await;
     run_init(&bootstrap, &schema_params(db))
@@ -318,7 +318,7 @@ async fn series_cap_counts_the_pre_window_union() {
         );
         return;
     }
-    let db = "pulsus_read_it_series_cap_pre_window";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_series_cap_pre_window");
     let bootstrap = ChClient::new(test_config()).await.expect("connect");
     drop_database(&bootstrap, db).await;
     run_init(&bootstrap, &schema_params(db))

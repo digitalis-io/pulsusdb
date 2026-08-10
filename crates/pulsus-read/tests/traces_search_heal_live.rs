@@ -270,7 +270,7 @@ async fn healed_attr_registration_is_found_by_attribute_scoped_traceql_search() 
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_trace_search_heal";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_trace_search_heal");
     init_db(&bootstrap, db).await;
 
     let client = Arc::new(
@@ -453,7 +453,7 @@ async fn spanset_by_service_cardinality_cap_rejects_over_max_series() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_trace_search_by_cap";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_trace_search_by_cap");
     init_db(&bootstrap, db).await;
 
     let client = Arc::new(
@@ -601,7 +601,7 @@ async fn instrumentation_search_constructs_return_the_seeded_span() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_trace_search_instrumentation";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_trace_search_instrumentation");
     init_db(&bootstrap, db).await;
 
     let client = Arc::new(

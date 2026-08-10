@@ -67,11 +67,12 @@ fn test_ctx(db: &str) -> SchemaParams {
     }
 }
 
-const DB: &str = "pulsus_traces_metrics_it";
+static DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_metrics_it");
 /// Issue #252's own throwaway database: the log2-histogram membership,
 /// sub-2ns guard and quantile-divergence corpora need durations the
 /// shared `DB` corpus deliberately does not have.
-const DB_LOG2: &str = "pulsus_traces_metrics_log2_it";
+static DB_LOG2: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_log2_it");
 
 /// Corpus base: "two hours ago", floored to a multiple of 600 (so the
 /// primary test windows are step-aligned by construction for both step
@@ -628,7 +629,7 @@ async fn log2_histogram_membership_and_the_sub_two_ns_guard() {
 
     let admin = ChClient::new(test_config()).await.expect("connect");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_LOG2}")).await;
-    run_init(&admin, &test_ctx(DB_LOG2))
+    run_init(&admin, &test_ctx(&DB_LOG2))
         .await
         .expect("run_init");
 
@@ -1123,7 +1124,7 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
 }
 
 /// Isolated DB for the trace-wide-roots gate (issue #189 adjudication #1).
-const DB_TW: &str = "pulsus_traces_metrics_tw_it";
+static DB_TW: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_metrics_tw_it");
 
 /// Issue #189 AC5 — the trace-wide (window-free) roots gate. A single
 /// 2-span trace: the root (`parent_id=0`, `name='root-op'`) sits an hour
@@ -1145,7 +1146,7 @@ async fn compare_roots_resolve_trace_wide() {
 
     let admin = ChClient::new(test_config()).await.expect("connect");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_TW}")).await;
-    run_init(&admin, &test_ctx(DB_TW)).await.expect("run_init");
+    run_init(&admin, &test_ctx(&DB_TW)).await.expect("run_init");
 
     let client = {
         let mut cfg = test_config();
@@ -1267,10 +1268,10 @@ async fn metrics_internal_consistency_identities() {
 
     let admin = ChClient::new(test_config()).await.expect("connect");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB}")).await;
-    run_init(&admin, &test_ctx(DB)).await.expect("run_init");
+    run_init(&admin, &test_ctx(&DB)).await.expect("run_init");
 
     let client = data_client().await;
-    seed_corpus(&client, DB).await;
+    seed_corpus(&client, &DB).await;
     let engine = TraceEngine::new(data_client().await, engine_config());
 
     // Independent expected counts, computed from the seeding rules.
@@ -1320,7 +1321,7 @@ async fn metrics_internal_consistency_identities() {
     );
     let before_range = engine.metrics_range(&rate_plan).await.expect("range");
     let before_instant = engine.metrics_instant(&rate_plan).await.expect("instant");
-    seed_corpus(&client, DB).await; // every row now exists twice
+    seed_corpus(&client, &DB).await; // every row now exists twice
     let after_range = engine.metrics_range(&rate_plan).await.expect("range dup");
     let after_instant = engine
         .metrics_instant(&rate_plan)
@@ -1418,7 +1419,7 @@ async fn metrics_internal_consistency_identities() {
     // (see `create_extreme_epoch_view`), not the physical `trace_spans`
     // table — sidesteps a separate, out-of-scope schema TTL/partition
     // overflow, still a live round trip through the real generated SQL. ---
-    create_extreme_epoch_view(&client, DB).await;
+    create_extreme_epoch_view(&client, &DB).await;
     let extreme_engine = extreme_epoch_engine(data_client().await);
 
     let past_plan = plan_for(
@@ -1462,7 +1463,7 @@ async fn metrics_internal_consistency_identities() {
 }
 
 /// Isolated DB for the issue #237 ns→seconds ULP gate.
-const DB_ULP: &str = "pulsus_traces_metrics_ulp_it";
+static DB_ULP: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_metrics_ulp_it");
 
 /// Issue #237 (Tier-1, scale-invariant): the ns→seconds conversion of a
 /// duration value survives the whole SQL→decode path bit-exactly and
@@ -1509,7 +1510,9 @@ async fn duration_seconds_conversion_matches_the_reference() {
 
     let admin = ChClient::new(test_config()).await.expect("connect");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_ULP}")).await;
-    run_init(&admin, &test_ctx(DB_ULP)).await.expect("run_init");
+    run_init(&admin, &test_ctx(&DB_ULP))
+        .await
+        .expect("run_init");
 
     let client = {
         let mut cfg = test_config();

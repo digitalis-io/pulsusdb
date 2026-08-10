@@ -111,7 +111,7 @@ fn test_ctx(db: &str) -> SchemaParams {
     }
 }
 
-const DB: &str = "pulsus_traces_search_it";
+static DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_search_it");
 /// ≥100k time-spread spans (issue #53 fixture floor).
 const CORPUS_SPANS: u64 = 120_000;
 /// The default MergeTree index granularity: reads are quantized to
@@ -459,12 +459,12 @@ async fn two_phase_search_explain_and_budget_gates() {
 
     let admin = ChClient::new(test_config()).await.expect("connect");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB}")).await;
-    run_init(&admin, &test_ctx(DB)).await.expect("run_init");
+    run_init(&admin, &test_ctx(&DB)).await.expect("run_init");
 
     let now = now_ns();
     let base = now - WINDOW_NS;
     let client = data_client().await;
-    seed_corpus(&client, DB, base).await;
+    seed_corpus(&client, &DB, base).await;
 
     let engine = TraceEngine::new(data_client().await, engine_config());
 

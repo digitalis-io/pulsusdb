@@ -331,7 +331,7 @@ async fn total_marks(admin: &ChClient, db: &str) -> u64 {
 #[tokio::test]
 async fn corpus_is_large_enough_to_prove_skip_index_pruning() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_size";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_size");
     let (client, _ts_ns) = setup_corpus(db).await;
     let marks = total_marks(&client, db).await;
     // Edge case #4 of the #16 architect plan: a too-small corpus can't
@@ -347,7 +347,7 @@ async fn corpus_is_large_enough_to_prove_skip_index_pruning() {
 #[tokio::test]
 async fn stage3_narrow_window_read_rows_are_index_confined_not_a_full_scan() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_narrow";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_narrow");
     let (client, ts_ns) = setup_corpus(db).await;
 
     // A window covering ~1,000 of the corpus's 100,000 rows (rows
@@ -409,7 +409,7 @@ async fn stage3_narrow_window_read_rows_are_index_confined_not_a_full_scan() {
 #[tokio::test]
 async fn body_search_skip_index_prunes_most_granules() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_bodysearch";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_bodysearch");
     let (client, ts_ns) = setup_corpus(db).await;
 
     let params = QueryParams {
@@ -511,7 +511,10 @@ async fn body_search_skip_index_prunes_most_granules() {
 /// `current_database = '{db}'` filter (no time marker) and `seed_corpus`
 /// can skip the drop-if-exists. Returns `(admin, run_db, ts_ns)`.
 async fn fresh_run_db() -> (ChClient, String, i64) {
-    let run_db = format!("pulsus_read_it_qlg_{}", uuid::Uuid::new_v4().simple());
+    let run_db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let admin = ChClient::new(test_config()).await.expect("connect admin");
     admin
         .execute(
@@ -859,7 +862,7 @@ fn detected_bounds(ts_ns: i64) -> pulsus_read::TimeBounds {
 #[tokio::test]
 async fn detected_fields_sparse_filter_finds_late_matches_window_exhausted() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_detected_late";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_detected_late");
     let (client, ts_ns) = setup_detected_corpus(db).await;
     drop(client);
 
@@ -907,7 +910,7 @@ async fn detected_fields_sparse_filter_finds_late_matches_window_exhausted() {
 #[tokio::test]
 async fn detected_fields_budget_exhaustion_mid_paging_returns_truncated() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_detected_budget";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_detected_budget");
     let (client, ts_ns) = setup_detected_corpus(db).await;
     drop(client);
 
@@ -941,7 +944,7 @@ async fn detected_fields_budget_exhaustion_mid_paging_returns_truncated() {
 #[tokio::test]
 async fn detected_fields_first_page_over_budget_stays_query_too_broad() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_detected_tight";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_detected_tight");
     let (client, ts_ns) = setup_detected_corpus(db).await;
     drop(client);
 
@@ -964,7 +967,7 @@ async fn detected_fields_first_page_over_budget_stays_query_too_broad() {
 #[tokio::test]
 async fn fetch_until_limit_first_page_over_budget_stays_query_too_broad() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_budget_tight";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_budget_tight");
     let (_admin, ts_ns) = setup_corpus(db).await;
 
     // Well below the first page's whole-window scan (~19 MiB): the FIRST
@@ -1018,7 +1021,7 @@ async fn fetch_until_limit_first_page_over_budget_stays_query_too_broad() {
 #[tokio::test]
 async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_detected_labels_fanin";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_detected_labels_fanin");
     let admin = ChClient::new(test_config()).await.expect("connect admin");
     admin
         .execute(
@@ -1447,7 +1450,10 @@ async fn every_logql_engine_query_carries_the_memory_ceiling() {
 #[tokio::test]
 async fn every_trace_engine_query_carries_the_memory_ceiling() {
     skip_unless_live!();
-    let run_db = format!("pulsus_read_it_qlg_tr_{}", uuid::Uuid::new_v4().simple());
+    let run_db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_tr_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let admin = ChClient::new(test_config()).await.expect("connect admin");
     admin
         .execute(

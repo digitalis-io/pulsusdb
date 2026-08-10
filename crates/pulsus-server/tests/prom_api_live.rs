@@ -17,6 +17,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -118,8 +123,7 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
         return;
     }
 
-    let db = std::env::var("PULSUS_TEST_CH_DATABASE")
-        .unwrap_or_else(|_| "pulsus_prom_api_live_test".to_string());
+    let db = pulsus_testkit::test_db("pulsus_prom_api_live_it");
     let port: u16 = 31_173;
 
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
@@ -297,17 +301,7 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     assert!(body.contains("\"errorType\":\"bad_data\""), "body: {body}");
     assert!(!body.contains("\"position\""), "body: {body}");
 
-    let bootstrap = ChClient::new(test_ch_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    bootstrap
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            pulsus_clickhouse::Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
+    drop_db(&db).await;
 }
 
 /// Issue #89 (AC5): a regex-`__name__` discovery selector whose resolved
@@ -323,7 +317,7 @@ async fn prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution() {
         return;
     }
 
-    let db = "pulsus_prom_api_live_fanout_test";
+    let db = &pulsus_testkit::test_db("pulsus_prom_api_fanout_it");
     let port: u16 = 31_174;
 
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
@@ -427,17 +421,7 @@ async fn prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution() {
         "expected the fan-out-cap breach message, not the nameless-unresolvable one; body: {body}"
     );
 
-    let bootstrap = ChClient::new(test_ch_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    bootstrap
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            pulsus_clickhouse::Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
+    drop_db(db).await;
 }
 
 /// Issue #89 (retroactive re-review, plan v2 AC5b): a regex-`__name__`
@@ -455,7 +439,7 @@ async fn prom_api_name_regex_discovery_over_the_cache_scan_budget_is_422_executi
         return;
     }
 
-    let db = "pulsus_prom_api_live_scan_budget_test";
+    let db = &pulsus_testkit::test_db("pulsus_prom_api_scan_budget_it");
     let port: u16 = 31_175;
 
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
@@ -562,17 +546,7 @@ async fn prom_api_name_regex_discovery_over_the_cache_scan_budget_is_422_executi
         );
     }
 
-    let bootstrap = ChClient::new(test_ch_config("default"))
-        .await
-        .expect("connect (bootstrap)");
-    bootstrap
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            pulsus_clickhouse::Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
+    drop_db(db).await;
 }
 
 // ---------------------------------------------------------------------
@@ -647,7 +621,7 @@ async fn promql_memory_breach_is_422_and_actually_dispatched() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis();
-    let db = format!("pulsus_prom_api_mem_it_{nonce}");
+    let db = pulsus_testkit::test_db(&format!("pulsus_prom_api_mem_it_{nonce}"));
     let db = db.as_str();
     let port: u16 = 31_149;
 
@@ -776,12 +750,5 @@ async fn promql_memory_breach_is_422_and_actually_dispatched() {
         "every dispatched metrics read must carry max_memory_usage"
     );
 
-    admin
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            pulsus_clickhouse::Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
+    drop_db(db).await;
 }

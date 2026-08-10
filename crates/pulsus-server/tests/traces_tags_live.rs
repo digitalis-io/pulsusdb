@@ -47,6 +47,11 @@
 //! (hermetic) enumerates every declaration under `crates/*/tests` and
 //! fails if two collide.
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -257,18 +262,6 @@ fn ch_config() -> ChConnConfig {
     }
 }
 
-async fn drop_db(db: &str) {
-    let client = ChClient::new(ch_config()).await.expect("connect for drop");
-    client
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
-}
-
 fn spawn_ready(port: u16, db: &str) -> ChildGuard {
     spawn_ready_env(port, db, &[])
 }
@@ -474,7 +467,7 @@ async fn tag_discovery_against_real_clickhouse() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis();
-    let db = format!("pulsus_traces_tags_live_it_{nonce}");
+    let db = pulsus_testkit::test_db(&format!("pulsus_traces_tags_live_it_{nonce}"));
     let db = db.as_str();
     drop_db(db).await;
     let _guard = spawn_ready(port, db);
@@ -1011,7 +1004,7 @@ async fn trace_tag_values_memory_breach_is_422() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis();
-    let db = format!("pulsus_traces_tags_mem_it_{nonce}");
+    let db = pulsus_testkit::test_db(&format!("pulsus_traces_tags_mem_it_{nonce}"));
     let db = db.as_str();
     drop_db(db).await;
     let _guard = spawn_ready_env(
@@ -1081,7 +1074,7 @@ async fn the_default_trace_memory_ceiling_does_not_refuse_a_catalog_read() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis();
-    let db = format!("pulsus_traces_tags_mem_ok_it_{nonce}");
+    let db = pulsus_testkit::test_db(&format!("pulsus_traces_tags_mem_ok_it_{nonce}"));
     let db = db.as_str();
     drop_db(db).await;
     let _guard = spawn_ready(port, db);

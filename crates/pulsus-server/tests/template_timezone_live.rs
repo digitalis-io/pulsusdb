@@ -59,6 +59,11 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -227,20 +232,6 @@ fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
     panic!("/ready never reached 200 within 60s (port {port}, db {db})");
 }
 
-async fn drop_database(db: &str) {
-    let mut cfg = conn_config(db);
-    cfg.database = "default".to_string();
-    let client = ChClient::new(cfg).await.expect("connect bootstrap client");
-    client
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
-}
-
 /// Seeds exactly one stream and one entry, at [`FIXED_TS_NS`].
 async fn seed(db: &str) {
     let client = ChClient::new(conn_config(db))
@@ -306,11 +297,11 @@ async fn a_configured_template_timezone_reaches_the_rendered_query_response() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
         return;
     }
-    let db = "pulsus_template_tz_it";
+    let db = &pulsus_testkit::test_db("pulsus_template_tz_it");
     let configured_port: u16 = 31_170;
     let default_port: u16 = 31_171;
 
-    drop_database(db).await;
+    drop_db(db).await;
     // Seeded through a server that has already reconciled the schema.
     let configured = spawn_ready(
         configured_port,

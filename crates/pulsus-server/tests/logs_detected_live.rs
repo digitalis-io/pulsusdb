@@ -41,6 +41,11 @@
 //! (hermetic) enumerates every declaration under `crates/*/tests` and
 //! fails if two collide.
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -190,32 +195,6 @@ fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("/ready never reached 200 within 60s (port {port}, db {db})");
-}
-
-async fn admin_client() -> ChClient {
-    ChClient::new(ChConnConfig {
-        server: ch_host(),
-        http_port: ch_http_port(),
-        database: "default".to_string(),
-        proto: ChProto::Http,
-        pool_size: 2,
-        query_timeout: Duration::from_secs(30),
-        ..ChConnConfig::default()
-    })
-    .await
-    .expect("connect admin client")
-}
-
-async fn drop_db(db: &str) {
-    admin_client()
-        .await
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop db");
 }
 
 async fn data_client(db: &str) -> ChClient {
@@ -392,7 +371,7 @@ async fn detected_labels_and_fields_end_to_end() {
         return;
     }
     let port = 31_176;
-    let db = "pulsus_detected_it_live";
+    let db = &pulsus_testkit::test_db("pulsus_detected_it_live");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
     let client = data_client(db).await;
@@ -799,7 +778,7 @@ async fn detected_fields_budget_truncation_signals_pulsus_partial() {
         return;
     }
     let port = 31_177;
-    let db = "pulsus_detected_it_budget";
+    let db = &pulsus_testkit::test_db("pulsus_detected_it_budget");
     drop_db(db).await;
     // ~4.2 MiB corpus (10,000 rows x ~420 read bytes each); a 6 MiB
     // budget fits page 1 (whole-window scan) but page 2's remaining cap
@@ -921,7 +900,7 @@ async fn detected_labels_cardinality_is_exact_at_the_reference_divergence_points
         return;
     }
     let port = 31_165;
-    let db = "pulsus_detected_it_cardinality";
+    let db = &pulsus_testkit::test_db("pulsus_detected_it_cardinality");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
     let client = data_client(db).await;
@@ -1104,7 +1083,7 @@ async fn detected_labels_is_scoped_to_the_requested_window() {
         return;
     }
     let port = 31_167;
-    let db = "pulsus_detected_it_window";
+    let db = &pulsus_testkit::test_db("pulsus_detected_it_window");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[]);
     let client = data_client(db).await;
@@ -1164,7 +1143,7 @@ async fn detected_labels_keeps_a_sample_in_the_bucket_that_contains_start() {
         return;
     }
     let port = 31_169;
-    let db = "pulsus_detected_it_bucket_edge";
+    let db = &pulsus_testkit::test_db("pulsus_detected_it_bucket_edge");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[]);
     let client = data_client(db).await;

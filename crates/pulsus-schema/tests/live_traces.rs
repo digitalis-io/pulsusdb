@@ -335,7 +335,7 @@ async fn seed_attrs_corpus(client: &ChClient, db: &str, base_ns: i64) {
 async fn run_init_creates_trace_tables_and_mv_and_round_trips_via_the_catalog_mv() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_full";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_full");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
@@ -482,7 +482,7 @@ async fn run_init_creates_trace_tables_and_mv_and_round_trips_via_the_catalog_mv
 async fn stage1_intrinsics_query_selects_the_service_time_projection() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_projection";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_projection");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init");
@@ -543,7 +543,7 @@ async fn stage1_intrinsics_query_selects_the_service_time_projection() {
 async fn narrow_time_window_prunes_granules_within_a_fixed_key_val_prefix() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_attr_prune";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_attr_prune");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init");
@@ -622,7 +622,7 @@ async fn narrow_time_window_prunes_granules_within_a_fixed_key_val_prefix() {
 async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_retention";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_retention");
     drop_database(&client, db).await;
     let mut ctx = test_ctx(db);
     ctx.retention_days = 7;
@@ -693,7 +693,7 @@ fn new_ttl_expr(ts_ns: i64, retention_days: u32) -> String {
 async fn trace_ttl_expression_is_equivalent_in_range_and_saturates_at_the_boundary() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_ttl_expr";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_ttl_expr");
     drop_database(&client, db).await;
     let mut ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init");
@@ -780,7 +780,7 @@ async fn trace_ttl_expression_is_equivalent_in_range_and_saturates_at_the_bounda
 async fn boundary_span_survives_saturating_ttl_and_drops_under_the_wrapping_ttl() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_ttl_boundary";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_ttl_boundary");
     drop_database(&client, db).await;
     let ctx = test_ctx(db); // retention_days = 7; run_init applies the new TTL
     run_init(&client, &ctx).await.expect("run_init");
@@ -961,7 +961,7 @@ async fn insert_span(
 async fn run_init_creates_the_edge_ledger_and_mv_and_pairs_client_server_edges() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_edges";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_edges");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
@@ -1149,7 +1149,7 @@ async fn run_init_creates_the_edge_ledger_and_mv_and_pairs_client_server_edges()
 async fn migration_35_adds_status_message_idempotently_and_round_trips() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_status_msg";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_status_msg");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init (first run)");
@@ -1244,7 +1244,7 @@ async fn migration_35_adds_status_message_idempotently_and_round_trips() {
 async fn migration_status_message_add_column_survives_a_populated_projection_table() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_status_msg_alter";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_status_msg_alter");
     drop_database(&client, db).await;
     client
         .execute(
@@ -1356,7 +1356,7 @@ async fn migration_status_message_add_column_survives_a_populated_projection_tab
 async fn migration_37_adds_scope_name_version_idempotently_and_round_trips() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_scope_name_ver";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_scope_name_ver");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init (first run)");
@@ -1457,7 +1457,7 @@ async fn migration_37_adds_scope_name_version_idempotently_and_round_trips() {
 async fn migration_scope_name_version_add_column_survives_a_populated_projection_table() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_scope_ver_alter";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_scope_ver_alter");
     drop_database(&client, db).await;
     client
         .execute(
@@ -1568,7 +1568,7 @@ async fn migration_scope_name_version_add_column_survives_a_populated_projection
 async fn migration_shared_add_column_survives_a_populated_projection_table() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_traces_shared_alter";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_shared_alter");
     drop_database(&client, db).await;
     client
         .execute(

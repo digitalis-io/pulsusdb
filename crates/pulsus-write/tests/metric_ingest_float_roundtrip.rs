@@ -161,7 +161,7 @@ fn gauge_body(base_ms: i64) -> Vec<u8> {
         r#"{{"resourceMetrics":[{{"resource":{{"attributes":[
              {{"key":"service.name","value":{{"stringValue":"float-roundtrip"}}}}]}},
            "scopeMetrics":[{{"metrics":[
-             {{"name":"pulsus_it_ulp_gauge","gauge":{{"dataPoints":[{}]}}}}
+             {{"name":"pulsus_ulp_gauge_probe","gauge":{{"dataPoints":[{}]}}}}
            ]}}]}}]}}"#,
         points.join(",")
     )
@@ -171,7 +171,7 @@ fn gauge_body(base_ms: i64) -> Vec<u8> {
 #[tokio::test]
 async fn otlp_json_metrics_store_the_nearest_representable_f64_bits() {
     skip_unless_live!();
-    let db = "pulsus_write_it_metric_float_roundtrip";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_float_roundtrip");
     let client = fresh_db(db).await;
 
     let base_ms = i64::try_from(
@@ -212,7 +212,7 @@ async fn otlp_json_metrics_store_the_nearest_representable_f64_bits() {
     let sql = format!(
         "SELECT unix_milli, reinterpretAsUInt64(value) AS bits \
          FROM {db}.metric_samples \
-         WHERE metric_name = 'pulsus_it_ulp_gauge' ORDER BY unix_milli"
+         WHERE metric_name = 'pulsus_ulp_gauge_probe' ORDER BY unix_milli"
     );
     let mut rows: Vec<SampleBitsRow> = Vec::new();
     {

@@ -134,7 +134,7 @@ fn run_marker() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("pulsus_spread_it_{}_{nanos}", std::process::id())
+    pulsus_testkit::test_ident(&format!("pulsus_spread_it_{}_{nanos}", std::process::id()))
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize)]

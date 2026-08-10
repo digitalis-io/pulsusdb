@@ -129,7 +129,7 @@ async fn metric_metadata_a_to_b_to_a_collapses_to_the_latest_value_on_final_read
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_metric_metadata";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_metadata");
     drop_database(&bootstrap, db).await;
 
     let params = RenderCtx {
@@ -189,7 +189,7 @@ async fn metric_metadata_repeated_identical_descriptor_is_idempotent() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_metric_metadata_idempotent";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_metadata_idempotent");
     drop_database(&bootstrap, db).await;
 
     let params = RenderCtx {
@@ -260,7 +260,7 @@ async fn metric_series_same_bucket_samples_register_exactly_one_row() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_metric_series";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_series");
     drop_database(&bootstrap, db).await;
 
     let params = RenderCtx {
@@ -360,7 +360,7 @@ async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_write_it_metric_series_label_immutability";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_metric_series_label_immutability");
     drop_database(&bootstrap, db).await;
 
     let params = RenderCtx {

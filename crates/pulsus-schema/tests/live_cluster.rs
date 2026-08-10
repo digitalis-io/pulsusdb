@@ -36,8 +36,10 @@ const CLUSTER_NAME: &str = "pulsus_test_cluster";
 // Keeper (`REPLICA_ALREADY_EXISTS`) when two tests share a name; distinct
 // databases (and therefore distinct zoo paths, which are `{{db}}`-qualified)
 // sidestep the race entirely rather than papering over it with a retry.
-const TEST_DB_DIST: &str = "pulsus_schema_it_cluster_dist";
-const TEST_DB_BOOKKEEPING: &str = "pulsus_schema_it_cluster_bookkeeping";
+static TEST_DB_DIST: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_dist");
+static TEST_DB_BOOKKEEPING: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_schema_it_cluster_bookkeeping");
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -201,13 +203,13 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         .await
         .expect("drop test database on cluster");
 
-    let ctx = cluster_ctx(TEST_DB_DIST);
+    let ctx = cluster_ctx(&TEST_DB_DIST);
     run_init(&shard1, &ctx).await.expect("run_init (clustered)");
 
     // The DDL must be visible on BOTH shards — proof that `ON CLUSTER`
     // actually distributed it, not just created objects locally on shard1.
-    let names1 = table_names(&shard1, TEST_DB_DIST).await;
-    let names2 = table_names(&shard2, TEST_DB_DIST).await;
+    let names1 = table_names(&shard1, &TEST_DB_DIST).await;
+    let names2 = table_names(&shard2, &TEST_DB_DIST).await;
     assert_eq!(names1, names2, "DDL must land identically on every shard");
 
     let dist_tables = [
@@ -228,8 +230,8 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
             names1.contains(&table.to_string()),
             "missing {table} on shard1"
         );
-        let ddl1 = create_table_query(&shard1, TEST_DB_DIST, table).await;
-        let ddl2 = create_table_query(&shard2, TEST_DB_DIST, table).await;
+        let ddl1 = create_table_query(&shard1, &TEST_DB_DIST, table).await;
+        let ddl2 = create_table_query(&shard2, &TEST_DB_DIST, table).await;
         assert_eq!(
             ddl1, ddl2,
             "{table}'s CREATE statement must be identical on every shard"
@@ -248,7 +250,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     let metrics_exprs: Vec<String> = {
         let mut v = Vec::new();
         for t in metrics_dist {
-            v.push(create_table_query(&shard1, TEST_DB_DIST, t).await);
+            v.push(create_table_query(&shard1, &TEST_DB_DIST, t).await);
         }
         v
     };
@@ -263,7 +265,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         "log_metrics_5s_dist",
     ];
     for t in logs_dist {
-        let ddl = create_table_query(&shard1, TEST_DB_DIST, t).await;
+        let ddl = create_table_query(&shard1, &TEST_DB_DIST, t).await;
         assert!(ddl.contains(Family::Logs.sharding_expr()));
     }
 
@@ -273,7 +275,7 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         "trace_edges_dist",
     ];
     for t in traces_dist {
-        let ddl = create_table_query(&shard1, TEST_DB_DIST, t).await;
+        let ddl = create_table_query(&shard1, &TEST_DB_DIST, t).await;
         assert!(ddl.contains(Family::Traces.sharding_expr()));
     }
 
@@ -457,21 +459,21 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
         .await
         .expect("drop test database on cluster");
 
-    let ctx = cluster_ctx(TEST_DB_BOOKKEEPING);
+    let ctx = cluster_ctx(&TEST_DB_BOOKKEEPING);
     run_init(&shard1, &ctx).await.expect("run_init (clustered)");
 
     let (migrations1, migrations2) = poll_until_matching(|| async {
         (
             bookkeeping_rows::<MigrationRow>(
                 &shard1,
-                TEST_DB_BOOKKEEPING,
+                &TEST_DB_BOOKKEEPING,
                 "schema_migrations",
                 "id",
             )
             .await,
             bookkeeping_rows::<MigrationRow>(
                 &shard2,
-                TEST_DB_BOOKKEEPING,
+                &TEST_DB_BOOKKEEPING,
                 "schema_migrations",
                 "id",
             )
@@ -492,14 +494,14 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
         (
             bookkeeping_rows::<MvChecksumRow>(
                 &shard1,
-                TEST_DB_BOOKKEEPING,
+                &TEST_DB_BOOKKEEPING,
                 "mv_checksums",
                 "mv_name",
             )
             .await,
             bookkeeping_rows::<MvChecksumRow>(
                 &shard2,
-                TEST_DB_BOOKKEEPING,
+                &TEST_DB_BOOKKEEPING,
                 "mv_checksums",
                 "mv_name",
             )
@@ -521,14 +523,14 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
     // "identical"), not that it is populated.
     let metadata1 = bookkeeping_rows::<MetricMetadataRow>(
         &shard1,
-        TEST_DB_BOOKKEEPING,
+        &TEST_DB_BOOKKEEPING,
         "metric_metadata",
         "metric_name",
     )
     .await;
     let metadata2 = bookkeeping_rows::<MetricMetadataRow>(
         &shard2,
-        TEST_DB_BOOKKEEPING,
+        &TEST_DB_BOOKKEEPING,
         "metric_metadata",
         "metric_name",
     )
@@ -559,14 +561,14 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
         (
             bookkeeping_rows::<TraceTagRow>(
                 &shard1,
-                TEST_DB_BOOKKEEPING,
+                &TEST_DB_BOOKKEEPING,
                 "trace_tag_catalog",
                 "scope, key, val",
             )
             .await,
             bookkeeping_rows::<TraceTagRow>(
                 &shard2,
-                TEST_DB_BOOKKEEPING,
+                &TEST_DB_BOOKKEEPING,
                 "trace_tag_catalog",
                 "scope, key, val",
             )

@@ -224,7 +224,7 @@ fn day_start_ago(days_ago: i64) -> i64 {
 #[tokio::test]
 async fn patterns_read_prunes_at_the_primary_key_time_prefix_within_one_partition() {
     skip_unless_live!();
-    let db = format!("pulsus_patterns_it_{}", std::process::id());
+    let db = pulsus_testkit::test_db(&format!("pulsus_patterns_it_{}", std::process::id()));
     let client = Arc::new(ChClient::new(test_config()).await.expect("connect"));
     drop_database(&client, &db).await;
     run_init(&client, &test_ctx(&db))
@@ -290,7 +290,7 @@ async fn patterns_read_prunes_at_the_primary_key_time_prefix_within_one_partitio
 #[tokio::test]
 async fn patterns_read_prunes_daily_partitions() {
     skip_unless_live!();
-    let db = format!("pulsus_patterns_part_it_{}", std::process::id());
+    let db = pulsus_testkit::test_db(&format!("pulsus_patterns_part_it_{}", std::process::id()));
     let client = Arc::new(ChClient::new(test_config()).await.expect("connect"));
     drop_database(&client, &db).await;
     run_init(&client, &test_ctx(&db))
@@ -369,7 +369,7 @@ fn engine_config(db: &str) -> EngineConfig {
 #[tokio::test]
 async fn patterns_engine_assembles_ordered_series_with_exact_step_rebucketing() {
     skip_unless_live!();
-    let db = format!("pulsus_patterns_e2e_it_{}", std::process::id());
+    let db = pulsus_testkit::test_db(&format!("pulsus_patterns_e2e_it_{}", std::process::id()));
     let client = Arc::new(ChClient::new(test_config()).await.expect("connect"));
     drop_database(&client, &db).await;
     run_init(&client, &test_ctx(&db))

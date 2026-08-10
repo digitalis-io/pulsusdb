@@ -165,7 +165,7 @@ async fn silent_last_week_series_is_absent_from_the_cache_but_resolves_via_metri
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_silent";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_silent");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -241,7 +241,7 @@ async fn bucket_floor_boundary_includes_the_mid_bucket_row_and_excludes_the_late
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_bucket_floor";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_bucket_floor");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -296,7 +296,7 @@ async fn warm_cache_and_sql_fallback_return_identical_results() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_differential";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_differential");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -409,7 +409,7 @@ async fn a_cold_cache_falls_back_to_sql_with_the_same_result_a_warm_cache_would_
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_cold";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_cold");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -487,7 +487,7 @@ async fn stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refre
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_stale_differential";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_stale_differential");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -675,7 +675,7 @@ async fn a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_quote_key";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_quote_key");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -786,7 +786,7 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_sweep_mem";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_sweep_mem");
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await

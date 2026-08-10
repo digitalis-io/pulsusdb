@@ -207,7 +207,7 @@ async fn count(client: &ChClient, sql: &str) -> u64 {
 async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_full";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_full");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
@@ -350,7 +350,7 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
 async fn structured_metadata_column_is_additive_and_backward_compatible() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_sm";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_sm");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
@@ -461,7 +461,7 @@ async fn structured_metadata_column_is_additive_and_backward_compatible() {
 async fn reconcile_recreates_a_materialized_view_missing_from_system_tables() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_mv_absent";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_mv_absent");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
@@ -514,7 +514,7 @@ async fn reconcile_recreates_a_materialized_view_missing_from_system_tables() {
 async fn reconcile_recreates_a_materialized_view_whose_checksum_row_is_stale() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_mv_stale_checksum";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_mv_stale_checksum");
     drop_database(&client, db).await;
     let ctx = test_ctx(db);
 
@@ -624,7 +624,7 @@ fn family_sharding_expr_is_the_single_source_of_truth() {
 async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_retention_change";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_retention_change");
     drop_database(&client, db).await;
     let mut ctx = test_ctx(db);
     ctx.retention_days = 7;
@@ -700,7 +700,7 @@ async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
 async fn run_init_after_log_rollup_resolution_change_creates_new_table_and_retains_old() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_rollup_change";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_rollup_change");
     drop_database(&client, db).await;
     let mut ctx = test_ctx(db);
     ctx.log_rollup = Duration::from_secs(5);
@@ -769,7 +769,7 @@ fn new_ms_ttl_expr(ts_ms: i64, retention_days: u32) -> String {
 async fn metric_ttl_expression_is_equivalent_in_range_and_saturates_at_the_boundary() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_metric_ttl_expr";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_metric_ttl_expr");
     drop_database(&client, db).await;
     let mut ctx = test_ctx(db);
     run_init(&client, &ctx).await.expect("run_init");
@@ -871,7 +871,7 @@ async fn metric_ttl_expression_is_equivalent_in_range_and_saturates_at_the_bound
 async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl() {
     skip_unless_live!();
     let client = ChClient::new(test_config()).await.expect("connect");
-    let db = "pulsus_schema_it_ttl_boundary_2106";
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_ttl_boundary_2106");
     drop_database(&client, db).await;
     let ctx = test_ctx(db); // retention_days = 7; run_init applies the new TTL
     run_init(&client, &ctx).await.expect("run_init");

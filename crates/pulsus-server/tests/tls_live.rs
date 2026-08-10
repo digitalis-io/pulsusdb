@@ -149,7 +149,10 @@ fn tls_listener_serves_ready_and_config_and_rejects_plaintext() {
             "CLICKHOUSE_HTTP_PORT",
             std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
         )
-        .env("CLICKHOUSE_DB", "pulsus_tls_live_test")
+        .env(
+            "CLICKHOUSE_DB",
+            pulsus_testkit::test_db("pulsus_tls_live_it"),
+        )
         .spawn()
         .expect("spawn pulsusdb");
     let _guard = ChildGuard(child);

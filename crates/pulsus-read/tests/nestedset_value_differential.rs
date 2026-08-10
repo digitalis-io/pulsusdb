@@ -537,7 +537,7 @@ async fn nestedset_value_differential() {
         otlp_push(&otlp_base, &trace, &fx.spans);
 
         // PulsusDB: throwaway DB, real ingest + real search-path readback.
-        let db = format!("pulsus_nsdiff_it_{}", hex(&trace));
+        let db = pulsus_testkit::test_db(&format!("pulsus_nsdiff_it_{}", hex(&trace)));
         init_db(&bootstrap, &db).await;
         let client = ChClient::new(ch_config(&db)).await.expect("connect db");
         pulsus_insert(&client, &db, &trace, &fx.spans).await;

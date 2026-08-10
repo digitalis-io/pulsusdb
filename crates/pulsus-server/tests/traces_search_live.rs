@@ -26,6 +26,11 @@
 //! (hermetic) enumerates every declaration under `crates/*/tests` and
 //! fails if two collide.
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -39,7 +44,6 @@ use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -213,30 +217,6 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-async fn drop_db(db: &str) {
-    let cfg = ChConnConfig {
-        server: std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
-        http_port: std::env::var("PULSUS_TEST_CH_HTTP_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(19123),
-        database: "default".to_string(),
-        proto: ChProto::Http,
-        pool_size: 2,
-        query_timeout: Duration::from_secs(30),
-        ..ChConnConfig::default()
-    };
-    let client = ChClient::new(cfg).await.expect("connect for drop");
-    client
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop test database");
 }
 
 fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
@@ -480,7 +460,7 @@ async fn search_semantics_against_real_clickhouse() {
         return;
     }
     let port = 31_131;
-    let db = "pulsus_traces_search_it_a";
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_a");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[]);
 
@@ -1124,7 +1104,7 @@ async fn candidate_cap_partial_and_boundary_semantics() {
         return;
     }
     let port = 31_132;
-    let db = "pulsus_traces_search_it_b";
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_b");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_MAX_CANDIDATES", "3")]);
 
@@ -1295,7 +1275,7 @@ async fn scan_budget_breach_is_422_query_too_broad() {
         return;
     }
     let port = 31_133;
-    let db = "pulsus_traces_search_it_c";
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_c");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", "50")]);
 
@@ -1380,7 +1360,7 @@ async fn negation_demands_a_boolean_where_truthiness_tolerates_a_string() {
         return;
     }
     let port = 31_134;
-    let db = "pulsus_traces_search_it_d";
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_d");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[]);
 
@@ -1542,7 +1522,7 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
         return;
     }
     let port = 31_135;
-    let db = "pulsus_traces_search_it_e";
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_e");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[]);
 
@@ -1706,7 +1686,7 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
         return;
     }
     let port = 31_136;
-    let db = "pulsus_traces_search_it_f";
+    let db = &pulsus_testkit::test_db("pulsus_traces_search_it_f");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", "50")]);
 

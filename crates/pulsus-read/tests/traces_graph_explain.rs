@@ -69,7 +69,7 @@ fn test_ctx(db: &str) -> SchemaParams {
     }
 }
 
-const DB: &str = "pulsus_traces_graph_it";
+static DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_graph_it");
 /// Edge pairs seeded — one client + one server span each, so `trace_edges`
 /// holds `2 * PAIRS` rows across `DAYS` daily partitions.
 const PAIRS: u64 = 120_000;
@@ -251,9 +251,11 @@ async fn service_graph_tier1_gates() {
         .await
         .expect("connect");
     exec(&bootstrap, &format!("DROP DATABASE IF EXISTS {DB}")).await;
-    run_init(&bootstrap, &test_ctx(DB)).await.expect("run_init");
+    run_init(&bootstrap, &test_ctx(&DB))
+        .await
+        .expect("run_init");
 
-    let client = ChClient::new(test_config(DB)).await.expect("data client");
+    let client = ChClient::new(test_config(&DB)).await.expect("data client");
     let anchor = now_ns();
     seed_pairs(&client, anchor).await;
 
@@ -342,7 +344,9 @@ async fn service_graph_tier1_gates() {
     // -- Determinism + real decode: the engine's edges round-trip Vec<f64>
     //    and are byte-identical before/after OPTIMIZE ... FINAL ------------
     let engine = TraceEngine::new(
-        ChClient::new(test_config(DB)).await.expect("engine client"),
+        ChClient::new(test_config(&DB))
+            .await
+            .expect("engine client"),
         engine_config(50_000_000),
     );
     let before: ServiceGraph = engine.service_graph(full).await.expect("service_graph");
@@ -402,7 +406,7 @@ async fn service_graph_tier1_gates() {
 
     // -- Scan-budget 422: a tiny row budget trips code 158 -----------------
     let tiny = TraceEngine::new(
-        ChClient::new(test_config(DB)).await.expect("tiny client"),
+        ChClient::new(test_config(&DB)).await.expect("tiny client"),
         engine_config(1),
     );
     match tiny.service_graph(full).await {

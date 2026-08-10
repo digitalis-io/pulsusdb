@@ -368,7 +368,7 @@ async fn stage1_usage(db: &str, ts_ns: i64, client: &ChClient, query: &str) -> V
 #[tokio::test]
 async fn stage1_single_equality_uses_the_key_val_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s1_single";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s1_single");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -396,7 +396,7 @@ async fn stage1_single_equality_uses_the_key_val_primary_key() {
 #[tokio::test]
 async fn stage1_multi_equality_uses_the_key_val_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s1_multi";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s1_multi");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -430,7 +430,7 @@ async fn stage1_multi_equality_uses_the_key_val_primary_key() {
 #[tokio::test]
 async fn stage1_regex_matcher_uses_the_key_primary_key_prefix() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s1_regex";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s1_regex");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -463,7 +463,7 @@ async fn stage1_regex_matcher_uses_the_key_primary_key_prefix() {
 #[tokio::test]
 async fn stage1_mixed_positive_and_negative_matchers_uses_the_key_val_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s1_mixed";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s1_mixed");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -501,7 +501,7 @@ async fn stage1_mixed_positive_and_negative_matchers_uses_the_key_val_primary_ke
 #[tokio::test]
 async fn stage2_hydration_uses_the_fingerprint_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s2";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s2");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -579,7 +579,7 @@ fn expected_stage3_line_filter_usage() -> Vec<String> {
 #[tokio::test]
 async fn stage3_contains_line_filter_uses_the_primary_key_and_the_token_skip_index() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s3_contains";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_contains");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -596,7 +596,7 @@ async fn stage3_contains_line_filter_uses_the_primary_key_and_the_token_skip_ind
 #[tokio::test]
 async fn stage3_not_contains_line_filter_uses_the_primary_key_and_the_token_skip_index() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s3_not_contains";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_not_contains");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -613,7 +613,7 @@ async fn stage3_not_contains_line_filter_uses_the_primary_key_and_the_token_skip
 #[tokio::test]
 async fn stage3_regex_line_filter_over_a_plain_literal_uses_the_token_skip_index() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s3_regex";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_regex");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -631,7 +631,7 @@ async fn stage3_regex_line_filter_over_a_plain_literal_uses_the_token_skip_index
 async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_still_lists_the_body_skip_indexes()
  {
     skip_unless_live!();
-    let db = "pulsus_read_it_s3_not_regex";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_not_regex");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -660,7 +660,7 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_still_lists_t
 #[tokio::test]
 async fn stage3_line_filter_before_a_parser_keeps_the_exact_skip_index_usage() {
     skip_unless_live!();
-    let db = "pulsus_read_it_s3_parser_pushdown";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_parser_pushdown");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -711,7 +711,7 @@ async fn keyset_page_usage(
 #[tokio::test]
 async fn keyset_forward_page_keeps_the_primary_key_engaged_via_the_redundant_time_bound() {
     skip_unless_live!();
-    let db = "pulsus_read_it_keyset_fwd";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_keyset_fwd");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -739,7 +739,7 @@ async fn keyset_forward_page_keeps_the_primary_key_engaged_via_the_redundant_tim
 #[tokio::test]
 async fn keyset_backward_page_keeps_the_primary_key_engaged_via_the_redundant_time_bound() {
     skip_unless_live!();
-    let db = "pulsus_read_it_keyset_bwd";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_keyset_bwd");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -774,7 +774,7 @@ async fn keyset_backward_page_keeps_the_primary_key_engaged_via_the_redundant_ti
 #[tokio::test]
 async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_metric_range_sliding";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metric_range_sliding");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -816,7 +816,7 @@ async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp
 #[tokio::test]
 async fn volume_rollup_read_uses_the_fingerprint_bucket_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_volume_rollup";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_volume_rollup");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -852,7 +852,7 @@ async fn volume_rollup_read_uses_the_fingerprint_bucket_primary_key() {
 #[tokio::test]
 async fn detected_labels_aggregation_prunes_on_the_month_partition() {
     skip_unless_live!();
-    let db = "pulsus_read_it_detected_labels";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_detected_labels");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -917,7 +917,7 @@ async fn detected_labels_aggregation_prunes_on_the_month_partition() {
 #[tokio::test]
 async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
     skip_unless_live!();
-    let db = "pulsus_read_it_activity_subquery";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_activity_subquery");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -1010,7 +1010,7 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
 #[tokio::test]
 async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_series_all";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_series_all");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -1089,7 +1089,7 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
 #[tokio::test]
 async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_bucket_range() {
     skip_unless_live!();
-    let db = "pulsus_read_it_label_discovery_window";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_label_discovery_window");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -1189,7 +1189,7 @@ fn expected_metric_rollup_usage() -> Vec<String> {
 async fn metric_instant_read_routes_to_raw_and_uses_the_service_fingerprint_timestamp_primary_key()
 {
     skip_unless_live!();
-    let db = "pulsus_read_it_metric_instant_raw";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metric_instant_raw");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -1342,7 +1342,7 @@ fn promql_params(start_ms: i64, end_ms: i64, step_ms: i64) -> pulsus_promql::Pla
 #[tokio::test]
 async fn promql_at_fixed_metric_read_stays_on_the_metric_samples_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_promql_at";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_promql_at");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
     let now_ms = ts_ns / 1_000_000;
@@ -1369,7 +1369,7 @@ async fn promql_at_fixed_metric_read_stays_on_the_metric_samples_primary_key() {
 #[tokio::test]
 async fn promql_subquery_widened_metric_read_stays_on_the_metric_samples_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_promql_subq";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_promql_subq");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
     let now_ms = ts_ns / 1_000_000;
@@ -1401,7 +1401,7 @@ async fn promql_subquery_widened_metric_read_stays_on_the_metric_samples_primary
 #[tokio::test]
 async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_keys() {
     skip_unless_live!();
-    let db = "pulsus_read_it_promql_multi";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_promql_multi");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
     let now_ms = ts_ns / 1_000_000;
@@ -1479,7 +1479,7 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
 #[tokio::test]
 async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_limit_bounded() {
     skip_unless_live!();
-    let db = "pulsus_read_it_promql_info";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_promql_info");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
     let now_ms = ts_ns / 1_000_000;
@@ -1639,7 +1639,7 @@ async fn seed_metric_series(client: &ChClient, db: &str, now_ms: i64) {
 #[tokio::test]
 async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_keys() {
     skip_unless_live!();
-    let db = "pulsus_read_it_discovery_multi";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_discovery_multi");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
     let now_ms = ts_ns / 1_000_000;
@@ -1701,7 +1701,7 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
 #[tokio::test]
 async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_component() {
     skip_unless_live!();
-    let db = "pulsus_read_it_discovery_by_names";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_discovery_by_names");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
     let now_ms = ts_ns / 1_000_000;
@@ -1766,7 +1766,7 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
 #[tokio::test]
 async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagement() {
     skip_unless_live!();
-    let db = "pulsus_read_it_metrics_compile_probe";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_compile_probe");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
     let now_ms = ts_ns / 1_000_000;
@@ -1844,7 +1844,7 @@ async fn the_re2_compile_probe_costs_the_metric_series_fallback_no_index_engagem
 #[tokio::test]
 async fn m6_10_unpiped_count_over_time_range_slides_raw() {
     skip_unless_live!();
-    let db = "pulsus_read_it_m610_range_raw";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_m610_range_raw");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -1875,7 +1875,7 @@ async fn m6_10_unpiped_count_over_time_range_slides_raw() {
 #[tokio::test]
 async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_m610_client_raw";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_m610_client_raw");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -1924,7 +1924,7 @@ async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key(
 #[tokio::test]
 async fn a_grouped_range_aggregation_plans_the_same_single_raw_scan_as_its_ungrouped_twin() {
     skip_unless_live!();
-    let db = "pulsus_read_it_344_grouped_scan";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_344_grouped_scan");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -1984,7 +1984,7 @@ async fn a_grouped_range_aggregation_plans_the_same_single_raw_scan_as_its_ungro
 #[tokio::test]
 async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_metric_raw";
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metric_raw");
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 

@@ -1948,7 +1948,7 @@ async fn all_mode_auth_off_compat_on_full_matrix() {
         return;
     }
     let port = 31_180;
-    let db = "pulsus_api_conformance_it_full";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_full");
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
 
     for spec in route_manifest() {
@@ -1988,7 +1988,7 @@ async fn all_mode_auth_on_perimeter() {
         return;
     }
     let port = 31_181;
-    let db = "pulsus_api_conformance_it_auth";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_auth");
     let _guard = spawn_ready(
         port,
         db,
@@ -2099,7 +2099,7 @@ async fn all_mode_compat_off_alias_404() {
         return;
     }
     let port = 31_182;
-    let db = "pulsus_api_conformance_it_compat_off";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_compat_off");
     let _guard = spawn_ready(port, db, &[]); // PULSUS_COMPAT_ENDPOINTS unset => false.
 
     for spec in route_manifest() {
@@ -2145,7 +2145,7 @@ async fn writer_only_mode_reader_routes_404() {
         return;
     }
     let port = 31_183;
-    let db = "pulsus_api_conformance_it_writer_only";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_writer_only");
     // Review round-3 finding (medium): `PULSUS_COMPAT_ENDPOINTS=true` here
     // too, not just mode=writer — pins the actual gating interaction
     // (verified by reading `compat.rs::apply_aliases`: it checks
@@ -2206,7 +2206,7 @@ async fn reader_only_mode_writer_routes_404() {
         return;
     }
     let port = 31_184;
-    let db = "pulsus_api_conformance_it_reader_only";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_reader_only");
     let _guard = spawn_ready(port, db, &[("PULSUS_MODE", "reader")]);
 
     for spec in route_manifest() {
@@ -2293,7 +2293,7 @@ async fn reader_only_mode_compat_on_writer_compat_route_404() {
         return;
     }
     let port = 31_188;
-    let db = "pulsus_api_conformance_it_reader_compat_on";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_reader_compat_on");
     let _guard = spawn_ready(
         port,
         db,
@@ -2339,7 +2339,7 @@ async fn logql_scan_budget_query_too_broad_live_case() {
         return;
     }
     let port = 31_185;
-    let db = "pulsus_api_conformance_it_query_too_broad";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_query_too_broad");
     let _guard = spawn_ready(port, db, &[("PULSUS_LOGQL_SCAN_BUDGET_BYTES", "1")]);
 
     // Minimal seed (one stream, one sample — mirrors `logs_api_live.rs`'s
@@ -2425,7 +2425,7 @@ async fn tail_slot_exhaustion_returns_429_before_the_upgrade() {
         return;
     }
     let port = 31_187;
-    let db = "pulsus_api_conformance_it_tail_slots";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_tail_slots");
     let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_MAX_CONNECTIONS", "1")]);
 
     let target = "/api/logs/v1/tail?query=%7Bservice_name%3D%22checkout%22%7D";
@@ -2490,7 +2490,7 @@ async fn prom_query_string_literal_renders_result_type_string_live_case() {
         return;
     }
     let port = 31_186;
-    let db = "pulsus_api_conformance_it_string_result";
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_string_result");
     let _guard = spawn_ready(port, db, &[]);
 
     let ctx = "[spawn=all] GET /api/v1/query case=string-literal-200";

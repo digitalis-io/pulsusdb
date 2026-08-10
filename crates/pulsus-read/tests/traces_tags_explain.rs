@@ -76,7 +76,7 @@ fn test_ctx(db: &str) -> SchemaParams {
     }
 }
 
-const DB: &str = "pulsus_traces_tags_it";
+static DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_tags_it");
 /// Distinct values per (scope, key) — 10 keys × 2 scopes ×
 /// `VALS_PER_KEY` = 200k catalog rows, ~25 granules at the default 8192
 /// granularity: enough for granule-level discrimination on every shape.
@@ -225,12 +225,12 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
 
     let admin = ChClient::new(test_config()).await.expect("connect");
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB}")).await;
-    run_init(&admin, &test_ctx(DB)).await.expect("run_init");
+    run_init(&admin, &test_ctx(&DB)).await.expect("run_init");
 
     let mut cfg = test_config();
     cfg.database = DB.to_string();
     let client = ChClient::new(cfg).await.expect("connect data client");
-    seed_catalog(&client, DB).await;
+    seed_catalog(&client, &DB).await;
 
     let resource = ch_string("resource");
     let key = ch_string("k3");
@@ -479,7 +479,7 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let budget_db = format!("pulsus_traces_tags_budget_it_{nonce}");
+    let budget_db = pulsus_testkit::test_db(&format!("pulsus_traces_tags_budget_it_{nonce}"));
     let budget_db = budget_db.as_str();
 
     let admin = ChClient::new(test_config()).await.expect("connect");

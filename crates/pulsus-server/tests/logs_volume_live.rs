@@ -27,6 +27,11 @@
 //! (hermetic) enumerates every declaration under `crates/*/tests` and
 //! fails if two collide.
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -179,28 +184,6 @@ fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
     panic!("/ready never reached 200 within 60s (port {port}, db {db})");
 }
 
-async fn drop_db(db: &str) {
-    let admin = ChClient::new(ChConnConfig {
-        server: ch_host(),
-        http_port: ch_http_port(),
-        database: "default".to_string(),
-        proto: ChProto::Http,
-        pool_size: 2,
-        query_timeout: Duration::from_secs(30),
-        ..ChConnConfig::default()
-    })
-    .await
-    .expect("connect admin client");
-    admin
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop db");
-}
-
 /// One result entry's `(metric labels, value string)`.
 fn entries(json: &serde_json::Value) -> Vec<(serde_json::Value, String)> {
     json["data"]["result"]
@@ -223,7 +206,7 @@ async fn volume_modes_target_labels_limit_alias_and_zero_body_reads() {
         return;
     }
     let port = 31_148;
-    let db = "pulsus_volume_it_live";
+    let db = &pulsus_testkit::test_db("pulsus_volume_it_live");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
 

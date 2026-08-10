@@ -193,7 +193,7 @@ async fn zipkin_stored_spans_are_byte_identical_to_the_equivalent_otlp_ingest() 
     let dur = 1_500i64;
 
     // -- Zipkin side -----------------------------------------------------
-    let zdb = "pulsus_write_it_zipkin_identity_zipkin";
+    let zdb = &pulsus_testkit::test_db("pulsus_write_it_zipkin_identity_zipkin");
     let zclient = fresh_db(zdb).await;
     let zwriter = trace_writer(zdb).await;
     let zipkin_body = format!(
@@ -214,7 +214,7 @@ async fn zipkin_stored_spans_are_byte_identical_to_the_equivalent_otlp_ingest() 
     );
 
     // -- OTLP side: the hand-built equivalent ----------------------------
-    let odb = "pulsus_write_it_zipkin_identity_otlp";
+    let odb = &pulsus_testkit::test_db("pulsus_write_it_zipkin_identity_otlp");
     let oclient = fresh_db(odb).await;
     let owriter = trace_writer(odb).await;
     let otlp = ExportTraceServiceRequest {
@@ -278,7 +278,7 @@ async fn a_zipkin_shared_span_stores_both_the_server_and_client_sides() {
     skip_unless_live!();
 
     let ts = now_micros();
-    let db = "pulsus_write_it_zipkin_shared_span";
+    let db = &pulsus_testkit::test_db("pulsus_write_it_zipkin_shared_span");
     let client = fresh_db(db).await;
     let writer = trace_writer(db).await;
 

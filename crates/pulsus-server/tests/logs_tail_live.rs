@@ -64,6 +64,11 @@
 //! (hermetic) enumerates every declaration under `crates/*/tests` and
 //! fails if two collide.
 
+#[path = "support/live_db.rs"]
+mod live_db;
+
+use live_db::drop_db;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
@@ -168,28 +173,6 @@ async fn data_client(db: &str) -> ChClient {
     })
     .await
     .expect("connect data client")
-}
-
-async fn drop_db(db: &str) {
-    let admin = ChClient::new(ChConnConfig {
-        server: ch_host(),
-        http_port: ch_http_port(),
-        database: "default".to_string(),
-        proto: ChProto::Http,
-        pool_size: 2,
-        query_timeout: Duration::from_secs(30),
-        ..ChConnConfig::default()
-    })
-    .await
-    .expect("connect admin client");
-    admin
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop db");
 }
 
 /// Seeds one `log_streams` row whose `month` matches `at_ns` (stage-1
@@ -408,7 +391,7 @@ async fn tail_streams_new_rows_through_a_pipeline_in_order_exactly_once() {
         return;
     }
     let port = 31_140;
-    let db = "pulsus_tail_it_stream";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_stream");
     drop_db(db).await;
     let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_POLL_INTERVAL", "200ms")]);
     let client = data_client(db).await;
@@ -458,7 +441,7 @@ async fn tie_group_split_by_the_fetch_limit_is_delivered_exactly_once() {
         return;
     }
     let port = 31_141;
-    let db = "pulsus_tail_it_ties";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_ties");
     drop_db(db).await;
     let _guard = spawn_ready(
         port,
@@ -571,7 +554,7 @@ async fn engine_keyset_pages_resume_split_ties_and_honor_the_composite_cursor() 
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let db = "pulsus_tail_it_keyset";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_keyset");
     drop_db(db).await;
     init_schema(db);
     let client = data_client(db).await;
@@ -699,7 +682,7 @@ async fn tail_pages_and_range_query_deliver_identical_entry_sets() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
         return;
     }
-    let db = "pulsus_tail_it_diff";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_diff");
     drop_db(db).await;
     init_schema(db);
     let client = data_client(db).await;
@@ -831,7 +814,7 @@ async fn backlog_catch_up_is_slice_bounded_and_the_first_page_carries_the_start_
         return;
     }
     let port = 31_143;
-    let db = "pulsus_tail_it_backlog";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_backlog");
     drop_db(db).await;
     let _guard = spawn_ready(
         port,
@@ -963,7 +946,7 @@ async fn slow_consumer_backpressure_evicts_oldest_with_exact_drop_accounting() {
         return;
     }
     let port = 31_146;
-    let db = "pulsus_tail_it_slow";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_slow");
     drop_db(db).await;
     let _guard = spawn_ready(
         port,
@@ -1105,7 +1088,7 @@ async fn ancient_start_is_clamped_to_the_retention_floor_in_the_first_poll() {
     }
     const DAY_NS: i64 = 86_400_000_000_000;
     let port = 31_142;
-    let db = "pulsus_tail_it_clamp";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_clamp");
     drop_db(db).await;
     // Retention 1 day ⇒ clamp floor is now − 1·day − 1 partition-day slack
     // (issue #94). A 7-day catch-up slice makes the ~2-day clamped window a
@@ -1229,7 +1212,7 @@ async fn loki_tail_alias_streams_like_native() {
         return;
     }
     let port = 31_144;
-    let db = "pulsus_tail_it_alias";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_alias");
     drop_db(db).await;
     let _guard = spawn_ready(
         port,
@@ -1280,7 +1263,7 @@ async fn stage1_month_narrowing_keeps_an_older_registered_orphan_resolvable_via_
     }
     const DAY_NS: i64 = 86_400_000_000_000;
     let port = 31_147;
-    let db = "pulsus_tail_it_orphan";
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_orphan");
     drop_db(db).await;
 
     // B (sample month) and A (registration month): A is exactly TWO
@@ -1471,7 +1454,7 @@ async fn scan_gate_catches_a_gap_registration_via_the_qualifying_scan_then_narro
     );
 
     // -------------------- Phase 1 --------------------
-    let db1 = "pulsus_tail_it_scan_gate";
+    let db1 = &pulsus_testkit::test_db("pulsus_tail_it_scan_gate");
     drop_db(db1).await;
     init_schema(db1);
     let client1 = data_client(db1).await;
@@ -1620,7 +1603,7 @@ async fn scan_gate_catches_a_gap_registration_via_the_qualifying_scan_then_narro
     // tests) — F2's registration, inserted at the identical program
     // point, is never caught: a committed demonstration that the scan
     // gate is load-bearing.
-    let db2 = "pulsus_tail_it_scan_gate_strand";
+    let db2 = &pulsus_testkit::test_db("pulsus_tail_it_scan_gate_strand");
     drop_db(db2).await;
     init_schema(db2);
     let client2 = data_client(db2).await;

@@ -548,7 +548,7 @@ async fn compare_value_differential() {
     let bootstrap = ChClient::new(ch_config("default"))
         .await
         .expect("connect bootstrap");
-    let db = format!("pulsus_cmpdiff_it_{}", hex(&nonce));
+    let db = pulsus_testkit::test_db(&format!("pulsus_cmpdiff_it_{}", hex(&nonce)));
     init_db(&bootstrap, &db).await;
     let client = ChClient::new(ch_config(&db)).await.expect("connect db");
     pulsus_insert(&client, &db, &nonce, &spans).await;

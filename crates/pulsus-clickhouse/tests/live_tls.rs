@@ -79,7 +79,7 @@ async fn https_skip_verify_round_trips_an_insert_and_a_query_stream() {
     let client = ChClient::new(test_config())
         .await
         .expect("connect over HTTPS with tls_skip_verify=true against a self-signed cert");
-    let table = "pulsus_clickhouse_it_tls_roundtrip";
+    let table = &pulsus_testkit::test_ident("pulsus_clickhouse_it_tls_roundtrip");
 
     client
         .execute(

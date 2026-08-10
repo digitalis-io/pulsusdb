@@ -99,6 +99,14 @@
 //! guard can notice it. Two exist today (`pulsus-clickhouse/live_tls`,
 //! `pulsus-read/nestedset_value_differential`); the checked
 //! suite-to-CI-step inventory that would close that class is issue #323.
+//!
+//! # Naming a test database
+//!
+//! [`test_db`] is the single place a live suite's throwaway database name
+//! is composed, so that several checkouts can share one ClickHouse server.
+//! See its documentation, and the guard
+//! `crates/pulsus-server/tests/live_db_naming.rs`, which enforces that no
+//! suite composes such a name by hand.
 
 use std::fmt;
 
@@ -241,6 +249,191 @@ pub fn live_clickhouse_enabled() -> bool {
     live_gate_enabled(CLICKHOUSE_GATE)
 }
 
+// ---------------------------------------------------------------------
+// Test database naming
+// ---------------------------------------------------------------------
+
+/// Prepended to every name [`test_db`] composes, so that two checkouts
+/// running the same live suite against **one** ClickHouse server do not
+/// pick the same throwaway database and `DROP DATABASE` each other's data
+/// mid-run.
+///
+/// Unset — the default everywhere, including CI — the composed name is the
+/// bare one the suite asked for, so behaviour is exactly what it was
+/// before this variable existed.
+pub const DATABASE_PREFIX_VAR: &str = "PULSUS_TEST_CH_DATABASE_PREFIX";
+
+/// The longest database name ClickHouse will accept here. Its on-disk
+/// path component is escaped, so the real ceiling depends on the
+/// characters used; the value below is comfortably under it for the
+/// `[A-Za-z0-9_]` names this function admits, and the point of the check
+/// is to turn "an over-long prefix produces an opaque server-side error
+/// deep inside a live suite" into a message that names the variable.
+const MAX_DATABASE_NAME_LEN: usize = 200;
+
+/// Composes the name of a throwaway test database: `name`, prefixed with
+/// [`DATABASE_PREFIX_VAR`] when that variable is set.
+///
+/// ```text
+/// PULSUS_TEST_CH_DATABASE_PREFIX unset  -> "pulsus_read_it_s1_single"
+/// PULSUS_TEST_CH_DATABASE_PREFIX=wt3    -> "wt3_pulsus_read_it_s1_single"
+/// ```
+///
+/// Every live suite composes its database name through here and nowhere
+/// else; `crates/pulsus-server/tests/live_db_naming.rs` fails the build if
+/// a suite writes one itself.
+///
+/// # Panics
+///
+/// The result is interpolated straight into `CREATE DATABASE {db}` /
+/// `DROP DATABASE IF EXISTS {db}` by every caller, unquoted. So both parts
+/// are checked rather than trusted: `name` must be a non-empty
+/// `[A-Za-z0-9_]` word starting with a letter or `_`, the prefix must be
+/// the same shape, and the composed name must not exceed
+/// [`MAX_DATABASE_NAME_LEN`]. A bad value panics naming the offender —
+/// during a test, which is the only place this crate is ever linked.
+///
+/// Some prefix values are accepted rather than refused. Each is
+/// deliberate:
+///
+/// * **A blank prefix reads as unset.** `PULSUS_TEST_CH_DATABASE_PREFIX=`
+///   composes the bare name rather than `_pulsus_…`, so unsetting the
+///   variable and emptying it mean the same thing
+///   (`an_empty_or_blank_prefix_reads_as_unset`).
+/// * **Surrounding whitespace is trimmed.** `" wt3 "` and `"wt3"` compose
+///   the same database, so trimming costs no isolation — that is the
+///   whole justification. (A previous revision of this comment blamed
+///   `export …=$(cat .prefix)`; that is false — bash command substitution
+///   strips trailing newlines, measured: `$(printf 'wt3\n')` yields the
+///   bytes `77 74 33`. Recorded so the story is not reinvented.) The trim
+///   is not dead code: a quoted assignment does carry whitespace into a
+///   child's environment, measured — `C="wt3 "` reaches `env` as
+///   `C=wt3 `.
+///
+/// "Whitespace" here means whatever [`str::trim`] strips, whatever that
+/// is in the toolchain you are building with — the tests do not enumerate
+/// it, they derive it by running `trim` over every Unicode scalar value.
+/// Both halves are checked across that whole derived set: each such
+/// character is absorbed at an end
+/// (`every_character_trim_strips_is_absorbed_at_a_prefix_end`) and
+/// refused *inside* a prefix, where it would change the composed name
+/// (`every_character_trim_strips_is_refused_inside_a_prefix`). So this
+/// paragraph cannot go stale when Rust's definition of whitespace grows.
+pub fn test_db(name: &str) -> String {
+    test_ident(name)
+}
+
+/// [`test_db`]'s composition for the other server-side names a live test
+/// creates inside a database it does **not** own — a table in `default`,
+/// or the `query_id` it later looks up in `system.query_log`. Those
+/// collide between two concurrent checkouts exactly as a database name
+/// does, and they are prefixed by the same variable for the same reason.
+///
+/// # Panics
+///
+/// As [`test_db`].
+pub fn test_ident(name: &str) -> String {
+    let prefix = std::env::var(DATABASE_PREFIX_VAR).ok();
+    compose_db_name(prefix.as_deref(), name)
+}
+
+/// [`test_db`]'s whole decision as a pure function of the prefix reading —
+/// testable without mutating process environment (`std::env::set_var` is
+/// `unsafe` in edition 2024 and racy under a threaded harness besides).
+fn compose_db_name(prefix: Option<&str>, name: &str) -> String {
+    if let Err(why) = check_identifier(name) {
+        panic!(
+            "test database name {name:?} is not usable unquoted in `CREATE DATABASE`: {why}. \
+             Name it with ASCII letters, digits and underscores only."
+        );
+    }
+    // Trim, and treat blank as unset — both deliberate, both justified in
+    // [`test_db`]'s `# Panics` section. Surrounding whitespace cannot
+    // change which database is named, so absorbing it costs no isolation.
+    let composed = match prefix.map(str::trim).filter(|p| !p.is_empty()) {
+        None => name.to_string(),
+        Some(prefix) => {
+            if let Err(why) = check_identifier(prefix) {
+                panic!(
+                    "{DATABASE_PREFIX_VAR}={prefix:?} is not a usable database-name prefix: \
+                     {why}. Set it to a short ASCII word such as `wt3`."
+                );
+            }
+            format!("{prefix}_{name}")
+        }
+    };
+    assert!(
+        composed.len() <= MAX_DATABASE_NAME_LEN,
+        "composed test database name {composed:?} is {} characters, over the {MAX_DATABASE_NAME_LEN} \
+         this project allows — shorten {DATABASE_PREFIX_VAR}",
+        composed.len()
+    );
+    composed
+}
+
+/// A suite-wide test database name, composed once on first use.
+///
+/// The `const DB: &str = "pulsus_…_it";` that several suites used before
+/// the prefix existed cannot survive as a `const`, because the name is now
+/// a function of the environment. `static DB: TestDb = TestDb::new("…");`
+/// replaces it without disturbing the interpolations: `TestDb` is
+/// [`Display`](fmt::Display), so `format!("DROP DATABASE {DB}")` and
+/// `DB.to_string()` keep working, and it derefs to `str`, so `&DB` passes
+/// anywhere a `&str` was passed before.
+#[derive(Debug)]
+pub struct TestDb {
+    base: &'static str,
+    composed: std::sync::OnceLock<String>,
+}
+
+impl TestDb {
+    /// Declares the suite's database. `base` is the unprefixed name; the
+    /// prefix is read the first time [`TestDb::name`] is called, never at
+    /// declaration time.
+    pub const fn new(base: &'static str) -> Self {
+        Self {
+            base,
+            composed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The composed name. Panics on the same inputs [`test_db`] does.
+    pub fn name(&self) -> &str {
+        self.composed.get_or_init(|| test_db(self.base))
+    }
+}
+
+impl fmt::Display for TestDb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::ops::Deref for TestDb {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.name()
+    }
+}
+
+/// `Ok` iff `s` is a non-empty `[A-Za-z_][A-Za-z0-9_]*`. A leading digit
+/// is refused as well as punctuation: ClickHouse needs such a name
+/// backquoted, and every call site interpolates the result bare.
+fn check_identifier(s: &str) -> Result<(), String> {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return Err("it is empty".to_string());
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(format!("it starts with {first:?}, not a letter or `_`"));
+    }
+    if let Some(bad) = chars.find(|c| !(c.is_ascii_alphanumeric() || *c == '_')) {
+        return Err(format!("it contains {bad:?}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +523,247 @@ mod tests {
     fn the_suite_name_strips_cargos_binary_hash_suffix() {
         assert!(!suite_name().is_empty());
         assert!(!suite_name().contains('/'));
+    }
+
+    // -----------------------------------------------------------------
+    // Test database naming
+    // -----------------------------------------------------------------
+
+    /// The default has to be byte-for-byte what the suites used before the
+    /// prefix existed, or every committed EXPLAIN/SQL expectation that
+    /// interpolates the database name would have to move with it.
+    #[test]
+    fn no_prefix_leaves_the_name_exactly_as_the_suite_wrote_it() {
+        assert_eq!(
+            compose_db_name(None, "pulsus_read_it_s1_single"),
+            "pulsus_read_it_s1_single"
+        );
+    }
+
+    /// An empty or whitespace-only value reads as "unset": exporting
+    /// `PULSUS_TEST_CH_DATABASE_PREFIX=` must not produce `_pulsus_…`.
+    #[test]
+    fn an_empty_or_blank_prefix_reads_as_unset() {
+        assert_eq!(compose_db_name(Some(""), "pulsus_x_it"), "pulsus_x_it");
+        assert_eq!(compose_db_name(Some("   "), "pulsus_x_it"), "pulsus_x_it");
+    }
+
+    #[test]
+    fn a_prefix_is_joined_to_the_name_with_one_underscore() {
+        assert_eq!(
+            compose_db_name(Some("wt3"), "pulsus_x_it"),
+            "wt3_pulsus_x_it"
+        );
+        assert_eq!(
+            compose_db_name(Some("agent_b"), "pulsus_x_it"),
+            "agent_b_pulsus_x_it"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Trimming, over the whole set of characters `str::trim` strips.
+    //
+    // Review finding (PR #424, round 3): the previous version of these
+    // tests wrote out a handful of spellings by hand and claimed to cover
+    // "every whitespace character `str::trim` would have removed". It did
+    // not, and a hand-written list beside an "every" is the defect this
+    // branch had already produced once before. So the set is derived
+    // instead of enumerated: [`characters_trim_strips`] computes it by
+    // running `trim`, and a character added to Rust's definition in a
+    // future toolchain is picked up on the next run.
+    //
+    // The derivation is the mechanism, and it is what is verified. To see
+    // which characters are in the set, run the tests below.
+    // -----------------------------------------------------------------
+
+    /// The characters [`str::trim`] strips, **derived by running `trim`**
+    /// rather than copied out of its documentation.
+    ///
+    /// Every Unicode scalar value is tried; `c` is kept when the
+    /// one-character string `c` trims to nothing, which is exactly the
+    /// condition under which `trim` removes `c` from an end. The scan is
+    /// the whole scalar range — `char::from_u32` skips the surrogate gap
+    /// — so there is no boundary for a character to hide behind.
+    fn characters_trim_strips() -> Vec<char> {
+        (0..=u32::from(char::MAX))
+            .filter_map(char::from_u32)
+            .filter(|c| c.to_string().trim().is_empty())
+            .collect()
+    }
+
+    /// Checks the derivation, **not** the set it produced.
+    ///
+    /// A sweep over an empty (or universal) set passes vacuously, so this
+    /// asserts that [`characters_trim_strips`] found the characters any
+    /// working `trim` must strip and did not classify an ordinary letter
+    /// as whitespace.
+    ///
+    /// The characters below are named on purpose: they are the probe, and
+    /// a probe has to be written down.
+    fn assert_derivation_is_sane(ws: &[char]) {
+        for anchor in [' ', '\t', '\n', '\r'] {
+            assert!(
+                ws.contains(&anchor),
+                "deriving the trim set found {} characters and not {anchor:?} — the derivation is \
+                 broken, so anything it appears to prove is vacuous",
+                ws.len()
+            );
+        }
+        assert!(
+            !ws.contains(&'w'),
+            "the derivation classified an ordinary letter as whitespace"
+        );
+    }
+
+    /// Every character `trim` strips is absorbed at a prefix end: the
+    /// composed database is the same one the bare prefix names, and a
+    /// prefix made only of such characters reads as unset. `" wt3 "` and
+    /// `"wt3"` naming the same database is the whole justification for
+    /// trimming rather than refusing — see the note in `test_db`'s docs,
+    /// which also records the *false* justification a previous revision
+    /// gave for it.
+    #[test]
+    fn every_character_trim_strips_is_absorbed_at_a_prefix_end() {
+        let ws = characters_trim_strips();
+        assert_derivation_is_sane(&ws);
+        for c in &ws {
+            assert_eq!(
+                compose_db_name(Some(&format!("{c}wt3{c}")), "pulsus_x_it"),
+                "wt3_pulsus_x_it",
+                "a prefix wrapped in {c:?} must name the same database as \"wt3\""
+            );
+            assert_eq!(
+                compose_db_name(Some(&c.to_string()), "pulsus_x_it"),
+                "pulsus_x_it",
+                "a prefix of nothing but {c:?} must read as unset"
+            );
+        }
+    }
+
+    /// …and every character `trim` strips is refused *inside* a prefix,
+    /// where it would change the composed name. Iterated from the same
+    /// derivation as the test above, so absorbing at an end and refusing
+    /// in the middle cannot silently converge on a character neither test
+    /// happens to mention.
+    #[test]
+    fn every_character_trim_strips_is_refused_inside_a_prefix() {
+        let ws = characters_trim_strips();
+        assert_derivation_is_sane(&ws);
+        for c in &ws {
+            let spelling = format!("wt{c}3");
+            let err = std::panic::catch_unwind(|| compose_db_name(Some(&spelling), "pulsus_x_it"))
+                .expect_err("whitespace inside a prefix must panic");
+            let msg = err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or("<non-string panic payload>");
+            assert!(
+                msg.contains("is not a usable database-name prefix"),
+                "{c:?} inside a prefix: {msg}"
+            );
+        }
+    }
+
+    /// Two different prefixes never compose to the same database — the
+    /// whole point of the variable.
+    #[test]
+    fn two_prefixes_never_collide_on_one_suite_name() {
+        assert_ne!(
+            compose_db_name(Some("a"), "pulsus_x_it"),
+            compose_db_name(Some("b"), "pulsus_x_it")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a usable database-name prefix")]
+    fn a_prefix_with_punctuation_is_refused() {
+        // `DROP DATABASE x; DROP DATABASE pulsus_x_it` would otherwise be
+        // two statements.
+        let _ = compose_db_name(Some("x; DROP DATABASE y"), "pulsus_x_it");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a usable database-name prefix")]
+    fn a_prefix_starting_with_a_digit_is_refused() {
+        let _ = compose_db_name(Some("3wt"), "pulsus_x_it");
+    }
+
+    #[test]
+    #[should_panic(expected = "not usable unquoted")]
+    fn a_name_with_punctuation_is_refused() {
+        let _ = compose_db_name(None, "pulsus-x-it");
+    }
+
+    #[test]
+    #[should_panic(expected = "not usable unquoted")]
+    fn an_empty_name_is_refused() {
+        let _ = compose_db_name(Some("wt3"), "");
+    }
+
+    /// A name left un-substituted by a missing `format!` argument (`{}`)
+    /// must not reach ClickHouse as a database name.
+    #[test]
+    #[should_panic(expected = "not usable unquoted")]
+    fn an_unsubstituted_format_placeholder_is_refused() {
+        let _ = compose_db_name(None, "pulsus_x_it_{nonce}");
+    }
+
+    /// The length ceiling, driven from the constant rather than from a
+    /// literal repeated in prose: a prefix long enough to breach it
+    /// whatever the constant is set to.
+    #[test]
+    fn an_over_long_composed_name_is_refused() {
+        let err = std::panic::catch_unwind(|| {
+            compose_db_name(Some(&"p".repeat(MAX_DATABASE_NAME_LEN)), "pulsus_x_it")
+        })
+        .expect_err("a name over the ceiling must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            msg.contains(&format!("over the {MAX_DATABASE_NAME_LEN}")),
+            "{msg}"
+        );
+    }
+
+    /// `TestDb` has to interpolate and coerce exactly like the `&str`
+    /// constant it replaces, or migrating a suite to it would mean
+    /// rewriting every `format!("… {DB} …")` in the file.
+    #[test]
+    fn a_test_db_interpolates_and_derefs_like_the_str_constant_it_replaces() {
+        static DB: TestDb = TestDb::new("pulsus_x_it");
+        fn takes_str(s: &str) -> usize {
+            s.len()
+        }
+        let expected = test_db("pulsus_x_it");
+        assert_eq!(
+            format!("DROP DATABASE {DB}"),
+            format!("DROP DATABASE {expected}")
+        );
+        assert_eq!(DB.to_string(), expected);
+        assert_eq!(DB.name(), expected);
+        assert_eq!(takes_str(&DB), expected.len());
+    }
+
+    /// The name is composed once and then stable, so a suite that
+    /// interpolates it throughout a suite names one database.
+    #[test]
+    fn a_test_db_composes_its_name_once() {
+        static DB: TestDb = TestDb::new("pulsus_y_it");
+        assert_eq!(DB.name(), DB.name());
+        assert!(std::ptr::eq(DB.name(), DB.name()));
+    }
+
+    /// The public entry point reads the documented variable. Asserted
+    /// without mutating the environment: whatever the ambient value is,
+    /// `test_db` must agree with `compose_db_name` on it.
+    #[test]
+    fn test_db_reads_the_documented_variable() {
+        let ambient = std::env::var(DATABASE_PREFIX_VAR).ok();
+        assert_eq!(
+            test_db("pulsus_x_it"),
+            compose_db_name(ambient.as_deref(), "pulsus_x_it")
+        );
     }
 }
