@@ -302,8 +302,7 @@ const MAX_DATABASE_NAME_LEN: usize = 200;
 ///   (`an_empty_or_blank_prefix_reads_as_unset`).
 /// * **Surrounding whitespace is trimmed.** `" wt3 "` and `"wt3"` compose
 ///   the same database, so trimming costs no isolation — that is the
-///   whole justification, and no claim is made here about how such a
-///   value would arise. (A previous revision of this comment blamed
+///   whole justification. (A previous revision of this comment blamed
 ///   `export …=$(cat .prefix)`; that is false — bash command substitution
 ///   strips trailing newlines, measured: `$(printf 'wt3\n')` yields the
 ///   bytes `77 74 33`. Recorded so the story is not reinvented.) The trim
