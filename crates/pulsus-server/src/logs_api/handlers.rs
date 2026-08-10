@@ -213,7 +213,7 @@ pub(super) async fn read_form_pairs(
 ///
 /// Space stripping is ASCII space only (`strings.ReplaceAll(matcher, " ",
 /// "")`): `{ }` collapses, a tab does not — so no `trim`/`is_whitespace`.
-fn series_groups<'a>(pairs: &'a [(String, String)]) -> Vec<&'a str> {
+fn series_groups(pairs: &[(String, String)]) -> Vec<&str> {
     let mut groups: Vec<&str> = params::get_all(pairs, "match");
     groups.extend(params::get_all(pairs, "match[]"));
     groups.sort_unstable();
@@ -1011,7 +1011,13 @@ mod tests {
     async fn query_range_post_rejects_a_non_form_content_type() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        let res = query_range_post(State(test_state()), headers, RawQuery(None), Bytes::from_static(b"{}")).await;
+        let res = query_range_post(
+            State(test_state()),
+            headers,
+            RawQuery(None),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -1036,7 +1042,13 @@ mod tests {
             header::CONTENT_TYPE,
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
-        let res = query_post(State(test_state()), headers, RawQuery(None), Bytes::from_static(b"")).await;
+        let res = query_post(
+            State(test_state()),
+            headers,
+            RawQuery(None),
+            Bytes::from_static(b""),
+        )
+        .await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -1147,13 +1159,13 @@ mod tests {
 
         let explicit = end_ns - 12_345_000_000_000;
         let (start, _end) = bounds(&format!("start={explicit}&end={end_ns}&since=30m"));
-        assert_eq!(start, explicit, "`since` is ignored when `start` is present");
+        assert_eq!(
+            start, explicit,
+            "`since` is ignored when `start` is present"
+        );
 
         let err = parse_bounds(&params::parse_pairs("since=bogus")).expect_err("400");
-        assert!(matches!(
-            err,
-            ApiError::Param(ParamError::InvalidSince(_))
-        ));
+        assert!(matches!(err, ApiError::Param(ParamError::InvalidSince(_))));
     }
 
     /// Issue #406 Part C, the `endOrNow` clamp — the one row that changes
@@ -1186,7 +1198,13 @@ mod tests {
     async fn series_post_rejects_a_non_form_content_type() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        let res = series_post(State(test_state()), headers, RawQuery(None), Bytes::from_static(b"{}")).await;
+        let res = series_post(
+            State(test_state()),
+            headers,
+            RawQuery(None),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }

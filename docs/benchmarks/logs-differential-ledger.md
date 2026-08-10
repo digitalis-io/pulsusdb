@@ -2493,6 +2493,50 @@ The 131,072-byte `MAX_QUERY_BYTES` cap (docs/api.md §2.3, the reference's
 `maxInputSize`) matches the reference exactly at the parse seam. Its one
 divergence is a transport-layer bound discovered while shipping it.
 
+### `shards-no-pulsus-counterpart` (issue #406, informational note, not a gate downgrade)
+
+No fixture case references this entry — nothing is downgraded. It records
+a request parameter the reference reads on five routes we mount and that
+PulsusDB deliberately does not implement.
+
+- **What diverges:** `shards` is read through the repeated seam
+  (`r.Form["shards"]`, `pkg/loghttp/params.go:79-81` @ grafana/loki
+  v3.7.4 `b318f2829f0ae2094ab3a1e90780450e9e4b03be`) on `query_range`,
+  `query`, `series`, `index/stats` and `index/volume`. It names TSDB index
+  shards for the query frontend to fan a query across. PulsusDB has no
+  such object: sharding is ClickHouse's, decided by the cluster's own
+  `fingerprint`-keyed distribution (docs/schemas.md §7), and there is no
+  client-addressable shard identifier to accept.
+- **Reference behaviour, container-measured 2026-08-10 against
+  `grafana/loki:3.7.4` on a 160-entry, 3-stream corpus:** `?shards=` and
+  `?shards=bogus` are **`500`** on `/query_range` and `/query` — the
+  reference renders a client error as a server error here — and inert
+  (`200`) on `/series` and `/labels`.
+- **PulsusDB behaviour:** the parameter is accepted and ignored (`200`),
+  the same answer as omitting it.
+- **Why not implement it:** copying the parameter would mean either
+  inventing a shard identifier with no meaning in our storage layout, or
+  reproducing a `500` on a malformed client value. Neither is a behaviour
+  worth having. Recorded rather than silently dropped so the absence is a
+  decision with a date on it.
+
+### `storechunks-no-pulsus-counterpart` (issue #406, informational note, not a gate downgrade)
+
+No fixture case references this entry — nothing is downgraded.
+
+- **What diverges:** `storeChunks` is read on `query_range` and `query`
+  (`pkg/querier/queryrange/codec.go:2328` @ grafana/loki v3.7.4
+  `b318f282`), an undocumented escape hatch carrying a serialized chunk
+  reference set so a query can be replayed against specific stored chunks.
+  It is a debugging affordance over the reference's own chunk store.
+- **Reference behaviour, container-measured 2026-08-10:** a garbage value
+  is a `400`.
+- **PulsusDB behaviour:** accepted and ignored (`200`).
+- **Why not implement it:** PulsusDB stores log lines as ClickHouse rows,
+  not as chunk objects; there is no chunk reference for a client to name,
+  so there is nothing the parameter could select. It is also undocumented
+  upstream, so no client can depend on it by contract.
+
 ### `get-request-target-uri-bound` (issue #279, informational note, not a gate downgrade)
 
 No fixture case references this entry — nothing is downgraded. It records

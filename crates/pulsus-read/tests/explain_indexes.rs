@@ -994,6 +994,96 @@ async fn detected_labels_activity_subquery_prunes_the_rollup_by_bucket_range() {
     );
 }
 
+/// Issue #406 Part A — the two statements `/series` with no `match[]`
+/// renders. The branch introduces NO new SQL shape: statement one is
+/// `sql::active_fingerprints(rollup, None, …)`, already production SQL for
+/// `/labels`, `/label/{name}/values` and `/detected_labels`, and statement
+/// two is the byte-pinned `sql::stage2`. What this case adds over the
+/// pieces' existing coverage is the PAIRING — the unmatched path engages
+/// the rollup's `bucket_ns` MinMax/PrimaryKey and then `log_streams`'
+/// `fingerprint` primary key, with no `log_streams_idx` stage 1 between
+/// them and no `log_samples` read at all.
+///
+/// The `Parts: m/n` check on the first statement is what carries the
+/// pruning claim: `index_usage` drops those counts, so a `Condition:` that
+/// pruned nothing would still match the extract.
+#[tokio::test]
+async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primary_key() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_series_all";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    // Four distinct DAY partitions of rollup rows; the window covers one.
+    const DAY_NS: i64 = 86_400_000_000_000;
+    for day in 1..=4i64 {
+        let bucket = (ts_ns - day * DAY_NS) / ROLLUP_RES_NS as i64 * ROLLUP_RES_NS as i64;
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_metrics_5s (fingerprint, bucket_ns, count, bytes) \
+                     VALUES ({FP_PROD}, {bucket}, 1, 10)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed rollup day partition");
+    }
+
+    let rollup = format!("{db}.log_metrics_5s");
+    let window = TimeWindow {
+        start_ns: ts_ns - DAY_NS - 3_600_000_000_000,
+        end_ns: ts_ns - DAY_NS + 3_600_000_000_000,
+    };
+
+    // Statement 1 — the UNSCOPED activity scan (`fingerprints: None`),
+    // exactly what `all_active_fingerprints` dispatches.
+    let activity = sql::active_fingerprints(&rollup, None, window, ROLLUP_RES_NS);
+    let raw = explain_raw(&client, &activity).await;
+    assert_eq!(
+        index_usage(&raw),
+        v(&[
+            "MinMax",
+            "Keys:",
+            "bucket_ns",
+            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "bucket_ns",
+            "Condition: and((bucket_ns in (-Inf, #]), (bucket_ns in [#, +Inf)))",
+        ])
+    );
+    let (selected, total) = parts_selected(&raw).expect("a MinMax Parts: m/n line");
+    assert!(
+        total >= 4,
+        "the fixture must offer at least four day partitions to prune from, saw {total}\n{raw}"
+    );
+    assert!(
+        selected < total,
+        "the unmatched /series activity scan must prune parts: {selected}/{total}\n{raw}"
+    );
+
+    // Statement 2 — hydration over whatever statement 1 returned, on
+    // `log_streams`' `ORDER BY fingerprint` primary key.
+    let streams = format!("{db}.log_streams");
+    assert_eq!(
+        explain(&client, &sql::stage2(&streams, &[FP_PROD])).await,
+        v(&[
+            "MinMax",
+            "Condition: true",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "fingerprint",
+            "Condition: (fingerprint in #-element set)",
+        ])
+    );
+}
+
 /// Issue #399 AC15 — `/labels` and `/label/{name}/values` keep their
 /// month partition pruning and gain the same activity semi-join.
 #[tokio::test]

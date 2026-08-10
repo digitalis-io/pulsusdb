@@ -10,7 +10,7 @@ PulsusDB exposes two API surfaces:
 Conventions:
 
 - Default listener: `0.0.0.0:3100`. All endpoints relative to that root.
-- Timestamps: log APIs use nanoseconds; metrics APIs use RFC3339 or unix seconds; trace APIs accept unix seconds/nanoseconds/RFC3339.
+- Timestamps: the log APIs read an integer `start`/`end`/`time` as unix **seconds** when the value is **ten characters or fewer** and as unix **nanoseconds** otherwise — the test is the length of the string, not the magnitude of the number, so `1786342706` is 2026 and `01786342706` is 1970 (§2). A value containing `.` is seconds with a fraction, rounded to milliseconds, at any length; anything else is RFC3339. Metrics APIs use RFC3339 or unix seconds; trace APIs accept unix seconds/nanoseconds/RFC3339 (magnitude-based there: `>= 10^12` is nanoseconds — a different rule from a different reference, deliberately not unified).
 - Errors: the log query API (§2) and the trace query API (§4) return a bare `text/plain` body carrying the message and nothing else — but not the same container: §2 also sets `X-Content-Type-Options: nosniff` and §4 does not, because their references differ (see §2.3 and §4). The metrics API (§3) returns a `{"status":"error","errorType":...,"error":...}` JSON envelope, because upstream Prometheus does. `429` on ingest backpressure; `400` for malformed queries.
 - Compression: requests may be `gzip`, `snappy`, or `zstd` (`Content-Encoding`); responses gzip when accepted.
 - Regular expressions: RE2 in every query language — §9 documents the dialect and the measured differences from Loki/Prometheus/Tempo.
@@ -99,18 +99,59 @@ each container-measured against `grafana/loki:3.7.4` rather than inferred:
   identical to omitting `query` (§2.1-§2.2, §2.5, §2.6), because absent is
   what empty means here.
 
-The one exception is `match[]`, the only **repeated** parameter on this
-surface — see §2.3.
+The one exception is `match` / `match[]`, the only **repeated** parameters
+on this surface — see §2.3.
+
+**Timestamps: ten characters or fewer means unix seconds** (issue #406).
+`?start=1786341082&end=1786341542` — the form a Prometheus-style client
+sends by default — is a 460-second window, not a 460-nanosecond one.
+`parseTimestamp` (`pkg/loghttp/params.go:161-186` @ grafana/loki v3.7.4
+`b318f2829f0ae2094ab3a1e90780450e9e4b03be`) switches on `len(value) <= 10`,
+which is the length of the **string**: `01786342706` is eleven characters
+because of the leading zero and is read as nanoseconds, landing in 1970.
+A value containing `.` is seconds with a fraction whatever its length, and
+the fraction is rounded to **three decimal places** before it becomes
+nanoseconds (`1786342706.123456` is `…26.123`). Anything else is RFC3339.
+One deviation: PulsusDB's timestamp domain is `i64` nanoseconds
+(≈1677-09-21 to 2262-04-11), so a seconds value outside it — `9999999999`,
+which the reference reads as the year 2286 — is a `400`, exactly as the
+RFC3339 spelling of that instant already was.
+
+**`since` sets the default `start`** (issue #406). Read on every route in
+§2.1 and §2.3-§2.6 — everything carrying a `start`/`end` pair, i.e. all but
+§2.2's instant `/query` — as a duration literal defaulting to `1h`, and
+used **only when `start` is absent**. An unparseable value is a `400`, not
+silently ignored. The default is `min(end, now) - since`, not
+`end - since`: a future `end` does not drag the default `start` into the
+future with it (the reference's `endOrNow`, `params.go:105-111`).
+
+**`end` before `start` is a `400`** on `/query_range`, `/labels`,
+`/series`, `/stats`, `/volume`, `/detected_labels` and `/detected_fields`
+— `invalid time range: 'end' precedes 'start'` — where it used to be a
+silently empty `200`. The reference deliberately does **not** apply the
+check on `/query` (an instant query has no range) or on `/patterns`, and
+neither do we. `end == start` is served everywhere.
+
+**A `POST` reads the URL query alongside the body.** `POST
+/query_range?limit=5` with a body carrying no `limit` serves 5 entries, not
+the default 100. Go's `ParseForm` copies the parsed body into `r.Form` and
+then appends the URL query per key, so on a collision the **body wins** for
+a scalar parameter (`?limit=7` + body `limit=5` serves 5) and a **repeated**
+parameter takes **both, concatenated** (`?match[]={app="b"}` + body
+`match[]={app="a"}` returns both series). An empty body value is still the
+body's value and still collapses to the default — `?limit=5` + body
+`limit=` serves 100, not 5.
 
 ### 2.1 `GET|POST /api/logs/v1/query_range`
 
 | Param | Type | Notes |
 |-------|------|-------|
 | `query` | LogQL | required |
-| `start`, `end` | ns / RFC3339 | default: `end = now`, `start = end - 1h` |
+| `start`, `end` | unix s (<= 10 chars) / ns / fractional s / RFC3339 (§2 preamble) | default: `end = now`, `start = min(end, now) - since`; `since` defaults to `1h`. `end < start` is `400` |
 | `step` | duration \| int (seconds) | metric queries only; derived `clamp((end-start)/250, >=1s)` when omitted |
 | `limit` | int | max **total** entries returned across the response, ordered by `direction` (newest-first for `backward`); global, not per-stream (default 100, hard cap 5000 — values above the cap are rejected with `400`). This is the **entry** axis; §2.6.3's same-named `limit` counts field *names* and carries no ceiling |
 | `direction` | `forward`\|`backward` | default `backward` |
+| `since` | duration | the default `start`'s lookback (default `1h`); ignored when `start` is present |
 
 `POST` accepts the same param names as an `application/x-www-form-urlencoded` body (large queries/long ranges can exceed URL length limits; mainstream Loki-datasource clients POST this endpoint).
 
@@ -127,21 +168,29 @@ Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":
 
 ### 2.2 `GET|POST /api/logs/v1/query`
 
-Instant evaluation at `time` (ns / RFC3339, default now). Returns `vector` (`result: [{"metric":{...},"value":[<unix_seconds>, "<value>"]}, ...]`) or `streams`, plus `stats`/`explain` per §2.1's shapes. `POST` accepts the same param names as an `application/x-www-form-urlencoded` body (same rationale as `query_range`).
+Instant evaluation at `time` (unix s / ns / fractional s / RFC3339 per §2's preamble, default now). `since` is **not** read here and `end < start` cannot apply — an instant query has no range, and both are the reference's own exemptions. Returns `vector` (`result: [{"metric":{...},"value":[<unix_seconds>, "<value>"]}, ...]`) or `streams`, plus `stats`/`explain` per §2.1's shapes. `POST` accepts the same param names as an `application/x-www-form-urlencoded` body (same rationale as `query_range`).
 
 ### 2.3 Labels & series
 
 ```
-GET|POST /api/logs/v1/labels                 ?start=&end=
-GET      /api/logs/v1/label/{name}/values    ?start=&end=
-GET|POST /api/logs/v1/series                 ?match[]=<selector>&start=&end=
+GET|POST /api/logs/v1/labels                 ?start=&end=&since=
+GET|POST /api/logs/v1/label/{name}/values    ?start=&end=&since=
+GET|POST /api/logs/v1/series                 ?match[]=<selector>&start=&end=&since=
 ```
 
-`start`/`end` default the same way as §2.1 (`end = now`, `start = end - 1h`). POST accepts the same params as an `application/x-www-form-urlencoded` body (`match[]` repeated for `/series`); `/label/{name}/values` is `GET`-only. `match[]` selectors are bare LogQL stream selectors (e.g. `{service_name="checkout"}`); at least one is required.
+`start`/`end`/`since` default the same way as §2.1. POST accepts the same params as an `application/x-www-form-urlencoded` body (`match[]` repeated for `/series`), and — per §2's preamble — also reads the URL query alongside it. `match[]` selectors are bare LogQL stream selectors (e.g. `{service_name="checkout"}`).
 
-**`match[]` is the exception to §2's present-but-empty rule.** It is the only *repeated* parameter here, and the reference reads repeated parameters through `r.Form[...]` rather than `r.Form.Get` (`pkg/loghttp/series.go:23-25` @ grafana/loki v3.7.4 `b318f282`), which keeps `""` as a value instead of collapsing it. So `?match[]=` is an empty **selector** and a `400` parse error — not an absent `match[]` — on both stores, measured 2026-08-09.
+**`match[]` is optional, and so is `match`.** The reference reads both keys, unions them, sorts and dedupes (`ParseSeriesQuery`, `pkg/loghttp/series.go:23-38` @ grafana/loki v3.7.4 `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and an empty group set is legal: `MatchForSeriesRequest(nil)` returns no error (`pkg/logql/matchers.go:13-26`). So, matching it (issue #406):
+
+- **No `match[]` at all is a `200`** listing every series active in the window — the discovery call, and the first thing a new integration tries. It is bounded by the window and by `max_streams` (100,000), with no result-count cap, and it costs two statements rather than the matched path's three (the rollup activity scan, then stream hydration — `log_samples` is never touched).
+- **A lone `?match[]={}`** — or `{ }`, after stripping ASCII spaces — means the same thing. The collapse applies only when the deduped set has **exactly one** element: `?match[]={}&match[]={app="a"}` is a `400` on both stores.
+- **`?match={app="a"}`** (Prometheus's unbracketed spelling) is read as well, and unions with `match[]`.
+
+**An empty `match[]` is the exception to §2's present-but-empty rule.** These are the only *repeated* parameters here, and the reference reads repeated parameters through `r.Form[...]` rather than `r.Form.Get` (`pkg/loghttp/series.go:23-25`), which keeps `""` as a value instead of collapsing it. So `?match[]=` is an empty **selector** and a `400` parse error — not an absent `match[]` — on both stores, measured 2026-08-09.
 
 Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values` return an array of strings, `series` returns an array of label maps (sorted for a deterministic response). With `X-Pulsus-Explain: 1`, `explain` (the §2.1 shape, `routing` always `null`) is added as a **top-level sibling of `data`** (not nested under it — these responses' `data` is an array, not an object).
+
+`/label/{name}/values` accepts `GET|POST` from issue #406 Part B2 (the reference registers it `Methods("GET","POST")`, `pkg/loki/modules.go:687` @ v3.7.4 `b318f282`).
 
 **`label/{name}/values` M1 scope:** returns every distinct value of `name` within `[start, end]`; `query=`-selector narrowing (restricting to values seen only on streams matching a selector) is deferred to M6 parity.
 
@@ -261,31 +310,33 @@ docs/benchmarks/logs-differential-ledger.md
 | `start` | starting timestamp (ns), default now − 1h |
 | `delay_for` | seconds to delay to tolerate late arrivals (default 0; values above `PULSUS_TAIL_MAX_DELAY` — 5s — are clamped) |
 
+`/tail` also **accepts a `regexp` parameter and ignores it.** That is not a gap: the reference reads it (`pkg/loghttp/tail.go:84` @ grafana/loki v3.7.4 `b318f282`) only after having already built `Plan.AST` from the pre-rewrite query (`:73-81`), and its tailer dispatches on `Plan` (`pkg/querier/tail/querier.go:71-94`) — measured 2026-08-10, byte-identical 10,571-byte first frames with and without it. There is no behaviour to match, so there is no divergence to register; use an inline `|~ "..."` line filter in `query`, which both stores honour.
+
 Frames: `{"streams":[...],"dropped_entries":[{"labels":{...},"timestamp":"<ns>"}],"dropped_total":<n>}`. Slow consumers get the **oldest** undelivered frames evicted and reported, never unbounded buffering: `dropped_entries` is a bounded representative sample (at most `PULSUS_TAIL_MAX_ENTRIES_PER_FRAME` rows), and `dropped_total` — a PulsusDB **additive** field next to the reference frame shape; clients that don't know it ignore the extra key — carries the *exact* cumulative count dropped since the previous frame (`0` on a normal frame). Exceeding `PULSUS_TAIL_MAX_CONNECTIONS` concurrent tail connections rejects the next one `429` before the upgrade.
 
 Delivery: tail polls ClickHouse (there is no push channel) with a deterministic composite keyset cursor — `(timestamp_ns, fingerprint, cityHash64(body))` plus an occurrence count — catching up over a backlog one `PULSUS_TAIL_CATCHUP_SLICE` window per query, so no single query scans unbounded history. Every row from `start` forward is delivered **exactly once**, including timestamp tie groups split across fetch pages and byte-identical duplicate lines inside a scanned window. Sole documented limitation: an entry arriving later than `delay_for` at an already-scanned position — at or below the cursor/watermark, e.g. a late byte-identical duplicate of an already-delivered same-nanosecond line — is genuinely late and is not delivered.
 
-### 2.5 `GET /api/logs/v1/stats`
+### 2.5 `GET|POST /api/logs/v1/stats`
 
-`?query={selector}&start=<ns>&end=<ns>` → `{"streams":N,"chunks":N,"entries":N,"bytes":N}`. `query` accepts a stream selector plus optional line filters; anything else (parsers, formats, label filters, metric queries) is rejected `400`. `chunks` is a **partition-count proxy**: the selector-scoped distinct count of partition dates touched, not a physical MergeTree part count (per-part fidelity, if ever demanded, routes to the scale-validation milestone). Without a line filter the counters are served from the rollup with zero body reads (entries/bytes are 5s-bucket-granular at window edges, the same rollup-routing caveat as `count_over_time`); a line filter forces an exact `log_samples` scan. With `X-Pulsus-Explain: 1`, `explain` (the §2.1 shape) is added as a sibling key of the four counters.
+`?query={selector}&start=&end=&since=` → `{"streams":N,"chunks":N,"entries":N,"bytes":N}`. `GET|POST` since issue #406 Part B2 (the reference registers `/loki/api/v1/index/stats` `Methods("GET","POST")`, `pkg/loki/modules.go:690` @ v3.7.4 `b318f282`); `end < start` is `400`. `query` accepts a stream selector plus optional line filters; anything else (parsers, formats, label filters, metric queries) is rejected `400`. `chunks` is a **partition-count proxy**: the selector-scoped distinct count of partition dates touched, not a physical MergeTree part count (per-part fidelity, if ever demanded, routes to the scale-validation milestone). Without a line filter the counters are served from the rollup with zero body reads (entries/bytes are 5s-bucket-granular at window edges, the same rollup-routing caveat as `count_over_time`); a line filter forces an exact `log_samples` scan. With `X-Pulsus-Explain: 1`, `explain` (the §2.1 shape) is added as a sibling key of the four counters.
 
 ### 2.6 Drilldown (M7)
 
 ```
-GET      /api/logs/v1/volume             ?query=&start=&end=&limit=&targetLabels=&aggregateBy=
-GET|POST /api/logs/v1/detected_labels    ?query=&start=&end=
-GET|POST /api/logs/v1/detected_fields    ?query=&start=&end=&line_limit=&limit=
-GET      /api/logs/v1/patterns           ?query=&start=&end=&step=
+GET|POST /api/logs/v1/volume             ?query=&start=&end=&since=&limit=&targetLabels=&aggregateBy=
+GET|POST /api/logs/v1/detected_labels    ?query=&start=&end=&since=
+GET|POST /api/logs/v1/detected_fields    ?query=&start=&end=&since=&line_limit=&limit=
+GET|POST /api/logs/v1/patterns           ?query=&start=&end=&since=&step=
 ```
 
-#### 2.6.1 `GET /api/logs/v1/volume`
+#### 2.6.1 `GET|POST /api/logs/v1/volume`
 
-Per-label-set log byte volumes over `[start, end]` — the drilldown UI's "which streams are loud" aggregation. **GET-only** (the reference also mounts POST; additive later if a client demands it). Served **entirely from the 5s rollup with zero body reads** — the endpoint accepts a matchers-only selector, so unlike §2.5 there is no raw fallback at all.
+Per-label-set log byte volumes over `[start, end]` — the drilldown UI's "which streams are loud" aggregation. `GET|POST` since issue #406 Part B2 (the reference registers it `Methods("GET","POST")`, `pkg/loki/modules.go:691` @ v3.7.4 `b318f282`). Served **entirely from the 5s rollup with zero body reads** — the endpoint accepts a matchers-only selector, so unlike §2.5 there is no raw fallback at all.
 
 | Param | Notes |
 |-------|-------|
 | `query` | LogQL **stream selector, matchers only** — required. ANY pipeline stage is rejected `400` (line filters included, unlike §2.5: the rollup is body-content-blind and volume has no raw scan to fall back on), as are metric queries. The match-all `{}` is rejected `400` (PulsusDB's ≥1-positive-matcher rule; the reference accepts `{}` here — documented deviation; `targetLabels` remains fully usable with any non-empty selector, e.g. `{env=~".+"}`) |
-| `start`, `end` | ns / RFC3339; default `end = now`, `start = end - 1h` (§2.1). `end < start` is `400` |
+| `start`, `end`, `since` | §2's timestamp rules; default `end = now`, `start = min(end, now) - since`, `since = 1h`. `end < start` is `400` |
 | `limit` | top-N entries kept **after** the bytes-desc sort. Absent **or `0`** → 100 (the reference resets an explicit 0 to its default); above 5000 → `400`, never clamped (§2.1's cap rule) |
 | `aggregateBy` | `series` (default): group by the matched label **pairs**. `labels`: group by bare label **names** — each entry's metric is `{"<name>":""}` (the reference's empty-value shape) |
 | `targetLabels` | comma-separated label names re-keying the aggregation. When supplied, entries key on these names alone (both modes); each target with no matcher of its name in the selector is injected as `name=~".+"` before planning, so negative-only or unrelated selectors still resolve target-keyed streams. **Bounded** (documented deviation — the reference has no caps; same defensive 400-not-clamp posture as `limit`): at most **32** names post-dedupe, each at most **256** bytes (post-percent-decode) — oversized requests are rejected `400` in pure param parsing, before any planning or SQL |
@@ -346,14 +397,14 @@ With `X-Pulsus-Explain: 1`, `explain` is added as a sibling key — its `detecte
 
 Errors: `400` (missing/malformed `query`, metric query, invalid `line_limit`/`limit`), `422`, and `503`/`504`/`500` per §2.3's table.
 
-#### 2.6.4 `GET /api/logs/v1/patterns`
+#### 2.6.4 `GET|POST /api/logs/v1/patterns`
 
-Detected **log patterns** — the drilldown UI's "group these lines by shape" view. Each pattern is a **deterministic, stateless** token-class template of the line body (extracted at ingest, aggregated per `(fingerprint, 10s-bucket, template)` into `log_patterns`; docs/schemas.md §3.1): digit/length classification (a fragment with an ASCII digit, or longer than 64 bytes, becomes `<_>`), `key=value`/`key:value` awareness (only the value is classified), wrapper-punctuation preservation, and 1 KiB-prefix / 64-token / 512-byte caps. Templates are **normalized (whitespace-collapsed), not round-trip matchable**; grouping is deliberately coarser than an online clusterer (a digit-free variable word stays literal) in exchange for identity that survives merges across batches, shards, replicas, and retries. Served by ONE pushed-down aggregate over `log_patterns` with `fingerprint` primary-key prefix pruning and a server-side top-1000 — **no hydration, no body read** (the response carries no labels). **GET-only.**
+Detected **log patterns** — the drilldown UI's "group these lines by shape" view. Each pattern is a **deterministic, stateless** token-class template of the line body (extracted at ingest, aggregated per `(fingerprint, 10s-bucket, template)` into `log_patterns`; docs/schemas.md §3.1): digit/length classification (a fragment with an ASCII digit, or longer than 64 bytes, becomes `<_>`), `key=value`/`key:value` awareness (only the value is classified), wrapper-punctuation preservation, and 1 KiB-prefix / 64-token / 512-byte caps. Templates are **normalized (whitespace-collapsed), not round-trip matchable**; grouping is deliberately coarser than an online clusterer (a digit-free variable word stays literal) in exchange for identity that survives merges across batches, shards, replicas, and retries. Served by ONE pushed-down aggregate over `log_patterns` with `fingerprint` primary-key prefix pruning and a server-side top-1000 — **no hydration, no body read** (the response carries no labels). `GET|POST` since issue #406 Part B2.
 
 | Param | Notes |
 |-------|-------|
 | `query` | LogQL **stream selector, matchers only** — required. ANY pipeline stage is rejected `400` (line filters included, like §2.6.1: templates are precomputed and the bodies are gone), as are metric queries |
-| `start`, `end` | ns / RFC3339; default `end = now`, `start = end - 1h` (§2.1). Half-open `[start, end)` over the pattern buckets |
+| `start`, `end`, `since` | §2's timestamp rules; default `end = now`, `start = min(end, now) - since`, `since = 1h`. Half-open `[start, end)` over the pattern buckets. `end < start` is **not** checked here — the reference's own exemption (§2 preamble) |
 | `step` | optional bucket size; a duration string or bare seconds. Absent → derived `clamp((end-start)/250, ≥1s)`. **Floored to the 10s ingest bucket** (never smaller — a finer step would invent sub-bucket granularity the stored data lacks). The `(end-start)/step` grid is capped at **11,000** (else `400`), the same bound as the metrics endpoints |
 
 Response `200`: the Loki-interop envelope `{"status":"success","data":[{"pattern":"<_> ...","samples":[[<unix_seconds>,<count>],...]},...]}`. `samples` are ascending by second, zero-count steps omitted, both elements bare integers (`unix_seconds` is the floor of the bucket ns). **`data` is ordered total-count desc then pattern asc, truncated to the top 1000 — NOT re-sorted client-side** (the top-N presentation is the contract; a PulsusDB determinism pin — upstream order is unspecified). **Count semantics** are exact on the clean ingest path and **best-effort approximate under ingest-failure re-sends**, at parity with §2.2's `log_metrics` (the writer never auto-replays a block that could have committed; a per-request burst of >10 000 distinct templates is an under-count event, folded into the same approximate semantics — see docs/schemas.md §3.1). With `X-Pulsus-Explain: 1`, `data.explain` (the §2.1 shape) is added — its `patterns_read` stage always targets `log_patterns`.
@@ -842,11 +893,11 @@ When `PULSUS_AUTH_*` is set, the perimeter returns 401 to every unauthenticated 
 
 | Compatibility path | Native equivalent | Ships with |
 |--------------------|-------------------|------------|
-| `/loki/api/v1/query_range`, `/query`, `/labels`, `/label/{name}/values`, `/series` | `/api/logs/v1/{query_range,query,labels,label/*/values,series}` | M1 |
-| `/loki/api/v1/tail`, `/loki/api/v1/index/stats` | `/api/logs/v1/{tail,stats}` | M6 |
-| `/loki/api/v1/index/volume` | `/api/logs/v1/volume` | M7 |
+| `/loki/api/v1/query_range`, `/query`, `/labels`, `/label/{name}/values`, `/series` (all `GET|POST`) | `/api/logs/v1/{query_range,query,labels,label/*/values,series}` | M1 |
+| `/loki/api/v1/tail` (`GET`), `/loki/api/v1/index/stats` (`GET|POST`) | `/api/logs/v1/{tail,stats}` | M6 |
+| `/loki/api/v1/index/volume` (`GET|POST`) | `/api/logs/v1/volume` | M7 |
 | `/loki/api/v1/detected_labels`, `/loki/api/v1/detected_fields` | `/api/logs/v1/detected_labels`, `/api/logs/v1/detected_fields` (pure prefix swaps, `GET|POST` like native) | M7 |
-| `/loki/api/v1/patterns` | `/api/logs/v1/patterns` | M7 |
+| `/loki/api/v1/patterns` (`GET|POST`) | `/api/logs/v1/patterns` | M7 |
 | `/api/traces/{traceId}`, `/api/traces/{traceId}/json`, `/tempo/api/traces/{traceId}` | `/api/traces/v1/trace/{traceId}`, `/api/traces/v1/trace/{traceId}/json` | M4 |
 | `/api/search` | `/api/traces/v1/search` | M4 |
 | `/api/search/tags`, `/api/search/tag/{tag}/values` | `/api/traces/v1/tags`, `/api/traces/v1/tag/{tag}/values` (Tempo v1 flat projection) | M4 |

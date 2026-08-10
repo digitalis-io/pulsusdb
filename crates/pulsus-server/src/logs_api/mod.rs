@@ -933,11 +933,8 @@ mod tests {
             let base = post_base_query(path);
             // (a) URL-only POST == the equivalent GET.
             let (get_status, get_body) = routed(router(), get_req(&uri(path, base))).await;
-            let (post_status, post_body) = routed(
-                router(),
-                form_post(&uri(path, base), String::new()),
-            )
-            .await;
+            let (post_status, post_body) =
+                routed(router(), form_post(&uri(path, base), String::new())).await;
             assert_eq!(
                 post_status,
                 get_status,
@@ -1125,8 +1122,7 @@ mod tests {
                 };
                 uri(path, &q)
             };
-            let (secs_status, secs_body) =
-                routed(router(), get_req(&build(START_S, END_S))).await;
+            let (secs_status, secs_body) = routed(router(), get_req(&build(START_S, END_S))).await;
             let (nanos_status, nanos_body) =
                 routed(router(), get_req(&build(START_NS, END_NS))).await;
             assert_eq!(

@@ -301,8 +301,7 @@ pub(crate) fn parse_since(raw: Option<&str>) -> Result<i64, ParamError> {
     let Some(raw) = raw else {
         return Ok(DEFAULT_SINCE_NS);
     };
-    let ns =
-        parse_duration_ns(raw).map_err(|_| ParamError::InvalidSince(raw.to_string()))?;
+    let ns = parse_duration_ns(raw).map_err(|_| ParamError::InvalidSince(raw.to_string()))?;
     // `parse_duration_ns` is unsigned, so a negative literal never reaches
     // here (it fails the grammar); this refuses the other end instead — a
     // duration too large to be an `i64` nanosecond offset.
@@ -816,7 +815,13 @@ mod tests {
             assert_eq!(parse_ts(raw).unwrap(), want, "parse_ts({raw:?})");
         }
 
-        for raw in ["not-a-timestamp", "1.2.3", "", " 1786342706", "1786342706abc"] {
+        for raw in [
+            "not-a-timestamp",
+            "1.2.3",
+            "",
+            " 1786342706",
+            "1786342706abc",
+        ] {
             assert!(
                 matches!(parse_ts(raw), Err(ParamError::InvalidTimestamp(_))),
                 "parse_ts({raw:?}) must be InvalidTimestamp"
