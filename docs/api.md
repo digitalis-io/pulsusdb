@@ -112,10 +112,14 @@ because of the leading zero and is read as nanoseconds, landing in 1970.
 A value containing `.` is seconds with a fraction whatever its length, and
 the fraction is rounded to **three decimal places** before it becomes
 nanoseconds (`1786342706.123456` is `…26.123`). Anything else is RFC3339.
-One deviation: PulsusDB's timestamp domain is `i64` nanoseconds
-(≈1677-09-21 to 2262-04-11), so a seconds value outside it — `9999999999`,
+One deviation: PulsusDB's whole timestamp domain is `i64` nanoseconds, so
+it ends at **2262-04-11T23:47:16.854775807Z** (and begins at
+1677-09-21T00:12:43.145224192Z). A seconds value past that — `9999999999`,
 which the reference reads as the year 2286 — is a `400`, exactly as the
-RFC3339 spelling of that instant already was.
+RFC3339 spelling of that same instant always was. The largest accepted
+ten-character seconds value is `9223372036`. Registered as
+`logs-timestamp-i64-nanosecond-domain` in
+`docs/benchmarks/logs-differential-ledger.md`.
 
 **`since` sets the default `start`** (issue #406). Read on every route in
 §2.1 and §2.3-§2.6 — everything carrying a `start`/`end` pair, i.e. all but
@@ -126,11 +130,13 @@ silently ignored. The default is `min(end, now) - since`, not
 future with it (the reference's `endOrNow`, `params.go:105-111`).
 
 **`end` before `start` is a `400`** on `/query_range`, `/labels`,
-`/series`, `/stats`, `/volume`, `/detected_labels` and `/detected_fields`
-— `invalid time range: 'end' precedes 'start'` — where it used to be a
-silently empty `200`. The reference deliberately does **not** apply the
-check on `/query` (an instant query has no range) or on `/patterns`, and
-neither do we. `end == start` is served everywhere.
+`/label/{name}/values`, `/series`, `/stats`, `/volume`, `/detected_labels`
+and `/detected_fields` — `invalid time range: 'end' precedes 'start'` —
+where it used to be a silently empty `200`. The reference deliberately
+does **not** apply the check on `/query` (an instant query has no range)
+or on `/patterns`, and neither do we. `end == start` is served everywhere:
+every one of the reference's call sites spells `End.Before(Start)`,
+despite its message's "or equal".
 
 **A `POST` reads the URL query alongside the body.** `POST
 /query_range?limit=5` with a body carrying no `limit` serves 5 entries, not
@@ -178,7 +184,7 @@ GET|POST /api/logs/v1/label/{name}/values    ?start=&end=&since=
 GET|POST /api/logs/v1/series                 ?match[]=<selector>&start=&end=&since=
 ```
 
-`start`/`end`/`since` default the same way as §2.1. POST accepts the same params as an `application/x-www-form-urlencoded` body (`match[]` repeated for `/series`), and — per §2's preamble — also reads the URL query alongside it. `match[]` selectors are bare LogQL stream selectors (e.g. `{service_name="checkout"}`).
+`start`/`end`/`since` default the same way as §2.1, and `end < start` is a `400` on all three. POST accepts the same params as an `application/x-www-form-urlencoded` body (`match[]` repeated for `/series`), and — per §2's preamble — also reads the URL query alongside it. `match[]` selectors are bare LogQL stream selectors (e.g. `{service_name="checkout"}`).
 
 **`match[]` is optional, and so is `match`.** The reference reads both keys, unions them, sorts and dedupes (`ParseSeriesQuery`, `pkg/loghttp/series.go:23-38` @ grafana/loki v3.7.4 `b318f2829f0ae2094ab3a1e90780450e9e4b03be`), and an empty group set is legal: `MatchForSeriesRequest(nil)` returns no error (`pkg/logql/matchers.go:13-26`). So, matching it (issue #406):
 

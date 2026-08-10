@@ -2493,6 +2493,48 @@ The 131,072-byte `MAX_QUERY_BYTES` cap (docs/api.md §2.3, the reference's
 `maxInputSize`) matches the reference exactly at the parse seam. Its one
 divergence is a transport-layer bound discovered while shipping it.
 
+### `logs-timestamp-i64-nanosecond-domain` (issue #406 Part D, rulings v3 — a representation limit with a date on it)
+
+No fixture case references this entry — nothing is downgraded. It records
+the one place PulsusDB **refuses** a `start`/`end`/`time` value the
+reference serves, and it is a consequence of our representation rather
+than a policy choice.
+
+- **The boundary is a date, not an integer.** Every PulsusDB timestamp is
+  an `i64` count of nanoseconds since the Unix epoch, so the whole
+  representable range is **1677-09-21T00:12:43.145224192Z** to
+  **2262-04-11T23:47:16.854775807Z**. `i64::MAX` nanoseconds is ~9.22e18,
+  which is 2262 — not an arbitrary cut-off, and not something a larger
+  constant could move without changing the type. The reference has no such
+  limit on the parse: Go's `time.Time` stores seconds and nanoseconds in
+  separate fields, so it represents any second-valued instant a client can
+  spell.
+- **What that costs, measured 2026-08-10 against `grafana/loki:3.7.4`
+  with a corpus loaded.** `?start=9999999999` — ten characters, so unix
+  SECONDS under both stores' length rule — is logged by the reference as
+  `start=2286-11-20T17:46:39Z` and served. `9999999999 s` is ~1.0e19 ns,
+  past `i64::MAX`, so PulsusDB answers `400 invalid timestamp
+  "9999999999": expected unix seconds (<= 10 characters), unix
+  nanoseconds, a fractional-second value, or RFC3339`. The largest
+  ten-character seconds value we accept is `9223372036`
+  (2262-04-11T23:47:16Z); `9223372037` is the first refused.
+  `crates/pulsus-server/src/logs_api/params.rs`'s
+  `parse_ts_refuses_a_seconds_value_outside_the_i64_nanosecond_domain`
+  pins both sides of that boundary.
+- **Why this is acceptable rather than a hole: the two spellings of one
+  unrepresentable instant agree.** `parse_ts`' RFC3339 branch has ALWAYS
+  refused out-of-domain values — `chrono`'s `timestamp_nanos_opt` returns
+  `None` outside 1677-2262 — so `?start=2286-11-20T17:46:39Z` was already
+  a `400` here before issue #406, and Part D did not introduce a new
+  asymmetry. What Part D changed is that `9999999999` now means that same
+  instant instead of 10 seconds after the epoch, so it now gets the same
+  answer. A `checked_mul` decides it; nothing wraps and nothing saturates
+  to an arbitrary instant.
+- **Consumer impact:** none reachable. The refusal starts in the year 2262
+  at one end and 1677 at the other; no query a user writes against stored
+  observability data lands outside it, and the retention TTLs make the
+  point moot long before the type does.
+
 ### `shards-no-pulsus-counterpart` (issue #406, informational note, not a gate downgrade)
 
 No fixture case references this entry — nothing is downgraded. It records

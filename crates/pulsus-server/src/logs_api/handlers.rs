@@ -133,7 +133,16 @@ pub(super) fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), Api
 /// `series` one layer down, where `ValidateQueryTimeRangeLimits`
 /// (`pkg/querier/limits/validation.go:91-93`) refuses `through.Before(from)`
 /// for `SingleTenantQuerier.Label`/`Series` (`pkg/querier/querier.go:311,388`).
-/// It does **not** apply it on `/query` (instant — no range) or on
+/// `/label/{name}/values` is in the refusal set for the same reason
+/// `/labels` is, and by the same code: upstream they are ONE handler —
+/// `ParseLabelQuery` sets `Values: ok` from the path variable
+/// (`pkg/loghttp/labels.go:70-84`) and `SingleTenantQuerier.Label`
+/// validates the range before branching on it
+/// (`pkg/querier/querier.go:307-315`). Container-measured 2026-08-10:
+/// `400` there, `200`-empty here. (It was left out of issue #406's first
+/// route table by oversight and folded in by rulings v3.)
+///
+/// It does **not** apply on `/query` (instant — no range) or on
 /// `/patterns` (`ParsePatternsQuery` never checks). Both negatives are
 /// pinned by `mod.rs`'s
 /// `end_before_start_is_refused_on_exactly_the_reference_routes`;
@@ -482,7 +491,7 @@ async fn label_values_impl(
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (start_ns, end_ns) = parse_bounds(&pairs)?;
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
     let engine = engine_for(&state).await?;
     if wants_explain(headers) {

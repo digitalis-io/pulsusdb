@@ -1033,6 +1033,12 @@ mod tests {
         let cases: &[(&str, &str, bool)] = &[
             ("/api/logs/v1/query_range", SELECTOR_QUERY, true),
             ("/api/logs/v1/labels", "", true),
+            // The tenth row (issue #406 rulings v3): upstream this is the
+            // SAME handler as `/labels` — `ParseLabelQuery` sets
+            // `Values: ok` from the path variable and
+            // `SingleTenantQuerier.Label` validates the range before
+            // branching on it. Measured `400` there against our `200`.
+            ("/api/logs/v1/label/env/values", "", true),
             ("/api/logs/v1/series", SELECTOR_MATCH, true),
             ("/api/logs/v1/stats", SELECTOR_QUERY, true),
             ("/api/logs/v1/volume", SELECTOR_QUERY, true),

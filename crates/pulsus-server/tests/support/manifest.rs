@@ -1480,6 +1480,12 @@ pub struct RouteSpec {
     /// The axum route template exactly as `.route(...)` registers it
     /// (e.g. `/api/v1/label/{name}/values`).
     pub path: &'static str,
+    /// The documented method matrix. Drives the `api_conformance` method
+    /// case class and the `Allow` header assertion — and **nothing in the
+    /// docs**. `docs/api.md`'s `GET|POST` headings are NOT checked against
+    /// this list (`route_inventory::every_mounted_route_is_documented_in_docs_api_md`
+    /// resolves a path token only), so adding a method here does not make
+    /// a stale heading fail; move the heading by hand and read it back.
     pub methods: &'static [Method],
     pub surface: Surface,
     pub gate: Gate,
