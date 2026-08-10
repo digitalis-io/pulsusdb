@@ -52,12 +52,20 @@
 # the owner's 2026-07-26 ruling on this issue relaxes to
 # wording-independent.
 #
-# NOT PINNED HERE, deliberately. A targeted MISS emits `a=""` on the
-# reference with or without `--keep-empty` and emits nothing here, and
-# the reference sanitizes the LINE key before comparing while we do not —
-# both are issue #393, so every row below either uses `--keep-empty` or
-# hits, and the load line carries no key that would exercise the
-# sanitizer.
+# NOT PINNED HERE — it lives in b24_logfmt_expr_eval.test. What a
+# SURVIVING expression evaluates to is a different mechanism from what is
+# refused: a targeted miss leaves a pre-seeded empty label, the LINE key
+# is sanitized before it is compared, an extraction identifier aliases a
+# line key, the pass is document-order with last-write-wins, and a value
+# containing U+FFFD is emptied. Issue #393 closed all of those and pinned
+# them there.
+#
+# Every row below was re-derived under those rules and none of them
+# changed: each either uses `--keep-empty` or hits, and the load line
+# carries no key the sanitizer would rewrite. The `--keep-empty` flags on
+# the miss rows no longer do anything (this parser has no such field);
+# they are kept as captured rather than rewritten, and their flagless
+# spellings are pinned in b24.
 #
 # provenance: captured
 # (file default; see logqltest/PROVENANCE.md §provenance markers.

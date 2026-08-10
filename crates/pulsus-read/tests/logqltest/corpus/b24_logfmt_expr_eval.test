@@ -1,0 +1,321 @@
+# b24 — what a SURVIVING `| logfmt <id>="<expr>"` extraction EVALUATES
+# to: which labels it emits and with which values (issue #393).
+#
+# b22 is the REJECTION surface — which expressions are refused. This file
+# is the other half, and the two were split because they are different
+# mechanisms: b22 is a sub-grammar run once at query-compile time, this is
+# `LogfmtExpressionParser.Process` run once per line.
+#
+# Reference of record: grafana/loki:3.7.4, digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc.
+# Container identity READ FROM THE RUNNING PROCESS, not from this header:
+# /loki/api/v1/status/buildinfo answered {"version":"3.7.4",
+# "revision":"b318f282","branch":"release-3.7.x"} — the same b318f282 the
+# pinned digest and the Go checkout at v3.7.4 resolve to. Captured
+# 2026-08-10 in a single run, streams rows through
+# /loki/api/v1/query_range and metric rows through /loki/api/v1/query.
+# This file needs no configuration override of any kind: the bare
+# single-binary container serves every row below. It does attach a `detected_level`
+# label of its own, which PulsusDB's label model has no analogue for and
+# which no row here depends on; it is dropped from the expected sets, as
+# the live replay leg drops it from every file. Values are unaffected.
+#
+# THE RULE, read off `pkg/logql/log/parser.go:531-624 @ v3.7.4` and then
+# measured. `LogfmtExpressionParser.Process` is NOT "resolve each
+# expression's source key independently". It is:
+#
+#   a map keyed by IDENTIFIER            parser.go:521
+#     so a repeated identifier keeps only its LAST source key
+#   pre-seed every identifier to ""      parser.go:545-550
+#     BEFORE the line is read, unconditionally, skipping only an
+#     identifier the stream or the live structured metadata supplies
+#   ONE document-order pass              parser.go:562-618
+#     each line key SANITIZED first      parser.go:575, util.go:22-38
+#     renamed to an identifier whose SOURCE key it equals  :594-599
+#     else written under its own name if that IS an identifier  :601
+#     last write wins — no first-hit latch
+#   a value containing U+FFFD is EMPTIED  parser.go:590-592
+#     where the IMPLICIT parser maps it to a space instead   :417-419
+#
+# `--keep-empty` cannot reach any of this: `Stage()` passes only
+# `l.Strict` to `NewLogfmtExpressionParser` (syntax/ast.go:1073-1075), so
+# this parser has no `keepEmpty` field. Every miss below is an empty
+# label whether or not the flag is written, and both spellings are
+# pinned.
+#
+# NOT PINNED HERE, deliberately, each with the issue that owns it:
+#
+#  - The LENIENT decoder resuming after a recoverable error. Over
+#    `=x b=1` the reference answers `a="1"` for `| logfmt a="b"` because
+#    its decoder `continue`s past the bad token (parser.go:564-571) where
+#    ours stops; ours answers `a=""`. That is `walk_logfmt`'s error
+#    model — issue #200. The --strict row over the same line IS pinned,
+#    because both sides stop there and agree.
+#  - The bare parser's U+FFFD handling: `removeInvalidUtf` maps it to a
+#    space (parser.go:417-419) and we hand the rune back. Same #200
+#    ground. The TARGETED half is pinned below; the bare half is not.
+#  - `ParserHint.ShouldExtract` (parser.go:580) is modelled nowhere here,
+#    so metric queries that GROUP the extracted labels away still differ —
+#    `sum by (a) (count_over_time({...} | logfmt a="x" [5m]))` is
+#    `{a=""}` there (the source key `x` is not a required label, so it is
+#    skipped and the pre-seeded empty survives) and `{a="3"}` here, and
+#    `... | logfmt a="b_c" ...` is `{a=""}` there and `{a="4"}` here.
+#    That is a fourth, separate mechanism touching every parser stage.
+#    ONE OF THOSE TWO ROWS CHANGED ITS PRINTED VALUE AT THE COMMIT THAT
+#    ADDED THIS FILE and the other did not; the difference is recorded,
+#    with the before/after column and the reason, under
+#    `logfmt-expression-parser-hints-unmodelled` in
+#    docs/benchmarks/logs-differential-ledger.md. Read that row before
+#    reading either answer as a regression. The metric row PINNED below
+#    is the third case — the one where the hint changes nothing, because
+#    the extraction misses on both sides — and it moved INTO agreement.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
+
+load
+  {service_name="lfe"}
+  0s  b=1 a-b=2 x=3
+
+# --- the controls, green before this issue and after ------------------
+
+eval instant at 60s {service_name="lfe"} | logfmt a="b"
+  {a="1", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+eval instant at 60s {service_name="lfe"} | logfmt
+  {a_b="2", b="1", x="3", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+# --- A: a targeted MISS emits an EMPTY label, flag or no flag ---------
+
+eval instant at 60s {service_name="lfe"} | logfmt a="nosuch"
+  {a="", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+eval instant at 60s {service_name="lfe"} | logfmt --keep-empty a="nosuch"
+  {a="", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+# THE GROUPING CONSEQUENCE. A label that EXISTS with an empty value is
+# not the same as an absent one (issue #241), so the miss changes which
+# output series a sample lands in: one series carrying `a=""`, where
+# before this issue the query answered no series at all.
+eval instant at 60s sum by (a) (count_over_time({service_name="lfe"} | logfmt a="nosuch" [5m]))
+  {a=""}  1
+
+# --- B: the LINE key is sanitized before it is compared ---------------
+
+eval instant at 60s {service_name="lfe"} | logfmt a="a_b"
+  {a="2", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+# The mirror of the same rule: the raw `a-b` spelling matches nothing,
+# because the key it is compared against is `a_b`.
+eval instant at 60s {service_name="lfe"} | logfmt a="\"a-b\""
+  {a="", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+# --- C: an extraction IDENTIFIER aliases a line key -------------------
+
+# `b` is nobody's source key, but it IS a destination, so the pair lands
+# under its own name.
+eval instant at 60s {service_name="lfe"} | logfmt a="x", b="nosuch"
+  {a="3", b="1", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+# …and the alias does not fire when the line carries no such key.
+eval instant at 60s {service_name="lfe"} | logfmt a="b", b="a"
+  {a="1", b="", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+# --- a repeated identifier keeps only its LAST source key -------------
+
+eval instant at 60s {service_name="lfe"} | logfmt a="b", a="nosuch"
+  {a="", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+eval instant at 60s {service_name="lfe"} | logfmt a="nosuch", a="b"
+  {a="1", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+# --- the pre-seed is UNCONDITIONAL, so a later stage RESETS an earlier
+# --- stage's parsed label rather than leaving it standing.
+eval instant at 60s {service_name="lfe"} | logfmt a="x" | logfmt a="nosuch"
+  {a="", service_name="lfe"}  0s  b=1 a-b=2 x=3
+
+clear
+
+load
+  {service_name="lfe2"}
+  0s  b=1 a-b=2 x=3 b.c=4
+
+# BOTH DIRECTIONS OF THE SANITIZATION RULE, and both moved at this
+# commit. The source key is the parsed path UNSANITIZED (issue #247), and
+# the LINE key is what gets sanitized — so `b_c` hits the `b.c` pair and
+# the literal `b.c` a quoted path resolves to hits nothing.
+eval instant at 60s {service_name="lfe2"} | logfmt a="b_c"
+  {a="4", service_name="lfe2"}  0s  b=1 a-b=2 x=3 b.c=4
+
+eval instant at 60s {service_name="lfe2"} | logfmt a="\"b.c\""
+  {a="", service_name="lfe2"}  0s  b=1 a-b=2 x=3 b.c=4
+
+clear
+
+load
+  {service_name="lfe4"}
+  0s  a_b=1 a-b=2
+
+# Two line keys sanitize to the SAME name; the LAST one in document order
+# wins. A first-hit resolution answers `a="1"`.
+eval instant at 60s {service_name="lfe4"} | logfmt a="a_b"
+  {a="2", service_name="lfe4"}  0s  a_b=1 a-b=2
+
+clear
+
+load
+  {service_name="lfe16"}
+  0s  p.q=1 p_q=2 p-q=3
+
+# Three spellings, one sanitized name, last write wins. Sanitizing the
+# SOURCE key at compile time instead (and still comparing raw line keys)
+# answers `a="2"` here.
+eval instant at 60s {service_name="lfe16"} | logfmt a="p_q"
+  {a="3", service_name="lfe16"}  0s  p.q=1 p_q=2 p-q=3
+
+# The identifier-alias path reaches the same three pairs.
+eval instant at 60s {service_name="lfe16"} | logfmt p_q="nosuch"
+  {p_q="3", service_name="lfe16"}  0s  p.q=1 p_q=2 p-q=3
+
+clear
+
+load
+  {service_name="lfe9"}
+  0s  b=2 a=1
+
+# THE DISCRIMINATOR. `b` renames to `a` and writes 2; then the pair `a`
+# aliases the identifier and OVERWRITES with 1. The plausible "keep the
+# per-extraction source-key lookup, just emit an empty string on a miss"
+# fix answers `a="2"` here, which is why it is not the fix.
+eval instant at 60s {service_name="lfe9"} | logfmt a="b"
+  {a="1", service_name="lfe9"}  0s  b=2 a=1
+
+clear
+
+load
+  {service_name="lfe9m"}
+  0s  a=1 b=2
+
+# The direction control for the row above: reversing the line reverses
+# the answer, so neither row can be passed by a constant bias.
+eval instant at 60s {service_name="lfe9m"} | logfmt a="b"
+  {a="2", service_name="lfe9m"}  0s  a=1 b=2
+
+clear
+
+load
+  {service_name="lfe7"}
+  0s  p=1 q=2
+
+# A source-key match BEATS an identifier match on the same pass, but the
+# later pair still overwrites: `p`→`q`=1, then `q` aliases and wins.
+eval instant at 60s {service_name="lfe7"} | logfmt q="p"
+  {q="2", service_name="lfe7"}  0s  p=1 q=2
+
+clear
+
+load
+  {service_name="lfe13"}
+  0s  a-b=7
+
+# The identifier alias is compared SANITIZED too.
+eval instant at 60s {service_name="lfe13"} | logfmt a_b="nosuch"
+  {a_b="7", service_name="lfe13"}  0s  a-b=7
+
+clear
+
+load
+  {service_name="lfe11"}
+  0s  1x=5 y=6
+
+# A leading-digit line key gains the reference's `_` prefix before it is
+# compared (util.go:30-32), so the source key that reaches it is `_1x`.
+eval instant at 60s {service_name="lfe11"} | logfmt a="_1x"
+  {a="5", service_name="lfe11"}  0s  1x=5 y=6
+
+clear
+
+load
+  {service_name="lfe8"}
+  0s  b= x=3
+
+# A HIT whose value is empty is indistinguishable from a miss here —
+# there is no empty-drop rule on this arm to make them differ.
+eval instant at 60s {service_name="lfe8"} | logfmt a="b"
+  {a="", service_name="lfe8"}  0s  b= x=3
+
+clear
+
+load
+  {service_name="lfe15"}
+  0s  =x b=1
+
+# The pre-seed happens BEFORE the decoder is reset (parser.go:545-552),
+# so the empty label survives a line that fails to decode at all. Both
+# sides stop at this token under --strict, and the detail string is
+# byte-identical to the reference's.
+eval instant at 60s {service_name="lfe15"} | logfmt --strict a="b"
+  {a="", __error__="LogfmtParserErr", __error_details__="logfmt syntax error at pos 1 : unexpected '='", service_name="lfe15"}  0s  =x b=1
+
+clear
+
+load
+  {service_name="lfeu"}
+  0s  a=x�y b=2
+
+# The expression parser EMPTIES a value containing U+FFFD (parser.go:590-592,
+# `val = nil`). The bare arm's answer over the same line is #200's
+# ground and is deliberately absent from this file.
+eval instant at 60s {service_name="lfeu"} | logfmt a="a"
+  {a="", service_name="lfeu"}  0s  a=x�y b=2
+
+clear
+
+load
+  {service_name="lfe5"}
+  0s  x=3 y=4
+
+# TWO IDENTIFIERS SHARING ONE SOURCE KEY. The reference iterates a Go map
+# here (`for id, orig := range keys`, parser.go:594) and therefore has no
+# answer at all: 30 repetitions of each query below against one pushed
+# line split 29/1, 21/9 and 23/7 between the two outcomes (the exact
+# command is in the ledger entry named on these rows). We take QUERY
+# ORDER — the one order a user can predict from what they wrote. The
+# divergence is that the reference is nondeterministic, not that we are
+# wrong; do not "fix" this back toward a coin flip.
+# provenance: divergence(logfmt-expression-duplicate-source-key-tiebreak)
+eval instant at 60s {service_name="lfe5"} | logfmt a="x", b="x"
+  {a="3", b="", service_name="lfe5"}  0s  x=3 y=4
+
+# Swapping the declarations swaps OUR winner — which is what makes it
+# query order rather than a name order. It is also the row that shows the
+# reference is not doing this: a single capture of this exact query in
+# the same session answered `{a="3", b=""}`, i.e. the SECOND-declared
+# identifier won, and the 30-rep sweep above split 21/9.
+# provenance: divergence(logfmt-expression-duplicate-source-key-tiebreak)
+eval instant at 60s {service_name="lfe5"} | logfmt b="x", a="x"
+  {a="", b="3", service_name="lfe5"}  0s  x=3 y=4
+
+# provenance: divergence(logfmt-expression-duplicate-source-key-tiebreak)
+eval instant at 60s {service_name="lfe5"} | logfmt a="x", b="y", c="x"
+  {a="3", b="4", c="", service_name="lfe5"}  0s  x=3 y=4
+
+clear
+
+load
+  {s="m", service_name="lfes"}
+  0s  b=1 a-b=2 x=3
+
+# --- the #334 containment controls: an identifier the STREAM supplies is
+# --- not pre-seeded (parser.go:547's `!BaseHas` guard), and a HIT on it
+# --- renames in the write path (:602-604). Both agreed before this issue
+# --- and must keep agreeing.
+
+eval instant at 60s {service_name="lfes"} | logfmt s="nosuch"
+  {s="m", service_name="lfes"}  0s  b=1 a-b=2 x=3
+
+eval instant at 60s {service_name="lfes"} | logfmt s="b"
+  {s="m", s_extracted="1", service_name="lfes"}  0s  b=1 a-b=2 x=3
+
+clear

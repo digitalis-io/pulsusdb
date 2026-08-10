@@ -511,10 +511,22 @@ fn logfmt_default_is_lenient_on_malformed_lines() {
 }
 
 #[test]
-fn logfmt_targeted_extraction_drops_a_missing_source_by_default() {
-    // The empty-drop rule applies uniformly to a targeted-extraction miss
-    // (issue #200): `missing` (no `nope` key in the line) is dropped by
-    // default, leaving only the renamed `lvl`.
+fn logfmt_targeted_extraction_emits_an_empty_label_for_a_missing_source() {
+    // **This assertion CHANGED DIRECTION at issue #393**, and it is the
+    // place to look hardest. It used to be
+    // `logfmt_targeted_extraction_drops_a_missing_source_by_default` and
+    // asserted that `missing` was ABSENT, crediting the empty-drop rule
+    // to issue #200 — pinning the defect as if it were correct
+    // behaviour. The expression parser has no `keepEmpty` field at all
+    // (`LogfmtExpressionParserExpr.Stage()` passes only `l.Strict`,
+    // `pkg/logql/syntax/ast.go:1073-1075 @ v3.7.4`); the label comes from
+    // the unconditional pre-seed of every identifier
+    // (`pkg/logql/log/parser.go:545-550`).
+    //
+    // Captured on `grafana/loki:3.7.4` (buildinfo from the running
+    // process: revision `b318f282`) on 2026-08-10: `| logfmt a="nosuch"`
+    // over `b=1 a-b=2 x=3` answers `{a=""}` with AND without
+    // `--keep-empty`.
     let (got, _) = run(
         r#"{a="b"} | logfmt lvl="level", missing="nope""#,
         "level=warn other=x",
@@ -522,14 +534,26 @@ fn logfmt_targeted_extraction_drops_a_missing_source_by_default() {
     .unwrap();
     assert_eq!(
         got,
-        labels(&[("app", "checkout"), ("env", "prod"), ("lvl", "warn")])
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("lvl", "warn"),
+            ("missing", ""),
+        ])
     );
 }
 
 #[test]
 fn logfmt_keep_empty_retains_empty_value_keys() {
     // `--keep-empty` retains empty-value extractions (issue #200): the bare
-    // key `retry` and the targeted miss `missing` come back as `""`.
+    // key `retry` comes back as `""`.
+    //
+    // The second half is the TARGETED arm, where the flag is now inert
+    // (issue #393): `missing` comes back as `""` whether or not it is
+    // written, and the flagless spelling is asserted by
+    // `logfmt_targeted_extraction_emits_an_empty_label_for_a_missing_source`
+    // above. Kept here so a future change that reconnects `keep_empty` to
+    // the targeted arm has to move BOTH tests, not one.
     let (got, _) = run(
         r#"{a="b"} | logfmt --keep-empty"#,
         "level=error retry took=250ms",

@@ -1873,7 +1873,20 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// reference's surviving-error surface there carry a
 /// `divergence(variants-surviving-error-status)` marker instead and move
 /// `DIVERGENCE`, not this constant.
-const CAPTURED: usize = 1_341;
+///
+/// Issue #393 added `b24_logfmt_expr_eval.test` — what a SURVIVING
+/// `| logfmt <id>="<expr>"` extraction EVALUATES to, where
+/// `b22_logfmt_expr_reject.test` asks which expressions are refused: the
+/// pre-seeded empty label a miss leaves behind, the sanitization of the
+/// LINE key before it is compared, the identifier that aliases a line
+/// key, document-order last-write-wins, and the `U+FFFD` emptying rule.
+/// Captured against the pinned v3.7.4 container in a single run over a
+/// window ending at now, same file-level `captured` default. Its rows
+/// where several identifiers share a source key carry
+/// `divergence(logfmt-expression-duplicate-source-key-tiebreak)` instead
+/// and move `DIVERGENCE`, not this constant — the reference has no answer
+/// there.
+const CAPTURED: usize = 1_368;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1884,8 +1897,10 @@ const DERIVED: usize = 31;
 /// bound where both sides answer the empty string — all name
 /// `json-nonvalidating-scan-residual`. Issue #397's wrapped-variant rows
 /// on the reference's surviving-error surface name
-/// `variants-surviving-error-status`.
-const DIVERGENCE: usize = 25;
+/// `variants-surviving-error-status`. Issue #393's rows where several
+/// logfmt extraction identifiers share a source key name
+/// `logfmt-expression-duplicate-source-key-tiebreak`.
+const DIVERGENCE: usize = 28;
 const PORTED: usize = 32;
-const TOTAL: usize = 1_429;
+const TOTAL: usize = 1_459;
 // corpus-counts: end (provenance-corpus-constants)

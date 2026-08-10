@@ -299,6 +299,56 @@ fn per_row_allocation_bounds_hold() {
         );
     }
 
+    // --- Issue #393: ONE walk of the line, not one per extraction. The
+    // --- targeted `| logfmt` arm used to run a full `walk_logfmt` per
+    // --- requested extraction; `LogfmtExpressionParser.Process`
+    // --- (`pkg/logql/log/parser.go:531-624 @ v3.7.4`) makes a single
+    // --- document-order pass, and the port has to as well.
+    //
+    // The accounting unit is one `run_into` over one row, `ROWS` of them
+    // with a reused scratch, warm-up discarded (`count_run_into`).
+    //
+    // Every value on the line is QUOTED AND CARRIES A BACKSLASH ESCAPE,
+    // which is `walk_logfmt`'s only owned path: one `String` per pair,
+    // per walk. So the walk count is directly observable — E walks of a
+    // P-pair line cost E*P allocations per row, one walk costs P.
+    //
+    // The bound is stated as a DIFFERENCE between one extraction and
+    // eight over the SAME line, so the line's own decode cost cancels and
+    // the gate is about the walk count alone. What remains on the
+    // eight-extraction side is the pre-seed's label-vector growth, which
+    // is amortized to nothing by the reused scratch — hence a flat
+    // residue, not a per-row term.
+    //
+    // Watched to fail: with `crates/pulsus-read/src/logql/{pipeline,
+    // logfmt_expr}.rs` checked out at `ec774ee` and this file left as it
+    // is, the gate reports `800000 allocations over 20000 rows for eight
+    // extractions against 100000 for one` — one walk per extraction,
+    // exactly 8x, and a failure margin five orders of magnitude past
+    // `ZERO_RESIDUE`. At this commit both sides read 100000.
+    {
+        let escaped_bodies: Vec<String> = (0..64)
+            .map(|i| {
+                format!(
+                    r#"k1="a\"{i}" k2="b\"{i}" k3="c\"{i}" k4="d\"{i}" k5="e\"{i}""#,
+                    i = i
+                )
+            })
+            .collect();
+        let one = count_run_into(r#"{a="b"} | logfmt a1="k1""#, &escaped_bodies, &base);
+        let eight = count_run_into(
+            r#"{a="b"} | logfmt a1="k1", a2="k2", a3="k3", a4="k4", a5="k5", a6="n6", a7="n7", a8="n8""#,
+            &escaped_bodies,
+            &base,
+        );
+        assert!(
+            eight <= one + ZERO_RESIDUE,
+            "targeted logfmt walk count depends on the extraction count: {eight} allocations \
+             over {ROWS} rows for eight extractions against {one} for one, out of the SAME \
+             line — `run_logfmt`'s targeted arm must walk the line exactly once"
+        );
+    }
+
     // --- Assembly paths (`run_pipeline_rows` end to end). Output
     // --- materialization is inherent (owned `StreamResult`s), so these
     // --- pin small per-surviving-row constants, not zero.
