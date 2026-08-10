@@ -371,9 +371,64 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
          WHERE fingerprint IN (18374, 99120)\n\
          \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
          \x20 AND hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0\n\
-         ORDER BY timestamp_ns DESC\n\
+         ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC\n\
          LIMIT 100"
     );
+}
+
+/// **Issue #406: the stage-3 `ORDER BY` is a TOTAL order, and this is the
+/// byte pin on it.** `ORDER BY timestamp_ns` alone left entries sharing a
+/// timestamp in whatever order the parts were read in, which ClickHouse
+/// does not fix across runs — measured 2026-08-10 over 81 active parts
+/// holding 200 rows at one identical `timestamp_ns`, fifteen identical
+/// queries returned fifteen different orderings, and at a `LIMIT` cutting
+/// through the tie group, fifteen different result SETS. The reference is
+/// stable over the same corpus shape.
+///
+/// The key list is `stage3_keyset`'s, exactly, so the fast path and the
+/// fetch-until-limit path break a tie the same way; the assertion below
+/// reads that list off `stage3_keyset` rather than restating it, so the two
+/// cannot drift apart silently.
+#[test]
+fn stage3_breaks_timestamp_ties_with_the_same_total_order_as_the_keyset_builder() {
+    for (direction, ord) in [(Direction::Backward, "DESC"), (Direction::Forward, "ASC")] {
+        let window = TimeWindow {
+            start_ns: START_NS,
+            end_ns: END_NS,
+        };
+        let fast = sql::stage3(
+            "log_samples",
+            &["'checkout'".to_string()],
+            &[1],
+            window,
+            &[],
+            direction,
+            25,
+        );
+        let paged = sql::stage3_keyset(
+            "log_samples",
+            &["'checkout'".to_string()],
+            &[1],
+            window,
+            sql::KeysetLower::First,
+            direction,
+            &[],
+            25,
+        );
+        // The paged builder projects `cityHash64(body) AS body_hash` and
+        // sorts on the alias; the fast path has no such projection and
+        // sorts on the expression. Same key list either way.
+        let want = format!(
+            "ORDER BY timestamp_ns {ord}, fingerprint {ord}, cityHash64(body) {ord}, body {ord}"
+        );
+        assert!(fast.contains(&want), "stage3 {direction:?}:\n{fast}");
+        let want_paged =
+            format!("ORDER BY timestamp_ns {ord}, fingerprint {ord}, body_hash {ord}, body {ord}");
+        assert!(
+            paged.contains(&want_paged),
+            "stage3_keyset {direction:?} — if this moved, stage3 must move with it:\n{paged}"
+        );
+    }
 }
 
 #[test]
@@ -407,7 +462,7 @@ fn direction_forward_orders_ascending() {
         Direction::Forward,
         25,
     );
-    assert!(sql.contains("ORDER BY timestamp_ns ASC"));
+    assert!(sql.contains("ORDER BY timestamp_ns ASC, fingerprint ASC"));
     assert!(sql.contains("LIMIT 25"));
 }
 

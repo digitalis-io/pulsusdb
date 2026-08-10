@@ -3406,6 +3406,95 @@ async fn a_seconds_valued_window_returns_the_seed() {
     drop_database(db).await;
 }
 
+/// **Issue #406, found by a CI failure on this suite's own
+/// `a_seconds_valued_window_returns_the_seed`.** Two entries sharing a
+/// byte-identical `timestamp_ns` came back in one order on a developer
+/// box and the other on a CI runner, so a test asserting byte-identity
+/// between two equivalent queries failed for a reason that had nothing to
+/// do with what it was testing.
+///
+/// The cause was ours: `sql::stage3` ordered by `timestamp_ns` alone, and
+/// ClickHouse does not fix the relative order of equal sort keys across
+/// runs — it varies with how the parts happen to be read. Measured
+/// 2026-08-10 over 81 active parts holding 200 rows at one timestamp,
+/// **fifteen identical queries returned fifteen different orderings**,
+/// and at a `LIMIT` cutting through the tie group, **fifteen different
+/// result SETS** — the same query answering with different log lines. The
+/// reference is stable over the same corpus shape.
+///
+/// `stage3` now carries the same total order `stage3_keyset` always did
+/// (`timestamp_ns, fingerprint, cityHash64(body), body`). This gates the
+/// behaviour rather than the SQL text — the byte pin on the text lives in
+/// `pulsus-read/tests/sql_snapshots.rs`.
+///
+/// **The many-parts fixture is the test.** One `INSERT` per row keeps the
+/// rows in separate parts (merges are stopped first), which is what makes
+/// the read parallel enough to reorder; a single-part fixture is stable
+/// even without a tie-break and would pass against the defect.
+#[tokio::test]
+async fn entries_sharing_a_timestamp_come_back_in_a_stable_order() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_ts_ties";
+    let port = 31_197;
+    drop_database(db).await;
+    let (_guard, client, base_ns) = setup(db, port).await;
+
+    // Merges off, then one INSERT per row: 40 single-row parts, every row
+    // at the SAME timestamp, in one stream.
+    client
+        .execute(
+            &format!("SYSTEM STOP MERGES {db}.log_samples"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("stop merges");
+    let tied_ns = base_ns - 10_000_000_000;
+    for i in 0..40 {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                     body) VALUES ('checkout', {FP_A}, {tied_ns}, 0, 'tied line {i:03}')"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed one tied row per part");
+    }
+
+    let start = (base_ns - 3_600_000_000_000).to_string();
+    let end = (base_ns + 1_000_000_000).to_string();
+    let selector = urlencode(r#"{service_name="checkout"}"#);
+
+    // Two limits: one comfortably past the tie group (order alone is at
+    // stake) and one that cuts through it (MEMBERSHIP is at stake too —
+    // the worse half of the defect).
+    for limit in ["500", "20"] {
+        let path = format!(
+            "/api/logs/v1/query_range?query={selector}&start={start}&end={end}&limit={limit}"
+        );
+        let first = http_get(port, &path).expect("query_range reachable");
+        assert_eq!(first.status, 200, "{}", first.body);
+        for run in 1..12 {
+            let again = http_get(port, &path).expect("query_range reachable");
+            assert_eq!(again.status, 200, "{}", again.body);
+            assert_eq!(
+                again.body, first.body,
+                "limit={limit}, run {run}: entries sharing a timestamp must come back in a STABLE \
+                 order — and at a limit cutting the tie group, the same SET. Repeating one query \
+                 must not answer differently."
+            );
+        }
+    }
+
+    drop_database(db).await;
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {

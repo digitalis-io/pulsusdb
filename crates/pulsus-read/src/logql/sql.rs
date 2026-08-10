@@ -299,6 +299,31 @@ pub fn stage2(streams_table: &str, fingerprints: &[u64]) -> String {
 /// **Singleton/`IN` split (architect plan amendment §2, review finding 2):**
 /// exactly one service renders the byte-exact §3.2 form `PREWHERE service =
 /// 'checkout'`; more than one renders `PREWHERE service IN (...)`.
+///
+/// **The `ORDER BY` is a TOTAL order, and that is load-bearing (issue
+/// #406, found by a CI failure).** `ORDER BY timestamp_ns` alone leaves
+/// entries sharing a timestamp in whatever order the parts happened to be
+/// read in, which ClickHouse does not fix across runs: measured
+/// 2026-08-10 on 81 active parts holding 200 rows at one identical
+/// `timestamp_ns`, **fifteen identical queries returned fifteen different
+/// orderings**, and at a `LIMIT` that cut through the tie group,
+/// **fifteen different result SETS** — the same query answering with
+/// different log lines each time. The reference is stable over the same
+/// corpus shape (229 rows, 160 separate appends): one ordering, one set,
+/// every run.
+///
+/// So ties break on `fingerprint`, then `cityHash64(body)`, then the raw
+/// `body` — **the identical key list [`stage3_keyset`] already renders**,
+/// so the fast path and the fetch-until-limit path order a tie group the
+/// same way and a pipeline gaining a dropping stage cannot reshuffle it.
+/// All four columns follow `direction`, as there.
+///
+/// This costs no pruning: the table's sort key is `(service, fingerprint,
+/// timestamp_ns)` and this query leads with `timestamp_ns`, so it was
+/// never a read-in-order scan — the added keys change comparison cost
+/// inside a sort that already had to happen, over at most the matched
+/// rows. Index engagement is pinned unchanged by
+/// `explain_indexes.rs`'s stage-3 cases.
 pub fn stage3(
     samples_table: &str,
     services: &[String],
@@ -323,7 +348,10 @@ pub fn stage3(
         sql.push_str("\n  AND ");
         sql.push_str(clause);
     }
-    sql.push_str(&format!("\nORDER BY timestamp_ns {order}\nLIMIT {limit}"));
+    sql.push_str(&format!(
+        "\nORDER BY timestamp_ns {order}, fingerprint {order}, cityHash64(body) {order}, body \
+         {order}\nLIMIT {limit}"
+    ));
     sql
 }
 
