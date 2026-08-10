@@ -310,11 +310,57 @@ pub(crate) fn tokenize(input: CheckedQuery<'_>) -> Result<Vec<Token>, LogQlError
     Ok(tokens)
 }
 
-/// Scans a double-quoted, Go-escaped string. `start` is the byte offset
-/// of the opening quote (already peeked, not yet consumed).
+/// Scans a double-quoted string with the reference's full escape grammar
+/// (issue #400 Stage 1).
+///
+/// The rule is `prometheus/util/strutil.Unquote`
+/// (`vendor/github.com/prometheus/prometheus/util/strutil/quote.go:66-231
+/// @ v3.7.4`), which Loki's lexer calls on every `scanner.String` token
+/// (`pkg/logql/syntax/lex.go:190-201 @ v3.7.4`) — so this is a LEXER
+/// rule and reaches every LogQL construct that carries a string, not
+/// particular regex positions. Accepted: the short escapes
+/// `\a \b \f \n \r \t \v \\ \"`, `\xHH` (2 hex, a raw BYTE), `\NNN`
+/// (exactly 3 octal digits, > 255 is an error), `\uXXXX` (4 hex) and
+/// `\UXXXXXXXX` (8 hex, > `0x10FFFF` is an error). **Everything else is
+/// an error**, including `\d`, `\w`, `\q`, `\0`, `\'` (`quote.go:220-224`
+/// permits the escaped quote only when it IS the delimiter) and a raw
+/// newline (`quote.go:85-87`).
+///
+/// This function used to end in `Some(other) => value.push(other)` —
+/// drop the backslash, keep the character. That single arm produced both
+/// halves of #400's escape divergence: `{app=~"\101"}` selected the
+/// stream `101` where the reference selects `A` (**different rows, both
+/// `200`, no error either side**), and `{app=~"\d+"}` was served here as
+/// the pattern `d+` where the reference answers
+/// `400 … invalid char escape`.
+///
+/// **Accumulation is into a `Vec<u8>`, not a `String`, and that is the
+/// whole point of the byte buffer:** `\xHH`/`\NNN` denote raw bytes in
+/// Go, so consecutive escapes compose — `"\xc3\xa9"` is the single
+/// character `é`, measured on the pinned container. Decoding each escape
+/// to `char::from_u32(HH)` instead would read them as Latin-1 and give
+/// four bytes for that literal. `\uXXXX`/`\UXXXXXXXX` are Unicode code
+/// points and are encoded as UTF-8, with a **surrogate decoding to
+/// U+FFFD** rather than being refused — Go's `utf8.EncodeRune` maps an
+/// invalid rune to `RuneError` (`quote.go:172-179` sets `multibyte` and
+/// leaves the bounds check at `utf8.MaxRune`), which is why this differs
+/// from `pulsus-traceql`'s otherwise-identical scanner.
+///
+/// **One deliberate narrowing, ledgered as `logql-string-escape-non-utf8`:**
+/// a literal whose decoded bytes are not valid UTF-8 (`"\xff"`) is a
+/// positioned error here, where the reference serves it at its five
+/// `NewFastRegexMatcher` positions. No mounted ingest route can store
+/// invalid UTF-8 (`LogRow.body: String`,
+/// `pulsus-write/src/protocols/otlp_logs.rs:37-55`), so no line or label
+/// value in this store could match such a pattern; `pulsus-traceql`
+/// carries the identical ruling (#56).
+///
+/// `start` is the byte offset of the opening quote (already peeked, not
+/// yet consumed).
 fn scan_double_quoted(sc: &mut Scanner<'_>, start: usize) -> Result<String, LogQlError> {
     sc.advance(); // opening quote
-    let mut value = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4];
     loop {
         match sc.peek() {
             None => {
@@ -327,10 +373,14 @@ fn scan_double_quoted(sc: &mut Scanner<'_>, start: usize) -> Result<String, LogQ
             }
             Some('"') => {
                 sc.advance();
-                return Ok(value);
+                let end = sc.current_byte();
+                return String::from_utf8(bytes).map_err(|_| LogQlError::NonUtf8StringLiteral {
+                    span: Span { start, end },
+                });
             }
             Some('\\') => {
-                sc.advance();
+                let esc_start = sc.current_byte();
+                sc.advance(); // backslash
                 match sc.advance() {
                     None => {
                         return Err(LogQlError::UnterminatedString {
@@ -340,22 +390,167 @@ fn scan_double_quoted(sc: &mut Scanner<'_>, start: usize) -> Result<String, LogQ
                             },
                         });
                     }
-                    Some('n') => value.push('\n'),
-                    Some('t') => value.push('\t'),
-                    Some('r') => value.push('\r'),
-                    // Anything else (`\\`, `\"`, `` \` ``, or an unknown
-                    // escape) passes through as the literal character —
-                    // lenient by design, this is a proof-subset lexer,
-                    // not a full Go-string validator.
-                    Some(other) => value.push(other),
+                    Some('a') => bytes.push(0x07),
+                    Some('b') => bytes.push(0x08),
+                    Some('f') => bytes.push(0x0C),
+                    Some('n') => bytes.push(b'\n'),
+                    Some('r') => bytes.push(b'\r'),
+                    Some('t') => bytes.push(b'\t'),
+                    Some('v') => bytes.push(0x0B),
+                    Some('\\') => bytes.push(b'\\'),
+                    Some('"') => bytes.push(b'"'),
+                    Some('x') => {
+                        let code = scan_hex_escape(sc, start, esc_start, 2)?;
+                        // `\xHH` is one BYTE, whatever its value — the
+                        // composition rule above.
+                        bytes.push(code as u8);
+                    }
+                    Some(c @ '0'..='7') => {
+                        let code = scan_octal_escape(sc, start, esc_start, c)?;
+                        bytes.push(code as u8);
+                    }
+                    Some('u') => {
+                        let code = scan_hex_escape(sc, start, esc_start, 4)?;
+                        push_code_point(sc, &mut bytes, &mut buf, esc_start, code)?;
+                    }
+                    Some('U') => {
+                        let code = scan_hex_escape(sc, start, esc_start, 8)?;
+                        push_code_point(sc, &mut bytes, &mut buf, esc_start, code)?;
+                    }
+                    Some(_) => {
+                        return Err(invalid_char_escape(sc, esc_start));
+                    }
                 }
             }
+            // `quote.go:85-87` refuses a raw newline in an interpreted
+            // literal outright; Go's own scanner stops the token there
+            // too. It nearly always means the closing quote was
+            // forgotten, so the unterminated-string diagnostic (pointing
+            // at the opening quote) beats silently going multiline.
+            // Backtick raw strings still allow newlines, as in Go.
+            Some('\n') => {
+                return Err(LogQlError::UnterminatedString {
+                    span: Span {
+                        start,
+                        end: sc.current_byte(),
+                    },
+                });
+            }
             Some(c) => {
-                value.push(c);
+                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                 sc.advance();
             }
         }
     }
+}
+
+/// The offending escape's own source text, from the backslash to
+/// wherever the scan stopped — `\d`, `\'`, `\x8"`. Never the whole
+/// literal: the message names what the user has to change.
+fn invalid_char_escape(sc: &Scanner<'_>, esc_start: usize) -> LogQlError {
+    let end = sc.current_byte();
+    LogQlError::InvalidCharEscape {
+        escape: sc.input[esc_start..end].to_string(),
+        span: Span {
+            start: esc_start,
+            end,
+        },
+    }
+}
+
+/// Consumes exactly `digits` hex digits after `\x`/`\u`/`\U` and returns
+/// their value. EOF mid-escape is the string's unterminated error (there
+/// is no closing quote to be found); anything else that is not a hex
+/// digit — including the closing quote itself, which is Go's
+/// `len(s) < n` case — is a positioned invalid-escape error.
+fn scan_hex_escape(
+    sc: &mut Scanner<'_>,
+    string_start: usize,
+    esc_start: usize,
+    digits: u32,
+) -> Result<u32, LogQlError> {
+    let mut code: u32 = 0;
+    for _ in 0..digits {
+        match sc.peek() {
+            None => {
+                return Err(LogQlError::UnterminatedString {
+                    span: Span {
+                        start: string_start,
+                        end: sc.len(),
+                    },
+                });
+            }
+            Some(c) => match c.to_digit(16) {
+                Some(d) => {
+                    sc.advance();
+                    code = code * 16 + d;
+                }
+                None => {
+                    sc.advance();
+                    return Err(invalid_char_escape(sc, esc_start));
+                }
+            },
+        }
+    }
+    Ok(code)
+}
+
+/// Consumes the remaining two digits of a `\NNN` octal escape (`first`
+/// is already consumed) and returns the value, which Go bounds at 255
+/// (`quote.go:202-205`) because the escape denotes a byte.
+fn scan_octal_escape(
+    sc: &mut Scanner<'_>,
+    string_start: usize,
+    esc_start: usize,
+    first: char,
+) -> Result<u32, LogQlError> {
+    // `first` is '0'..='7', so `to_digit(8)` always succeeds.
+    let mut code: u32 = first.to_digit(8).unwrap_or(0);
+    for _ in 0..2 {
+        match sc.peek() {
+            None => {
+                return Err(LogQlError::UnterminatedString {
+                    span: Span {
+                        start: string_start,
+                        end: sc.len(),
+                    },
+                });
+            }
+            Some(c) => match c.to_digit(8) {
+                Some(d) => {
+                    sc.advance();
+                    code = code * 8 + d;
+                }
+                None => {
+                    sc.advance();
+                    return Err(invalid_char_escape(sc, esc_start));
+                }
+            },
+        }
+    }
+    if code > 255 {
+        return Err(invalid_char_escape(sc, esc_start));
+    }
+    Ok(code)
+}
+
+/// Appends a `\uXXXX`/`\UXXXXXXXX` code point as UTF-8. Above
+/// `utf8.MaxRune` is Go's error (`quote.go:180-183`); a **surrogate is
+/// not** — `utf8.EncodeRune` writes U+FFFD for it, which is what the
+/// container returns (`|~ "\ud800"` matches a U+FFFD line, measured).
+fn push_code_point(
+    sc: &Scanner<'_>,
+    bytes: &mut Vec<u8>,
+    buf: &mut [u8; 4],
+    esc_start: usize,
+    code: u32,
+) -> Result<(), LogQlError> {
+    if code > 0x10_FFFF {
+        return Err(invalid_char_escape(sc, esc_start));
+    }
+    let c = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
+    bytes.extend_from_slice(c.encode_utf8(buf).as_bytes());
+    Ok(())
 }
 
 /// Scans a backtick raw string (commonly used for regex bodies): no
