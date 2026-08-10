@@ -9,7 +9,7 @@
 //! caps (`params::MAX_TARGET_LABELS`/`MAX_TARGET_LABEL_BYTES`) reject
 //! here, in pure param parsing, BEFORE any AST mutation/planning/SQL.
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -52,14 +52,14 @@ pub(crate) async fn volume_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match volume_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 

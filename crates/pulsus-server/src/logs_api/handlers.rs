@@ -3,8 +3,8 @@
 //! encode the envelope (`encode.rs`). Thin by design — all planning/SQL/
 //! execution stays in `pulsus-read` (issue #13 architect plan).
 
-use axum::body::Bytes;
-use axum::extract::{Path, RawQuery, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 
@@ -191,13 +191,47 @@ pub(super) fn parse_bounds_ordered(pairs: &[(String, String)]) -> Result<(i64, i
 /// type (Go's grammar admits ASCII token characters only), so it takes the
 /// malformed branch rather than being read as absent.
 ///
+/// **The header is examined BEFORE the body is consumed** — the ordering
+/// is the contract, not an implementation detail, and it is why this takes
+/// [`Body`] rather than `Bytes`. A `Bytes` extractor buffers the entire
+/// upload before the handler runs, so a client POSTing a large body it did
+/// not need to send pays the whole transfer for a request that is decided
+/// by its URL. Measured 2026-08-10 against `grafana/loki:3.7.4`
+/// (`b318f282`) with `Content-Length: 100000` and 7 bytes actually sent:
+/// the reference answers `200` in under 10 ms under `application/json`,
+/// under `text/plain` and under no `Content-Type`, and `400` just as
+/// promptly for a malformed one — while PulsusDB, before this change,
+/// answered **none of the four** and sat waiting for a body it was going
+/// to discard. On the [`params::FormBody::Ignore`] branch the `Body` is
+/// dropped unpolled, which is what lets the response go out first.
+///
+/// **One measured divergence, deliberate, and it is the reference being
+/// wasteful rather than us being wrong.** For a form `Content-Type` whose
+/// PARAMETERS are malformed (`application/x-www-form-urlencoded; bogus`),
+/// Go's `parsePostForm` enters the form branch on the base type, reads and
+/// parses the whole body, and only then returns the MIME error it retained
+/// (`request.go:1274-1297` — `mime.ParseMediaType` yields a non-empty
+/// media type ALONGSIDE `ErrInvalidMediaParameter`, `mediatype.go:164`).
+/// Measured: the reference waits for the full body and then answers `400`;
+/// we answer the same `400` without reading it. Same status, same body,
+/// strictly less transfer — so the divergence is invisible to any client
+/// that sends a complete request, and is not ledgered as a behavioural
+/// difference. Reading an upload we have already decided to reject is
+/// exactly the waste this change exists to remove.
+///
+/// Returns a ready [`Response`] rather than an `ApiError` because the
+/// over-limit rejection on the parse branch is **axum's own** and must
+/// stay byte-identical: routing it through [`ApiError`] would re-render it
+/// through `plain_text_error`, which adds `X-Content-Type-Options:
+/// nosniff` that today's `413` does not carry.
+///
 /// `pub(super)` (issue #170): the detected_labels/detected_fields POST
 /// handlers (`detected.rs`) reuse the same form-decode core.
 pub(super) async fn read_form_pairs(
     headers: &HeaderMap,
     raw_query: Option<&str>,
-    body: Bytes,
-) -> Result<Vec<(String, String)>, ApiError> {
+    body: Body,
+) -> Result<Vec<(String, String)>, Response> {
     let raw_content_type = headers.get(header::CONTENT_TYPE);
     // An ABSENT header reads as `""`, which is what Go's `Header.Get`
     // returns for one; `parsePostForm` then substitutes
@@ -207,24 +241,52 @@ pub(super) async fn read_form_pairs(
         Some(value) => value.to_str().ok(),
         None => Some(""),
     };
-    let mut pairs = match content_type {
-        Some(content_type) => match params::form_body_disposition(Some(content_type))? {
-            params::FormBody::Parse => {
-                let text = std::str::from_utf8(&body)
-                    .map_err(|_| ApiError::Param(ParamError::InvalidFormBody))?;
-                params::parse_pairs(text)
-            }
-            params::FormBody::Ignore => Vec::new(),
-        },
-        None => {
-            let lossy =
-                String::from_utf8_lossy(raw_content_type.map(|v| v.as_bytes()).unwrap_or_default())
-                    .into_owned();
-            return Err(ApiError::Param(ParamError::MalformedContentType(lossy)));
+    let Some(content_type) = content_type else {
+        let lossy =
+            String::from_utf8_lossy(raw_content_type.map(|v| v.as_bytes()).unwrap_or_default())
+                .into_owned();
+        return Err(ApiError::Param(ParamError::MalformedContentType(lossy)).into_response());
+    };
+    // Decided from the header alone. Nothing below this line polls `body`
+    // unless the answer is `Parse`.
+    let disposition = params::form_body_disposition(Some(content_type))
+        .map_err(|e| ApiError::from(e).into_response())?;
+
+    let mut pairs = match disposition {
+        params::FormBody::Parse => {
+            let bytes = read_capped_form_body(body).await?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| ApiError::Param(ParamError::InvalidFormBody).into_response())?;
+            params::parse_pairs(text)
+        }
+        // Dropped without a single poll: the upload is never awaited, and
+        // the response is written while the client may still be sending.
+        params::FormBody::Ignore => {
+            drop(body);
+            Vec::new()
         }
     };
     pairs.extend(params::parse_pairs(raw_query.unwrap_or("")));
     Ok(pairs)
+}
+
+/// Buffers a form body under the same bound, and with the same rejection
+/// bytes, that the `Bytes` extractor applied before issue #406 moved the
+/// content-type check ahead of the body.
+///
+/// `Bytes::from_request` is called rather than reimplemented precisely so
+/// the `413` stays axum's own — status, `text/plain; charset=utf-8` and
+/// the `Failed to buffer the request body: length limit exceeded` text
+/// alike (captured from a running server at `60670cc` before the change).
+/// The synthetic [`Request`] carries no extensions, so axum applies its
+/// 2 MiB `DefaultBodyLimit` default; **no `logs_api` route layers a
+/// `DefaultBodyLimit` of its own** (`git grep DefaultBodyLimit` finds only
+/// `pulsus-write`'s ingest note), and one added later would have to bound
+/// this call itself rather than the extractor.
+async fn read_capped_form_body(body: Body) -> Result<Bytes, Response> {
+    Bytes::from_request(Request::new(body), &())
+        .await
+        .map_err(|rejection| rejection.into_response())
 }
 
 /// The reference's series groups (`ParseSeriesQuery`,
@@ -282,14 +344,14 @@ pub(crate) async fn query_range_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match query_range_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 
@@ -351,14 +413,14 @@ pub(crate) async fn query_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match query_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 
@@ -440,14 +502,14 @@ pub(crate) async fn labels_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match labels_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 
@@ -498,14 +560,14 @@ pub(crate) async fn label_values_post(
     Path(name): Path<String>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match label_values_impl(state, &name, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 
@@ -547,14 +609,14 @@ pub(crate) async fn series_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match series_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        Err(e) => e.into_response(),
+        Err(response) => response,
     }
 }
 
@@ -1059,7 +1121,7 @@ mod tests {
                 RawQuery(Some(r#"query={app="x"}"#.to_string())),
                 // Would be a 400 if it were read: no `query` and a
                 // `since` that does not parse.
-                Bytes::from_static(b"since=bogus"),
+                Body::from("since=bogus"),
             )
             .await;
             let (status, body) = status_and_body(res).await;
@@ -1086,7 +1148,7 @@ mod tests {
                 State(test_state()),
                 headers,
                 RawQuery(Some(r#"query={app="x"}"#.to_string())),
-                Bytes::from_static(b""),
+                Body::from(""),
             )
             .await;
             let (status, body) = status_and_body(res).await;
@@ -1109,7 +1171,7 @@ mod tests {
             header::CONTENT_TYPE,
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
-        let body = Bytes::from_static(b"query=%7Bapp%3D%22x%22%7D");
+        let body = Body::from("query=%7Bapp%3D%22x%22%7D");
         let res = query_range_post(State(test_state()), headers, RawQuery(None), body).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1122,13 +1184,7 @@ mod tests {
             header::CONTENT_TYPE,
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
-        let res = query_post(
-            State(test_state()),
-            headers,
-            RawQuery(None),
-            Bytes::from_static(b""),
-        )
-        .await;
+        let res = query_post(State(test_state()), headers, RawQuery(None), Body::from("")).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -1140,7 +1196,7 @@ mod tests {
             header::CONTENT_TYPE,
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
-        let body = Bytes::from_static(b"query=%7Bapp%3D%22x%22%7D");
+        let body = Body::from("query=%7Bapp%3D%22x%22%7D");
         let res = query_post(State(test_state()), headers, RawQuery(None), body).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1287,7 +1343,7 @@ mod tests {
             State(test_state()),
             headers,
             RawQuery(Some(r#"match[]={app="x"}"#.to_string())),
-            Bytes::from_static(b"since=bogus"),
+            Body::from("since=bogus"),
         )
         .await;
         let (status, body) = status_and_body(res).await;
@@ -1305,7 +1361,7 @@ mod tests {
             header::CONTENT_TYPE,
             "application/x-www-form-urlencoded".parse().unwrap(),
         );
-        let body = Bytes::from_static(b"match%5B%5D=%7Bapp%3D%22x%22%7D");
+        let body = Body::from("match%5B%5D=%7Bapp%3D%22x%22%7D");
         let res = series_post(State(test_state()), headers, RawQuery(None), body).await;
         let (status, _body) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
