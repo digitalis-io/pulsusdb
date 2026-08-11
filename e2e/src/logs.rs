@@ -3795,6 +3795,49 @@ mod tests {
         outside: String,
     }
 
+    /// Per line: is it OUTSIDE every fenced code block, i.e. is it live
+    /// Markdown rather than a code sample? A fence opens with three or
+    /// more `` ` `` or `~`, may be indented, and closes only with the
+    /// character that opened it — so `~~~` inside a ```` ``` ```` block is
+    /// content. The fence lines themselves are never live.
+    ///
+    /// Shared by both extractors on purpose. When only headings consulted
+    /// it, wrapping a bullet in an indented `~~~` fence demoted it to a
+    /// code sample while the bullet check went on matching it — the same
+    /// hole as matching bare words, one layer down.
+    ///
+    /// Panics on an unbalanced fence rather than slicing a document it
+    /// cannot read.
+    fn live_markdown_lines(lines: &[&str]) -> Vec<bool> {
+        let fence_char = |line: &str| -> Option<char> {
+            let t = line.trim_start();
+            ['`', '~']
+                .into_iter()
+                .find(|&c| t.starts_with(&String::from(c).repeat(3)))
+        };
+        let mut open: Option<char> = None;
+        let live: Vec<bool> = lines
+            .iter()
+            .map(|line| match (open, fence_char(line)) {
+                (None, Some(c)) => {
+                    open = Some(c);
+                    false
+                }
+                (Some(o), Some(c)) if o == c => {
+                    open = None;
+                    false
+                }
+                _ => open.is_none(),
+            })
+            .collect();
+        assert!(
+            open.is_none(),
+            "the text ends inside an unclosed code fence, so no slice of it \
+             can be trusted"
+        );
+        live
+    }
+
     /// Slices one ledger entry by its `### \`<id>\`` heading.
     ///
     /// Scoped extraction, not a whole-file search, because the claim is a
@@ -3808,13 +3851,10 @@ mod tests {
     /// * a DEEPER heading (`#### …`) does not end the entry — the prefix
     ///   test requires the trailing space, so `"#### x"` never matches
     ///   `"### "`. The committed ledger carries such headings;
-    /// * a heading-shaped line inside a fenced block is ignored. BOTH
-    ///   fence characters are recognised (```` ``` ```` and `~~~`), a
-    ///   fence may be indented (the committed ledger has indented ones,
-    ///   which an unindented-only rule silently missed in an earlier
-    ///   revision of this helper), and a fence only closes with the
-    ///   character that opened it, so `~~~` inside a ```` ``` ```` block
-    ///   is content;
+    /// * a heading-shaped line inside a fenced block is ignored, per
+    ///   [`live_markdown_lines`] — which an unindented-backticks-only
+    ///   rule in an earlier revision of this helper silently missed, the
+    ///   committed ledger's fences being mostly indented;
     /// * an UNBALANCED fence panics rather than mis-slicing quietly;
     /// * a heading may carry up to three leading spaces, which is what
     ///   CommonMark admits as an ATX heading;
@@ -3835,65 +3875,31 @@ mod tests {
     /// * an entry whose heading is written with `setext` underlining, or
     ///   with the id unbackticked, is not found at all — it panics with
     ///   "found 0" rather than passing, which is the safe direction;
+    /// * a bullet whose lead-in and content are BOTH intact but whose
+    ///   meaning has been reversed by an edit inside it. Nothing short of
+    ///   reading the sentence catches that, and this check does not claim
+    ///   to;
     /// * nothing here validates the REST of the ledger. It answers one
     ///   question about one entry.
     fn ledger_entry(ledger: &str, id: &str) -> LedgerEntry {
         let heading = format!("### `{id}`");
         let lines: Vec<&str> = ledger.lines().collect();
+        let live = live_markdown_lines(&lines);
 
-        // A fence opens with three or more `` ` `` or `~`, optionally
-        // indented, and closes only with the SAME character.
-        let fence_char = |line: &str| -> Option<char> {
-            let t = line.trim_start();
-            ['`', '~']
-                .into_iter()
-                .find(|&c| t.starts_with(&String::from(c).repeat(3)))
-        };
-        // A heading counts only outside a fence, and CommonMark admits up
-        // to three leading spaces before the `#` run.
-        let is_heading: Vec<bool> = {
-            let mut open: Option<char> = None;
-            lines
-                .iter()
-                .map(|line| {
-                    match (open, fence_char(line)) {
-                        (None, Some(c)) => {
-                            open = Some(c);
-                            return false;
-                        }
-                        (Some(o), Some(c)) if o == c => {
-                            open = None;
-                            return false;
-                        }
-                        _ => {}
-                    }
-                    if open.is_some() {
-                        return false;
-                    }
-                    let indent = line.len() - line.trim_start_matches(' ').len();
-                    let body = &line[indent..];
-                    indent <= 3
-                        && (body.starts_with("# ")
-                            || body.starts_with("## ")
-                            || body.starts_with("### "))
-                })
-                .collect()
-        };
-        assert!(
-            {
-                let mut open: Option<char> = None;
-                for line in &lines {
-                    match (open, fence_char(line)) {
-                        (None, Some(c)) => open = Some(c),
-                        (Some(o), Some(c)) if o == c => open = None,
-                        _ => {}
-                    }
-                }
-                open.is_none()
-            },
-            "the ledger ends inside an unclosed code fence, so no slice of it \
-             can be trusted"
-        );
+        // CommonMark admits up to three leading spaces before the `#` run.
+        let is_heading: Vec<bool> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let indent = line.len() - line.trim_start_matches(' ').len();
+                let body = &line[indent..];
+                live[i]
+                    && indent <= 3
+                    && (body.starts_with("# ")
+                        || body.starts_with("## ")
+                        || body.starts_with("### "))
+            })
+            .collect();
 
         let starts: Vec<usize> = (0..lines.len())
             .filter(|&i| is_heading[i] && lines[i].starts_with(&heading))
@@ -3934,11 +3940,16 @@ mod tests {
     ///
     /// A top-level bullet is `- ` at column 0 — the shape every bullet in
     /// this ledger has. An indented `- ` is a nested bullet and belongs to
-    /// the item it sits under, so it does not end the span.
+    /// the item it sits under, so it does not end the span. A `- ` inside
+    /// a fenced code block is a code sample and is not a bullet at all
+    /// ([`live_markdown_lines`]); an entry is delimited by headings, which
+    /// are themselves only recognised outside a fence, so an entry never
+    /// begins or ends mid-fence and this local scan is well defined.
     fn ledger_bullet(entry: &str, lead_in: &str) -> String {
         let lines: Vec<&str> = entry.lines().collect();
+        let live = live_markdown_lines(&lines);
         let opens: Vec<usize> = (0..lines.len())
-            .filter(|&i| lines[i].starts_with("- ") && lines[i].starts_with(lead_in))
+            .filter(|&i| live[i] && lines[i].starts_with("- ") && lines[i].starts_with(lead_in))
             .collect();
         assert_eq!(
             opens.len(),
@@ -3949,7 +3960,7 @@ mod tests {
         );
         let start = opens[0];
         let end = (start + 1..lines.len())
-            .find(|&i| lines[i].starts_with("- ") || lines[i].starts_with('#'))
+            .find(|&i| live[i] && (lines[i].starts_with("- ") || lines[i].starts_with('#')))
             .unwrap_or(lines.len());
         lines[start..end].join("\n")
     }
