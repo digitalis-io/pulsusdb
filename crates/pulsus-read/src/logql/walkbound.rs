@@ -191,14 +191,18 @@ const fn max_of(xs: &[u64]) -> u64 {
 /// | `size_of::<(MeRef, u32, usize)>()` | the largest emitter step frame |
 /// | `2 * size_of::<PlanOp>()` | `build_metric_node`'s plan program (#293) — a push-grown `Vec`, so `old + new` can be live across one reallocation |
 /// | `size_of::<MetricNode>()` | `build_metric_node`'s fold value stack (#293) — reserved once at the program's length, so exactly one slot per node |
+/// | `2 * size_of::<MeNode>()` | [`order::sorted_order_reaches_the_wire`](super::order)'s post-order node list (#406) — a push-grown `Vec`, so `old + new` can be live across one reallocation |
+/// | `size_of::<Verdict>()` | that fold's value stack (#406) — reserved once at the node list's length, so exactly one slot per node |
 /// | [`WALK_INDEX_BYTES_PER_NODE`] | the amortised chunk index |
 /// | [`WALK_ALLOC_OVERHEAD_PER_NODE`] | the amortised allocation envelope |
 ///
-/// The last two terms arrived with #293: converting `build_metric_node`
-/// moved a machine-stack frame per node onto the heap as one emitted
-/// [`PlanOp`] plus one folded value. Every `const` assertion below
-/// re-derives from this constant rather than being re-chosen, so the
-/// figures moved with it.
+/// The `PlanOp`/`MetricNode` pair arrived with #293: converting
+/// `build_metric_node` moved a machine-stack frame per node onto the heap
+/// as one emitted [`PlanOp`] plus one folded value. The `MeNode`/`Verdict`
+/// pair arrived with #406, which added a second such fold — the
+/// instant-vector order predicate — over the SAME `N`. Every `const`
+/// assertion below re-derives from this constant rather than being
+/// re-chosen, so the figures moved with it.
 pub const WALK_BYTES_PER_NODE: u64 = size_of::<pulsus_logql::MeRef<'static>>() as u64
     + size_of::<&'static MetricNode>() as u64
     + size_of::<&'static MetricNode>() as u64
@@ -209,6 +213,8 @@ pub const WALK_BYTES_PER_NODE: u64 = size_of::<pulsus_logql::MeRef<'static>>() a
     + size_of::<(pulsus_logql::MeRef<'static>, u32, usize)>() as u64
     + 2 * size_of::<PlanOp>() as u64
     + size_of::<MetricNode>() as u64
+    + 2 * size_of::<pulsus_logql::MeNode<'static>>() as u64
+    + size_of::<super::order::Verdict>() as u64
     + WALK_INDEX_BYTES_PER_NODE
     + WALK_ALLOC_OVERHEAD_PER_NODE;
 

@@ -457,12 +457,7 @@ async fn run_query(
     explain: bool,
     at_ns: i64,
 ) -> Result<Response, ApiError> {
-    // Preserve the engine's value order on the wire only for a terminal
-    // sort/sort_desc INSTANT query (mirrors the PromQL `step_ms == 0 &&
-    // expr_is_sort_root` gate). A range sort yields a matrix and keeps the
-    // deterministic label-sort.
-    let preserve_vector_order = matches!(query_params.spec, QuerySpec::Instant { .. })
-        && pulsus_read::logql::terminal_sort(expr);
+    let preserve_vector_order = preserve_vector_order(&query_params.spec, expr);
     if explain {
         let (result, plan_explain) = engine.query_explained(expr, query_params).await?;
         Ok(encode::query_response(
@@ -480,6 +475,30 @@ async fn run_query(
             preserve_vector_order,
         ))
     }
+}
+
+/// The encoder's order gate (issue #406 R2). `true` suppresses
+/// `encode::query_response`'s default label re-sort so the engine's
+/// sequence reaches the client.
+///
+/// Two conjuncts, and both are load-bearing:
+///
+/// * the result must be an instant VECTOR. A range query yields a matrix,
+///   which has no per-series value order to preserve and keeps its
+///   deterministic label sort — the same shape the reference's own gate
+///   has, where `Sortable` is consulted only under
+///   `GetRangeType(q.params) == InstantType`
+///   (`pkg/logql/engine.go:551-570 @ grafana/loki v3.7.4
+///   b318f2829f0ae2094ab3a1e90780450e9e4b03be`);
+/// * the order must actually come from a `sort`/`sort_desc` — the whole
+///   question [`pulsus_read::logql::sorted_order_reaches_the_wire`]
+///   answers. Before #406 this asked a ROOT-ONLY predicate, so
+///   `label_replace(sort(…), …)`, `sort(…) * 1` and a vector binary
+///   operand all had the order the engine had already computed thrown
+///   away by the re-sort.
+fn preserve_vector_order(spec: &QuerySpec, expr: &Expr) -> bool {
+    matches!(spec, QuerySpec::Instant { .. })
+        && pulsus_read::logql::sorted_order_reaches_the_wire(expr)
 }
 
 // ---------------------------------------------------------------------
@@ -684,6 +703,42 @@ mod tests {
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         }
+    }
+
+    /// Issue #406 R2, AC 6: the encoder's order gate reads the WHOLE AST
+    /// and fires only at instant. Before this change the predicate was
+    /// root-only, so all six of these were `false` in both columns and
+    /// the six wrapped sorts reached the client label-sorted — measured
+    /// against the digest-pinned reference, 20/20 on both stores.
+    #[test]
+    fn preserve_vector_order_reads_the_whole_ast_and_only_at_instant() {
+        const X: &str = r#"sum by (svc) (count_over_time({app="x"}[5m]))"#;
+        let instant = QuerySpec::Instant { at_ns: 1_000 };
+        let range = QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 1_000,
+            step_ns: 100,
+        };
+        for query in [
+            format!(r#"label_replace(sort({X}), "tag", "$1", "svc", "(.*)")"#),
+            format!(r#"label_replace(sort_desc({X}), "tag", "$1", "svc", "(.*)")"#),
+            format!("sort({X}) * 1"),
+            format!("sort_desc({X}) * 1"),
+            format!("sort({X}) + on(svc) ({X} * 0)"),
+            format!("sort_desc({X}) + on(svc) ({X} * 0)"),
+        ] {
+            let expr = pulsus_logql::parse(&query).expect("parses");
+            assert!(preserve_vector_order(&instant, &expr), "instant: {query}");
+            assert!(
+                !preserve_vector_order(&range, &expr),
+                "a range query yields a matrix and keeps its label sort: {query}"
+            );
+        }
+        // The negative the whole design turns on: a vector aggregation
+        // over a sort would put our own `HashMap` walk on the wire.
+        let nested = pulsus_logql::parse(&format!("sum by (svc) (sort({X}))")).expect("parses");
+        assert!(!preserve_vector_order(&instant, &nested));
+        assert!(!preserve_vector_order(&range, &nested));
     }
 
     /// `(status, body text)`. Issue #264: every error on this surface is a
