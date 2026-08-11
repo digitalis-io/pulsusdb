@@ -82,6 +82,20 @@ const COMPLETENESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// emit at most one completeness line per this interval.
 const COMPLETENESS_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Bounds for the trace-by-ID gate's reference-side re-ask
+/// ([`fetch_tempo_trace_through_cut`]), sized against Tempo's live-store
+/// cut window.
+///
+/// Measured gap widths on the real control flow were 11ms-959ms, so the
+/// 5s ceiling is ~5x the widest observed. It is also exactly one
+/// `flush_check_period`, which is the load-bearing half of the choice: a
+/// single `cutIdleTraces` pass that outlasts the interval between cuts is
+/// a broken reference, not a race a differential gate should absorb. The
+/// 100ms interval costs even an 11ms gap at most one extra poll, and caps
+/// a genuinely-absent trace at ~51 attempts before the gate fails.
+const TEMPO_CUT_RETRY_CEILING: Duration = Duration::from_secs(5);
+const TEMPO_CUT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Margin between the corpus's last span end and "now" at generation
 /// time, and the search-window slack on each side (both stores get the
 /// same snapped unix-second bounds).
@@ -616,6 +630,198 @@ async fn fetch_tempo_trace(
         reqwest::StatusCode::NOT_FOUND => Ok(None),
         s => bail!("tempo trace fetch for {trace_hex} returned {s}"),
     }
+}
+
+/// [`fetch_tempo_trace`] with a bounded re-ask on an absent result, for
+/// callers that have already established the trace WAS visible and treat
+/// a later 404 as fatal.
+///
+/// Tempo can 404 a trace it served moments earlier and will serve again,
+/// byte-identical. `cutIdleTraces`
+/// (`modules/livestore/instance.go:336-406` @ v3.0.2, `0c4b926d`) calls
+/// `CutIdle`, which deletes EVERY idle trace from the live map in one
+/// locked pass before yielding any of them
+/// (`pkg/livetraces/livetraces.go:121-145` @ v3.0.2, the `delete(l.Traces, k)`
+/// at :129 runs for the whole map first). The cut traces are then
+/// appended to the head block one at a time and `hb.Flush()` is called
+/// once, after the loop (`instance.go:399` @ v3.0.2). `walBlock.FindTraceByID`
+/// only reads flushed pages, so between the delete and that flush a cut
+/// trace is in neither place. This is a read-visibility gap, not data
+/// loss — and because the delete is one pass over the map, ALL idle
+/// traces vanish together, so the number a client trips over is bounded
+/// only by how fast it asks. Both knobs are at their defaults here:
+/// `deploy/e2e/tempo.yaml` sets neither, leaving `max_trace_idle` and
+/// `flush_check_period` at 5s (`modules/livestore/config.go:109` @ v3.0.2).
+///
+/// **What distinguishes "temporarily invisible" from "gone".** A
+/// mid-cut trace has a pending event that will restore it: the same
+/// `cutIdleTraces` call reaches its `hb.Flush()`, and nothing re-hides it
+/// afterwards. Its invisibility is therefore bounded by the duration of
+/// that one cut. A trace that was never pushed, or that the reference
+/// genuinely dropped, has no such pending event and stays 404 forever.
+/// Outlasting a full cut window is exactly that distinction, so
+/// exhausting [`TEMPO_CUT_RETRY_CEILING`] is the discriminator and the
+/// gate still fails. "Bounded" here means the whole call returns at about
+/// the ceiling whatever the reference does — a hung or merely slow
+/// response is cancelled at the deadline rather than being allowed to run
+/// out `query_timeout` (60s ci / 120s full) — and a body that lands after
+/// the deadline is rejected by an explicit clock comparison in the loop,
+/// NOT by anything the types enforce. On failure it reports the observed
+/// counters and draws no conclusion from them — see the comment above the
+/// message for why.
+///
+/// Deliberately NOT applied to [`fetch_pulsus_trace`]: see
+/// [`assert_trace_by_id_gate`] for why the retry is one-sided.
+async fn fetch_tempo_trace_through_cut(
+    ctx: &Ctx,
+    trace_hex: &str,
+    query_timeout: Duration,
+) -> Result<serde_json::Value> {
+    retry_through_cut(
+        trace_hex,
+        TEMPO_CUT_RETRY_CEILING,
+        TEMPO_CUT_RETRY_INTERVAL,
+        || fetch_tempo_trace(ctx, trace_hex, query_timeout),
+    )
+    .await
+}
+
+/// [`fetch_tempo_trace_through_cut`]'s loop, parameterised over the fetch
+/// and its bounds.
+///
+/// Split out for one reason: with a real HTTP fetch the
+/// "body arrived after the deadline" arm below is **unreachable**, because
+/// a fresh request is never already-ready when `timeout_at` first polls
+/// it, so it is always cancelled instead. That arm still has to exist —
+/// see its comment — and this shape is what lets a hermetic test drive an
+/// already-ready fetch at an expired deadline and prove the guard rejects
+/// it. Measured: with a stub answering instantly past the ceiling, the
+/// final attempt never reached the stub at all.
+async fn retry_through_cut<F, Fut>(
+    trace_hex: &str,
+    ceiling: Duration,
+    interval: Duration,
+    mut fetch: F,
+) -> Result<serde_json::Value>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<serde_json::Value>>>,
+{
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + ceiling;
+    // The counters the failure reports. `attempts` alone cannot be read
+    // back into what happened — the final attempt is typically cancelled
+    // at the deadline (measured: 48 completed 404s then one
+    // cancellation) — so each outcome is tallied on its own.
+    let mut attempts = 0usize;
+    let mut absent_responses = 0usize;
+    let mut transport_errors = 0usize;
+    let mut last_transport_err: Option<anyhow::Error> = None;
+    let mut body_after_deadline = false;
+    let mut final_attempt_cancelled = false;
+
+    loop {
+        attempts += 1;
+        // `timeout_at` bounds the ATTEMPT, not merely the gap between
+        // attempts, and that is what makes the ceiling a real ceiling
+        // here. `harness::poll_until` — the primitive this loop otherwise
+        // mirrors, and which `wait_for_fetch_completeness` absorbs the
+        // same 404 with — awaits `attempt()` unbounded and returns
+        // `Ok(Some(_))` without re-checking the deadline
+        // (`harness.rs:291`/`:294`; its doc now says so). For its other
+        // callers that is harmless, because their per-attempt cost is
+        // small beside their budget; for THIS caller it is not, because
+        // `query_timeout` is 60s (ci) / 120s (full) against a 5s ceiling,
+        // so one slow response could overrun the stated bound by 12-24x
+        // and a success arriving after the deadline would still be
+        // accepted.
+        //
+        // The primitive is deliberately left alone. Census of its call
+        // sites — SEVENTEEN, none of them this function, counted with
+        //   git grep -n "poll_until(" -- e2e/src/ \
+        //     | grep -v "pub async fn poll_until" | grep -v harness.rs \
+        //     | grep -v "//"
+        // (the last filter drops this comment, so the command reproduces
+        // the number it is quoted for). Three groups:
+        //
+        //  * FIVE non-idempotent POST pushes — `logs.rs:263,2501`,
+        //    `metrics.rs:361`, `scenarios.rs:307`, `push_trace_corpus`
+        //    here. Cancelling a request in flight creates exactly the
+        //    "may already have ingested it" ambiguity that
+        //    `harness::classify_push_send` exists to prevent.
+        //  * SEVEN corpus-wide convergence waits — `logs.rs:910,2536`,
+        //    `metrics.rs:434`, and `wait_for_fetch_completeness`,
+        //    `wait_for_search_completeness`,
+        //    `assert_shard_local_span_counts`,
+        //    `assert_reference_metrics_positive_control` here. One
+        //    attempt scans the whole corpus (both stores, or a shard
+        //    row-count query) against a 180s/600s budget, so rejecting a
+        //    success whose final attempt straddles the deadline would
+        //    turn legitimate runs into flakes.
+        //  * FIVE at `scenarios.rs:554,908,1050,1225,1234`, which are NOT
+        //    uniformly "cheap readiness": `:554`/`:908` wait on queried
+        //    data, `:1050` shells out to `clickhouse-client` (as
+        //    `assert_shard_local_span_counts` does), which cancellation
+        //    would orphan; only `:1225`/`:1234` are true service
+        //    readiness.
+        //
+        // So the bound lives at the one call site that claims it.
+        match tokio::time::timeout_at(deadline, fetch()).await {
+            // A body counts ONLY if the deadline had not already passed
+            // when it landed. `timeout_at` alone does not establish that:
+            // tokio polls the inner future before the elapsed timer, so
+            // `timeout_at(<expired>, <already-ready>)` yields `Ok(_)`, not
+            // `Err(Elapsed)` (measured — see the break test in this
+            // change's notes). `timeout_at` is therefore doing one job
+            // here, capping how long an attempt may RUN; this explicit
+            // comparison is what rejects a late body, and without it the
+            // ceiling would hold only by the accident that a real fetch
+            // takes time.
+            Ok(Ok(Some(body))) if tokio::time::Instant::now() < deadline => return Ok(body),
+            Ok(Ok(Some(_))) => {
+                body_after_deadline = true;
+                break;
+            }
+            Ok(Ok(None)) => absent_responses += 1,
+            // Retried like an absence, but counted separately and the last
+            // one kept, so the failure can report it rather than leaving
+            // the reader to infer it.
+            Ok(Err(err)) => {
+                transport_errors += 1;
+                last_transport_err = Some(err);
+            }
+            Err(_elapsed) => {
+                final_attempt_cancelled = true;
+                break;
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(interval.min(deadline - now)).await;
+    }
+
+    // EVIDENCE ONLY — no conclusion. Four review rounds each found this
+    // message asserting slightly more than it could support (the trace is
+    // gone / the reference was slow / this says nothing either way), and
+    // each fix produced a fresh overstatement one round later. The cause
+    // was the diagnosing, not any one sentence, so the message now reports
+    // what was observed and stops. Whoever debugs the next failure reads
+    // the counters; they are better placed to interpret them than we are.
+    // Do not add an explanatory clause here.
+    let waited = started.elapsed();
+    let detail = format!(
+        "tempo trace {trace_hex} not obtained within the re-ask budget: attempts={attempts}, \
+         http_404={absent_responses}, transport_errors={transport_errors}, \
+         body_after_deadline={body_after_deadline}, \
+         final_attempt_cancelled={final_attempt_cancelled}, elapsed={waited:.3?}, \
+         ceiling={ceiling:?}, interval={interval:?}"
+    );
+    Err(match last_transport_err {
+        Some(err) => err.context(detail),
+        None => anyhow!(detail),
+    })
 }
 
 /// One rejection response's whole observable wire shape — issue #384's
@@ -1512,6 +1718,36 @@ pub async fn traces_differential(ctx: &Ctx) -> Result<()> {
 /// PulsusDB == corpus == Tempo per seeded trace, artifact + fail on any
 /// divergence. Structural tuples are compared afterwards as a separate
 /// INFORMATIONAL section.
+///
+/// **Why the reference-side fetch retries and ours does not.** This gate
+/// used a single unretried GET per store, while
+/// `wait_for_fetch_completeness` one second earlier polls with the
+/// identical fetch. A trace caught inside Tempo's live-store cut window
+/// (see [`fetch_tempo_trace_through_cut`]) is therefore invisible to the
+/// completeness loop, which retries past it, and fatal to this gate,
+/// which did not — the same event, two treatments. That asymmetry was
+/// the defect; measured, it failed 18% of replays of this control flow
+/// (9 of 50), so a green re-run demonstrated nothing.
+///
+/// The retry is applied ONLY to the reference side. The window above is
+/// a property of Tempo's live store, read from its source, and Tempo is
+/// the oracle here, not the system under test. Nobody has measured an
+/// analogous re-hide on the PulsusDB path, so wrapping our fetch too
+/// would buy nothing known and cost something real: it would spend up to
+/// [`TEMPO_CUT_RETRY_CEILING`] absorbing exactly the regression this
+/// suite exists to catch — one of our traces going invisible after it
+/// was already served. If our side ever does show such a window, it
+/// wants measuring and its own comment, not this one extended by
+/// symmetry.
+///
+/// **Known remaining exposure, deliberately not addressed here.** The
+/// same cut hides traces from Tempo's SEARCH path as well, which reads
+/// the same live traces. `wait_for_search_completeness` and every
+/// `run_search_case` below run later than this gate — usually past the
+/// cut, which is why they have not been seen to fail this way — but they
+/// are exposed by construction, and `run_search_case` compares result
+/// SETS, where a mid-cut trace shows up as a set difference rather than
+/// a 404. Nothing in this change protects them.
 async fn assert_trace_by_id_gate(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> {
     let mut structural_deltas: Vec<String> = Vec::new();
     let mut structural_bodies: Vec<serde_json::Value> = Vec::new();
@@ -1525,9 +1761,7 @@ async fn assert_trace_by_id_gate(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> 
         let pulsus_body = fetch_pulsus_trace(ctx, &trace_hex, query_timeout)
             .await?
             .with_context(|| format!("pulsus lost trace {trace_hex} after completeness"))?;
-        let tempo_body = fetch_tempo_trace(ctx, &trace_hex, query_timeout)
-            .await?
-            .with_context(|| format!("tempo lost trace {trace_hex} after completeness"))?;
+        let tempo_body = fetch_tempo_trace_through_cut(ctx, &trace_hex, query_timeout).await?;
 
         let pulsus_ids = fetch_span_ids(&pulsus_body)?;
         let tempo_ids = fetch_span_ids(&tempo_body)?;
@@ -2720,6 +2954,185 @@ mod tests {
     /// deltas 2+3). Update deliberately, with the ledger entry, never
     /// as a quick fix for a red run.
     const INFORMATIONAL_CASE_IDS: &[&str] = &["neg_attr_missing_key"];
+
+    // -----------------------------------------------------------------
+    // `retry_through_cut` — the by-ID gate's bounded reference-side
+    // re-ask. Short bounds (200ms/20ms) keep these hermetic and fast; the
+    // shipped bounds are `TEMPO_CUT_RETRY_CEILING`/`_INTERVAL`.
+    // -----------------------------------------------------------------
+
+    const TEST_CEILING: Duration = Duration::from_millis(200);
+    const TEST_INTERVAL: Duration = Duration::from_millis(20);
+
+    fn body() -> serde_json::Value {
+        serde_json::json!({ "batches": [] })
+    }
+
+    /// Readings that four successive review rounds each found the failure
+    /// message asserting beyond its evidence. The message reports counters
+    /// and stops, so none of these may come back — and neither may a new
+    /// one: the ban is on diagnosing, not on these particular strings.
+    const CAUSAL_READINGS: &[&str] = &[
+        "gone rather than mid-cut",
+        "still absent or unreadable",
+        "says nothing either way",
+        "the reference was slow",
+        "not accepted as timely",
+        "NOT evidence",
+        "IS there",
+        "so this is",
+        "which says",
+    ];
+
+    fn assert_no_causal_language(msg: &str) {
+        for reading in CAUSAL_READINGS {
+            assert!(
+                !msg.contains(reading),
+                "the failure must report evidence, not diagnose it — found {reading:?} in: {msg}"
+            );
+        }
+    }
+
+    /// The guard's reason for existing. `tokio::time::timeout_at` polls
+    /// the inner future BEFORE its elapsed timer, so an already-ready
+    /// future at an expired deadline yields `Ok`, not `Err(Elapsed)`. If
+    /// this ever fails, `timeout_at` gained the guarantee and
+    /// `retry_through_cut`'s explicit clock comparison could be revisited.
+    #[tokio::test]
+    async fn timeout_at_accepts_an_already_ready_future_at_an_expired_deadline() {
+        let expired = tokio::time::Instant::now() - Duration::from_secs(1);
+        let got = tokio::time::timeout_at(expired, std::future::ready(42u32)).await;
+        assert_eq!(got.expect("timeout_at polls the inner future first"), 42);
+    }
+
+    /// A body that really arrives, but after the deadline, is rejected —
+    /// and the failure says it answered late rather than claiming the
+    /// trace was absent. Unreachable through a real HTTP fetch (a fresh
+    /// request is never already-ready), hence the ready-future stand-in.
+    #[tokio::test]
+    async fn body_arriving_after_the_deadline_is_rejected_as_late() {
+        let started = Instant::now();
+        let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
+            // Absent until the ceiling has passed, then instantly ready —
+            // so the final attempt polls a ready future at an expired
+            // deadline, the exact case `timeout_at` cannot catch.
+            let elapsed = started.elapsed();
+            std::future::ready(Ok(if elapsed >= TEST_CEILING {
+                Some(body())
+            } else {
+                None
+            }))
+        })
+        .await
+        .expect_err("a body arriving after the deadline must not be accepted");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("abc"), "must name the trace: {msg}");
+        assert!(
+            msg.contains("body_after_deadline=true"),
+            "must record that a body arrived late: {msg}"
+        );
+        assert_no_causal_language(&msg);
+    }
+
+    /// The other half: a body inside the ceiling is still accepted, so the
+    /// guard has not simply made late-but-valid answers fail.
+    #[tokio::test]
+    async fn body_arriving_before_the_deadline_is_accepted() {
+        let started = Instant::now();
+        let got = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
+            let visible = started.elapsed() >= TEST_CEILING / 4;
+            std::future::ready(Ok(visible.then(body)))
+        })
+        .await
+        .expect("a body inside the ceiling must be accepted");
+        assert_eq!(got, body());
+        assert!(
+            started.elapsed() < TEST_CEILING,
+            "must return as soon as the body appears"
+        );
+    }
+
+    /// A trace that never appears still fails, bounded, and the failure
+    /// carries the 404 tally rather than a verdict about it.
+    #[tokio::test]
+    async fn permanently_absent_trace_fails_bounded_with_attempts_and_elapsed() {
+        let started = Instant::now();
+        let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
+            std::future::ready(Ok(None))
+        })
+        .await
+        .expect_err("a permanently absent trace must fail");
+        let waited = started.elapsed();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("attempts="), "must count attempts: {msg}");
+        assert!(
+            !msg.contains("http_404=0,"),
+            "must record the 404s it actually saw: {msg}"
+        );
+        assert!(
+            msg.contains("transport_errors=0") && msg.contains("body_after_deadline=false"),
+            "must record the outcomes that did NOT happen too: {msg}"
+        );
+        assert!(waited >= TEST_CEILING, "must not give up early: {waited:?}");
+        assert!(waited < TEST_CEILING * 3, "must stay bounded: {waited:?}");
+        assert_no_causal_language(&msg);
+    }
+
+    /// A reference that could not be READ is tallied as a transport error,
+    /// separately from a 404, and the underlying cause stays attached.
+    #[tokio::test]
+    async fn an_unreadable_reference_is_counted_separately_from_a_404() {
+        let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
+            std::future::ready(Err(anyhow!("connection reset by peer")))
+        })
+        .await
+        .expect_err("an unreadable reference must still fail the gate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("http_404=0"),
+            "no 404 was ever received: {msg}"
+        );
+        assert!(
+            !msg.contains("transport_errors=0"),
+            "the read failures must be counted: {msg}"
+        );
+        assert!(
+            msg.contains("connection reset by peer"),
+            "the real cause must survive in the chain: {msg}"
+        );
+        assert_no_causal_language(&msg);
+    }
+
+    /// A slow attempt is cancelled at the deadline rather than being
+    /// allowed to run to its own (much longer) timeout — the overrun the
+    /// round-1 review found.
+    #[tokio::test]
+    async fn a_slow_attempt_is_cancelled_at_the_deadline() {
+        let started = Instant::now();
+        let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || async {
+            // Far longer than the ceiling, standing in for a reference
+            // that accepts the connection and then never answers.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(Some(body()))
+        })
+        .await
+        .expect_err("a hung attempt must not be waited out");
+        let waited = started.elapsed();
+        assert!(
+            waited < TEST_CEILING * 3,
+            "must return at the ceiling, not the attempt's own timeout: {waited:?}"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("final_attempt_cancelled=true"),
+            "must record that the attempt was cancelled: {msg}"
+        );
+        assert!(
+            msg.contains("http_404=0") && msg.contains("transport_errors=0"),
+            "nothing was ever received, and the counters must show that: {msg}"
+        );
+        assert_no_causal_language(&msg);
+    }
 
     fn shipped_fixture() -> TracesFixture {
         let root = crate::engine::workspace_root();
