@@ -22,7 +22,7 @@ pub enum ChError {
     /// A ClickHouse server exception with an explicit numeric code
     /// (`DB::Exception` `Code: N`). Retryability is classified by `code`,
     /// see [`ChError::is_retryable`].
-    #[error("server [{code}]: {message}")]
+    #[error("server [{code}]: {}", redact_server_version(message))]
     Server { code: i32, message: String },
     /// A row failed to (de)serialize, or a query result did not match the
     /// expected shape. Poison: retrying an identical request reproduces it.
@@ -51,6 +51,54 @@ const RETRYABLE_SERVER_CODES: &[i32] = &[
     159, // TIMEOUT_EXCEEDED
     425, // SYSTEM_ERROR (transient subset)
 ];
+
+/// Replaces a ClickHouse `(version X.Y.Z.W (official build))` banner with
+/// `(version <redacted>)`.
+///
+/// **Why this sits on `Display` rather than at an API boundary (issue
+/// #376).** `ReadError::Clickhouse(ChError::Server { .. })` is rendered
+/// with `e.to_string()` by the logs, Prometheus and traces surfaces, so
+/// every one of them used to put the connected server's exact version in a
+/// client body. Fixing it at those three call sites would leave a fourth
+/// surface — or a fourth route on an existing one — free to leak it again;
+/// the claim is "no server version string reaches a client", so the check
+/// belongs where a server message becomes a rendered string, which is here.
+///
+/// `message` itself is untouched: `parse_exception_code` and every
+/// archived-capture test read the field, not this rendering, so nothing
+/// that parses a real body is affected.
+///
+/// Matched as a SHAPE — `(version ` followed by a digit — never as a
+/// version spelling, so it cannot go vacuous on the next upgrade the way
+/// the `"version 24.8"` leak checks did.
+pub(crate) fn redact_server_version(message: &str) -> String {
+    const OPEN: &str = "(version ";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(i) = rest.find(OPEN) {
+        let after = &rest[i + OPEN.len()..];
+        if !after.starts_with(|c: char| c.is_ascii_digit()) {
+            // Not a version banner; copy through and keep looking.
+            out.push_str(&rest[..i + OPEN.len()]);
+            rest = after;
+            continue;
+        }
+        out.push_str(&rest[..i]);
+        out.push_str("(version <redacted>)");
+        // ClickHouse closes the banner with `))` — the build parenthesis
+        // and the banner's own. Skip to just past it; if it is malformed,
+        // drop the remainder rather than risk emitting the tail.
+        match after.find("))") {
+            Some(j) => rest = &after[j + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 impl ChError {
     /// True only for transient faults where retrying the *same idempotent*
@@ -100,10 +148,21 @@ impl ChError {
     /// function reads it. That is issue #412 — it is live on `main`, predates
     /// #382, and cannot be fixed by any patch here or upstream, because at
     /// HTTP 200 the exception boundary is genuinely unrecoverable from the
-    /// text. It closes with the move to ClickHouse 26.3 (#376), whose
-    /// streaming path frames the exception with a length the client trusts
-    /// (`extract_exception_new`). **Do not read this parse as sound on both
-    /// pinned versions.**
+    /// text.
+    ///
+    /// **#376's move to 26.3 narrows this but does NOT close it, and the
+    /// earlier claim that it did is withdrawn.** What was measured is that
+    /// the FINAL-chunk path is sound on 26.3 — the server sends
+    /// `X-ClickHouse-Exception-Tag` and a `<len> <tag>\r\n__exception__\r\n`
+    /// trailer, so `extract_exception_new` slices by a declared length
+    /// instead of searching. But `extract_exception`
+    /// (`vendor/clickhouse/src/response.rs:369-382`) runs **per chunk**, and
+    /// its length-slicing arm additionally requires the chunk to end with
+    /// `__exception__\r\n`, which only the final chunk does. A non-final
+    /// chunk ending `))\n` — and result bytes are tenant data — still
+    /// reaches `extract_exception_old`'s `rfind(b"Code:")` on 26.3. So #412
+    /// stays open and this parse is **not** sound on the version we run
+    /// either; see the note on #412 for the probe that would settle it.
     ///
     /// # Shapes this receives, all measured through this client
     ///
@@ -124,7 +183,8 @@ const EXCEPTION_CODE_MARKER: &str = "Code: ";
 
 /// Reads `Code: <ascii digits>` at byte 0. Deliberately positional: see
 /// [`ChError::server_from_bad_response`] for why nothing past byte 0 can be
-/// believed, and what remains unsound on ClickHouse 24.8 (#412).
+/// believed, and what remains unsound (#412 — on 24.8 unconditionally, and
+/// on 26.3 for a non-final chunk).
 ///
 /// Compatible with the `strip_prefix("Code: ").split(['.', ' '])` read this
 /// replaces for every body that begins with a run of ASCII digits that fits
@@ -188,6 +248,101 @@ pub enum Idempotency {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #376: a real server body's version banner never survives
+    /// `ChError::Server`'s rendering, which is what the logs, Prometheus
+    /// and traces surfaces put in a client body via `e.to_string()`.
+    #[test]
+    fn a_rendered_server_error_carries_no_version_banner() {
+        for message in [
+            "Code: 241. DB::Exception: Query memory limit exceeded: would use 194.36 MiB. \
+             (MEMORY_LIMIT_EXCEEDED) (version 26.3.17.110 (official build))",
+            "Code: 60. DB::Exception: Unknown table expression identifier 'nosuchtable'. \
+             (UNKNOWN_TABLE) (version 24.8.14.39 (official build))",
+            "Code: 210. DB::NetException: Connection refused (127.0.0.1:9999). \
+             (NETWORK_ERROR) (version 26.3.17.110 (official build))",
+        ] {
+            let rendered = ChError::Server {
+                code: 241,
+                message: message.to_string(),
+            }
+            .to_string();
+            assert!(
+                !carries_a_version_banner(&rendered),
+                "a version banner survived rendering: {rendered:?}"
+            );
+            assert!(
+                rendered.contains("(version <redacted>)"),
+                "the banner must be replaced, not silently dropped: {rendered:?}"
+            );
+            // The diagnosis a caller acts on must survive the redaction.
+            assert!(rendered.contains("Code: "), "{rendered:?}");
+            assert!(rendered.contains("DB::"), "{rendered:?}");
+        }
+    }
+
+    /// The nested case a real distributed failure produces: three banners
+    /// in one body, none of which may survive.
+    #[test]
+    fn every_banner_in_a_nested_server_error_is_redacted() {
+        let refused = "Code: 210. DB::NetException: Connection refused (127.0.0.1:9999). \
+                       (NETWORK_ERROR) (version 26.3.17.110 (official build))";
+        let message = format!(
+            "Code: 519. DB::NetException: All attempts to get table structure failed. Log: \n\n\
+             {refused}\n{refused}\n\n. \
+             (ALL_CONNECTION_TRIES_FAILED) (version 26.3.17.110 (official build))"
+        );
+        let rendered = ChError::Server { code: 519, message }.to_string();
+        assert!(
+            !carries_a_version_banner(&rendered),
+            "a banner survived: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches("(version <redacted>)").count(),
+            3,
+            "every one of the three banners must be replaced: {rendered:?}"
+        );
+    }
+
+    /// The FIELD is untouched — every parser and archived-capture test in
+    /// this file reads `message`, not the rendering.
+    #[test]
+    fn redaction_does_not_touch_the_message_field_or_the_parsed_code() {
+        let message = "Code: 396. DB::Exception: Limit for result exceeded. \
+                       (TOO_MANY_ROWS_OR_BYTES) (version 26.3.17.110 (official build))";
+        let e = ChError::Server {
+            code: 396,
+            message: message.to_string(),
+        };
+        match &e {
+            ChError::Server { message: m, .. } => assert_eq!(m, message),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(parse_exception_code(message), Some(396));
+    }
+
+    /// A body with no banner is passed through byte-for-byte.
+    #[test]
+    fn a_body_with_no_version_banner_is_unchanged() {
+        for message in ["Code: 396", "no framing at all", "(version not-a-number)"] {
+            assert_eq!(redact_server_version(message), message);
+        }
+    }
+
+    /// `true` when `body` carries anything SHAPED like a server version
+    /// banner — `(version ` followed by a digit. Matched as a shape, never
+    /// as a spelling, so it cannot go vacuous on the next upgrade.
+    fn carries_a_version_banner(body: &str) -> bool {
+        let mut rest = body;
+        while let Some(i) = rest.find("(version ") {
+            let after = &rest[i + "(version ".len()..];
+            if after.starts_with(|c: char| c.is_ascii_digit()) {
+                return true;
+            }
+            rest = after;
+        }
+        false
+    }
 
     #[test]
     fn connect_timeout_and_io_are_retryable() {
@@ -358,6 +513,11 @@ mod tests {
     ///             notEquals(intDiv(1, toInt64(number) - 400000), 0))
     ///   FORMAT RowBinaryWithNamesAndTypes" http://localhost:8123/
     /// ```
+    /// **Archived capture (issue #376).** The `(version 24.8.14.39 …)` tail
+    /// records the server that produced these bytes, which is no longer a version
+    /// we run. It keeps its bytes: rewriting it to say `26.3` would falsify a
+    /// measurement, and the parser must stay correct against real bodies it has
+    /// actually seen.
     #[test]
     fn a_forged_code_echoed_in_the_description_is_never_read() {
         let echoed = "Code: 153. DB::Exception: Division by zero: while executing 'FUNCTION and(match(toStri\
@@ -391,7 +551,9 @@ mod tests {
     ///
     /// What the bytes are: ClickHouse 24.8's streaming path, which this parse
     /// cannot make sound and which the ADR 0007 patch does not reach (#412,
-    /// closing with #376). At HTTP 200 there is no exception-code header, and
+    /// which #376 narrows but does NOT close — the final-chunk path is sound
+    /// on 26.3, the non-final-chunk path is unverified and looks reachable).
+    /// At HTTP 200 there is no exception-code header, and
     /// the crate anchors the message with `rfind(b"Code:")`
     /// (`extract_exception_old`, `vendor/clickhouse/src/response.rs:392-401`),
     /// so a tenant literal echoed into the description becomes byte 0. The
@@ -465,6 +627,11 @@ mod tests {
     /// the cheap check `extract_exception` makes
     /// (`vendor/clickhouse/src/response.rs:377`) before it will call
     /// `extract_exception_old` at all.
+    /// **Archived capture (issue #376).** The `(version 24.8.14.39 …)` tail
+    /// records the server that produced these bytes, which is no longer a version
+    /// we run. It keeps its bytes: rewriting it to say `26.3` would falsify a
+    /// measurement, and the parser must stay correct against real bodies it has
+    /// actually seen.
     #[test]
     fn on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412() {
         let body = "Code: 210. DB::Exception: forged|.*'_String), notEquals(intDiv(1_UInt8, \
@@ -488,6 +655,11 @@ mod tests {
     /// `format!` and the total length is asserted against the 644 bytes
     /// measured from `SELECT toString(dummy) AS v FROM
     /// remote('127.0.0.1:9999', system.one)` on 24.8.14.39.
+    /// **Archived capture (issue #376).** The `(version 24.8.14.39 …)` tail
+    /// records the server that produced these bytes, which is no longer a version
+    /// we run. It keeps its bytes: rewriting it to say `26.3` would falsify a
+    /// measurement, and the parser must stay correct against real bodies it has
+    /// actually seen.
     #[test]
     fn nested_exception_yields_the_outermost_code() {
         let refused = "Code: 210. DB::NetException: Connection refused (127.0.0.1:9999). \
@@ -515,6 +687,11 @@ mod tests {
     /// 26.3.17.110, plus the header-derived fallback. The `Code: N. DB::…`
     /// head of each is verbatim; the descriptions after it are abridged, since
     /// only the head is load-bearing here.
+    /// **Archived capture (issue #376).** The `(version 24.8.14.39 …)` tail
+    /// records the server that produced these bytes, which is no longer a version
+    /// we run. It keeps its bytes: rewriting it to say `26.3` would falsify a
+    /// measurement, and the parser must stay correct against real bodies it has
+    /// actually seen.
     #[test]
     fn every_body_the_old_prefix_read_parsed_yields_the_same_code() {
         let old = |m: &str| {
@@ -597,6 +774,11 @@ mod tests {
     /// Everything that is not `Code: <digits>` at byte 0 reads as `0`: a digit
     /// run too wide for `i32`, Poco's own framing (`Code: N,` with no `DB::`),
     /// a non-numeric code, and an empty body.
+    /// **Archived capture (issue #376).** The `(version 24.8.14.39 …)` tail
+    /// records the server that produced these bytes, which is no longer a version
+    /// we run. It keeps its bytes: rewriting it to say `26.3` would falsify a
+    /// measurement, and the parser must stay correct against real bodies it has
+    /// actually seen.
     #[test]
     fn anything_that_is_not_a_leading_code_reads_as_zero() {
         assert_eq!(

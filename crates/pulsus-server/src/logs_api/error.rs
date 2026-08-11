@@ -248,6 +248,58 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #376, code review finding 5: the path that fell BETWEEN the
+    /// hermetic 427 fixture check and the live `SELECT version()` check.
+    /// `ReadError::Clickhouse(ChError::Server { .. })` is rendered here
+    /// with `e.to_string()`, and before the fix that put the connected
+    /// server's exact version in the body a tenant receives. The redaction
+    /// lives on `ChError`'s `Display` (one choke point for all three
+    /// surfaces); this asserts it from the surface a client actually talks
+    /// to, over a REAL 26.3 body.
+    #[tokio::test]
+    async fn a_raw_clickhouse_server_error_never_puts_the_server_version_in_the_body() {
+        let raw = "Code: 241. DB::Exception: Query memory limit exceeded: would use 194.36 \
+                   MiB. (MEMORY_LIMIT_EXCEEDED) (version 26.3.17.110 (official build))";
+        let err = ReadError::Clickhouse(pulsus_clickhouse::ChError::Server {
+            code: 241,
+            message: raw.to_string(),
+        });
+        let (status, body) = rendered(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !carries_a_server_version_banner(&body),
+            "the connected server's version leaked into a client body: {body}"
+        );
+        // The premise: the fixture really does carry one, so this cannot
+        // pass by checking an empty body.
+        assert!(carries_a_server_version_banner(raw), "premise");
+    }
+
+    /// `true` when `body` carries anything SHAPED like a ClickHouse server
+    /// version banner — the literal `version ` followed by `<digits>.<digits>`.
+    ///
+    /// Issue #376: the assertions below used to name `"version 24.8"`. That
+    /// made a claim about *any* server version leaking, checked against
+    /// *one* server's spelling — on 26.3 the fragment never appears at all,
+    /// so the check would have passed while testing nothing. Matching the
+    /// shape instead means the next version bump cannot silently retire it.
+    fn carries_a_server_version_banner(body: &str) -> bool {
+        let mut rest = body;
+        while let Some(i) = rest.find("version ") {
+            let tail = &rest[i + "version ".len()..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let after = &tail[digits.len()..];
+            if !digits.is_empty()
+                && after.starts_with('.')
+                && after[1..].starts_with(|c: char| c.is_ascii_digit())
+            {
+                return true;
+            }
+            rest = &rest[i + "version ".len()..];
+        }
+        false
+    }
+
     use super::*;
 
     /// Asserts the reference's error container on a rendered response:
@@ -482,9 +534,16 @@ mod tests {
             "the body must carry the configured ceiling: {body}"
         );
         // The pre-#398 failure mode: the raw server exception in the body.
+        // `body == expected` above already pins the whole rendering; these
+        // two say what a regression would look like, and the version half
+        // is matched as a SHAPE so it cannot go vacuous (issue #376).
         assert!(
-            !body.contains("DB::Exception") && !body.contains("version 24.8"),
+            !body.contains("DB::Exception"),
             "the 422 body must carry only our own message: {body}"
+        );
+        assert!(
+            !carries_a_server_version_banner(&body),
+            "a server version banner leaked into the 422 body: {body}"
         );
     }
 

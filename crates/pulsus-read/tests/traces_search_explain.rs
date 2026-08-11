@@ -1,6 +1,6 @@
 //! Issue #57 AC2/AC6 plus the re-audit's AC-A2/AC-A3/AC-B1/AC-B2
 //! (Tier-1, scale-invariant): live gates for the two-phase TraceQL
-//! search against ClickHouse 24.8.
+//! search against ClickHouse 26.3.
 //!
 //! - **AC2** — `EXPLAIN indexes = 1` on the **real** per-generator plans
 //!   (the exact SQL `plan_search` emits, which since plan v7 is also the
@@ -62,7 +62,7 @@
 //! optimizer). Live-gated behind `PULSUS_TEST_CLICKHOUSE=1`:
 //!
 //! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:24.8
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test traces_search_explain
 //! podman rm -f pulsus-ch-test
 //! ```

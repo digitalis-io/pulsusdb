@@ -35,8 +35,9 @@ code-review [high] regression fix):** the official entrypoint
 (`/entrypoint.sh`'s `manage_clickhouse_user`) writes
 `/etc/clickhouse-server/users.d/default-user.xml` on every start whenever
 `CLICKHOUSE_PASSWORD` is set — which this chart always sets (never
-passwordless, above). Verified directly against the pinned
-`24.8.14` image's own entrypoint script (not assumed): every other path it
+passwordless, above). Verified directly against the pinned image's own
+entrypoint script (not assumed; first on `24.8.14`, re-verified on
+`26.3.17` when the pin moved — issue #376): every other path it
 creates/chowns (`DATA_DIR`, `TMP_DIR`, `USER_PATH`, `FORMAT_SCHEMA_PATH` —
 all under `/var/lib/clickhouse/`; `LOG_DIR`/`ERROR_LOG_DIR` under
 `/var/log/clickhouse-server/`) is already covered by the `data`/`log`
@@ -47,10 +48,16 @@ directory is empty in the base image (nothing baked-in to lose by
 mounting over it). Boot-proven: `podman run --read-only --tmpfs /tmp
 --tmpfs /var/lib/clickhouse --tmpfs /var/log/clickhouse-server --tmpfs
 /etc/clickhouse-server/users.d --user 101:101 -e
-CLICKHOUSE_PASSWORD=... clickhouse/clickhouse-server:24.8.14` reaches
-`/ping` 200 and accepts authenticated queries with the set password
-(rejects unauthenticated ones with 403) — verified locally against the
-pinned image before this fix was written up.
+CLICKHOUSE_PASSWORD=... clickhouse/clickhouse-server:26.3.17` reaches
+`/ping` 200 and accepts authenticated queries with the set password, and
+the same run WITHOUT the `users.d` tmpfs still exits 1 with
+`/entrypoint.sh: line 122: /etc/clickhouse-server/users.d/default-user.xml:
+Read-only file system` — so the volume is still load-bearing. Re-measured
+against the new pin on the version move (issue #376). One detail moved
+with the server and is recorded rather than dropped: an unauthenticated
+query is rejected `401` on `26.3.17`, where `24.8.14` answered `403`.
+Nothing in this repo branches on that code (checked); it is noted so the
+next reader does not read the older number as current.
 */}}
 {{- if and .Values.clickhouse.enabled (eq .Values.topology "single") }}
 {{- include "pulsusdb.validateClickhouseAuth" . }}

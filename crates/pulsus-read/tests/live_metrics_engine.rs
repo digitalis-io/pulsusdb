@@ -19,7 +19,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test live_metrics_engine
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -2154,6 +2154,30 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
 /// `FallbackReason::RegexUnsupported` and routes it to SQL). It must
 /// still ANSWER — the classification must not have turned the
 /// RE2-authority fallback into a rejection.
+/// The connected server's own `SELECT version()` string. Issue #376: a
+/// leak assertion that spells a version out is a claim about every server
+/// checked against one server's spelling, and goes vacuous the moment the
+/// pin moves. Reading it off the server makes the checked domain equal
+/// the claimed one.
+async fn live_server_version(client: &ChClient) -> String {
+    use futures::StreamExt;
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct VersionRow {
+        v: String,
+    }
+    let mut stream = client
+        .query_stream::<VersionRow>("SELECT version() AS v", &QuerySettings::new())
+        .await
+        .expect("SELECT version()");
+    stream
+        .next()
+        .await
+        .expect("one row from SELECT version()")
+        .expect("decode version row")
+        .v
+}
+
 #[tokio::test]
 async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error() {
     skip_unless_live!();
@@ -2236,6 +2260,21 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
         matchers,
     }];
 
+    // Issue #376: the forbidden version string is read off the CONNECTED
+    // server rather than spelled out here, so this assertion follows
+    // whatever server the suite runs against and survives the next
+    // upgrade untouched. The hermetic half of the same claim lives in
+    // `metrics::dispatch`'s unit tests, which derive it from their own
+    // captured fixture.
+    let server_version = live_server_version(&client).await;
+    assert!(
+        server_version
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit()),
+        "premise: SELECT version() must return a version number, got {server_version:?}"
+    );
+
     let expect_rejection = |err: ReadError, surface: &str| {
         match err {
             ReadError::Promql(pulsus_promql::PromqlError::InvalidRegexMatcher { detail }) => {
@@ -2247,6 +2286,10 @@ async fn an_re2_rejected_matcher_regex_is_a_client_rejection_not_a_server_error(
                         "{surface}: {leak:?} leaked: {detail:?}"
                     );
                 }
+                assert!(
+                    !detail.contains(server_version.as_str()),
+                    "{surface}: the connected server's own version {server_version:?} leaked:                      {detail:?}"
+                );
                 assert!(
                     detail.contains(RE2_REJECTED),
                     "{surface}: detail must name the pattern, got {detail:?}"

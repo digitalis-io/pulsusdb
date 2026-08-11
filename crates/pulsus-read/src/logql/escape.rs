@@ -93,7 +93,9 @@ pub fn ch_ident(s: &str) -> String {
 /// the never-matching `|$.` arm sits OUTSIDE the `(?:…)` that encloses
 /// the user's pattern (their `(?m)` must not scope into it — with it
 /// contained, `$` in the arm is end-of-text and `$.` can never match,
-/// measured against 24.8.14.39 including newline-bearing subjects).
+/// measured against 24.8.14.39 and re-measured on 26.3.17.110 — the
+/// version we run — including newline-bearing subjects: `match('a\nb',
+/// '^(?:z)$|$.')` is `0` on both).
 fn anchored_match_regex(pat: &str) -> String {
     // One `^(?:…)$` template occurrence, whatever the strategy — the
     // issue #240 anchoring guard counts this site and keeps the
@@ -172,22 +174,33 @@ pub(crate) fn ch_regex_unanchored_checked(pat: &str) -> Result<String, PipelineE
 /// **Issue #324 — `.` versus newline.** ClickHouse's `match()` compiles its
 /// pattern with RE2's `dot_nl` option ON, so `.` matches a newline there,
 /// while upstream RE2 — and Go's `regexp`, and therefore Prometheus —
-/// leaves it off unless the `s` flag is set. Measured on 24.8.14.39:
-/// `match('\n', '^(?:.)$')` returns `1` while `replaceRegexpOne`, which
-/// reaches RE2 without ClickHouse's `OptimizedRegularExpression` wrapper in
-/// front of it, reports no match — the server is not self-consistent. A
+/// leaves it off unless the `s` flag is set. Measured on 24.8.14.39 and
+/// **re-measured unchanged on 26.3.17.110**, the version we run (issue
+/// #376): `match('\n', '^(?:.)$')` returns `1` while `replaceRegexpOne`,
+/// which reaches RE2 without ClickHouse's `OptimizedRegularExpression`
+/// wrapper in front of it, reports no match — the server is not
+/// self-consistent. This one did NOT get fixed by the upgrade, so the
+/// `(?-s)` prefix is still load-bearing. A
 /// label value carrying a line break therefore over-matched on this path
 /// (they arrive through structured metadata and OTLP attributes). The
 /// rendered pattern is prefixed with RE2's own `(?-s)` flag group, which
 /// restores the reference's reading; a `(?s)` inside the user's pattern
 /// still overrides it from that point on, exactly as upstream.
 ///
-/// The flag goes BEFORE the anchor, not inside the group. ClickHouse's
-/// required-substring analysis mis-reads a flag-negation group that follows
-/// a literal and then answers `0` for every row — measured,
-/// `match('abc', '^(?:(?-s)abc)$')` is `0` while RE2 says it matches — and
-/// the leading position is the one it analyses correctly (corpus evidence:
-/// `pulsus-read/tests/re2_screen_differential.rs`). Composing
+/// The flag goes BEFORE the anchor, not inside the group. On 24.8.14.39
+/// ClickHouse's required-substring analysis mis-read a flag-negation group
+/// that follows a literal and then answered `0` for every row — measured,
+/// `match('abc', '^(?:(?-s)abc)$')` was `0` while RE2 says it matches —
+/// and the leading position was the one it analysed correctly (corpus
+/// evidence: `pulsus-read/tests/re2_screen_differential.rs`).
+///
+/// **That server defect is FIXED on 26.3.17.110** (issue #376: the same
+/// probe now answers `1`, and the whole 28-entry flag-head registry flips
+/// with it). The leading placement is nonetheless **retained pending
+/// issue #331**: it is equally correct on the fixed server — `match('abc',
+/// '(?-s)^(?:abc)$')` is `1` on both — and unwinding the workaround is
+/// #331's decision, not a version bump's. Read this as "the placement no
+/// longer has to be here", never as "the server still requires it". Composing
 /// [`ch_regex_anchored`]'s own output rather than re-spelling the anchoring
 /// template keeps that template single-sourced, which the issue #240
 /// anchoring guard also requires.

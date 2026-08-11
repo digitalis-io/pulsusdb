@@ -1,5 +1,5 @@
 //! Issue #59 AC3 (Tier-1, scale-invariant): live `EXPLAIN indexes = 1`
-//! gates for the TraceQL metrics pushdown against ClickHouse 24.8, on
+//! gates for the TraceQL metrics pushdown against ClickHouse 26.3, on
 //! the **real** generated SQL (`plan_trace_metrics` output is the exact
 //! execution shape):
 //!
@@ -23,7 +23,7 @@
 //! `PULSUS_TEST_CLICKHOUSE=1`:
 //!
 //! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:24.8
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test traces_metrics_explain
 //! podman rm -f pulsus-ch-test
 //! ```

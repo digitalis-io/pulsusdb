@@ -5,9 +5,15 @@
 //! retained trace tables, and the two docs/schemas.md §4.2 EXPLAIN gates
 //! hold on a seeded ≥100k-row corpus.
 //!
-//! 24.8 constraints (binding findings on issue #53):
-//! - `EXPLAIN projections = 1` does not exist on 24.8 — the projection gate
-//!   uses `EXPLAIN indexes = 1` plus `system.query_log.projections`.
+//! Gate constraints (binding findings on issue #53):
+//! - The projection gate uses `EXPLAIN indexes = 1` plus
+//!   `system.query_log.projections`, because `EXPLAIN projections = 1` did
+//!   not exist on 24.8, the version this suite was written against.
+//!   Measured on the version move (issue #376): it now parses on
+//!   26.3.17.110 and is `Code: 115 … Unknown setting "projections" for
+//!   EXPLAIN PLAN query` on 24.8.14.39. Adopting it is an opportunity, not
+//!   a defect of the move, and is deliberately NOT taken here — the
+//!   `system.query_log.projections` gate is unchanged.
 //! - Projection selection is data-dependent: on tiny fixtures the optimizer
 //!   reads the base table. The gate corpus therefore seeds ≥100k spans with
 //!   a low-frequency (4%) target `service` and timestamps spread across the
@@ -17,7 +23,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-schema --test live_traces
 //! podman rm -f pulsus-ch-test
 //! ```

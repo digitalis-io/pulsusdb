@@ -25,9 +25,11 @@ verifying this fix against the pinned image): the entrypoint's directory
 setup fails closed ("Necessary directory '/var/log/clickhouse-keeper'
 isn't accessible") under `readOnlyRootFilesystem: true` without a
 writable volume mounted at exactly that path — verified directly with
-`podman run --read-only` against the pinned `24.8.14` keeper image; same
-class of bug as the ClickHouse server's `users.d` fix above, different
-path.
+`podman run --read-only` against the pinned keeper image (first `24.8.14`,
+re-verified on `26.3.17` when the pin moved — issue #376: the same run
+without a writable `/var/log/clickhouse-keeper` still exits 1 with that
+exact message, and boots with it); same class of bug as the ClickHouse
+server's `users.d` fix above, different path.
 */}}
 {{- if and .Values.clickhouse.enabled (eq .Values.topology "cluster") }}
 apiVersion: v1

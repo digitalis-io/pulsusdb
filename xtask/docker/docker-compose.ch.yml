@@ -1,10 +1,10 @@
-# Local ClickHouse 24.8 (docs/schemas.md §8 minimum-supported version) for the
+# Local ClickHouse 26.3 (docs/schemas.md §8 minimum-supported version) for the
 # xtask ch-bench harness. Works with either `docker compose` or
 # `podman-compose` (podman's CLI is docker-compatible). To run the plain
 # scenarios only, a bare container is simpler:
 #
 #   podman run -d --rm --name pulsus-ch-bench \
-#       -p 9000:9000 -p 8123:8123 clickhouse/clickhouse-server:24.8
+#       -p 9000:9000 -p 8123:8123 clickhouse/clickhouse-server:26.3
 #
 # For the `tls` scenario, first run `./gen-certs.sh` (writes ./certs/), then
 # bring up the `clickhouse-tls` service below, which mounts the certs and
@@ -13,7 +13,7 @@ version: "3.8"
 
 services:
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:24.8
+    image: docker.io/clickhouse/clickhouse-server:26.3
     container_name: pulsus-ch-bench
     ports:
       - "9000:9000" # native protocol (klickhouse)
@@ -29,7 +29,7 @@ services:
         hard: 262144
 
   clickhouse-tls:
-    image: docker.io/clickhouse/clickhouse-server:24.8
+    image: docker.io/clickhouse/clickhouse-server:26.3
     container_name: pulsus-ch-bench-tls
     profiles: ["tls"]
     ports:

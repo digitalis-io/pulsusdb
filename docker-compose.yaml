@@ -16,7 +16,7 @@
 
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.3
     volumes: [ clickhouse-data:/var/lib/clickhouse ]
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]

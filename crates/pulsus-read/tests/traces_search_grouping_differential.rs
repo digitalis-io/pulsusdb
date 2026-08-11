@@ -39,7 +39,7 @@
 //! HTTP base, e.g. `http://localhost:4318`) are all set. Run locally:
 //!
 //! ```text
-//! # ClickHouse 24.8 on 19124, Tempo 3.0.2 on 3200 (API) / 4318 (OTLP)
+//! # ClickHouse 26.3 on 19124, Tempo 3.0.2 on 3200 (API) / 4318 (OTLP)
 //! PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19124 \
 //!   PULSUSDB_GROUPING_DIFF_URL=http://localhost:3200 \
 //!   PULSUSDB_GROUPING_OTLP_URL=http://localhost:4318 \

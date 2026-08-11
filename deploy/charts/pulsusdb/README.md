@@ -40,7 +40,7 @@ Environment variables always win over the YAML file ([docs/configuration.md](../
 
 ## ClickHouse: bundled vs. external
 
-`clickhouse.enabled: true` (default) renders a bundled ClickHouse — a CI/compose-fixture-parity deployment (mirrors [`deploy/e2e/compose.single.yaml`](../../e2e/compose.single.yaml) and [`ci/clickhouse-cluster/`](../../../ci/clickhouse-cluster/)), **not a hardened, HA production ClickHouse**. It is never passwordless: a random password is generated on install (stable across upgrades — a `lookup`-guarded Secret) and wired into both the bundled server and `pulsusdb`'s `CLICKHOUSE_AUTH`. `clickhouse.image`/`clickhouse.keeperImage` are pinned to a full patch tag (`24.8.14`), not a floating `24.8` minor — re-verify the pin is still a published, non-EOL patch before bumping the chart's own default.
+`clickhouse.enabled: true` (default) renders a bundled ClickHouse — a CI/compose-fixture-parity deployment (mirrors [`deploy/e2e/compose.single.yaml`](../../e2e/compose.single.yaml) and [`ci/clickhouse-cluster/`](../../../ci/clickhouse-cluster/)), **not a hardened, HA production ClickHouse**. It is never passwordless: a random password is generated on install (stable across upgrades — a `lookup`-guarded Secret) and wired into both the bundled server and `pulsusdb`'s `CLICKHOUSE_AUTH`. `clickhouse.image`/`clickhouse.keeperImage` are pinned to a full patch tag (`26.3.17`), not a floating `26.3` minor — re-verify the pin is still a published, non-EOL patch before bumping the chart's own default.
 
 **Recommended production path: `clickhouse.enabled: false`** — point `pulsusdb.config.clickhouse.server` (+ `port`/`http_port`/`database`) at your own ClickHouse and supply credentials via `clickhouse.auth.existingSecret` (a Secret you manage, holding the password under `clickhouse.auth.existingSecretPasswordKey`, default `password`).
 
@@ -55,7 +55,7 @@ Environment variables always win over the YAML file ([docs/configuration.md](../
 All four images this chart can render support an immutable digest pin, `values.schema.json`-validated:
 
 - `image.digest` (`sha256:<64 hex>`) is preferred over `image.tag` when set — `_helpers.tpl`'s `pulsusdb.image` renders `repository@sha256:...` and silently drops `tag` rather than producing an invalid combined ref.
-- `clickhouse.image`, `clickhouse.keeperImage`, and `otelCollector.image` are single-string refs rendered verbatim; an optional `@sha256:<64 hex>` suffix on any of them is schema-validated (e.g. `--set clickhouse.image=docker.io/clickhouse/clickhouse-server:24.8.14@sha256:<digest>`).
+- `clickhouse.image`, `clickhouse.keeperImage`, and `otelCollector.image` are single-string refs rendered verbatim; an optional `@sha256:<64 hex>` suffix on any of them is schema-validated (e.g. `--set clickhouse.image=docker.io/clickhouse/clickhouse-server:26.3.17@sha256:<digest>`).
 
 ### Inter-node authentication (cluster mode)
 

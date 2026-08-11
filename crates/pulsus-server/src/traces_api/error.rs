@@ -496,6 +496,45 @@ mod tests {
         error_body(err.into_response()).await
     }
 
+    /// `true` when `body` carries anything SHAPED like a ClickHouse server
+    /// version banner — `(version ` followed by a digit. A shape, never a
+    /// spelling, so it cannot go vacuous on the next upgrade (issue #376).
+    fn carries_a_server_version_banner(body: &str) -> bool {
+        let mut rest = body;
+        while let Some(i) = rest.find("(version ") {
+            let after = &rest[i + "(version ".len()..];
+            if after.starts_with(|c: char| c.is_ascii_digit()) {
+                return true;
+            }
+            rest = after;
+        }
+        false
+    }
+
+    /// Issue #376, code review finding 5: the traces surface's half of the
+    /// leak that fell between the hermetic 427 fixture check and the live
+    /// `SELECT version()` check. `ReadError::Clickhouse(ChError::Server)`
+    /// is rendered here with `e.to_string()`, which before the fix put the
+    /// connected server's exact version in the body a tenant receives. The
+    /// redaction lives on `ChError`'s `Display` — one choke point for all
+    /// three surfaces — and this asserts it from the surface itself.
+    #[tokio::test]
+    async fn a_raw_clickhouse_server_error_never_puts_the_server_version_in_the_body() {
+        let raw = "Code: 241. DB::Exception: Query memory limit exceeded: would use 194.36 \
+                   MiB. (MEMORY_LIMIT_EXCEEDED) (version 26.3.17.110 (official build))";
+        let err = pulsus_read::logql::ReadError::Clickhouse(pulsus_clickhouse::ChError::Server {
+            code: 241,
+            message: raw.to_string(),
+        });
+        let (status, body) = rendered(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !carries_a_server_version_banner(&body),
+            "the connected server's version leaked into a client body: {body}"
+        );
+        assert!(carries_a_server_version_banner(raw), "premise");
+    }
+
     /// Issue #384: the exact wire container. The body is the message and
     /// nothing else — no JSON, no trailing newline (the frontend's
     /// `io.Copy(w, resp.Body)`, `modules/frontend/handler.go:116 @

@@ -39,8 +39,8 @@ pub fn guard_skip_ddl_in_init(skip_ddl: bool) -> Result<(), SchemaError> {
     Ok(())
 }
 
-/// Parses a ClickHouse `SELECT version()` string (e.g. `24.8.14.10`) and
-/// refuses anything older than 24.8 (docs/schemas.md §8). Pure and
+/// Parses a ClickHouse `SELECT version()` string (e.g. `26.3.17.110`) and
+/// refuses anything older than 26.3 (docs/schemas.md §8). Pure and
 /// injectable (task-manager resolution #3 on issue #5) so refusal messages
 /// are unit-tested without a live server; `run_init` supplies the real
 /// server-reported string.
@@ -54,7 +54,7 @@ pub fn check_version(version: &str) -> Result<(), SchemaError> {
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| SchemaError::Version(version.to_string()))?;
-    if (major, minor) < (24, 8) {
+    if (major, minor) < (26, 3) {
         return Err(SchemaError::UnsupportedVersion {
             found: version.to_string(),
         });
@@ -694,25 +694,29 @@ mod tests {
 
     #[test]
     fn check_version_accepts_the_minimum_supported_version() {
-        assert!(check_version("24.8.0.1").is_ok());
+        assert!(check_version("26.3.0.1").is_ok());
     }
 
     #[test]
     fn check_version_accepts_newer_versions() {
-        assert!(check_version("25.1.3.9").is_ok());
-        assert!(check_version("24.9.0.0").is_ok());
+        assert!(check_version("26.4.0.0").is_ok());
+        assert!(check_version("27.1.0.0").is_ok());
     }
 
     #[test]
     fn check_version_refuses_older_minor_versions() {
-        let err = check_version("24.7.9.1").unwrap_err();
+        let err = check_version("26.2.9.1").unwrap_err();
         assert!(matches!(err, SchemaError::UnsupportedVersion { .. }));
-        assert!(err.to_string().contains("24.7.9.1"));
+        assert!(err.to_string().contains("26.2.9.1"));
     }
 
     #[test]
     fn check_version_refuses_older_major_versions() {
-        let err = check_version("24.3.2.1").unwrap_err();
+        // The version this floor replaced (issue #376). 24.8 is refused
+        // for the reason `SchemaError::UnsupportedVersion` gives: an
+        // HTTP-200 mid-stream exception carries no server-declared
+        // length there, so it cannot be told from result text.
+        let err = check_version("24.8.14.39").unwrap_err();
         assert!(matches!(err, SchemaError::UnsupportedVersion { .. }));
     }
 

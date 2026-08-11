@@ -4,7 +4,7 @@
 //! `PULSUS_TEST_CLICKHOUSE=1`, reusing `crates/pulsus-read/tests/
 //! explain_indexes.rs`'s connection/setup pattern verbatim — the CI
 //! `schema-it` job runs this after the EXPLAIN gate, against the same
-//! ClickHouse 24.8 container.
+//! ClickHouse 26.3 container.
 //!
 //! **Why ratios, not absolute counts (edge case #5 of the #16 architect
 //! plan).** `read_rows`/`read_bytes`/`SelectedMarks` all scale with corpus
@@ -29,7 +29,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test query_log_gates
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -252,6 +252,12 @@ struct QueryLogRow {
     read_rows: u64,
     read_bytes: u64,
     selected_marks: u64,
+    /// `Settings['use_query_condition_cache']`, read back so the pin in
+    /// [`run_and_capture`] cannot be deleted silently. `system.query_log`
+    /// only records settings a query actually changed, so this is `"0"`
+    /// when the pin is in place and `""` when it is not (measured on
+    /// 26.3.17.110).
+    condition_cache: String,
 }
 
 /// Runs `sql` tagged with a unique `query_id`, draining every row of
@@ -259,13 +265,27 @@ struct QueryLogRow {
 /// only that the stream is fully consumed before `SYSTEM FLUSH LOGS` —
 /// `system.query_log`'s `QueryFinish` row is only written once the query
 /// has fully completed), flushes logs, and reads back the evidence.
+///
+/// **`use_query_condition_cache = 0` is deliberate — do not delete it.**
+/// ClickHouse turned the query-condition cache on by default at 25.4
+/// (`system.settings_changes`), so from 26.3 a repeated identical query
+/// can be served partly from that cache. The cache can only *reduce*
+/// `read_rows`/`read_bytes`/`SelectedMarks`, so it cannot redden a gate
+/// wrongly — but it can make one pass by having CACHED rather than by
+/// having PRUNED, and proving the index pruned is the entire point of
+/// these gates. Coordinator ruling on issue #376, 2026-08-06: pin it here
+/// so the gates keep measuring the index. The pin is read back out of
+/// `system.query_log` and asserted below, so removing the `.set(...)`
+/// line reddens the suite instead of quietly weakening it.
 async fn run_and_capture<R: pulsus_clickhouse::ChRow>(
     client: &ChClient,
     admin: &ChClient,
     sql: &str,
     query_id: &str,
 ) -> (u64, QueryLogRow) {
-    let settings = QuerySettings::new().set("query_id", query_id);
+    let settings = QuerySettings::new()
+        .set("query_id", query_id)
+        .set("use_query_condition_cache", 0);
     let mut returned = 0u64;
     let mut stream = client
         .query_stream::<R>(sql, &settings)
@@ -287,7 +307,8 @@ async fn run_and_capture<R: pulsus_clickhouse::ChRow>(
         .expect("flush logs");
 
     let log_sql = format!(
-        "SELECT read_rows, read_bytes, ProfileEvents['SelectedMarks'] AS selected_marks \
+        "SELECT read_rows, read_bytes, ProfileEvents['SelectedMarks'] AS selected_marks, \
+         Settings['use_query_condition_cache'] AS condition_cache \
          FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish' \
          ORDER BY event_time_microseconds DESC LIMIT 1"
     );
@@ -300,13 +321,116 @@ async fn run_and_capture<R: pulsus_clickhouse::ChRow>(
         .await
         .unwrap_or_else(|| panic!("no query_log row for query_id {query_id}"))
         .expect("decode query_log row");
+    assert_eq!(
+        evidence.condition_cache, "0",
+        "every gated query must run with use_query_condition_cache = 0 so these gates measure \
+         index pruning rather than a cache hit (issue #376); the server reported \
+         {:?} for query_id {query_id}",
+        evidence.condition_cache
+    );
     (returned, evidence)
 }
 
-/// Total marks the corpus's `log_samples` table holds — the denominator
-/// for the skip-index pruning ratio, read straight off `system.parts`
-/// rather than assumed from [`CORPUS_ROWS`]/[`INDEX_GRANULARITY`], so the
-/// gate reflects the table's real physical layout.
+/// The in-run pruning identity that replaced the `SelectedMarks` ratio.
+///
+/// Runs `gated_sql` and `control_sql` against the **same server in the
+/// same test**, both through [`run_and_capture`], and asserts the gated
+/// form reads at least `min_byte_ratio`× fewer bytes and `min_row_ratio`×
+/// fewer rows than the control. Both numbers come from the server, so a
+/// pasted expectation cannot satisfy it — which is what makes
+/// "regenerate until green" insufficient rather than merely discouraged.
+///
+/// `read_bytes` leads because it is what a user pays for, and because it
+/// is the quantity that survives lazy materialization (default-on from
+/// 25.4, `system.settings_changes`) — a read can touch more rows and
+/// still cost less, because the wide `body` column is only materialized
+/// for the rows that survive. Rows are asserted too, but second.
+///
+/// Measured for issue #376 on a faithful SQL reproduction of this
+/// suite's corpus shape (100_000 rows, one stream, 4 needle rows,
+/// ~150-byte bodies), same query on both servers:
+///
+/// | | 24.8.14.39 | 26.3.17.110 |
+/// |---|---|---|
+/// | gated `read_rows` | 8_192 | 8_192 |
+/// | gated `read_bytes` | 1_556_440 | 1_382_508 |
+/// | gated `SelectedMarks` | 1 / 14 | 13 / 14 |
+///
+/// So on this shape 26.3 reads the same rows for 11% fewer bytes while
+/// `SelectedMarks` moves from 1 to 13 — the marks number is the only one
+/// that regressed, and it regressed as a *measure*, not as a cost.
+async fn assert_index_pruning_by_bytes(
+    client: &ChClient,
+    admin: &ChClient,
+    gated_sql: &str,
+    control_sql: &str,
+    min_byte_ratio: f64,
+    min_row_ratio: f64,
+    what: &str,
+) -> QueryLogRow {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let (_, gated) = run_and_capture::<pulsus_read::logql::rows::SampleRow>(
+        client,
+        admin,
+        gated_sql,
+        &format!("qlg-prune-gated-{nonce}"),
+    )
+    .await;
+    let (_, control) = run_and_capture::<pulsus_read::logql::rows::SampleRow>(
+        client,
+        admin,
+        control_sql,
+        &format!("qlg-prune-control-{nonce}"),
+    )
+    .await;
+
+    let byte_ratio = control.read_bytes as f64 / gated.read_bytes.max(1) as f64;
+    let row_ratio_report = control.read_rows as f64 / gated.read_rows.max(1) as f64;
+    // Printed so a CI log records the measurement, not just the verdict —
+    // the delta table in docs/benchmarks/clickhouse-26.3-plan-deltas.md is
+    // read against these numbers.
+    eprintln!(
+        "{what}: gated {} rows / {} bytes; control {} rows / {} bytes; \
+         ratios {row_ratio_report:.2}x rows, {byte_ratio:.2}x bytes",
+        gated.read_rows, gated.read_bytes, control.read_rows, control.read_bytes
+    );
+    assert!(
+        byte_ratio >= min_byte_ratio,
+        "{what}: read_bytes ratio {byte_ratio:.2}x (control {} / gated {}) is below the \
+         pre-committed {min_byte_ratio}x — the skip index is no longer keeping the read off \
+         the corpus",
+        control.read_bytes,
+        gated.read_bytes
+    );
+    let row_ratio = control.read_rows as f64 / gated.read_rows.max(1) as f64;
+    assert!(
+        row_ratio >= min_row_ratio,
+        "{what}: read_rows ratio {row_ratio:.2}x (control {} / gated {}) is below the \
+         pre-committed {min_row_ratio}x",
+        control.read_rows,
+        gated.read_rows
+    );
+    gated
+}
+
+/// Total marks the corpus's `log_samples` table holds, read straight off
+/// `system.parts` rather than assumed from
+/// [`CORPUS_ROWS`]/[`INDEX_GRANULARITY`], so a gate reflects the table's
+/// real physical layout.
+///
+/// **Boundary (issue #376).** This is no longer a denominator for skip-
+/// index pruning. From ClickHouse 26.1 `use_skip_indexes_on_data_read` is
+/// default-on and moves skip filtering out of mark selection and into the
+/// data read, so `SelectedMarks` stops tracking how much a skip index
+/// pruned — measured on this corpus's shape, 1/14 on 24.8.14.39 against
+/// 13/14 on 26.3.17.110 for the identical query and identical
+/// `read_rows` (8_192 on both). It
+/// survives as a corpus-size sanity check
+/// (`corpus_is_large_enough_to_prove_skip_index_pruning`) and as the
+/// denominator of a loose byte ceiling.
 async fn total_marks(admin: &ChClient, db: &str) -> u64 {
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
     struct MarksRow {
@@ -439,7 +563,7 @@ async fn body_search_skip_index_prunes_most_granules() {
         sp.scan_limit,
     );
 
-    let (returned, evidence) = run_and_capture::<pulsus_read::logql::rows::SampleRow>(
+    let (returned, _) = run_and_capture::<pulsus_read::logql::rows::SampleRow>(
         &client,
         &client,
         &sql,
@@ -457,31 +581,58 @@ async fn body_search_skip_index_prunes_most_granules() {
         "corpus must have marks to compute a ratio against"
     );
 
-    // The skip-index pruning gate: SelectedMarks/total_marks must be well
-    // under 1 — proving the token/ngram bloom filter is actually skipping
-    // granules that cannot contain the needle, not scanning every granule
-    // in the stream (docs/schemas.md §3.2's whole point for finding #3).
-    let ratio = evidence.selected_marks as f64 / total as f64;
-    assert!(
-        ratio <= 0.5,
-        "SelectedMarks/total_marks ratio ({ratio:.3} = {}/{total}) did not show skip-index \
-         pruning — expected the body skip index to rule out most of the corpus's granules",
-        evidence.selected_marks
-    );
+    // The skip-index pruning gate. It used to be
+    // `SelectedMarks/total_marks <= 0.5`. That assertion stopped
+    // measuring what it claimed at ClickHouse 26.1, where
+    // `use_skip_indexes_on_data_read` became default-on
+    // (`system.settings_changes`) and moved skip filtering from mark
+    // SELECTION to data READ: the marks are all selected and the
+    // filtering happens inside them. Measured for issue #376 on this
+    // corpus's shape: 24.8.14.39 reported 1/14 marks, 26.3.17.110
+    // reports 13/14 = 0.929 for the identical query — so the old
+    // assertion FAILS on 26.3 while `read_rows` is identical (8_192 on
+    // both) and `read_bytes` actually FELL 11%. Marks stopped tracking
+    // pruning; the read did not get worse.
+    //
+    // The replacement is a same-server control identity rather than a
+    // re-tuned constant: run the same SQL with `use_skip_indexes = 0`
+    // and require the gated form to read several times less. Both
+    // numbers come from the server in this run, so no pasted number can
+    // satisfy it. See [`assert_index_pruning_by_bytes`] for why bytes
+    // lead.
+    //
+    // The ratios are pre-committed floors well under the values this
+    // suite measures on 26.3 (12.2x bytes / 6.6x rows on the run that
+    // introduced them), so they fire on a genuine loss of pruning, not
+    // on corpus drift.
+    let control_sql = format!("{sql} SETTINGS use_skip_indexes = 0");
+    let evidence = assert_index_pruning_by_bytes(
+        &client,
+        &client,
+        &sql,
+        &control_sql,
+        4.0,
+        3.0,
+        "stage-3 body search vs a use_skip_indexes = 0 control",
+    )
+    .await;
 
-    // read_bytes bounded relative to selected_marks (a ratio, never an
-    // absolute byte count — edge case #5): a generous 4 KiB/row ceiling
-    // per granule, comfortably above this corpus's ~170-byte rows, so the
-    // bound only fires on a genuine regression (e.g. reading unrelated
-    // granules), not on legitimate corpus growth.
+    // read_bytes bounded relative to the corpus's own mark count (a
+    // ratio, never an absolute byte count — edge case #5): a generous
+    // 4 KiB/row ceiling per granule, comfortably above this corpus's
+    // ~170-byte rows, so the bound only fires on a genuine regression
+    // (e.g. reading unrelated granules), not on legitimate corpus
+    // growth. `total` rather than `SelectedMarks` is the denominator now
+    // that marks no longer track pruning (above); it is the weaker of
+    // the two bounds and is kept only as a sanity ceiling — the control
+    // identity above is the real gate.
     let granule_byte_ceiling = INDEX_GRANULARITY * 4096;
-    let byte_bound = evidence.selected_marks.max(1) * granule_byte_ceiling;
+    let byte_bound = total.max(1) * granule_byte_ceiling;
     assert!(
         evidence.read_bytes <= byte_bound,
-        "read_bytes ({}) exceeded {byte_bound} (selected_marks={} x {granule_byte_ceiling} \
+        "read_bytes ({}) exceeded {byte_bound} (total_marks={total} x {granule_byte_ceiling} \
          byte/granule ceiling)",
         evidence.read_bytes,
-        evidence.selected_marks
     );
 }
 

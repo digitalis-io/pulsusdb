@@ -197,7 +197,11 @@ opentelemetry-proto = { path = "vendor/opentelemetry-proto" }
 # byte-identical to upstream for every response whose exception was not
 # preceded by output. See vendor/clickhouse/PATCHES.md for the change and the
 # re-vendor rule, and note that this does NOT make ClickHouse 24.8 sound: its
-# streaming path has no such header and is issue #412, closing with #376.
+# streaming path has no such header and is issue #412. #376's move to 26.3
+# narrows #412 but does NOT close it: 26.3 tags the exception and declares its
+# length, so the FINAL chunk is sliced rather than searched, but
+# `extract_exception` runs per chunk and a non-final chunk ending `))\n`
+# still reaches `rfind(b"Code:")`. #412 stays open.
 clickhouse = { path = "vendor/clickhouse" }
 
 # Dev-profile debuginfo is line-tables-only: full DWARF across the workspace's

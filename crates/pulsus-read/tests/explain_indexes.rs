@@ -4,7 +4,7 @@
 //! behind `PULSUS_TEST_CLICKHOUSE=1`, reusing the #5 harness verbatim
 //! (`crates/pulsus-schema/tests/live_schema.rs`'s connection/setup
 //! pattern) — the CI `schema-it` job runs this after the live schema
-//! tests, against the same ClickHouse 24.8 container.
+//! tests, against the same ClickHouse 26.3 container.
 //!
 //! **Coverage (fix-plan amendment §4, code review FAIL):** every canonical
 //! query shape from `tests/sql_snapshots.rs`'s matrix gets its own
@@ -38,7 +38,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test explain_indexes
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -162,6 +162,27 @@ fn normalize_numbers(s: &str) -> String {
 /// self-describing (which *kind* of index, not just position-in-list).
 const INDEX_BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
 
+/// The `Name:` line of the pseudo-block ClickHouse 26.x emits when a
+/// filter mixes AND and OR over skip-indexed columns. It is not an index
+/// the table declares, so [`index_usage`] excludes it and
+/// [`combined_skip_present`] reports it separately — it can never be
+/// silently absorbed into a declared-index name set.
+const COMBINED_SKIP_NAME: &str = "Name: <Combined skip indexes>";
+
+/// `true` when ClickHouse's `Name: <Combined skip indexes>` pseudo-block
+/// is in `raw`.
+///
+/// Measured for issue #376 on the real `log_samples` DDL with a 100k-row
+/// corpus: absent on 24.8.14.39 for every stage-3 shape; on 26.3.17.110
+/// absent for `|=`, `|~` and `!~`, and **present** for `!=`, whose
+/// rendered predicate is `NOT (hasToken AND hasToken AND position)` — a
+/// negated conjunction, i.e. the AND/OR mix the block reports on. Net
+/// granule selection is 12/12 on both versions for that shape, so the
+/// block is a reporting addition, not a plan change.
+fn combined_skip_present(raw: &str) -> bool {
+    raw.lines().any(|l| l.trim() == COMBINED_SKIP_NAME)
+}
+
 /// Reduces raw `EXPLAIN indexes = 1` text to its stable, index-relevant
 /// lines: block titles (`PrimaryKey`/`Skip`/...), `Keys:` plus the
 /// key-name lines under it, `Condition:`, and skip-index `Name:` lines.
@@ -170,11 +191,32 @@ const INDEX_BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip
 /// about is which columns and which skip indexes are in play) and
 /// collapses digit runs via [`normalize_numbers`] so a fixture's
 /// wall-clock-dependent timestamp literals don't defeat `assert_eq!`.
+///
+/// Two lines 26.x adds under `PrimaryKey` — `Search Algorithm:` and
+/// `Ranges:` — fall out here: neither is a block title, neither starts
+/// `Condition:`/`Name:`, and both carry a `:` so they also close a `Keys:`
+/// run. Verified line by line against both servers (issue #376).
+///
+/// The `<Combined skip indexes>` pseudo-block is excluded entirely (title
+/// and name), because it is not an index the table declares; ask
+/// [`combined_skip_present`] for it instead.
 fn index_usage(raw: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut capturing_keys = false;
     for line in raw.lines() {
         let trimmed = line.trim();
+        if trimmed == COMBINED_SKIP_NAME {
+            // Drop the `Skip` title this pseudo-block's name belongs to,
+            // so the extract holds only declared indexes.
+            assert_eq!(
+                out.last().map(String::as_str),
+                Some("Skip"),
+                "a `{COMBINED_SKIP_NAME}` line must directly follow its own `Skip` block title"
+            );
+            out.pop();
+            capturing_keys = false;
+            continue;
+        }
         if INDEX_BLOCK_TITLES.contains(&trimmed) {
             out.push(trimmed.to_string());
             capturing_keys = false;
@@ -222,6 +264,257 @@ fn parts_selected(raw: &str) -> Option<(u64, u64)> {
         }
     }
     None
+}
+
+/// The LAST `Granules: m/n` count in raw `EXPLAIN indexes = 1` text — the
+/// net granule selection after every block has narrowed in turn, which is
+/// what [`assert_prunes_at_least`] compares. Like [`parts_selected`] this
+/// is deliberately outside [`index_usage`]'s extract; it is used only
+/// inside a same-server comparison, never as a pinned constant.
+fn last_granules(raw: &str) -> Option<(u64, u64)> {
+    let mut found = None;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Granules: ")
+            && let Some((m, n)) = rest.split_once('/')
+        {
+            found = Some((m.trim().parse().ok()?, n.trim().parse().ok()?));
+        }
+    }
+    found
+}
+
+/// One `Skip` block of an `EXPLAIN indexes = 1`, reduced to the two lines
+/// that say WHICH index it is and WHAT it is: `Name:` and `Description:`
+/// (`<type> GRANULARITY <n>`), joined with `|` and digit-normalised.
+///
+/// `Description:` is captured on purpose. Without it the gate would accept
+/// `idx_body_tokens` silently becoming a different index type or
+/// granularity.
+///
+/// `Condition:` is captured too, and its ABSENCE is recorded explicitly as
+/// `Condition: <none>` rather than skipped — **but for the bloom-filter
+/// family it is always absent, and that is a fact about ClickHouse, not an
+/// omission here.** Measured on 26.3.17.110 over five index types on one
+/// table:
+///
+/// | index type | `Condition:` under its `Skip` block |
+/// |---|---|
+/// | `minmax` | `Condition: (severity in [4, +Inf))` |
+/// | `set` | `Condition: (fingerprint in 2-element set)` |
+/// | `tokenbf_v1` | **none emitted** |
+/// | `ngrambf_v1` | **none emitted** |
+/// | `bloom_filter` | **none emitted** |
+///
+/// Stage 3's two skip indexes are `tokenbf_v1` and `ngrambf_v1`, so there
+/// is no condition text to pin for them and never was — the pre-#376
+/// literal expectation did not carry one either. The failure this file's
+/// header describes ("a skip index still listed but with `Condition: true`
+/// pruning nothing") is therefore caught for these indexes by
+/// [`assert_prunes_at_least`] against a same-server control, not by
+/// condition text: a bloom filter that stops ruling granules out makes the
+/// gated and control granule counts equal, and the ratio collapses to 1.
+/// That is why the stage-3 fixture seeds a real corpus — see
+/// [`seed_line_filter_corpus`].
+fn skip_blocks(raw: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut lines = raw.lines().map(str::trim).peekable();
+    while let Some(line) = lines.next() {
+        if line != "Skip" {
+            continue;
+        }
+        let mut name = None;
+        let mut description = None;
+        let mut condition = None;
+        // PEEK, never consume, at the boundary: a block title belongs to
+        // the NEXT block, and taking it here would swallow every second
+        // `Skip` block. (It did, until the corpus fixture made a
+        // three-block plan visible — the two-row fixture hid it.)
+        while let Some(inner) = lines.peek() {
+            let inner = *inner;
+            if INDEX_BLOCK_TITLES.contains(&inner) || inner.is_empty() {
+                break;
+            }
+            lines.next();
+            if inner.starts_with("Name: ") {
+                name = Some(inner.to_string());
+            } else if inner.starts_with("Description: ") {
+                description = Some(normalize_numbers(inner));
+            } else if inner.starts_with("Condition: ") {
+                condition = Some(normalize_numbers(inner));
+            }
+            // `Parts:`/`Granules:` are volatile and are handled by the
+            // pruning identity instead, so they are consumed and dropped.
+        }
+        let name = name.unwrap_or_else(|| "Name: <missing>".to_string());
+        // 26.x's `<Combined skip indexes>` pseudo-block is not an index the
+        // table declares (its own `Description:` says so — "Final set of
+        // granules after AND/OR processing"), so it never enters this set.
+        // [`combined_skip_present`] reports it separately and each shape
+        // asserts it explicitly, which is what stops it being absorbed here.
+        if name == COMBINED_SKIP_NAME {
+            continue;
+        }
+        let description = description.unwrap_or_else(|| "Description: <missing>".to_string());
+        // `Condition:` is recorded as `<none>` when the server emits none,
+        // so its ABSENCE is asserted rather than merely unobserved — a
+        // condition appearing where the expectation says there is none is
+        // a change the gate reports.
+        let condition = condition.unwrap_or_else(|| "Condition: <none>".to_string());
+        out.insert(format!("{name}|{description}|{condition}"));
+    }
+    out
+}
+
+/// Hermetic: [`skip_blocks`] captures a skip block's `Condition:` where the
+/// server emits one, records `<none>` where it does not, and never lets one
+/// block swallow the next.
+///
+/// The input is a verbatim `EXPLAIN indexes = 1` capture from
+/// 26.3.17.110 over a table carrying `minmax`, `tokenbf_v1` and
+/// `ngrambf_v1` indexes. It is here because the live stage-3 shapes only
+/// exercise the two bloom filters, which emit no condition at all — without
+/// this, "conditions are pinned" would be a claim with no case that
+/// exercises it. It also pins the block-boundary behaviour: an earlier
+/// revision consumed the next block's title while scanning a block, which
+/// silently dropped every second `Skip` block.
+#[test]
+fn skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other() {
+    const RAW: &str = "\
+          Indexes:\n\
+            MinMax\n\
+              Keys:\n\
+                timestamp_ns\n\
+              Condition: (timestamp_ns in [1, +Inf))\n\
+              Parts: 1/1\n\
+              Granules: 12/12\n\
+            Skip\n\
+              Name: idx_severity\n\
+              Description: minmax GRANULARITY 4\n\
+              Condition: (severity in [4, +Inf))\n\
+              Parts: 1/1\n\
+              Granules: 12/12\n\
+            Skip\n\
+              Name: idx_body_tokens\n\
+              Description: tokenbf_v1 GRANULARITY 1\n\
+              Parts: 1/1\n\
+              Granules: 5/12\n\
+            Skip\n\
+              Name: idx_body_ngrams\n\
+              Description: ngrambf_v1 GRANULARITY 1\n\
+              Parts: 1/1\n\
+              Granules: 5/5\n\
+            Ranges: 5\n";
+
+    let blocks = skip_blocks(RAW);
+    assert_eq!(
+        blocks,
+        [
+            "Name: idx_severity|Description: minmax GRANULARITY #|Condition: (severity in [#, +Inf))",
+            "Name: idx_body_tokens|Description: tokenbf_v# GRANULARITY #|Condition: <none>",
+            "Name: idx_body_ngrams|Description: ngrambf_v# GRANULARITY #|Condition: <none>",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>(),
+        "all three blocks, the minmax condition captured, the bloom filters' absence recorded"
+    );
+
+    // The `MinMax` block's own `Condition:` is NOT a skip block's and must
+    // not be attributed to one.
+    assert!(
+        !blocks
+            .iter()
+            .any(|b| b.contains("timestamp_ns in [#, +Inf)")),
+        "a prefix block's condition leaked into the skip set: {blocks:?}"
+    );
+}
+
+/// The `Skip` blocks a stage-3 line filter must show — **committed here,
+/// not derived from the server**.
+///
+/// This was briefly read out of `system.data_skipping_indices`, and code
+/// review caught why that is wrong: the planner reads the same catalog, so
+/// dropping `idx_body_ngrams` from the DDL moved BOTH sides and the gate
+/// passed on a table that had lost an index. An expectation derived from
+/// the thing it checks is not a check. The owner's rule for this bump is
+/// that a moved plan may never be replaced by something that would pass on
+/// a worse configuration, so the names and their types are written down
+/// here, where only a human edit can move them.
+///
+/// What legitimately changed with the 26.3 move is the **comparison**, not
+/// the source: this is a SET, because the order in which ClickHouse applies
+/// two skip indexes over one column is the planner's choice. Measured both
+/// ways — 24.8.14.39 follows the DDL declaration order, and 26.3.17.110
+/// chooses: on a 50k fixture it reports `ngrams, tokens` where 24.8 reports
+/// `tokens, ngrams` for the identical query and DDL, while on a 100k
+/// fixture with a different body it reports `tokens, ngrams` like 24.8.
+/// Net granule selection is identical in every one of those cases, so the
+/// order was never a correctness property — but it IS unstable on 26.3, and
+/// asserting it would redden on data volume alone.
+fn expected_stage3_skip_blocks() -> std::collections::BTreeSet<String> {
+    [
+        "Name: idx_body_tokens|Description: tokenbf_v# GRANULARITY #|Condition: <none>",
+        "Name: idx_body_ngrams|Description: ngrambf_v# GRANULARITY #|Condition: <none>",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// An extract with its `Skip` blocks removed — the `MinMax`/`Partition`/
+/// `PrimaryKey` prefix, whose ORDER is asserted (those three are printed
+/// in a fixed order that reflects how ClickHouse narrows, and a block
+/// appearing or vanishing there IS a plan change).
+fn without_skip_blocks(usage: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_skip = false;
+    for line in usage {
+        if line == "Skip" {
+            in_skip = true;
+            continue;
+        }
+        if INDEX_BLOCK_TITLES.contains(&line.as_str()) {
+            in_skip = false;
+        }
+        if !in_skip {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
+/// The in-run pruning identity (issue #376 rule R2). Runs `sql` and
+/// `control_sql` against the **same server in the same test** and asserts
+/// the gated form's net granule selection is at least `k`x smaller.
+///
+/// Both numbers come from the server, so a pasted expectation cannot
+/// satisfy this — which is what makes "regenerate until green"
+/// insufficient rather than merely discouraged. `control_sql` is normally
+/// `sql` with `SETTINGS use_skip_indexes = 0`.
+///
+/// `k = 1` is a real and sometimes the ONLY honest claim: for a negated
+/// line filter (`!=`, `!~`) a bloom filter cannot rule a granule out at
+/// all, so the correct assertion is "never worse than no skip index",
+/// not a ratio. Callers say which they mean.
+async fn assert_prunes_at_least(
+    client: &ChClient,
+    sql: &str,
+    control_sql: &str,
+    k: u64,
+    what: &str,
+) {
+    let gated_raw = explain_raw(client, sql).await;
+    let control_raw = explain_raw(client, control_sql).await;
+    let (gated, _) = last_granules(&gated_raw)
+        .unwrap_or_else(|| panic!("{what}: no Granules: line in the gated EXPLAIN"));
+    let (control, _) = last_granules(&control_raw)
+        .unwrap_or_else(|| panic!("{what}: no Granules: line in the control EXPLAIN"));
+    assert!(
+        gated.saturating_mul(k) <= control,
+        "{what}: gated selected {gated} granules against the control's {control}; required \
+         gated x {k} <= control"
+    );
 }
 
 /// The rollup resolution `test_ctx` renders (`log_rollup: 5s`).
@@ -293,6 +586,58 @@ async fn seed(client: &ChClient, db: &str, ts_ns: i64) {
         )
         .await
         .expect("seed log_samples");
+}
+
+/// Rows the line-filter fixture seeds. At the default
+/// `index_granularity = 8192` this spans ~13 granules, which is what makes
+/// bloom-filter pruning OBSERVABLE — the two-row fixture the rest of this
+/// file uses fits in one granule, where every skip index trivially selects
+/// 1/1 and a degraded one is indistinguishable from a working one.
+const LINE_FILTER_CORPUS_ROWS: u64 = 100_000;
+
+/// The needle occupies a narrow, known row range, so selectivity is a
+/// controlled constant rather than incidental to the data.
+const NEEDLE_START: u64 = 50_000;
+const NEEDLE_COUNT: u64 = 4;
+
+/// Seeds [`LINE_FILTER_CORPUS_ROWS`] rows into `log_samples` on top of the
+/// shared fixture, server-side so no rows cross the wire.
+///
+/// **Why the stage-3 shapes need this and the rest of the file does not.**
+/// Code review (issue #376, round 2) found that pinning a skip block's
+/// name, type and granularity still admits an index that is declared,
+/// correct and pruning NOTHING — the regression this file's header says it
+/// exists to catch. For `tokenbf_v1`/`ngrambf_v1` there is no
+/// `Condition:` text to pin (measured — see [`skip_blocks`]), so the only
+/// thing that distinguishes a working bloom filter from a dead one is
+/// whether it rules granules out, and that is invisible on a single
+/// granule. With this corpus the gated shape selects far fewer granules
+/// than a `use_skip_indexes = 0` control, and a dead index collapses the
+/// ratio to 1.
+async fn seed_line_filter_corpus(client: &ChClient, db: &str, ts_ns: i64) {
+    let sql = format!(
+        "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+         SELECT 'checkout', {FP_PROD}, \
+                toInt64({ts_ns}) - toInt64(number) * 36000000, 0, \
+                if(number >= {NEEDLE_START} AND number < {NEEDLE_START} + {NEEDLE_COUNT}, \
+                   concat('row ', toString(number), ' connection refused padding_', \
+                          repeat('x', 120)), \
+                   concat('row ', toString(number), ' routine request completed padding_', \
+                          repeat('x', 120))) \
+         FROM numbers({LINE_FILTER_CORPUS_ROWS})"
+    );
+    client
+        .execute(&sql, &QuerySettings::new(), Idempotency::Idempotent)
+        .await
+        .expect("seed the line-filter corpus");
+}
+
+/// [`setup`] plus [`seed_line_filter_corpus`] — the fixture every stage-3
+/// line-filter shape uses.
+async fn setup_with_line_filter_corpus(db: &str, ts_ns: i64) -> ChClient {
+    let client = setup(db, ts_ns).await;
+    seed_line_filter_corpus(&client, db, ts_ns).await;
+    client
 }
 
 /// Sets up a fresh database, seeds fixture data around `ts_ns`, and returns
@@ -526,18 +871,34 @@ async fn stage2_hydration_uses_the_fingerprint_primary_key() {
 
 // ---------------------------------------------------------------------
 // Stage 3 — samples, every line-filter op. All four line-filter ops below
-// produce the byte-identical index-usage extract: the `service`/
-// `fingerprint`/`timestamp_ns` primary-key `Condition:` only reflects
-// those three columns (not `body`, which isn't part of the primary key),
-// and both `body` skip indexes are always listed as considered whenever
-// any predicate references `body` — the ops differ in generated SQL
+// produce the same index-usage extract: the `service`/`fingerprint`/
+// `timestamp_ns` primary-key `Condition:` only reflects those three
+// columns (not `body`, which isn't part of the primary key), and both
+// `body` skip indexes are always listed as considered whenever any
+// predicate references `body` — the ops differ in generated SQL
 // (`sql_snapshots.rs`'s job) but not in which indexes ClickHouse consults.
+//
+// **How the expectation is built (issue #376).** The `PrimaryKey` key
+// list comes from `system.tables.sorting_key` and the `Skip` name set
+// from `system.data_skipping_indices`, so neither can be satisfied by
+// pasting an EXPLAIN back in. What stays literal is only the planner's
+// rendering of OUR predicate (`Condition:`), which is the thing this gate
+// exists to pin and which is byte-identical across 24.8.14.39 and
+// 26.3.17.110 (measured).
+//
+// **Skip blocks are compared as a SET, not a list.** The order in which
+// ClickHouse applies two skip indexes over the same column is the
+// planner's choice and provably not a correctness property — it reaches
+// the same net granule count either way — so asserting it was asserting
+// something the gate never meant. The prefix blocks
+// (`MinMax`/`Partition`/`PrimaryKey`) keep their ordered `assert_eq!`:
+// one of those appearing or vanishing IS a plan change.
 // ---------------------------------------------------------------------
 
-async fn stage3_usage(db: &str, ts_ns: i64, client: &ChClient, query: &str) -> Vec<String> {
+async fn stage3_sql(db: &str, ts_ns: i64, query: &str) -> String {
     let sp = streams_plan(query, &range_params(ts_ns), db);
     let table = format!("{db}.log_samples");
-    let sql = sql::stage3(
+    sql::stage3(
         &table,
         &["'checkout'".to_string()],
         &[FP_PROD],
@@ -548,14 +909,116 @@ async fn stage3_usage(db: &str, ts_ns: i64, client: &ChClient, query: &str) -> V
         &sp.line_filters,
         sp.direction,
         sp.scan_limit,
-    );
-    explain(client, &sql).await
+    )
 }
 
-/// The `(service, fingerprint, timestamp_ns)` primary key + both `body`
-/// skip indexes — the shared expectation every stage-3 line-filter case
-/// below asserts (see the section comment for why they coincide).
-fn expected_stage3_line_filter_usage() -> Vec<String> {
+/// How much a stage-3 shape's skip indexes must narrow the read, relative
+/// to the same query with `use_skip_indexes = 0`.
+///
+/// Stated per shape because it is a property of the PREDICATE, not of the
+/// server: a bloom filter can rule granules out for a positive line filter
+/// and cannot for a negated one, on either version. Measured on the
+/// fixture this suite seeds, 26.3.17.110.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrunesBy {
+    /// A positive line filter (`|=`, `|~`): the bloom filters confine the
+    /// read to the granules that can hold the needle. Measured 13/13
+    /// granules on the control against 1 gated, i.e. 13x; the gate
+    /// requires 4x, which is the floor a dead index cannot reach — a
+    /// degraded condition makes gated == control and the ratio 1.
+    Strongly,
+    /// A negated line filter (`!=`, `!~`): a bloom filter answers "this
+    /// granule MAY contain the token", which cannot rule a granule out
+    /// for `NOT (...)`. The honest claim is "never worse than no skip
+    /// index at all", and it is the same on both server versions —
+    /// measured 12/12 on 24.8.14.39 and 26.3.17.110 alike.
+    NotAtAll,
+}
+
+impl PrunesBy {
+    fn factor(self) -> u64 {
+        match self {
+            PrunesBy::Strongly => 4,
+            PrunesBy::NotAtAll => 1,
+        }
+    }
+}
+
+/// Whether a stage-3 shape is expected to carry 26.x's
+/// `<Combined skip indexes>` pseudo-block. Asserted per shape, never
+/// folded into the index-name set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CombinedSkip {
+    /// The filter is a plain conjunction over `body`.
+    Absent,
+    /// The filter mixes AND and OR over `body` — a negated conjunction
+    /// (`!=`) is the shape that does this in our SQL.
+    Present,
+}
+
+/// Runs a stage-3 shape's `EXPLAIN indexes = 1` and makes the whole
+/// stage-3 judgement: the ordered prefix, the derived skip-index set, the
+/// combined-block expectation, and the in-run pruning identity against a
+/// same-server `use_skip_indexes = 0` control.
+async fn assert_stage3_usage(
+    db: &str,
+    ts_ns: i64,
+    client: &ChClient,
+    query: &str,
+    combined: CombinedSkip,
+    prunes: PrunesBy,
+) {
+    let sql = stage3_sql(db, ts_ns, query).await;
+    let raw = explain_raw(client, &sql).await;
+    let usage = index_usage(&raw);
+
+    assert_eq!(
+        without_skip_blocks(&usage),
+        expected_stage3_prefix(),
+        "stage-3 MinMax/Partition/PrimaryKey prefix for {query}"
+    );
+    assert_eq!(
+        skip_blocks(&raw),
+        expected_stage3_skip_blocks(),
+        "stage-3 Skip blocks (name + type + granularity, as a SET) for {query}"
+    );
+    assert_eq!(
+        combined_skip_present(&raw),
+        combined == CombinedSkip::Present,
+        "stage-3 `{COMBINED_SKIP_NAME}` presence for {query}"
+    );
+
+    // Rule R2, and the answer to code review round 2: a skip index that
+    // is still declared, still the right type and granularity, but whose
+    // condition has degraded to something that rules nothing out, is a
+    // read-path regression this file exists to catch — and for a bloom
+    // filter there is no `Condition:` text to pin (see [`skip_blocks`]).
+    // What distinguishes a working bloom filter from a dead one is
+    // whether it rules granules out, so that is what is asserted, against
+    // a same-server `use_skip_indexes = 0` control whose number comes
+    // from the same run.
+    //
+    // The fixture seeds a real corpus for exactly this reason
+    // ([`seed_line_filter_corpus`]): on a single granule every index
+    // trivially selects 1/1 and a dead one is indistinguishable.
+    let control_sql = format!("{sql} SETTINGS use_skip_indexes = 0");
+    assert_prunes_at_least(client, &sql, &control_sql, prunes.factor(), query).await;
+}
+
+/// The `MinMax`/`Partition`/`PrimaryKey` prefix every stage-3 line-filter
+/// case asserts — **committed, not derived**.
+///
+/// The `PrimaryKey` key list was briefly read from
+/// `system.tables.sorting_key`; that is the same catalog the planner reads,
+/// so it carried exactly the defect code review found in the skip-index
+/// derivation — a DDL that lost or reordered the sorting key would move
+/// both sides together and the gate would pass on the worse table. Written
+/// down here instead, where only a human edit can move it.
+///
+/// The `Condition:` strings are the planner's rendering of OUR predicate,
+/// which is what this gate exists to pin, and they are byte-identical
+/// across 24.8.14.39 and 26.3.17.110 (measured).
+fn expected_stage3_prefix() -> Vec<String> {
     v(&[
         "MinMax",
         "Keys:",
@@ -568,11 +1031,8 @@ fn expected_stage3_line_filter_usage() -> Vec<String> {
         "service",
         "fingerprint",
         "timestamp_ns",
-        "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), (fingerprint in #-element set))), (service in ['checkout', 'checkout']))",
-        "Skip",
-        "Name: idx_body_tokens",
-        "Skip",
-        "Name: idx_body_ngrams",
+        "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), \
+         (fingerprint in #-element set))), (service in ['checkout', 'checkout']))",
     ])
 }
 
@@ -581,16 +1041,17 @@ async fn stage3_contains_line_filter_uses_the_primary_key_and_the_token_skip_ind
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_contains");
     let ts_ns = now_ns();
-    let client = setup(db, ts_ns).await;
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
-    let usage = stage3_usage(
+    assert_stage3_usage(
         db,
         ts_ns,
         &client,
         r#"{service_name="checkout"} |= "connection refused""#,
+        CombinedSkip::Absent,
+        PrunesBy::Strongly,
     )
     .await;
-    assert_eq!(usage, expected_stage3_line_filter_usage());
 }
 
 #[tokio::test]
@@ -598,16 +1059,26 @@ async fn stage3_not_contains_line_filter_uses_the_primary_key_and_the_token_skip
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_not_contains");
     let ts_ns = now_ns();
-    let client = setup(db, ts_ns).await;
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
-    let usage = stage3_usage(
+    // The one stage-3 shape whose extract MOVED on 26.3 (issue #376).
+    // `!=` renders `NOT (hasToken AND hasToken AND position)`, a negated
+    // conjunction, and 26.x reports an extra `<Combined skip indexes>`
+    // pseudo-block for exactly that AND/OR mix. Judged **moved-correct**:
+    // net granule selection is 12/12 on a 100k-row corpus on BOTH
+    // 24.8.14.39 and 26.3.17.110, i.e. a negated line filter prunes
+    // nothing on either version and the block is a reporting addition.
+    // The declared skip-index SET is unchanged, which is what the
+    // assertion below actually pins.
+    assert_stage3_usage(
         db,
         ts_ns,
         &client,
         r#"{service_name="checkout"} != "connection refused""#,
+        CombinedSkip::Present,
+        PrunesBy::NotAtAll,
     )
     .await;
-    assert_eq!(usage, expected_stage3_line_filter_usage());
 }
 
 #[tokio::test]
@@ -615,16 +1086,17 @@ async fn stage3_regex_line_filter_over_a_plain_literal_uses_the_token_skip_index
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_regex");
     let ts_ns = now_ns();
-    let client = setup(db, ts_ns).await;
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
-    let usage = stage3_usage(
+    assert_stage3_usage(
         db,
         ts_ns,
         &client,
         r#"{service_name="checkout"} |~ "connection refused""#,
+        CombinedSkip::Absent,
+        PrunesBy::Strongly,
     )
     .await;
-    assert_eq!(usage, expected_stage3_line_filter_usage());
 }
 
 #[tokio::test]
@@ -633,7 +1105,7 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_still_lists_t
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_not_regex");
     let ts_ns = now_ns();
-    let client = setup(db, ts_ns).await;
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
     // Not a plain literal (`.*` is a regex metacharacter sequence) — no
     // `hasToken` prefilter is generated (`plan::is_plain_literal`), only
@@ -642,14 +1114,15 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_still_lists_t
     // `body` surfaces every skip index declared on that column) — the
     // `Parts:`/`Granules:` counts this file deliberately drops are what
     // would show whether either one actually pruned anything.
-    let usage = stage3_usage(
+    assert_stage3_usage(
         db,
         ts_ns,
         &client,
         r#"{service_name="checkout"} !~ "err.*""#,
+        CombinedSkip::Absent,
+        PrunesBy::NotAtAll,
     )
     .await;
-    assert_eq!(usage, expected_stage3_line_filter_usage());
 }
 
 /// Issue M6-09 AC4 (Tier-1, the named perf gate): a line filter followed
@@ -662,16 +1135,17 @@ async fn stage3_line_filter_before_a_parser_keeps_the_exact_skip_index_usage() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_parser_pushdown");
     let ts_ns = now_ns();
-    let client = setup(db, ts_ns).await;
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
-    let usage = stage3_usage(
+    assert_stage3_usage(
         db,
         ts_ns,
         &client,
         r#"{service_name="checkout"} |= "connection refused" | json | status = "500""#,
+        CombinedSkip::Absent,
+        PrunesBy::Strongly,
     )
     .await;
-    assert_eq!(usage, expected_stage3_line_filter_usage());
 }
 
 // ---------------------------------------------------------------------
@@ -1247,7 +1721,7 @@ fn projection_of(mp: &pulsus_read::logql::MetricPlan) -> ScanProjection {
 }
 
 /// The `(service, fingerprint, timestamp_ns)` primary key on `log_samples`
-/// — the same key condition [`expected_stage3_line_filter_usage`] asserts
+/// — the same key condition [`expected_stage3_prefix`] asserts
 /// (a `body` predicate never factors into `PrimaryKey`'s `Condition:`, only
 /// into whether the `Skip` blocks are listed at all), minus the two `Skip`
 /// entries: an instant metric read carries no line filter, so it never
@@ -2035,6 +2509,11 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
         projection_of(&mp),
     );
 
-    let usage = explain(&client, &sql).await;
-    assert_eq!(usage, expected_stage3_line_filter_usage());
+    let raw = explain_raw(&client, &sql).await;
+    let usage = index_usage(&raw);
+    assert_eq!(without_skip_blocks(&usage), expected_stage3_prefix());
+    assert_eq!(skip_blocks(&raw), expected_stage3_skip_blocks());
+    // A positive line filter is a plain conjunction over `body`, so 26.x
+    // reports no `<Combined skip indexes>` pseudo-block here (measured).
+    assert!(!combined_skip_present(&raw));
 }

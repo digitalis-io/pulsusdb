@@ -277,7 +277,7 @@ Durations accept `ms|s|m|h|d|w`; byte sizes accept binary units (`KiB/MiB/GiB/Ti
 ```yaml
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.3
     volumes: [ clickhouse-data:/var/lib/clickhouse ]
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
@@ -323,4 +323,4 @@ service:
 
 Query via the PulsusDB API (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`). To use existing dashboards or datasources that speak third-party observability APIs, set `PULSUS_COMPAT_ENDPOINTS=true` and point them at `http://pulsusdb:3100`.
 
-**Minimum supported ClickHouse: 24.8 LTS** (projections, modern TTL and aggregate-state behavior). The schema controller verifies the server version at startup and refuses to run DDL against older servers.
+**Minimum supported ClickHouse: 26.3 LTS** (the supported LTS line; older servers do not tag an HTTP-200 mid-stream exception, so it cannot be told apart from result text — issue #412). The schema controller verifies the server version at startup and refuses to run DDL against older servers.

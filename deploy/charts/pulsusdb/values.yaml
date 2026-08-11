@@ -193,16 +193,16 @@ clickhouse:
   # CI/compose-fixture-parity convenience, not a hardened HA ClickHouse —
   # see README.md's production guidance.
   enabled: true
-  # -- Pinned to a full patch tag, not a floating `24.8` minor (code
-  # review round-1 [low] finding #12) — `24.8` can resolve to a different
+  # -- Pinned to a full patch tag, not a floating `26.3` minor (code
+  # review round-1 [low] finding #12) — `26.3` can resolve to a different
   # image over time as new patches land. Digest-pinning is available and
   # schema-validated (issue #38 #115 group, `values.schema.json`):
   # `--set clickhouse.image=...@sha256:<64 hex>` appends a validated
   # digest suffix, rendered verbatim. Re-verify this pin is still a
-  # published, non-EOL 24.8.x LTS patch before bumping the chart's own
+  # published, non-EOL 26.3.x LTS patch before bumping the chart's own
   # default.
-  image: docker.io/clickhouse/clickhouse-server:24.8.14
-  keeperImage: docker.io/clickhouse/clickhouse-keeper:24.8.14
+  image: docker.io/clickhouse/clickhouse-server:26.3.17
+  keeperImage: docker.io/clickhouse/clickhouse-keeper:26.3.17
 
   # -- Number of shards when `topology=cluster` (`values.schema.json`
   # requires >= 2). Ignored when `topology=single`.

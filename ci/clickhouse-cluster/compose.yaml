@@ -28,7 +28,7 @@ networks:
 
 services:
   keeper:
-    image: docker.io/clickhouse/clickhouse-keeper:24.8
+    image: docker.io/clickhouse/clickhouse-keeper:26.3
     container_name: pulsus-keeper-it
     networks:
       pulsus-schema-it:
@@ -44,7 +44,7 @@ services:
       retries: 30
 
   ch-shard1:
-    image: docker.io/clickhouse/clickhouse-server:24.8
+    image: docker.io/clickhouse/clickhouse-server:26.3
     container_name: pulsus-ch-shard1-it
     networks:
       pulsus-schema-it:
@@ -70,7 +70,7 @@ services:
         hard: 262144
 
   ch-shard2:
-    image: docker.io/clickhouse/clickhouse-server:24.8
+    image: docker.io/clickhouse/clickhouse-server:26.3
     container_name: pulsus-ch-shard2-it
     networks:
       pulsus-schema-it:
