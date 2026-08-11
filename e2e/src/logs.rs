@@ -3963,53 +3963,52 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
     }
 
-    /// The text of ONE `### ` entry: from its heading to the next
-    /// `\n### ` or the end of the document.
+    /// The `nested-sort-order` entry's three markers, each written on
+    /// purpose and each asserted to occur EXACTLY ONCE in the ledger.
     ///
-    /// **Entry-SCOPED, deliberately, and this is the whole point of the
-    /// helper** (issue #406): a document-wide `contains` is satisfied by
-    /// the needle appearing anywhere, including in a different entry that
-    /// happens to cite the same file, so it certifies nothing about the
-    /// entry it names. Slicing on the heading is the smallest rule that
-    /// scopes the claim, and its residual is stated rather than reasoned
-    /// away: a line beginning `### ` **inside a fenced code block** would
-    /// end the slice early. Detecting that needs fence parsing, which the
-    /// sibling `sort-tie-order` guard removed after three review rounds
-    /// found the next markdown edge case each time. Nothing in this file
-    /// is committed inside a fence today, and the heading uniqueness
-    /// assertion at each call site is what would notice a duplicate.
-    fn ledger_entry<'a>(ledger: &'a str, heading: &str) -> &'a str {
-        assert_eq!(
-            ledger.matches(heading).count(),
-            1,
-            "the ledger must carry exactly one {heading:?} entry heading"
-        );
-        let start = ledger.find(heading).expect("the heading was just counted");
-        let rest = &ledger[start + heading.len()..];
-        let end = rest
-            .find("\n### ")
-            .map_or(ledger.len(), |i| start + heading.len() + i);
-        &ledger[start..end]
-    }
-
-    /// The `nested-sort-order` entry's unique marker.
+    /// **No markdown is parsed here, and that is the point** (issue #406,
+    /// code review round 1). The first version of this guard sliced the
+    /// entry out of the document between `### ` headings; the reviewer
+    /// demoted the heading to `####`, the substring `### ` was still
+    /// found inside it, and the test stayed green. That is the fourth
+    /// distinct markdown edge case this issue has hit in a
+    /// section-scanner — after a bullet inside a fence, an unclosed fence
+    /// elsewhere, and an indented heading — and the sibling
+    /// `sort-tie-order` guard had already deleted its own scanner for
+    /// exactly that reason. Patching the slicer to understand `####`
+    /// would be the fifth patch, not a fix.
+    ///
+    /// Uniqueness replaces extraction. A claim that reads as relational —
+    /// "recorded in THIS entry" — becomes checkable without locating the
+    /// entry at all, because a marker that occurs exactly once cannot be
+    /// satisfied by text somewhere else, and everything the claim asserts
+    /// sits on the marker's own line.
+    ///
+    /// [`NESTED_ENTRY_MARKER`] is the one exception, and it is not an
+    /// extraction: it lives ON the heading line, so asserting that its
+    /// line begins with the exact prefix `"### "` is a single-line shape
+    /// check that rejects the reviewer's `####` demotion (and an indented
+    /// heading) without looking at any other line.
     const NESTED_ENTRY_MARKER: &str = "ledger-marker: nested-sort-order/entry";
-    /// Its "Not covered" bullet's unique marker.
+    /// The entry's machine-checkable one-line record.
+    const NESTED_RECORD_MARKER: &str = "ledger-marker: nested-sort-order/record";
+    /// Its "Not covered" bullet.
     const NESTED_NOT_COVERED_MARKER: &str = "ledger-marker: nested-sort-order/not-covered";
 
-    /// Everything the `nested-sort-order` entry must carry, each needle
-    /// asserted INSIDE the entry rather than anywhere in the document.
-    /// Chosen so no needle contains another — asserted below, because a
-    /// contained needle can never fail on its own and its survivor
-    /// certifies a check that does not hold.
-    const NESTED_ENTRY_NEEDLES: &[&str] = &[
-        // The reference rule and its call sites.
+    /// Everything the record must carry, asserted ON
+    /// [`NESTED_RECORD_MARKER`]'s own line. Chosen so no needle contains
+    /// another — asserted below, because a contained needle can never
+    /// fail on its own and its survivor certifies a check that does not
+    /// hold.
+    const NESTED_RECORD_NEEDLES: &[&str] = &[
+        // The reference rule and its call site.
         "evaluator.go:242-260",
         "engine.go:564",
         // The mechanism that makes its surviving order arbitrary.
         "evaluator.go:584",
         "map[uint64]*groupedAggregation",
-        // Our own, which is why this is a correctness argument.
+        // Ours, which is why this is a correctness argument and not a
+        // parity one.
         "post_agg.rs:1122-1135",
         // The measurement: both images by digest, both buildinfo
         // revisions, and the repeat count.
@@ -4017,7 +4016,7 @@ mod tests {
         "sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08",
         "b318f282",
         "4fa045d3",
-        "20 instant queries per store per query",
+        "20 repeats per store per query",
         // Our rule, by symbol.
         "sorted_order_reaches_the_wire",
         // The five enumerated sub-cases where we stay deterministic.
@@ -4026,69 +4025,93 @@ mod tests {
         "Y * sort(X)",
         "sort(X) or Y",
         "variants(…) of (…)",
-        // The agreeing half, so the entry cannot be read as a wholesale
+        // The agreeing half, so the record cannot be read as a wholesale
         // divergence.
         "sort(A) or sort(B)",
         "group_right",
     ];
 
-    /// Issue #406 R2, AC 9: the `nested-sort-order` divergence is
-    /// registered where the divergence discipline says it is registered —
-    /// and every assertion is scoped to THAT ENTRY, never to the
-    /// document.
+    /// The one line in `ledger` carrying `marker`, with the marker
+    /// asserted to occur exactly once in the whole document first.
     ///
-    /// Two markers carry the two claims that are relational: the entry
-    /// exists once, and its exclusion is recorded once. Uniqueness is
-    /// what makes a relational claim checkable without a markdown parser
-    /// (the sibling guard's rationale, above); scoping the content
-    /// needles to [`ledger_entry`]'s slice is what stops a needle
-    /// satisfied by another entry counting as this one.
+    /// This is the entire mechanism: no ranges, no headings, no fences.
+    fn unique_marker_line<'a>(ledger: &'a str, marker: &str) -> &'a str {
+        assert_eq!(
+            ledger.matches(marker).count(),
+            1,
+            "{marker:?} must occur exactly once in the ledger, found {}",
+            ledger.matches(marker).count()
+        );
+        let hits: Vec<&str> = ledger.lines().filter(|l| l.contains(marker)).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "{marker:?} must sit on exactly one line, found {}",
+            hits.len()
+        );
+        hits[0]
+    }
+
+    /// Issue #406 R2, AC 9: the `nested-sort-order` divergence is
+    /// registered where the divergence discipline says it is registered.
+    ///
+    /// Three markers, three claims, each pinned by exactly-once
+    /// uniqueness and by what sits on the marker's own line — the shape
+    /// the sibling `sort-tie-order` guard arrived at after three review
+    /// rounds, and the one this test arrived at after a fourth. See
+    /// [`NESTED_ENTRY_MARKER`] for why no markdown is parsed.
+    ///
+    /// **Residual failure surface, measured rather than reasoned about**
+    /// (each mutation applied to the committed ledger and observed):
+    /// * **the record marker's own prose edited to say something false**
+    ///   while keeping every needle. Reading the sentence is the only
+    ///   thing that catches that, and this test does not claim to;
+    /// * **the record line relocated to another entry.** The entry marker
+    ///   is on the heading, so a demotion or a duplicate heading is
+    ///   caught; a record line MOVED under a different heading, with its
+    ///   needles intact, is not. Catching that needs the extraction this
+    ///   test exists to avoid;
+    /// * nothing here validates the rest of the ledger, or the prose
+    ///   below the record line. It answers three questions.
     #[test]
     fn the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger() {
         let ledger = committed_ledger();
-        let entry = ledger_entry(&ledger, "### `nested-sort-order`");
 
-        // Both markers occur exactly once in the WHOLE document, and both
-        // occurrences are inside this entry.
-        for marker in [NESTED_ENTRY_MARKER, NESTED_NOT_COVERED_MARKER] {
-            assert_eq!(
-                ledger.matches(marker).count(),
-                1,
-                "{marker:?} must occur exactly once in the ledger"
-            );
-            assert!(
-                entry.contains(marker),
-                "{marker:?} is in the ledger but not inside the `nested-sort-order` entry"
-            );
-        }
+        // (1) The entry exists, once, at `###` — the marker rides the
+        // heading, so this is a one-line shape check, not a section scan.
+        // `"#### x".starts_with("### ")` is FALSE (the fourth byte is
+        // `#`, not a space), which is exactly the demotion the review
+        // caught the previous version on.
+        let heading = unique_marker_line(&ledger, NESTED_ENTRY_MARKER);
+        assert!(
+            heading.starts_with("### "),
+            "the `nested-sort-order` entry must be a `###` heading, not {:?}:\n{heading}",
+            heading.chars().take_while(|c| *c == '#').count()
+        );
+        assert!(
+            heading.contains("`nested-sort-order`"),
+            "the entry marker's line must name the entry:\n{heading}"
+        );
 
-        // No needle may contain another, or it can never fail alone.
-        for needle in NESTED_ENTRY_NEEDLES {
-            for other in NESTED_ENTRY_NEEDLES {
+        // (2) The record, entirely on its marker's own line.
+        for needle in NESTED_RECORD_NEEDLES {
+            for other in NESTED_RECORD_NEEDLES {
                 assert!(
                     needle == other || !other.contains(needle),
                     "needle {needle:?} is contained in {other:?}, so it can never fail alone"
                 );
             }
         }
-        // Matched against the entry with runs of whitespace collapsed, so
-        // a needle spanning a line wrap still matches and re-flowing the
-        // prose does not redden the gate. The markers below are matched
-        // on the RAW lines, where their line-scoping is the point.
-        let compact = entry.split_whitespace().collect::<Vec<_>>().join(" ");
-        for needle in NESTED_ENTRY_NEEDLES {
+        let record = unique_marker_line(&ledger, NESTED_RECORD_MARKER);
+        for needle in NESTED_RECORD_NEEDLES {
             assert!(
-                compact.contains(needle),
-                "the `nested-sort-order` entry does not carry {needle:?}"
+                record.contains(needle),
+                "the `{NESTED_RECORD_MARKER}` line does not carry {needle:?}:\n{record}"
             );
         }
 
-        // The exclusion's own content sits on the marker's own line, so
-        // no part of it can drift away from the marker.
-        let line = entry
-            .lines()
-            .find(|l| l.contains(NESTED_NOT_COVERED_MARKER))
-            .expect("the marker was just located inside the entry");
+        // (3) The exclusion, entirely on its marker's own line.
+        let line = unique_marker_line(&ledger, NESTED_NOT_COVERED_MARKER);
         let tokens = identifier_tokens(line);
         for token in ["topk", "bottomk", "R1"] {
             assert!(
@@ -4102,33 +4125,23 @@ mod tests {
                 "the `{NESTED_NOT_COVERED_MARKER}` line is missing {phrase:?}:\n{line}"
             );
         }
-    }
 
-    /// [`ledger_entry`] slices ONE entry, so a needle that lives in a
-    /// different entry does not satisfy a claim about this one. Without
-    /// this the AC 9 guard above would be a document-wide `contains`
-    /// wearing a scoped name — the exact failure this issue spent four
-    /// review rounds on.
-    #[test]
-    fn the_ledger_entry_slice_stops_at_the_next_entry() {
-        let doc = "\
-### `a` (one)
-
-alpha only
-
-### `b` (two)
-
-beta only
-";
-        let a = ledger_entry(doc, "### `a`");
-        assert!(a.contains("alpha only"));
-        assert!(
-            !a.contains("beta only"),
-            "the slice leaked into the next entry: {a:?}"
-        );
-        let b = ledger_entry(doc, "### `b`");
-        assert!(b.contains("beta only"));
-        assert!(!b.contains("alpha only"));
+        // The three markers are distinct claims, so none may be a
+        // substring of another — otherwise one exactly-once count would
+        // be satisfied by another marker's line.
+        let markers = [
+            NESTED_ENTRY_MARKER,
+            NESTED_RECORD_MARKER,
+            NESTED_NOT_COVERED_MARKER,
+        ];
+        for a in markers {
+            for b in markers {
+                assert!(
+                    a == b || !b.contains(a),
+                    "marker {a:?} is contained in {b:?}, so its count can never be 1 alone"
+                );
+            }
+        }
     }
 
     /// AC15: the fixture prose no longer promises a reference tie order.

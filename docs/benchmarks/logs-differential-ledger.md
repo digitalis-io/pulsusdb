@@ -2801,12 +2801,22 @@ RELAXED, and what stays asserted.
   `value_ordered_agreement_*` / `tie_groups_*` in `e2e/src/logs.rs`, and
   by `the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger`.
 
-### `nested-sort-order` (issue #406 R2 — where the reference's surviving order is its own map walk, ours stays deterministic)
+### `nested-sort-order` (issue #406 R2 — where the reference's surviving order is its own map walk, ours stays deterministic) `ledger-marker: nested-sort-order/entry`
 
-`ledger-marker: nested-sort-order/entry` — this entry records a
-**deliberate** difference in one place only: which instant `vector`
-responses keep a `sort`/`sort_desc`'s value order on the wire. No fixture
-case is downgraded and no case carries a `ledger` field for it.
+This entry records a **deliberate** difference in one place only: which
+instant `vector` responses keep a `sort`/`sort_desc`'s value order on the
+wire. No fixture case is downgraded and no case carries a `ledger` field
+for it.
+
+**The record, on one line so a machine can check it.** `ledger-marker: nested-sort-order/record` — reference rule `Sortable` (`pkg/logql/evaluator.go:242-260`), call site `pkg/logql/engine.go:564`; its surviving order is a Go map walk, `evaluator.go:584` over `map[uint64]*groupedAggregation`; ours would be too, `post_agg.rs:1122-1135`; our rule is `sorted_order_reaches_the_wire`. Measured 2026-08-11, 20 repeats per store per query on a 2/1/3 fixture, against `grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc` (`b318f282`) and `grafana/loki@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08` (`4fa045d3`). We DIVERGE (our deterministic label order, their map walk) on: `sum by (svc) (sort(X))`; `topk(2, sort(X))`; `Y * sort(X)`; `sort(X) or Y`; a `variants(…) of (…)` root. We AGREE (value order, 20/20 both images) on `label_replace`, a scalar operand, the many side of a vector binop including `group_right`, `and`/`unless`, and `sort(A) or sort(B)`.
+
+  *(One line on purpose, and the marker's own line: the AC 9 guard
+  (`the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger`,
+  `e2e/src/logs.rs`) asserts every needle above ON this line and asserts
+  the marker occurs exactly once in this file, so nothing here can drift
+  away from the marker and no text elsewhere can satisfy the check. The
+  prose below is the same content for a human reader, and only the line
+  above is gated.)*
 
 R2's defect itself is FIXED, not ledgered: `label_replace(sort(…), …)`,
 `sort(…) * 1` and a vector binary operand now return value order here, in
