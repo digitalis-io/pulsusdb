@@ -7,15 +7,20 @@
 # Pinned image: grafana/tempo:3.0.2 (see compose.single.yaml for the
 # digest — tag AND digest, the prom/prometheus:v3.13.0 precedent;
 # upgrades are deliberate future commits, never floating). Note for that
-# future upgrade path: Tempo 3.x's single-binary mode has no `ingester`
-# config block — adding one makes the process exit 1 before serving, with
+# future upgrade path: the image pinned below rejects an `ingester` config
+# block outright — it exits 1 before serving. Measured 2026-08-11 on that
+# image only (not a claim about Tempo 3.x in general); to reproduce:
+#
+#   printf 'server:\n  http_listen_port: 3200\ningester:\n  max_block_duration: 5m\n' > /tmp/t.yaml
+#   podman run --rm -v /tmp/t.yaml:/etc/tempo.yaml:ro \
+#     grafana/tempo:3.0.2@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3 \
+#     -config.file=/etc/tempo.yaml
+#
 #   failed parsing config: failed to parse configFile /etc/tempo.yaml:
 #   yaml: unmarshal errors:
-#     line 52: field ingester not found in type app.Config
-# (measured 2026-08-11: this file plus `ingester: {max_block_duration: 5m}`
-# appended, run against the pinned digest below — `podman run --rm -v
-# <cfg>:/etc/tempo.yaml:ro grafana/tempo:3.0.2@sha256:cda87c21…
-# -config.file=/etc/tempo.yaml`). The 2.x flush and
+#     line 3: field ingester not found in type app.Config
+#
+# The 2.x flush and
 # complete-block tuning knobs were not removed, they moved — they now sit
 # under the root `live_store` key (`cmd/tempo/app/config.go:72` @ v3.0.2,
 # `0c4b926d`), which declares `flush_check_period`, `max_trace_idle`,

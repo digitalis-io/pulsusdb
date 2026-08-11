@@ -632,20 +632,6 @@ async fn fetch_tempo_trace(
     }
 }
 
-/// Whether [`retry_through_cut`] ever got a body, which is the one
-/// distinction the loop itself has to carry. The finer reading — a real
-/// absence, a reference that never answered, a reference that could not
-/// be read — is drawn afterwards from the 404 count and the last
-/// transport error, so that each failure states only what its own
-/// evidence supports.
-#[derive(Debug)]
-enum CutRetryExhaustion {
-    /// No body arrived before the deadline.
-    StillAbsent,
-    /// A body did arrive — just not before the deadline.
-    BodyAfterDeadline,
-}
-
 /// [`fetch_tempo_trace`] with a bounded re-ask on an absent result, for
 /// callers that have already established the trace WAS visible and treat
 /// a later 404 as fatal.
@@ -680,9 +666,9 @@ enum CutRetryExhaustion {
 /// response is cancelled at the deadline rather than being allowed to run
 /// out `query_timeout` (60s ci / 120s full) — and a body that lands after
 /// the deadline is rejected by an explicit clock comparison in the loop,
-/// NOT by anything the types enforce. The exhaustion error carries the
-/// attempt count and the real elapsed time so that a future argument for
-/// widening the ceiling can be made from numbers.
+/// NOT by anything the types enforce. On failure it reports the observed
+/// counters and draws no conclusion from them — see the comment above the
+/// message for why.
 ///
 /// Deliberately NOT applied to [`fetch_pulsus_trace`]: see
 /// [`assert_trace_by_id_gate`] for why the retry is one-sided.
@@ -723,16 +709,16 @@ where
 {
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + ceiling;
+    // The counters the failure reports. `attempts` alone cannot be read
+    // back into what happened — the final attempt is typically cancelled
+    // at the deadline (measured: 48 completed 404s then one
+    // cancellation) — so each outcome is tallied on its own.
     let mut attempts = 0usize;
-    let mut last_transport_err: Option<anyhow::Error> = None;
-    let mut exhaustion = CutRetryExhaustion::StillAbsent;
-    // Attempts that COMPLETED and said 404. Counted separately from
-    // `attempts` because only these license the "the trace is gone"
-    // reading: the final attempt is typically cancelled at the deadline
-    // (measured: 48 clean 404s then one cancellation), and concluding
-    // from that last event alone would report a timeout for what is
-    // plainly an absence.
     let mut absent_responses = 0usize;
+    let mut transport_errors = 0usize;
+    let mut last_transport_err: Option<anyhow::Error> = None;
+    let mut body_after_deadline = false;
+    let mut final_attempt_cancelled = false;
 
     loop {
         attempts += 1;
@@ -793,16 +779,21 @@ where
             // takes time.
             Ok(Ok(Some(body))) if tokio::time::Instant::now() < deadline => return Ok(body),
             Ok(Ok(Some(_))) => {
-                exhaustion = CutRetryExhaustion::BodyAfterDeadline;
+                body_after_deadline = true;
                 break;
             }
             Ok(Ok(None)) => absent_responses += 1,
-            // A transient transport error is retried like an absence (the
-            // reason the message below says "absent or unreadable"), but
-            // the last one is kept so the failure names the real cause
-            // rather than a bare timeout.
-            Ok(Err(err)) => last_transport_err = Some(err),
-            Err(_elapsed) => break,
+            // Retried like an absence, but counted separately and the last
+            // one kept, so the failure can report it rather than leaving
+            // the reader to infer it.
+            Ok(Err(err)) => {
+                transport_errors += 1;
+                last_transport_err = Some(err);
+            }
+            Err(_elapsed) => {
+                final_attempt_cancelled = true;
+                break;
+            }
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -811,38 +802,22 @@ where
         tokio::time::sleep(interval.min(deadline - now)).await;
     }
 
+    // EVIDENCE ONLY — no conclusion. Four review rounds each found this
+    // message asserting slightly more than it could support (the trace is
+    // gone / the reference was slow / this says nothing either way), and
+    // each fix produced a fresh overstatement one round later. The cause
+    // was the diagnosing, not any one sentence, so the message now reports
+    // what was observed and stops. Whoever debugs the next failure reads
+    // the counters; they are better placed to interpret them than we are.
+    // Do not add an explanatory clause here.
     let waited = started.elapsed();
-    let tries = if attempts == 1 { "attempt" } else { "attempts" };
-    let budget =
-        format!("{attempts} {tries} over {waited:.3?}, ceiling {ceiling:?}, interval {interval:?}");
-    // Each ending states only the conclusion its own evidence supports.
-    // "The trace is gone rather than mid-cut" needs an unbroken run of
-    // 404s outlasting a cut window; a body that arrived, a reference that
-    // never answered, and a reference we could not read are three
-    // different findings and none of them is an absence.
-    let detail = match exhaustion {
-        CutRetryExhaustion::BodyAfterDeadline => format!(
-            "tempo answered for trace {trace_hex}, but only after the {ceiling:?} ceiling had \
-             passed — {budget}. The trace IS there; the body is rejected as untimely, which says \
-             the reference was slow, not that anything is missing"
-        ),
-        CutRetryExhaustion::StillAbsent if absent_responses > 0 => format!(
-            "tempo lost trace {trace_hex} after completeness: 404 on {absent_responses} of \
-             {budget} — an unbroken run of 404s longer than one live-store cut window, so the \
-             trace is gone rather than mid-cut"
-        ),
-        CutRetryExhaustion::StillAbsent if last_transport_err.is_some() => format!(
-            "tempo was unreadable for trace {trace_hex} within the {ceiling:?} ceiling — \
-             {budget}. No attempt ever returned a 404, so this is a reference/transport failure \
-             and NOT evidence the trace is gone (cause attached below)"
-        ),
-        CutRetryExhaustion::StillAbsent => format!(
-            "tempo never answered for trace {trace_hex} within the {ceiling:?} ceiling — \
-             {budget}. Every attempt was still in flight when the deadline cancelled it, so this \
-             is a timeout against the reference and says nothing either way about whether the \
-             trace is there"
-        ),
-    };
+    let detail = format!(
+        "tempo trace {trace_hex} not obtained within the re-ask budget: attempts={attempts}, \
+         http_404={absent_responses}, transport_errors={transport_errors}, \
+         body_after_deadline={body_after_deadline}, \
+         final_attempt_cancelled={final_attempt_cancelled}, elapsed={waited:.3?}, \
+         ceiling={ceiling:?}, interval={interval:?}"
+    );
     Err(match last_transport_err {
         Some(err) => err.context(detail),
         None => anyhow!(detail),
@@ -2993,6 +2968,31 @@ mod tests {
         serde_json::json!({ "batches": [] })
     }
 
+    /// Readings that four successive review rounds each found the failure
+    /// message asserting beyond its evidence. The message reports counters
+    /// and stops, so none of these may come back — and neither may a new
+    /// one: the ban is on diagnosing, not on these particular strings.
+    const CAUSAL_READINGS: &[&str] = &[
+        "gone rather than mid-cut",
+        "still absent or unreadable",
+        "says nothing either way",
+        "the reference was slow",
+        "not accepted as timely",
+        "NOT evidence",
+        "IS there",
+        "so this is",
+        "which says",
+    ];
+
+    fn assert_no_causal_language(msg: &str) {
+        for reading in CAUSAL_READINGS {
+            assert!(
+                !msg.contains(reading),
+                "the failure must report evidence, not diagnose it — found {reading:?} in: {msg}"
+            );
+        }
+    }
+
     /// The guard's reason for existing. `tokio::time::timeout_at` polls
     /// the inner future BEFORE its elapsed timer, so an already-ready
     /// future at an expired deadline yields `Ok`, not `Err(Elapsed)`. If
@@ -3026,11 +3026,12 @@ mod tests {
         .await
         .expect_err("a body arriving after the deadline must not be accepted");
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("only after"),
-            "must report a late answer, not an absence: {msg}"
-        );
         assert!(msg.contains("abc"), "must name the trace: {msg}");
+        assert!(
+            msg.contains("body_after_deadline=true"),
+            "must record that a body arrived late: {msg}"
+        );
+        assert_no_causal_language(&msg);
     }
 
     /// The other half: a body inside the ceiling is still accepted, so the
@@ -3051,8 +3052,8 @@ mod tests {
         );
     }
 
-    /// A trace that is genuinely gone still fails, bounded, naming the
-    /// attempt count and the elapsed time.
+    /// A trace that never appears still fails, bounded, and the failure
+    /// carries the 404 tally rather than a verdict about it.
     #[tokio::test]
     async fn permanently_absent_trace_fails_bounded_with_attempts_and_elapsed() {
         let started = Instant::now();
@@ -3063,36 +3064,43 @@ mod tests {
         .expect_err("a permanently absent trace must fail");
         let waited = started.elapsed();
         let msg = format!("{err:#}");
+        assert!(msg.contains("attempts="), "must count attempts: {msg}");
         assert!(
-            msg.contains("gone rather than mid-cut"),
-            "an unbroken run of 404s DOES license the absence reading: {msg}"
+            !msg.contains("http_404=0,"),
+            "must record the 404s it actually saw: {msg}"
         );
-        assert!(msg.contains("404 on"), "must cite the 404s it saw: {msg}");
-        assert!(msg.contains("attempts over"), "must name attempts: {msg}");
+        assert!(
+            msg.contains("transport_errors=0") && msg.contains("body_after_deadline=false"),
+            "must record the outcomes that did NOT happen too: {msg}"
+        );
         assert!(waited >= TEST_CEILING, "must not give up early: {waited:?}");
         assert!(waited < TEST_CEILING * 3, "must stay bounded: {waited:?}");
+        assert_no_causal_language(&msg);
     }
 
-    /// A reference we could not READ is not a missing trace. The attempt
-    /// fails rather than returning 404, so no absence may be concluded and
-    /// the underlying cause stays attached.
+    /// A reference that could not be READ is tallied as a transport error,
+    /// separately from a 404, and the underlying cause stays attached.
     #[tokio::test]
-    async fn an_unreadable_reference_is_not_reported_as_an_absence() {
+    async fn an_unreadable_reference_is_counted_separately_from_a_404() {
         let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
             std::future::ready(Err(anyhow!("connection reset by peer")))
         })
         .await
         .expect_err("an unreadable reference must still fail the gate");
         let msg = format!("{err:#}");
-        assert!(msg.contains("unreadable"), "must report unreadable: {msg}");
         assert!(
-            !msg.contains("gone rather than mid-cut"),
-            "no 404 was ever seen, so absence must NOT be concluded: {msg}"
+            msg.contains("http_404=0"),
+            "no 404 was ever received: {msg}"
+        );
+        assert!(
+            !msg.contains("transport_errors=0"),
+            "the read failures must be counted: {msg}"
         );
         assert!(
             msg.contains("connection reset by peer"),
             "the real cause must survive in the chain: {msg}"
         );
+        assert_no_causal_language(&msg);
     }
 
     /// A slow attempt is cancelled at the deadline rather than being
@@ -3114,17 +3122,16 @@ mod tests {
             waited < TEST_CEILING * 3,
             "must return at the ceiling, not the attempt's own timeout: {waited:?}"
         );
-        // A reference that never answers is a timeout, and the message
-        // must not upgrade that into a claim the trace is missing.
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("never answered") && msg.contains("says nothing either way"),
-            "a cancelled attempt must be reported as a timeout: {msg}"
+            msg.contains("final_attempt_cancelled=true"),
+            "must record that the attempt was cancelled: {msg}"
         );
         assert!(
-            !msg.contains("gone rather than mid-cut"),
-            "no 404 was ever seen, so absence must NOT be concluded: {msg}"
+            msg.contains("http_404=0") && msg.contains("transport_errors=0"),
+            "nothing was ever received, and the counters must show that: {msg}"
         );
+        assert_no_causal_language(&msg);
     }
 
     fn shipped_fixture() -> TracesFixture {
