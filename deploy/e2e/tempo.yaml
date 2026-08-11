@@ -8,11 +8,21 @@
 # digest — tag AND digest, the prom/prometheus:v3.13.0 precedent;
 # upgrades are deliberate future commits, never floating). Note for that
 # future upgrade path: Tempo 3.x's single-binary mode has no `ingester`
-# config block (the 2.x flush/complete-block tuning knobs are gone —
-# `field ingester not found` on boot); recent traces are served from the
-# live store, and the harness's bounded completeness pre-checks
-# (trace-by-ID first, then search visibility) absorb the remaining
-# ingest-to-searchable lag without fixed sleeps.
+# config block (`field ingester not found` on boot). The 2.x flush and
+# complete-block tuning knobs were not removed, they moved — they now sit
+# under the root `live_store` key (`cmd/tempo/app/config.go:72` @ v3.0.2,
+# `0c4b926d`), which declares `flush_check_period`, `max_trace_idle`,
+# `max_trace_live`, `max_block_duration` and `complete_block_timeout`
+# (`modules/livestore/config.go:35,47-53`). This file overrides none of
+# them, so the defaults apply: `flush_check_period` and `max_trace_idle`
+# are both 5s (`modules/livestore/config.go:106,109`). Those two defaults
+# are what size the trace-by-ID gate's reference-side re-ask — see
+# `fetch_tempo_trace_through_cut` in `e2e/src/traces.rs`; changing them
+# here changes the window that retry is sized against.
+#
+# Recent traces are served from the live store, and the harness's bounded
+# completeness pre-checks (trace-by-ID first, then search visibility)
+# absorb the remaining ingest-to-searchable lag without fixed sleeps.
 server:
   http_listen_port: 3200
 

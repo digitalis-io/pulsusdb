@@ -661,9 +661,13 @@ async fn fetch_tempo_trace(
 /// genuinely dropped, has no such pending event and stays 404 forever.
 /// Outlasting a full cut window is exactly that distinction, so
 /// exhausting [`TEMPO_CUT_RETRY_CEILING`] is the discriminator and the
-/// gate still fails — bounded, never hanging. The exhaustion error
-/// carries the attempt count and the real elapsed time so that a future
-/// argument for widening the ceiling can be made from numbers.
+/// gate still fails. "Bounded" here means the whole call returns by the
+/// ceiling whatever the reference does — a hung or merely slow response
+/// is cancelled at the deadline rather than being allowed to run out
+/// `query_timeout` (60s ci / 120s full), and an answer that arrives after
+/// the deadline is not accepted. The exhaustion error carries the attempt
+/// count and the real elapsed time so that a future argument for widening
+/// the ceiling can be made from numbers.
 ///
 /// Deliberately NOT applied to [`fetch_pulsus_trace`]: see
 /// [`assert_trace_by_id_gate`] for why the retry is one-sided.
@@ -673,26 +677,63 @@ async fn fetch_tempo_trace_through_cut(
     query_timeout: Duration,
 ) -> Result<serde_json::Value> {
     let started = Instant::now();
-    let attempts = Cell::new(0usize);
-    // `poll_until` is the module's bounded-poll primitive and is what
-    // `wait_for_fetch_completeness` already absorbs this same 404 with;
-    // reusing it here is the point of the fix — one event, one treatment,
-    // in both loops. It also retries a transient transport error, hence
-    // "absent or unreadable" rather than "404" in the message below.
-    poll_until(TEMPO_CUT_RETRY_CEILING, TEMPO_CUT_RETRY_INTERVAL, || {
-        attempts.set(attempts.get() + 1);
-        async { fetch_tempo_trace(ctx, trace_hex, query_timeout).await }
-    })
-    .await
-    .with_context(|| {
-        format!(
-            "tempo lost trace {trace_hex} after completeness: still absent or unreadable after \
-             {} attempts over {:.3?} (ceiling {TEMPO_CUT_RETRY_CEILING:?}, interval \
-             {TEMPO_CUT_RETRY_INTERVAL:?}) — longer than one live-store cut window, so the \
-             trace is gone rather than mid-cut",
-            attempts.get(),
-            started.elapsed(),
-        )
+    let deadline = tokio::time::Instant::now() + TEMPO_CUT_RETRY_CEILING;
+    let mut attempts = 0usize;
+    let mut last_transport_err: Option<anyhow::Error> = None;
+
+    loop {
+        attempts += 1;
+        // `timeout_at` bounds the ATTEMPT, not merely the gap between
+        // attempts, and that is what makes the ceiling a real ceiling
+        // here. `harness::poll_until` — the primitive this loop otherwise
+        // mirrors, and which `wait_for_fetch_completeness` absorbs the
+        // same 404 with — awaits `attempt()` unbounded and returns
+        // `Ok(Some(_))` without re-checking the deadline
+        // (`harness.rs:291`/`:294`). For its other callers that is
+        // harmless, because their per-attempt cost is small beside their
+        // budget; for THIS caller it is not, because `query_timeout` is
+        // 60s (ci) / 120s (full) against a 5s ceiling, so one slow
+        // response could overrun the stated bound by 12-24x and a success
+        // arriving after the deadline would still be accepted. The
+        // primitive is deliberately left alone — tightening it would
+        // cancel in-flight non-idempotent POSTs at the five push call
+        // sites (the hazard `harness::classify_push_send` exists to
+        // avoid) and would reject legitimate late successes at the seven
+        // whole-corpus completeness call sites, whose single attempt
+        // scans every trace on both stores. So the bound lives at the one
+        // call site that claims it.
+        match tokio::time::timeout_at(deadline, fetch_tempo_trace(ctx, trace_hex, query_timeout))
+            .await
+        {
+            // A body only counts if it arrived strictly inside the
+            // ceiling; `timeout_at` cancels the attempt otherwise, so a
+            // late answer cannot be mistaken for a timely one.
+            Ok(Ok(Some(body))) => return Ok(body),
+            Ok(Ok(None)) => {}
+            // A transient transport error is retried like an absence (the
+            // reason the message below says "absent or unreadable"), but
+            // the last one is kept so the failure names the real cause
+            // rather than a bare timeout.
+            Ok(Err(err)) => last_transport_err = Some(err),
+            Err(_elapsed) => break,
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(TEMPO_CUT_RETRY_INTERVAL.min(deadline - now)).await;
+    }
+
+    let waited = started.elapsed();
+    let detail = format!(
+        "tempo lost trace {trace_hex} after completeness: still absent or unreadable after \
+         {attempts} attempts over {waited:.3?} (ceiling {TEMPO_CUT_RETRY_CEILING:?}, interval \
+         {TEMPO_CUT_RETRY_INTERVAL:?}) — longer than one live-store cut window, so the trace is \
+         gone rather than mid-cut"
+    );
+    Err(match last_transport_err {
+        Some(err) => err.context(detail),
+        None => anyhow!(detail),
     })
 }
 
