@@ -2801,22 +2801,25 @@ RELAXED, and what stays asserted.
   `value_ordered_agreement_*` / `tie_groups_*` in `e2e/src/logs.rs`, and
   by `the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger`.
 
-### `nested-sort-order` (issue #406 R2 — where the reference's surviving order is its own map walk, ours stays deterministic) `ledger-marker: nested-sort-order/entry`
+### `nested-sort-order` (issue #406 R2 — where the reference's surviving order is its own map walk, ours stays deterministic)
 
 This entry records a **deliberate** difference in one place only: which
 instant `vector` responses keep a `sort`/`sort_desc`'s value order on the
 wire. No fixture case is downgraded and no case carries a `ledger` field
 for it.
 
-**The record, on one line so a machine can check it.** `ledger-marker: nested-sort-order/record` — reference rule `Sortable` (`pkg/logql/evaluator.go:242-260`), call site `pkg/logql/engine.go:564`; its surviving order is a Go map walk, `evaluator.go:584` over `map[uint64]*groupedAggregation`; ours would be too, `post_agg.rs:1122-1135`; our rule is `sorted_order_reaches_the_wire`. Measured 2026-08-11, 20 repeats per store per query on a 2/1/3 fixture, against `grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc` (`b318f282`) and `grafana/loki@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08` (`4fa045d3`). We DIVERGE (our deterministic label order, their map walk) on: `sum by (svc) (sort(X))`; `topk(2, sort(X))`; `Y * sort(X)`; `sort(X) or Y`; a `variants(…) of (…)` root. We AGREE (value order, 20/20 both images) on `label_replace`, a scalar operand, the many side of a vector binop including `group_right`, `and`/`unless`, and `sort(A) or sort(B)`.
+**The whole record, on one line so a machine can check it.** `ledger-marker: nested-sort-order` — reference rule `Sortable` (`pkg/logql/evaluator.go:242-260`), call site `pkg/logql/engine.go:564`; its surviving order is a Go map walk, `evaluator.go:584` over `map[uint64]*groupedAggregation`; ours would be too, `post_agg.rs:1122-1135`; our rule is `sorted_order_reaches_the_wire`. Measured 2026-08-11, 20 repeats per store per query on a 2/1/3 fixture, against `grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc` (`b318f282`) and `grafana/loki@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08` (`4fa045d3`). We DIVERGE (our deterministic label order, their map walk) on: `sum by (svc) (sort(X))`; `topk(2, sort(X))`; `Y * sort(X)`; `sort(X) or Y`; a `variants(…) of (…)` root. We AGREE (value order, 20/20 both images) on `label_replace`, a scalar operand, the many side of a vector binop including `group_right`, `and`/`unless`, and `sort(A) or sort(B)`. **Not covered**: whether an inner sort changes which sample a `topk`/`bottomk` keeps — that is R1 on issue #406, a subset consequence rather than an order one, ruled **no work** (comment 5252213426) because nothing gated reaches it and `topk` orders its input anyway.
 
-  *(One line on purpose, and the marker's own line: the AC 9 guard
+  *(ONE line on purpose, and the only gated one. The AC 9 guard
   (`the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger`,
-  `e2e/src/logs.rs`) asserts every needle above ON this line and asserts
-  the marker occurs exactly once in this file, so nothing here can drift
-  away from the marker and no text elsewhere can satisfy the check. The
-  prose below is the same content for a human reader, and only the line
-  above is gated.)*
+  `e2e/src/logs.rs`) asserts that this marker occurs exactly once in this
+  file and that every needle above sits on its line — so nothing the
+  record claims can drift away from the marker, and no text elsewhere can
+  satisfy the check. It was three lines until code review round 4; one
+  line means there is no "are these lines in the same entry" question to
+  answer, and the four rounds of markdown edge cases that question cost
+  are deleted with it. The prose below is the same content for a human
+  reader and is not gated.)*
 
 R2's defect itself is FIXED, not ledgered: `label_replace(sort(…), …)`,
 `sort(…) * 1` and a vector binary operand now return value order here, in
@@ -2909,14 +2912,13 @@ arbitrary answer.
   reference except where it is wrong, and an arbitrary answer to a
   deterministic question is wrong.
 
-- **Not covered** — whether an inner sort changes WHICH sample a `topk`/`bottomk` keeps. `ledger-marker: nested-sort-order/not-covered` — that is R1 on issue #406, a subset consequence rather than an order one, ruled **no work** (comment 5252213426) because nothing gated reaches it and `topk` orders its input anyway. Row 2 above records only the ORDER half.
-
-  *(One line on purpose: it carries this exclusion's marker and every term
-  the AC 9 guard
-  (`the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger`,
-  `e2e/src/logs.rs`) asserts on the marker's own line, so no part of the
-  exclusion can drift away from the marker. Same shape as
-  `sort-tie-order`'s exclusion above.)*
+- **Not covered** — whether an inner sort changes WHICH sample a
+  `topk`/`bottomk` keeps. That is R1 on issue #406, a subset consequence
+  rather than an order one, ruled **no work** (comment 5252213426)
+  because nothing gated reaches it and `topk` orders its input anyway.
+  Row 2 above records only the ORDER half. *(The gated copy of this
+  exclusion is on the record line at the top of the entry; this is the
+  same statement for a human reader.)*
 
 - Gated by
   `the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger`
