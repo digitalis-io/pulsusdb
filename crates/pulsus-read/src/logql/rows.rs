@@ -53,18 +53,35 @@ pub struct TailSampleRow {
     pub structured_metadata: String,
 }
 
-/// The client-aggregated LogQL metric raw scan (`metric_raw_samples`): the
-/// same three columns stage 3 projected before issue #97, WITHOUT
-/// `structured_metadata`. A metric aggregation never reads structured
-/// metadata (it is surfaced only in the streams/tail label set, not in metric
-/// grouping — issue #97 is scoped to those paths), so this lean row keeps the
-/// unbounded metric scan from reading a column it never uses (the query-
-/// performance mandate) and leaves `metric_raw_samples`'s SQL byte-identical.
+/// The client-aggregated LogQL metric raw scan (`metric_raw_samples` /
+/// `metric_raw_samples_sliding`): stage 3's columns, `structured_metadata`
+/// LAST (append-only, the [`SampleRow`] precedent).
+///
+/// The metric path MERGES structured metadata into the label set, exactly as
+/// the streams path does — both sample extractors add it as their FIRST act,
+/// before any pipeline stage runs (`pkg/logql/log/metrics_extraction.go:102-104`
+/// and `:202-205 @ v3.7.4`, `builder.Add(StructuredMetadataLabel, …)`), and
+/// the `NoopStage` short-circuit at `:104-108` is AFTER the `Add`, so a query
+/// with NO pipeline stages merges too. The merged set is what `by`/`without`
+/// group on, what label filters see, and what `line_format`/`label_format`
+/// read (issue #249).
+///
+/// Empty string = no structured metadata — also what pre-#97 rows read back
+/// through the column's `DEFAULT ''`, and what the writer stores for an entry
+/// with none (`structured_metadata_json` returns `""`, never `"{}"`).
+///
+/// `absent_over_time` is the ONE reader that does not project this column:
+/// `syntax/extractor.go:46-47 @ v3.7.4` forces `noLabels = true` and
+/// `labels.go:667-668` then returns `EmptyLabelsResult`, so its label set is
+/// provably metadata-independent and the unbounded scan need not read a
+/// column it cannot use (the query-performance mandate). See
+/// [`super::sql::ScanProjection`].
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricScanRow {
     pub fingerprint: u64,
     pub timestamp_ns: i64,
     pub body: String,
+    pub structured_metadata: String,
 }
 
 /// The single `/api/logs/v1/stats` aggregation row (issue #74): both the
@@ -140,13 +157,28 @@ pub struct MetricBucketRow {
     pub n: u64,
 }
 
-/// An instant-query metric point: one `(fingerprint, n)` aggregate over the
-/// single evaluation window — structurally no `step` column, matching
-/// [`crate::logql::params::QuerySpec::Instant`]'s "no bucketing" contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
+/// An instant-query metric point: one `(fingerprint, structured_metadata, n)`
+/// aggregate over the single evaluation window — structurally no `step`
+/// column, matching [`crate::logql::params::QuerySpec::Instant`]'s "no
+/// bucketing" contract.
+///
+/// Grouped server-side by `(fingerprint, structured_metadata)` since issue
+/// #249, because the metric path merges structured metadata into the label
+/// set and one fingerprint therefore covers N output series. The client
+/// RE-groups the returned rows by the merged final label set and sums `n`
+/// BEFORE `apply_rate`; that is exact because every op reaching this path is
+/// a linear sum (`count()` / `sum(length(body))` — the only two `agg_expr`
+/// values a `client == None` plan can carry, `plan.rs`), so server-grouping
+/// on the raw metadata string and client-regrouping on the final label set
+/// produce bit-identical values to the client path's single accumulator.
+///
+/// `structured_metadata` is LAST (append-only, the [`SampleRow`]
+/// precedent). Empty string = none.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricInstantRow {
     pub fingerprint: u64,
     pub n: u64,
+    pub structured_metadata: String,
 }
 
 #[cfg(test)]

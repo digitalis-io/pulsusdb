@@ -121,7 +121,7 @@
 //! | F-a | MetricAggState::push_rows kind dispatch | MetricAggState::push_rows | exec.rs MetricAggState::push_rows | NIL | Phi1/Phi4 |
 //! | F-b | ClientAggState::push_rows prologue (Vec::new scratch) | ClientAggState::push_rows, ClientAggState::push_rows_inner | exec.rs ClientAggState::push_rows | NIL | Phi4-Phi7 |
 //! | F-c | RangeSlideState::push_rows prologue/epilogue (mem::take) | RangeSlideState::push_rows | exec.rs RangeSlideState::push_rows | NIL | Phi1-Phi3 |
-//! | F-d | the row loops and everything reachable only from them | ClientAggState::push_rows, ClientAggState::push_rows_inner, ClientAggState::stage, ClientAggState::stage_bytes, ClientAggState::flush_pending, RangeSlideState::push_rows, RangeSlideState::flush_collision, FpSlide::finish | exec.rs row paths | NOT-EXEC | rows.is_empty(); the existing CLIENT_AGG_FLAT_BUDGET per-row gate |
+//! | F-d | the row loops and everything reachable only from them | ClientAggState::push_rows, ClientAggState::push_rows_inner, ClientAggState::push_one_row, RangeSlideState::push_one_row, ClientAggState::stage, ClientAggState::stage_bytes, ClientAggState::flush_pending, RangeSlideState::push_rows, RangeSlideState::flush_collision, FpSlide::finish | exec.rs row paths | NOT-EXEC | rows.is_empty(); the existing CLIENT_AGG_FLAT_BUDGET per-row gate |
 //! | F-e | MetricAggState::finish kind dispatch (Box move) | MetricAggState::finish | exec.rs MetricAggState::finish | NIL | Phi1/Phi4 |
 //! | F-f | ClientAggState::finish absent vs non-absent | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 vs Phi4/Phi5 |
 //! | F-g | absent: the finish-time absent_labels clone (1 + 2k) | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (k = 2 gives 5) |
@@ -1143,6 +1143,7 @@ fn variants_allocation_gates() {
                     fingerprint: 1 + (i % 2),
                     timestamp_ns: (i as i64 % 50) * NS,
                     body: fat.clone(),
+                    structured_metadata: String::new(),
                 })
                 .collect();
             if shuffled {
@@ -1525,7 +1526,7 @@ fn zz_print_frame_censuses() {
 /// (M1's `.clone` → `.cloned` plus `format_args!`) and
 /// `RangeSlideState::new` (the `vec![0; …]` macro body does not parse as
 /// an expression list, so the token fallback records `max?`).
-static PER_VARIANT_FRAMES: [Frame; 32] = [
+static PER_VARIANT_FRAMES: [Frame; 34] = [
     // --- W_plan (4) ---
     Frame {
         file: "plan.rs",
@@ -2207,41 +2208,17 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // gone from it. The allocations are censused where they now
         // happen (BAND, `ClientAggState::stage`). Inventory rows
         // F-b/F-d.
-        branches: 26,
+        branches: 5,
         callees: &[
-            ".add",
-            ".as_deref",
-            ".collect",
-            // Issue #249: the per-row slider-safety probe, NIL.
-            ".contains",
-            ".contains_key",
-            ".copied",
-            ".entry",
-            ".flush_pending",
             ".get",
-            ".get_mut",
-            ".insert",
-            ".into_mut",
-            ".iter",
-            ".key",
-            ".len",
-            ".map",
-            ".run_metric_into",
-            ".sort_unstable",
-            ".stage",
-            ".to_string",
-            ".unwrap_or",
-            "Err",
+            ".is_empty",
+            ".push_one_row",
             "Ok",
-            "QueryTooBroad",
-            "charge_group_bytes",
-            "check_surviving_error",
-            "group_entry_bytes",
-            "matches!",
+            "default",
+            "merge_labels_with_structured_metadata",
             "new",
-            "render_labels_json_sorted",
-            // Issue #249: the per-row route decision, NIL.
-            "row_route",
+            "recycle_label_scratch",
+            "take",
         ],
     },
     Frame {
@@ -2370,25 +2347,21 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // a length test plus a zipped `&str` compare, and a
         // `HashSet<u64>` probe on a `Copy` key; neither allocates on
         // either path, and this frame's per-row allocation stays zero.
-        branches: 8,
+        branches: 6,
         // `.into` joined with issue #230: the render-budget breach
         // (`TemplateBudgetExceeded`) converts into `ReadError` on the
         // row path — F-d's NOT-EXEC disposition covers it.
         callees: &[
-            // Issue #249: the per-row slider-safety probe, NIL.
-            ".contains",
             ".flush_collision",
             ".get",
-            ".into",
-            ".len",
-            ".run_metric_into",
-            ".stage_member",
+            ".is_empty",
+            ".push_one_row",
             "Err",
             "Ok",
-            "check_surviving_error",
+            "default",
+            "merge_labels_with_structured_metadata",
             "new",
-            // Issue #249: the per-row route decision, NIL.
-            "row_route",
+            "recycle_label_scratch",
             "take",
         ],
     },
@@ -2613,6 +2586,76 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             ".len",
             "Some",
             "discharge_retention",
+        ],
+    },
+    // --- issue #249: the per-ROW frames the batch loops delegate to ---
+    //
+    // `push_rows_inner`/`push_rows` used to hold the whole row body. Issue
+    // #249 moved it into `push_one_row` on each state so the metadata-free
+    // and metadata-bearing rows share ONE implementation of valuing,
+    // routing and staging a sample. The per-row allocations therefore live
+    // HERE now, and both frames are censused so that move did not hide them
+    // behind an un-censused helper.
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("ClientAggState"),
+        anchor: "push_one_row",
+        // The instant row body, moved here whole from `push_rows_inner`
+        // (which kept 5 branches: the metadata split and its buffers).
+        // W-MEM disposition: **NOT-EXEC, row F-d** — the disposition the
+        // body carried inside `push_rows_inner`, unchanged by the move, and
+        // still covered by `rows.is_empty()` plus the resident
+        // `CLIENT_AGG_FLAT_BUDGET` per-row gate.
+        branches: 24,
+        callees: &[
+            ".add",
+            ".as_deref",
+            ".collect",
+            ".contains",
+            ".contains_key",
+            ".copied",
+            ".entry",
+            ".flush_pending",
+            ".get",
+            ".get_mut",
+            ".insert",
+            ".into_mut",
+            ".iter",
+            ".key",
+            ".len",
+            ".map",
+            ".run_metric_into_with_sm",
+            ".sort_unstable",
+            ".stage",
+            ".to_string",
+            ".unwrap_or",
+            "Err",
+            "Ok",
+            "QueryTooBroad",
+            "charge_group_bytes",
+            "check_surviving_error",
+            "group_entry_bytes",
+            "matches!",
+            "new",
+            "render_labels_json_sorted",
+            "row_route",
+        ],
+    },
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("RangeSlideState"),
+        anchor: "push_one_row",
+        // The sliding row body, likewise moved whole out of `push_rows`.
+        // W-MEM disposition: **NOT-EXEC, row F-d**, for the same reason.
+        branches: 5,
+        callees: &[
+            ".contains",
+            ".len",
+            ".run_metric_into_with_sm",
+            ".stage_member",
+            "Ok",
+            "check_surviving_error",
+            "row_route",
         ],
     },
 ];
@@ -2900,6 +2943,10 @@ static INVENTORY: [Row; 50] = [
         frames: &[
             "ClientAggState::push_rows",
             "ClientAggState::push_rows_inner",
+            // Issue #249: the row bodies moved out of the two batch loops
+            // into these, and they are reachable ONLY from them.
+            "ClientAggState::push_one_row",
+            "RangeSlideState::push_one_row",
             "ClientAggState::stage",
             "ClientAggState::stage_bytes",
             "ClientAggState::flush_pending",
@@ -3115,7 +3162,11 @@ static INVENTORY: [Row; 50] = [
 /// The 15 delegating boundary callees (see [`Boundary`]).
 static BOUNDARY_CALLEES: [Boundary; 13] = [
     Boundary {
-        callee: ".run_metric_into",
+        // Issue #249: the metric entrypoint became
+        // `run_metric_into_with_sm`, which the metadata-FREE row reaches
+        // through the same call with the shared empty context — one
+        // implementation, so the boundary is one name.
+        callee: ".run_metric_into_with_sm",
         rows: &["F-d"],
         disp: Disp::NotExec,
     },
@@ -3224,7 +3275,7 @@ fn module_doc() -> String {
 fn g4_frame_census_and_inventory_closure() {
     let _serial = serialize();
     // (1) 26 unique frames, each resolving to exactly one item.
-    assert_eq!(PER_VARIANT_FRAMES.len(), 32);
+    assert_eq!(PER_VARIANT_FRAMES.len(), 34);
     let mut keys = BTreeSet::new();
     for f in &PER_VARIANT_FRAMES {
         assert!(

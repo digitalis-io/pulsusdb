@@ -48,7 +48,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_logql::parse;
-use pulsus_read::logql::sql::{self, TimeWindow};
+use pulsus_read::logql::sql::{self, ScanProjection, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 
@@ -796,6 +796,7 @@ async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        projection_of(&mp),
     );
     assert!(
         sql.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"),
@@ -1220,10 +1221,29 @@ async fn metric_instant_read_routes_to_raw_and_uses_the_service_fingerprint_time
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        // Issue #249: an instant plan is always raw over `log_samples`, so
+        // the pushdown aggregate reads AND groups by `structured_metadata`.
+        // AC-8: the wider SELECT and the extra GROUP BY key must leave
+        // `index_usage` byte-equal to the pre-#249 expectation, because that
+        // is a function of the WHERE/PREWHERE predicates alone.
+        ScanProjection::WithStructuredMetadata,
     );
 
     let usage = explain(&client, &sql).await;
     assert_eq!(usage, expected_metric_instant_raw_usage());
+}
+
+/// The [`ScanProjection`] `LogQlEngine` would pass for this plan — derived
+/// from `mp.op` exactly as `client_metric_read_sql` derives it (issue #249).
+/// A wider `SELECT` list cannot move `index_usage`, which is a function of
+/// the `WHERE`/`PREWHERE` predicates alone; asserting it here is what turns
+/// that from an argument into a check.
+fn projection_of(mp: &pulsus_read::logql::MetricPlan) -> ScanProjection {
+    if matches!(mp.op, pulsus_logql::RangeAggOp::AbsentOverTime) {
+        ScanProjection::Lean
+    } else {
+        ScanProjection::WithStructuredMetadata
+    }
 }
 
 /// The `(service, fingerprint, timestamp_ns)` primary key on `log_samples`
@@ -1867,6 +1887,7 @@ async fn m6_10_unpiped_count_over_time_range_slides_raw() {
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        projection_of(&mp),
     );
     let usage = explain(&client, &sql).await;
     assert_eq!(usage, expected_metric_instant_raw_usage());
@@ -1902,6 +1923,7 @@ async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key(
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        projection_of(&mp),
     );
     assert!(!sql.contains("LIMIT"), "aggregations never truncate: {sql}");
     let usage = explain(&client, &sql).await;
@@ -1948,6 +1970,7 @@ async fn a_grouped_range_aggregation_plans_the_same_single_raw_scan_as_its_ungro
             },
             mp.scan_lower,
             &mp.extra_predicates,
+            projection_of(&mp),
         );
         assert!(!sql.contains("LIMIT"), "{query}: {sql}");
         (mp, sql)
@@ -2009,6 +2032,7 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        projection_of(&mp),
     );
 
     let usage = explain(&client, &sql).await;

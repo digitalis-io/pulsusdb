@@ -290,8 +290,12 @@ fn json_string(s: &str, out: &mut String) {
 pub struct StreamSpec {
     pub labels: Vec<(String, String)>,
     pub service: String,
-    /// `(timestamp_ns, body)`.
-    pub samples: Vec<(i64, String)>,
+    /// `(timestamp_ns, structured metadata as canonical JSON, body)`.
+    ///
+    /// The metadata field is `""` — never `"{}"` — when the sample line
+    /// carries no `sm{...}` token, which is exactly what the writer stores
+    /// for an entry with none (`structured_metadata_json`, issue #249).
+    pub samples: Vec<(i64, String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,15 +504,41 @@ fn parse_load_block(
             let stream = streams
                 .last_mut()
                 .ok_or_else(|| fmt_err(file, idx, "sample line before any stream header".into()))?;
-            let (offset, body) = content
+            let (offset, rest) = content
                 .split_once(char::is_whitespace)
                 .ok_or_else(|| fmt_err(file, idx, "sample line needs `<offset> <body>`".into()))?;
             let ts = parse_duration_ns(offset).map_err(|e| fmt_err(file, idx, e))?;
-            stream.samples.push((ts, body.trim_start().to_string()));
+            let (sm, body) = parse_sample_metadata(rest).map_err(|e| fmt_err(file, idx, e))?;
+            stream.samples.push((ts, sm, body));
         }
         idx += 1;
     }
     Ok((streams, idx))
+}
+
+/// Splits a sample line's remainder into `(structured metadata JSON, body)`
+/// (issue #249).
+///
+/// After the offset token, if what follows begins with `sm{`, everything
+/// through the MATCHING `}` is that entry's structured metadata — parsed by
+/// the same [`parse_labelset`] the stream header uses and rendered to
+/// canonical sorted-key JSON by the same [`labels_to_json`], so the corpus
+/// cannot disagree with the store about what a metadata set means. The body
+/// is the remainder, `trim_start`ed.
+///
+/// `sm{}` is the explicit-empty form, and it is the ESCAPE for a body that
+/// must itself begin with `sm{`. An absent token yields `""` — never `"{}"`
+/// — which is the stored representation of "no structured metadata".
+fn parse_sample_metadata(rest: &str) -> Result<(String, String), String> {
+    let Some(after) = rest.strip_prefix("sm") else {
+        return Ok((String::new(), rest.trim_start().to_string()));
+    };
+    if !after.starts_with('{') {
+        return Ok((String::new(), rest.trim_start().to_string()));
+    }
+    let (pairs, consumed) = parse_labelset(after)?;
+    let body = after[consumed..].trim_start().to_string();
+    Ok((labels_to_json(&pairs), body))
 }
 
 /// Strips the `eval`/`eval_ordered`/`eval_fail` verb; returns
@@ -760,7 +790,9 @@ fn fmt_err(file: &str, idx: usize, msg: String) -> String {
 struct StoredStream {
     fingerprint: u64,
     base: Vec<(String, String)>,
-    samples: Vec<(i64, String)>,
+    /// `(timestamp_ns, structured metadata JSON, body)` — see
+    /// [`StreamSpec::samples`].
+    samples: Vec<(i64, String, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -794,11 +826,12 @@ impl Store {
                     labels: labels_to_json(&spec.labels),
                 },
             );
-            for (ts, body) in &spec.samples {
+            for (ts, sm, body) in &spec.samples {
                 self.rows.push(MetricScanRow {
                     fingerprint: fp,
                     timestamp_ns: *ts,
                     body: body.clone(),
+                    structured_metadata: sm.clone(),
                 });
             }
             self.streams.push(StoredStream {
@@ -833,7 +866,7 @@ enum Outcome {
 fn validate_distinct_timestamps(store: &Store) -> Result<(), String> {
     let mut seen: HashMap<i64, ()> = HashMap::new();
     for stream in &store.streams {
-        for (ts, _) in &stream.samples {
+        for (ts, _, _) in &stream.samples {
             if seen.insert(*ts, ()).is_some() {
                 return Err(format!(
                     "eval detected requires distinct timestamps across every loaded sample \
@@ -868,6 +901,7 @@ fn evaluate_detected(store: &Store, query: &str, de: DetectedEval) -> Result<Out
             );
         }
     };
+    reject_metadata_for_label_leg(store, "`eval detected`")?;
     // (b) compile; a compile error is a case failure.
     let compiled = CompiledPipeline::compile(&le.pipeline)
         .map_err(|e| e.to_string())?
@@ -875,7 +909,7 @@ fn evaluate_detected(store: &Store, query: &str, de: DetectedEval) -> Result<Out
     // (c) flatten EVERY loaded stream's samples (no matcher filtering).
     let mut rows: Vec<(u64, i64, &str)> = Vec::new();
     for stream in &store.streams {
-        for (ts, body) in &stream.samples {
+        for (ts, _sm, body) in &stream.samples {
             rows.push((stream.fingerprint, *ts, body.as_str()));
         }
     }
@@ -902,6 +936,30 @@ fn evaluate_detected(store: &Store, query: &str, de: DetectedEval) -> Result<Out
     Ok(Outcome::Detected(fields))
 }
 
+/// The runner's STREAMS and `detected` legs evaluate `CompiledPipeline::run`
+/// over the stream's base labels only — they do not merge structured
+/// metadata, because issue #249 extended the DSL for the METRIC path and
+/// deliberately did not touch the streams evaluator.
+///
+/// A silently metadata-blind streams eval would answer a `sm{...}`-bearing
+/// section with the wrong label set and look like a corpus value that simply
+/// disagreed. So it is a GRAMMAR error (file-fatal) instead: a section whose
+/// `load` carries structured metadata may only be evaluated by metric
+/// queries until the streams leg is taught the merge.
+fn reject_metadata_for_label_leg(store: &Store, leg: &str) -> Result<(), String> {
+    if store
+        .streams
+        .iter()
+        .any(|s| s.samples.iter().any(|(_, sm, _)| !sm.is_empty()))
+    {
+        return Err(format!(
+            "{leg} evals are structured-metadata-blind in this runner (issue #249 extended the \
+             DSL for the metric path only); this section's `load` carries `sm{{...}}`"
+        ));
+    }
+    Ok(())
+}
+
 fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, String> {
     let expr = parse(query).map_err(|e| e.to_string())?;
     match &expr {
@@ -909,6 +967,7 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
             if matches!(spec, QuerySpec::Range { .. }) {
                 return Err("a `range` eval requires a metric query".to_string());
             }
+            reject_metadata_for_label_leg(store, "streams")?;
             // Pin the template environment to the capture precondition
             // (stock container: degenerate-UTC Local, PROVENANCE §230) so
             // goldens replay identically on any host/CI timezone.
@@ -917,7 +976,7 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
                 .with_template_env(TemplateEnv::default());
             let mut out = Vec::new();
             for stream in &store.streams {
-                for (ts, body) in &stream.samples {
+                for (ts, _sm, body) in &stream.samples {
                     if let Some(entry) = compiled
                         .run(body, &stream.base, *ts)
                         .map_err(|e| e.to_string())?

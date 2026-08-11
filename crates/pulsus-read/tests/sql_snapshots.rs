@@ -6,7 +6,7 @@
 //! direction/limit variants; and the `Instant`/`Range` `QuerySpec` shapes.
 
 use pulsus_logql::parse;
-use pulsus_read::logql::sql::{self, ScanLowerBound, TimeWindow};
+use pulsus_read::logql::sql::{self, ScanLowerBound, ScanProjection, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 fn ctx() -> PlanCtx<'static> {
@@ -741,6 +741,17 @@ fn bytes_over_time_range_slides_raw_with_no_rate_division() {
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
+/// The [`ScanProjection`] `LogQlEngine` would pass for this plan — derived
+/// from `mp.op` exactly as `client_metric_read_sql` derives it (issue #249),
+/// so a snapshot cannot pin SQL the engine would never issue.
+fn projection_of(mp: &pulsus_read::logql::MetricPlan) -> ScanProjection {
+    if matches!(mp.op, pulsus_logql::RangeAggOp::AbsentOverTime) {
+        ScanProjection::Lean
+    } else {
+        ScanProjection::WithStructuredMetadata
+    }
+}
+
 /// Renders the sliding raw scan (`metric_raw_samples_sliding`) the way
 /// `LogQlEngine` would for a range query, so the `PREWHERE service` contract
 /// (PK-prefix engagement) stays pinned.
@@ -759,6 +770,7 @@ fn sliding_sql(
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        projection_of(mp),
     )
 }
 
@@ -888,6 +900,13 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
         },
         ScanLowerBound::Exclusive,
         &[],
+        // The ROLLUP source: `log_metrics_5s` has no `structured_metadata`
+        // column, so the lean projection is the only renderable one here.
+        // This combination is unreachable for a LogQL instant plan (the
+        // rollup routing decision requires `QuerySpec::Range`); the
+        // parameter is what makes rendering an absent column impossible
+        // rather than merely unreached (issue #249).
+        ScanProjection::Lean,
     );
     assert_eq!(
         sql,
@@ -1203,6 +1222,7 @@ fn client_metric_sql(mp: &pulsus_read::logql::MetricPlan) -> String {
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        projection_of(mp),
     )
 }
 
@@ -1223,7 +1243,7 @@ fn an_unwrapped_sum_over_time_renders_a_sliding_raw_scan_with_no_aggregate_and_n
     // (start = START_NS - 300s = 1782906900000000000).
     assert_eq!(
         sql,
-        "SELECT fingerprint, timestamp_ns, body\n\
+        "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
          WHERE fingerprint IN (18374, 99120)\n\
@@ -1381,6 +1401,7 @@ fn variants_scan_sql_is_byte_identical_to_the_single_extractor_plan() {
                     },
                     mp.scan_lower,
                     &mp.extra_predicates,
+                    projection_of(mp),
                 )
             }
         };
@@ -1495,6 +1516,8 @@ fn instant_sql(mp: &pulsus_read::logql::MetricPlan, fingerprints: &[u64]) -> Str
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        // Issue #249: an instant plan is always raw over `log_samples`.
+        ScanProjection::WithStructuredMetadata,
     )
 }
 

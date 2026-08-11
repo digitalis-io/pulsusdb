@@ -67,7 +67,7 @@ use std::collections::BTreeMap;
 
 use std::time::Duration;
 
-use logqltest::runner::{Command, EvalMode, Labels, StreamEntry, StreamSpec};
+use logqltest::runner::{Command, EvalMode, Labels, StreamEntry, StreamSpec, parse_labelset};
 use pulsus_logql::{Expr, parse};
 
 /// Why a directive is not replayable against the live reference.
@@ -313,7 +313,7 @@ fn reachability(
     if load
         .iter()
         .flat_map(|s| s.samples.iter())
-        .any(|(ts, _)| *ts > RELATIVE_CEILING_NS)
+        .any(|(ts, _, _)| *ts > RELATIVE_CEILING_NS)
     {
         return Err(Unreachable::AbsoluteTimestamp);
     }
@@ -589,7 +589,7 @@ fn slots_fit_inside_the_measured_ingestion_window() {
         .map(|c| {
             let mut lo = i64::MAX;
             let mut hi = i64::MIN;
-            for (ts, _) in c.load.iter().flat_map(|s| s.samples.iter()) {
+            for (ts, _, _) in c.load.iter().flat_map(|s| s.samples.iter()) {
                 lo = lo.min(*ts);
                 hi = hi.max(*ts);
             }
@@ -1038,7 +1038,7 @@ fn live_replay_of_the_reachable_rows_against_the_reference() {
             .load
             .iter()
             .flat_map(|s| s.samples.iter())
-            .map(|(ts, _)| *ts)
+            .map(|(ts, _, _)| *ts)
             .min()
             .expect("a reachable case has samples");
         let mut streams = Vec::new();
@@ -1054,11 +1054,24 @@ fn live_replay_of_the_reachable_rows_against_the_reference() {
             let values: Vec<serde_json::Value> = spec
                 .samples
                 .iter()
-                .map(|(ts, body)| {
-                    serde_json::json!([
-                        (slot_start_ns + (ts - case_min_ns)).to_string(),
-                        body.clone()
-                    ])
+                .map(|(ts, sm, body)| {
+                    let ts = (slot_start_ns + (ts - case_min_ns)).to_string();
+                    // Issue #249: a `sm{...}` sample replays as the push
+                    // API's THIRD element, so the container sees the same
+                    // per-entry structured metadata the hermetic store
+                    // does. A metadata-free sample keeps the two-element
+                    // form byte for byte.
+                    if sm.is_empty() {
+                        serde_json::json!([ts, body.clone()])
+                    } else {
+                        let map: serde_json::Map<String, serde_json::Value> = parse_labelset(sm)
+                            .expect("the runner rendered this metadata JSON")
+                            .0
+                            .into_iter()
+                            .map(|(k, v)| (k, serde_json::Value::String(v)))
+                            .collect();
+                        serde_json::json!([ts, body.clone(), map])
+                    }
                 })
                 .collect();
             streams.push(serde_json::json!({"stream": labels, "values": values}));
@@ -1103,7 +1116,7 @@ fn live_replay_of_the_reachable_rows_against_the_reference() {
             .load
             .iter()
             .flat_map(|s| s.samples.iter())
-            .map(|(ts, _)| *ts)
+            .map(|(ts, _, _)| *ts)
             .max()
             .expect("a reachable case has samples")
             - case_min_ns;

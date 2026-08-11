@@ -22,7 +22,7 @@ use super::error::{ReadError, TooBroadReason};
 use pulsus_logql::RangeAggOp;
 use std::borrow::Cow;
 
-use super::agg::{LabelSet, VectorAccum};
+use super::agg::{InstantSeries, LabelSet, VectorAccum};
 use super::client_agg::{BucketAcc, MutGroup, WinSample};
 use super::exec::{MatrixSeries, QueryResult};
 use super::fold::KSel;
@@ -488,7 +488,8 @@ pub(in crate::logql) fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// | variants: each extra sub-state's boxed slot / `base_labels`(+`hashes`) snapshot (C table share + H payload) / range `absent_labels` clone / absent `present_cover` | **charged** ([`variant_state_bytes`]) before construction; sub-state 0 charges 0 (a 1-variant query is admitted exactly when the plain query is) |
 /// | variants: `MetricNode::Variants::variants` vec + each `VariantSpec`'s tail/absent/grouping clones (incl. the CREATED `by (__variant__)` grouping and the pushed-into `Grouping::labels` realloc) | **charged at PLAN time** ([`variant_spec_bytes`] + the spec-vector buffer) into the SAME counter the arena continues (`spec_bytes`) — one budget, never two |
 /// | variants: per-sub-state growing state (`groups`/retention/collision/quantile/counter) | [`AggCaps::divided`]`(n)` — the per-field SUM over sub-states is exactly the single-query bound above |
-/// | post-aggregation selection/grouping keys (`select_k_*`/`group_*`'s `HashMap<LabelSet, _>` owned `group_key` copies) | **flagged, not yet charged** (issue #241): bounded only indirectly by the upstream hydration/series caps; `approx_topk` itself is exempt structurally (`grouping == None` ⇒ a single empty key) |
+/// | post-aggregation selection/grouping keys (`select_k_*`/`group_*`'s `HashMap<LabelSet, _>` owned `group_key` copies) | **charged against [`super::post_agg::MAX_POST_AGG_BYTES`]**, not this cap: `apply_vector_aggs_capped` measures the stage input and `Ledger::acquire`s BEFORE converting or grouping (`post_agg.rs:3120-3163`), so a refused chain builds no map; the four maps are `select_k_range`/`select_k_instant`/`group_range`/`group_instant` (`post_agg.rs:820`/`:871`/`:1064`/`:1122`). Measured-and-margined, not a worst-case proof — see that constant's own doc (`post_agg.rs:1357-1362`). `approx_topk` is exempt structurally (`grouping == None` ⇒ a single empty key) |
+/// | the SQL-pushdown instant path's re-grouping map + its output `Vec<InstantSeries>` (issue #249) | **charged** ([`group_entry_bytes`] with [`PUSHDOWN_INSTANT_SLOT`]) before the map retains a group, against THIS cap — the same counter and the same named 422 the client paths use, so a query's refusal surface does not depend on how it routed |
 ///
 /// **Value: 256 MiB, raised from 64 MiB by issue #236 (owner ruling O1).**
 /// With the group-COUNT cap deleted this became the only bound on the
@@ -625,6 +626,15 @@ pub(in crate::logql) const FOLD_GROUP_SLOT: usize = {
 /// about instead of two.
 pub(in crate::logql) const SERIES_OUT_SLOT: usize = size_of::<MatrixSeries>();
 
+/// The SQL-pushdown instant path's per-group slot (issue #249). Prices BOTH
+/// live containers in one term because both are live while the re-grouping
+/// map drains into the result vector: the map entry
+/// (`(rendered key, LabelSet, u64)`) AND the [`InstantSeries`] element the
+/// group becomes. The over-charge is the safe direction and keeps ONE sizing
+/// vocabulary ([`group_entry_bytes`]) — the [`SERIES_OUT_SLOT`] precedent.
+pub(in crate::logql) const PUSHDOWN_INSTANT_SLOT: usize =
+    size_of::<(String, InstantSeries)>() + size_of::<InstantSeries>();
+
 /// A provable UPPER BOUND on the query-lifetime heap bytes ONE distinct
 /// output group's map entry retains: the rendered-JSON key, the cloned
 /// `LabelSet` (each owned string plus the element buffer), and the entry's
@@ -756,7 +766,7 @@ pub(crate) fn label_set_bytes(labels: &LabelSet) -> u64 {
 ///
 /// | cap | live counters | max live at once |
 /// |---|---|---|
-/// | [`MAX_CLIENT_AGG_GROUP_BYTES`] | `ClientAggState::group_bytes` (instant) **XOR** `RangeSlideState::group_bytes` (range) — the two arms of `MetricAggState`; plus `ReduceFold::group_bytes` **XOR** `SelectFold::group_bytes` (the two arms of `VectorAggFold`), whose cap is fed from the slider's own `caps.group_bytes` at `attach_fold`; plus `VariantsAggState::charged` against [`super::variants::MAX_VARIANT_FANOUT_STATE_BYTES`] (`== AggCaps::DEFAULT.group_bytes`), whose sub-states are `AggCaps::divided(n)` and never take a fold | **2** — `{slider, fold}` on the folded range path, `{fan-out, Σ sub-states}` on the variants path |
+/// | [`MAX_CLIENT_AGG_GROUP_BYTES`] | `ClientAggState::group_bytes` (instant) **XOR** `RangeSlideState::group_bytes` (range) — the two arms of `MetricAggState` — **XOR** `PushdownInstantGroups::charged` (issue #249), which runs only when `client == None` and is therefore mutually exclusive with BOTH `MetricAggState` arms and with the variants path; plus `ReduceFold::group_bytes` **XOR** `SelectFold::group_bytes` (the two arms of `VectorAggFold`), whose cap is fed from the slider's own `caps.group_bytes` at `attach_fold`; plus `VariantsAggState::charged` against [`super::variants::MAX_VARIANT_FANOUT_STATE_BYTES`] (`== AggCaps::DEFAULT.group_bytes`), whose sub-states are `AggCaps::divided(n)` and never take a fold | **2** — `{slider, fold}` on the folded range path, `{fan-out, Σ sub-states}` on the variants path |
 /// | [`MAX_RETAINED_WINDOW_POINTS`] | `RangeSlideState::retained` | **1** |
 /// | [`MAX_QUANTILE_VALUES`] | `ClientAggState::quantile_values` — the instant path's `BucketAcc::Values(Vec<f64>)` retention. (The RANGE path's `quantile_over_time` retention is charged into `RangeSlideState::retained` instead, at [`retention_points_per_sample`] = 2, so it is inside the retention term, not this one.) | **1** |
 /// | [`MAX_COUNTER_VALUES`] | `ClientAggState::counter_values` — the instant path's `BucketAcc::Counter(Vec<(i64, f64)>)` retention; the range path's is likewise inside the retention term | **1** |
@@ -886,7 +896,10 @@ const _: () = assert!(
 /// **Known residuals, stated rather than hidden:** accumulated leaf
 /// RESULTS across a binary chain are charged by nothing (#257 on the SQL
 /// path, #285 for the chain); post-aggregation selection/grouping keys
-/// are flagged-not-charged (#241); a streams response accumulates one
+/// are charged, but against [`super::post_agg::MAX_POST_AGG_BYTES`]
+/// rather than into this sum (`post_agg.rs:3120-3163`), so they are
+/// outside this bound by SCOPE, not uncharged; a streams response
+/// accumulates one
 /// row's template output per entry across up to the entries limit
 /// (#312); and process RSS is still `N ×` this under concurrency, which
 /// #245's closure ruled an operational concern rather than a per-query
@@ -1915,6 +1928,14 @@ mod tests {
             // `RangeSlideState::retained`, through `&mut u64` parameters
             // and the `let retained = &mut self.retained` local.
             ("client_agg.rs", "charge_retention", "retained", 4),
+            // Issue #249: `PushdownInstantGroups::charged`, the SQL-pushdown
+            // instant path's re-grouping map. A further XOR arm of
+            // `MAX_CLIENT_AGG_GROUP_BYTES` — it runs only when
+            // `client == None`, which is mutually exclusive with both
+            // `MetricAggState` arms and with the variants path — so
+            // `LEAF_COUNTERS.group_bytes` stays 2 and
+            // `MAX_LEAF_RETAINED_BYTES` is unmoved.
+            ("exec.rs", "charge_group_bytes", "&mut self.charged", 1),
             // `VariantsAggState::charged` / `VariantArena::charged`.
             ("variants.rs", "charge_fanout_bytes", "&mut charged", 3),
             // The plan-time continuation of the SAME fan-out counter.
@@ -2041,6 +2062,17 @@ mod tests {
                 "group_bytes",
                 6,
                 "ClientAggState::group_bytes | RangeSlideState::group_bytes | the fold's cap",
+            ),
+            // Issue #249: the SQL-pushdown instant path's re-grouping cap
+            // read — the SAME cap and the SAME named 422 the client paths
+            // use, so a query's refusal surface does not depend on how it
+            // routed. XOR with both `MetricAggState` arms (see
+            // `CounterPlurality`), so the composed bound is unmoved.
+            (
+                "exec.rs",
+                "group_bytes",
+                1,
+                "PushdownInstantGroups::charged",
             ),
             (
                 "client_agg.rs",

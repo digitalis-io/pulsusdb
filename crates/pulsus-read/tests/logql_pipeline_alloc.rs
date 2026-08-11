@@ -541,6 +541,9 @@ fn per_row_allocation_bounds_hold() {
             fingerprint: 1,
             timestamp_ns: (i as i64) * 1_000_000, // 20s of 1ms-spaced rows
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+            // The SM-FREE leg: issue #249's merge must leave this budget
+            // unmoved. The SM-PRESENT leg is a separate test below.
+            structured_metadata: String::new(),
         })
         .collect();
     let params = QueryParams {
