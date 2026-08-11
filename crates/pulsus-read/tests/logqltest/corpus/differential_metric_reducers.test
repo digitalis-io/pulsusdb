@@ -116,13 +116,19 @@ load
   9s   grp=c
   10s  grp=c
 
-# sort: ascending by value; the a/c tie breaks by label ascending -> b,a,c.
+# sort: ascending by value. The a/c tie is broken by label set ascending
+# -> b,a,c, which is OUR rule (post_agg::sort_instant) and not a reference
+# capture: the reference orders on the value alone through an unstable
+# sort and specifies no order among equal-valued samples.
+# provenance: divergence(sort-tie-order)
 eval_ordered instant at 60s sort(sum by (grp) (count_over_time({service_name="svc-sort"} | logfmt [30m])))
   {grp="b"} 1
   {grp="a"} 5
   {grp="c"} 5
 
-# sort_desc: descending by value; the a/c tie breaks by label ascending -> a,c,b.
+# sort_desc: descending by value. Same rule of ours for the a/c tie
+# -> a,c,b; same absence of a reference rule to mirror.
+# provenance: divergence(sort-tie-order)
 eval_ordered instant at 60s sort_desc(sum by (grp) (count_over_time({service_name="svc-sort"} | logfmt [30m])))
   {grp="a"} 5
   {grp="c"} 5

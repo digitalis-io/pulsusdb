@@ -119,13 +119,17 @@ pub const METRIC_CASE_IDS: &[&str] = &[
     "metric_rate_counter_boundary",
     "metric_rate_counter_dup_ts",
     // Issue M8-LQ3 `sort` value-order vector (instant; gated). A dedicated
-    // `metric_instant_ordered` kind whose ordered result sequence is
-    // compared store-vs-store; branch-validated order `b, a, c`.
+    // `metric_instant_ordered` kind whose result sequence is compared
+    // store-vs-store on VALUE: pointwise, with each run of equal values
+    // treated as an unordered set at its position (issue #406, ledger
+    // `sort-tie-order`). PulsusDB's own order `b, a, c` is pinned
+    // hermetically, not asserted across stores.
     "metric_sort_order",
     // Issue M8-LQ3 `sort_desc` value-order vector (instant; gated) — the
     // descending mirror over the SAME `svc-sort` counts {a:5,b:1,c:5}, so
     // the sort_desc handler/encoder path is covered end-to-end
-    // independently; branch-validated order `a, c, b`.
+    // independently. Same store-vs-store value comparison; PulsusDB's own
+    // order `a, c, b` is pinned hermetically.
     "metric_sort_desc_order",
 ];
 
@@ -198,11 +202,15 @@ pub const SVC_RC_DUPTS: &str = "svc-rcdup";
 /// Issue M8-LQ3 `sort` witness service. Eleven `grp=<v>` records — five
 /// `grp=a`, one `grp=b`, five `grp=c` — so
 /// `sum by (grp) (count_over_time({… | logfmt [30m]}))` yields the counts
-/// `{a:5, b:1, c:5}`; `sort` then orders them ascending by value with the
-/// equal-value (`a`/`c`) tie broken by label set ascending → `b, a, c`
-/// (branch-validated against reference v3.7.3, the oracle pinned at the
-/// time; the oracle is now pinned to v3.7.4 and this ordering is
-/// unaffected — it is a value record, not a claim about the current pin).
+/// `{a:5, b:1, c:5}`; `sort` then orders them ascending by value, leaving
+/// `a` and `c` tied. PulsusDB breaks that tie by label set ascending
+/// (`post_agg::sort_instant`) → `b, a, c`, and `sort_desc` → `a, c, b`.
+/// **That is OUR rule, not a reference capture** — no version claim is
+/// made here or anywhere else about the arrangement inside a tie. The
+/// store-vs-store gate compares the two value sequences pointwise and
+/// treats each run of equal values as an unordered set at its position;
+/// see `sort-tie-order` in docs/benchmarks/logs-differential-ledger.md
+/// (issue #406).
 pub const SVC_SORT: &str = "svc-sort";
 
 /// The issue #109 scope witness service: exactly ONE synthetic record
@@ -857,11 +865,13 @@ impl LogCorpus {
             }
             // Issue M8-LQ3 `sort`: `sum by (grp) (count_over_time(...))`
             // reduces to `{grp}` counts {a:5, b:1, c:5}. The set is the
-            // order-neutral validity gate; the ordered sequence (b,a,c) is
-            // checked store-vs-store in `run_metric_instant_ordered_case`.
-            // Same set as `metric_sort_order` (the order-neutral validity
-            // gate); `sort_desc`'s descending sequence (a,c,b) is checked
-            // store-vs-store in `run_metric_instant_ordered_case`.
+            // order-neutral validity gate; `run_metric_instant_ordered_case`
+            // then checks the two stores' VALUE order pointwise, with the
+            // equal-value a/c run compared as an unordered set at its
+            // position (issue #406, ledger `sort-tie-order`). PulsusDB's own
+            // sequences (b,a,c ascending, a,c,b descending) are pinned
+            // hermetically in `logs.rs`, never asserted across stores.
+            // `metric_sort_desc_order` shares this set exactly.
             "metric_sort_order" | "metric_sort_desc_order" => {
                 for (grp, count) in [("a", 5.0), ("b", 1.0), ("c", 5.0)] {
                     out.insert(

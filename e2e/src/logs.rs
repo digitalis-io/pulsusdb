@@ -1439,13 +1439,141 @@ fn ordered_vector(body: &serde_json::Value) -> Result<Vec<(BTreeMap<String, Stri
     Ok(out)
 }
 
+/// One maximal run of equal-valued samples in a value-ordered instant
+/// vector: the half-open index range `[start, end)` into the sequence it
+/// was computed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TieGroup {
+    start: usize,
+    end: usize,
+}
+
+/// Partition a value-ordered `(labels, value)` sequence into maximal runs
+/// of ANCHOR-EQUAL value. Equality is [`approx_eq`] against the run's
+/// FIRST value (its anchor), never against the previous element.
+/// `approx_eq` is not transitive, so no partition of it is canonical;
+/// this one is a deliberate choice and its consequences are stated:
+///   * a CHAIN of near-equal values is deliberately SPLIT where an
+///     element compares equal to its predecessor but not to the anchor —
+///     a chained walk would merge them, and its result would depend on
+///     where the walk started;
+///   * the rule can conversely place in one run two elements that are
+///     each close to the anchor but not to each other.
+///
+/// The runs are therefore ANCHOR-DEFINED over the PulsusDB sequence only.
+/// They are NOT a tie partition the two stores agree on, and nothing here
+/// asserts anything about the oracle's own boundaries.
+/// Keyed on the VALUE only — nothing here knows a label name, so the rule
+/// survives a corpus change and covers `sort_desc` unaltered.
+fn tie_groups(seq: &[(BTreeMap<String, String>, f64)]) -> Vec<TieGroup> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < seq.len() {
+        let anchor = seq[start].1;
+        let mut end = start + 1;
+        while end < seq.len() && approx_eq(anchor, seq[end].1) {
+            end += 1;
+        }
+        out.push(TieGroup { start, end });
+        start = end;
+    }
+    out
+}
+
+/// Issue #406: the store-vs-store comparison for a terminal
+/// `sort`/`sort_desc`. Order BY VALUE is asserted exactly; order WITHIN a
+/// run of equal values is not asserted at all — see the `sort-tie-order`
+/// entry in docs/benchmarks/logs-differential-ledger.md.
+///
+/// Three checks, in this order; the first to fail names itself:
+/// 1. equal length;
+/// 2. `approx_eq(pulsus[i].1, oracle[i].1)` at every index `i`;
+/// 3. for every group of [`tie_groups`]`(pulsus)`, the label sets of
+///    `pulsus[start..end]` and `oracle[start..end]` are the same MULTISET
+///    (both sides sorted and compared).
+///
+/// The partition is taken from the PulsusDB side ONLY: it is the side
+/// already hard-gated monotone in the sort direction and set-equal to the
+/// by-construction corpus, and deriving a partition from each side would
+/// add a boundary-disagreement failure mode that says nothing about
+/// ordering. Check 2 independently pins the oracle's value at every
+/// position to PulsusDB's, so the oracle's sequence is monotone in the
+/// same direction to within the tolerance — no separate oracle-
+/// monotonicity check is needed and none is added. Stated so it is not
+/// read as more: an oracle whose own anchored partition differs can pass
+/// this check.
+///
+/// **Float equality, decided explicitly.** Both the pointwise value check
+/// and the run partition use [`approx_eq`] (relative 1e-9), as
+/// `vectors_match` and `matrices_match` already do: the two stores compute
+/// these values through entirely different machinery, so bit equality
+/// across stores is not something any comparison in this file assumes.
+/// Non-transitivity is handled by anchoring each run on its first element,
+/// so the partition is a well-defined function of the PulsusDB sequence
+/// alone — and that is all it is. The grouping is defined from PulsusDB's
+/// anchored tolerance partition; it asserts nothing about where the
+/// oracle's own run boundaries fall. An oracle sequence that partitions
+/// differently under the same rule can pass, because pointwise
+/// `approx_eq` can hold at every index while the oracle's internal
+/// boundaries lie elsewhere. The comparison *declines to observe* oracle
+/// boundaries; it does not establish that they coincide. What it does
+/// establish is exactly the ledger's **Asserted** list and nothing past
+/// it.
+///
+/// Direction-free by construction: nothing branches on `sort` vs
+/// `sort_desc`, which is why both cases share one code path.
+fn value_ordered_sequences_agree(
+    pulsus: &[(BTreeMap<String, String>, f64)],
+    oracle: &[(BTreeMap<String, String>, f64)],
+) -> Result<(), String> {
+    if pulsus.len() != oracle.len() {
+        return Err(format!(
+            "ordered sequence length diverged: pulsusdb {} vs oracle {} \
+             (pulsusdb {pulsus:?} vs oracle {oracle:?})",
+            pulsus.len(),
+            oracle.len()
+        ));
+    }
+    for (i, (p, o)) in pulsus.iter().zip(oracle.iter()).enumerate() {
+        if !approx_eq(p.1, o.1) {
+            return Err(format!(
+                "value diverged at position {i}: pulsusdb {} vs oracle {} \
+                 (pulsusdb {pulsus:?} vs oracle {oracle:?})",
+                p.1, o.1
+            ));
+        }
+    }
+    for group in tie_groups(pulsus) {
+        let mut pulsus_run: Vec<&BTreeMap<String, String>> = pulsus[group.start..group.end]
+            .iter()
+            .map(|(l, _)| l)
+            .collect();
+        let mut oracle_run: Vec<&BTreeMap<String, String>> = oracle[group.start..group.end]
+            .iter()
+            .map(|(l, _)| l)
+            .collect();
+        pulsus_run.sort();
+        oracle_run.sort();
+        if pulsus_run != oracle_run {
+            return Err(format!(
+                "equal-value run [{}, {}) holds different series: pulsusdb {pulsus_run:?} \
+                 vs oracle {oracle_run:?} (pulsusdb {pulsus:?} vs oracle {oracle:?})",
+                group.start, group.end
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Issue M8-LQ3 AC9: the `sort`/`sort_desc` VALUE-ORDER differential. A
 /// terminal sort establishes the wire order of the instant vector, so
 /// both stores must return the same series in the same value order. The
 /// set-equal `expected_metric_vector` comparison is the direction-neutral
 /// validity gate (dup-label hard-fail); the ordered sequence is then
 /// asserted (a) monotone in the sort direction on PulsusDB and (b)
-/// label-sequence-equal between the two stores. Kept separate from
+/// value-sequence-equal pointwise between the two stores, with the
+/// entries of each equal-value run compared as an unordered multiset
+/// (issue #406, ledger `sort-tie-order`). Kept separate from
 /// `run_metric_instant_case` because that path normalizes to a set.
 async fn run_metric_instant_ordered_case(
     ctx: &Ctx,
@@ -1471,7 +1599,7 @@ async fn run_metric_instant_ordered_case(
     );
 
     // Oracle-less on cluster (issue #204): the PulsusDB value-order gate is
-    // unchanged; the cross-store label-sequence comparison runs on the
+    // unchanged; the cross-store value-order comparison runs on the
     // single overlay only.
     let with_oracle = oracle_present(ctx);
     let pulsus_body = query_instant(
@@ -1562,24 +1690,20 @@ async fn run_metric_instant_ordered_case(
             path.display()
         );
     }
-    // (b) The ordered label-set sequences agree between the two stores
-    // (the equal-value a/c tie-break is label-ascending on both — v3.7.3).
-    // Cross-store only, so skipped oracle-less on cluster (issue #204).
-    if with_oracle {
-        let pulsus_seq: Vec<&BTreeMap<String, String>> =
-            pulsus_ordered.iter().map(|(l, _)| l).collect();
-        let oracle_seq: Vec<&BTreeMap<String, String>> =
-            oracle_ordered.iter().map(|(l, _)| l).collect();
-        if pulsus_seq != oracle_seq {
-            let path = dump(&format!(
-                "ordered label sequence diverged: pulsusdb {pulsus_seq:?} vs oracle {oracle_seq:?}"
-            ))?;
-            bail!(
-                "case {:?}: the two stores disagree on value order (repro {})",
-                case.case_id,
-                path.display()
-            );
-        }
+    // (b) The two stores agree on VALUE order (issue #406): pointwise on
+    // value, and on the multiset of series occupying each equal-value run.
+    // The arrangement inside a run is not asserted — ledger
+    // `sort-tie-order`. Cross-store only, so skipped oracle-less on
+    // cluster (issue #204).
+    if with_oracle
+        && let Err(reason) = value_ordered_sequences_agree(&pulsus_ordered, &oracle_ordered)
+    {
+        let path = dump(&reason)?;
+        bail!(
+            "case {:?}: the two stores disagree on value order (repro {})",
+            case.case_id,
+            path.display()
+        );
     }
     Ok(())
 }
@@ -3313,9 +3437,13 @@ mod tests {
     /// Issue M8-LQ3 AC9 (hermetic half): the `metric_sort_order` case's
     /// SHIPPED evaluator output is in the pinned value order `b, a, c`
     /// (ascending by value, the equal-value `a`/`c` tie broken by label
-    /// ascending). The live lane then asserts both stores agree on this
-    /// order; here the ordered engine output itself is pinned so a
-    /// reducer/encoder regression fails hermetically every PR.
+    /// ascending). The live lane asserts the two stores agree on the
+    /// VALUE order only — the arrangement inside an equal-value run is
+    /// not asserted there (issue #406, ledger `sort-tie-order`). This
+    /// test observes PulsusDB only, so it is evidence about our own
+    /// determinism and never about the reference; the ordered engine
+    /// output is pinned here so a reducer/encoder regression fails
+    /// hermetically every PR.
     #[test]
     fn shipped_sort_case_evaluates_in_the_pinned_value_order() {
         assert_eq!(
@@ -3333,8 +3461,10 @@ mod tests {
     /// of the AC9 hermetic gate — the SHIPPED evaluator output is in the
     /// pinned DESCENDING value order `a, c, b` (the equal-value `a`/`c` tie
     /// still broken by label ascending). Covers the sort_desc handler/
-    /// encoder path independently every PR; the live lane asserts both
-    /// stores agree on this order.
+    /// encoder path independently every PR. This test observes PulsusDB
+    /// only, so it is evidence about our own determinism and never about
+    /// the reference; the live lane asserts the two stores agree on the
+    /// VALUE order only (issue #406, ledger `sort-tie-order`).
     #[test]
     fn shipped_sort_desc_case_evaluates_in_the_pinned_value_order() {
         assert_eq!(
@@ -3384,6 +3514,622 @@ mod tests {
                 (grp, s.value)
             })
             .collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #406 — the relaxed cross-store order comparison, its anchor
+    // rule, and the terminality of every committed `sort` case.
+    // -----------------------------------------------------------------
+
+    /// Builds an ordered `(labels, value)` sequence over a single `grp`
+    /// label. The label NAME is a parameter of the fixture, never of the
+    /// comparison: `tie_groups` keys on the value alone.
+    fn grp_seq(rows: &[(&str, f64)]) -> Vec<(BTreeMap<String, String>, f64)> {
+        rows.iter()
+            .map(|(g, v)| (BTreeMap::from([("grp".to_string(), (*g).to_string())]), *v))
+            .collect()
+    }
+
+    fn logs_rs_source() -> String {
+        let path = crate::engine::workspace_root().join("e2e/src/logs.rs");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    /// The `///` block immediately above `fn <fn_name>(`, joined into one
+    /// line so a phrase that wraps across lines is still found. The first
+    /// occurrence is the DEFINITION: a test naming the function writes it
+    /// without the `fn ` prefix.
+    fn doc_comment_above(src: &str, fn_name: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let needle = format!("fn {fn_name}(");
+        let at = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(&needle))
+            .unwrap_or_else(|| panic!("{fn_name} is defined in e2e/src/logs.rs"));
+        let mut doc = Vec::new();
+        for line in lines[..at].iter().rev() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("///") {
+                doc.push(rest.trim().to_string());
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                continue;
+            }
+            break;
+        }
+        doc.reverse();
+        doc.join(" ")
+    }
+
+    /// AC1: the relaxed comparison is the ONLY cross-store order check on
+    /// this path. Behavioural half — it accepts the arrangement the
+    /// deleted whole-sequence equality rejected; source half — that
+    /// equality no longer appears anywhere in the file.
+    #[test]
+    fn value_ordered_agreement_is_the_only_cross_store_order_check() {
+        let pulsus = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]);
+        let oracle = grp_seq(&[("b", 1.0), ("c", 5.0), ("a", 5.0)]);
+        assert!(value_ordered_sequences_agree(&pulsus, &oracle).is_ok());
+
+        // ASSEMBLED, never written out: a literal here would satisfy the
+        // very search this test performs and the check would pass on its
+        // own text.
+        let deleted = ["pulsus_seq", "!=", "oracle_seq"].join(" ");
+        let src = logs_rs_source();
+        assert!(
+            !src.contains(&deleted),
+            "the deleted whole-label-sequence equality is back in e2e/src/logs.rs"
+        );
+        assert!(
+            src.contains("value_ordered_sequences_agree(&pulsus_ordered, &oracle_ordered)"),
+            "the ordered case no longer calls the relaxed comparison"
+        );
+    }
+
+    /// AC2: the exact sequences from the `e2e-metrics-full` failure of
+    /// run 31439057683 — the `a`/`c` tie arrives in the other order at the
+    /// oracle, both stores ascending by value — are now accepted.
+    #[test]
+    fn value_ordered_agreement_accepts_the_run_31439057683_tie_reordering() {
+        let pulsus = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]);
+        let oracle = grp_seq(&[("b", 1.0), ("c", 5.0), ("a", 5.0)]);
+        assert_eq!(value_ordered_sequences_agree(&pulsus, &oracle), Ok(()));
+    }
+
+    /// AC3: the tie group sitting on the wrong side of the untied entry
+    /// is still a value-order divergence.
+    #[test]
+    fn value_ordered_agreement_rejects_a_tie_group_at_the_wrong_position() {
+        let pulsus = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]);
+        let oracle = grp_seq(&[("a", 5.0), ("c", 5.0), ("b", 1.0)]);
+        let err = value_ordered_sequences_agree(&pulsus, &oracle).expect_err("must reject");
+        assert!(err.contains("position 0"), "{err}");
+    }
+
+    /// AC4: a wrong VALUE at a position whose labels and monotonicity are
+    /// both fine is rejected.
+    #[test]
+    fn value_ordered_agreement_rejects_a_wrong_value() {
+        let pulsus = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]);
+        let oracle = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 7.0)]);
+        let err = value_ordered_sequences_agree(&pulsus, &oracle).expect_err("must reject");
+        assert!(err.contains("position 2"), "{err}");
+    }
+
+    /// AC5: the right multiset in fully reversed value order is rejected —
+    /// the relaxation frees the arrangement inside a run, never the
+    /// direction.
+    #[test]
+    fn value_ordered_agreement_rejects_a_fully_reversed_value_order() {
+        let pulsus = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]);
+        let oracle = grp_seq(&[("c", 5.0), ("a", 5.0), ("b", 1.0)]);
+        assert!(value_ordered_sequences_agree(&pulsus, &oracle).is_err());
+    }
+
+    /// AC6 (first half): a series the oracle never returned is rejected.
+    #[test]
+    fn value_ordered_agreement_rejects_a_missing_entry() {
+        let pulsus = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]);
+        let oracle = grp_seq(&[("b", 1.0), ("a", 5.0)]);
+        let err = value_ordered_sequences_agree(&pulsus, &oracle).expect_err("must reject");
+        assert!(err.contains("length diverged"), "{err}");
+    }
+
+    /// AC6 (second half): a series only the oracle returned is rejected.
+    #[test]
+    fn value_ordered_agreement_rejects_an_extra_entry() {
+        let pulsus = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]);
+        let oracle = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0), ("d", 5.0)]);
+        let err = value_ordered_sequences_agree(&pulsus, &oracle).expect_err("must reject");
+        assert!(err.contains("length diverged"), "{err}");
+    }
+
+    /// AC7, the sharpest form of AC6: same length, every value equal, one
+    /// label set inside the tie group SUBSTITUTED. Nothing but the
+    /// multiset check can see this.
+    #[test]
+    fn value_ordered_agreement_rejects_a_substituted_label_set_inside_a_tie_group() {
+        let pulsus = grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]);
+        let oracle = grp_seq(&[("b", 1.0), ("a", 5.0), ("d", 5.0)]);
+        let err = value_ordered_sequences_agree(&pulsus, &oracle).expect_err("must reject");
+        assert!(err.contains("equal-value run [1, 3)"), "{err}");
+    }
+
+    /// AC8: the freedom is PER RUN, not global — a swap that moves an
+    /// entry across a run boundary is rejected.
+    #[test]
+    fn value_ordered_agreement_rejects_a_swap_across_two_tie_groups() {
+        let pulsus = grp_seq(&[("x", 1.0), ("y", 1.0), ("z", 5.0), ("w", 5.0)]);
+        let oracle = grp_seq(&[("x", 1.0), ("z", 5.0), ("y", 1.0), ("w", 5.0)]);
+        assert!(value_ordered_sequences_agree(&pulsus, &oracle).is_err());
+    }
+
+    /// AC9: `tie_groups` partitions on the VALUE and never on a label —
+    /// the label names here are deliberately not the corpus's `a`/`b`/`c`.
+    #[test]
+    fn tie_groups_partitions_by_value_and_never_by_label() {
+        assert_eq!(
+            tie_groups(&grp_seq(&[("p", 1.0), ("q", 5.0), ("r", 5.0)])),
+            vec![TieGroup { start: 0, end: 1 }, TieGroup { start: 1, end: 3 },],
+        );
+        assert_eq!(
+            tie_groups(&grp_seq(&[("r", 5.0), ("q", 5.0), ("p", 5.0)])),
+            vec![TieGroup { start: 0, end: 3 }],
+        );
+        assert_eq!(
+            tie_groups(&grp_seq(&[("p", 1.0), ("q", 2.0), ("r", 3.0)])),
+            vec![
+                TieGroup { start: 0, end: 1 },
+                TieGroup { start: 1, end: 2 },
+                TieGroup { start: 2, end: 3 },
+            ],
+        );
+        assert_eq!(tie_groups(&grp_seq(&[])), vec![]);
+        // Inside the `approx_eq` tolerance: one run. Outside it: two.
+        assert_eq!(
+            tie_groups(&grp_seq(&[("p", 1.0), ("q", 1.0 + 5e-10)])),
+            vec![TieGroup { start: 0, end: 2 }],
+        );
+        assert_eq!(
+            tie_groups(&grp_seq(&[("p", 1.0), ("q", 1.0 + 5e-9)])),
+            vec![TieGroup { start: 0, end: 1 }, TieGroup { start: 1, end: 2 },],
+        );
+    }
+
+    /// AC10: `sort_desc` runs through the identical function — the tie is
+    /// free in the descending case too, and the direction is still
+    /// asserted.
+    #[test]
+    fn value_ordered_agreement_covers_the_descending_case() {
+        let pulsus = grp_seq(&[("a", 5.0), ("c", 5.0), ("b", 1.0)]);
+        assert!(
+            value_ordered_sequences_agree(&pulsus, &grp_seq(&[("c", 5.0), ("a", 5.0), ("b", 1.0)]))
+                .is_ok()
+        );
+        assert!(
+            value_ordered_sequences_agree(&pulsus, &grp_seq(&[("b", 1.0), ("a", 5.0), ("c", 5.0)]))
+                .is_err()
+        );
+    }
+
+    /// AC19: the anchor rule, including the SPLIT it deliberately causes.
+    /// `b - a` and `c - b` are each inside the tolerance while `c - a` is
+    /// outside it, so a chained walk returns ONE group over `[a, b, c]`
+    /// and this test fails. That is the point of it.
+    #[test]
+    fn tie_groups_anchors_each_run_on_its_first_value() {
+        let a = 1.0_f64;
+        let b = 1.000_000_000_6_f64;
+        let c = 1.000_000_001_2_f64;
+        assert_eq!(
+            tie_groups(&grp_seq(&[("p", a), ("q", b)])),
+            vec![TieGroup { start: 0, end: 2 }],
+            "adjacent pair a/b is inside the tolerance",
+        );
+        assert_eq!(
+            tie_groups(&grp_seq(&[("q", b), ("r", c)])),
+            vec![TieGroup { start: 0, end: 2 }],
+            "adjacent pair b/c is inside the tolerance",
+        );
+        assert_eq!(
+            tie_groups(&grp_seq(&[("p", a), ("q", b), ("r", c)])),
+            vec![TieGroup { start: 0, end: 2 }, TieGroup { start: 2, end: 3 },],
+            "the run is anchored on `a`, so `c` starts a new one",
+        );
+    }
+
+    /// AC11: both committed ordered cases share one code path, established
+    /// from the fixture rather than assumed.
+    #[test]
+    fn both_sort_cases_share_the_ordered_comparison_path() {
+        let fixture = shipped_fixture();
+        let mut ordered: Vec<&str> = fixture
+            .cases
+            .iter()
+            .filter(|c| c.kind() == "metric_instant_ordered")
+            .map(|c| c.case_id.as_str())
+            .collect();
+        ordered.sort_unstable();
+        assert_eq!(
+            ordered,
+            vec!["metric_sort_desc_order", "metric_sort_order"],
+            "the ordered comparison path serves exactly the two sort cases",
+        );
+    }
+
+    /// AC12: the two determinism pins stay, and their docs stop implying
+    /// they are evidence about the reference.
+    #[test]
+    fn the_sort_pins_do_not_claim_reference_evidence() {
+        // Assembled for the same reason as in AC1's source half.
+        let stale = ["both stores", "agree on this order"].join(" ");
+        let src = logs_rs_source();
+        for pin in [
+            "shipped_sort_case_evaluates_in_the_pinned_value_order",
+            "shipped_sort_desc_case_evaluates_in_the_pinned_value_order",
+        ] {
+            let doc = doc_comment_above(&src, pin);
+            assert!(
+                !doc.contains(&stale),
+                "{pin}'s doc still claims the live lane pins this arrangement across stores:\n{doc}"
+            );
+            assert!(
+                doc.contains("PulsusDB only"),
+                "{pin}'s doc does not say it observes PulsusDB only:\n{doc}"
+            );
+        }
+    }
+
+    /// The marker the ledger carries on the "Not covered" exclusion.
+    /// Deliberately a token no prose would produce by accident, so
+    /// counting it is a meaningful uniqueness test. It sits in the
+    /// bullet's RENDERED text rather than in an HTML comment: the point
+    /// of recording the exclusion is that a person reads it, and a
+    /// comment is invisible to exactly that reader.
+    const NOT_COVERED_MARKER: &str = "ledger-marker: sort-tie-order/not-covered";
+
+    /// Operator names the marker line must carry, matched as WHOLE
+    /// TOKENS.
+    ///
+    /// Token equality, not `contains`, and the reason is a defect this
+    /// test shipped with: `approx_topk` contains `topk`, so a `contains`
+    /// check for `topk` is satisfied by any line carrying `approx_topk`
+    /// and can never fail. Splitting the line into `[A-Za-z0-9_]+` runs
+    /// and comparing for equality makes the three independently
+    /// breakable.
+    const MARKER_TOKENS: &[&str] = &["topk", "bottomk", "approx_topk", "composed"];
+
+    /// Phrases the marker line must carry, matched by `contains` because
+    /// they are prose. Chosen so that no phrase contains another, and no
+    /// phrase carries a [`MARKER_TOKENS`] entry — both asserted below.
+    /// The earlier list violated the second rule: its lead-in phrase
+    /// contained the word `composed`, so deleting `composed` failed on
+    /// the lead-in and the `composed` needle itself was never exercised.
+    const MARKER_PHRASES: &[&str] = &["Not covered", "#406"];
+
+    /// The `[A-Za-z0-9_]+` runs of `s`, in order.
+    fn identifier_tokens(s: &str) -> Vec<&str> {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    /// AC13: the divergence is registered where the divergence discipline
+    /// says it is registered, and the exclusion the AC exists to hold —
+    /// the composed/`topk` case the cosmetic conclusion does NOT cover —
+    /// is pinned by an explicit machine-readable marker rather than by
+    /// anything about the document's shape.
+    ///
+    /// **Why a marker and not a section scan.** Three review rounds each
+    /// found the next markdown edge case in a hand-written scanner here —
+    /// whole-document versus entry, substring versus bullet, a bullet
+    /// wrapped in a fence, a malformed closing fence, an indented
+    /// heading. Every finding was correct and none of them was the
+    /// product. Markdown has more edge cases than this test will ever
+    /// have rounds, so the mechanism changed: a marker the ledger carries
+    /// on purpose, asserted UNIQUE. Uniqueness is what replaces section
+    /// extraction — a claim that was relational ("recorded in THIS
+    /// entry") becomes checkable without locating the entry at all,
+    /// because a marker that occurs exactly once cannot be satisfied by
+    /// text somewhere else. Same shape as the corpus provenance markers
+    /// (`# provenance: divergence(...)`, bound by
+    /// `crates/pulsus-read/tests/logqltest_provenance.rs`).
+    ///
+    /// **Residual failure surface — written down and left alone.** Each
+    /// bullet below was MEASURED: the mutation was applied to the
+    /// committed ledger and this test was observed to stay GREEN. None of
+    /// them is reasoned about.
+    /// * **the bullet relocated.** Move the marker to another bullet, or
+    ///   to another entry, and this test stays green. It pins that the
+    ///   exclusion is recorded ONCE in the ledger, not which heading it
+    ///   sits under. Locating it was what the deleted scanner attempted,
+    ///   at the cost of a markdown parser that took three review rounds
+    ///   and still had edge cases left;
+    /// * **the marker fenced.** Wrap the bullet in a code fence and the
+    ///   exclusion renders as a code SAMPLE rather than as normative
+    ///   text, while the line — and so this test — is unchanged.
+    ///   Detecting it needs fence parsing, the mechanism that was
+    ///   removed;
+    /// * **an unclosed fence elsewhere in the file.** Nothing here reads
+    ///   fences, so appending one changes nothing. The guard that used to
+    ///   catch this existed only to protect the deleted scanner;
+    /// * **the entry heading demoted to `####`.** The uniqueness count
+    ///   looks for the substring ``### `sort-tie-order` ``, which
+    ///   ``#### `sort-tie-order` `` still contains, so the demotion is
+    ///   invisible here;
+    /// * **the marker's own prose edited to say something false** while
+    ///   keeping every needle. Reading the sentence is the only thing
+    ///   that catches that, and this test does not claim to;
+    /// * nothing here validates the rest of the ledger. It answers one
+    ///   question.
+    ///
+    /// That trade is deliberate: "recorded exactly once, with its content
+    /// intact" in exchange for "rendered as a bullet under that heading".
+    #[test]
+    fn the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger() {
+        let ledger_path =
+            crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
+        let ledger = std::fs::read_to_string(&ledger_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", ledger_path.display()));
+
+        // The entry exists, once. `### `<id>`` is the heading form
+        // `logqltest_provenance.rs::ledger_ids` resolves a
+        // `divergence(...)` marker against.
+        assert_eq!(
+            ledger.matches("### `sort-tie-order`").count(),
+            1,
+            "the ledger must carry exactly one `sort-tie-order` entry heading"
+        );
+
+        // The artifacts the entry governs.
+        for needle in [
+            "metric_sort_order",
+            "metric_sort_desc_order",
+            "value_ordered_sequences_agree",
+            "differential_metric_reducers.test",
+            "timestamp-tie-order",
+        ] {
+            assert!(
+                ledger.contains(needle),
+                "the ledger does not name {needle:?}"
+            );
+        }
+
+        // The exclusion, pinned by a UNIQUE marker.
+        let hits: Vec<&str> = ledger
+            .lines()
+            .filter(|l| l.contains(NOT_COVERED_MARKER))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "{NOT_COVERED_MARKER:?} must occur exactly once in the ledger, found {}",
+            hits.len()
+        );
+
+        // Every needle must be INDEPENDENTLY breakable — removing one
+        // from the marker line must fail on that needle and on no other.
+        // Two needles that overlap cannot both be exercised, and the
+        // survivor certifies a check that does not hold. Asserted here
+        // rather than trusted, because this list has been wrong once.
+        for phrase in MARKER_PHRASES {
+            for other in MARKER_PHRASES {
+                assert!(
+                    phrase == other || !other.contains(phrase),
+                    "phrase needle {phrase:?} is contained in {other:?}, so it can never fail alone"
+                );
+            }
+            let phrase_tokens = identifier_tokens(phrase);
+            for token in MARKER_TOKENS {
+                assert!(
+                    !phrase_tokens.contains(token),
+                    "phrase needle {phrase:?} carries the token needle {token:?}, \
+                     so removing the token would fail on the phrase instead"
+                );
+            }
+        }
+
+        // Everything the exclusion has to say, on the marker's own line,
+        // so no part of it can drift away from the marker.
+        let line = hits[0];
+        let line_tokens = identifier_tokens(line);
+        for token in MARKER_TOKENS {
+            assert!(
+                line_tokens.contains(token),
+                "the `{NOT_COVERED_MARKER}` line carries no {token:?} token:\n{line}"
+            );
+        }
+        for phrase in MARKER_PHRASES {
+            assert!(
+                line.contains(phrase),
+                "the `{NOT_COVERED_MARKER}` line is missing {phrase:?}:\n{line}"
+            );
+        }
+    }
+
+    /// AC15: the fixture prose no longer promises a reference tie order.
+    /// `construct` is the only place a case's expected response is written
+    /// in words, and prose rot there is invisible to every other gate.
+    #[test]
+    fn the_sort_case_constructs_do_not_promise_a_reference_tie_order() {
+        let fixture = shipped_fixture();
+        for case_id in ["metric_sort_order", "metric_sort_desc_order"] {
+            let case = fixture
+                .cases
+                .iter()
+                .find(|c| c.case_id == case_id)
+                .unwrap_or_else(|| panic!("the {case_id} case is shipped"));
+            assert!(
+                case.construct.contains("sort-tie-order"),
+                "case {case_id:?} does not name the ledger entry:\n{}",
+                case.construct
+            );
+            assert!(
+                !case.construct.contains("oracle-confirmed"),
+                "case {case_id:?} still promises a reference tie order:\n{}",
+                case.construct
+            );
+        }
+    }
+
+    /// Issue #406: where a rendered LogQL query's `sort`/`sort_desc` and
+    /// k-selecting vector aggregations sit in its parse tree. A log
+    /// (streams) query has no metric tree and reports all-zero.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SortShape {
+        /// `sort`/`sort_desc` nodes ANYWHERE in the tree, root included.
+        sorts: usize,
+        /// The AST ROOT is itself a `sort`/`sort_desc`.
+        root_is_sort: bool,
+        /// `topk`/`bottomk`/`approx_topk` nodes anywhere in the tree.
+        k_selectors: usize,
+    }
+
+    /// Parses under the shipped grammar; panics with the query's own text
+    /// if it does not parse (a fixture typo is already caught upstream by
+    /// `shipped_fixture_queries_parse_and_their_pipelines_compile`).
+    ///
+    /// Counts come from `pulsus_logql::for_each_metric_expr`, the
+    /// iterative SCC-2 driver (`crates/pulsus-logql/src/ast.rs:1453-1455`),
+    /// which visits the root and descends through non-aggregation
+    /// wrappers such as `MetricExpr::LabelReplace` — so a sort buried
+    /// under one is counted.
+    fn sort_shape(rendered: &str) -> SortShape {
+        use pulsus_logql::{Expr, MeNode, MetricExpr, VectorAggOp};
+
+        let expr = pulsus_logql::parse(rendered)
+            .unwrap_or_else(|e| panic!("query does not parse: {rendered:?}: {e}"));
+        let me = match &expr {
+            Expr::Log(_) => {
+                return SortShape {
+                    sorts: 0,
+                    root_is_sort: false,
+                    k_selectors: 0,
+                };
+            }
+            Expr::Metric(me) => me,
+        };
+        let root_is_sort = matches!(
+            me,
+            MetricExpr::Vector {
+                op: VectorAggOp::Sort | VectorAggOp::SortDesc,
+                ..
+            }
+        );
+        let mut sorts = 0usize;
+        let mut k_selectors = 0usize;
+        pulsus_logql::for_each_metric_expr(me, |node| {
+            if let MeNode::Expr(MetricExpr::Vector { op, .. }) = node {
+                match op {
+                    VectorAggOp::Sort | VectorAggOp::SortDesc => sorts += 1,
+                    VectorAggOp::Topk | VectorAggOp::Bottomk | VectorAggOp::ApproxTopk => {
+                        k_selectors += 1
+                    }
+                    _ => {}
+                }
+            }
+        });
+        SortShape {
+            sorts,
+            root_is_sort,
+            k_selectors,
+        }
+    }
+
+    /// AC20's property as a PURE predicate, so it can be broken without a
+    /// fixture: no sort at all, or exactly one and it is the root. The
+    /// "exactly one" clause is load-bearing — `sort(sort(X))` has a sort
+    /// at the root AND a second, non-terminal sort beneath it.
+    fn sort_is_terminal(rendered: &str) -> bool {
+        let s = sort_shape(rendered);
+        s.sorts == 0 || (s.sorts == 1 && s.root_is_sort)
+    }
+
+    /// The inner metric expression the AC20 break/control rows are built
+    /// around — the committed sort cases' own operand.
+    const AC20_INNER: &str =
+        r#"sum by (grp) (count_over_time({run_id="r", service_name="svc-sort"} | logfmt [30m]))"#;
+
+    /// AC20(a): every committed case is terminal-sort-clean and carries no
+    /// k-selector — the exact domain of the ledger's cosmetic conclusion,
+    /// established by PARSING rather than by string shape.
+    #[test]
+    fn every_committed_sort_case_is_terminal() {
+        let fixture = shipped_fixture();
+        for case in &fixture.cases {
+            let rendered = case.query.replace("{R}", "e2e-logs-test");
+            let shape = sort_shape(&rendered);
+            assert!(
+                sort_is_terminal(&rendered),
+                "case {:?} has a non-terminal sort: {shape:?} for {rendered}",
+                case.case_id
+            );
+            assert_eq!(
+                shape.k_selectors, 0,
+                "case {:?} carries a k-selector, which truncates and so falls \
+                 outside the `sort-tie-order` cosmetic conclusion: {rendered}",
+                case.case_id
+            );
+        }
+    }
+
+    /// AC20(b): the break cases. Each is a query a `starts_with("sort(")`
+    /// / literal-substring rule reads as terminal-and-k-free, and each
+    /// fails the AST rule.
+    #[test]
+    fn sort_terminality_rejects_a_composed_or_repeated_sort() {
+        let b = AC20_INNER;
+        // THE named break case: `sort(B) + 5` starts with `sort(`, so a
+        // `starts_with("sort(")` test passes it, but its root is
+        // `Binary(Add)` and the sort is an operand.
+        assert!(!sort_is_terminal(&format!("sort({b}) + 5")));
+        // Whitespace before the paren: no literal `sort(` at all, so a
+        // substring rule passes it vacuously.
+        assert!(!sort_is_terminal(&format!("sort ({b}) + 5")));
+        // A root sort with a second sort beneath it.
+        assert!(!sort_is_terminal(&format!("sort(sort({b}))")));
+        // A k-selector wrapping a sort — the composed case R1 records.
+        assert!(!sort_is_terminal(&format!("topk(1, sort({b}))")));
+        // The k-selector half, which a literal-substring rule also misses
+        // because the keywords are case-insensitive
+        // (`VectorAggOp::from_ident` lowercases first).
+        for k in [
+            format!("TopK(1, {b})"),
+            format!("bottomk(2, {b})"),
+            format!("approx_topk(2, {b})"),
+        ] {
+            assert_eq!(sort_shape(&k).k_selectors, 1, "{k}");
+        }
+    }
+
+    /// AC20(c): the positive controls. Rows 7 and 8 are terminal-or-
+    /// sortless queries a prefix/literal rule would have wrongly RED-ed,
+    /// so the new rule cannot be "stronger" merely by rejecting more.
+    #[test]
+    fn sort_terminality_accepts_the_committed_and_parenthesised_forms() {
+        let b = AC20_INNER;
+        assert!(sort_is_terminal(&format!("sort({b})")));
+        assert!(sort_is_terminal(&format!("sort_desc({b})")));
+        // Parenthesised: no `sort(` at position 0.
+        assert!(sort_is_terminal(&format!("(sort({b}))")));
+        // `sort(` inside a label-filter string literal, in a log query
+        // that has no metric tree at all.
+        assert!(sort_is_terminal(
+            r#"{run_id="r"} | logfmt | msg = "sort(x)""#
+        ));
+        // The committed queries themselves, taken from the fixture rather
+        // than retyped.
+        let fixture = shipped_fixture();
+        for case in fixture
+            .cases
+            .iter()
+            .filter(|c| c.kind() == "metric_instant_ordered")
+        {
+            let rendered = case.query.replace("{R}", "e2e-logs-test");
+            assert!(sort_is_terminal(&rendered), "case {:?}", case.case_id);
+        }
     }
 
     /// The D1 witness, hermetic half: the SHIPPED evaluator FAILS the
