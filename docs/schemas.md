@@ -449,21 +449,65 @@ text:
   `labels.go:667-668` then returns `EmptyLabelsResult`), so it keeps the
   lean projection rather than paying for a column it cannot use on an
   unbounded scan.
-- **A mixed-shape selection loses the zero-allocation slider, and that is
-  a real cost.** The per-fingerprint streaming slider is kept only where a
+- **A mixed-shape selection loses the zero-allocation slider, and it costs
+  about 2.1x.** The per-fingerprint streaming slider is kept only where a
   fingerprint's base label set is provably unreachable by merging any
   co-selected stream's metadata; the test is a sound over-approximation
   (minimum label count, and no `_extracted` key), so a selection whose
   streams have DIFFERENT label counts withholds the slider from the longer
-  ones even when nothing could in fact reach them. Measured on this
-  machine, `count_over_time({app="a"}[5m])` over 20 000 metadata-free rows,
-  step 10s, release build, 11 interleaved reps: median **1.49 ms** with the
-  slider against **8.28 ms** without it, a ratio of **5.54x**. Reproduce
-  with `cargo test -p pulsus-read --release --test
-  logql_slider_withholding_timings -- --ignored --nocapture`. This is a
-  cliff a user cannot see from the query, and it is reachable by ordinary
-  data — one producer adding a label to its streams is enough. Tightening
-  the over-approximation to an exact subset test is open on issue #249.
+  ones — sometimes correctly, sometimes not.
+
+  Measured on this machine, `count_over_time({app="a"}[5m])` over 20 000
+  metadata-free rows, step 10s, release build, five interleaved rounds of
+  11 reps each against the pre-#249 tree, reported as the median of the
+  per-round medians:
+
+  | selection | vs pre-#249 |
+  |---|---|
+  | single-shape (slider kept on both) | **1.19x** |
+  | mixed-shape, shorter stream's keys a proper SUBSET of the longer's | **2.13x** |
+  | mixed-shape, NOT a subset | **2.14x** |
+  | the instant path | **1.07x** |
+
+  Reproduce with `cargo test -p pulsus-read --release --test
+  logql_slider_withholding_timings -- --ignored --nocapture`, running the
+  same generator in a worktree at the pre-#249 commit for the baseline.
+
+  Three things that table does not say on its own:
+
+  - **The two mixed-shape rows are not the same kind of cost.** Where the
+    shorter stream's key set is a proper subset of the longer's, merging its
+    metadata can genuinely produce the longer's label set, so withholding
+    the slider is REQUIRED for correctness and no tightening could recover
+    it. Where it is not a subset, the withholding is the over-approximation
+    — recoverable in principle by an exact subset test, which is a follow-up
+    on issue #249 rather than work in hand. That follow-up is now worth
+    about 1.2x rather than the ~7x it would have been worth before this
+    optimisation, and the number is recorded there so the case is not
+    re-derived from the old figure.
+  - **1.19x on the single-shape row is a measured ceiling, not "no cost".**
+    An earlier revision of this path cost 1.61x; hoisting the slider-safety
+    probe to a per-fingerprint memo and eliding the route comparison where
+    the pipeline provably cannot change the label set removed most of it.
+    The residual is roughly 9 ns/row and is **unattributed**: the one
+    ablation that was run excludes the ordering pre-scan
+    (`run_client_agg_rows_folded`, ~4 ns/row on both trees) and excludes
+    nothing else. The wider `MetricScanRow` (40 -> 64 bytes) and the
+    per-row `structured_metadata.is_empty()` load are CANDIDATES, not
+    causes; deciding between them needs a matched-layout ablation on the
+    baseline tree and a branch ablation that pins the load, neither of
+    which has been run.
+  - **The mixed-shape path allocates nothing per row.** Removing the
+    per-row allocations is what took the two mixed-shape rows from ~7.3x
+    and ~8.4x to ~2.1x — 80% (subset) and 82% (non-subset) of the measured
+    regression. The remaining ~20% / ~18% is likewise unattributed: the
+    ablation that excluded the routing work excludes only that. The
+    zero-per-row property is gated as a scale-invariant identity rather
+    than a rounded average — the same fixture at twice the row density over
+    the same span costs the same total (measured: 47 allocations at both
+    20 000 and 40 000 rows), so a per-row term of even one allocation would
+    miss by 20 000 (`logql_pipeline_alloc.rs`). Wall time is never
+    asserted in CI (§9 Tier-1).
 
 **`GET /api/logs/v1/patterns`** (M7-C3, issue #171) — stage-1 fingerprint resolution (selector only; line filters are rejected — templates are precomputed, bodies are gone), then ONE pushed-down aggregate over `log_patterns` with no hydration (the response carries no labels), top-1000 by total count:
 

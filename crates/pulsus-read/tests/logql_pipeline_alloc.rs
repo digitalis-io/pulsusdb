@@ -617,6 +617,127 @@ fn per_row_allocation_bounds_hold() {
          aggregation loop regressed"
     );
 
+    // --- Issue #249 cost work: the WITHHELD (mixed-shape) path. The
+    // --- budget above measures a fingerprint-routed run; a selection whose
+    // --- streams differ in label count withholds the slider from the
+    // --- longer one, and every one of its rows takes the LABEL route. That
+    // --- path used to render the group key and clone the `LabelSet` per
+    // --- row; a base-routed row's final label set is its fingerprint's
+    // --- base set, a per-fingerprint constant, so it is now rendered once
+    // --- per output series and looked up by `&str`.
+    //
+    // Two legs. (a) is the budget: the SAME query and rows as the
+    // fingerprint-routed leg above, so the two are directly comparable.
+    // (b) is the scale-invariant IDENTITY, and it is the stronger of the
+    // two — the same fixture at TWICE the row density over the SAME time
+    // span, so the output series and the grid are identical and every
+    // fixed cost cancels. A per-row term of even ONE allocation adds
+    // 20 000 and misses by three orders of magnitude. That is what
+    // "steady-state zero allocations per row" means as a Tier-1 gate
+    // (docs/schemas.md §9: an identity, never a wall-time assert) and it is
+    // strictly stronger than any rounded average.
+    //
+    // Raw totals are printed, not a rounded per-row figure: the initial
+    // cached key, the group entry, the `coll` buffer and the output series
+    // all land inside the measured window and are counted in them.
+    let withheld_meta: std::collections::HashMap<u64, StreamMetaRow> = [
+        (
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "checkout".to_string(),
+                labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+            },
+        ),
+        (
+            2u64,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "checkout".to_string(),
+                // One label LONGER, so the minimum-length rule withholds
+                // the slider from this fingerprint — which is the whole
+                // point of the fixture.
+                labels: r#"{"env":"prod","pod":"p","service_name":"checkout"}"#.to_string(),
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    // Rows on fp 2 — the LONGER stream, which the minimum-length rule
+    // withholds the slider from.
+    let withheld_rows = |n: usize| -> Vec<MetricScanRow> {
+        (0..n)
+            .map(|i| MetricScanRow {
+                fingerprint: 2,
+                // The same 20s SPAN whatever `n` is, so the grid and the
+                // output series do not move with density.
+                timestamp_ns: (i as i64) * (20_000_000_000 / n as i64),
+                body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+                structured_metadata: String::new(),
+            })
+            .collect()
+    };
+    let withheld_run = |rows: &[MetricScanRow]| -> (u64, usize) {
+        let warm = run_client_agg_rows(
+            rows,
+            &compiled,
+            &withheld_meta,
+            client,
+            window,
+            mp.rate_window_ns,
+        )
+        .expect("client agg");
+        let series = match &warm {
+            pulsus_read::logql::QueryResult::Matrix(m) => m.len(),
+            other => panic!("expected a matrix, got {other:?}"),
+        };
+        drop(warm);
+        let start = ALLOCS.load(Ordering::Relaxed);
+        let out = run_client_agg_rows(
+            rows,
+            &compiled,
+            &withheld_meta,
+            client,
+            window,
+            mp.rate_window_ns,
+        )
+        .expect("client agg");
+        let total = ALLOCS.load(Ordering::Relaxed) - start;
+        std::hint::black_box(&out);
+        (total, series)
+    };
+
+    const WITHHELD_N: usize = 20_000;
+    let rows_n = withheld_rows(WITHHELD_N);
+    let (total_n, series_n) = withheld_run(&rows_n);
+    assert_eq!(
+        series_n, 1,
+        "the withheld fingerprint must produce ONE output series — otherwise this \
+         leg is not measuring the base-routed path"
+    );
+    assert!(
+        total_n <= CLIENT_AGG_FLAT_BUDGET + ZERO_RESIDUE,
+        "withheld (label-routed) path: {total_n} allocations over {WITHHELD_N} rows \
+         ({:.2}/row) — the base-routed fan-out must render its key once per output \
+         series, not once per row",
+        total_n as f64 / WITHHELD_N as f64
+    );
+
+    // (b) THE IDENTITY: twice the rows, same span, same series, same grid.
+    let rows_2n = withheld_rows(2 * WITHHELD_N);
+    let (total_2n, series_2n) = withheld_run(&rows_2n);
+    assert_eq!(
+        series_2n, series_n,
+        "doubling the density must not change the series"
+    );
+    assert!(
+        total_2n <= total_n + ZERO_RESIDUE,
+        "withheld path is not steady-state zero per row: {WITHHELD_N} rows cost \
+         {total_n} allocations and {} rows cost {total_2n} — a per-row term of even \
+         one allocation would add {WITHHELD_N} here",
+        2 * WITHHELD_N
+    );
+
     // --- Issue #249: the METRIC path's structured-metadata leg. The
     // --- SM-FREE budget above is BLIND to this path — it is measured on
     // --- rows whose `structured_metadata` is empty, and the merge branch

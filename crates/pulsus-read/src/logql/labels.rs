@@ -10,7 +10,6 @@
 
 use super::pipeline::{ERROR_DETAILS_LABEL, ERROR_LABEL};
 use super::rows::StreamMetaRow;
-use std::borrow::Cow;
 
 /// Renders a SORTED label set as the oracle's series shape
 /// (`{a="b", c="d"}`) for the surviving-`__error__` query failure.
@@ -415,6 +414,7 @@ fn parse_json_string<I: Iterator<Item = char>>(
 mod tests {
     use super::*;
     use crate::logql::testkit::*;
+    use std::borrow::Cow;
 
     /// AC2: `stream_hash` == Loki's `labels.StableHash`, pinned against
     /// GOLDEN VALUES CAPTURED FROM THE REFERENCE ITSELF — computed by calling

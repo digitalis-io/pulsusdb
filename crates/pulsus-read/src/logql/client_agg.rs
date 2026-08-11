@@ -205,15 +205,22 @@ pub(in crate::logql) mod route_counters {
 
     /// Zeroes both counters. Called at the top of each gate leg so a leg
     /// measures only its own rows.
+    ///
+    /// The ACCESSORS are `cfg(test)`: only the gate reads them, while the
+    /// counters themselves are written by the production wrappers whenever
+    /// `debug_assertions` is on.
+    #[cfg(test)]
     pub fn reset() {
         ROW_ROUTE_CALLS.with(|c| c.set(0));
         SLIDER_SAFE_PROBES.with(|c| c.set(0));
     }
 
+    #[cfg(test)]
     pub fn row_route_calls() -> u64 {
         ROW_ROUTE_CALLS.with(Cell::get)
     }
 
+    #[cfg(test)]
     pub fn slider_safe_probes() -> u64 {
         SLIDER_SAFE_PROBES.with(Cell::get)
     }
@@ -5292,6 +5299,75 @@ mod tests {
             n
         }
 
+        // Issue #249 cost work, AC-6: a BASE member stages nothing beyond
+        // its `CollMember` slot, so `member_stage_bytes`' charge — which is
+        // told `stages_out = false` for it — remains a true upper bound.
+        // Checked first, on its own state, because the class-C fixture
+        // below cannot produce one (`unwrap` forces `fan_out`, and an inert
+        // row needs `!fan_out`).
+        {
+            let base_client = ClientAgg {
+                pipeline: vec![],
+                value: ClientValue::Count,
+                range_op: RangeAggOp::CountOverTime,
+                param: None,
+                absent_labels: vec![],
+                grouping: None,
+            };
+            let base_compiled = CompiledPipeline::compile(&base_client.pipeline).unwrap();
+            let mut base_meta = HashMap::new();
+            base_meta.insert(
+                1,
+                StreamMetaRow {
+                    fingerprint: 1,
+                    service: "svc".to_string(),
+                    labels: r#"{"app":"a"}"#.to_string(),
+                },
+            );
+            base_meta.insert(
+                2,
+                StreamMetaRow {
+                    fingerprint: 2,
+                    service: "svc".to_string(),
+                    labels: r#"{"app":"a","zone":"eu"}"#.to_string(),
+                },
+            );
+            let mut st = RangeSlideState::new(
+                &base_compiled,
+                &base_meta,
+                &base_client,
+                slide_window(0, 60, 30, 60),
+                None,
+                AggCaps::DEFAULT,
+            )
+            .unwrap();
+            // fp 2 is withheld and the row is inert ⇒ a BASE member.
+            st.push_rows(&[scan_row(2, 10, "a body long enough to notice")])
+                .expect("staged");
+            assert_eq!(st.coll.len(), 1);
+            let m = &st.coll[0];
+            assert!(
+                m.base && m.out.is_none(),
+                "the fixture must stage a BASE member"
+            );
+            assert!(
+                m.body.is_empty() && m.body.capacity() == 0,
+                "a base member retains no body (class A never needs tie_rank order)"
+            );
+            let staged = staged_capacity(&st);
+            let slot_only = (st.coll.capacity() * size_of::<CollMember>()) as u64;
+            assert_eq!(
+                staged, slot_only,
+                "a BASE member must allocate NOTHING beyond its slot — that is what \
+                 lets `member_stage_bytes` charge it the slot alone"
+            );
+            assert!(
+                st.coll_bytes >= staged,
+                "and the charge must still upper-bound it: charged {} vs staged {staged}",
+                st.coll_bytes
+            );
+        }
+
         // Class C (`sum_over_time` over `unwrap`) ⇒ bodies staged for
         // `tie_rank`; `label_format` ⇒ the fan-out `key`/`LabelSet` staged
         // too. Both legs of the charge are exercised at once.
@@ -6850,13 +6926,17 @@ mod tests {
             grouping: None,
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        // ALL THREE ROUTES in one state (issue #249 cost work, AC-5):
         let rows = vec![
-            // fp 1 is slider-safe (minimum length, no `_extracted`), and
-            // this row is inert -> the SLIDER.
+            // (1) FINGERPRINT-routed: fp 1 is slider-safe (minimum length,
+            //     no `_extracted`) and this row is inert -> the slider.
             scan_row(1, 10, "a"),
-            // ...while this one merges and grows -> the FAN-OUT map.
+            // (2) GENERAL label route: this row merges and grows, so it is
+            //     not inert and its key/`LabelSet` are rendered and cloned.
             sm_row(1, 20, "b", r#"{"trace":"t"}"#),
-            // fp 2 is withheld (longer than the minimum) -> fan-out.
+            // (3) BASE route: fp 2 is withheld (longer than the minimum)
+            //     but the row is inert, so its final set IS fp 2's base set
+            //     and it is served from the cached key, allocating nothing.
             scan_row(2, 30, "c"),
         ];
         let window = slide_window(0, 60, 30, 60);
@@ -6899,7 +6979,388 @@ mod tests {
                     1.0
                 ),
             ],
-            "a mixed run must emit BOTH structures' series"
+            "a mixed run must emit every route's series"
         );
+    }
+
+    /// Issue #249 cost work, AC-5's other half — the same three-route run,
+    /// inspected at the STATE rather than at the result, so the routes are
+    /// named rather than inferred from the output, and the charging
+    /// identities are read directly.
+    #[test]
+    fn a_three_route_run_stages_one_member_of_each_kind_and_closes_its_charges() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            1,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "svc".to_string(),
+                labels: r#"{"app":"a"}"#.to_string(),
+            },
+        );
+        meta.insert(
+            2,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "svc".to_string(),
+                labels: r#"{"app":"a","zone":"eu"}"#.to_string(),
+            },
+        );
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+            grouping: None,
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let window = slide_window(0, 60, 30, 60);
+        let mut state =
+            RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                .unwrap();
+
+        // One member of each kind, all at the SAME `(fingerprint,
+        // timestamp)` for the base/general pair so they share a collision
+        // group and the dispatch has to separate them.
+        state
+            .push_rows(&[
+                scan_row(1, 10, "fingerprint-routed"),
+                scan_row(2, 20, "base-routed"),
+                sm_row(2, 20, "general", r#"{"trace":"t"}"#),
+            ])
+            .expect("served");
+
+        // The staged group is fp 2's, holding the base and the general
+        // member — the routes are visible on the members themselves.
+        assert_eq!(
+            state.coll.len(),
+            2,
+            "fp 2's collision group holds two members"
+        );
+        assert!(
+            state.coll.iter().any(|m| m.base && m.out.is_none()),
+            "one BASE member: label-routed, and nothing rendered for it"
+        );
+        assert!(
+            state.coll.iter().any(|m| !m.base && m.out.is_some()),
+            "one GENERAL member: label-routed, carrying its own rendered set"
+        );
+
+        // `finish` asserts `retained == 0` and `group_bytes == 0`; a panic
+        // here IS the failure this test exists to catch.
+        let res = state.finish().expect("finishes");
+        let QueryResult::Matrix(series) = res else {
+            panic!("a range query yields a matrix");
+        };
+        assert_eq!(
+            series.len(),
+            3,
+            "each route contributes its own output series: {series:?}"
+        );
+    }
+    /// Issue #249 cost work, AC-1 — **the routing decision is per
+    /// FINGERPRINT, not per row.**
+    ///
+    /// The work this gate measures allocates nothing, so
+    /// `CLIENT_AGG_FLAT_BUDGET` provably cannot see it: a per-row
+    /// `HashSet<u64>` probe and a per-row label-vector comparison are pure
+    /// instructions. Hence the counters.
+    ///
+    /// **Three legs, all of them always-run.** Leg 1 is the gate. Legs 2
+    /// and 3 are POSITIVE CONTROLS, and they are the deliverable rather
+    /// than a recorded manual break: each drives a fixture in which the
+    /// property does NOT hold and asserts its counter reaches exactly
+    /// 20 000, so every CI run re-proves that both counters can still
+    /// reach the value the gate asserts they do not. A gate whose failure
+    /// value has only been reasoned about is not a control.
+    ///
+    /// Break tests for leg 1, run and recorded in the issue #249
+    /// implementation notes: deleting the memo makes it 20 000 probes;
+    /// deleting the inert shortcut makes it 20 000 route calls.
+    ///
+    /// `row_route` stays an uninstrumented oracle throughout — the
+    /// `debug_assert_eq!` inside `push_one_row` calls it on every inert row
+    /// and must not be visible here, and neither must the unit tests below
+    /// that call it directly.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn metadata_free_rows_route_once_per_fingerprint() {
+        const N: usize = 20_000;
+
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+            grouping: None,
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let window = slide_window(0, 60_000_000_000, 10_000_000_000, 300_000_000_000);
+
+        // A single-SHAPE, two-fingerprint selection: both fingerprints are
+        // slider-safe, so every row is inert and fingerprint-routed.
+        let mut meta = HashMap::new();
+        for (fp, labels) in [(1u64, r#"{"app":"a"}"#), (2, r#"{"app":"b"}"#)] {
+            meta.insert(
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: "svc".to_string(),
+                    labels: labels.to_string(),
+                },
+            );
+        }
+
+        // --- leg 1: THE GATE. Fingerprint-contiguous runs, no metadata.
+        let contiguous: Vec<MetricScanRow> = (0..N)
+            .map(|i| {
+                let fp = if i < N / 2 { 1 } else { 2 };
+                scan_row(fp, (i as i64 % (N as i64 / 2)) * 1_000_000, "line")
+            })
+            .collect();
+        route_counters::reset();
+        run_client_agg_rows(&contiguous, &compiled, &meta, &client, window, None).unwrap();
+        let probes = route_counters::slider_safe_probes();
+        let routes = route_counters::row_route_calls();
+        assert!(
+            probes <= 2,
+            "the slider-safety answer is a per-query constant of the fingerprint: \
+             expected at most one probe per fingerprint (2), got {probes} over {N} rows \
+             — the memo in `push_rows` regressed"
+        );
+        assert_eq!(
+            routes, 0,
+            "an inert row's route is decided without comparing label vectors: \
+             expected 0 route calls, got {routes} over {N} rows — the inert \
+             shortcut in `push_one_row` regressed"
+        );
+
+        // --- leg 2: POSITIVE CONTROL for the route counter. Distinct
+        // metadata per row makes `inert` false, so the general path runs
+        // and every row is a counted route decision.
+        let sm_rows: Vec<MetricScanRow> = (0..N)
+            .map(|i| {
+                sm_row(
+                    1,
+                    (i as i64) * 1_000_000,
+                    "line",
+                    &format!(r#"{{"t":"t{i}"}}"#),
+                )
+            })
+            .collect();
+        route_counters::reset();
+        run_client_agg_rows(&sm_rows, &compiled, &meta, &client, window, None).unwrap();
+        assert_eq!(
+            route_counters::row_route_calls(),
+            N as u64,
+            "the control must force one counted route decision per row — otherwise \
+             leg 1's `== 0` proves nothing about a counter that cannot move"
+        );
+
+        // --- leg 3: POSITIVE CONTROL for the probe counter. ALTERNATING
+        // fingerprints make the memo miss on every row.
+        //
+        // Driven through `RangeSlideState::push_rows` DIRECTLY, not through
+        // `run_client_agg_rows`: that wrapper sorts a non-(fingerprint,
+        // timestamp)-ordered slice before pushing
+        // (`run_client_agg_rows_folded`'s `ordered` pre-scan), which would
+        // hand the state contiguous runs and make the memo hit — the
+        // control would then measure 2 and prove nothing. The live engine
+        // streams the PK-ordered scan, so interleaved fingerprints do not
+        // occur there either; forcing them here is precisely what makes
+        // this a control.
+        let alternating: Vec<MetricScanRow> = (0..N)
+            .map(|i| scan_row(1 + (i as u64 % 2), (i as i64) * 1_000_000, "line"))
+            .collect();
+        route_counters::reset();
+        let mut state =
+            RangeSlideState::new(&compiled, &meta, &client, window, None, AggCaps::DEFAULT)
+                .unwrap();
+        state.push_rows(&alternating).unwrap();
+        assert_eq!(
+            route_counters::slider_safe_probes(),
+            N as u64,
+            "the control must force one probe per row — otherwise leg 1's `<= 2` \
+             proves nothing about a counter that cannot move"
+        );
+    }
+
+    /// Issue #249 cost work, AC-3(b) — **the inert invariant, enumerated
+    /// over the stage kinds that can reach it.**
+    ///
+    /// `inert` claims that when a row carries no structured metadata and
+    /// the state does not fan out, the pipeline's output label vector is
+    /// byte-for-byte `base`. `!metric_mutates_labels() && grouping.is_none()`
+    /// admits exactly: an empty pipeline, a line filter, a NON-compare
+    /// label filter, a `Parts` `line_format`, and `decolorize`. Every other
+    /// stage kind sets `mutates_labels` (or `has_unwrap`) and so forces
+    /// `fan_out`, where the shortcut is not taken.
+    ///
+    /// Break: make `Decolorize` push a label — this fails, and so does the
+    /// `debug_assert_eq!` in `push_one_row`.
+    #[test]
+    fn an_inert_pipeline_never_changes_the_label_set() {
+        let base = pairs(&[("app", "a"), ("service_name", "svc")]);
+        // Each of these must leave `metric_mutates_labels()` false; that is
+        // asserted per case, so a stage silently gaining the flag turns
+        // this into a failure rather than a vacuous pass.
+        for q in [
+            r#"{app="a"}"#,
+            r#"{app="a"} |= "line""#,
+            r#"{app="a"} != "nope""#,
+            r#"{app="a"} | app="a""#,
+            r#"{app="a"} | line_format "static parts""#,
+            r#"{app="a"} | decolorize"#,
+        ] {
+            let stages = parse_pipeline(q);
+            let compiled = CompiledPipeline::compile(&stages).expect("compiles");
+            assert!(
+                !compiled.metric_mutates_labels(),
+                "{q}: this case only tests the inert path if the pipeline is non-mutating"
+            );
+            let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+            let run = compiled
+                .run_metric_into(" line ", &base, 0, None, &mut scratch)
+                .expect("runs");
+            if matches!(run, MetricRun::Dropped) {
+                continue;
+            }
+            assert_eq!(
+                scratch.len(),
+                base.len(),
+                "{q}: an inert pipeline must not change the label COUNT"
+            );
+            for ((sk, sv), (bk, bv)) in scratch.iter().zip(base.iter()) {
+                assert_eq!(
+                    (sk.as_ref(), sv.as_ref()),
+                    (bk.as_str(), bv.as_str()),
+                    "{q}: an inert pipeline's output must be `base`, in order"
+                );
+            }
+        }
+    }
+
+    /// Issue #249 cost work, AC-4 — **the cached base key and the general
+    /// path agree, so one label set is ONE output series.**
+    ///
+    /// On a slider-WITHHELD fingerprint, a metadata-free row takes the
+    /// base route (cached key) while a row whose metadata is
+    /// `__error_details__`-only is NOT inert — it carries metadata, so it
+    /// goes down the general path — yet the #238 `visible()` rule makes its
+    /// final label set identical. The two must land in the same group.
+    ///
+    /// Break: render the cached key from the UNSORTED base vector — two
+    /// series with identical labels.
+    #[test]
+    fn a_base_routed_row_and_an_inert_merge_share_one_output_series() {
+        let mut meta = HashMap::new();
+        // `{app="a"}` is the minimum length, so fp 2 is WITHHELD and its
+        // rows take the label route.
+        meta.insert(
+            1,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "svc".to_string(),
+                labels: r#"{"app":"a"}"#.to_string(),
+            },
+        );
+        meta.insert(
+            2,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "svc".to_string(),
+                labels: r#"{"app":"a","pod":"p"}"#.to_string(),
+            },
+        );
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+            grouping: None,
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let rows = vec![
+            scan_row(2, 10, "base-routed"),
+            sm_row(2, 20, "general-path", r#"{"__error_details__":"det"}"#),
+        ];
+        let window = slide_window(0, 60, 30, 60);
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let QueryResult::Matrix(series) = res else {
+            panic!("a range query yields a matrix");
+        };
+        assert_eq!(
+            series.len(),
+            1,
+            "the cached base key must be byte-identical to the general path's \
+             rendering of the same set: {series:?}"
+        );
+        assert_eq!(
+            series[0].points.last().map(|(_, v)| *v),
+            Some(2.0),
+            "and both rows must have accumulated into it: {series:?}"
+        );
+    }
+
+    /// Issue #249 cost work, AC-12 — **a failed flush leaves nothing
+    /// staged.** One sub-case per fallible exit, each driven by shrinking
+    /// exactly one cap on a live state.
+    ///
+    /// Break: move the `std::mem::take` back below the charges — sub-case
+    /// 1 fails with a non-empty `coll`.
+    #[test]
+    fn a_failed_flush_leaves_no_staged_member_behind() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+            grouping: None,
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 60_000_000_000, 10_000_000_000, 300_000_000_000);
+
+        // The three fallible exits of `flush_collision`, in order:
+        // `charge_group_bytes`, `charge_result_points`, and `load_group`'s
+        // inner `charge_retention`.
+        for (name, tweak) in [
+            (
+                "group_bytes",
+                (|c: &mut AggCaps| c.group_bytes = 1) as fn(&mut AggCaps),
+            ),
+            ("result_points", |c: &mut AggCaps| c.result_points = 1),
+            ("retention_points", |c: &mut AggCaps| c.retention_points = 1),
+        ] {
+            let mut caps = AggCaps::DEFAULT;
+            tweak(&mut caps);
+            let mut state =
+                RangeSlideState::new(&compiled, &meta, &client, window, None, caps).unwrap();
+            let rows = vec![
+                scan_row(1, 10, "a"),
+                scan_row(1, 10, "b"),
+                scan_row(1, 20, "c"),
+            ];
+            let err = state
+                .push_rows(&rows)
+                .expect_err("the shrunken cap must refuse");
+            assert!(
+                matches!(err, ReadError::QueryTooBroad(_)),
+                "{name}: expected a named too-broad refusal, got {err:?}"
+            );
+            assert!(
+                state.coll.is_empty(),
+                "{name}: a failed flush must leave NO staged member behind, found {}",
+                state.coll.len()
+            );
+            assert_eq!(
+                state.coll_bytes, 0,
+                "{name}: and the staged-byte counter must be reset with it"
+            );
+        }
     }
 }
