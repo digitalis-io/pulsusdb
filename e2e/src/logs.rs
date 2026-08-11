@@ -4276,12 +4276,28 @@ mod tests {
         // `"#### x".starts_with("### ")` is FALSE (the fourth byte is
         // `#`, not a space), which is exactly the demotion the review
         // caught an earlier version on.
+        //
+        // **STRICT on purpose, and NOT `opens_a_ledger_entry`.** That
+        // predicate tolerates CommonMark's three leading spaces and a tab
+        // separator, because a boundary it fails to see is a false GREEN.
+        // Our OWN heading is the opposite case: it is ours to keep clean,
+        // an indented one is a house-style defect, and tolerating it here
+        // silently retired a mutation the review had already validated as
+        // red. Measured: routing this assertion through
+        // `opens_a_ledger_entry` turned the two-space-indent mutation
+        // GREEN, which is how this comment came to exist.
         let entry_idx = unique_marker_index(&ledger, &lines, NESTED_ENTRY_MARKER);
         let heading = lines[entry_idx];
         assert!(
-            opens_a_ledger_entry(heading),
-            "the `nested-sort-order` entry must be a `###` heading, not {:?}:\n{heading}",
-            heading.chars().take_while(|c| *c == '#').count()
+            heading.starts_with("### "),
+            "the `nested-sort-order` entry must be an UNINDENTED `###` heading — \
+             {} leading spaces, {} hashes:\n{heading}",
+            heading.len() - heading.trim_start_matches(' ').len(),
+            heading
+                .trim_start_matches(' ')
+                .chars()
+                .take_while(|c| *c == '#')
+                .count()
         );
         assert!(
             heading.contains("`nested-sort-order`"),
