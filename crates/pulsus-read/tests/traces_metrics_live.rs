@@ -1,5 +1,5 @@
 //! Issue #59 AC4 (Tier-1, scale-invariant): the internal-consistency
-//! identities for the TraceQL metrics endpoints against ClickHouse 24.8,
+//! identities for the TraceQL metrics endpoints against ClickHouse 26.3,
 //! on a seeded deterministic corpus:
 //!
 //! - **(a)** `Σ_buckets rate·step_s == Σ_buckets count_over_time ==`
@@ -20,7 +20,7 @@
 //! Live-gated behind `PULSUS_TEST_CLICKHOUSE=1`:
 //!
 //! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:24.8
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test traces_metrics_live
 //! podman rm -f pulsus-ch-test
 //! ```

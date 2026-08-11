@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-clickhouse --test live_clickhouse
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -162,27 +162,37 @@ async fn insert_block_then_query_stream_round_trips_rows() {
 /// change — `pulsus-read`'s `traces_search_explain` catches the same revert
 /// on 26.3 — but it is the cheapest, and the only one in this suite.
 ///
-/// **What it proves depends on the server it runs against**, and that is
-/// deliberate rather than papered over:
+/// **It is a regression gate, on the only version we run** (issue #376).
+/// On **26.3.17.110** the server keeps the already-written output, the
+/// crate returns the whole body (`collect_bad_response`,
+/// `vendor/clickhouse/src/response.rs:127-188`), and without the patch the
+/// message is `\u{1}\u{1}v\u{6}StringCode: 396. …`, whose code sits past
+/// byte 0 where nothing can be trusted.
 ///
-/// - On **26.3.17.110** it is the regression gate. The server keeps the
-///   already-written output, the crate returns the whole body
-///   (`collect_bad_response`, `vendor/clickhouse/src/response.rs:127-188`),
-///   and without the
-///   patch the message is `\u{1}\u{1}v\u{6}StringCode: 396. …`, whose code
-///   sits past byte 0 where nothing can be trusted.
-/// - On **24.8.14.39** — the version this suite's CI step runs — it is a
-///   pin only: that server discards its not-yet-flushed output buffer
-///   when it turns the response into an error, so the message begins at
-///   `Code:` and the pre-#382 read passes too. Named as a pin, not
-///   counted as a gate. The hermetic discriminating cases live in
-///   `pulsus_clickhouse::error`'s
-///   `the_code_the_patch_puts_at_byte_zero_is_what_gets_read`.
+/// It used to be described as "a pin on 24.8, a gate on 26.3", because
+/// 24.8.14.39 discarded its not-yet-flushed output buffer when it turned
+/// the response into an error, so the message began at `Code:` and the
+/// pre-#382 read passed too. The floor is 26.3 now, so only the gate leg
+/// exists; the hermetic discriminating cases stay in
+/// `pulsus_clickhouse::error`'s
+/// `the_code_the_patch_puts_at_byte_zero_is_what_gets_read`.
 ///
-/// Neither leg says anything about 24.8's **streaming** path, which stays
-/// forgeable by a tenant literal echoed into the exception description and
-/// is issue #412, closing with #376. Pinned hermetically by
-/// `on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412`.
+/// **What it still does NOT say anything about**, stated so it is not read
+/// as more than it is: the crate's exception extraction runs PER CHUNK
+/// (`extract_exception`, `vendor/clickhouse/src/response.rs:369-382`), and
+/// its length-slicing arm additionally requires the chunk to end with
+/// `__exception__\r\n` — which only the FINAL chunk does. A non-final
+/// chunk ending `))\n` still falls through to `extract_exception_old`'s
+/// `rfind(b"Code:")` on 26.3, exactly as on 24.8. Measured for issue #376:
+/// on an HTTP-200 late failure 26.3.17.110 sends
+/// `X-ClickHouse-Exception-Tag` plus a `<len> <tag>\r\n__exception__\r\n`
+/// trailer and 24.8.14.39 sends neither, so the FINAL-chunk path is sound
+/// on 26.3 and unfixable on 24.8 — but the non-final-chunk residual is
+/// **unverified and looks reachable**. That residual is issue #412's, and
+/// this commit does not claim #412 is closed. Pinned hermetically by
+/// `on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412`,
+/// which keeps its name and its bytes as the record of why the floor
+/// moved.
 ///
 /// Read-only against `numbers()`, so this suite's existing CI step (which
 /// runs against the bare image's `default` database) needs no new fixture

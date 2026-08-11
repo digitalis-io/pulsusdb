@@ -223,6 +223,51 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #376, code review finding 5 — the Prometheus surface's half of
+    /// the same leak. See the logs surface's twin for the argument.
+    #[tokio::test]
+    async fn a_raw_clickhouse_server_error_never_puts_the_server_version_in_the_envelope() {
+        let raw = "Code: 241. DB::Exception: Query memory limit exceeded: would use 194.36 \
+                   MiB. (MEMORY_LIMIT_EXCEEDED) (version 26.3.17.110 (official build))";
+        let err = pulsus_read::logql::ReadError::Clickhouse(pulsus_clickhouse::ChError::Server {
+            code: 241,
+            message: raw.to_string(),
+        });
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = json["error"].as_str().unwrap_or_default();
+        assert!(
+            !carries_a_server_version_banner(body),
+            "the connected server's version leaked into a client envelope: {json}"
+        );
+        assert!(carries_a_server_version_banner(raw), "premise");
+    }
+
+    /// `true` when `body` carries anything SHAPED like a ClickHouse server
+    /// version banner — the literal `version ` followed by `<digits>.<digits>`.
+    ///
+    /// Issue #376: the assertions below used to name `"version 24.8"`. That
+    /// made a claim about *any* server version leaking, checked against
+    /// *one* server's spelling — on 26.3 the fragment never appears at all,
+    /// so the check would have passed while testing nothing. Matching the
+    /// shape instead means the next version bump cannot silently retire it.
+    fn carries_a_server_version_banner(body: &str) -> bool {
+        let mut rest = body;
+        while let Some(i) = rest.find("version ") {
+            let tail = &rest[i + "version ".len()..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let after = &tail[digits.len()..];
+            if !digits.is_empty()
+                && after.starts_with('.')
+                && after[1..].starts_with(|c: char| c.is_ascii_digit())
+            {
+                return true;
+            }
+            rest = &rest[i + "version ".len()..];
+        }
+        false
+    }
+
     use super::*;
 
     async fn envelope(err: ApiError) -> (StatusCode, serde_json::Value) {
@@ -377,9 +422,23 @@ mod tests {
             body.contains("reader.promql_read_max_memory_bytes"),
             "the body must name the knob an operator would raise: {json}"
         );
+        assert_eq!(
+            body,
+            pulsus_read::logql::ReadError::QueryTooBroad(
+                pulsus_read::logql::TooBroadReason::PromqlReadMemory {
+                    budget_bytes: 8_589_934_592,
+                },
+            )
+            .to_string(),
+            "the 422 body must be exactly our own rendered message: {json}"
+        );
         assert!(
-            !body.contains("DB::Exception") && !body.contains("version 24.8"),
+            !body.contains("DB::Exception"),
             "the 422 body must carry only our own message: {json}"
+        );
+        assert!(
+            !carries_a_server_version_banner(body),
+            "a server version banner leaked into the 422 body: {json}"
         );
     }
 

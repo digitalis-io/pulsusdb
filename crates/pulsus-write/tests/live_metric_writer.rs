@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-write --test live_metric_writer
 //! podman rm -f pulsus-ch-test
 //! ```

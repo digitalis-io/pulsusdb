@@ -121,9 +121,9 @@ jobs:
 
 
   # Issue #5: every DDL block in docs/schemas.md must be rendered and
-  # executed against a fresh ClickHouse in CI. Single-node 24.8 leg (live
+  # executed against a fresh ClickHouse in CI. Single-node 26.3 leg (live
   # migration/MV tests, the `--mode init` create-then-no-op acceptance
-  # criterion) plus a negative leg proving the < 24.8 version refusal.
+  # criterion) plus a negative leg proving the < 26.3 version refusal.
   # Uses the runner's own docker (task-manager resolution #3 on issue #5);
   # local development uses podman against the same runtime-neutral fixtures.
 
@@ -399,11 +399,11 @@ jobs:
       - name: Install cargo-nextest (pinned)
         run: curl -LsSf https://get.nexte.st/0.9.140/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
-      - name: Start ClickHouse 24.8
+      - name: Start ClickHouse 26.3
         run: |
           docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
             -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
-            clickhouse/clickhouse-server:24.8
+            clickhouse/clickhouse-server:26.3
           for _ in $(seq 1 30); do
             curl -sf http://localhost:19123/ping && break
             sleep 1
@@ -420,7 +420,7 @@ jobs:
       # metric_series.value_type exist, an EXPLAIN indexes=1 metric_name-led PK
       # prune on metric_hist_samples matching the metric_samples gate, and a
       # native-histogram row round-trips losslessly for both an exponential and
-      # an NHCB sample. Reuses this job's 24.8 container.
+      # an NHCB sample. Reuses this job's 26.3 container.
       - name: Live native-histogram schema tests (migrations + EXPLAIN + round-trip)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -430,7 +430,7 @@ jobs:
       # Issue #53: traces-family tables + tag-catalog MV, retention-change
       # propagation, and the two docs/schemas.md §4.2 EXPLAIN gates on a
       # seeded ≥100k-row corpus (EXPLAIN indexes=1 + query_log.projections —
-      # `EXPLAIN projections=1` is 25.x-only). Reuses this job's 24.8
+      # `EXPLAIN projections=1` is 25.x-only). Reuses this job's 26.3
       # container.
       - name: Live traces schema tests (tables + MV + EXPLAIN gates)
         env:
@@ -440,7 +440,7 @@ jobs:
 
       # Issue #11: docs/schemas.md §9's "EXPLAIN indexes = 1 output for the
       # canonical queries is snapshot-tested" gate for the LogQL read path —
-      # reuses this job's ClickHouse 24.8 container verbatim.
+      # reuses this job's ClickHouse 26.3 container verbatim.
       - name: LogQL EXPLAIN indexes gate
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -460,7 +460,7 @@ jobs:
       # Issue #55: the trace-by-ID point read's EXPLAIN primary-key gate
       # (PrimaryKey block keyed on trace_id, granules pruned) on a seeded
       # 100k-trace corpus, plus the TraceEngine fetch round-trip. Reuses
-      # this job's ClickHouse 24.8 container.
+      # this job's ClickHouse 26.3 container.
       - name: Trace point-read EXPLAIN gate
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -516,7 +516,7 @@ jobs:
       # (non-skipped). Pushes fixture OTLP spans to the reference's :4318
       # receiver, waits for them to become metrics-queryable, then asserts
       # byte-parity of compare()'s statusMessage / rootName / rootServiceName
-      # values against PulsusDB (over this job's ClickHouse 24.8 on 19123).
+      # values against PulsusDB (over this job's ClickHouse 26.3 on 19123).
       - name: TraceQL Tempo differential leg (compare values)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -530,7 +530,7 @@ jobs:
       # oracle: pushes fixture spans to :4318, then asserts grouped /
       # coalesced spanSet-array parity (per-trace group-tuple set + per-group
       # span-id membership + attributes typing) against PulsusDB's real
-      # search executor over this job's ClickHouse 24.8 on 19123.
+      # search executor over this job's ClickHouse 26.3 on 19123.
       - name: TraceQL Tempo differential leg (by()/coalesce grouping)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -849,7 +849,7 @@ jobs:
       # scale-invariant system.query_log ratio gate for the logs read path
       # (CI-scale corpus). Includes issue #261's /detected_labels fan-in
       # identity: the aggregation returns one row per distinct KEY at any
-      # value cardinality. Reuses this job's ClickHouse 24.8 container.
+      # value cardinality. Reuses this job's ClickHouse 26.3 container.
       - name: LogQL query_log ratio gate (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -860,7 +860,7 @@ jobs:
       # a >256 KiB rendered stage2/sample_fetch_multi SQL text fails to
       # parse under ClickHouse's server-default max_query_size and
       # succeeds once the raised product setting is applied. Reuses this
-      # job's ClickHouse 24.8 container.
+      # job's ClickHouse 26.3 container.
       - name: Query-text admission live witness (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -890,7 +890,7 @@ jobs:
       # Issue #54 AC5: the OTLP traces round-trip — POST /v1/traces ->
       # TraceWriter (sync) -> exact count()s on both writer-written trace
       # tables, plus a live payload/FixedString wire-encoding read-back.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 26.3 container.
       - name: Traces ingest round-trip (exact counts)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -903,7 +903,7 @@ jobs:
       # reinterpretAsUInt64(value). The literals are chosen so serde_json's
       # default parser and str::parse disagree by 1 ULP, so this step fails if
       # the workspace `float_roundtrip` feature is ever dropped.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 26.3 container.
       - name: OTLP/JSON metrics ingest stores nearest-representable f64 bits
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -915,7 +915,7 @@ jobs:
       # ClickHouse. Proves fingerprint identity (Zipkin summary columns
       # byte-identical to the equivalent OTLP ingest) and shared-span
       # storage (a shared RPC span stores both the SERVER and CLIENT sides).
-      # Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 26.3 container.
       - name: Zipkin v2 JSON ingest round-trip (fingerprint identity + shared span)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -930,7 +930,7 @@ jobs:
       # round-trip incl. an internal zero bucket, and the value_type
       # discriminator mask (a cross-request float+histogram at one series
       # registers both metric_series rows, groupBitOr == 3). Reuses this
-      # job's ClickHouse 24.8 container.
+      # job's ClickHouse 26.3 container.
       - name: Native histogram writer round-trip (NaN gate + value_type)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -943,7 +943,7 @@ jobs:
       # ClickHouse: counter_reset_hint lands 3 and 0 respectively, the
       # stored row decodes to a Gauge FloatHistogram, and the
       # histograms-only series register value_type = 1 metric_series rows.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 26.3 container.
       - name: Remote-write gauge-hint native histogram (counter_reset_hint e2e)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -957,7 +957,7 @@ jobs:
       # month) and L2 "false Poisoned" (the first insert genuinely lands;
       # the backfill's duplicate re-insert provably occurs and collapses
       # to one row on a FINAL read — no inflation). Reuses this job's
-      # ClickHouse 24.8 container.
+      # ClickHouse 26.3 container.
       - name: Log stream registration backfill (live L1/L2 failure injection)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -971,7 +971,7 @@ jobs:
       # across a forced duplicate re-insert) and L-M2 (metric_metadata
       # "false Poisoned": the backfill's genuine duplicate plus a stale
       # re-insert both collapse to one FINAL row whose survivor is the
-      # max-updated_ns descriptor). Reuses this job's ClickHouse 24.8
+      # max-updated_ns descriptor). Reuses this job's ClickHouse 26.3
       # container.
       - name: Metric registration backfill (live L-M1/L-M2 failure injection)
         env:
@@ -985,7 +985,7 @@ jobs:
       # finds nothing; after the heal the primary-key probe returns the
       # trace_id, the span matches, and a forced duplicate collapses to
       # FINAL count 1). The TraceQL-executor end-to-end proof is the
-      # #167 step below. Reuses this job's ClickHouse 24.8 container.
+      # #167 step below. Reuses this job's ClickHouse 26.3 container.
       - name: Trace attr-index registration backfill (live L-T1 failure injection)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -999,7 +999,7 @@ jobs:
       # fetchable by trace id yet invisible to an attribute-scoped
       # search; post-heal the IDENTICAL SearchPlan (whose single
       # generator targets trace_attrs_idx) finds it. Reuses this job's
-      # ClickHouse 24.8 container.
+      # ClickHouse 26.3 container.
       - name: Trace attr-search heal end-to-end (live #167 executor proof)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1013,7 +1013,7 @@ jobs:
       # stable). `--profile ci` hard-codes a fixed, small cardinality set
       # ([1_000, 10_000, 50_000]) and rejects any `--metric-cardinalities`
       # override, so this step can never silently run the 5M-series
-      # design-target shape in CI. Reuses this job's ClickHouse 24.8
+      # design-target shape in CI. Reuses this job's ClickHouse 26.3
       # container.
       - name: M2 metrics-labels benchmark (--profile ci smoke)
         run: |
@@ -1039,7 +1039,7 @@ jobs:
       # override, so this step never silently runs the 50,000-breadth
       # verdict-evaluation shape in CI (that is `--profile full`,
       # manual-only — see docs/benchmarks/m1-logs-late-hydration.md's
-      # reproduction section). Reuses this job's ClickHouse 24.8 container.
+      # reproduction section). Reuses this job's ClickHouse 26.3 container.
       - name: M1 late-hydration benchmark (--profile ci smoke)
         run: |
           cargo run -p xtask -- bench logs-hydration \
@@ -1067,6 +1067,17 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-clickhouse --test live_clickhouse
+
+      # Issue #376: every setting this workspace injects must exist on the
+      # connected server and not be Obsolete — the class of breakage a
+      # version bump produces silently, because ClickHouse ignores a
+      # retired setting rather than failing the query. Read-only queries
+      # against `system.settings`; no database of its own.
+      - name: Live injected-settings liveness check
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-clickhouse --test injected_settings
 
       - name: Live cityHash64 fixture cross-check
         env:
@@ -1142,7 +1153,7 @@ jobs:
       # run time — no committed keys) and proves the inbound TLS listener
       # end-to-end: /ready reaches 200 over TLS, a plaintext GET on the
       # TLS port gets no valid HTTP response, and /config over TLS shows
-      # both path fields. Reuses this job's ClickHouse 24.8 container.
+      # both path fields. Reuses this job's ClickHouse 26.3 container.
       - name: Live inbound TLS suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1174,7 +1185,7 @@ jobs:
       # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
       # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406
       # mapping), dedup, short-id resolution, canonical ordering. Reuses
-      # this job's ClickHouse 24.8 container.
+      # this job's ClickHouse 26.3 container.
       - name: Live traces API suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1191,7 +1202,7 @@ jobs:
       # hard byte ceiling on multi-byte UTF-8), AC-A3 (the reshaped
       # retention-counter trip with its full drift guard), AC-B1 (the
       # phase-1 generator memory ceiling trips 241 -> 422). Reuses this
-      # job's ClickHouse 24.8 container.
+      # job's ClickHouse 26.3 container.
       - name: TraceQL search EXPLAIN + budget gates (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1203,7 +1214,7 @@ jobs:
       # the pre-committed q= cases, legacy-params equivalence, ordering/
       # tiebreak, cap/partial contract, scan-budget 422. Wired here by
       # issue #58 — the step was omitted when #57 landed. Reuses this job's
-      # ClickHouse 24.8 container.
+      # ClickHouse 26.3 container.
       - name: Live traces search suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1214,7 +1225,7 @@ jobs:
       # gates on the exact tags_sql shapes — strict (scope)/(scope, key)
       # primary-key-prefix pruning for the scoped shapes (two-shape
       # query_log comparison), the two unscoped degraded paths recorded.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 26.3 container.
       - name: Tag catalog EXPLAIN gate (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1225,7 +1236,7 @@ jobs:
       # §4.3 tags/tag-values surface end-to-end — deduped scoped names,
       # typed value inference, q= superset semantics, the truncation
       # contract, and the zero-payload query_log proof (catalog-only
-      # reads). Reuses this job's ClickHouse 24.8 container.
+      # reads). Reuses this job's ClickHouse 26.3 container.
       - name: Live traces tags suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1240,7 +1251,7 @@ jobs:
       # issue #252 it also carries AC13: the log2 histogram's scan-row
       # identity against a count-only query over the byte-identical inner
       # subquery, and its exact result-row identity at typical AND
-      # maximum bucket occupancy. Reuses this job's ClickHouse 24.8
+      # maximum bucket occupancy. Reuses this job's ClickHouse 26.3
       # container.
       - name: TraceQL metrics EXPLAIN + budget gates (Tier 1)
         env:
@@ -1257,7 +1268,7 @@ jobs:
       # sub-2ns guard (spans of -1/0/1 ns produce no __bucket series
       # while count_over_time counts them), and the ledgered
       # quantile-divergence direction. Reuses this job's ClickHouse
-      # 24.8 container.
+      # 26.3 container.
       - name: Live traces metrics consistency suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1269,7 +1280,7 @@ jobs:
       # MinMax prune (narrow < full parts + read_rows ratio), leading-side
       # PrimaryKey prune, the Array(Float64) quantile wire-type pin, merge
       # invariance (OPTIMIZE ... FINAL), and the scan-budget 422 trip.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 26.3 container.
       - name: Service graph EXPLAIN + budget gates (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1281,7 +1292,7 @@ jobs:
       # GET /api/traces/v1/service_graph exact JSON edges (client fan-out,
       # messaging vs cross-kind decoy, error failed count, replay + FINAL
       # invariance, Zipkin shared-span correctness). Reuses this job's
-      # ClickHouse 24.8 container.
+      # ClickHouse 26.3 container.
       - name: Live service graph suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1291,7 +1302,7 @@ jobs:
       # Issue #36: the live exhaustive API conformance matrix — every
       # mounted route x case-class over loopback HTTP against five
       # `pulsusdb` spawns (mode/auth/compat permutations), reusing this
-      # job's ClickHouse 24.8 container. The hermetic drift-guard/docs-gap
+      # job's ClickHouse 26.3 container. The hermetic drift-guard/docs-gap
       # half (`route_inventory`) needs no step here — it runs under the
       # `ci` job's plain `cargo test --workspace` above.
       - name: API conformance matrix
@@ -1307,7 +1318,7 @@ jobs:
       # the first-page start bound and slice-bounded backlog scans proven
       # from system.query_log, the live slow-consumer eviction/accounting
       # contract, the tail-vs-range differential, and the
-      # /loki/api/v1/tail alias. Reuses this job's ClickHouse 24.8
+      # /loki/api/v1/tail alias. Reuses this job's ClickHouse 26.3
       # container.
       - name: Live logs tail (WebSocket) suite
         env:
@@ -1322,7 +1333,7 @@ jobs:
       # `| line_format "{{ __timestamp__ }}"` response text. The hermetic
       # suites cannot see this: removing the install call from serve::run
       # leaves every one of them green. Reuses this
-      # job's ClickHouse 24.8 container.
+      # job's ClickHouse 26.3 container.
       - name: Live LogQL template timezone suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1333,7 +1344,7 @@ jobs:
       # the adjudicated partition-count proxy), the Tier-1 rollup-vs-raw
       # pushdown routing gate from X-Pulsus-Explain stage SQL, and
       # /loki/api/v1/index/stats byte-identity. Reuses this
-      # job's ClickHouse 24.8 container.
+      # job's ClickHouse 26.3 container.
       - name: Live logs stats suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1345,7 +1356,7 @@ jobs:
       # truncation, the zero-body-read pushdown proof from
       # X-Pulsus-Explain stage SQL (log_metrics_5s only, never
       # log_samples), and /loki/api/v1/index/volume byte-identity.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 26.3 container.
       - name: Live logs volume suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1369,7 +1380,7 @@ jobs:
       # answered from that window rather than the calendar month, and —
       # separately named because it discriminates a different wrong fix —
       # a line whose rollup bucket STARTS BEFORE `start` still counts.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Reuses this job's ClickHouse 26.3 container.
       - name: Live logs detected labels/fields suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1382,7 +1393,7 @@ jobs:
       # correctness gate live: the pushed stream is queryable via LogQL
       # query_range (native + /loki alias) and appears in
       # /api/logs/v1/tail with its exact entries + labels. Reuses this
-      # job's ClickHouse 24.8 container.
+      # job's ClickHouse 26.3 container.
       - name: Live Loki push receiver round-trip
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -1406,21 +1417,21 @@ jobs:
           CLICKHOUSE_DB: pulsus
         run: ./target/debug/pulsusdb --mode init
 
-      - name: Stop ClickHouse 24.8
+      - name: Stop ClickHouse 26.3
         if: always()
         run: docker rm -f pulsus-ch-schema-it
 
-      - name: Start ClickHouse 24.3 (below the minimum supported version)
+      - name: Start ClickHouse 24.8 (below the minimum supported version)
         run: |
           docker run -d --name pulsus-ch-schema-it-old -p 19124:8123 -p 19001:9000 \
             -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
-            clickhouse/clickhouse-server:24.3
+            clickhouse/clickhouse-server:24.8
           for _ in $(seq 1 30); do
             curl -sf http://localhost:19124/ping && break
             sleep 1
           done
 
-      - name: "--mode init refuses ClickHouse < 24.8 with a clear error"
+      - name: "--mode init refuses ClickHouse < 26.3 with a clear error"
         env:
           CLICKHOUSE_SERVER: localhost
           CLICKHOUSE_HTTP_PORT: "19124"
@@ -1432,15 +1443,15 @@ jobs:
           set -e
           echo "$output"
           if [ "$status" -eq 0 ]; then
-            echo "::error::expected a nonzero exit refusing ClickHouse < 24.8, got 0"
+            echo "::error::expected a nonzero exit refusing ClickHouse < 26.3, got 0"
             exit 1
           fi
-          if ! echo "$output" | grep -qi "24.8"; then
-            echo "::error::refusal message did not name the minimum supported version (24.8)"
+          if ! echo "$output" | grep -qi "26.3"; then
+            echo "::error::refusal message did not name the minimum supported version (26.3)"
             exit 1
           fi
 
-      - name: Stop ClickHouse 24.3
+      - name: Stop ClickHouse 24.8
         if: always()
         run: docker rm -f pulsus-ch-schema-it-old
 

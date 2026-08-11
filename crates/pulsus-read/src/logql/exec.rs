@@ -3815,9 +3815,12 @@ fn scan_budget_spent(spent: u64, budget: u64) -> bool {
 /// timeout or vice versa.
 ///
 /// **The #412 rule.** `ChError::Server.code` is parsed out of the
-/// exception TEXT on ClickHouse 24.8, and a user-supplied regex can reach
-/// that text, so the code is spoofable on `main` today (issue #412, which
-/// closes with the 26.3 move, #376). The classification here is designed
+/// exception TEXT, and a user-supplied regex can reach that text, so the
+/// code is spoofable (issue #412). **#376's move to 26.3 narrows this and
+/// does NOT close it** — the final-chunk path is sound there, but
+/// `extract_exception` runs per chunk and a non-final chunk ending `))\n`
+/// still reaches the forgeable search, so #412 stays open on the version we
+/// run. The classification here is designed
 /// so a wrong code can never make anything worse:
 ///
 /// 1. The BOUND is not the parse — `max_memory_usage` is enforced by

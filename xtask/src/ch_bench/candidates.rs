@@ -11,6 +11,19 @@ use futures::StreamExt;
 use super::CrateUnderTest;
 use super::rows::{AggRow, LogRow, MetricRow};
 
+/// Every benchmark client this module builds pins `async_insert = 0`, the
+/// same value `ChClient` pins on the product write path (issue #376).
+///
+/// ClickHouse flipped the default to `1` at 26.2, and these clients talk to
+/// the server directly rather than through `ChClient`, so without this they
+/// would inherit it. That is not a correctness defect — nothing here is a
+/// production write path — it is a **measurement-validity** one: a benchmark
+/// that informs a read- or write-path decision has to run the settings the
+/// shipped system runs, or its numbers describe a system we do not ship.
+/// The gap is not hypothetical on this setting: default-on measured 1.76x
+/// slower than pinned-off across `pulsus-write`'s live suites on 26.3.17.110.
+pub(super) const BENCH_ASYNC_INSERT: &str = "0";
+
 // ---------------------------------------------------------------------
 // clickhouse (HTTP + RowBinary)
 // ---------------------------------------------------------------------
@@ -24,7 +37,11 @@ impl ChCandidate {
         let mut client = clickhouse::Client::default()
             .with_url(url)
             .with_database(database)
-            .with_user(user);
+            .with_user(user)
+            // Pinned on the CLIENT, not per call site, so every statement
+            // this candidate issues carries it — inserts, `INSERT ...
+            // SELECT`, DDL and fetches alike. See [`BENCH_ASYNC_INSERT`].
+            .with_setting("async_insert", BENCH_ASYNC_INSERT);
         if !password.is_empty() {
             client = client.with_password(password);
         }
@@ -174,6 +191,7 @@ impl KlCandidate {
             tcp_nodelay: true,
         };
         let client = klickhouse::Client::connect(addr, options).await?;
+        Self::pin_session_settings(&client).await?;
         Ok(Self { client })
     }
 }
@@ -213,6 +231,20 @@ struct KlAggRow {
     val_count: u64,
     first_value: f64,
     last_value: f64,
+}
+
+impl KlCandidate {
+    /// `klickhouse` has no per-client settings map, so the session is set
+    /// once immediately after connect — a native session carries `SET`
+    /// forward, which makes this the same choke point the HTTP candidate
+    /// gets from `with_setting`. Both the plaintext constructor above and
+    /// the TLS one in `tls.rs` route through here.
+    pub(super) async fn pin_session_settings(client: &klickhouse::Client) -> anyhow::Result<()> {
+        client
+            .execute(format!("SET async_insert = {BENCH_ASYNC_INSERT}"))
+            .await?;
+        Ok(())
+    }
 }
 
 impl CrateUnderTest for KlCandidate {

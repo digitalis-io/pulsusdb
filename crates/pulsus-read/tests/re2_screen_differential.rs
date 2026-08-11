@@ -50,7 +50,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test re2_screen_differential
 //! ```
 //!
@@ -601,23 +601,38 @@ const fn raw(pattern: &'static str, subject: &'static str) -> RawMatchProbe {
 }
 
 /// Issue #331 (superseding issue #324's single-entry exemption list):
-/// ClickHouse's `OptimizedRegularExpression::analyze` leaks a `(?…`
+/// ClickHouse's `OptimizedRegularExpression::analyze` used to leak a `(?…`
 /// flag-group head's own characters into the required substring it
-/// extracts, whenever the head's flags carry no `i`. Measured on
-/// 24.8.14.39: `match('xaby', '(?s:ab)')` is `0` while `match('xs:aby',
-/// '(?s:ab)')` is `1` — the server is requiring the literal `s:ab` —
-/// and `replaceRegexpOne`, which reaches RE2 without the wrapper,
-/// matches. Every entry here is a form measured broken, across the
-/// full enumeration: scoped and flag-only heads, every `{s,m,U}`
+/// extracts, whenever the head's flags carried no `i`. Measured on
+/// 24.8.14.39: `match('xaby', '(?s:ab)')` was `0` while `match('xs:aby',
+/// '(?s:ab)')` was `1` — the server was requiring the literal `s:ab` —
+/// while `replaceRegexpOne`, which reaches RE2 without the wrapper,
+/// matched. Every entry here is a form that was measured broken, across
+/// the full enumeration: scoped and flag-only heads, every `{s,m,U}`
 /// combination, positive and negated, two-sided, repeated, mid-pattern,
 /// grouped, and inside the read path's own anchored template.
 ///
-/// **The rot check:** the registry test asserts every entry is STILL
-/// broken raw. The day a ClickHouse upgrade fixes the analyzer, that
-/// assertion fails and the issue #331 workaround
-/// (`pulsus_re2::clickhouse_match_strategy` and the render shapes in
-/// `logql::escape`) is retired rather than carried dead.
-const CLICKHOUSE_STILL_BROKEN_RAW: &[RawMatchProbe] = &[
+/// **The rot check fired, and this is what it found (issue #376).** The
+/// registry used to assert every entry was STILL broken; on the move to
+/// 26.3 that assertion failed on the first entry, which is exactly the
+/// stopping rule it was written for. Replayed in full against both
+/// servers — the probe parses these arrays out of this file, so it
+/// cannot drift from them:
+///
+/// - these **28** entries: `match()` is `0` on **24.8.14.39** and `1` on
+///   **26.3.17.110**, with `replaceRegexpOne` matching on both. The
+///   analyzer defect is **fixed** on the version we run.
+/// - [`CLICKHOUSE_STILL_SOUND_RAW`]'s **34** premises: `1`/`1` on both,
+///   so the `-i` rewrite is still sound.
+/// - [`CLICKHOUSE_NEVER_MATCH_RAW`]'s **4** probes: `0`/`0` on both.
+///
+/// So the issue #331 workaround (`pulsus_re2::clickhouse_match_strategy`
+/// and the render shapes in `logql::escape`) becomes **redundant, not
+/// wrong**, and is deliberately RETAINED here: retiring it is issue
+/// #331's call, not a version bump's. The entries keep their subjects
+/// and change direction — they now assert the fix HOLDS, so a server
+/// that regressed the analyzer would redden this suite just as loudly.
+const CH_FLAG_HEAD_ANALYZER_FIXED_IN_26_3: &[RawMatchProbe] = &[
     raw("(?s:a)", "xay"),
     raw("(?s:ab)", "xaby"),
     raw("(?s:a.b)", "xa-by"),
@@ -968,12 +983,12 @@ async fn raw_verdicts(client: &ChClient, p: &RawMatchProbe) -> (char, char) {
 }
 
 /// The issue #331 registry, all three faces (see the consts above):
-/// every recorded defect is STILL broken raw (the rot check — a
-/// ClickHouse fix turns up here, and the workaround is then retired,
-/// never carried dead), every premise the workaround rests on still
-/// holds, and the never-matching arm still never matches. Probed RAW,
-/// never through the renderer, so this test is independent of the fix
-/// it justifies.
+/// every recorded flag-head defect is now FIXED on the server we run
+/// (the rot check fired on the move to 26.3 — issue #376 — and the
+/// entries changed direction rather than being deleted), every premise
+/// the workaround rests on still holds, and the never-matching arm still
+/// never matches. Probed RAW, never through the renderer, so this test
+/// is independent of the fix it justifies.
 #[tokio::test]
 async fn the_flag_head_defect_registry_holds_raw() {
     if !should_run() {
@@ -984,7 +999,7 @@ async fn the_flag_head_defect_registry_holds_raw() {
         return;
     }
     let client = ChClient::new(test_config()).await.expect("connect");
-    for p in CLICKHOUSE_STILL_BROKEN_RAW {
+    for p in CH_FLAG_HEAD_ANALYZER_FIXED_IN_26_3 {
         let (ch, re2) = raw_verdicts(&client, p).await;
         assert_eq!(
             re2, '1',
@@ -992,11 +1007,12 @@ async fn the_flag_head_defect_registry_holds_raw() {
             p.pattern, p.subject
         );
         assert_eq!(
-            ch, '0',
-            "{:?} vs {:?}: ClickHouse's match() now AGREES with RE2 — the analyzer defect \
-             is fixed on this server. Delete this entry, and once the list is empty retire \
-             the issue #331 workaround (pulsus_re2::clickhouse_match_strategy and the \
-             render shapes in logql::escape).",
+            ch, '1',
+            "{:?} vs {:?}: ClickHouse's match() DISAGREES with RE2 again — the flag-head \
+             analyzer defect issue #331 records, fixed as of 26.3.17.110 and measured \
+             broken on 24.8.14.39, is back on this server. The issue #331 workaround is \
+             still rendered, so reads stay correct; this is a signal that the server \
+             regressed, not that our rendering did.",
             p.pattern, p.subject
         );
     }
@@ -1023,8 +1039,8 @@ async fn the_flag_head_defect_registry_holds_raw() {
         );
     }
     println!(
-        "flag-head defect registry: {} broken, {} sound, {} never-match probes all hold",
-        CLICKHOUSE_STILL_BROKEN_RAW.len(),
+        "flag-head defect registry: {} fixed-on-26.3, {} sound, {} never-match probes all hold",
+        CH_FLAG_HEAD_ANALYZER_FIXED_IN_26_3.len(),
         CLICKHOUSE_STILL_SOUND_RAW.len(),
         CLICKHOUSE_NEVER_MATCH_RAW.len()
     );

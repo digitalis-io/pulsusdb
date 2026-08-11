@@ -100,11 +100,42 @@ impl ChClient {
     }
 
     /// The complete settings the insert path attaches (issue #114): the
-    /// server-side deadline (`max_execution_time`) plus — when quorum is
-    /// enabled — the quorum trio. Pool-free and pure, so
+    /// server-side deadline (`max_execution_time`), `async_insert = 0`, and
+    /// — when quorum is enabled — the quorum trio. Pool-free and pure, so
     /// [`Self::insert_block`]'s exact injected set is unit-testable directly.
+    ///
+    /// **`async_insert = 0` is pinned, not inherited (issue #376).**
+    /// ClickHouse flipped its default `0 → 1` at 26.2
+    /// (`system.settings_changes`: "Enable async inserts by default."), and
+    /// that default is a loss for this writer rather than a gain: async
+    /// insert exists to coalesce many small inserts, and
+    /// [`Self::insert_block`] already sends one columnar block per batch, so
+    /// all it adds is the adaptive busy timeout (50–200 ms) on the way to a
+    /// flush the batch did not need. Measured on 26.3.17.110 across five
+    /// `pulsus-write` live suites, 1 warmup discarded and 5 reps taken
+    /// interleaved between two otherwise identical servers: default-on
+    /// 23.51 / 22.52 / 23.98 / 22.66 / 23.92 s against pinned-off 12.77 /
+    /// 12.69 / 13.38 / 13.72 / 14.51 s — **1.76x slower at the median, with
+    /// no overlap between the two distributions.** `logs_tail_live` passes
+    /// on both legs with no deadline change, so read-your-write is not what
+    /// decides it (`wait_for_async_insert` is `1` on both versions anyway).
+    /// It is also the setting #114's quorum reasoning and #143's
+    /// effectively-once design both assume.
+    ///
+    /// **Scope of the pin, stated so it is not read as wider than it is.**
+    /// It covers [`Self::insert_block`], which is the whole production data
+    /// path — `git grep -n "INSERT INTO" -- crates/*/src` finds no other
+    /// production insert, only `schema_migrations`/`mv_checksums`
+    /// bookkeeping. Verified on the connected server rather than argued:
+    /// after a `pulsus-write` live run, every `INSERT INTO \`log_samples\``
+    /// / \`log_streams\` / \`metric_series\` / … row in
+    /// `system.query_log` carries `Settings['async_insert'] = '0'`, while
+    /// the rows that do NOT are test-fixture `execute()` seeding and
+    /// migration bookkeeping, which are not this path.
     fn insert_settings_of(c: &ConsistencyConfig, timeout: Duration) -> QuerySettings {
-        c.insert_settings().with_max_execution_time(timeout)
+        c.insert_settings()
+            .set("async_insert", 0)
+            .with_max_execution_time(timeout)
     }
 
     /// The complete settings the read path attaches (issue #114): the
@@ -219,6 +250,20 @@ impl ChClient {
 
     /// DDL / maintenance statement. Settings are injected per-statement.
     ///
+    /// **Carries the same `async_insert = 0` pin as the insert path**
+    /// ([`Self::insert_settings_of`] explains why we do not want async
+    /// inserts at all). It matters here because this method also runs
+    /// `INSERT` statements — `pulsus-schema`'s `schema_migrations` /
+    /// `mv_checksums` bookkeeping writes a row and a later step reads it
+    /// back, which is read-your-write. From ClickHouse 26.2 the server
+    /// default is `1`, so without this pin those inserts would be buffered
+    /// and a reconcile could read state that has not landed. Measured
+    /// (issue #376): `logs_tail_live`, whose fixtures seed through this
+    /// method, failed **3 of 6 runs** against a 26.3 server at the stock
+    /// default and passed **6 of 6** against an otherwise identical 26.3
+    /// server with `async_insert = 0`. Harmless on the DDL statements that
+    /// make up the rest of this method's traffic.
+    ///
     /// The wrapper auto-retries a *retryable* [`ChError`] only when
     /// `idem == Idempotency::Idempotent`, up to [`MAX_IDEMPOTENT_RETRIES`]
     /// with capped exponential backoff. `Idempotency::NonIdempotent`
@@ -234,7 +279,10 @@ impl ChClient {
         s: &QuerySettings,
         idem: Idempotency,
     ) -> Result<(), ChError> {
-        let settings = s.clone().with_max_execution_time(self.default_timeout);
+        let settings = s
+            .clone()
+            .set("async_insert", 0)
+            .with_max_execution_time(self.default_timeout);
         let mut attempt = 0u32;
         loop {
             let conn = self.pool.get().await?;
@@ -375,13 +423,37 @@ mod tests {
         const { assert!(MAX_IDEMPOTENT_RETRIES > 0 && MAX_IDEMPOTENT_RETRIES <= 10) };
     }
 
-    /// AC3 (issue #114): the default (quorum off) insert emits ONLY the
-    /// deadline — byte-for-byte the pre-#114 insert.
+    /// AC3 (issue #114): the default (quorum off) insert emits only the
+    /// deadline and the pinned `async_insert = 0` (issue #376) — nothing
+    /// else.
     #[test]
-    fn insert_settings_of_default_emits_only_the_deadline() {
+    fn insert_settings_of_default_emits_the_deadline_and_the_async_insert_pin() {
         let s =
             ChClient::insert_settings_of(&ConsistencyConfig::default(), Duration::from_secs(120));
-        assert_eq!(s.render_suffix(), " SETTINGS max_execution_time = 120.000");
+        assert_eq!(
+            s.render_suffix(),
+            " SETTINGS async_insert = 0, max_execution_time = 120.000"
+        );
+    }
+
+    /// Issue #376: the writer pins `async_insert = 0` rather than
+    /// inheriting the server default, which flipped to `1` at ClickHouse
+    /// 26.2. Measured 1.76x slower on this writer's own batches — see
+    /// [`ChClient::insert_settings_of`]. Deleting the pin reddens here.
+    #[test]
+    fn every_insert_pins_async_insert_off_whatever_the_server_default_is() {
+        for c in [
+            ConsistencyConfig::default(),
+            ConsistencyConfig {
+                insert_quorum: 2,
+                insert_quorum_parallel: true,
+                insert_quorum_timeout: Duration::from_secs(5),
+                select_sequential_consistency: true,
+            },
+        ] {
+            let s = ChClient::insert_settings_of(&c, Duration::from_secs(120));
+            assert_eq!(s.get("async_insert"), Some("0"), "{c:?}");
+        }
     }
 
     /// AC4 (issue #114): the default (sequential consistency off) select

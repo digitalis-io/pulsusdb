@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test live_metrics_cache
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -815,7 +815,33 @@ async fn a_memory_bounded_sweep_failure_retains_the_last_good_snapshot() {
     seed(&client, &small).await;
 
     let mut cfg = cache_config(db, "metric_series", 24 * 3_600_000, Duration::from_secs(60));
-    cfg.read_max_memory_bytes = 1024;
+    // Re-derived on the move to ClickHouse 26.3 (issue #376). This was
+    // `1024`, which 24.8.14.39 accepted for the small sweep; 26.3.17.110
+    // reserves ~1.17 MiB for the query before it reads anything, so the
+    // small sweep failed at 1 KiB and the test's FIRST half broke — the
+    // half that proves the cache is functional under the ceiling.
+    //
+    // Re-measured the way this test's own comment says the sizing is
+    // measured — by running the sweep at candidate ceilings over both
+    // corpora, on both servers:
+    //
+    // | cap      | 24.8 small | 24.8 wide | 26.3 small | 26.3 wide |
+    // |----------|------------|-----------|------------|-----------|
+    // | 1 KiB    | ok         | 241       | 241        | 241       |
+    // | 64 KiB   | ok         | 241       | 241        | 241       |
+    // | 1 MiB    | ok         | 241       | 241        | 241       |
+    // | 4 MiB    | ok         | 241       | **ok**     | **241**   |
+    // | 16 MiB   | ok         | 241       | ok         | 241       |
+    //
+    // 4 MiB is the smallest probed value that keeps BOTH halves on 26.3,
+    // and it keeps them on 24.8 too. Headroom is real in both directions:
+    // the small sweep needs 1.17 MiB (3.4x under the ceiling) and the
+    // widened one asks for 7.51 MiB at this ceiling and 20.01 MiB at
+    // 16 MiB, so neither half is sitting on a cliff. Only the fixture
+    // moved — `reader.promql_read_max_memory_bytes`'s product default is
+    // untouched, and this value is deliberately tiny so the failure path
+    // is reachable at CI scale at all.
+    cfg.read_max_memory_bytes = 4 * 1024 * 1024;
     let cache_client = ChClient::new(test_config(db))
         .await
         .expect("connect (cache client)");

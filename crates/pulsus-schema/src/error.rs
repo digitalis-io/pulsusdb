@@ -16,8 +16,10 @@ pub enum SchemaError {
     /// The connected server's `SELECT version()` is older than the M0
     /// minimum (docs/schemas.md §8: ClickHouse 24.8 LTS).
     #[error(
-        "unsupported ClickHouse version {found:?}: PulsusDB requires >= 24.8 \
-         (docs/schemas.md §8 — projections + modern TTL/SimpleAggregateFunction behavior)"
+        "unsupported ClickHouse version {found:?}: PulsusDB requires >= 26.3 \
+         (docs/schemas.md §8 — the supported LTS line; older servers do not \
+         tag an HTTP-200 mid-stream exception, so it cannot be told apart \
+         from result text — issue #412)"
     )]
     UnsupportedVersion { found: String },
 
@@ -54,10 +56,10 @@ mod tests {
     #[test]
     fn unsupported_version_message_names_the_found_version() {
         let err = SchemaError::UnsupportedVersion {
-            found: "24.3.2.1".to_string(),
+            found: "24.8.14.39".to_string(),
         };
-        assert!(err.to_string().contains("24.3.2.1"));
-        assert!(err.to_string().contains("24.8"));
+        assert!(err.to_string().contains("24.8.14.39"));
+        assert!(err.to_string().contains("26.3"));
     }
 
     #[test]

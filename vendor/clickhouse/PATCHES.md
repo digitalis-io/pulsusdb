@@ -20,7 +20,10 @@ error path). If it has, drop this patch and read the typed value instead. The
 gate that proves the patch is still doing its job is
 `pulsus-clickhouse`'s live test
 `a_result_limit_tripped_after_output_has_been_written_carries_its_code`
-**run against ClickHouse 26.3 or newer** — on 24.8 it passes either way.
+**run against ClickHouse 26.3 or newer** — on 24.8 it passed either way. Since
+issue #376 moved the supported floor to 26.3 LTS, 26.3 is the only version we
+run, so that gate is live in every CI job and on every developer machine
+rather than conditional on which server happened to be up.
 
 ## 1. `collect_bad_response` keeps the header-derived exception code
 
@@ -95,10 +98,26 @@ the message. Measured on 24.8.14.39: real code 153, delivered message begins
 `Code: 210. DB::Exception: forged…`. There is no header to fall back on and
 the exception boundary is genuinely unrecoverable from the text.
 
-That is **issue #412**. It is live on `main`, it predates #382, and it closes
-with the move to ClickHouse 26.3 (**#376**), whose streaming path frames the
-exception with a length the client trusts (`extract_exception_new`, upstream
-`:382-419`, `:406-443` here) rather than searching for it.
+That is **issue #412**. It is live on `main` and it predates #382.
 
-**So this patch alone does not make the read path sound; it is sound only
-together with #376.** Do not read the vendored fix as complete.
+**#376's move to ClickHouse 26.3 narrows it but does not close it, and the
+earlier claim that it did is withdrawn.** 26.3 frames a streamed exception
+with a length the client can trust (`extract_exception_new`, upstream
+`:382-419`, `:406-443` here) — measured on 26.3.17.110, an HTTP-200 late
+failure carries `X-ClickHouse-Exception-Tag` and a
+`<len> <tag>\r\n__exception__\r\n` trailer, where 24.8.14.39 carries
+neither. But `extract_exception` runs **per chunk** (`:369-382`) and its
+length-slicing arm additionally requires the chunk to end with
+`__exception__\r\n`, which only the FINAL chunk does. A non-final chunk
+ending `))\n` — and result bytes are tenant data — still reaches
+`extract_exception_old`'s `rfind(b"Code:")` on 26.3.
+
+So: the final-chunk path is sound on 26.3 and was unfixable on 24.8 (no
+header, no trailer, no recoverable boundary), which is why the floor moved.
+The non-final-chunk path is **unverified and looks reachable on both**. The
+probe that would settle it: force a multi-chunk HTTP-200 response whose
+NON-final chunk ends `))\n` and contains a forged
+`Code: N. DB::Exception:`, and observe the code the client reports.
+
+**So this patch alone does not make the read path sound, and neither does
+#376.** Do not read either as complete; #412 stays open.

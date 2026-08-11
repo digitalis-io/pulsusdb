@@ -101,11 +101,24 @@ unrecoverable from the text, so neither this patch nor an upstream one can fix
 it.
 
 That is **#412**. It is live on `main` and predates #382 — the pre-#382
-`strip_prefix` read returns the same forged 210. It closes with **#376**, the
-move to ClickHouse 26.3, whose streaming path frames the exception with a
-length the client trusts (`extract_exception_new`) instead of searching for it.
+`strip_prefix` read returns the same forged 210.
 
-**Soundness is this ADR *and* #376.** The limitation is pinned by
+**#376's move to ClickHouse 26.3 narrows it but does NOT close it, and the
+earlier claim that it did is withdrawn.** 26.3's streaming path does frame the
+exception with a length the client trusts (`extract_exception_new`) — measured
+on `26.3.17.110`, an HTTP-200 late failure carries
+`X-ClickHouse-Exception-Tag` and a `<len> <tag>\r\n__exception__\r\n`
+trailer where `24.8.14.39` carries neither. But `extract_exception`
+(`src/response.rs:369-382`) runs **per chunk**, and its length-slicing arm
+additionally requires the chunk to end with `__exception__\r\n`, which only
+the FINAL chunk does. A non-final chunk ending `))\n` — and result bytes are
+tenant data — still reaches `extract_exception_old`'s `rfind(b"Code:")` on
+26.3. The discriminating probe, unrun: force a multi-chunk HTTP-200 response
+whose non-final chunk ends `))\n` and contains a forged
+`Code: N. DB::Exception:`, and observe the code the client reports.
+
+**So neither this ADR nor #376 makes the path sound.** #412 stays open. The
+limitation is pinned by
 `pulsus_clickhouse::error`'s
 `on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412`, on a
 verbatim 24.8 capture, so it fails loudly if a future crate or server version

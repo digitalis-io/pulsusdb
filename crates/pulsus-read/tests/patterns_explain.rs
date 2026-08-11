@@ -1,6 +1,6 @@
 //! Live Tier-1 gate + end-to-end engine assertion for `/api/logs/v1/patterns`
 //! (M7-C3, issue #171). Gated behind `PULSUS_TEST_CLICKHOUSE=1`, reusing the
-//! `explain_indexes.rs` harness pattern against the same ClickHouse 24.8
+//! `explain_indexes.rs` harness pattern against the same ClickHouse 26.3
 //! container the `schema-it` CI job runs.
 //!
 //! Two proofs (AC6, v2 PK-order delta):
@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-patterns -p 19123:8123 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test patterns_explain
 //! podman rm -f pulsus-ch-patterns
 //! ```

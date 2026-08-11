@@ -1,5 +1,5 @@
 //! Issue #173 (M7-E1) AC7/AC-new: live Tier-1 gates for the service-graph
-//! read against ClickHouse 24.8 (scale-invariant ratios only — no
+//! read against ClickHouse 26.3 (scale-invariant ratios only — no
 //! wall-time asserts). Seeds a multi-day `trace_edges` corpus through the
 //! ingest MV (spans → `trace_edges_mv` → `trace_edges`), then proves:
 //!
@@ -22,7 +22,7 @@
 //! Live-gated behind `PULSUS_TEST_CLICKHOUSE=1`:
 //!
 //! ```text
-//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:24.8
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-read --test traces_graph_explain
 //! podman rm -f pulsus-ch-test
 //! ```

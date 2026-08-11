@@ -39,7 +39,7 @@
 //! ))
 //! ```
 //!
-//! against a live ClickHouse 24.8 server, substituting that fixture's own
+//! against a live ClickHouse 26.3 server, substituting that fixture's own
 //! `golden.labels_json` keys/values in sorted order — e.g. case 1's
 //! `deployment_environment`/`k8s_pod_name`/`service_name` pairs, in that
 //! order (resource attributes only — scope is structured metadata now, not a
@@ -77,7 +77,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-write --test ingest_fidelity
 //! podman rm -f pulsus-ch-test
 //! ```

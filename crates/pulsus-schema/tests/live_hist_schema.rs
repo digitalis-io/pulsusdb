@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19124:8123 -p 19001:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=19124 \
 //!     cargo test -p pulsus-schema --test live_hist_schema
 //! podman rm -f pulsus-ch-test

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! podman run -d --name pulsus-ch-bench -p 19134:8123 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! cargo run -p xtask -- bench match-flag-head \
 //!     --http-url http://127.0.0.1:19134 --database pulsus_match_bench \
 //!     --reps 9

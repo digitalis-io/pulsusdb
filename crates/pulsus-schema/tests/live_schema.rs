@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
-//!     clickhouse/clickhouse-server:24.8
+//!     clickhouse/clickhouse-server:26.3
 //! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-schema --test live_schema
 //! podman rm -f pulsus-ch-test
 //! ```
@@ -583,7 +583,7 @@ async fn check_version_accepts_the_live_test_servers_reported_version() {
         .await
         .expect("select version()");
     let row = stream.next().await.expect("one row").expect("decode");
-    check_version(&row.v).expect("the live test server must be >= 24.8");
+    check_version(&row.v).expect("the live test server must be >= 26.3");
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]

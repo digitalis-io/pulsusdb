@@ -162,7 +162,13 @@ pub fn ch_candidate_over_tls(
     let mut client = clickhouse::Client::with_http_client(http)
         .with_url(https_url)
         .with_database(database)
-        .with_user(user);
+        .with_user(user)
+        // Same client-level pin as the plaintext HTTP candidate (issue
+        // #376) — found by a census of every `clickhouse::Client::` /
+        // `klickhouse::Client::` construction in the tree, not by the
+        // reviewer's list, so the TLS leg is not left measuring a
+        // configuration we do not ship.
+        .with_setting("async_insert", super::candidates::BENCH_ASYNC_INSERT);
     if !password.is_empty() {
         client = client.with_password(password);
     }
@@ -187,5 +193,8 @@ pub async fn kl_candidate_over_tls(
     let name = rustls_pki_types::ServerName::try_from(server_name.to_string())?;
     let connector = tokio_rustls::TlsConnector::from(config);
     let client = klickhouse::Client::connect_tls(addr, options, name, &connector).await?;
+    // Same session pin as the plaintext candidate (issue #376): a benchmark
+    // must run the settings the shipped system runs.
+    super::KlCandidate::pin_session_settings(&client).await?;
     Ok(super::KlCandidate { client })
 }

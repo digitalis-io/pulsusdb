@@ -147,7 +147,10 @@ fn re2_reject_detail(message: &str) -> String {
 ///
 /// **The #412 rule** (see `logql::exec::map_read_error`'s doc for the full
 /// argument): `ChError::Server.code` is parsed out of the exception text
-/// on ClickHouse 24.8 and is spoofable today. The BOUND is enforced by
+/// and is spoofable — on 24.8 unconditionally, and on 26.3 through the
+/// non-final chunks `extract_exception` still searches rather than slices,
+/// so #376's floor move narrowed this without closing it. The BOUND is
+/// enforced by
 /// ClickHouse regardless of the parse; a missed 241 falls open to the
 /// pre-#398 `500`; a false 241 only relabels an already-failing query; and
 /// this mapper is a pure function of the already-parsed `code` for the
@@ -303,6 +306,12 @@ mod tests {
     /// `while executing 'FUNCTION match(...)'` tail, which is what makes
     /// the "keep only the pattern and RE2's reason" cut load-bearing
     /// rather than cosmetic (the tail names internal table aliases).
+    ///
+    /// **Archived capture (issue #376).** 24.8.14.39 is no longer a version
+    /// we run. These bytes stay as captured — rewriting them to say `26.3`
+    /// would falsify a measurement — and the version-leak assertion below
+    /// derives its forbidden string FROM this fixture, so it follows
+    /// whatever server a future re-capture came from.
     const LIVE_427_BODY: &str = "Code: 427. DB::Exception: OptimizedRegularExpression: \
         cannot compile re2: ^(?:\\p{Alphabetic})$, error: invalid character class range: \
         \\p{Alphabetic}. Look at https://github.com/google/re2/wiki/Syntax for reference. \
@@ -317,17 +326,50 @@ mod tests {
         (CANNOT_COMPILE_REGEXP) (version 24.8.14.39 (official build))";
 
     /// Fragments of a real 427 body that must never reach a client.
+    ///
+    /// **No version spelling appears here (issue #376).** It used to carry
+    /// `"version 24.8"`, which made the claim "no server version string
+    /// leaks" true only of one server's spelling: on 26.3 that substring
+    /// never appears in any body, so the entry would have passed while
+    /// testing nothing. The version half of the claim is checked by
+    /// [`version_banner_of`] instead, which derives the forbidden string
+    /// from the fixture the test is actually rendering.
     const MUST_NOT_LEAK: &[&str] = &[
         "DB::Exception",
         "Code: 427",
         "wiki/Syntax",
-        "version 24.8",
         "OptimizedRegularExpression",
         "__table1",
         "MergeTreeSelect",
         "JSONExtractString",
         "while executing",
     ];
+
+    /// The `(version <x.y.z.w> (official build))` banner a server body
+    /// carries, extracted FROM that body rather than spelled out — so the
+    /// leak assertion's forbidden string follows whatever server produced
+    /// the fixture and can never go vacuous on a version bump.
+    ///
+    /// Returns both the whole banner and the bare version number, because
+    /// a partial leak (the number without its parentheses) is still a
+    /// leak.
+    fn version_banner_of(body: &str) -> (String, String) {
+        let start = body
+            .rfind("(version ")
+            .unwrap_or_else(|| panic!("fixture carries no `(version ...)` banner: {body:?}"));
+        let banner = body[start..].to_string();
+        let number = banner
+            .trim_start_matches("(version ")
+            .split_whitespace()
+            .next()
+            .expect("a version number after `(version `")
+            .to_string();
+        assert!(
+            number.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "extracted {number:?} from {banner:?}, which is not a version number"
+        );
+        (banner, number)
+    }
 
     fn rejection_detail(message: &str) -> String {
         let mapped = map_metrics_read_error(
@@ -364,17 +406,36 @@ mod tests {
             detail: rejection_detail(LIVE_427_BODY),
         }
         .to_string();
-        assert_eq!(
-            rendered,
-            "invalid regexp: ^(?:\\p{Alphabetic})$, error: invalid character class range: \
-             \\p{Alphabetic}"
-        );
+        // The leak assertions run FIRST, so a leak is reported as a leak
+        // rather than as a diff against the expected rendering. The
+        // equality below is the stronger statement and closes the test.
         for leak in MUST_NOT_LEAK {
             assert!(
                 !rendered.contains(leak),
                 "{leak:?} leaked into {rendered:?}"
             );
         }
+
+        // The version half of the claim, derived from the fixture rather
+        // than spelled (issue #376): whatever server produced
+        // `LIVE_427_BODY`, neither its banner nor its bare version number
+        // may survive the cut. A version bump moves the fixture and this
+        // assertion follows it; it cannot go vacuous.
+        let (banner, number) = version_banner_of(LIVE_427_BODY);
+        assert!(
+            !rendered.contains(&banner),
+            "the server version banner {banner:?} leaked into {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&number),
+            "the server version {number:?} leaked into {rendered:?}"
+        );
+
+        assert_eq!(
+            rendered,
+            "invalid regexp: ^(?:\\p{Alphabetic})$, error: invalid character class range: \
+             \\p{Alphabetic}"
+        );
     }
 
     /// Issue #324: the SQL renderer's `(?-s)` prefix is ClickHouse-facing
