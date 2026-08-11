@@ -632,6 +632,17 @@ async fn fetch_tempo_trace(
     }
 }
 
+/// Why [`retry_through_cut`] gave up, so the failure says what actually
+/// happened instead of assuming absence.
+#[derive(Debug)]
+enum CutRetryExhaustion {
+    /// Every attempt answered 404, or the last was still unanswered when
+    /// the deadline cancelled it.
+    StillAbsent,
+    /// A body did arrive — just not before the deadline.
+    BodyAfterDeadline,
+}
+
 /// [`fetch_tempo_trace`] with a bounded re-ask on an absent result, for
 /// callers that have already established the trace WAS visible and treat
 /// a later 404 as fatal.
@@ -672,24 +683,43 @@ async fn fetch_tempo_trace(
 ///
 /// Deliberately NOT applied to [`fetch_pulsus_trace`]: see
 /// [`assert_trace_by_id_gate`] for why the retry is one-sided.
-/// Why [`fetch_tempo_trace_through_cut`] gave up, so the failure says
-/// what actually happened instead of assuming absence.
-#[derive(Debug)]
-enum CutRetryExhaustion {
-    /// Every attempt answered 404, or the last was still unanswered when
-    /// the deadline cancelled it.
-    StillAbsent,
-    /// A body did arrive — just not before the deadline.
-    BodyAfterDeadline,
-}
-
 async fn fetch_tempo_trace_through_cut(
     ctx: &Ctx,
     trace_hex: &str,
     query_timeout: Duration,
 ) -> Result<serde_json::Value> {
+    retry_through_cut(
+        trace_hex,
+        TEMPO_CUT_RETRY_CEILING,
+        TEMPO_CUT_RETRY_INTERVAL,
+        || fetch_tempo_trace(ctx, trace_hex, query_timeout),
+    )
+    .await
+}
+
+/// [`fetch_tempo_trace_through_cut`]'s loop, parameterised over the fetch
+/// and its bounds.
+///
+/// Split out for one reason: with a real HTTP fetch the
+/// "body arrived after the deadline" arm below is **unreachable**, because
+/// a fresh request is never already-ready when `timeout_at` first polls
+/// it, so it is always cancelled instead. That arm still has to exist —
+/// see its comment — and this shape is what lets a hermetic test drive an
+/// already-ready fetch at an expired deadline and prove the guard rejects
+/// it. Measured: with a stub answering instantly past the ceiling, the
+/// final attempt never reached the stub at all.
+async fn retry_through_cut<F, Fut>(
+    trace_hex: &str,
+    ceiling: Duration,
+    interval: Duration,
+    mut fetch: F,
+) -> Result<serde_json::Value>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<serde_json::Value>>>,
+{
     let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + TEMPO_CUT_RETRY_CEILING;
+    let deadline = tokio::time::Instant::now() + ceiling;
     let mut attempts = 0usize;
     let mut last_transport_err: Option<anyhow::Error> = None;
     let mut exhaustion = CutRetryExhaustion::StillAbsent;
@@ -740,9 +770,7 @@ async fn fetch_tempo_trace_through_cut(
         //    readiness.
         //
         // So the bound lives at the one call site that claims it.
-        match tokio::time::timeout_at(deadline, fetch_tempo_trace(ctx, trace_hex, query_timeout))
-            .await
-        {
+        match tokio::time::timeout_at(deadline, fetch()).await {
             // A body counts ONLY if the deadline had not already passed
             // when it landed. `timeout_at` alone does not establish that:
             // tokio polls the inner future before the elapsed timer, so
@@ -770,22 +798,21 @@ async fn fetch_tempo_trace_through_cut(
         if now >= deadline {
             break;
         }
-        tokio::time::sleep(TEMPO_CUT_RETRY_INTERVAL.min(deadline - now)).await;
+        tokio::time::sleep(interval.min(deadline - now)).await;
     }
 
     let waited = started.elapsed();
     let what = match exhaustion {
         CutRetryExhaustion::StillAbsent => "still absent or unreadable".to_string(),
         CutRetryExhaustion::BodyAfterDeadline => format!(
-            "answered with a body, but only after the {TEMPO_CUT_RETRY_CEILING:?} ceiling had \
-             passed, so it is not accepted as timely"
+            "answered with a body, but only after the {ceiling:?} ceiling had passed, so it is \
+             not accepted as timely"
         ),
     };
     let detail = format!(
         "tempo lost trace {trace_hex} after completeness: {what} after {attempts} attempts over \
-         {waited:.3?} (ceiling {TEMPO_CUT_RETRY_CEILING:?}, interval \
-         {TEMPO_CUT_RETRY_INTERVAL:?}) — longer than one live-store cut window, so the trace is \
-         gone rather than mid-cut"
+         {waited:.3?} (ceiling {ceiling:?}, interval {interval:?}) — longer than one live-store \
+         cut window, so the trace is gone rather than mid-cut"
     );
     Err(match last_transport_err {
         Some(err) => err.context(detail),
@@ -2923,6 +2950,120 @@ mod tests {
     /// deltas 2+3). Update deliberately, with the ledger entry, never
     /// as a quick fix for a red run.
     const INFORMATIONAL_CASE_IDS: &[&str] = &["neg_attr_missing_key"];
+
+    // -----------------------------------------------------------------
+    // `retry_through_cut` — the by-ID gate's bounded reference-side
+    // re-ask. Short bounds (200ms/20ms) keep these hermetic and fast; the
+    // shipped bounds are `TEMPO_CUT_RETRY_CEILING`/`_INTERVAL`.
+    // -----------------------------------------------------------------
+
+    const TEST_CEILING: Duration = Duration::from_millis(200);
+    const TEST_INTERVAL: Duration = Duration::from_millis(20);
+
+    fn body() -> serde_json::Value {
+        serde_json::json!({ "batches": [] })
+    }
+
+    /// The guard's reason for existing. `tokio::time::timeout_at` polls
+    /// the inner future BEFORE its elapsed timer, so an already-ready
+    /// future at an expired deadline yields `Ok`, not `Err(Elapsed)`. If
+    /// this ever fails, `timeout_at` gained the guarantee and
+    /// `retry_through_cut`'s explicit clock comparison could be revisited.
+    #[tokio::test]
+    async fn timeout_at_accepts_an_already_ready_future_at_an_expired_deadline() {
+        let expired = tokio::time::Instant::now() - Duration::from_secs(1);
+        let got = tokio::time::timeout_at(expired, std::future::ready(42u32)).await;
+        assert_eq!(got.expect("timeout_at polls the inner future first"), 42);
+    }
+
+    /// A body that really arrives, but after the deadline, is rejected —
+    /// and the failure says it answered late rather than claiming the
+    /// trace was absent. Unreachable through a real HTTP fetch (a fresh
+    /// request is never already-ready), hence the ready-future stand-in.
+    #[tokio::test]
+    async fn body_arriving_after_the_deadline_is_rejected_as_late() {
+        let started = Instant::now();
+        let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
+            // Absent until the ceiling has passed, then instantly ready —
+            // so the final attempt polls a ready future at an expired
+            // deadline, the exact case `timeout_at` cannot catch.
+            let elapsed = started.elapsed();
+            std::future::ready(Ok(if elapsed >= TEST_CEILING {
+                Some(body())
+            } else {
+                None
+            }))
+        })
+        .await
+        .expect_err("a body arriving after the deadline must not be accepted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("only after"),
+            "must report a late answer, not an absence: {msg}"
+        );
+        assert!(msg.contains("abc"), "must name the trace: {msg}");
+    }
+
+    /// The other half: a body inside the ceiling is still accepted, so the
+    /// guard has not simply made late-but-valid answers fail.
+    #[tokio::test]
+    async fn body_arriving_before_the_deadline_is_accepted() {
+        let started = Instant::now();
+        let got = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
+            let visible = started.elapsed() >= TEST_CEILING / 4;
+            std::future::ready(Ok(visible.then(body)))
+        })
+        .await
+        .expect("a body inside the ceiling must be accepted");
+        assert_eq!(got, body());
+        assert!(
+            started.elapsed() < TEST_CEILING,
+            "must return as soon as the body appears"
+        );
+    }
+
+    /// A trace that is genuinely gone still fails, bounded, naming the
+    /// attempt count and the elapsed time.
+    #[tokio::test]
+    async fn permanently_absent_trace_fails_bounded_with_attempts_and_elapsed() {
+        let started = Instant::now();
+        let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || {
+            std::future::ready(Ok(None))
+        })
+        .await
+        .expect_err("a permanently absent trace must fail");
+        let waited = started.elapsed();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("still absent or unreadable"),
+            "must report absence: {msg}"
+        );
+        assert!(msg.contains("attempts over"), "must name attempts: {msg}");
+        assert!(waited >= TEST_CEILING, "must not give up early: {waited:?}");
+        assert!(waited < TEST_CEILING * 3, "must stay bounded: {waited:?}");
+    }
+
+    /// A slow attempt is cancelled at the deadline rather than being
+    /// allowed to run to its own (much longer) timeout — the overrun the
+    /// round-1 review found.
+    #[tokio::test]
+    async fn a_slow_attempt_is_cancelled_at_the_deadline() {
+        let started = Instant::now();
+        let err = retry_through_cut("abc", TEST_CEILING, TEST_INTERVAL, || async {
+            // Far longer than the ceiling, standing in for a reference
+            // that accepts the connection and then never answers.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(Some(body()))
+        })
+        .await
+        .expect_err("a hung attempt must not be waited out");
+        let waited = started.elapsed();
+        assert!(
+            waited < TEST_CEILING * 3,
+            "must return at the ceiling, not the attempt's own timeout: {waited:?}"
+        );
+        assert!(format!("{err:#}").contains("still absent or unreadable"));
+    }
 
     fn shipped_fixture() -> TracesFixture {
         let root = crate::engine::workspace_root();
