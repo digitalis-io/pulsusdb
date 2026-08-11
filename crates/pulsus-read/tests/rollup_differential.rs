@@ -40,9 +40,10 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use futures::StreamExt;
+use pulsus_clickhouse::Row;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_logql::{RangeAggOp, parse};
-use pulsus_read::logql::rows::{MetricBucketRow, MetricScanRow};
+use pulsus_read::logql::rows::MetricBucketRow;
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{
     Direction, EngineConfig, LogQlEngine, MatrixSeries, Plan, PlanCtx, QueryParams, QueryResult,
@@ -292,6 +293,27 @@ fn sliding_count_reference(
     out
 }
 
+/// Exactly what [`fetch_timestamps`] asks ClickHouse for, and nothing else.
+///
+/// This used to decode into `MetricScanRow` — the engine's own metric-scan
+/// row — over a SELECT list this file writes by hand. That coupled a test
+/// that wants ONE `i64` to a struct owned by the read path, and when issue
+/// #249 widened `MetricScanRow` with `structured_metadata` the hand-written
+/// `SELECT fingerprint, timestamp_ns, body` no longer matched it. The
+/// failure was a RUNTIME decode error against the live schema, invisible to
+/// a compile-time sweep of the SQL builders' callers, because this query
+/// never goes near a builder.
+///
+/// A local row whose fields are the SELECT list is the fix, not adding the
+/// column: the query does not need `body` or `fingerprint` (the body filter
+/// is a WHERE predicate and the fingerprint is already known), so asking
+/// for them was the whole defect. Now no widening of any engine row type
+/// can reach this test.
+#[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
+struct TimestampRow {
+    timestamp_ns: i64,
+}
+
 /// Fetches the raw sample timestamps for one fingerprint (optionally
 /// body-filtered), ascending — the input to [`sliding_count_reference`].
 async fn fetch_timestamps(
@@ -305,11 +327,11 @@ async fn fetch_timestamps(
         None => String::new(),
     };
     let sql = format!(
-        "SELECT fingerprint, timestamp_ns, body FROM {db}.log_samples \
+        "SELECT timestamp_ns FROM {db}.log_samples \
          WHERE fingerprint = {fp}{filter} ORDER BY timestamp_ns"
     );
     let mut stream = client
-        .query_stream::<MetricScanRow>(&sql, &QuerySettings::new())
+        .query_stream::<TimestampRow>(&sql, &QuerySettings::new())
         .await
         .unwrap_or_else(|e| panic!("timestamp fetch failed: {e}"));
     let mut out = Vec::new();
