@@ -178,6 +178,72 @@ pub(in crate::logql) fn row_route(
     }
 }
 
+/// Per-thread instrumentation for the issue #249 cost gate.
+///
+/// Thread-LOCAL, not global: `cargo test`'s harness runs tests in parallel
+/// threads, and the aggregation path these count is synchronous within one
+/// thread, so a thread-local is both exact and free of cross-test bleed.
+///
+/// Only the two PRODUCTION decision sites move these. [`row_route`] itself
+/// stays an uninstrumented oracle — the `debug_assert_eq!` in
+/// [`RangeSlideState::push_one_row`] calls it on every inert row to check
+/// the shortcut, and the unit tests below call it directly, and neither may
+/// be visible to a counter whose whole claim is "this does not happen per
+/// row". An earlier revision counted `row_route` itself, which made
+/// `ROW_ROUTE_CALLS == 0` unsatisfiable by construction.
+#[cfg(debug_assertions)]
+pub(in crate::logql) mod route_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Bumped by [`super::route_row_counted`] — the production route
+        /// decision, never the oracle.
+        pub static ROW_ROUTE_CALLS: Cell<u64> = const { Cell::new(0) };
+        /// Bumped by [`super::probe_slider_safe`] — the memo-MISS arm.
+        pub static SLIDER_SAFE_PROBES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Zeroes both counters. Called at the top of each gate leg so a leg
+    /// measures only its own rows.
+    pub fn reset() {
+        ROW_ROUTE_CALLS.with(|c| c.set(0));
+        SLIDER_SAFE_PROBES.with(|c| c.set(0));
+    }
+
+    pub fn row_route_calls() -> u64 {
+        ROW_ROUTE_CALLS.with(Cell::get)
+    }
+
+    pub fn slider_safe_probes() -> u64 {
+        SLIDER_SAFE_PROBES.with(Cell::get)
+    }
+}
+
+/// The counted PRODUCTION route decision (issue #249). Delegates verbatim
+/// to [`row_route`], which stays uninstrumented so the oracle and the unit
+/// tests never move the counter.
+#[inline]
+fn route_row_counted(
+    state_fans_out: bool,
+    fp_is_slider_safe: bool,
+    scratch: &[(Cow<'_, str>, Cow<'_, str>)],
+    base: &[(String, String)],
+) -> RowRoute {
+    #[cfg(debug_assertions)]
+    route_counters::ROW_ROUTE_CALLS.with(|c| c.set(c.get() + 1));
+    row_route(state_fans_out, fp_is_slider_safe, scratch, base)
+}
+
+/// The counted PRODUCTION slider-safety probe (issue #249) — the memo-MISS
+/// arm only, which is what makes "once per fingerprint, not once per row"
+/// observable.
+#[inline]
+fn probe_slider_safe(set: &HashSet<u64>, fp: u64) -> bool {
+    #[cfg(debug_assertions)]
+    route_counters::SLIDER_SAFE_PROBES.with(|c| c.set(c.get() + 1));
+    set.contains(&fp)
+}
+
 /// Streaming per-bucket accumulator for every over-time reducer except
 /// `quantile_over_time` (which needs the full value set). Welford's
 /// algorithm for mean/M2 (population stddev/stdvar); first/last are the
@@ -700,12 +766,34 @@ impl<'q> ClientAggState<'q> {
         let mut sm_buf: Vec<(String, String)> = Vec::new();
         let mut sm_ctx = StructuredMetadataCtx::default();
         let mut sm_scratch: LabelScratch<'static> = Vec::new();
+        // The slider-safety memo — the instant twin of
+        // `RangeSlideState::push_rows`', and for the same reason (issue
+        // #249 cost work): the answer is a per-query constant of the
+        // fingerprint, so it is memoised on equality with the previous
+        // row's rather than probed per row.
+        let mut memo_fp: u64 = u64::MAX;
+        let mut memo_safe = false;
         for row in rows {
             let Some(base) = base_labels.get(&row.fingerprint) else {
                 continue;
             };
+            let fp_slider_safe = if row.fingerprint == memo_fp {
+                memo_safe
+            } else {
+                memo_fp = row.fingerprint;
+                memo_safe = probe_slider_safe(&self.slider_safe, row.fingerprint);
+                memo_safe
+            };
             if row.structured_metadata.is_empty() {
-                self.push_one_row(row, base, base, &EMPTY_STRUCTURED_METADATA, &mut scratch)?;
+                self.push_one_row(
+                    row,
+                    base,
+                    base,
+                    &EMPTY_STRUCTURED_METADATA,
+                    &mut scratch,
+                    fp_slider_safe,
+                    true,
+                )?;
             } else {
                 merge_labels_with_structured_metadata(
                     base,
@@ -715,7 +803,15 @@ impl<'q> ClientAggState<'q> {
                     &mut sm_ctx,
                 );
                 let mut row_scratch: LabelScratch<'_> = std::mem::take(&mut sm_scratch);
-                let outcome = self.push_one_row(row, &merge_buf, base, &sm_ctx, &mut row_scratch);
+                let outcome = self.push_one_row(
+                    row,
+                    &merge_buf,
+                    base,
+                    &sm_ctx,
+                    &mut row_scratch,
+                    fp_slider_safe,
+                    false,
+                );
                 // Drop every borrow of `merge_buf` before the next row
                 // rewrites it; the allocation itself is handed back.
                 sm_scratch = recycle_label_scratch(row_scratch);
@@ -727,7 +823,9 @@ impl<'q> ClientAggState<'q> {
 
     /// Runs ONE row's pipeline over `pipeline_base` and folds the sample into
     /// its group — the instant twin of [`RangeSlideState::push_one_row`], with
-    /// the same `pipeline_base` / `route_base` split and for the same reason.
+    /// the same `pipeline_base` / `route_base` split and for the same reason,
+    /// and the same hoisted `fp_slider_safe` / `sm_free` (issue #249).
+    #[allow(clippy::too_many_arguments)]
     fn push_one_row<'a>(
         &mut self,
         row: &'a MetricScanRow,
@@ -735,6 +833,8 @@ impl<'q> ClientAggState<'q> {
         route_base: &LabelSet,
         sm: &'a StructuredMetadataCtx,
         scratch: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        fp_slider_safe: bool,
+        sm_free: bool,
     ) -> Result<(), ReadError>
     where
         'q: 'a,
@@ -809,13 +909,27 @@ impl<'q> ClientAggState<'q> {
             }
             // Issue #249: WHERE this sample belongs, decided per row and
             // BEFORE the in-place sort below, which would destroy the
-            // pipeline output order `row_route` compares against `base`.
-            let route = row_route(
-                self.fan_out,
-                self.slider_safe.contains(&row.fingerprint),
-                scratch,
-                route_base,
-            );
+            // pipeline output order the comparison reads against
+            // `route_base`. The inert shortcut is the range path's, with
+            // the same oracle `debug_assert_eq!` — see
+            // `RangeSlideState::push_one_row` for why it is sound and where
+            // it is checked.
+            let inert = sm_free && !self.fan_out;
+            let route = if inert {
+                let fast = if fp_slider_safe {
+                    RowRoute::Fingerprint
+                } else {
+                    RowRoute::Labels
+                };
+                debug_assert_eq!(
+                    fast,
+                    row_route(self.fan_out, fp_slider_safe, scratch, route_base),
+                    "an inert row's final label set must be its fingerprint's base set"
+                );
+                fast
+            } else {
+                route_row_counted(self.fan_out, fp_slider_safe, scratch, route_base)
+            };
             // ONE accumulator per group (issue #236 Part D): an instant
             // window has a single bucket, so each arm either seeds the
             // group's accumulator or folds into it — there is no bucket
@@ -1165,6 +1279,97 @@ impl<'q> ClientAggState<'q> {
     }
 }
 
+/// The accumulate half of the mutating fan-out, shared by BOTH entrypoints
+/// ([`RangeSlideState::fan_out_sample`] and
+/// [`RangeSlideState::fan_out_sample_base`]) so no [`MutCells`] variant can
+/// acquire a second implementation (issue #249 cost work, risk 4).
+///
+/// An inert row can in practice only be class A — every class B/C reducer
+/// requires `unwrap`, hence `has_unwrap`, hence `fan_out` — so the base
+/// entrypoint reaches only the integer arms today. It is nonetheless served
+/// by the same function as everything else: a class-A-only carve-out is
+/// where the next bug would live.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_into(
+    cells: &mut MutCells,
+    retained: &mut u64,
+    retention_cap: u64,
+    per_sample: u64,
+    k_lo: i64,
+    k_hi: i64,
+    ts: i64,
+    stream_hash: u64,
+    tie_rank: u32,
+    value: f64,
+) -> Result<(), ReadError> {
+    // Review finding 3: a newly-CREATED entry is charged to the same
+    // concurrent-retention counter as a retained point, so the
+    // mutating fan-out obeys the documented invariant instead of
+    // relying on an implicit `groups × grid` product — which issue
+    // #236 has since deleted outright (there is no group-count cap
+    // left to form one). Updating an EXISTING entry is O(1) and
+    // charges nothing. Size → check the cap → allocate, through the
+    // ONE gate (issue #227 review round 5, finding 2): an insert may
+    // grow the map, so the cap must refuse before it, not after.
+    //
+    // ONE point per entry on the class-A arms: an entry is a pair of
+    // integers, narrower than the `WinSample` the unit is defined by,
+    // and class A never re-reduces over a scratch (`per_sample == 1`
+    // for every integer op anyway).
+    let cap = retention_cap;
+    match cells {
+        // Issue #236 Part C, C1: two touches per SAMPLE — the deltas
+        // at `k_lo` and at the exclusive `k_hi + 1` — instead of one
+        // per covered cell. `k_hi + 1` may be `kmax + 1`, which is a
+        // delta index only and is never emitted.
+        MutCells::IntDeltas(cells) => {
+            for (k, dv, dc) in [(k_lo, value as i64, 1i64), (k_hi + 1, -(value as i64), -1)] {
+                match cells.entry(k) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let d = e.get_mut();
+                        d.dvalue += dv;
+                        d.dcount += dc;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        charge_retention(retained, 1, cap)?;
+                        e.insert(IntDelta {
+                            dvalue: dv,
+                            dcount: dc,
+                        });
+                    }
+                }
+            }
+        }
+        MutCells::IntExpanded(cells) => {
+            for k in k_lo..=k_hi {
+                match cells.entry(k) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        *e.get_mut() += value as u64;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        charge_retention(retained, 1, cap)?;
+                        e.insert(value as u64);
+                    }
+                }
+            }
+        }
+        // Issue #236 Part C, C2: classes B/C retain each surviving
+        // sample ONCE. The covering cells are recovered at finish by
+        // a two-pointer sweep, so retention no longer scales with
+        // `ceil(range/step)`.
+        MutCells::Samples(samples) => {
+            charge_retention(retained, per_sample, cap)?;
+            samples.push(WinSample {
+                ts,
+                stream_hash,
+                tie_rank,
+                value,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The three sliding-window reducer classes (issue #227 finding-4 table,
 /// cited to Loki v3.7.4 `range_vector.go` / `syntax/ast.go:1449-1458`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1265,9 +1470,18 @@ struct CollMember {
     /// hold members of both routes once structured metadata makes the
     /// final label set, not the fingerprint, the output-series key.
     route: RowRoute,
-    /// [`RowRoute::Labels`] members only: the rendered final label-set key
-    /// and the labels themselves. `None` for a [`RowRoute::Fingerprint`]
-    /// member (whose output labels ARE the fingerprint's base set) and for
+    /// Issue #249 cost work: label-routed, and the final label set IS
+    /// `base_labels[fp]` — a per-fingerprint constant, so nothing was
+    /// rendered or cloned for this member and `out` is `None`.
+    /// `flush_collision` dispatches it through
+    /// [`RangeSlideState::fan_out_sample_base`], which serves it from the
+    /// cached key. Mutually exclusive with `out.is_some()`; set ONLY by
+    /// [`RangeSlideState::stage_member`].
+    base: bool,
+    /// [`RowRoute::Labels`] members only, and only when `!base`: the
+    /// rendered final label-set key and the labels themselves. `None` for a
+    /// [`RowRoute::Fingerprint`] member (whose output labels ARE the
+    /// fingerprint's base set), for a `base` member, and for
     /// `absent_over_time` (label-blind by construction).
     out: Option<(String, LabelSet)>,
 }
@@ -1766,6 +1980,17 @@ pub(in crate::logql) struct RangeSlideState<'q> {
     /// ADMISSION counter: it is never discharged, because the points it
     /// reserves are the result.
     result_points: u64,
+    /// The rendered final-label-set JSON key of the last BASE-routed
+    /// fingerprint (issue #249 cost work), with that fingerprint.
+    ///
+    /// Built from a SORTED copy of `base_labels[fp]`, so it is byte-
+    /// identical to what `render_labels_json_sorted` produces for the same
+    /// set on the general path — which is what keeps a base-routed row and
+    /// a generally-routed row with the same final set in ONE output series.
+    /// One entry, not a map: the scan delivers fingerprint-contiguous runs,
+    /// so a single slot serves every row of a fingerprint, and a miss costs
+    /// one render rather than a wrong answer.
+    fp_base_key: Option<(u64, String)>,
     /// The innermost vector aggregation, applied AS this state emits
     /// (issue #236 Part B) instead of over its materialised output.
     /// `None` — the state's own construction default — is the
@@ -1873,6 +2098,7 @@ impl<'q> RangeSlideState<'q> {
             coll_bytes: 0,
             group_bytes: 0,
             result_points: 0,
+            fp_base_key: None,
             fold: None,
         })
     }
@@ -1948,6 +2174,15 @@ impl<'q> RangeSlideState<'q> {
         // `merge_buf`, whose contents are rewritten every row, so each call
         // needs a fresh lifetime that a hoisted `&mut` binding cannot give.
         let mut sm_scratch: LabelScratch<'static> = Vec::new();
+        // The slider-safety memo (issue #249 cost work). A `HashSet<u64>`
+        // probe per row measured 15.5 ns/row; the answer is a per-QUERY
+        // constant of the fingerprint, so it is memoised on equality with
+        // the previous row's. Correct for ANY row order — a miss merely
+        // re-probes — and the scan delivers fingerprint-contiguous runs, so
+        // in practice it probes once per fingerprint. Two locals rather
+        // than state: nothing outside this loop may observe them.
+        let mut memo_fp: u64 = u64::MAX;
+        let mut memo_safe = false;
         let mut result = Ok(());
         for row in rows {
             // `base_labels` is a LOCAL, so the reused `scratch` (whose `Cow`s
@@ -1964,10 +2199,23 @@ impl<'q> RangeSlideState<'q> {
             let Some(base) = base_labels.get(&row.fingerprint) else {
                 continue;
             };
+            let fp_slider_safe = if row.fingerprint == memo_fp {
+                memo_safe
+            } else {
+                memo_fp = row.fingerprint;
+                memo_safe = probe_slider_safe(&self.slider_safe, row.fingerprint);
+                memo_safe
+            };
             if row.structured_metadata.is_empty() {
-                if let Err(e) =
-                    self.push_one_row(row, base, base, &EMPTY_STRUCTURED_METADATA, &mut scratch)
-                {
+                if let Err(e) = self.push_one_row(
+                    row,
+                    base,
+                    base,
+                    &EMPTY_STRUCTURED_METADATA,
+                    &mut scratch,
+                    fp_slider_safe,
+                    true,
+                ) {
                     result = Err(e);
                     break;
                 }
@@ -1980,7 +2228,15 @@ impl<'q> RangeSlideState<'q> {
                     &mut sm_ctx,
                 );
                 let mut row_scratch: LabelScratch<'_> = std::mem::take(&mut sm_scratch);
-                let outcome = self.push_one_row(row, &merge_buf, base, &sm_ctx, &mut row_scratch);
+                let outcome = self.push_one_row(
+                    row,
+                    &merge_buf,
+                    base,
+                    &sm_ctx,
+                    &mut row_scratch,
+                    fp_slider_safe,
+                    false,
+                );
                 // Drop every borrow of `merge_buf` before the next row
                 // rewrites it; the allocation itself is handed back.
                 sm_scratch = recycle_label_scratch(row_scratch);
@@ -2004,6 +2260,12 @@ impl<'q> RangeSlideState<'q> {
     ///
     /// Shared by both row kinds so the metadata-free and metadata-bearing
     /// paths cannot drift in how they value, route or stage a sample.
+    ///
+    /// `fp_slider_safe` is the caller's memo of
+    /// `self.slider_safe.contains(&row.fingerprint)` and `sm_free` is the
+    /// branch the caller already took — both hoisted out of the row loop by
+    /// issue #249's cost work.
+    #[allow(clippy::too_many_arguments)]
     fn push_one_row<'a>(
         &mut self,
         row: &'a MetricScanRow,
@@ -2011,6 +2273,8 @@ impl<'q> RangeSlideState<'q> {
         route_base: &LabelSet,
         sm: &'a StructuredMetadataCtx,
         scratch: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        fp_slider_safe: bool,
+        sm_free: bool,
     ) -> Result<(), ReadError>
     where
         'q: 'a,
@@ -2038,15 +2302,41 @@ impl<'q> RangeSlideState<'q> {
             },
         };
         // Issue #249: WHERE this sample belongs, decided per row and
-        // BEFORE `stage_member` sorts the scratch in place — `row_route`
-        // compares the pipeline's output order against `route_base`, which
-        // the sort would destroy.
-        let route = row_route(
-            self.fan_out,
-            self.slider_safe.contains(&row.fingerprint),
-            scratch,
-            route_base,
-        );
+        // BEFORE `stage_member` sorts the scratch in place — the comparison
+        // reads the pipeline's output order against `route_base`, which the
+        // sort would destroy.
+        //
+        // **The inert shortcut** (cost work). `inert` means the row carries
+        // no structured metadata AND the state does not fan out, and under
+        // it the pipeline's output vector is byte-for-byte `route_base`, in
+        // order — so the comparison is a foregone conclusion and only the
+        // memo decides. That is not a new assumption: `8750090` routed
+        // EVERY row of a `!fan_out` state to the fingerprint accumulator
+        // with no comparison at all. It is nevertheless checked rather than
+        // argued — the `debug_assert_eq!` below runs the real predicate on
+        // every inert row in every hermetic test, the whole corpus
+        // included, and `an_inert_pipeline_never_changes_the_label_set`
+        // enumerates the stage kinds `!fan_out` admits.
+        let inert = sm_free && !self.fan_out;
+        let route = if inert {
+            let fast = if fp_slider_safe {
+                RowRoute::Fingerprint
+            } else {
+                RowRoute::Labels
+            };
+            debug_assert_eq!(
+                fast,
+                row_route(self.fan_out, fp_slider_safe, scratch, route_base),
+                "an inert row's final label set must be its fingerprint's base set"
+            );
+            fast
+        } else {
+            route_row_counted(self.fan_out, fp_slider_safe, scratch, route_base)
+        };
+        // A label-routed INERT row's output set is `base_labels[fp]`, a
+        // per-fingerprint constant — so it need not be rendered or cloned
+        // per row. This is arms B and C's whole cost.
+        let base_member = inert && matches!(route, RowRoute::Labels);
         self.coll_active = true;
         self.coll_fp = row.fingerprint;
         self.coll_ts = row.timestamp_ns;
@@ -2055,7 +2345,7 @@ impl<'q> RangeSlideState<'q> {
         // JSON, cloned `LabelSet` — is sized, capped, THEN allocated in
         // one place. No reducer class has a path that stages anything
         // outside it.
-        self.stage_member(row, v, route, scratch)
+        self.stage_member(row, v, route, base_member, scratch)
     }
 
     /// **The single staging funnel** — the ONLY place a per-member
@@ -2077,17 +2367,33 @@ impl<'q> RangeSlideState<'q> {
         row: &MetricScanRow,
         value: f64,
         route: RowRoute,
+        base: bool,
         scratch: &mut Vec<(Cow<'_, str>, Cow<'_, str>)>,
     ) -> Result<(), ReadError> {
         // Issue #249: per ROW, not per state. `route` is already `Labels`
         // for every row of a fan-out state, so a state that fanned out
         // before still stages exactly what it staged before.
-        let stages_out = matches!(route, RowRoute::Labels) && !self.is_absent;
+        //
+        // A `base` member stages NOTHING beyond its slot: its output set is
+        // the fingerprint's base set, which `fan_out_sample_base` serves
+        // from a cached key. `member_stage_bytes` is told the same thing,
+        // so its charge stays a true upper bound on what this allocates.
+        debug_assert!(
+            !base || matches!(route, RowRoute::Labels),
+            "a base member is label-routed by construction"
+        );
+        debug_assert!(
+            !base || !self.is_absent,
+            "absent_over_time is label-blind and never stages a base member"
+        );
+        let stages_out = matches!(route, RowRoute::Labels) && !self.is_absent && !base;
         if stages_out {
             // In-place sort, no allocation — safe to do before the caps.
             scratch.sort_unstable();
         }
-        // (i) size EVERY allocation this member will make.
+        // (i) size EVERY allocation this member will make. A `base`
+        // member's `stages_out` is false, so this is the slot alone — which
+        // is exact, because it allocates nothing else.
         let bytes = self.member_stage_bytes(row, scratch, stages_out);
         // (ii) both caps, BEFORE any allocation. `saturating_add` cannot mask
         // a breach (saturation only grows the sum) but does keep a
@@ -2123,6 +2429,7 @@ impl<'q> RangeSlideState<'q> {
             body,
             value,
             route,
+            base,
             out,
         });
         Ok(())
@@ -2214,9 +2521,36 @@ impl<'q> RangeSlideState<'q> {
         let fp = self.coll_fp;
         let ts = self.coll_ts;
         self.coll_active = false;
-        // The staged bodies are released with this group (every exit path
-        // below either clears or takes `coll`), so the byte charge resets
-        // here — one group is staged at a time, which is what makes
+        // **The buffer leaves `self` HERE, before the first fallible call**
+        // (issue #249 review round 1, finding 3), so `self.coll` is empty on
+        // every exit path below — including the three that return `Err` with
+        // the group half-processed: `charge_group_bytes`,
+        // `charge_result_points` and `load_group`'s inner `charge_retention`.
+        //
+        // Before this, the take sat at the DISPATCH, after all three, and a
+        // failed flush returned with the previous group's members still
+        // staged while `coll_active` was already `false` and `coll_bytes`
+        // already `0`. That is pre-existing rather than introduced — on
+        // `8750090` the slider arm's `self.coll.clear()` likewise sits after
+        // its `charge_group_bytes`/`charge_result_points`/`load_group` (that
+        // tree's fan-out arm took the buffer first, so only the slider arm
+        // was exposed) — and it is not reachable in production, because
+        // `push_rows` breaks its row loop and returns the error and every
+        // caller propagates it with `?` without resuming the state
+        // (`exec.rs:1516`, `:1521`, `:1632`, `:1637`; `variants.rs:711`,
+        // `:724`, `:886-897`). Both of those were checked against the tree,
+        // not argued.
+        //
+        // What it WAS is a false comment — the text here used to assert
+        // "every exit path below either clears or takes `coll`" — and that
+        // is the defect shape this issue already corrected once in
+        // `charge.rs`. Taking at the top makes the sentence true
+        // STRUCTURALLY: no future edit to this function can reintroduce the
+        // leak, whereas clearing on each fallible exit is a property that
+        // would have to be re-proved after every one.
+        let mut members = std::mem::take(&mut self.coll);
+        // The staged bodies are released with this group, so the byte charge
+        // resets here — one group is staged at a time, which is what makes
         // `MAX_TS_COLLISION_GROUP_BYTES` a true bound on the staged buffer.
         // The fan-out `key`/`LabelSet` that SURVIVE the flush into the
         // query-lifetime `groups` map are re-charged against
@@ -2231,8 +2565,7 @@ impl<'q> RangeSlideState<'q> {
         // interchangeable. Skipped entirely for the common order-independent
         // reducers (which never retained a body).
         if self.needs_body_order {
-            self.coll
-                .sort_by(|a, b| a.body.as_bytes().cmp(b.body.as_bytes()));
+            members.sort_by(|a, b| a.body.as_bytes().cmp(b.body.as_bytes()));
         }
 
         if self.is_absent {
@@ -2244,14 +2577,15 @@ impl<'q> RangeSlideState<'q> {
             // grid (already capped at `MAX_CLIENT_AGG_BUCKETS`) regardless of
             // scan density — nothing per-sample is retained, so no
             // client-supplied range/step/cardinality can grow it.
-            if !self.coll.is_empty() {
+            if !members.is_empty() {
                 let (k_lo, k_hi) = self.covering_k(ts);
                 if k_lo <= k_hi {
                     self.present_cover[k_lo as usize] += 1;
                     self.present_cover[k_hi as usize + 1] -= 1;
                 }
             }
-            self.coll.clear();
+            members.clear();
+            self.coll = members;
             return Ok(());
         }
 
@@ -2262,14 +2596,10 @@ impl<'q> RangeSlideState<'q> {
         // key. The fingerprint-routed half is loaded FIRST and the
         // label-routed half consumes the buffer afterwards, so a group that
         // is wholly one route takes byte-for-byte the path it took before.
-        let any_fp_route = self
-            .coll
+        let any_fp_route = members
             .iter()
             .any(|m| matches!(m.route, RowRoute::Fingerprint));
-        let any_label_route = self
-            .coll
-            .iter()
-            .any(|m| matches!(m.route, RowRoute::Labels));
+        let any_label_route = members.iter().any(|m| matches!(m.route, RowRoute::Labels));
 
         if any_fp_route {
             // Non-mutating: one slider per fingerprint (fingerprints contiguous).
@@ -2320,32 +2650,42 @@ impl<'q> RangeSlideState<'q> {
                 });
                 self.cur_fp = fp;
             }
-            // Disjoint field borrows (`cur`, `coll`, `retained`) — the slider
-            // reads values straight from the buffer, no intermediate `Vec`; the
-            // buffer's capacity is reused (cleared, never reallocated per group).
+            // The slider reads values straight from the local buffer — no
+            // intermediate `Vec`, and no disjoint-field-borrow dance now
+            // that `members` is not part of `self`.
             let cur = self.cur.as_mut().expect("slider just set");
-            cur.load_group(
-                ts,
-                &self.coll,
-                &mut self.retained,
-                self.caps.retention_points,
-            )?;
+            cur.load_group(ts, &members, &mut self.retained, self.caps.retention_points)?;
         }
         if any_label_route {
-            // The fan-out path moves `out` out of each member, so it consumes
-            // the buffer (the mutating path is the already-expensive class);
-            // `coll` re-grows on the next group.
-            let members = std::mem::take(&mut self.coll);
-            for (rank, m) in members.into_iter().enumerate() {
+            for (rank, m) in members.iter_mut().enumerate() {
                 if matches!(m.route, RowRoute::Fingerprint) {
                     continue;
                 }
-                let (key, labels) = m.out.expect("a label-routed member carries its output set");
-                self.fan_out_sample(key, labels, ts, stream_hash, rank as u32, m.value)?;
+                if m.base {
+                    // Issue #249 cost work: the member's output set IS its
+                    // fingerprint's base set, so nothing was rendered or
+                    // cloned for it and the cached key serves it.
+                    self.fan_out_sample_base(
+                        fp,
+                        base_labels,
+                        ts,
+                        stream_hash,
+                        rank as u32,
+                        m.value,
+                    )?;
+                } else {
+                    let (key, labels) = m
+                        .out
+                        .take()
+                        .expect("a label-routed member carries its output set");
+                    self.fan_out_sample(key, labels, ts, stream_hash, rank as u32, m.value)?;
+                }
             }
-        } else {
-            self.coll.clear();
         }
+        // The capacity is handed back on SUCCESS only — an error path drops
+        // it with `members`, and the query is over.
+        members.clear();
+        self.coll = members;
         Ok(())
     }
 
@@ -2410,71 +2750,85 @@ impl<'q> RangeSlideState<'q> {
             labels,
             cells: empty_cells,
         });
-        // Review finding 3: a newly-CREATED entry is charged to the same
-        // concurrent-retention counter as a retained point, so the
-        // mutating fan-out obeys the documented invariant instead of
-        // relying on an implicit `groups × grid` product — which issue
-        // #236 has since deleted outright (there is no group-count cap
-        // left to form one). Updating an EXISTING entry is O(1) and
-        // charges nothing. Size → check the cap → allocate, through the
-        // ONE gate (issue #227 review round 5, finding 2): an insert may
-        // grow the map, so the cap must refuse before it, not after.
-        //
-        // ONE point per entry on the class-A arms: an entry is a pair of
-        // integers, narrower than the `WinSample` the unit is defined by,
-        // and class A never re-reduces over a scratch (`per_sample == 1`
-        // for every integer op anyway).
-        match &mut group.cells {
-            // Issue #236 Part C, C1: two touches per SAMPLE — the deltas
-            // at `k_lo` and at the exclusive `k_hi + 1` — instead of one
-            // per covered cell. `k_hi + 1` may be `kmax + 1`, which is a
-            // delta index only and is never emitted.
-            MutCells::IntDeltas(cells) => {
-                for (k, dv, dc) in [(k_lo, value as i64, 1i64), (k_hi + 1, -(value as i64), -1)] {
-                    match cells.entry(k) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            let d = e.get_mut();
-                            d.dvalue += dv;
-                            d.dcount += dc;
-                        }
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            charge_retention(retained, 1, cap)?;
-                            e.insert(IntDelta {
-                                dvalue: dv,
-                                dcount: dc,
-                            });
-                        }
-                    }
-                }
-            }
-            MutCells::IntExpanded(cells) => {
-                for k in k_lo..=k_hi {
-                    match cells.entry(k) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            *e.get_mut() += value as u64;
-                        }
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            charge_retention(retained, 1, cap)?;
-                            e.insert(value as u64);
-                        }
-                    }
-                }
-            }
-            // Issue #236 Part C, C2: classes B/C retain each surviving
-            // sample ONCE. The covering cells are recovered at finish by
-            // a two-pointer sweep, so retention no longer scales with
-            // `ceil(range/step)`.
-            MutCells::Samples(samples) => {
-                charge_retention(retained, per_sample, cap)?;
-                samples.push(WinSample {
-                    ts,
-                    stream_hash,
-                    tie_rank,
-                    value,
-                });
-            }
+        accumulate_into(
+            &mut group.cells,
+            retained,
+            cap,
+            per_sample,
+            k_lo,
+            k_hi,
+            ts,
+            stream_hash,
+            tie_rank,
+            value,
+        )
+    }
+
+    /// Zero-allocation fan-out for a BASE-routed member (issue #249 cost
+    /// work): one whose final label set IS its fingerprint's base set.
+    ///
+    /// That set is a per-fingerprint constant, so the rendered group key is
+    /// cached in [`Self::fp_base_key`] and looked up **by `&str`** — on a
+    /// HIT nothing at all is allocated, which is what takes arms B and C to
+    /// steady-state zero allocations per row.
+    ///
+    /// On a MISS the owned key and `LabelSet` are built and handed to the
+    /// existing [`Self::fan_out_sample`], so the group-byte charge, the
+    /// result-point reservation, the retention cap and the group-creation
+    /// path are byte-for-byte the ones they already were. Nothing escapes a
+    /// counter and no cap is bypassed; the only thing that changes is how
+    /// often the key is rendered — once per output series instead of once
+    /// per row.
+    fn fan_out_sample_base(
+        &mut self,
+        fp: u64,
+        base_labels: &HashMap<u64, LabelSet>,
+        ts: i64,
+        stream_hash: u64,
+        tie_rank: u32,
+        value: f64,
+    ) -> Result<(), ReadError> {
+        let (k_lo, k_hi) = self.covering_k(ts);
+        if k_lo > k_hi {
+            return Ok(());
         }
-        Ok(())
+        // The HIT path: the cached key belongs to this fingerprint and its
+        // group already exists, so accumulate straight into it.
+        if let Some((cached_fp, key)) = self.fp_base_key.as_ref()
+            && *cached_fp == fp
+            && let Some(group) = self.groups.get_mut(key.as_str())
+        {
+            return accumulate_into(
+                &mut group.cells,
+                &mut self.retained,
+                self.caps.retention_points,
+                self.per_sample,
+                k_lo,
+                k_hi,
+                ts,
+                stream_hash,
+                tie_rank,
+                value,
+            );
+        }
+        // The MISS path. Build the owned key and label set the SAME way the
+        // general path does — clone, `sort_unstable`, then render FROM the
+        // sorted copy and collect FROM the same sorted copy
+        // (`stage_member`'s `scratch.sort_unstable()` then
+        // `render_labels_json_sorted(scratch)` / the `LabelSet` collect).
+        //
+        // The sort is explicit and is NOT skipped on the grounds that
+        // `series_labels` already sorts (`labels.rs`): if the cached key
+        // were rendered from an unsorted vector, a base-routed row and a
+        // generally-routed row with the same final set would render
+        // DIFFERENT keys and land in two output series carrying identical
+        // labels. Making the equivalence local costs one sort per output
+        // series and removes a dependency on a function two modules away.
+        let mut sorted: LabelSet = base_labels.get(&fp).cloned().unwrap_or_default();
+        sorted.sort_unstable();
+        let key = render_labels_json_sorted(&sorted);
+        self.fp_base_key = Some((fp, key.clone()));
+        self.fan_out_sample(key, sorted, ts, stream_hash, tie_rank, value)
     }
 
     /// The grid-index range `[k_lo, k_hi]` (clamped to `[0, kmax]`) of grid
@@ -3474,6 +3828,7 @@ mod tests {
             body: String::new(),
             value: v,
             route: RowRoute::Fingerprint,
+            base: false,
             out: None,
         };
         let mut err = None;
@@ -3549,6 +3904,7 @@ mod tests {
                 body: String::new(),
                 value: i as f64,
                 route: RowRoute::Fingerprint,
+                base: false,
                 out: None,
             }];
             slide
@@ -5012,7 +5368,7 @@ mod tests {
                     .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
                     .collect();
                 state
-                    .stage_member(&row, 1.0, RowRoute::Labels, &mut scratch)
+                    .stage_member(&row, 1.0, RowRoute::Labels, false, &mut scratch)
                     .expect("staged");
                 assert!(
                     state.coll_bytes >= staged_capacity(&state),
@@ -5378,7 +5734,7 @@ mod tests {
             state.coll_fp = 1;
             state.coll_ts = 5;
             state
-                .stage_member(&row, 1.0, RowRoute::Labels, &mut scratch)
+                .stage_member(&row, 1.0, RowRoute::Labels, false, &mut scratch)
                 .expect("staged");
             state.flush_collision(&HashMap::new()).expect("flushed");
             assert_eq!(state.groups.len(), 1, "{name}: one retained group");

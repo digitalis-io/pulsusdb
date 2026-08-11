@@ -1924,21 +1924,28 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // the same fingerprint, and it scales on the same axis
         // (`meta.len()`) — so the row's slope covers it without a new
         // coefficient. It allocates nothing per ROW.
+        // Issue #249 cost work: 2 branches — UNCHANGED — and no new callee;
+        // `slider_safe_fingerprints` is the #249 entry already pinned here.
+        // Listed among the eight touched anchors because this file is
+        // edited heavily by the optimisation and the pin is re-derived from
+        // the generator rather than assumed stable. W-MEM disposition:
+        // **unchanged** (BAND, row C-e).
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs ClientAggState::new 2 10 :: .insert .is_some .metric_mutates_labels Ok matches! new reducer_class series_labels slider_safe_fingerprints stream_hash
         branches: 2,
         callees: &[
             ".insert",
-            // Issue #344: the fan-out gate's grouping disjunct, NIL.
             ".is_some",
             ".metric_mutates_labels",
             "Ok",
-            // Issue #344 review round 1: the `needs_ts_order` gate, NIL.
             "matches!",
             "new",
             "reducer_class",
             "series_labels",
-            // Issue #249: the per-query slider-safety set, BAND (C-e).
             "slider_safe_fingerprints",
-            // Issue #344: the instant path's `hashes` map, BAND (C-e).
             "stream_hash",
         ],
     },
@@ -1965,15 +1972,24 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // fingerprint, scaling on the `meta.len()` axis C-e already prices
         // for `base_labels`/`hashes` and strictly narrower per entry than
         // either; nothing per ROW.
+        // Issue #249 cost work: 6 branches — UNCHANGED — and no new callee.
+        // `fp_base_key` is initialised to `None`, a struct-literal field
+        // rather than a call or a branch. W-MEM disposition: **NIL** —
+        // `Option::None` allocates nothing, and the 32 bytes it adds to the
+        // state are computed by `variant_state_bytes` from
+        // `size_of::<RangeSlideState<'_>>()`, so that band self-adjusts.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs RangeSlideState::new 6 19 :: .as_deref .as_u64 .clone .get .insert .is_some .metric_mutates_labels Ok ensure_grid_resolution matches! max? new reducer_class retention_points_per_sample series_labels slider_safe_fingerprints stream_hash unreachable! vec!
         branches: 6,
         callees: &[
-            // Issue #344: the borrowed grouping, NIL.
             ".as_deref",
             ".as_u64",
             ".clone",
             ".get",
             ".insert",
-            // Issue #344: the fan-out gate's grouping disjunct, NIL.
             ".is_some",
             ".metric_mutates_labels",
             "Ok",
@@ -1984,7 +2000,6 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "reducer_class",
             "retention_points_per_sample",
             "series_labels",
-            // Issue #249: the per-query slider-safety set, BAND (C-e).
             "slider_safe_fingerprints",
             "stream_hash",
             "unreachable!",
@@ -2198,7 +2213,18 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // gone from it. The allocations are censused where they now
         // happen (BAND, `ClientAggState::stage`). Inventory rows
         // F-b/F-d.
-        branches: 5,
+        // Issue #249 cost work: 5 -> 6 branches, and `probe_slider_safe` joins the
+        // callee set. The added branch is the memo test
+        // (`row.fingerprint == memo_fp`), which replaces a per-row
+        // `HashSet` probe with a `u64` compare. W-MEM disposition: **NIL**
+        // — a `u64` equality and two stack locals, and the probe it guards
+        // allocated nothing either. The win is instructions, not bytes.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs ClientAggState::push_rows_inner 6 10 :: .get .is_empty .push_one_row Ok default merge_labels_with_structured_metadata new probe_slider_safe recycle_label_scratch take
+        branches: 6,
         callees: &[
             ".get",
             ".is_empty",
@@ -2207,6 +2233,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "default",
             "merge_labels_with_structured_metadata",
             "new",
+            "probe_slider_safe",
             "recycle_label_scratch",
             "take",
         ],
@@ -2232,6 +2259,16 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // named `TsCollisionGroup` 422 and leaves the buffer untouched.
         // The `Vec`'s capacity is returned to the state at flush, so the
         // steady state is one allocation per query. Inventory row F-d.
+        // Issue #249 cost work: 2 branches — UNCHANGED — and one callee LEAVES
+        // (`alloc_block_bytes`; the sizing sits wholly in `stage_bytes`).
+        // Re-derived from the generator rather than hand-edited. W-MEM
+        // disposition: **unchanged** — the staging funnel's
+        // size-then-check-then-allocate order and its caps are untouched.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs ClientAggState::stage 2 14 :: .collect .contains_key .iter .len .map .push .saturating_add .stage_bytes .to_string Err Ok QueryTooBroad Some render_labels_json_sorted
         branches: 2,
         callees: &[
             ".collect",
@@ -2337,7 +2374,15 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // a length test plus a zipped `&str` compare, and a
         // `HashSet<u64>` probe on a `Copy` key; neither allocates on
         // either path, and this frame's per-row allocation stays zero.
-        branches: 6,
+        // Issue #249 cost work: 6 -> 7 branches, and `probe_slider_safe` joins the
+        // callee set — the memo, exactly as in the instant twin above.
+        // W-MEM disposition: **NIL**, same reasoning.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs RangeSlideState::push_rows 7 12 :: .flush_collision .get .is_empty .push_one_row Err Ok default merge_labels_with_structured_metadata new probe_slider_safe recycle_label_scratch take
+        branches: 7,
         // `.into` joined with issue #230: the render-budget breach
         // (`TemplateBudgetExceeded`) converts into `ReadError` on the
         // row path — F-d's NOT-EXEC disposition covers it.
@@ -2351,6 +2396,7 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "default",
             "merge_labels_with_structured_metadata",
             "new",
+            "probe_slider_safe",
             "recycle_label_scratch",
             "take",
         ],
@@ -2526,9 +2572,28 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // route — which is every group a variants sub-state can
         // produce, and every group of any metadata-free query — takes
         // byte-for-byte the path it took before.
-        branches: 18,
+        // Issue #249 cost work: 18 -> 20 branches; `.fan_out_sample_base`,
+        // `.iter_mut`, `.take` and `take` join the callee set while
+        // `.into_iter` leaves. Two things happened. (i) The staged buffer is
+        // taken in the FIRST statements rather than at the dispatch, so
+        // `self.coll` is empty on every exit path including the three
+        // fallible ones — that is the `take` callee and the recycle at the
+        // end. (ii) A base-routed member dispatches through
+        // `fan_out_sample_base`, which is the added branch pair (`m.base`,
+        // and the cached-key hit test inside it). W-MEM disposition:
+        // **NOT-EXEC, row F-d** — everything here is reachable only from
+        // the row loop, F-d's existing disposition, and the change strictly
+        // REMOVES per-row allocations: the base arm renders and clones once
+        // per output series instead of once per row, and the recycle hands
+        // the buffer's capacity back so the group's `coll` re-growth stops
+        // being a per-group allocation.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs RangeSlideState::flush_collision 20 32 :: .any .as_bytes .as_mut .clear .cloned .cmp .copied .covering_k .enumerate .expect .fan_out_sample .fan_out_sample_base .get .is_empty .is_none .iter .iter_mut .load_group .rotate_slider .sort_by .take .unwrap_or .unwrap_or_default Ok Some charge_group_bytes charge_result_points grid_slot_count group_entry_bytes matches! new take
+        branches: 20,
         callees: &[
-            // Issue #249: the per-member route partition, NIL.
             ".any",
             ".as_bytes",
             ".as_mut",
@@ -2540,12 +2605,12 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             ".enumerate",
             ".expect",
             ".fan_out_sample",
+            ".fan_out_sample_base",
             ".get",
-            ".into_iter",
             ".is_empty",
             ".is_none",
-            // Issue #249: the per-member route partition, NIL.
             ".iter",
+            ".iter_mut",
             ".load_group",
             ".rotate_slider",
             ".sort_by",
@@ -2557,9 +2622,8 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "charge_group_bytes",
             "charge_result_points",
             "grid_slot_count",
-            // Issue #249: the route discriminant tests, NIL.
-            "matches!",
             "group_entry_bytes",
+            "matches!",
             "new",
             "take",
         ],
@@ -2596,12 +2660,26 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // body carried inside `push_rows_inner`, unchanged by the move, and
         // still covered by `rows.is_empty()` plus the resident
         // `CLIENT_AGG_FLAT_BUDGET` per-row gate.
-        branches: 24,
+        // Issue #249 cost work: 24 -> 26 branches; `debug_assert_eq!`,
+        // `route_row_counted` and `row_route` join the callee set. The added
+        // branches are the inert shortcut and its `fp_slider_safe` arm.
+        // **Both route functions appear, and that is the point**: the
+        // production decision goes through the counted wrapper while the
+        // `debug_assert_eq!` oracle calls the plain one, so the gate's
+        // counter cannot see its own check. W-MEM disposition:
+        // **NOT-EXEC, row F-d** — reachable only from the row loop; the
+        // shortcut allocates on neither arm and `debug_assert_eq!` compiles
+        // out of release entirely.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs ClientAggState::push_one_row 26 32 :: .add .as_deref .collect .contains_key .copied .entry .flush_pending .get .get_mut .insert .into_mut .iter .key .len .map .run_metric_into_with_sm .sort_unstable .stage .to_string .unwrap_or Err Ok QueryTooBroad charge_group_bytes check_surviving_error debug_assert_eq! group_entry_bytes matches! new render_labels_json_sorted route_row_counted row_route
+        branches: 26,
         callees: &[
             ".add",
             ".as_deref",
             ".collect",
-            ".contains",
             ".contains_key",
             ".copied",
             ".entry",
@@ -2624,10 +2702,12 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "QueryTooBroad",
             "charge_group_bytes",
             "check_surviving_error",
+            "debug_assert_eq!",
             "group_entry_bytes",
             "matches!",
             "new",
             "render_labels_json_sorted",
+            "route_row_counted",
             "row_route",
         ],
     },
@@ -2637,14 +2717,26 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         anchor: "push_one_row",
         // The sliding row body, likewise moved whole out of `push_rows`.
         // W-MEM disposition: **NOT-EXEC, row F-d**, for the same reason.
-        branches: 5,
+        // Issue #249 cost work: 5 -> 8 branches; `debug_assert_eq!`,
+        // `route_row_counted` and `row_route` join the callee set, matching
+        // the instant twin above term for term and for the same reason.
+        // The added branches are the inert shortcut, its `fp_slider_safe`
+        // arm, and `base_member`. W-MEM disposition: **NOT-EXEC, row F-d**.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs RangeSlideState::push_one_row 8 9 :: .len .run_metric_into_with_sm .stage_member Ok check_surviving_error debug_assert_eq! matches! route_row_counted row_route
+        branches: 8,
         callees: &[
-            ".contains",
             ".len",
             ".run_metric_into_with_sm",
             ".stage_member",
             "Ok",
             "check_surviving_error",
+            "debug_assert_eq!",
+            "matches!",
+            "route_row_counted",
             "row_route",
         ],
     },

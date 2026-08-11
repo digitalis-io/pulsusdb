@@ -2074,10 +2074,16 @@ mod tests {
                 1,
                 "PushdownInstantGroups::charged",
             ),
+            // Issue #249 cost work: 2 -> 3. `fan_out_sample_base`'s HIT
+            // path accumulates straight into the cached group and so
+            // reads the cap itself, where the MISS path reaches it
+            // through `fan_out_sample`. Same counter
+            // (`RangeSlideState::retained`), same cap, one more read
+            // site — `LEAF_COUNTERS` is unmoved.
             (
                 "client_agg.rs",
                 "retention_points",
-                2,
+                3,
                 "RangeSlideState::retained",
             ),
             (

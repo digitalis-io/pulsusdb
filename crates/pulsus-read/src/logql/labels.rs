@@ -58,13 +58,21 @@ pub(in crate::logql) fn stream_hash(sorted_labels: &[(String, String)]) -> u64 {
 /// escaping (byte-compatible with `serde_json`'s string escaping —
 /// unit-tested below) so rendering borrows the label pairs instead of
 /// cloning them into a `serde_json::Map` (round-2 finding 1).
-pub(in crate::logql) fn render_labels_json_sorted(
-    sorted_labels: &[(Cow<'_, str>, Cow<'_, str>)],
-) -> String {
+///
+/// Generic over the pair representation (issue #249 cost work): the
+/// per-row path renders the borrowed `Cow` scratch, the cached
+/// base-label key renders an owned `LabelSet`. ONE renderer, because two
+/// would be two ways to render the same set — and a key that differs by a
+/// byte silently splits one output series into two.
+pub(in crate::logql) fn render_labels_json_sorted<K, V>(sorted_labels: &[(K, V)]) -> String
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
     let mut out = String::with_capacity(
         2 + sorted_labels
             .iter()
-            .map(|(k, v)| k.len() + v.len() + 6)
+            .map(|(k, v)| k.as_ref().len() + v.as_ref().len() + 6)
             .sum::<usize>(),
     );
     out.push('{');
@@ -72,9 +80,9 @@ pub(in crate::logql) fn render_labels_json_sorted(
         if i > 0 {
             out.push(',');
         }
-        push_json_string(&mut out, k);
+        push_json_string(&mut out, k.as_ref());
         out.push(':');
-        push_json_string(&mut out, v);
+        push_json_string(&mut out, v.as_ref());
     }
     out.push('}');
     out
