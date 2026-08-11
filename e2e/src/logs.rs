@@ -3782,15 +3782,76 @@ mod tests {
         }
     }
 
+    /// The text of ONE `### \`<id>\`` ledger entry: its heading line up to
+    /// the next heading of the same or a shallower level, or end of file.
+    ///
+    /// Scoped extraction, not a whole-file search, because the claim is a
+    /// RELATION — "the `sort-tie-order` entry records these things" — and
+    /// a `contains` over the document proves only that the strings exist
+    /// somewhere. Several of AC13's needles already occurred in unrelated
+    /// entries before that entry was written, so a document-wide form
+    /// could not fail on half of them.
+    ///
+    /// Robustness against the ledger's own structure, stated rather than
+    /// assumed:
+    /// * a DEEPER heading (`#### …`) does not end the entry — the prefix
+    ///   test requires the trailing space, so `"#### x"` never matches
+    ///   `"### "`;
+    /// * a line that merely looks like a heading inside a fenced code
+    ///   block is ignored (the fence state is tracked);
+    /// * exactly one matching heading is required. A duplicated id would
+    ///   make "inside this entry" ambiguous, and ids are unique by
+    ///   construction — `logqltest_provenance.rs::ledger_ids` resolves a
+    ///   `divergence(...)` marker against exactly this heading form.
+    fn ledger_entry(ledger: &str, id: &str) -> String {
+        let heading = format!("### `{id}`");
+        let lines: Vec<&str> = ledger.lines().collect();
+        // A heading only counts outside a fenced code block.
+        let is_heading: Vec<bool> = {
+            let mut in_fence = false;
+            lines
+                .iter()
+                .map(|line| {
+                    if line.trim_start().starts_with("```") {
+                        in_fence = !in_fence;
+                        return false;
+                    }
+                    !in_fence
+                        && (line.starts_with("# ")
+                            || line.starts_with("## ")
+                            || line.starts_with("### "))
+                })
+                .collect()
+        };
+        let starts: Vec<usize> = (0..lines.len())
+            .filter(|&i| is_heading[i] && lines[i].starts_with(&heading))
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "the ledger must carry exactly one ``### `{id}` `` heading, found {}",
+            starts.len()
+        );
+        let start = starts[0];
+        let end = (start + 1..lines.len())
+            .find(|&i| is_heading[i])
+            .unwrap_or(lines.len());
+        lines[start..end].join("\n")
+    }
+
     /// AC13: the divergence is registered where the divergence discipline
-    /// says it is registered, and the entry names the artifacts it
+    /// says it is registered, and THAT ENTRY names the artifacts it
     /// governs — including the composed/`topk` case it does NOT cover.
+    /// Every needle is asserted inside the entry's own section text, so
+    /// deleting the entry, or deleting its "Not covered" bullet while the
+    /// rest of the entry stays, both fail this test.
     #[test]
     fn the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger() {
         let ledger_path =
             crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
         let ledger = std::fs::read_to_string(&ledger_path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", ledger_path.display()));
+        let entry = ledger_entry(&ledger, "sort-tie-order");
         for needle in [
             "sort-tie-order",
             "metric_sort_order",
@@ -3798,11 +3859,50 @@ mod tests {
             "value_ordered_sequences_agree",
             "differential_metric_reducers.test",
             "timestamp-tie-order",
+            // The three below live ONLY in the "Not covered" bullet, which
+            // is what this AC exists to hold in place.
+            "Not covered",
             "topk",
             "composed",
         ] {
-            assert!(ledger.contains(needle), "ledger is missing {needle:?}");
+            assert!(
+                entry.contains(needle),
+                "the `sort-tie-order` ledger entry is missing {needle:?}:\n{entry}"
+            );
         }
+    }
+
+    /// The AC13 needles that hold the "Not covered" bullet in place are
+    /// entry-LOCAL claims, and a document-wide `contains` cannot make
+    /// them: `topk` occurs in unrelated entries. Establishing that here
+    /// rather than in prose, so the reason `ledger_entry` exists cannot be
+    /// optimised away by a future reader who sees a simpler check.
+    #[test]
+    fn the_ledger_entry_scope_is_what_makes_the_not_covered_needles_bite() {
+        let ledger_path =
+            crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
+        let ledger = std::fs::read_to_string(&ledger_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", ledger_path.display()));
+        let entry = ledger_entry(&ledger, "sort-tie-order");
+        let outside = ledger.replace(&entry, "");
+        assert!(
+            outside.contains("topk"),
+            "`topk` no longer occurs outside the entry, so this test's premise has changed"
+        );
+        assert!(
+            !outside.contains("Not covered"),
+            "`Not covered` now occurs outside the entry, so it is no longer an entry-local needle"
+        );
+        assert!(
+            !outside.contains("composed"),
+            "`composed` now occurs outside the entry, so it is no longer an entry-local needle"
+        );
+        // The extraction is a strict slice of the document, and a strict
+        // one: it neither invents text nor swallows the neighbouring entry.
+        assert!(ledger.contains(&entry));
+        assert!(entry.starts_with("### `sort-tie-order`"));
+        assert!(!entry.contains("### `logs-timestamp-i64-nanosecond-domain`"));
+        assert!(!entry.contains("### `timestamp-tie-order`"));
     }
 
     /// AC15: the fixture prose no longer promises a reference tie order.
