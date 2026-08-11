@@ -3782,47 +3782,119 @@ mod tests {
         }
     }
 
-    /// The text of ONE `### \`<id>\`` ledger entry: its heading line up to
-    /// the next heading of the same or a shallower level, or end of file.
+    /// One `### \`<id>\`` ledger entry, sliced out of the document by line
+    /// index.
+    #[derive(Debug)]
+    struct LedgerEntry {
+        /// The entry's own text: its heading line up to the next heading of
+        /// the same or a shallower level, or end of file.
+        text: String,
+        /// Everything OUTSIDE the entry, joined. Computed from the same
+        /// line indices, never with `str::replace`, which would delete
+        /// every byte-identical copy rather than this one slice.
+        outside: String,
+    }
+
+    /// Slices one ledger entry by its `### \`<id>\`` heading.
     ///
     /// Scoped extraction, not a whole-file search, because the claim is a
     /// RELATION — "the `sort-tie-order` entry records these things" — and
     /// a `contains` over the document proves only that the strings exist
     /// somewhere. Several of AC13's needles already occurred in unrelated
     /// entries before that entry was written, so a document-wide form
-    /// could not fail on half of them.
+    /// could not fail on them.
     ///
-    /// Robustness against the ledger's own structure, stated rather than
-    /// assumed:
+    /// **What it handles, each stated because it was checked:**
     /// * a DEEPER heading (`#### …`) does not end the entry — the prefix
     ///   test requires the trailing space, so `"#### x"` never matches
-    ///   `"### "`;
-    /// * a line that merely looks like a heading inside a fenced code
-    ///   block is ignored (the fence state is tracked);
+    ///   `"### "`. The committed ledger carries such headings;
+    /// * a heading-shaped line inside a fenced block is ignored. BOTH
+    ///   fence characters are recognised (```` ``` ```` and `~~~`), a
+    ///   fence may be indented (the committed ledger has indented ones,
+    ///   which an unindented-only rule silently missed in an earlier
+    ///   revision of this helper), and a fence only closes with the
+    ///   character that opened it, so `~~~` inside a ```` ``` ```` block
+    ///   is content;
+    /// * an UNBALANCED fence panics rather than mis-slicing quietly;
+    /// * a heading may carry up to three leading spaces, which is what
+    ///   CommonMark admits as an ATX heading;
     /// * exactly one matching heading is required. A duplicated id would
-    ///   make "inside this entry" ambiguous, and ids are unique by
-    ///   construction — `logqltest_provenance.rs::ledger_ids` resolves a
+    ///   make "inside this entry" ambiguous;
+    ///   `logqltest_provenance.rs::ledger_ids` resolves a
     ///   `divergence(...)` marker against exactly this heading form.
-    fn ledger_entry(ledger: &str, id: &str) -> String {
+    ///
+    /// **Residual failure surface — written down, and deliberately not
+    /// instrumented further.** This is a consistency check on a prose
+    /// document, not a parser, and every guard added to it becomes the
+    /// next thing that needs guarding. What it can still get wrong:
+    /// * a line inside a LIST ITEM that is indented one-to-three spaces
+    ///   and begins with `#` reads as a heading here and would end the
+    ///   entry early. Real CommonMark block parsing is what distinguishes
+    ///   those, and importing a Markdown parser to police a nine-needle
+    ///   check is out of proportion;
+    /// * an entry whose heading is written with `setext` underlining, or
+    ///   with the id unbackticked, is not found at all — it panics with
+    ///   "found 0" rather than passing, which is the safe direction;
+    /// * nothing here validates the REST of the ledger. It answers one
+    ///   question about one entry.
+    fn ledger_entry(ledger: &str, id: &str) -> LedgerEntry {
         let heading = format!("### `{id}`");
         let lines: Vec<&str> = ledger.lines().collect();
-        // A heading only counts outside a fenced code block.
+
+        // A fence opens with three or more `` ` `` or `~`, optionally
+        // indented, and closes only with the SAME character.
+        let fence_char = |line: &str| -> Option<char> {
+            let t = line.trim_start();
+            ['`', '~']
+                .into_iter()
+                .find(|&c| t.starts_with(&String::from(c).repeat(3)))
+        };
+        // A heading counts only outside a fence, and CommonMark admits up
+        // to three leading spaces before the `#` run.
         let is_heading: Vec<bool> = {
-            let mut in_fence = false;
+            let mut open: Option<char> = None;
             lines
                 .iter()
                 .map(|line| {
-                    if line.trim_start().starts_with("```") {
-                        in_fence = !in_fence;
+                    match (open, fence_char(line)) {
+                        (None, Some(c)) => {
+                            open = Some(c);
+                            return false;
+                        }
+                        (Some(o), Some(c)) if o == c => {
+                            open = None;
+                            return false;
+                        }
+                        _ => {}
+                    }
+                    if open.is_some() {
                         return false;
                     }
-                    !in_fence
-                        && (line.starts_with("# ")
-                            || line.starts_with("## ")
-                            || line.starts_with("### "))
+                    let indent = line.len() - line.trim_start_matches(' ').len();
+                    let body = &line[indent..];
+                    indent <= 3
+                        && (body.starts_with("# ")
+                            || body.starts_with("## ")
+                            || body.starts_with("### "))
                 })
                 .collect()
         };
+        assert!(
+            {
+                let mut open: Option<char> = None;
+                for line in &lines {
+                    match (open, fence_char(line)) {
+                        (None, Some(c)) => open = Some(c),
+                        (Some(o), Some(c)) if o == c => open = None,
+                        _ => {}
+                    }
+                }
+                open.is_none()
+            },
+            "the ledger ends inside an unclosed code fence, so no slice of it \
+             can be trusted"
+        );
+
         let starts: Vec<usize> = (0..lines.len())
             .filter(|&i| is_heading[i] && lines[i].starts_with(&heading))
             .collect();
@@ -3836,22 +3908,71 @@ mod tests {
         let end = (start + 1..lines.len())
             .find(|&i| is_heading[i])
             .unwrap_or(lines.len());
+        LedgerEntry {
+            text: lines[start..end].join("\n"),
+            outside: lines[..start]
+                .iter()
+                .chain(lines[end..].iter())
+                .copied()
+                .collect::<Vec<&str>>()
+                .join("\n"),
+        }
+    }
+
+    /// One top-level bullet of a ledger entry: the `- ` line whose text
+    /// begins with `lead_in`, plus its continuation lines, up to the next
+    /// top-level bullet, the next heading, or the end of the entry.
+    ///
+    /// Structure, not substring. An earlier revision asserted the needles
+    /// anywhere in the entry, and a reviewer showed the hole by deleting
+    /// the bullet outright and pasting `Not covered; topk; composed` into
+    /// the entry as plain prose: the check stayed green. Matching bare
+    /// words inside the right section still cannot tell a bullet from
+    /// text that happens to contain the words, so the bullet's own list
+    /// marker and bold lead-in are what is matched here, and the needles
+    /// are then required INSIDE its span.
+    ///
+    /// A top-level bullet is `- ` at column 0 — the shape every bullet in
+    /// this ledger has. An indented `- ` is a nested bullet and belongs to
+    /// the item it sits under, so it does not end the span.
+    fn ledger_bullet(entry: &str, lead_in: &str) -> String {
+        let lines: Vec<&str> = entry.lines().collect();
+        let opens: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].starts_with("- ") && lines[i].starts_with(lead_in))
+            .collect();
+        assert_eq!(
+            opens.len(),
+            1,
+            "the entry must carry exactly one top-level bullet opening \
+             {lead_in:?}, found {}:\n{entry}",
+            opens.len()
+        );
+        let start = opens[0];
+        let end = (start + 1..lines.len())
+            .find(|&i| lines[i].starts_with("- ") || lines[i].starts_with('#'))
+            .unwrap_or(lines.len());
         lines[start..end].join("\n")
     }
 
+    /// The exact opening of the ledger bullet AC13 exists to hold in
+    /// place. Written once so the test and its failure message cannot
+    /// drift apart.
+    const NOT_COVERED_LEAD_IN: &str = "- **Not covered — a composed (non-terminal) `sort`.**";
+
     /// AC13: the divergence is registered where the divergence discipline
-    /// says it is registered, and THAT ENTRY names the artifacts it
-    /// governs — including the composed/`topk` case it does NOT cover.
-    /// Every needle is asserted inside the entry's own section text, so
-    /// deleting the entry, or deleting its "Not covered" bullet while the
-    /// rest of the entry stays, both fail this test.
+    /// says it is registered; THAT ENTRY names the artifacts it governs;
+    /// and the "Not covered" bullet — the composed/`topk` case the
+    /// cosmetic conclusion does NOT cover — is present AS A BULLET, with
+    /// its own content inside its own span.
     #[test]
     fn the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger() {
         let ledger_path =
             crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
         let ledger = std::fs::read_to_string(&ledger_path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", ledger_path.display()));
-        let entry = ledger_entry(&ledger, "sort-tie-order");
+        let entry = ledger_entry(&ledger, "sort-tie-order").text;
+
+        // Entry-scoped: the artifacts this entry governs.
         for needle in [
             "sort-tie-order",
             "metric_sort_order",
@@ -3859,50 +3980,82 @@ mod tests {
             "value_ordered_sequences_agree",
             "differential_metric_reducers.test",
             "timestamp-tie-order",
-            // The three below live ONLY in the "Not covered" bullet, which
-            // is what this AC exists to hold in place.
-            "Not covered",
-            "topk",
-            "composed",
         ] {
             assert!(
                 entry.contains(needle),
                 "the `sort-tie-order` ledger entry is missing {needle:?}:\n{entry}"
             );
         }
+
+        // Bullet-scoped: the exclusion the AC exists for. Asserting the
+        // lead-in gets the list marker and the bold title; asserting the
+        // needles inside the bullet's span gets its content.
+        let bullet = ledger_bullet(&entry, NOT_COVERED_LEAD_IN);
+        for needle in ["topk", "bottomk", "approx_topk", "composed", "#406"] {
+            assert!(
+                bullet.contains(needle),
+                "the entry's `Not covered` bullet is missing {needle:?}:\n{bullet}"
+            );
+        }
     }
 
-    /// The AC13 needles that hold the "Not covered" bullet in place are
-    /// entry-LOCAL claims, and a document-wide `contains` cannot make
-    /// them: `topk` occurs in unrelated entries. Establishing that here
-    /// rather than in prose, so the reason `ledger_entry` exists cannot be
-    /// optimised away by a future reader who sees a simpler check.
+    /// The premises the two scopings rest on, as a check rather than as
+    /// prose — so a future reader who sees a simpler form and "simplifies"
+    /// to it is told why it was not simpler.
+    ///
+    /// Measured on the committed ledger with
+    /// `grep -o '<needle>' docs/benchmarks/logs-differential-ledger.md | wc -l`
+    /// (occurrences, not matching LINES — `grep -c` counts lines and gave
+    /// a figure three too low in an earlier report of this same number):
+    /// `topk` 22 total, 3 inside the entry, 19 outside; `composed` and
+    /// `Not covered` 1 each, all inside.
     #[test]
     fn the_ledger_entry_scope_is_what_makes_the_not_covered_needles_bite() {
         let ledger_path =
             crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
         let ledger = std::fs::read_to_string(&ledger_path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", ledger_path.display()));
-        let entry = ledger_entry(&ledger, "sort-tie-order");
-        let outside = ledger.replace(&entry, "");
+        let LedgerEntry { text, outside } = ledger_entry(&ledger, "sort-tie-order");
+
+        // Why the ENTRY scope is load-bearing: `topk` is satisfied by
+        // unrelated entries, so a document-wide `contains` cannot fail on
+        // it. `composed` and `Not covered` are entry-local today.
         assert!(
             outside.contains("topk"),
             "`topk` no longer occurs outside the entry, so this test's premise has changed"
         );
         assert!(
-            !outside.contains("Not covered"),
-            "`Not covered` now occurs outside the entry, so it is no longer an entry-local needle"
-        );
-        assert!(
             !outside.contains("composed"),
             "`composed` now occurs outside the entry, so it is no longer an entry-local needle"
         );
-        // The extraction is a strict slice of the document, and a strict
-        // one: it neither invents text nor swallows the neighbouring entry.
-        assert!(ledger.contains(&entry));
-        assert!(entry.starts_with("### `sort-tie-order`"));
-        assert!(!entry.contains("### `logs-timestamp-i64-nanosecond-domain`"));
-        assert!(!entry.contains("### `timestamp-tie-order`"));
+
+        // Why the BULLET scope is load-bearing on top of that: the entry
+        // holds bullets besides this one, so "somewhere in the entry" is
+        // still weaker than "in this bullet".
+        let bullet = ledger_bullet(&text, NOT_COVERED_LEAD_IN);
+        assert!(
+            text.len() > bullet.len(),
+            "the entry is exactly its `Not covered` bullet, so bullet scope adds nothing"
+        );
+        assert!(
+            text.replace(&bullet, "").contains("- **"),
+            "the entry has no other top-level bullet, so bullet scope adds nothing"
+        );
+
+        // The extraction is a strict slice: it starts at its own heading,
+        // swallows neither neighbour, and partitions the document.
+        assert!(text.starts_with("### `sort-tie-order`"));
+        assert!(!text.contains("### `logs-timestamp-i64-nanosecond-domain`"));
+        assert!(!text.contains("### `timestamp-tie-order`"));
+        // `split('\n')` rather than `lines()`: both halves were joined
+        // from `lines()`, so a half whose last element is the blank line
+        // before the next heading would lose it to `lines()` and the
+        // partition would look off by one when it is not.
+        assert_eq!(
+            text.split('\n').count() + outside.split('\n').count(),
+            ledger.lines().count(),
+            "the entry and its complement must partition the ledger's lines"
+        );
     }
 
     /// AC15: the fixture prose no longer promises a reference tie order.
