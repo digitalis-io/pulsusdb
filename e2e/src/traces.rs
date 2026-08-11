@@ -661,16 +661,28 @@ async fn fetch_tempo_trace(
 /// genuinely dropped, has no such pending event and stays 404 forever.
 /// Outlasting a full cut window is exactly that distinction, so
 /// exhausting [`TEMPO_CUT_RETRY_CEILING`] is the discriminator and the
-/// gate still fails. "Bounded" here means the whole call returns by the
-/// ceiling whatever the reference does — a hung or merely slow response
-/// is cancelled at the deadline rather than being allowed to run out
-/// `query_timeout` (60s ci / 120s full), and an answer that arrives after
-/// the deadline is not accepted. The exhaustion error carries the attempt
-/// count and the real elapsed time so that a future argument for widening
-/// the ceiling can be made from numbers.
+/// gate still fails. "Bounded" here means the whole call returns at about
+/// the ceiling whatever the reference does — a hung or merely slow
+/// response is cancelled at the deadline rather than being allowed to run
+/// out `query_timeout` (60s ci / 120s full) — and a body that lands after
+/// the deadline is rejected by an explicit clock comparison in the loop,
+/// NOT by anything the types enforce. The exhaustion error carries the
+/// attempt count and the real elapsed time so that a future argument for
+/// widening the ceiling can be made from numbers.
 ///
 /// Deliberately NOT applied to [`fetch_pulsus_trace`]: see
 /// [`assert_trace_by_id_gate`] for why the retry is one-sided.
+/// Why [`fetch_tempo_trace_through_cut`] gave up, so the failure says
+/// what actually happened instead of assuming absence.
+#[derive(Debug)]
+enum CutRetryExhaustion {
+    /// Every attempt answered 404, or the last was still unanswered when
+    /// the deadline cancelled it.
+    StillAbsent,
+    /// A body did arrive — just not before the deadline.
+    BodyAfterDeadline,
+}
+
 async fn fetch_tempo_trace_through_cut(
     ctx: &Ctx,
     trace_hex: &str,
@@ -680,6 +692,7 @@ async fn fetch_tempo_trace_through_cut(
     let deadline = tokio::time::Instant::now() + TEMPO_CUT_RETRY_CEILING;
     let mut attempts = 0usize;
     let mut last_transport_err: Option<anyhow::Error> = None;
+    let mut exhaustion = CutRetryExhaustion::StillAbsent;
 
     loop {
         attempts += 1;
@@ -689,26 +702,62 @@ async fn fetch_tempo_trace_through_cut(
         // mirrors, and which `wait_for_fetch_completeness` absorbs the
         // same 404 with — awaits `attempt()` unbounded and returns
         // `Ok(Some(_))` without re-checking the deadline
-        // (`harness.rs:291`/`:294`). For its other callers that is
-        // harmless, because their per-attempt cost is small beside their
-        // budget; for THIS caller it is not, because `query_timeout` is
-        // 60s (ci) / 120s (full) against a 5s ceiling, so one slow
-        // response could overrun the stated bound by 12-24x and a success
-        // arriving after the deadline would still be accepted. The
-        // primitive is deliberately left alone — tightening it would
-        // cancel in-flight non-idempotent POSTs at the five push call
-        // sites (the hazard `harness::classify_push_send` exists to
-        // avoid) and would reject legitimate late successes at the seven
-        // whole-corpus completeness call sites, whose single attempt
-        // scans every trace on both stores. So the bound lives at the one
-        // call site that claims it.
+        // (`harness.rs:291`/`:294`; its doc now says so). For its other
+        // callers that is harmless, because their per-attempt cost is
+        // small beside their budget; for THIS caller it is not, because
+        // `query_timeout` is 60s (ci) / 120s (full) against a 5s ceiling,
+        // so one slow response could overrun the stated bound by 12-24x
+        // and a success arriving after the deadline would still be
+        // accepted.
+        //
+        // The primitive is deliberately left alone. Census of its call
+        // sites — SEVENTEEN, none of them this function, counted with
+        //   git grep -n "poll_until(" -- e2e/src/ \
+        //     | grep -v "pub async fn poll_until" | grep -v harness.rs \
+        //     | grep -v "//"
+        // (the last filter drops this comment, so the command reproduces
+        // the number it is quoted for). Three groups:
+        //
+        //  * FIVE non-idempotent POST pushes — `logs.rs:263,2501`,
+        //    `metrics.rs:361`, `scenarios.rs:307`, `push_trace_corpus`
+        //    here. Cancelling a request in flight creates exactly the
+        //    "may already have ingested it" ambiguity that
+        //    `harness::classify_push_send` exists to prevent.
+        //  * SEVEN corpus-wide convergence waits — `logs.rs:910,2536`,
+        //    `metrics.rs:434`, and `wait_for_fetch_completeness`,
+        //    `wait_for_search_completeness`,
+        //    `assert_shard_local_span_counts`,
+        //    `assert_reference_metrics_positive_control` here. One
+        //    attempt scans the whole corpus (both stores, or a shard
+        //    row-count query) against a 180s/600s budget, so rejecting a
+        //    success whose final attempt straddles the deadline would
+        //    turn legitimate runs into flakes.
+        //  * FIVE at `scenarios.rs:554,908,1050,1225,1234`, which are NOT
+        //    uniformly "cheap readiness": `:554`/`:908` wait on queried
+        //    data, `:1050` shells out to `clickhouse-client` (as
+        //    `assert_shard_local_span_counts` does), which cancellation
+        //    would orphan; only `:1225`/`:1234` are true service
+        //    readiness.
+        //
+        // So the bound lives at the one call site that claims it.
         match tokio::time::timeout_at(deadline, fetch_tempo_trace(ctx, trace_hex, query_timeout))
             .await
         {
-            // A body only counts if it arrived strictly inside the
-            // ceiling; `timeout_at` cancels the attempt otherwise, so a
-            // late answer cannot be mistaken for a timely one.
-            Ok(Ok(Some(body))) => return Ok(body),
+            // A body counts ONLY if the deadline had not already passed
+            // when it landed. `timeout_at` alone does not establish that:
+            // tokio polls the inner future before the elapsed timer, so
+            // `timeout_at(<expired>, <already-ready>)` yields `Ok(_)`, not
+            // `Err(Elapsed)` (measured — see the break test in this
+            // change's notes). `timeout_at` is therefore doing one job
+            // here, capping how long an attempt may RUN; this explicit
+            // comparison is what rejects a late body, and without it the
+            // ceiling would hold only by the accident that a real fetch
+            // takes time.
+            Ok(Ok(Some(body))) if tokio::time::Instant::now() < deadline => return Ok(body),
+            Ok(Ok(Some(_))) => {
+                exhaustion = CutRetryExhaustion::BodyAfterDeadline;
+                break;
+            }
             Ok(Ok(None)) => {}
             // A transient transport error is retried like an absence (the
             // reason the message below says "absent or unreadable"), but
@@ -725,9 +774,16 @@ async fn fetch_tempo_trace_through_cut(
     }
 
     let waited = started.elapsed();
+    let what = match exhaustion {
+        CutRetryExhaustion::StillAbsent => "still absent or unreadable".to_string(),
+        CutRetryExhaustion::BodyAfterDeadline => format!(
+            "answered with a body, but only after the {TEMPO_CUT_RETRY_CEILING:?} ceiling had \
+             passed, so it is not accepted as timely"
+        ),
+    };
     let detail = format!(
-        "tempo lost trace {trace_hex} after completeness: still absent or unreadable after \
-         {attempts} attempts over {waited:.3?} (ceiling {TEMPO_CUT_RETRY_CEILING:?}, interval \
+        "tempo lost trace {trace_hex} after completeness: {what} after {attempts} attempts over \
+         {waited:.3?} (ceiling {TEMPO_CUT_RETRY_CEILING:?}, interval \
          {TEMPO_CUT_RETRY_INTERVAL:?}) — longer than one live-store cut window, so the trace is \
          gone rather than mid-cut"
     );

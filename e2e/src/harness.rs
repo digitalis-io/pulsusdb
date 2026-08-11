@@ -277,6 +277,31 @@ fn dump_logs(compose: &Compose, variant: Variant) {
 /// scenario failure reports the *last* observed state, not the first.
 /// Mirrors [`wait_ready`]'s bounded-poll shape, generalized over the
 /// condition being polled for.
+///
+/// **What `timeout` does and does not bound.** It bounds when a NEW
+/// attempt is *started*, not when one *returns*. An attempt already in
+/// flight is awaited to completion — this function applies no timeout of
+/// its own, so a single attempt's duration is bounded only by whatever
+/// the caller built into `attempt` itself (typically a
+/// [`query_request_timeout`] on the request). A success is returned
+/// whenever it arrives, including after the deadline has passed. Total
+/// wall time is therefore roughly `timeout` plus the cost of one
+/// straddling attempt, which for most callers here is small beside their
+/// budget.
+///
+/// This is deliberate: the push call sites drive non-idempotent POSTs,
+/// where cancelling a request in flight would create exactly the "the
+/// server may already have ingested it" ambiguity that
+/// [`classify_push_send`] exists to prevent, and the completeness call
+/// sites run whole-corpus scans that may legitimately straddle the
+/// deadline on the final attempt.
+///
+/// **A caller needing a hard wall-clock bound must impose it itself** —
+/// wrap the attempt (e.g. `tokio::time::timeout_at`) AND compare against
+/// the deadline before accepting a result, because `timeout_at` polls the
+/// inner future before its elapsed timer and so still yields `Ok` for a
+/// future that is already ready at an expired deadline.
+/// `traces::fetch_tempo_trace_through_cut` does both and explains why.
 pub async fn poll_until<F, Fut, T>(
     timeout: Duration,
     interval: Duration,

@@ -15,10 +15,12 @@
 # `max_trace_live`, `max_block_duration` and `complete_block_timeout`
 # (`modules/livestore/config.go:35,47-53`). This file overrides none of
 # them, so the defaults apply: `flush_check_period` and `max_trace_idle`
-# are both 5s (`modules/livestore/config.go:106,109`). Those two defaults
-# are what size the trace-by-ID gate's reference-side re-ask — see
-# `fetch_tempo_trace_through_cut` in `e2e/src/traces.rs`; changing them
-# here changes the window that retry is sized against.
+# are both 5s (`modules/livestore/config.go:106,109`). The trace-by-ID
+# gate's reference-side re-ask was sized against those two defaults —
+# `TEMPO_CUT_RETRY_CEILING` in `e2e/src/traces.rs`. Note that it is a
+# fixed constant CHOSEN to match them as they stand today; it does not
+# read this file and will not follow an override added here. If you set
+# either knob below, re-check that constant by hand.
 #
 # Recent traces are served from the live store, and the harness's bounded
 # completeness pre-checks (trace-by-ID first, then search visibility)
