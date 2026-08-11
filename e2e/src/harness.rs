@@ -277,6 +277,35 @@ fn dump_logs(compose: &Compose, variant: Variant) {
 /// scenario failure reports the *last* observed state, not the first.
 /// Mirrors [`wait_ready`]'s bounded-poll shape, generalized over the
 /// condition being polled for.
+///
+/// **What `timeout` does and does not bound.** Neither when an attempt
+/// *starts* nor when one *returns*. The loop calls `attempt` first and
+/// tests the deadline only afterwards, and the inter-attempt sleep is
+/// clamped to the deadline — so when the budget runs out the loop still
+/// starts one more attempt, at or just after the deadline, and it is that
+/// attempt's outcome which is reported. (At most one: if it does not
+/// succeed, the post-deadline arms bail.) Whatever is in flight is then
+/// awaited to completion — this function applies no timeout of its own,
+/// so a single attempt's duration is bounded only by whatever the caller
+/// built into `attempt` itself (typically a [`query_request_timeout`] on
+/// the request). A success is returned whenever it arrives, including
+/// after the deadline has passed. Total wall time is therefore roughly
+/// `timeout` plus the cost of that final attempt, which for most callers
+/// here is small beside their budget.
+///
+/// This is deliberate: the push call sites drive non-idempotent POSTs,
+/// where cancelling a request in flight would create exactly the "the
+/// server may already have ingested it" ambiguity that
+/// [`classify_push_send`] exists to prevent, and the completeness call
+/// sites run whole-corpus scans that may legitimately straddle the
+/// deadline on the final attempt.
+///
+/// **A caller needing a hard wall-clock bound must impose it itself** —
+/// wrap the attempt (e.g. `tokio::time::timeout_at`) AND compare against
+/// the deadline before accepting a result, because `timeout_at` polls the
+/// inner future before its elapsed timer and so still yields `Ok` for a
+/// future that is already ready at an expired deadline.
+/// `traces::fetch_tempo_trace_through_cut` does both and explains why.
 pub async fn poll_until<F, Fut, T>(
     timeout: Duration,
     interval: Duration,
