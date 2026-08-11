@@ -82,6 +82,20 @@ const COMPLETENESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// emit at most one completeness line per this interval.
 const COMPLETENESS_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Bounds for the trace-by-ID gate's reference-side re-ask
+/// ([`fetch_tempo_trace_through_cut`]), sized against Tempo's live-store
+/// cut window.
+///
+/// Measured gap widths on the real control flow were 11ms-959ms, so the
+/// 5s ceiling is ~5x the widest observed. It is also exactly one
+/// `flush_check_period`, which is the load-bearing half of the choice: a
+/// single `cutIdleTraces` pass that outlasts the interval between cuts is
+/// a broken reference, not a race a differential gate should absorb. The
+/// 100ms interval costs even an 11ms gap at most one extra poll, and caps
+/// a genuinely-absent trace at ~51 attempts before the gate fails.
+const TEMPO_CUT_RETRY_CEILING: Duration = Duration::from_secs(5);
+const TEMPO_CUT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Margin between the corpus's last span end and "now" at generation
 /// time, and the search-window slack on each side (both stores get the
 /// same snapped unix-second bounds).
@@ -616,6 +630,70 @@ async fn fetch_tempo_trace(
         reqwest::StatusCode::NOT_FOUND => Ok(None),
         s => bail!("tempo trace fetch for {trace_hex} returned {s}"),
     }
+}
+
+/// [`fetch_tempo_trace`] with a bounded re-ask on an absent result, for
+/// callers that have already established the trace WAS visible and treat
+/// a later 404 as fatal.
+///
+/// Tempo can 404 a trace it served moments earlier and will serve again,
+/// byte-identical. `cutIdleTraces`
+/// (`modules/livestore/instance.go:336-406` @ v3.0.2, `0c4b926d`) calls
+/// `CutIdle`, which deletes EVERY idle trace from the live map in one
+/// locked pass before yielding any of them
+/// (`pkg/livetraces/livetraces.go:121-145` @ v3.0.2, the `delete(l.Traces, k)`
+/// at :129 runs for the whole map first). The cut traces are then
+/// appended to the head block one at a time and `hb.Flush()` is called
+/// once, after the loop (`instance.go:399` @ v3.0.2). `walBlock.FindTraceByID`
+/// only reads flushed pages, so between the delete and that flush a cut
+/// trace is in neither place. This is a read-visibility gap, not data
+/// loss — and because the delete is one pass over the map, ALL idle
+/// traces vanish together, so the number a client trips over is bounded
+/// only by how fast it asks. Both knobs are at their defaults here:
+/// `deploy/e2e/tempo.yaml` sets neither, leaving `max_trace_idle` and
+/// `flush_check_period` at 5s (`modules/livestore/config.go:109` @ v3.0.2).
+///
+/// **What distinguishes "temporarily invisible" from "gone".** A
+/// mid-cut trace has a pending event that will restore it: the same
+/// `cutIdleTraces` call reaches its `hb.Flush()`, and nothing re-hides it
+/// afterwards. Its invisibility is therefore bounded by the duration of
+/// that one cut. A trace that was never pushed, or that the reference
+/// genuinely dropped, has no such pending event and stays 404 forever.
+/// Outlasting a full cut window is exactly that distinction, so
+/// exhausting [`TEMPO_CUT_RETRY_CEILING`] is the discriminator and the
+/// gate still fails — bounded, never hanging. The exhaustion error
+/// carries the attempt count and the real elapsed time so that a future
+/// argument for widening the ceiling can be made from numbers.
+///
+/// Deliberately NOT applied to [`fetch_pulsus_trace`]: see
+/// [`assert_trace_by_id_gate`] for why the retry is one-sided.
+async fn fetch_tempo_trace_through_cut(
+    ctx: &Ctx,
+    trace_hex: &str,
+    query_timeout: Duration,
+) -> Result<serde_json::Value> {
+    let started = Instant::now();
+    let attempts = Cell::new(0usize);
+    // `poll_until` is the module's bounded-poll primitive and is what
+    // `wait_for_fetch_completeness` already absorbs this same 404 with;
+    // reusing it here is the point of the fix — one event, one treatment,
+    // in both loops. It also retries a transient transport error, hence
+    // "absent or unreadable" rather than "404" in the message below.
+    poll_until(TEMPO_CUT_RETRY_CEILING, TEMPO_CUT_RETRY_INTERVAL, || {
+        attempts.set(attempts.get() + 1);
+        async { fetch_tempo_trace(ctx, trace_hex, query_timeout).await }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "tempo lost trace {trace_hex} after completeness: still absent or unreadable after \
+             {} attempts over {:.3?} (ceiling {TEMPO_CUT_RETRY_CEILING:?}, interval \
+             {TEMPO_CUT_RETRY_INTERVAL:?}) — longer than one live-store cut window, so the \
+             trace is gone rather than mid-cut",
+            attempts.get(),
+            started.elapsed(),
+        )
+    })
 }
 
 /// One rejection response's whole observable wire shape — issue #384's
@@ -1512,6 +1590,36 @@ pub async fn traces_differential(ctx: &Ctx) -> Result<()> {
 /// PulsusDB == corpus == Tempo per seeded trace, artifact + fail on any
 /// divergence. Structural tuples are compared afterwards as a separate
 /// INFORMATIONAL section.
+///
+/// **Why the reference-side fetch retries and ours does not.** This gate
+/// used a single unretried GET per store, while
+/// `wait_for_fetch_completeness` one second earlier polls with the
+/// identical fetch. A trace caught inside Tempo's live-store cut window
+/// (see [`fetch_tempo_trace_through_cut`]) is therefore invisible to the
+/// completeness loop, which retries past it, and fatal to this gate,
+/// which did not — the same event, two treatments. That asymmetry was
+/// the defect; measured, it failed 18% of replays of this control flow
+/// (9 of 50), so a green re-run demonstrated nothing.
+///
+/// The retry is applied ONLY to the reference side. The window above is
+/// a property of Tempo's live store, read from its source, and Tempo is
+/// the oracle here, not the system under test. Nobody has measured an
+/// analogous re-hide on the PulsusDB path, so wrapping our fetch too
+/// would buy nothing known and cost something real: it would spend up to
+/// [`TEMPO_CUT_RETRY_CEILING`] absorbing exactly the regression this
+/// suite exists to catch — one of our traces going invisible after it
+/// was already served. If our side ever does show such a window, it
+/// wants measuring and its own comment, not this one extended by
+/// symmetry.
+///
+/// **Known remaining exposure, deliberately not addressed here.** The
+/// same cut hides traces from Tempo's SEARCH path as well, which reads
+/// the same live traces. `wait_for_search_completeness` and every
+/// `run_search_case` below run later than this gate — usually past the
+/// cut, which is why they have not been seen to fail this way — but they
+/// are exposed by construction, and `run_search_case` compares result
+/// SETS, where a mid-cut trace shows up as a set difference rather than
+/// a 404. Nothing in this change protects them.
 async fn assert_trace_by_id_gate(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> {
     let mut structural_deltas: Vec<String> = Vec::new();
     let mut structural_bodies: Vec<serde_json::Value> = Vec::new();
@@ -1525,9 +1633,7 @@ async fn assert_trace_by_id_gate(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> 
         let pulsus_body = fetch_pulsus_trace(ctx, &trace_hex, query_timeout)
             .await?
             .with_context(|| format!("pulsus lost trace {trace_hex} after completeness"))?;
-        let tempo_body = fetch_tempo_trace(ctx, &trace_hex, query_timeout)
-            .await?
-            .with_context(|| format!("tempo lost trace {trace_hex} after completeness"))?;
+        let tempo_body = fetch_tempo_trace_through_cut(ctx, &trace_hex, query_timeout).await?;
 
         let pulsus_ids = fetch_span_ids(&pulsus_body)?;
         let tempo_ids = fetch_span_ids(&tempo_body)?;
