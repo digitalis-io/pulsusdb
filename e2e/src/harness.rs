@@ -278,16 +278,20 @@ fn dump_logs(compose: &Compose, variant: Variant) {
 /// Mirrors [`wait_ready`]'s bounded-poll shape, generalized over the
 /// condition being polled for.
 ///
-/// **What `timeout` does and does not bound.** It bounds when a NEW
-/// attempt is *started*, not when one *returns*. An attempt already in
-/// flight is awaited to completion — this function applies no timeout of
-/// its own, so a single attempt's duration is bounded only by whatever
-/// the caller built into `attempt` itself (typically a
-/// [`query_request_timeout`] on the request). A success is returned
-/// whenever it arrives, including after the deadline has passed. Total
-/// wall time is therefore roughly `timeout` plus the cost of one
-/// straddling attempt, which for most callers here is small beside their
-/// budget.
+/// **What `timeout` does and does not bound.** Neither when an attempt
+/// *starts* nor when one *returns*. The loop calls `attempt` first and
+/// tests the deadline only afterwards, and the inter-attempt sleep is
+/// clamped to the deadline — so when the budget runs out the loop still
+/// starts one more attempt, at or just after the deadline, and it is that
+/// attempt's outcome which is reported. (At most one: if it does not
+/// succeed, the post-deadline arms bail.) Whatever is in flight is then
+/// awaited to completion — this function applies no timeout of its own,
+/// so a single attempt's duration is bounded only by whatever the caller
+/// built into `attempt` itself (typically a [`query_request_timeout`] on
+/// the request). A success is returned whenever it arrives, including
+/// after the deadline has passed. Total wall time is therefore roughly
+/// `timeout` plus the cost of that final attempt, which for most callers
+/// here is small beside their budget.
 ///
 /// This is deliberate: the push call sites drive non-idempotent POSTs,
 /// where cancelling a request in flight would create exactly the "the

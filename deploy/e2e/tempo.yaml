@@ -8,7 +8,14 @@
 # digest — tag AND digest, the prom/prometheus:v3.13.0 precedent;
 # upgrades are deliberate future commits, never floating). Note for that
 # future upgrade path: Tempo 3.x's single-binary mode has no `ingester`
-# config block (`field ingester not found` on boot). The 2.x flush and
+# config block — adding one makes the process exit 1 before serving, with
+#   failed parsing config: failed to parse configFile /etc/tempo.yaml:
+#   yaml: unmarshal errors:
+#     line 52: field ingester not found in type app.Config
+# (measured 2026-08-11: this file plus `ingester: {max_block_duration: 5m}`
+# appended, run against the pinned digest below — `podman run --rm -v
+# <cfg>:/etc/tempo.yaml:ro grafana/tempo:3.0.2@sha256:cda87c21…
+# -config.file=/etc/tempo.yaml`). The 2.x flush and
 # complete-block tuning knobs were not removed, they moved — they now sit
 # under the root `live_store` key (`cmd/tempo/app/config.go:72` @ v3.0.2,
 # `0c4b926d`), which declares `flush_check_period`, `max_trace_idle`,
