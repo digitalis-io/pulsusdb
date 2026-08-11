@@ -15,7 +15,7 @@ use super::plan::{self, ClientAgg, ClientValue};
 use super::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_logql::RangeAggOp;
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::agg::{EMPTY_LABEL_SET, LabelSet, pin_reduction_order, range_payload_cmp};
 use super::charge::{
@@ -34,6 +34,145 @@ use super::window::{ClientWindow, InstantWindow, clamp_bucket, ensure_grid_resol
 /// folds into [`ClientAggState`] — bounds transient memory without
 /// per-row fold overhead (review round 1, finding 1).
 pub(in crate::logql) const CLIENT_AGG_CHUNK_ROWS: usize = 8_192;
+
+/// The base-collision rename suffix [`super::labels::merge_labels_with_structured_metadata`]
+/// applies (`pkg/logql/log/parser.go:25 @ v3.7.4`). Named here because
+/// [`slider_safe_fingerprints`]'s clause (ii) is a statement about which
+/// base label KEYS a merge can silently overwrite without growing the set.
+const EXTRACTED_SUFFIX: &str = "_extracted";
+
+/// Fingerprints whose BASE label set is provably unreachable by merging
+/// any co-selected stream's structured metadata (issue #249), and which
+/// may therefore keep the per-fingerprint streaming slider / `fp_groups`
+/// accumulator.
+///
+/// **Why the question is asked at all.** Merging structured metadata makes
+/// the *final projected label set* — not the fingerprint — the metric
+/// output-series key, exactly as the reference has it (there is no
+/// fingerprint fast path in `GroupedLabels()`/`b.Hash(lbls)`,
+/// `pkg/logql/log/labels.go:591-660`, `:662-686 @ v3.7.4`). Two structures
+/// keyed differently cannot be reconciled after the fact: `rate` emits
+/// `run_int / range_seconds`, and `a/s + b/s != (a+b)/s` in IEEE-754
+/// (`2/300 + 1/300 == 0.010000000000000002`, `3/300 == 0.01`). So a
+/// fingerprint may keep its own accumulator only when nothing else can
+/// ever land in the same output series.
+///
+/// **The rule.** A merge of stream `Z`'s structured metadata yields a
+/// label set whose key set is a SUPERSET of `Z`'s
+/// ([`super::labels::merge_labels_with_structured_metadata`]: a pair is
+/// renamed `<k>_extracted` on a base collision and then upserted, so a
+/// base key's value is never overwritten unless the base already holds the
+/// renamed key). Fingerprint `X`'s base label set is therefore unreachable
+/// by any merge iff
+///
+/// 1. no co-selected stream's key set is a proper subset of `X`'s —
+///    over-approximated soundly by `X.len() == min` over the selection; and
+/// 2. `X` carries no key ending in `_extracted` — which closes the
+///    equal-key-set case, where a merge can change a `<k>_extracted` VALUE
+///    without growing the set.
+///
+/// **Why those two are sufficient**, by cases on a merge of any
+/// co-selected stream `Z` whose result equals `X`'s base set:
+/// - The merge GREW `Z`'s key set. Then `|merged| > |Z| >= min = |X|`
+///   (clause 1), so it cannot equal `X`'s.
+/// - The merge left `Z`'s key set unchanged. The only way
+///   `merge_labels_with_structured_metadata` writes without pushing is the
+///   `<k>_extracted` rename landing on a slot `Z` already holds, so
+///   `merged` — and therefore `X` — would contain an `_extracted` key,
+///   which clause 2 excludes.
+///
+/// A third clause ("`X`'s rendered base set is unique in the selection")
+/// was considered and is NOT applied: it does not bear on merge
+/// reachability at all (the case analysis above never appeals to it), and
+/// two fingerprints sharing one base label set already emit two
+/// identically-labelled series today, independently of structured
+/// metadata. Adding it here would silently change that pre-existing
+/// behaviour — `fp_groups_non_mutating_past_the_old_series_cap_is_served_by_the_leaf`
+/// (`tests/logql_metric_agg_golden.rs`) collapses 501 same-labelled
+/// fingerprints to one series under it — which is a different defect from
+/// this one, and not this issue's to fix. See the implementation notes on
+/// issue #249.
+///
+/// **A SOUND OVER-APPROXIMATION**: it may withhold the slider from a
+/// fingerprint that was in fact safe (a mixed-shape selection loses the
+/// zero-allocation slider for its longer streams); it never grants it to
+/// one that was not. The exact subset test is `O(n^2)` in the stream count
+/// and was not worth buying — see docs/schemas.md §3.2 for the measured
+/// cost of withholding.
+pub(in crate::logql) fn slider_safe_fingerprints(
+    base_labels: &HashMap<u64, Vec<(String, String)>>,
+) -> HashSet<u64> {
+    let mut safe = HashSet::with_capacity(base_labels.len());
+    let Some(min_len) = base_labels.values().map(Vec::len).min() else {
+        return safe;
+    };
+    for (fp, labels) in base_labels {
+        if labels.len() != min_len {
+            continue;
+        }
+        if labels.iter().any(|(k, _)| k.ends_with(EXTRACTED_SUFFIX)) {
+            continue;
+        }
+        safe.insert(*fp);
+    }
+    safe
+}
+
+/// Where ONE row's sample belongs, decided AFTER the pipeline has run
+/// (issue #249).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::logql) enum RowRoute {
+    /// `final == base` for a slider-safe fingerprint: the fingerprint IS
+    /// the output series, so the row keeps the streaming slider
+    /// ([`FpSlide`]) or the per-fingerprint instant accumulator.
+    Fingerprint,
+    /// Anything else: the rendered final label set is the output series.
+    Labels,
+}
+
+/// Routes one row, POST-pipeline.
+///
+/// `scratch` is the FINAL (unsorted) label vector `run_metric_into*`
+/// produced; `base` the fingerprint's base label vector. The comparison is
+/// exact by definition rather than a rule about structured metadata: a row
+/// whose final set is byte-for-byte its fingerprint's base set cannot
+/// belong to any other output series, whatever produced it. That is why it
+/// needs no reasoning about `__error_details__`-only metadata or other
+/// inert merges — those rows simply compare equal.
+///
+/// Order-sensitivity is intended and is what makes the comparison cheap:
+/// `run_mode_into` seeds `labels` from `base` in order, and
+/// [`super::labels::merge_labels_with_structured_metadata`] only ever
+/// overwrites inside the seeded region or pushes past it, so an inert row
+/// compares equal element-wise without a sort.
+///
+/// POST-pipeline rather than post-merge, deliberately:
+/// [`check_surviving_error`] fails the whole query on any surviving
+/// `__error__`, so an `__error_details__`-only row provably never
+/// materialises with a visible error label (the reference agrees at
+/// `pkg/logql/log/labels.go:591-595 @ v3.7.4`).
+pub(in crate::logql) fn row_route(
+    state_fans_out: bool,
+    fp_is_slider_safe: bool,
+    scratch: &[(Cow<'_, str>, Cow<'_, str>)],
+    base: &[(String, String)],
+) -> RowRoute {
+    if state_fans_out || !fp_is_slider_safe {
+        return RowRoute::Labels;
+    }
+    if scratch.len() != base.len() {
+        return RowRoute::Labels;
+    }
+    let same = scratch
+        .iter()
+        .zip(base.iter())
+        .all(|((sk, sv), (bk, bv))| sk.as_ref() == bk.as_str() && sv.as_ref() == bv.as_str());
+    if same {
+        RowRoute::Fingerprint
+    } else {
+        RowRoute::Labels
+    }
+}
 
 /// Streaming per-bucket accumulator for every over-time reducer except
 /// `quantile_over_time` (which needs the full value set). Welford's
@@ -413,6 +552,10 @@ pub(in crate::logql) struct ClientAggState<'q> {
     /// issue #227; the instant path needed it once a grouping let two
     /// streams share one accumulator (issue #344).
     hashes: HashMap<u64, u64>,
+    /// Fingerprints allowed to keep the per-fingerprint `fp_groups`
+    /// accumulator (issue #249) — see [`slider_safe_fingerprints`].
+    /// Computed ONCE per query from the resolved stream set.
+    slider_safe: HashSet<u64>,
     fan_out: bool,
     /// `absent_over_time`'s selector-wide presence (plan v2 D2). A FLAG,
     /// not a bucket set, since issue #236 Part D: an instant window has
@@ -490,6 +633,7 @@ impl<'q> ClientAggState<'q> {
             compiled,
             client,
             rate_window_ns,
+            slider_safe: slider_safe_fingerprints(&base_labels),
             base_labels,
             hashes,
             // Issue #344 — the instant twin of `RangeSlideState`'s gate:
@@ -613,11 +757,20 @@ impl<'q> ClientAggState<'q> {
                     }));
                 }
             }
+            // Issue #249: WHERE this sample belongs, decided per row and
+            // BEFORE the in-place sort below, which would destroy the
+            // pipeline output order `row_route` compares against `base`.
+            let route = row_route(
+                self.fan_out,
+                self.slider_safe.contains(&row.fingerprint),
+                &scratch,
+                base,
+            );
             // ONE accumulator per group (issue #236 Part D): an instant
             // window has a single bucket, so each arm either seeds the
             // group's accumulator or folds into it — there is no bucket
             // map to index.
-            if self.fan_out {
+            if matches!(route, RowRoute::Labels) {
                 // In-place sort, no allocation — safe before the caps.
                 scratch.sort_unstable();
                 if self.needs_ts_order {
@@ -905,42 +1058,44 @@ impl<'q> ClientAggState<'q> {
 
         let base_labels = self.base_labels;
         let mut group_bytes = self.group_bytes;
-        let groups: Vec<(LabelSet, BucketAcc)> = if self.fan_out {
-            self.label_groups
-                .into_iter()
-                .map(|(key, (labels, acc))| {
-                    // Round 6 symmetry: sized over the same unmodified
-                    // key/labels as the charge, released as each entry is
-                    // consumed (key dropped, labels move to the output).
-                    discharge_group_bytes(
-                        &mut group_bytes,
-                        group_entry_bytes(&key, &labels, INSTANT_GROUP_SLOT),
-                    );
-                    (labels, acc)
-                })
-                .collect()
-        } else {
-            self.fp_groups
-                .into_iter()
-                .filter_map(|(fp, acc)| {
-                    // Issue #236 P1's discharge leg, with the SAME symmetry
-                    // the fan-out arm has had since round 6: sized over the
-                    // same `base_labels` value the charge used (empty key,
-                    // `FP_GROUP_SLOT`), released as the entry is consumed.
-                    // `push_rows` only charges a fingerprint it successfully
-                    // resolved in `base_labels`, so every charged entry is
-                    // discharged here and `group_bytes` returns to exactly 0
-                    // — the `filter_map` below can only drop an entry that
-                    // was never charged.
-                    let l = base_labels.get(&fp)?;
-                    discharge_group_bytes(
-                        &mut group_bytes,
-                        group_entry_bytes("", l, FP_GROUP_SLOT),
-                    );
-                    Some((l.clone(), acc))
-                })
-                .collect()
-        };
+        // Issue #249: routing is per ROW, so a query can leave output in
+        // BOTH maps and the two are UNIONED. Each pure case is unchanged —
+        // a fan-out state leaves `fp_groups` empty and a non-mutating state
+        // leaves `label_groups` empty — so the concatenation reduces to
+        // exactly one of today's two arms whenever the run is not mixed.
+        // Neither map has ever had an emission order to preserve (both are
+        // `HashMap`s under a randomly-seeded hasher).
+        let mut groups: Vec<(LabelSet, BucketAcc)> = self
+            .label_groups
+            .into_iter()
+            .map(|(key, (labels, acc))| {
+                // Round 6 symmetry: sized over the same unmodified
+                // key/labels as the charge, released as each entry is
+                // consumed (key dropped, labels move to the output).
+                discharge_group_bytes(
+                    &mut group_bytes,
+                    group_entry_bytes(&key, &labels, INSTANT_GROUP_SLOT),
+                );
+                (labels, acc)
+            })
+            .collect();
+        // A second STATEMENT rather than a chained iterator: both drains
+        // discharge into `group_bytes`, and two closures cannot hold one
+        // `&mut` at the same time.
+        groups.extend(self.fp_groups.into_iter().filter_map(|(fp, acc)| {
+            // Issue #236 P1's discharge leg, with the SAME symmetry
+            // the fan-out arm has had since round 6: sized over the
+            // same `base_labels` value the charge used (empty key,
+            // `FP_GROUP_SLOT`), released as the entry is consumed.
+            // `push_rows` only charges a fingerprint it successfully
+            // resolved in `base_labels`, so every charged entry is
+            // discharged here and `group_bytes` returns to exactly 0
+            // — the `filter_map` here can only drop an entry that
+            // was never charged.
+            let l = base_labels.get(&fp)?;
+            discharge_group_bytes(&mut group_bytes, group_entry_bytes("", l, FP_GROUP_SLOT));
+            Some((l.clone(), acc))
+        }));
         debug_assert_eq!(
             group_bytes, 0,
             "every group-label byte charge must be discharged at finish"
@@ -1055,7 +1210,15 @@ struct CollMember {
     /// group and dropped once `tie_rank` is assigned.
     body: String,
     value: f64,
-    /// Mutating path only: the rendered final label-set key + labels.
+    /// Where this member's sample belongs, decided per ROW rather than per
+    /// state since issue #249 — a `(fingerprint, timestamp_ns)` group can
+    /// hold members of both routes once structured metadata makes the
+    /// final label set, not the fingerprint, the output-series key.
+    route: RowRoute,
+    /// [`RowRoute::Labels`] members only: the rendered final label-set key
+    /// and the labels themselves. `None` for a [`RowRoute::Fingerprint`]
+    /// member (whose output labels ARE the fingerprint's base set) and for
+    /// `absent_over_time` (label-blind by construction).
     out: Option<(String, LabelSet)>,
 }
 
@@ -1272,6 +1435,13 @@ impl FpSlide {
     /// Loads one collision group (already `tie_rank`-ranked in `members`) at
     /// `ts`: emits grid points `< ts` first, then charges each member into the
     /// window. Reads values straight from the buffer (no intermediate `Vec`).
+    ///
+    /// Members routed by final label set ([`RowRoute::Labels`]) are SKIPPED —
+    /// they belong to the fan-out map, not to this fingerprint's slider
+    /// (issue #249). The `enumerate()` rank stays GLOBAL over the group so
+    /// the surviving subset keeps the group's total order: restricting an
+    /// order to a subset preserves it, and only the relative order of the
+    /// loaded samples is ever read (`win_order`'s `tie_rank`).
     fn load_group(
         &mut self,
         ts: i64,
@@ -1281,6 +1451,9 @@ impl FpSlide {
     ) -> Result<(), ReadError> {
         self.emit_until(ts, retained);
         for (rank, m) in members.iter().enumerate() {
+            if matches!(m.route, RowRoute::Labels) {
+                continue;
+            }
             let value = m.value;
             // Size → check the cap → allocate, through the ONE gate (issue
             // #227 review round 5, finding 2): `push_back` may grow the
@@ -1407,6 +1580,29 @@ pub(in crate::logql) struct MutGroup {
     cells: MutCells,
 }
 
+/// One output series waiting to be emitted by
+/// [`RangeSlideState::finish_in_place`] (issue #249): either a slider that
+/// already materialised its points, or a fan-out group still holding its
+/// cells. Both are sorted together on `labels()` so the emission order —
+/// and therefore the fold's accumulation order — is ONE total order over
+/// the whole result rather than two concatenated ones. The group arm stays
+/// LAZY: its points are drained one group at a time, so issue #236 Part
+/// B's point-axis win survives.
+#[derive(Debug)]
+enum FinishItem {
+    Slider(MatrixSeries),
+    Group(String, MutGroup),
+}
+
+impl FinishItem {
+    fn labels(&self) -> &LabelSet {
+        match self {
+            FinishItem::Slider(s) => &s.labels,
+            FinishItem::Group(_, g) => &g.labels,
+        }
+    }
+}
+
 /// The sliding-window range evaluator (issue #227).
 #[derive(Debug)]
 pub(in crate::logql) struct RangeSlideState<'q> {
@@ -1445,6 +1641,10 @@ pub(in crate::logql) struct RangeSlideState<'q> {
     absent_labels: LabelSet,
     pub(in crate::logql) base_labels: HashMap<u64, LabelSet>,
     hashes: HashMap<u64, u64>,
+    /// Fingerprints allowed to keep the per-fingerprint streaming slider
+    /// (issue #249) — see [`slider_safe_fingerprints`]. Computed ONCE per
+    /// query from the resolved stream set, `O(#streams)`, never per row.
+    slider_safe: HashSet<u64>,
     /// Concurrent retained-point count (charge-on-load / discharge-on-evict),
     /// gated by [`charge_retention`]/[`discharge_retention`].
     retained: u64,
@@ -1595,6 +1795,7 @@ impl<'q> RangeSlideState<'q> {
             grouping: client.grouping.as_deref(),
             needs_body_order,
             absent_labels: client.absent_labels.clone(),
+            slider_safe: slider_safe_fingerprints(&base_labels),
             base_labels,
             hashes,
             retained: 0,
@@ -1717,6 +1918,16 @@ impl<'q> RangeSlideState<'q> {
                     None => continue,
                 },
             };
+            // Issue #249: WHERE this sample belongs, decided per row and
+            // BEFORE `stage_member` sorts the scratch in place — `row_route`
+            // compares the pipeline's output order against `base`, which the
+            // sort would destroy.
+            let route = row_route(
+                self.fan_out,
+                self.slider_safe.contains(&row.fingerprint),
+                &scratch,
+                base,
+            );
             self.coll_active = true;
             self.coll_fp = row.fingerprint;
             self.coll_ts = row.timestamp_ns;
@@ -1725,7 +1936,7 @@ impl<'q> RangeSlideState<'q> {
             // JSON, cloned `LabelSet` — is sized, capped, THEN allocated in
             // one place. No reducer class has a path that stages anything
             // outside it.
-            if let Err(e) = self.stage_member(row, v, &mut scratch) {
+            if let Err(e) = self.stage_member(row, v, route, &mut scratch) {
                 result = Err(e);
                 break;
             }
@@ -1752,9 +1963,13 @@ impl<'q> RangeSlideState<'q> {
         &mut self,
         row: &MetricScanRow,
         value: f64,
+        route: RowRoute,
         scratch: &mut Vec<(Cow<'_, str>, Cow<'_, str>)>,
     ) -> Result<(), ReadError> {
-        let stages_out = self.fan_out && !self.is_absent;
+        // Issue #249: per ROW, not per state. `route` is already `Labels`
+        // for every row of a fan-out state, so a state that fanned out
+        // before still stages exactly what it staged before.
+        let stages_out = matches!(route, RowRoute::Labels) && !self.is_absent;
         if stages_out {
             // In-place sort, no allocation — safe to do before the caps.
             scratch.sort_unstable();
@@ -1791,7 +2006,12 @@ impl<'q> RangeSlideState<'q> {
             None
         };
         self.coll_bytes = next_bytes;
-        self.coll.push(CollMember { body, value, out });
+        self.coll.push(CollMember {
+            body,
+            value,
+            route,
+            out,
+        });
         Ok(())
     }
 
@@ -1923,77 +2143,96 @@ impl<'q> RangeSlideState<'q> {
         }
 
         let stream_hash = self.hashes.get(&fp).copied().unwrap_or(0);
-        if self.fan_out {
+        // Issue #249: the group's members are dispatched INDIVIDUALLY — a
+        // `(fingerprint, timestamp_ns)` group can hold both routes once
+        // structured metadata makes the final label set the output-series
+        // key. The fingerprint-routed half is loaded FIRST and the
+        // label-routed half consumes the buffer afterwards, so a group that
+        // is wholly one route takes byte-for-byte the path it took before.
+        let any_fp_route = self
+            .coll
+            .iter()
+            .any(|m| matches!(m.route, RowRoute::Fingerprint));
+        let any_label_route = self
+            .coll
+            .iter()
+            .any(|m| matches!(m.route, RowRoute::Labels));
+
+        if any_fp_route {
+            // Non-mutating: one slider per fingerprint (fingerprints contiguous).
+            if self.cur.is_none() || self.cur_fp != fp {
+                if let Some(prev) = self.cur.take() {
+                    self.rotate_slider(prev);
+                }
+                // Issue #236 P2 — the premise fix on the non-mutating RANGE
+                // path. Part A deleted the mid-scan group-count rejection
+                // that used to stand here, and the `labels` clone
+                // below plus the eventual `series_out` element were otherwise
+                // uncharged. Charged BEFORE the clone, so a refusal never
+                // allocates; discharged in the slider rotation's `None` arm
+                // (a series that yields no points) and at the end of
+                // `finish_in_place`'s non-mutating arm.
+                let src = base_labels.get(&fp);
+                charge_group_bytes(
+                    &mut self.group_bytes,
+                    group_entry_bytes("", src.unwrap_or(&EMPTY_LABEL_SET), SERIES_OUT_SLOT),
+                    self.caps.group_bytes,
+                )?;
+                // Issue #236: this slider will emit at most one point per
+                // grid point, so the grid's width is reserved once, here,
+                // before the slider exists — `O(1)`, and in the same units
+                // `MAX_METRIC_RESULT_POINTS` is derived in.
+                charge_result_points(
+                    &mut self.result_points,
+                    grid_slot_count(self.kmax),
+                    self.caps.result_points,
+                )?;
+                let labels = src.cloned().unwrap_or_default();
+                self.cur = Some(FpSlide {
+                    stream_hash,
+                    labels,
+                    op: self.op,
+                    class: self.class,
+                    param: self.param,
+                    rate_window_ns: self.rate_window_ns,
+                    grid_start: self.grid_start,
+                    step: self.step,
+                    range: self.range,
+                    kmax: self.kmax,
+                    next_k: 0,
+                    win: VecDeque::new(),
+                    run_int: 0,
+                    per_sample: self.per_sample,
+                    points: Vec::new(),
+                });
+                self.cur_fp = fp;
+            }
+            // Disjoint field borrows (`cur`, `coll`, `retained`) — the slider
+            // reads values straight from the buffer, no intermediate `Vec`; the
+            // buffer's capacity is reused (cleared, never reallocated per group).
+            let cur = self.cur.as_mut().expect("slider just set");
+            cur.load_group(
+                ts,
+                &self.coll,
+                &mut self.retained,
+                self.caps.retention_points,
+            )?;
+        }
+        if any_label_route {
             // The fan-out path moves `out` out of each member, so it consumes
             // the buffer (the mutating path is the already-expensive class);
             // `coll` re-grows on the next group.
             let members = std::mem::take(&mut self.coll);
             for (rank, m) in members.into_iter().enumerate() {
-                let (key, labels) = m.out.expect("mutating member carries its output set");
+                if matches!(m.route, RowRoute::Fingerprint) {
+                    continue;
+                }
+                let (key, labels) = m.out.expect("a label-routed member carries its output set");
                 self.fan_out_sample(key, labels, ts, stream_hash, rank as u32, m.value)?;
             }
-            return Ok(());
+        } else {
+            self.coll.clear();
         }
-
-        // Non-mutating: one slider per fingerprint (fingerprints contiguous).
-        if self.cur.is_none() || self.cur_fp != fp {
-            if let Some(prev) = self.cur.take() {
-                self.rotate_slider(prev);
-            }
-            // Issue #236 P2 — the premise fix on the non-mutating RANGE
-            // path. Part A deleted the mid-scan group-count rejection
-            // that used to stand here, and the `labels` clone
-            // below plus the eventual `series_out` element were otherwise
-            // uncharged. Charged BEFORE the clone, so a refusal never
-            // allocates; discharged in the slider rotation's `None` arm
-            // (a series that yields no points) and at the end of
-            // `finish_in_place`'s non-mutating arm.
-            let src = base_labels.get(&fp);
-            charge_group_bytes(
-                &mut self.group_bytes,
-                group_entry_bytes("", src.unwrap_or(&EMPTY_LABEL_SET), SERIES_OUT_SLOT),
-                self.caps.group_bytes,
-            )?;
-            // Issue #236: this slider will emit at most one point per
-            // grid point, so the grid's width is reserved once, here,
-            // before the slider exists — `O(1)`, and in the same units
-            // `MAX_METRIC_RESULT_POINTS` is derived in.
-            charge_result_points(
-                &mut self.result_points,
-                grid_slot_count(self.kmax),
-                self.caps.result_points,
-            )?;
-            let labels = src.cloned().unwrap_or_default();
-            self.cur = Some(FpSlide {
-                stream_hash,
-                labels,
-                op: self.op,
-                class: self.class,
-                param: self.param,
-                rate_window_ns: self.rate_window_ns,
-                grid_start: self.grid_start,
-                step: self.step,
-                range: self.range,
-                kmax: self.kmax,
-                next_k: 0,
-                win: VecDeque::new(),
-                run_int: 0,
-                per_sample: self.per_sample,
-                points: Vec::new(),
-            });
-            self.cur_fp = fp;
-        }
-        // Disjoint field borrows (`cur`, `coll`, `retained`) — the slider
-        // reads values straight from the buffer, no intermediate `Vec`; the
-        // buffer's capacity is reused (cleared, never reallocated per group).
-        let cur = self.cur.as_mut().expect("slider just set");
-        cur.load_group(
-            ts,
-            &self.coll,
-            &mut self.retained,
-            self.caps.retention_points,
-        )?;
-        self.coll.clear();
         Ok(())
     }
 
@@ -2186,7 +2425,12 @@ impl<'q> RangeSlideState<'q> {
             let series = self.finish_absent()?;
             return self.emit(series);
         }
-        if self.fan_out {
+        // Issue #249: with per-row routing a query can leave output in BOTH
+        // structures, so the two are unioned. Each pure case is preserved
+        // byte for byte — `groups` empty takes the unchanged non-mutating
+        // arm below, `series_out` empty takes the unchanged fan-out arm —
+        // and only a genuinely mixed run pays for the merge.
+        if !self.groups.is_empty() {
             // **The reduction-order pin, extended to the fold** (issue
             // #236, task-manager ruling "Option B"). `groups` is a
             // `HashMap` under a per-process randomly-seeded hasher, so
@@ -2204,22 +2448,50 @@ impl<'q> RangeSlideState<'q> {
             // could assert and no user could rely on; making it
             // label-ascending is the same order the wire already carries
             // everywhere else.
-            let mut groups: Vec<(String, MutGroup)> =
-                std::mem::take(&mut self.groups).into_iter().collect();
-            groups.sort_by(|(_, a), (_, b)| a.labels.cmp(&b.labels));
+            //
+            // Issue #249: any series the SLIDERS produced joins the same
+            // label-ascending sequence, so the fold sees ONE total order
+            // over the whole result whichever structure a series came from
+            // — a mixed run's folded value is therefore still the
+            // materialised value, bit for bit. `series_out` is empty on
+            // every pure fan-out run, where this reduces to exactly the
+            // sort this arm has always done, over exactly its groups.
+            let mut items: Vec<FinishItem> = std::mem::take(&mut self.groups)
+                .into_iter()
+                .map(|(key, group)| FinishItem::Group(key, group))
+                .chain(
+                    std::mem::take(&mut self.series_out)
+                        .into_iter()
+                        .map(FinishItem::Slider),
+                )
+                .collect();
+            items.sort_by(|a, b| a.labels().cmp(b.labels()));
             let mut out: Vec<MatrixSeries> = Vec::new();
-            for (key, group) in groups {
-                // Round 6 symmetry: the discharge is sized over the SAME
-                // (unmodified) key + labels the insertion charged — the key
-                // is immutable as the map key and `MutGroup.labels` is never
-                // touched after creation — so finish returns `group_bytes`
-                // to exactly 0. Taken AFTER the entry is consumed below (key
-                // dropped, labels moved into the output series), mirroring
-                // the cell discharges: a charge is never released while the
-                // memory it paid for is still owned by this state.
-                let entry_bytes = group_entry_bytes(&key, &group.labels, MUT_GROUP_SLOT);
-                drop(key);
-                let (labels, points) = self.drain_group(group);
+            for item in items {
+                let (labels, points, entry_bytes) = match item {
+                    // Issue #236 P2's discharge leg, reached here when a
+                    // mixed run leaves slider output alongside groups:
+                    // sized over the same (never-mutated) labels the charge
+                    // used, exactly as the non-mutating arm below sizes it.
+                    FinishItem::Slider(s) => {
+                        let entry_bytes = group_entry_bytes("", &s.labels, SERIES_OUT_SLOT);
+                        (s.labels, s.points, entry_bytes)
+                    }
+                    // Round 6 symmetry: the discharge is sized over the SAME
+                    // (unmodified) key + labels the insertion charged — the key
+                    // is immutable as the map key and `MutGroup.labels` is never
+                    // touched after creation — so finish returns `group_bytes`
+                    // to exactly 0. Taken AFTER the entry is consumed below (key
+                    // dropped, labels moved into the output series), mirroring
+                    // the cell discharges: a charge is never released while the
+                    // memory it paid for is still owned by this state.
+                    FinishItem::Group(key, group) => {
+                        let entry_bytes = group_entry_bytes(&key, &group.labels, MUT_GROUP_SLOT);
+                        drop(key);
+                        let (labels, points) = self.drain_group(group);
+                        (labels, points, entry_bytes)
+                    }
+                };
                 if !points.is_empty() {
                     // Issue #236 Part B: the fold consumes each group AS
                     // it is built, so the `scanned groups x grid points`
@@ -3064,6 +3336,7 @@ mod tests {
         let member = |v: f64| CollMember {
             body: String::new(),
             value: v,
+            route: RowRoute::Fingerprint,
             out: None,
         };
         let mut err = None;
@@ -3138,6 +3411,7 @@ mod tests {
             let group = [CollMember {
                 body: String::new(),
                 value: i as f64,
+                route: RowRoute::Fingerprint,
                 out: None,
             }];
             slide
@@ -4658,7 +4932,9 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
                     .collect();
-                state.stage_member(&row, 1.0, &mut scratch).expect("staged");
+                state
+                    .stage_member(&row, 1.0, RowRoute::Labels, &mut scratch)
+                    .expect("staged");
                 assert!(
                     state.coll_bytes >= staged_capacity(&state),
                     "{name}: charge {} under-counts the {} bytes actually allocated \
@@ -5038,7 +5314,9 @@ mod tests {
             state.coll_active = true;
             state.coll_fp = 1;
             state.coll_ts = 5;
-            state.stage_member(&row, 1.0, &mut scratch).expect("staged");
+            state
+                .stage_member(&row, 1.0, RowRoute::Labels, &mut scratch)
+                .expect("staged");
             state.flush_collision(&HashMap::new()).expect("flushed");
             assert_eq!(state.groups.len(), 1, "{name}: one retained group");
             for (key, g) in &state.groups {
@@ -5947,5 +6225,141 @@ mod tests {
         )
         .unwrap();
         assert_eq!(absent.present_cover.len(), (absent.kmax + 2) as usize);
+    }
+    /// Issue #249 AC-20 — **the genuinely universal half** of the
+    /// byte-identity claim. Unlike a claim about queries, this one
+    /// quantifies over `row_route`'s OWN inputs, so a generated sweep
+    /// really does cover the domain the sentence names: for EVERY base
+    /// label vector in a set spanning 0..8 pairs (including empty keys and
+    /// empty values), a row whose pipeline output equals that base — which
+    /// is exactly what a structured-metadata-free row produces — routes
+    /// `Fingerprint` under a slider-safe fingerprint.
+    ///
+    /// Break test: make `row_route` return `RowRoute::Labels` for an
+    /// SM-free row and this fails on the first vector.
+    #[test]
+    fn an_empty_metadata_row_always_routes_to_its_fingerprint() {
+        // 0..8 pairs, with an empty key at position 3 and an empty value
+        // at position 5, so the degenerate shapes are inside the sweep
+        // rather than adjacent to it.
+        let mut checked = 0usize;
+        for n in 0..=8usize {
+            let base: Vec<(String, String)> = (0..n)
+                .map(|i| {
+                    let k = if i == 3 {
+                        String::new()
+                    } else {
+                        format!("k{i}")
+                    };
+                    let v = if i == 5 {
+                        String::new()
+                    } else {
+                        format!("v{i}")
+                    };
+                    (k, v)
+                })
+                .collect();
+            let scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = base
+                .iter()
+                .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
+                .collect();
+            assert_eq!(
+                row_route(false, true, &scratch, &base),
+                RowRoute::Fingerprint,
+                "an inert row under a slider-safe fingerprint must keep the \
+                 fingerprint accumulator ({n} label pairs)"
+            );
+            // ...and the three ways OUT of that route, each on its own.
+            assert_eq!(
+                row_route(true, true, &scratch, &base),
+                RowRoute::Labels,
+                "a fan-out state routes by label set whatever the row is"
+            );
+            assert_eq!(
+                row_route(false, false, &scratch, &base),
+                RowRoute::Labels,
+                "a fingerprint that is not slider-safe never keeps the slider"
+            );
+            let mut grown = scratch.clone();
+            grown.push((Cow::Borrowed("added"), Cow::Borrowed("x")));
+            assert_eq!(
+                row_route(false, true, &grown, &base),
+                RowRoute::Labels,
+                "a row whose final set GREW is its own output series"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 9, "the sweep must cover 0..=8 pairs");
+    }
+
+    /// Issue #249 — the same-length, same-keys case: a merge that
+    /// OVERWRITES a value without growing the set still leaves the
+    /// fingerprint's own series, so the row must not join the slider.
+    /// This is the case `slider_safe_fingerprints`' `_extracted` clause
+    /// exists for, checked here at the row level where it is exact.
+    #[test]
+    fn a_row_whose_value_changed_without_growing_routes_by_label_set() {
+        let base = vec![
+            ("app".to_string(), "a".to_string()),
+            ("app_extracted".to_string(), "old".to_string()),
+        ];
+        let scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = vec![
+            (Cow::Borrowed("app"), Cow::Borrowed("a")),
+            (Cow::Borrowed("app_extracted"), Cow::Borrowed("new")),
+        ];
+        assert_eq!(row_route(false, true, &scratch, &base), RowRoute::Labels);
+    }
+
+    /// Issue #249 — `slider_safe_fingerprints`' two clauses, each
+    /// falsifiable on its own.
+    #[test]
+    fn slider_safety_withholds_on_length_and_on_an_extracted_key() {
+        let mk = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        // Clause 1 — the cross-fingerprint collision shape. `{app}` is at
+        // the minimum length and stays safe; `{app, pod}` is reachable by
+        // merging `{app}`'s metadata and is withheld.
+        let mut sel: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        sel.insert(1, mk(&[("app", "a")]));
+        sel.insert(2, mk(&[("app", "a"), ("pod", "p")]));
+        let safe = slider_safe_fingerprints(&sel);
+        assert!(
+            safe.contains(&1),
+            "the minimum-length stream keeps the slider"
+        );
+        assert!(
+            !safe.contains(&2),
+            "a stream whose base set a co-selected merge can REACH must be withheld"
+        );
+
+        // Uniform shapes: every fingerprint is safe, which is what keeps
+        // the metadata-free hot path on the slider.
+        let mut uniform: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        uniform.insert(1, mk(&[("app", "a")]));
+        uniform.insert(2, mk(&[("app", "b")]));
+        assert_eq!(slider_safe_fingerprints(&uniform).len(), 2);
+
+        // Clause 2 — an `_extracted` key is withheld even at the minimum
+        // length, because a merge can change its VALUE without growing
+        // the key set.
+        let mut ext: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        ext.insert(1, mk(&[("app", "a")]));
+        ext.insert(2, mk(&[("app_extracted", "z")]));
+        let safe = slider_safe_fingerprints(&ext);
+        assert!(safe.contains(&1));
+        assert!(
+            !safe.contains(&2),
+            "an `_extracted` key is exactly the equal-length merge target"
+        );
+
+        assert!(
+            slider_safe_fingerprints(&HashMap::new()).is_empty(),
+            "an empty selection has nothing to admit"
+        );
     }
 }

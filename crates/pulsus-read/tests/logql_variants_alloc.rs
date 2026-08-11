@@ -1919,6 +1919,20 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // test; neither allocates on either path, and the staging buffer
         // the flag governs starts EMPTY (`Vec::new()` allocates nothing)
         // and is charged against the collision caps when it fills.
+        //
+        // Issue #249: 2 branches — UNCHANGED — and one new callee,
+        // `slider_safe_fingerprints`. It decides ONCE per query which
+        // fingerprints may keep the per-fingerprint accumulator, which is
+        // what lets structured metadata make the final label set the
+        // output-series key without moving the metadata-free hot path.
+        // W-MEM disposition: **BAND, row C-e** — the same row that already
+        // prices the `base_labels`/`hashes` snapshot. The helper's own
+        // retained allocation is one `HashSet<u64>` of at most one entry
+        // per resolved fingerprint (8 bytes of key), i.e. strictly
+        // narrower than the `base_labels` entry C-e already charges for
+        // the same fingerprint, and it scales on the same axis
+        // (`meta.len()`) — so the row's slope covers it without a new
+        // coefficient. It allocates nothing per ROW.
         branches: 2,
         callees: &[
             ".insert",
@@ -1931,6 +1945,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             "new",
             "reducer_class",
             "series_labels",
+            // Issue #249: the per-query slider-safety set, BAND (C-e).
+            "slider_safe_fingerprints",
             // Issue #344: the instant path's `hashes` map, BAND (C-e).
             "stream_hash",
         ],
@@ -1950,6 +1966,14 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // allocate on neither path and add no per-variant band term (the
         // clause itself was cloned and charged at plan time, inside
         // `variant_spec_bytes`' range-grouping term). Inventory row C-e.
+        //
+        // Issue #249: 6 branches — UNCHANGED — and one new callee,
+        // `slider_safe_fingerprints`, the twin of the `ClientAggState::new`
+        // entry above and with the same disposition: **BAND, row C-e**. One
+        // `HashSet<u64>` sized at most one 8-byte key per resolved
+        // fingerprint, scaling on the `meta.len()` axis C-e already prices
+        // for `base_labels`/`hashes` and strictly narrower per entry than
+        // either; nothing per ROW.
         branches: 6,
         callees: &[
             // Issue #344: the borrowed grouping, NIL.
@@ -1969,6 +1993,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             "reducer_class",
             "retention_points_per_sample",
             "series_labels",
+            // Issue #249: the per-query slider-safety set, BAND (C-e).
+            "slider_safe_fingerprints",
             "stream_hash",
             "unreachable!",
             "vec!",
@@ -2114,10 +2140,28 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // `zz_print_frame_censuses`. W-MEM disposition: rows F-i and
         // F-v classified exactly those two arms as UNREACH and are
         // deleted with them.
-        branches: 5,
+        //
+        // Issue #249: 5 -> 4 branches, and `.extend` joins the callee set.
+        // Routing is now per ROW, so a run can leave output in BOTH maps
+        // and the `if self.fan_out { … } else { … }` that picked ONE of
+        // them is deleted — that is the branch that left. Both maps are
+        // now drained unconditionally into one vector, `label_groups`
+        // through the existing `collect` and `fp_groups` through
+        // `.extend` (a second STATEMENT, because both drains discharge
+        // into the same `&mut group_bytes` and two closures cannot hold
+        // it at once). W-MEM disposition: **NIL** — the drains and their
+        // discharges are unchanged term for term; `.extend` reserves for
+        // an iterator whose elements this frame already allocated and
+        // charged, and on every non-mixed run one of the two drains is
+        // empty, which is every run a variants sub-state can produce
+        // (`VariantsAggState` builds one sub-state per extractor and each
+        // is wholly fan-out or wholly not).
+        branches: 4,
         callees: &[
             ".clone",
             ".collect",
+            // Issue #249: the second drain's append, NIL.
+            ".extend",
             ".filter_map",
             ".finish",
             ".get",
@@ -2137,6 +2181,20 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         file: "client_agg.rs",
         ty: Some("ClientAggState"),
         anchor: "push_rows_inner",
+        // Issue #249: 25 -> 26 branches, and two new callees, `row_route`
+        // + `.contains`. The state-level `if self.fan_out` that chose
+        // between `label_groups` and `fp_groups` becomes a per-ROW
+        // `if matches!(route, RowRoute::Labels)` — the `matches!` is the
+        // one added branch — fed by `row_route(…, self.slider_safe
+        // .contains(&row.fingerprint), &scratch, base)`. W-MEM
+        // disposition: **NIL** — `row_route` is a length test plus a
+        // zipped `&str` comparison over the label scratch and allocates
+        // nothing on either arm, and `HashSet::<u64>::contains` hashes a
+        // `Copy` key. Both run per row and both are allocation-free; the
+        // per-row allocations this frame makes are unchanged, and which
+        // map a row lands in was already priced by rows F-* of the
+        // inventory for both destinations.
+        //
         // Issue #344 review round 1: the former `push_rows` body, plus
         // the equal-timestamp staging route. 21 -> 22 branches (the
         // `needs_ts_order` arm) and two new callees: `.flush_pending`
@@ -2149,11 +2207,13 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // gone from it. The allocations are censused where they now
         // happen (BAND, `ClientAggState::stage`). Inventory rows
         // F-b/F-d.
-        branches: 25,
+        branches: 26,
         callees: &[
             ".add",
             ".as_deref",
             ".collect",
+            // Issue #249: the per-row slider-safety probe, NIL.
+            ".contains",
             ".contains_key",
             ".copied",
             ".entry",
@@ -2180,6 +2240,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             "matches!",
             "new",
             "render_labels_json_sorted",
+            // Issue #249: the per-row route decision, NIL.
+            "row_route",
         ],
     },
     Frame {
@@ -2298,11 +2360,23 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "push_rows",
+        // Issue #249: 8 branches — UNCHANGED — and two new callees.
+        // `row_route(self.fan_out, self.slider_safe.contains(&row
+        // .fingerprint), &scratch, base)` decides per ROW where the
+        // sample belongs and is computed HERE, before `stage_member`
+        // sorts the scratch in place (the comparison reads the
+        // pipeline's output order). It sits inside the existing `let`,
+        // so it adds no branch. W-MEM disposition: **NIL** for both —
+        // a length test plus a zipped `&str` compare, and a
+        // `HashSet<u64>` probe on a `Copy` key; neither allocates on
+        // either path, and this frame's per-row allocation stays zero.
         branches: 8,
         // `.into` joined with issue #230: the render-budget breach
         // (`TemplateBudgetExceeded`) converts into `ReadError` on the
         // row path — F-d's NOT-EXEC disposition covers it.
         callees: &[
+            // Issue #249: the per-row slider-safety probe, NIL.
+            ".contains",
             ".flush_collision",
             ".get",
             ".into",
@@ -2313,6 +2387,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             "Ok",
             "check_surviving_error",
             "new",
+            // Issue #249: the per-row route decision, NIL.
+            "row_route",
             "take",
         ],
     },
@@ -2346,9 +2422,29 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // absent arm gains a `?` (10 -> 11 branches). Regenerated with
         // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — a
         // propagated `Result`, no allocation.
-        branches: 11,
+        // Issue #249: 11 -> 12 branches, and five new callees
+        // (`.chain`, `.map`, `.labels`, `Group`, plus the `Slider`/
+        // `Group` match itself). Per-row routing lets one query leave
+        // output in BOTH structures, so the fan-out arm's early return
+        // becomes a union: `groups` and `series_out` are collected into
+        // one `Vec<FinishItem>`, sorted on `labels()`, and emitted in
+        // that single total order — which is what keeps a mixed run's
+        // FOLDED value equal to its materialised value. The added
+        // branch is the `FinishItem` match. W-MEM disposition:
+        // **NIL** — issue #236 Part B's point-axis win is intact
+        // because the `Group` arm stays LAZY (`drain_group` still runs
+        // one group at a time inside the loop, nothing is materialised
+        // up front), and the new `Vec<FinishItem>` replaces the
+        // `Vec<(String, MutGroup)>` this frame already allocated and
+        // already sorted — one element per output series either way,
+        // on the axis rows F-* already price. A variants sub-state
+        // leaves one of the two sources empty, so its element count is
+        // unchanged.
+        branches: 12,
         callees: &[
             ".as_mut",
+            // Issue #249: the slider/group union, NIL.
+            ".chain",
             ".cmp",
             ".collect",
             ".drain_group",
@@ -2358,11 +2454,16 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             ".flush_collision",
             ".into_iter",
             ".is_empty",
+            // Issue #249: `FinishItem`'s sort key, NIL.
+            ".labels",
+            ".map",
             ".push",
             ".push_series",
             ".rotate_slider",
             ".sort_by",
             ".take",
+            // Issue #249: the lazy `FinishItem::Group` arm, NIL.
+            "Group",
             "Matrix",
             "Ok",
             "discharge_group_bytes",
@@ -2445,8 +2546,27 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // `zz_print_frame_censuses`. W-MEM disposition: **NIL** —
         // integer arithmetic on the same once-per-fingerprint path the
         // deleted check occupied; it allocates nothing.
-        branches: 13,
+        // Issue #249: 13 -> 18 branches, and three new callees (`.any`,
+        // `.iter`, `matches!`). The group's members are dispatched
+        // INDIVIDUALLY now: `if self.fan_out { … return }` — one
+        // whole-group decision — becomes two independent halves,
+        // `if any_fp_route { …slider… }` then `if any_label_route
+        // { …fan-out… } else { clear }`, plus the per-member
+        // `matches!(m.route, …)` skips inside each. A collision group
+        // can hold both routes once structured metadata makes the
+        // final label set the output-series key. W-MEM disposition:
+        // **NIL** — the two `.iter().any(…)` scans read a `Copy`
+        // discriminant over a buffer bounded by
+        // `AggCaps::collision_members` and allocate nothing, and each
+        // half performs exactly the allocations it performed before,
+        // for a subset of the members. A group that is wholly one
+        // route — which is every group a variants sub-state can
+        // produce, and every group of any metadata-free query — takes
+        // byte-for-byte the path it took before.
+        branches: 18,
         callees: &[
+            // Issue #249: the per-member route partition, NIL.
+            ".any",
             ".as_bytes",
             ".as_mut",
             ".clear",
@@ -2461,6 +2581,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             ".into_iter",
             ".is_empty",
             ".is_none",
+            // Issue #249: the per-member route partition, NIL.
+            ".iter",
             ".load_group",
             ".rotate_slider",
             ".sort_by",
@@ -2472,6 +2594,8 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             "charge_group_bytes",
             "charge_result_points",
             "grid_slot_count",
+            // Issue #249: the route discriminant tests, NIL.
+            "matches!",
             "group_entry_bytes",
             "new",
             "take",
