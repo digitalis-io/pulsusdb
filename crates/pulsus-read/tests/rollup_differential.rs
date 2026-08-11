@@ -308,7 +308,19 @@ fn sliding_count_reference(
 /// column: the query does not need `body` or `fingerprint` (the body filter
 /// is a WHERE predicate and the fingerprint is already known), so asking
 /// for them was the whole defect. Now no widening of any engine row type
-/// can reach this test.
+/// can reach THIS helper — that part is permanent.
+///
+/// **What it does not settle.** The enumeration of other hand-written-SQL
+/// decode sites is NOT complete, and nobody should read this fix as
+/// closing it. `ChClient::query_stream` is this workspace's decode
+/// wrapper but not its only decode path: `xtask/src/ch_bench/candidates.rs`
+/// (`:124`, `:137`, `:142`) decodes through the `clickhouse` crate's own
+/// `fetch::<T>()` / `fetch_one()` / `fetch_all()` on a raw
+/// `clickhouse::Client`, two of them by inference from the binding rather
+/// than a turbofish. Grep also cannot see through type aliases,
+/// re-exports, macro expansion or generic forwarding. So a row type's
+/// widening has its blast radius established per change, by building and
+/// by running the live suites — never read off a single pattern.
 #[derive(Debug, Row, serde::Serialize, serde::Deserialize)]
 struct TimestampRow {
     timestamp_ns: i64,
