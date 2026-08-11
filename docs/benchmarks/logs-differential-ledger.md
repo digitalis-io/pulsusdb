@@ -2684,6 +2684,114 @@ WHICH order.**
   Nothing gates equivalence with the reference's order, because we do not
   claim it.
 
+- **Sibling: `sort-tie-order`** (below). Same SHAPE — a tie in an ordering
+  key that the reference breaks by something we do not reproduce —
+  different mechanism and, decisively, different CONSEQUENCE. This entry
+  is about log **entries** in a `streams` response and its consequence is
+  a different SUBSET surviving a `LIMIT`. `sort-tie-order` is about
+  **samples** in an instant `vector`, and for the two committed terminal
+  sort cases the whole vector reaches the wire, so only the arrangement
+  inside an equal-value run differs. Do not fold the two together: the
+  subset consequence is what makes this entry important.
+
+### `sort-tie-order` (issue #406 — the reference specifies no order among equal-valued samples, so we pin our own)
+
+`metric_sort_order` and `metric_sort_desc_order` stay `mode: "gated"` —
+nothing is downgraded and neither case carries a `ledger` field. What this
+entry records is exactly which part of the store-vs-store comparison was
+RELAXED, and what stays asserted.
+
+- **Reference behaviour (from source, not from a behavioural claim).**
+  The heap comparators order on the sample value **alone**; there is no
+  label or identity tie-break — `vectorByValueHeap.Less`
+  (`pkg/logql/vector.go:16-21`) and `vectorByReverseValueHeap.Less`
+  (`:45-50`), both @ grafana/loki v3.7.4
+  `b318f2829f0ae2094ab3a1e90780450e9e4b03be`. The final ordering is
+  `sort.Sort(sort.Reverse(...))` over the heap's backing array —
+  `sort.Sort`, not `sort.Stable`, whose documented contract does not
+  preserve the order of equal elements
+  (`pkg/logql/evaluator.go:598-608` for `OpTypeTopK, OpTypeSortDesc`, the
+  sort itself at `:600`, and `:610-620` for `OpTypeBottomK, OpTypeSort`,
+  the sort at `:612` — both @ v3.7.4). The e2e oracle tag carries the same
+  code: `v3.4.2:pkg/logql/vector.go:16-21, 45-50` and
+  `v3.4.2:pkg/logql/evaluator.go:588-598` (sort at `:590`) and `:600-610`
+  (sort at `:602`). **So nothing in the reference assigns an order to
+  equal-valued samples.**
+
+- **What we have OBSERVED, and nothing beyond it.** Over the counts
+  `{a:5, b:1, c:5}` the reference returned `b,a,c` when the case was
+  written and `b,c,a` on `grafana/loki:3.4.2` at the nightly full tier on
+  2026-08-10 (`e2e-metrics-full (single)` run 31439057683). Both are
+  correctly ascending by value. **Whether the arrangement varies run to
+  run at a FIXED version has not been measured, and no claim that the
+  reference is random, stable or version-dependent is made here or
+  anywhere else.**
+
+- **PulsusDB behaviour.** `value` then label set ascending, deterministic:
+  `crates/pulsus-read/src/logql/post_agg.rs::sort_instant` (`:738-766`,
+  the tie-break at `:764`).
+  It stays. This is the ratified treatment of every irreproducible
+  reference tie in this repo (see `label-replace-collision-tie-order`).
+
+- **Asserted by the store-vs-store gate** (`value_ordered_sequences_agree`,
+  `e2e/src/logs.rs`): both stores return the same multiset of
+  `(labels, value)` (the pre-existing set-equal validity gate against the
+  by-construction corpus, on both stores); PulsusDB's sequence is monotone
+  in the requested direction (exact `>=`/`<=`, no tolerance); the two
+  value sequences agree pointwise; and the entries occupying each
+  equal-value run are the same multiset on both sides.
+
+- **Not asserted:** the arrangement *within* an equal-value run. The runs
+  are anchor-defined over the PulsusDB sequence alone — the comparison
+  declines to observe the oracle's own run boundaries and does not
+  establish that they coincide.
+
+- **Not covered — a composed (non-terminal) `sort`.** The cosmetic
+  conclusion is about a TERMINAL `sort`/`sort_desc`, whose entire result
+  vector reaches the wire. LogQL's grammar admits a sort as an inner
+  operand (`metricExpr: … | vectorAggregationExpr`,
+  `pkg/logql/syntax/syntax.y:114-121`; `vectorAggregationExpr: vectorOp
+  '(' NUMBER ',' metricExpr ')'`, `:176-184`, both @ v3.7.4 `b318f282`;
+  same productions at `v3.4.2:pkg/logql/syntax/expr.y:162-170, 226-234`),
+  so `topk(1, sort(rate({app="x"}[5m])))` is a legal query and the outer
+  operator **does** truncate. At the reference the survivor of a tie at
+  the k boundary depends on arrival order — `group.heap[0].F < s.F` is
+  strict, so the first-arrived of two equal samples is kept
+  (`pkg/logql/evaluator.go:549`, `bottomk` mirror `:560`; identical at
+  `v3.4.2:pkg/logql/evaluator.go:539, 550`) — so an inner sort's intra-run
+  arrangement can change WHICH sample survives. That is a subset
+  consequence, not a cosmetic one. PulsusDB's selection is arrival-order
+  independent (`select_k_instant`,
+  `crates/pulsus-read/src/logql/post_agg.rs:858`, → `sort_candidates`,
+  `:778`, value then label set ascending). **No committed case exercises
+  it** —
+  `test/fixtures/logs/differential.json` contains no
+  `topk`/`bottomk`/`approx_topk` query, and every committed `sort` is
+  terminal (pinned by AC20's `every_committed_sort_case_is_terminal`,
+  which PARSES each committed query and inspects its AST root rather than
+  its text). Open remainder on issue #406; not closed here.
+
+- **PulsusDB's own order is pinned** — by
+  `shipped_sort_case_evaluates_in_the_pinned_value_order`, its `sort_desc`
+  mirror (both `e2e/src/logs.rs`), and the two `eval_ordered` rows in
+  `differential_metric_reducers.test`. **All four observe PulsusDB only
+  and are evidence about our determinism, never about the reference.**
+
+- **Relationship to `timestamp-tie-order`** (above, same issue): same
+  shape, different surface and different consequence.
+
+  | | `timestamp-tie-order` | `sort-tie-order` |
+  |---|---|---|
+  | surface | log **entries** in a `streams` response | **samples** in an instant `vector` |
+  | our key | `ORDER BY timestamp_ns, fingerprint, cityHash64(body), body` in `sql::stage3` | `value` then label set ascending, `post_agg::sort_instant` |
+  | reference's key | arrival order within a stream / `streamHash` across (`pkg/iter/entry_iterator.go:241-275`) | none — value only, unstable sort |
+  | consequence | **a different SUBSET survives a `LIMIT`** — one row in four in common | **cosmetic for the two committed TERMINAL sort cases**: the whole result vector reaches the wire, so the multiset on the wire is identical and only the arrangement inside an equal-value run differs |
+
+- Gated by `differential_metric_reducers.test` (the two `eval_ordered`
+  rows, each carrying `# provenance: divergence(sort-tie-order)`), by
+  `value_ordered_agreement_*` / `tie_groups_*` in `e2e/src/logs.rs`, and
+  by `the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger`.
+
 ### `logs-timestamp-i64-nanosecond-domain` (issue #406 Part D, rulings v3 — a representation limit with a date on it)
 
 No fixture case references this entry — nothing is downgraded. It records

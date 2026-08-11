@@ -1909,8 +1909,12 @@ const DERIVED: usize = 31;
 /// on the reference's surviving-error surface name
 /// `variants-surviving-error-status`. Issue #393's rows where several
 /// logfmt extraction identifiers share a source key name
-/// `logfmt-expression-duplicate-source-key-tiebreak`.
-const DIVERGENCE: usize = 28;
-const PORTED: usize = 32;
+/// `logfmt-expression-duplicate-source-key-tiebreak`. Issue #406 moved
+/// `differential_metric_reducers.test`'s `eval_ordered` rows off that
+/// file's `ported(...)` default onto `sort-tie-order`: their expected
+/// sequences are OUR tie-break rule (`post_agg::sort_instant`), not a
+/// ported reference order — the reference specifies none.
+const DIVERGENCE: usize = 30;
+const PORTED: usize = 30;
 const TOTAL: usize = 1_486;
 // corpus-counts: end (provenance-corpus-constants)

@@ -765,8 +765,13 @@ const PROVENANCE_PERMITS: usize = 1_149;
 /// lands here and its `eval_fail` rows never enter the question.
 const REACHABLE: usize = 221;
 
+/// Issue #406 moved `differential_metric_reducers.test`'s `eval_ordered`
+/// rows off that file's `ported(...)` default onto
+/// `divergence(sort-tie-order)`, so the same rows leave the
+/// `not a capture claim (ported)` bucket and enter `pinned-divergence`.
+/// The total is unchanged; nothing became replayable or stopped being so.
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=154, not a capture claim (derived)=29, \
-not a capture claim (ported)=29, our-error-text (eval_fail)=97, pinned-divergence=28";
+not a capture claim (ported)=27, our-error-text (eval_fail)=97, pinned-divergence=30";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice
