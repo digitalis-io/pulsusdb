@@ -17,8 +17,16 @@ use driver::runner::{DirectiveCounts, EvalMode, run_file};
 
 /// Every `.test` file in `tests/logqltest/corpus`, discovered from disk (not
 /// a hardcoded list) so batches only ever ADD files with no shared edit point
-/// — parallel-safe. The #29 F1 anti-drop guarantee holds by construction: the
-/// replay runs whatever is on disk, so a file cannot silently drop out.
+/// — parallel-safe.
+///
+/// **What discovery does and does not guarantee** (issue #249, correcting
+/// the sentence that stood here). Reading the directory makes the replay run
+/// whatever is on disk, so a file cannot be silently SKIPPED — but a file
+/// that is DELETED simply stops being discovered, and nothing here notices.
+/// The floor in [`corpus_dir_is_populated`] is what closes that: it is the
+/// current file count, so removing a file fails the build. It is a COUNT,
+/// deliberately not a name list — a list would be the shared edit point the
+/// per-batch parallelism exists to avoid.
 fn corpus_files() -> Vec<String> {
     let mut on_disk: Vec<String> = std::fs::read_dir(driver::corpus_dir())
         .expect("corpus dir exists")
@@ -45,13 +53,20 @@ fn count_eval_directives(text: &str) -> usize {
 }
 
 /// The corpus directory is populated (a catastrophic dir/glob failure or an
-/// empty checkout is caught); at least the Batch 0 seed files are present.
+/// empty checkout is caught) and NO file has been deleted.
+///
+/// The floor is the count on disk, raised by each batch that adds a file
+/// (issue #249: 39 -> 40 with `b25_structured_metadata.test`). A deletion
+/// drops the count below the floor and fails here — which is the half of
+/// the anti-drop guarantee that disk discovery cannot give on its own.
 #[test]
 fn corpus_dir_is_populated() {
     let files = corpus_files();
     assert!(
-        files.len() >= 6,
-        "expected at least the 6 seed .test files, found {files:?}"
+        files.len() >= 40,
+        "expected at least the 40 committed .test files, found {} — a file was \
+         deleted, or the batch that added one did not raise this floor: {files:?}",
+        files.len()
     );
 }
 

@@ -1511,19 +1511,42 @@ impl CompiledPipeline {
         grouping: Option<&RangeGrouping>,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Result<MetricRun<'a>, RowBudgetExceeded> {
-        // `MetricScanRow` carries no structured metadata (issue #249), so the
-        // metric path always seeds empty slots.
+        self.run_metric_into_with_sm(
+            body,
+            base,
+            ts_ns,
+            &EMPTY_STRUCTURED_METADATA,
+            grouping,
+            labels,
+        )
+    }
+
+    /// As [`CompiledPipeline::run_metric_into`], for a row carrying per-entry
+    /// structured metadata (issue #249) — the exact metric sibling of
+    /// [`CompiledPipeline::run_into_with_sm`], and the same contract: `base`
+    /// is the stream labels ALREADY merged with the ordinary metadata entries
+    /// (`merge_labels_with_structured_metadata`), and `sm` carries the
+    /// reserved-name routing outcome plus `has_ordinary`.
+    ///
+    /// The reference merges at exactly this point, and unconditionally: both
+    /// sample extractors call `builder.Add(StructuredMetadataLabel, …)` as
+    /// their FIRST act — `streamLineSampleExtractor.Process`
+    /// (`pkg/logql/log/metrics_extraction.go:102-104 @ v3.7.4`) and
+    /// `streamLabelSampleExtractor.Process` for unwrap (`:202-205`) — and the
+    /// `NoopStage` short-circuit at `:104-108` sits AFTER the `Add`, so even a
+    /// query with no pipeline stages merges. `extractor.go:76-85` routes every
+    /// range aggregation through one of those two, so there is no third path.
+    pub fn run_metric_into_with_sm<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        ts_ns: i64,
+        sm: &'a StructuredMetadataCtx,
+        grouping: Option<&RangeGrouping>,
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    ) -> Result<MetricRun<'a>, RowBudgetExceeded> {
         Ok(self
-            .run_mode_into(
-                body,
-                base,
-                ts_ns,
-                &EMPTY_STRUCTURED_METADATA,
-                grouping,
-                labels,
-                true,
-                None,
-            )?
+            .run_mode_into(body, base, ts_ns, sm, grouping, labels, true, None)?
             .0)
     }
 

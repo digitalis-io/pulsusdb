@@ -4181,6 +4181,10 @@ mod tests {
                 fingerprint: 1,
                 timestamp_ns: r.ts_ns,
                 body: r.body.clone(),
+                // The shared logs corpus carries no per-entry structured
+                // metadata, so the hermetic mirror of the metric path sees
+                // exactly what the live one does (issue #249).
+                structured_metadata: String::new(),
             })
             .collect();
         assert!(!rows.is_empty(), "the witness record must exist");
@@ -4331,6 +4335,10 @@ mod tests {
                 fingerprint: 1,
                 timestamp_ns: r.ts_ns,
                 body: r.body.clone(),
+                // The shared logs corpus carries no per-entry structured
+                // metadata, so the hermetic mirror of the metric path sees
+                // exactly what the live one does (issue #249).
+                structured_metadata: String::new(),
             })
             .collect();
         let result = pulsus_read::logql::run_client_agg_rows(

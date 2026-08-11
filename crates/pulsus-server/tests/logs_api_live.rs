@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_read::logql::sql::{self, ScanLowerBound, TimeWindow};
+use pulsus_read::logql::sql::{self, ScanLowerBound, ScanProjection, TimeWindow};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -840,6 +840,13 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
         },
         ScanLowerBound::Exclusive,
         &[],
+        // Issue #249: the metric path merges structured metadata into the
+        // label set, so every reducer but `absent_over_time` projects the
+        // column. This leg's query is `sum(rate(...))`, so the EXPLAIN's
+        // reported SQL gains `structured_metadata` in the SELECT list — and
+        // it is derived through the SAME builder the engine calls, so the
+        // expectation cannot drift from what runs.
+        ScanProjection::WithStructuredMetadata,
     );
     let routing_reason = "raw: sliding-window range aggregation (issue #227)".to_string();
 

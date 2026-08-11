@@ -256,8 +256,8 @@ eval instant at 60s {service_name="b12a"} | json | label_format __error_details_
 eval instant at 60s {service_name="b12a"} | logfmt | label_format __error_details__="boom", d="{{.__error_details__}}"
   {__error_details__="boom", a="Hello", b="World", d="", env="prod", service_name="b12a"}  0s  a=Hello b=World
 
-# --- metric path (C17/C18: pipeline-set errors; SM never reaches the
-# metric scan — MetricScanRow carries none, issue #249) -------------------
+# --- metric path (C17/C18: pipeline-set errors. These two cases use
+# PIPELINE-set errors, not metadata-borne ones; issue #249) ---------------
 
 # C18 (kills W11 on the metric path): a surviving slot error fails the query.
 eval_fail instant at 60s count_over_time({service_name="b12a"} | json [30m])

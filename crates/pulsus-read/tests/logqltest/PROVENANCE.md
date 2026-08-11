@@ -329,7 +329,9 @@ range-vector reducer changes), so no re-capture was needed for the seed.
 cases (superseded by issue #227 — range queries are now Loki-exact sliding
 windows, covered by `b9_range_sliding.test` and the `eval range` directive);
 `scope_structured_metadata`
-(needs per-entry structured-metadata modelling, not yet in the DSL);
+(needed per-entry structured-metadata modelling, which the DSL did not
+have — **no longer deferred**: issue #249 added the `sm{...}` token and
+`b25_structured_metadata.test`, see §"Issue #249" below);
 `fetch_until_limit_paged` (keyset paging / result-limit — an exec/SQL concern,
 not the pure value path).
 
@@ -876,3 +878,145 @@ the reference does not make. Nothing marks them and no list exists —
 fabricating one would be worse than saying there is none, since a wrong
 exclusion list reads exactly like a right one. The replay should surface
 them as flapping failures and they should be marked from that evidence.
+
+## Issue #249 — structured metadata on the METRIC path (`b25_structured_metadata.test`)
+
+- **Image:** `grafana/loki:3.7.4`. Identity read from the RUNNING process
+  (`/loki/api/v1/status/buildinfo` →
+  `{"version":"3.7.4","revision":"b318f282","branch":"release-3.7.x","buildUser":"root@buildkitsandbox","buildDate":"2026-07-22T03:46:58Z"}`),
+  not from a header. Captured 2026-08-11 in ONE run against a
+  freshly-created container: an earlier run against a container that
+  already held the fixture doubled every count, which is exactly the
+  contamination this note exists to make visible.
+- **Config:** all-in-one filesystem mode, `allow_structured_metadata: true`,
+  **`discover_log_levels: false`** — non-optional: with the default the
+  distributor attaches a `detected_level` structured-metadata entry to
+  every entry, which would appear in every merged label set below and make
+  every value here wrong in the same direction. Also
+  `split_queries_by_interval: 0` (issue #301), so the query frontend
+  evaluates the range request as asked rather than a step-aligned rewrite
+  of it.
+- **`CONFIG_DELTA_FILES`:** `b25` IS a config-delta file. Unlike `b20`,
+  where the injected level only adds a label the replay strips, here the
+  injected `detected_level` is *structured metadata* and this file's whole
+  subject is what structured metadata does to the label set — so the
+  injection changes the ANSWER, as it does for `b12`/`b14`.
+- **Base timestamp:** `1786440799000000000`. Every offset in the `.test`
+  file is relative to it; the raw bodies below carry the absolute stamps.
+
+### The push payload
+
+One `POST /loki/api/v1/push`, `Content-Type: application/json`. Entries
+carrying metadata use the three-element form `[ts, line, {k: v}]`; the
+metadata-free entry uses `[ts, line]`.
+
+| stream | entries (offset, line, structured metadata) |
+|---|---|
+| `{app="x", fp="1", service_name="sm"}` | `+10s "alpha" {"n":"10","trace":"a"}`; `+20s "beta" {"n":"20","trace":"bb"}`; `+30s "gamma"` (none) |
+| `{app="y", fp="2", service_name="sm"}` | `+40s "delta" {"app":"SMVAL","trace":"a"}` |
+| `{fp="3", service_name="sm2"}` | `+10s "trace=z q=7" {"trace":"a"}` |
+| `{fp="4", service_name="sm3"}` | `+10s "boomline" {"__error__":"boom"}` |
+| `{fp="5", service_name="sm4"}` | `+10s "detline" {"__error_details__":"det"}` |
+
+### Per case: the query, the grid, the status and the RAW response body
+
+Read by the capture script and pasted verbatim; the `stats` block is
+elided (it carries timings, which are not values).
+
+| case | query | grid | status |
+|---|---|---|---|
+| `sm-filter-eq` | `count_over_time({service_name="sm"} | trace="a" [5m])` | instant at +60s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"app":"x","fp":"1","n":"10","service_name":"sm","trace":"a"},"value":[1786440859,"1"]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","trace":"a"},"value":[1786440859,"1"]}]}}` |
+| `sm-filter-neq` | `count_over_time({service_name="sm"} | trace!="a" [5m])` | instant at +60s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm","trace":"bb"},"value":[1786440859,"1"]},{"metric":{"app":"x","fp":"1","service_name":"sm"},"value":[1786440859,"1"]}]}}` |
+| `sm-filter-re` | `count_over_time({service_name="sm"} | trace=~"a.*" [5m])` | instant at +60s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"app":"x","fp":"1","n":"10","service_name":"sm","trace":"a"},"value":[1786440859,"1"]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","trace":"a"},"value":[1786440859,"1"]}]}}` |
+| `sm-filter-nre` | `count_over_time({service_name="sm"} | trace!~"a.*" [5m])` | instant at +60s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm","trace":"bb"},"value":[1786440859,"1"]},{"metric":{"app":"x","fp":"1","service_name":"sm"},"value":[1786440859,"1"]}]}}` |
+| `sm-filter-num` | `count_over_time({service_name="sm"} | n > 15 [5m])` | instant at +60s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm","trace":"bb"},"value":[1786440859,"1"]}]}}` |
+| `sm-by` | `sum by (trace) (count_over_time({service_name="sm"}[5m]))` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"trace":"a"},"values":[[1786440829,"1"],[1786440859,"2"]]},{"metric":{"trace":"bb"},"values":[[1786440829,"1"],[1786440859,"1"]]}]}}` |
+| `sm-without` | `sum without (trace) (count_over_time({service_name="sm"}[5m]))` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"x","fp":"1","n":"10","service_name":"sm"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","service_name":"sm"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm"},"values":[[1786440859,"1"]]}]}}` |
+| `sm-line-format-label` | `count_over_time({service_name="sm"} | line_format "t={{.trace}}" | logfmt [5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"x","fp":"1","n":"10","service_name":"sm","t":"a","trace":"a"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm","t":"bb","trace":"bb"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","service_name":"sm"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","t":"a","trace":"a"},"values":[[1786440859,"1"]]}]}}` |
+| `sm-line-format-bytes` | `bytes_over_time({service_name="sm"} | line_format "{{.trace}}" [5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"x","fp":"1","n":"10","service_name":"sm","trace":"a"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm","trace":"bb"},"values":[[1786440829,"2"],[1786440859,"2"]]},{"metric":{"app":"x","fp":"1","service_name":"sm"},"values":[[1786440829,"0"],[1786440859,"0"]]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","trace":"a"},"values":[[1786440859,"1"]]}]}}` |
+| `sm-label-format-src` | `count_over_time({service_name="sm"} | label_format t=trace [5m])` | instant at +60s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"app":"x","fp":"1","n":"10","service_name":"sm","t":"a"},"value":[1786440859,"1"]},{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm","t":"bb"},"value":[1786440859,"1"]},{"metric":{"app":"x","fp":"1","service_name":"sm"},"value":[1786440859,"1"]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","t":"a"},"value":[1786440859,"1"]}]}}` |
+| `sm-label-format-dst` | `count_over_time({service_name="sm"} | label_format t=trace | label_format trace="z" [5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"x","fp":"1","n":"10","service_name":"sm","t":"a","trace":"z"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm","t":"bb","trace":"z"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","service_name":"sm","trace":"z"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","t":"a","trace":"z"},"values":[[1786440859,"1"]]}]}}` |
+| `sm-unwrap` | `sum_over_time({service_name="sm"} | unwrap n [5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"x","fp":"1","service_name":"sm","trace":"a"},"values":[[1786440829,"10"],[1786440859,"10"]]},{"metric":{"app":"x","fp":"1","service_name":"sm","trace":"bb"},"values":[[1786440829,"20"],[1786440859,"20"]]}]}}` |
+| `sm-unwrap-by` | `quantile_over_time(0.5, {service_name="sm"} | unwrap n [5m]) by (trace)` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"trace":"a"},"values":[[1786440829,"10"],[1786440859,"10"]]},{"metric":{"trace":"bb"},"values":[[1786440829,"20"],[1786440859,"20"]]}]}}` |
+| `sm-drop` | `count_over_time({service_name="sm"} | drop n [5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"x","fp":"1","service_name":"sm"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","service_name":"sm","trace":"a"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","service_name":"sm","trace":"bb"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","trace":"a"},"values":[[1786440859,"1"]]}]}}` |
+| `sm-keep` | `count_over_time({service_name="sm"} | keep trace [5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"trace":"a"},"values":[[1786440829,"1"],[1786440859,"2"]]},{"metric":{"trace":"bb"},"values":[[1786440829,"1"],[1786440859,"1"]]}]}}` |
+| `sm-bare` | `count_over_time({service_name="sm"}[5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"x","fp":"1","n":"10","service_name":"sm","trace":"a"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","n":"20","service_name":"sm","trace":"bb"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"x","fp":"1","service_name":"sm"},"values":[[1786440829,"1"],[1786440859,"1"]]},{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","trace":"a"},"values":[[1786440859,"1"]]}]}}` |
+| `sm-by-empty` | `sum by () (count_over_time({service_name="sm"}[5m]))` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[[1786440829,"3"],[1786440859,"4"]]}]}}` |
+| `sm-absent` | `absent_over_time({service_name="sm"}[5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"service_name":"sm"},"values":[[1786440799,"1"]]}]}}` |
+| `sm-collide-stream` | `count_over_time({app="y"}[5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"y","app_extracted":"SMVAL","fp":"2","service_name":"sm","trace":"a"},"values":[[1786440859,"1"]]}]}}` |
+| `sm-collide-parser` | `count_over_time({service_name="sm2"} | logfmt [5m])` | instant at +60s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"fp":"3","q":"7","service_name":"sm2","trace":"a","trace_extracted":"z"},"value":[1786440859,"1"]}]}}` |
+| `sm-reserved-err` | `count_over_time({service_name="sm3"}[5m])` | instant at +60s | 400 |
+|  |  |  | `pipeline error: 'boom' for series: '{__error__="boom", fp="4", service_name="sm3"}'.
+Use a label filter to intentionally skip this error. (e.g | __error__!="boom").
+To skip all potential errors you can match empty errors.(e.g __error__="")
+The label filter can also be specified after unwrap. (e.g | unwrap latency | __error__="" )` |
+| `sm-reserved-details` | `count_over_time({service_name="sm4"}[5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"fp":"5","service_name":"sm4"},"values":[[1786440829,"1"],[1786440859,"1"]]}]}}` |
+| `sm-selector-not-index` | `count_over_time({trace="a"}[5m])` | range +0s..+60s step 30s | 200 |
+|  |  |  | `{"status":"success","data":{"resultType":"matrix","result":[]}}` |
+
+Three further captures, taken in the same session against the same
+container and the same fixture:
+
+| case | query | grid | status | result |
+|---|---|---|---|---|
+| `ac6-count-instant` | `count_over_time({service_name="sm"}[5m])` | instant at +60s | 200 | `{app="x",fp="1",n="10",service_name="sm",trace="a"} 1`; `{app="x",fp="1",n="20",service_name="sm",trace="bb"} 1`; `{app="x",fp="1",service_name="sm"} 1`; `{app="y",app_extracted="SMVAL",fp="2",service_name="sm",trace="a"} 1` |
+| `ac6-rate-instant` | `rate({service_name="sm"}[5m])` | instant at +60s | 200 | the same four label sets, each `0.0033333333333333335` |
+| `ac6-bytes-instant` | `bytes_over_time({service_name="sm"}[5m])` | instant at +60s | 200 | `…n="10"…` 5; `…n="20"…` 4; `{app="x",fp="1",service_name="sm"}` 5; `…app_extracted="SMVAL"…` 5 |
+| `sm-reserved-err-range` | `count_over_time({service_name="sm3"}[5m])` | range +0s..+60s step 30s | 400 | `pipeline error: 'boom' for series: '{__error__="boom", fp="4", service_name="sm3"}'.` … |
+| `sm-collide-stream-alone` | `count_over_time({service_name="sm"} \| app_extracted="SMVAL" [5m])` | range +0s..+60s step 30s | 200 | `{app="y",app_extracted="SMVAL",fp="2",service_name="sm",trace="a"}` at +60s = 1 |
+
+The three `ac6-*` rows are NOT in the `.test` file: they are the
+bare-instant shape, which plans `client == None` and so takes the
+SQL-pushdown path, which `logqltest`'s runner cannot hold (`eval_leaf`
+refuses a plan with no client aggregation). They are asserted instead by
+`pushdown_and_client_agree_with_the_reference_on_metadata_series`
+(`src/logql/exec.rs`), which compares the pushdown re-grouping against
+BOTH these captured values and `run_client_agg_rows` — so joint wrongness
+of the two internal paths cannot pass.
+
+### Two cases the DSL cannot express, and where they went instead
+
+- **`sm-reserved-err`** is captured at instant (400) and again at range
+  (400, byte-identical body). The `.test` file uses the RANGE form,
+  because the instant form plans to the pushdown path the runner refuses.
+  The pushdown path's own copy is
+  `a_metadata_error_fails_the_pushdown_query_too` (`src/logql/exec.rs`).
+- **`sm-selector-not-index`** — that a metadata key in the STREAM SELECTOR
+  matches no stream — is NOT in the corpus. `logqltest`'s store feeds every
+  loaded row to the leaf and never applies the selector (`eval_leaf`), so
+  a "matches nothing" case there would pass for the wrong reason. It is
+  asserted at the layer that actually decides it,
+  `a_structured_metadata_key_in_the_selector_resolves_against_the_stream_index`
+  (`tests/sql_snapshots.rs`), against the stage-1 SQL. The reference's own
+  answer — an empty matrix for `count_over_time({trace="a"}[5m])` over
+  this fixture — is in the table above.
+
+### `scope_structured_metadata` is no longer deferred
+
+The Batch-0 deferral (below, §"Deferred to later batches") named
+`scope_structured_metadata` as needing "per-entry structured-metadata
+modelling, not yet in the DSL". The DSL now has it: an `sm{...}` token
+after a sample's offset, parsed by the same `parse_labelset` the stream
+header uses and rendered by the same `labels_to_json`. See
+`the_sm_dsl_token_round_trips_and_sm_braces_escape_a_literal_body`.
