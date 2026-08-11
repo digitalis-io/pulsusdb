@@ -1896,7 +1896,14 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// file's own header names which section came from which container. Its
 /// `eval_fail` rows gate on PulsusDB's own wording, as elsewhere, while
 /// the REJECTION each pins was captured.
-const CAPTURED: usize = 1_395;
+///
+/// Issue #249 added `b25_structured_metadata.test`, whose rows all sit
+/// under that file's `captured` default: every expected value was read off
+/// the pinned v3.7.4 container, in a session against a freshly created
+/// container, with `discover_log_levels: false`. See `PROVENANCE.md`
+/// §"Issue #249" for the query strings, the push payload and the raw
+/// response bodies.
+const CAPTURED: usize = 1_417;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1916,5 +1923,6 @@ const DERIVED: usize = 31;
 /// ported reference order — the reference specifies none.
 const DIVERGENCE: usize = 30;
 const PORTED: usize = 30;
-const TOTAL: usize = 1_486;
+/// Issue #249 grew this by `b25_structured_metadata.test`'s rows.
+const TOTAL: usize = 1_508;
 // corpus-counts: end (provenance-corpus-constants)

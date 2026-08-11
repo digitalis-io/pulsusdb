@@ -417,6 +417,54 @@ GROUP BY fingerprint, step
 
 The engine maps fingerprints to `service` from stage 2 and finishes the `sum by`.
 
+**Structured metadata on the metric path (issue #249).** A LogQL metric
+query merges each entry's per-entry structured metadata into that sample's
+label set, exactly as the streams path does and exactly where the reference
+does — both of Loki's sample extractors add it as their FIRST act, before
+any pipeline stage runs
+(`pkg/logql/log/metrics_extraction.go:102-104` and `:202-205 @ v3.7.4`),
+and the `NoopStage` short-circuit sits after that `Add`, so even a query
+with no stages merges. So `sum by (trace_id) (count_over_time(...))` groups
+by metadata, a label filter filters on it, and `line_format`/`label_format`/
+`unwrap`/`drop`/`keep` read it. A fingerprint is therefore no longer an
+output-series identity on the metric path: one stream yields one series per
+distinct metadata combination.
+
+Three consequences worth stating, because none is visible from the query
+text:
+
+- **`structured_metadata` is projected, never predicated.** The client-
+  aggregated raw scans add it to the `SELECT` list and to nothing else — no
+  `WHERE`, no `PREWHERE`, no `ORDER BY`, no skip index. A filter on a
+  metadata label is evaluated client-side over the merged set. That matches
+  the reference (its syntax layer has no notion of pushing metadata into the
+  store) and it is also the only correct choice here: the column is an
+  opaque canonical-JSON `String` with `DEFAULT ''` and no index, so a
+  JSON-extract predicate could prune no granule, and the merge renames a
+  colliding key to `<k>_extracted` before any filter would see it. The
+  `ORDER BY` clauses are unchanged, so `optimize_read_in_order` is intact.
+- **`absent_over_time` does not read the column at all.** It is the one
+  reducer whose label set is provably metadata-independent
+  (`syntax/extractor.go:46-47` forces `noLabels = true`, and
+  `labels.go:667-668` then returns `EmptyLabelsResult`), so it keeps the
+  lean projection rather than paying for a column it cannot use on an
+  unbounded scan.
+- **A mixed-shape selection loses the zero-allocation slider, and that is
+  a real cost.** The per-fingerprint streaming slider is kept only where a
+  fingerprint's base label set is provably unreachable by merging any
+  co-selected stream's metadata; the test is a sound over-approximation
+  (minimum label count, and no `_extracted` key), so a selection whose
+  streams have DIFFERENT label counts withholds the slider from the longer
+  ones even when nothing could in fact reach them. Measured on this
+  machine, `count_over_time({app="a"}[5m])` over 20 000 metadata-free rows,
+  step 10s, release build, 11 interleaved reps: median **1.49 ms** with the
+  slider against **8.28 ms** without it, a ratio of **5.54x**. Reproduce
+  with `cargo test -p pulsus-read --release --test
+  logql_slider_withholding_timings -- --ignored --nocapture`. This is a
+  cliff a user cannot see from the query, and it is reachable by ordinary
+  data — one producer adding a label to its streams is enough. Tightening
+  the over-approximation to an exact subset test is open on issue #249.
+
 **`GET /api/logs/v1/patterns`** (M7-C3, issue #171) — stage-1 fingerprint resolution (selector only; line filters are rejected — templates are precomputed, bodies are gone), then ONE pushed-down aggregate over `log_patterns` with no hydration (the response carries no labels), top-1000 by total count:
 
 ```sql

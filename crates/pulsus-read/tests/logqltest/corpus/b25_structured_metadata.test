@@ -1,0 +1,234 @@
+# b25_structured_metadata.test — issue #249: the LogQL METRIC path merges
+# per-entry structured metadata into the label set.
+#
+# Both of the reference's sample extractors add structured metadata as their
+# FIRST act, before any pipeline stage runs
+# (pkg/logql/log/metrics_extraction.go:102-104 and :202-205 @ v3.7.4), and
+# the NoopStage short-circuit at :104-108 sits AFTER the Add — so even a
+# query with no stages merges. syntax/extractor.go:76-85 routes every range
+# aggregation through one of those two, so there is no third path.
+#
+# The `sm{...}` token after a sample's offset is that entry's structured
+# metadata (see logqltest/runner.rs `parse_sample_metadata`). An absent
+# token means none, which is stored as "" and never "{}".
+#
+# provenance: captured
+# Every expected value in this file was read off grafana/loki:3.7.4 —
+# /loki/api/v1/status/buildinfo answered
+# {"version":"3.7.4","revision":"b318f282","branch":"release-3.7.x"} — run
+# with limits_config.discover_log_levels: false so no detected_level
+# contaminates a label set, and split_queries_by_interval: 0 so the query
+# frontend does not rewrite the range request. Nothing here is transcribed
+# from a plan, a design report or a derivation (issue #249 AC-27). See
+# logqltest/PROVENANCE.md §b25 for the per-case query strings, the push
+# payload and the raw response bodies.
+#
+# The section's grid is `from 0s to 60s step 30s` with a `[5m]` range, so
+# the window at 0s is empty (a gap, no point) and the windows at 30s and
+# 60s are cumulative — which is what lets a case distinguish "arrived
+# late" from "absent".
+
+# =====================================================================
+# The main fixture. Stream A carries three entries, two with metadata and
+# one without; stream B's metadata key `app` COLLIDES with a stream label.
+# Entry 2's `trace` value is TWO bytes, so a byte-valued assertion observes
+# the rendered content rather than merely its presence.
+# =====================================================================
+load
+  {app="x", fp="1", service_name="sm"}
+  10s  sm{n="10", trace="a"}   alpha
+  20s  sm{n="20", trace="bb"}  beta
+  30s                          gamma
+  {app="y", fp="2", service_name="sm"}
+  40s  sm{app="SMVAL", trace="a"}  delta
+
+# --- sm-bare: one output series per distinct metadata combination ------
+# No grouping at all falls to LabelsResult() (labels.go:672-679), which is
+# the FULL merged label set — so one fingerprint becomes N series.
+eval range from 0s to 60s step 30s count_over_time({service_name="sm"}[5m])
+  {app="x", fp="1", n="10", service_name="sm", trace="a"} 30s 1 60s 1
+  {app="x", fp="1", n="20", service_name="sm", trace="bb"} 30s 1 60s 1
+  {app="x", fp="1", service_name="sm"} 30s 1 60s 1
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", trace="a"} 60s 1
+
+# --- sm-by: THE discriminating case ------------------------------------
+# `by (trace)` reads b.add[StructuredMetadataLabel] (withResult,
+# labels.go:687-703). The entry with no metadata groups under `{}`.
+eval range from 0s to 60s step 30s sum by (trace) (count_over_time({service_name="sm"}[5m]))
+  {} 30s 1 60s 1
+  {trace="a"} 30s 1 60s 2
+  {trace="bb"} 30s 1 60s 1
+
+# --- sm-without: `without` KEEPS every unnamed metadata label ----------
+eval range from 0s to 60s step 30s sum without (trace) (count_over_time({service_name="sm"}[5m]))
+  {app="x", fp="1", n="10", service_name="sm"} 30s 1 60s 1
+  {app="x", fp="1", n="20", service_name="sm"} 30s 1 60s 1
+  {app="x", fp="1", service_name="sm"} 30s 1 60s 1
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm"} 60s 1
+
+# --- sm-by-empty: `by ()` is label-blind -------------------------------
+eval range from 0s to 60s step 30s sum by () (count_over_time({service_name="sm"}[5m]))
+  {} 30s 3 60s 4
+
+# --- sm-filter-eq / -neq: a metadata label filter SELECTS --------------
+# Evaluated client-side, in the compiled pipeline, over the merged set —
+# it never becomes a SQL predicate (`no_label_filter_operator_ever_renders_sql`).
+eval instant at 60s count_over_time({service_name="sm"} | trace="a" [5m])
+  {app="x", fp="1", n="10", service_name="sm", trace="a"} 1
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", trace="a"} 1
+
+eval instant at 60s count_over_time({service_name="sm"} | trace!="a" [5m])
+  {app="x", fp="1", n="20", service_name="sm", trace="bb"} 1
+  {app="x", fp="1", service_name="sm"} 1
+
+# --- sm-filter-re / -nre: the regex operators of the same filter -------
+eval instant at 60s count_over_time({service_name="sm"} | trace=~"a.*" [5m])
+  {app="x", fp="1", n="10", service_name="sm", trace="a"} 1
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", trace="a"} 1
+
+eval instant at 60s count_over_time({service_name="sm"} | trace!~"a.*" [5m])
+  {app="x", fp="1", n="20", service_name="sm", trace="bb"} 1
+  {app="x", fp="1", service_name="sm"} 1
+
+# --- sm-filter-num: the only form that NUMERICALLY parses a merged value
+eval instant at 60s count_over_time({service_name="sm"} | n > 15 [5m])
+  {app="x", fp="1", n="20", service_name="sm", trace="bb"} 1
+
+# --- sm-line-format-label: the rendered line becomes an asserted LABEL --
+# `line_format` reads the metadata label into the line, and `| logfmt`
+# turns it back into the label `t` — which is IN the asserted set. On a
+# tree that does not merge, all three of stream A's rows render `t=` and
+# collapse to ONE series.
+eval range from 0s to 60s step 30s count_over_time({service_name="sm"} | line_format "t={{.trace}}" | logfmt [5m])
+  {app="x", fp="1", n="10", service_name="sm", t="a", trace="a"} 30s 1 60s 1
+  {app="x", fp="1", n="20", service_name="sm", t="bb", trace="bb"} 30s 1 60s 1
+  {app="x", fp="1", service_name="sm"} 30s 1 60s 1
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", t="a", trace="a"} 60s 1
+
+# --- sm-line-format-bytes: the VALUE is len(rendered line) -------------
+# 1 byte for "a", 2 for "bb", 0 for the metadata-free entry. A template
+# rendering a constant would fail this too.
+eval range from 0s to 60s step 30s bytes_over_time({service_name="sm"} | line_format "{{.trace}}" [5m])
+  {app="x", fp="1", n="10", service_name="sm", trace="a"} 30s 1 60s 1
+  {app="x", fp="1", n="20", service_name="sm", trace="bb"} 30s 2 60s 2
+  {app="x", fp="1", service_name="sm"} 30s 0 60s 0
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", trace="a"} 60s 1
+
+# --- sm-label-format-src: `label_format` reads metadata as its SOURCE ---
+eval instant at 60s count_over_time({service_name="sm"} | label_format t=trace [5m])
+  {app="x", fp="1", n="10", service_name="sm", t="a"} 1
+  {app="x", fp="1", n="20", service_name="sm", t="bb"} 1
+  {app="x", fp="1", service_name="sm"} 1
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", t="a"} 1
+
+# --- sm-label-format-dst: the OVERWRITE, with the source observable ----
+# Two separate stages, so no intra-stage ordering rule is load-bearing:
+# `t` carries the value that was there BEFORE `trace` is overwritten. On a
+# tree that does not merge, `t` is empty for every row.
+eval range from 0s to 60s step 30s count_over_time({service_name="sm"} | label_format t=trace | label_format trace="z" [5m])
+  {app="x", fp="1", n="10", service_name="sm", t="a", trace="z"} 30s 1 60s 1
+  {app="x", fp="1", n="20", service_name="sm", t="bb", trace="z"} 30s 1 60s 1
+  {app="x", fp="1", service_name="sm", trace="z"} 30s 1 60s 1
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", t="a", trace="z"} 60s 1
+
+# --- sm-unwrap: unwrap on a metadata label -----------------------------
+# The unwrapped label is DELETED from the emitted set, and the entries with
+# no `n` (stream A's third, and all of stream B) are silently skipped.
+eval range from 0s to 60s step 30s sum_over_time({service_name="sm"} | unwrap n [5m])
+  {app="x", fp="1", service_name="sm", trace="a"} 30s 10 60s 10
+  {app="x", fp="1", service_name="sm", trace="bb"} 30s 20 60s 20
+
+# --- sm-unwrap-by: a range-agg grouping over a metadata label ----------
+eval range from 0s to 60s step 30s quantile_over_time(0.5, {service_name="sm"} | unwrap n [5m]) by (trace)
+  {trace="a"} 30s 10 60s 10
+  {trace="bb"} 30s 20 60s 20
+
+# --- sm-drop: `drop` naming a metadata label ---------------------------
+# Fails two ways on a wrong tree: a no-op drop leaves `n` in the set, and
+# an unmerged tree collapses stream A's three rows into one series of 3.
+eval range from 0s to 60s step 30s count_over_time({service_name="sm"} | drop n [5m])
+  {app="x", fp="1", service_name="sm"} 30s 1 60s 1
+  {app="x", fp="1", service_name="sm", trace="a"} 30s 1 60s 1
+  {app="x", fp="1", service_name="sm", trace="bb"} 30s 1 60s 1
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", trace="a"} 60s 1
+
+# --- sm-keep: `keep` naming a metadata label ---------------------------
+eval range from 0s to 60s step 30s count_over_time({service_name="sm"} | keep trace [5m])
+  {} 30s 1 60s 1
+  {trace="a"} 30s 1 60s 2
+  {trace="bb"} 30s 1 60s 1
+
+# --- sm-collide-stream: a metadata key colliding with a STREAM label ---
+# LabelsBuilder.Add renames to `<k>_extracted` (parser.go:25) BEFORE
+# anything else (labels.go:395-397); the stream label keeps its own value.
+# Written as a FILTER on the renamed key, which pins something stronger
+# than presence: the renamed value is what the filter matches, and the
+# stream's own `app="y"` is what it does NOT.
+eval range from 0s to 60s step 30s count_over_time({service_name="sm"} | app_extracted="SMVAL" [5m])
+  {app="y", app_extracted="SMVAL", fp="2", service_name="sm", trace="a"} 60s 1
+
+# --- sm-absent: absent_over_time is metadata-BLIND ---------------------
+# syntax/extractor.go:46-47 forces noLabels = true and labels.go:667-668
+# then returns EmptyLabelsResult, so its label set cannot depend on
+# metadata at all. This is a LABEL-BLINDNESS GUARD: it must pass on the
+# pre-merge tree too (issue #249 AC-23).
+eval range from 0s to 60s step 30s absent_over_time({service_name="sm"}[5m])
+  {service_name="sm"} 0s 1
+
+clear
+
+# =====================================================================
+# The parser collision. The body carries `trace=z`, the metadata `trace=a`.
+# Every parser tests BaseHas(name) || HasInCategory(name,
+# StructuredMetadataLabel) (parser.go:152-154, :183-188, :343, :410, :482,
+# :603), so the PARSED key is the one renamed.
+# =====================================================================
+load
+  {fp="3", service_name="sm2"}
+  10s  sm{trace="a"}  trace=z q=7
+
+# --- sm-collide-parser -------------------------------------------------
+eval instant at 60s count_over_time({service_name="sm2"} | logfmt [5m])
+  {fp="3", q="7", service_name="sm2", trace="a", trace_extracted="z"} 1
+
+clear
+
+# =====================================================================
+# The reserved metadata names. `Add` routes a post-suffix `__error__` /
+# `__error_details__` to the OUT-OF-BAND slot and returns
+# (labels.go:399-407) — it never reaches Set.
+# =====================================================================
+load
+  {fp="4", service_name="sm3"}
+  10s  sm{__error__="boom"}  boomline
+
+# --- sm-reserved-err: a metadata __error__ FAILS the query -------------
+# Measured: the container answers 400 to this query, with NO pipeline in
+# it — the metadata alone carries the error. (The range form, not the
+# instant one, because the runner serves only client-aggregated plans and
+# a bare instant count plans to the SQL-pushdown path; the pushdown path's
+# own copy of this case is
+# `a_metadata_error_fails_the_pushdown_query_too` in exec.rs.)
+eval_fail range from 0s to 60s step 30s count_over_time({service_name="sm3"}[5m])
+  msg: boom
+
+clear
+
+load
+  {fp="5", service_name="sm4"}
+  10s  sm{__error_details__="det"}  detline
+
+# --- sm-reserved-details: __error_details__ ALONE is inert -------------
+# The #238 `visible()` rule: details render only when there is an ordinary
+# metadata entry or a slot error, and there is neither.
+eval range from 0s to 60s step 30s count_over_time({service_name="sm4"}[5m])
+  {fp="5", service_name="sm4"} 30s 1 60s 1
+
+# `sm-selector-not-index` — that a metadata key in the STREAM SELECTOR
+# matches no stream — is NOT expressible here: this runner feeds every
+# loaded row to the leaf and never applies the selector (`eval_leaf` hands
+# the whole store to `run_client_agg_rows_folded`), so a "matches nothing"
+# case would pass or fail for the wrong reason. It lives instead in
+# `sql_snapshots.rs::a_structured_metadata_key_in_the_selector_resolves_against_the_stream_index`,
+# which reads the stage-1 SQL — the layer where the question is actually
+# decided (issue #249).

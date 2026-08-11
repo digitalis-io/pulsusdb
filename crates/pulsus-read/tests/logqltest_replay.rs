@@ -193,6 +193,16 @@ const CONFIG_DELTA_FILES: &[(&str, &str)] = &[
         "b14_detected_fields.test",
         "discover_log_levels: false + /detected_fields (NOT in ci/logql/config.yaml)",
     ),
+    // Issue #249. The injected `detected_level` is itself STRUCTURED
+    // METADATA, and this file's whole subject is what structured metadata
+    // does to the metric label set — so with level discovery on, every
+    // expected set here would carry an extra pair and the ANSWERS change,
+    // as they do for `b12`/`b14`. (Contrast `b20`, where the injection
+    // only adds a stream label the replay strips.)
+    (
+        "b25_structured_metadata.test",
+        "discover_log_levels: false (NOT in ci/logql/config.yaml)",
+    ),
 ];
 
 /// Sorts every corpus directive into replayable / not, by the rules in
@@ -736,7 +746,14 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// exclusion; its `eval` rows are streams queries at a single instant
 /// over a relative-offset load set, so they move [`PROVENANCE_PERMITS`]
 /// and [`REACHABLE`] together.
-const TOTAL_DIRECTIVES: usize = 1_486;
+///
+/// Issue #249 adds `b25_structured_metadata.test`, whose every row is
+/// excluded as a CONFIG-DELTA file: its capture needs
+/// `discover_log_levels: false`, and unlike `b20`'s case the injected
+/// `detected_level` is itself structured metadata, so with level
+/// discovery on the answers — not merely a stripped label — change. So
+/// this figure moves and [`PROVENANCE_PERMITS`] does not.
+const TOTAL_DIRECTIVES: usize = 1_508;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
@@ -770,8 +787,16 @@ const REACHABLE: usize = 221;
 /// `divergence(sort-tie-order)`, so the same rows leave the
 /// `not a capture claim (ported)` bucket and enter `pinned-divergence`.
 /// The total is unchanged; nothing became replayable or stopped being so.
-const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=154, not a capture claim (derived)=29, \
-not a capture claim (ported)=27, our-error-text (eval_fail)=97, pinned-divergence=30";
+///
+/// Issue #249 adds `b25_structured_metadata.test` to `CONFIG_DELTA_FILES`
+/// (its capture needs `discover_log_levels: false`, and the injected
+/// `detected_level` is itself structured metadata, so it changes the
+/// answers rather than adding a strippable label). Its rows are counted
+/// there. Its `eval_fail` row is counted under `config-delta file` and NOT
+/// under `our-error-text`, because the classifier assigns each row a
+/// single reason and no row lands in both buckets.
+const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=175, not a capture claim (derived)=29, \
+not a capture claim (ported)=27, our-error-text (eval_fail)=98, pinned-divergence=30";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice

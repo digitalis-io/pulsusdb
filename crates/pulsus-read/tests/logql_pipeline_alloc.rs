@@ -617,6 +617,100 @@ fn per_row_allocation_bounds_hold() {
          aggregation loop regressed"
     );
 
+    // --- Issue #249: the METRIC path's structured-metadata leg. The
+    // --- SM-FREE budget above is BLIND to this path — it is measured on
+    // --- rows whose `structured_metadata` is empty, and the merge branch
+    // --- never executes for them. So the merge gets its own leg, over
+    // --- rows with DISTINCT metadata per row (the worst shape: every row
+    // --- opens a new output group).
+    //
+    // The ceiling is set from TWO measurements, so it separates the
+    // profile it pins from the regression it exists to catch:
+    //
+    //   reused buffers (this tree)                18.00 allocations/row
+    //   `merge_buf`/`sm_buf`/`sm_scratch` freshly
+    //     allocated per row                       21.00 allocations/row
+    //
+    // Both measured by this leg with the ceiling temporarily set to 0 and
+    // reading the panic message (`cargo nextest run -p pulsus-read -E
+    // 'binary(logql_pipeline_alloc)'`), on the second of the two
+    // measurements with the three `Vec::new()`s moved inside
+    // `RangeSlideState::push_rows`' row loop. 20/row admits the first and
+    // REFUSES the second, which is what makes this leg fail for the one
+    // reason it names — a loose "100/row" would admit both and prove
+    // nothing about reuse.
+    //
+    // Strictly LINEAR: no per-row growth term, so a per-row reallocating
+    // merge or a quadratic regrouping misses by orders of magnitude.
+    const SM_METRIC_ROWS: usize = 20_000;
+    const SM_METRIC_PER_ROW: u64 = 20;
+    let sm_metric_rows: Vec<MetricScanRow> = (0..SM_METRIC_ROWS)
+        .map(|i| MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns: (i as i64) * 1_000_000,
+            body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+            // DISTINCT per row: one output group per row, so the merge and
+            // the group retention are both fully exercised.
+            structured_metadata: format!(r#"{{"trace":"t{i}"}}"#),
+        })
+        .collect();
+    let sm_expr = pulsus_logql::parse(r#"count_over_time({a="b"}[5s])"#).expect("parse");
+    let Plan::Metric(sm_mp) = plan(&sm_expr, &params, &plan_ctx).expect("plan") else {
+        panic!("expected a Metric plan");
+    };
+    let sm_client = sm_mp.client.as_ref().expect("client-aggregated");
+    let sm_compiled = CompiledPipeline::compile(&sm_client.pipeline).expect("compile");
+    let sm_window = match sm_mp.step_ns {
+        Some(step_ns) => ClientWindow::Range {
+            grid_start_ns: sm_mp.grid_start_ns,
+            end_ns: sm_mp.end_ns,
+            step_ns,
+            range_ns: sm_mp.range_ns,
+            offset_ns: sm_mp.offset_ns,
+        },
+        None => panic!("the fixture is a range query"),
+    };
+    // Warm-up (allocator internals) + prove the merge really produced one
+    // series per metadata value — the leg is worthless if it did not.
+    let sm_warm = run_client_agg_rows(
+        &sm_metric_rows,
+        &sm_compiled,
+        &meta,
+        sm_client,
+        sm_window,
+        sm_mp.rate_window_ns,
+    )
+    .expect("client agg");
+    match &sm_warm {
+        pulsus_read::logql::QueryResult::Matrix(m) => assert_eq!(
+            m.len(),
+            SM_METRIC_ROWS,
+            "the merge must yield one output series per distinct metadata value — \
+             otherwise this leg measures the metadata-free path again"
+        ),
+        other => panic!("expected a matrix, got {other:?}"),
+    }
+    let sm_n = sm_metric_rows.len() as u64;
+    let sm_start = ALLOCS.load(Ordering::Relaxed);
+    let sm_out = run_client_agg_rows(
+        &sm_metric_rows,
+        &sm_compiled,
+        &meta,
+        sm_client,
+        sm_window,
+        sm_mp.rate_window_ns,
+    )
+    .expect("client agg");
+    let sm_total = ALLOCS.load(Ordering::Relaxed) - sm_start;
+    std::hint::black_box(&sm_out);
+    assert!(
+        sm_total <= SM_METRIC_PER_ROW * sm_n + ZERO_RESIDUE,
+        "SM-bearing metric rows: {sm_total} allocations over {sm_n} rows \
+         ({:.2}/row) — the ceiling is {SM_METRIC_PER_ROW}/row; the merge buffers \
+         must stay reused across rows",
+        sm_total as f64 / sm_n as f64
+    );
+
     // --- Issue #91: the binop (vector-matching) join path. The matrix
     // --- join is an INDEPENDENT per-step instant join; its cost is
     // --- O(series x steps), never per raw row — and the per-step scratch

@@ -530,11 +530,14 @@ fn parse_load_block(
 /// must itself begin with `sm{`. An absent token yields `""` — never `"{}"`
 /// — which is the stored representation of "no structured metadata".
 fn parse_sample_metadata(rest: &str) -> Result<(String, String), String> {
+    // `split_once` leaves the separator's trailing run, so the token starts
+    // after a trim — not at byte 0.
+    let rest = rest.trim_start();
     let Some(after) = rest.strip_prefix("sm") else {
-        return Ok((String::new(), rest.trim_start().to_string()));
+        return Ok((String::new(), rest.to_string()));
     };
     if !after.starts_with('{') {
-        return Ok((String::new(), rest.trim_start().to_string()));
+        return Ok((String::new(), rest.to_string()));
     }
     let (pairs, consumed) = parse_labelset(after)?;
     let body = after[consumed..].trim_start().to_string();
@@ -1572,6 +1575,73 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #249 AC-13 — the `sm{...}` DSL token's round trip.
+    ///
+    /// `sm{a="1"}` parses to the canonical sorted-key JSON the store keeps;
+    /// an ABSENT token yields `""`, never `"{}"` (which is what the writer
+    /// stores for an entry with no metadata, so the corpus and the store
+    /// agree on the empty case); and `sm{}` is the escape that lets a body
+    /// literally begin with `sm{`.
+    #[test]
+    fn the_sm_dsl_token_round_trips_and_sm_braces_escape_a_literal_body() {
+        // Canonical, sorted, JSON-escaped by the SAME renderer the store's
+        // label sets use.
+        assert_eq!(
+            parse_sample_metadata(r#" sm{b="2", a="1"}  the body"#).unwrap(),
+            (r#"{"a":"1","b":"2"}"#.to_string(), "the body".to_string())
+        );
+        assert_eq!(
+            parse_sample_metadata(r#" sm{a="1"}  x"#).unwrap(),
+            (r#"{"a":"1"}"#.to_string(), "x".to_string())
+        );
+
+        // ABSENT: "" and never "{}".
+        let (sm, body) = parse_sample_metadata("  plain body text").unwrap();
+        assert_eq!(sm, "", "an absent token is the stored empty representation");
+        assert_ne!(sm, "{}", "and specifically NOT `{{}}`");
+        assert_eq!(body, "plain body text");
+
+        // `sm{}` — the explicit-empty form, which is also the escape.
+        let (sm, body) = parse_sample_metadata(r#" sm{}  sm{literal-brace-body}"#).unwrap();
+        assert_eq!(sm, "{}", "an explicit empty set renders as `{{}}`");
+        assert_eq!(
+            body, "sm{literal-brace-body}",
+            "and the body may then begin with `sm{{`"
+        );
+
+        // A body that merely STARTS with `sm` but is not the token.
+        assert_eq!(
+            parse_sample_metadata(" smoke=1 level=warn").unwrap(),
+            (String::new(), "smoke=1 level=warn".to_string())
+        );
+
+        // End to end through the load-block parser: the token becomes the
+        // sample's metadata and the rest becomes its body.
+        let lines = vec![
+            r#"  {app="x", service_name="s"}"#,
+            r#"  10s  sm{trace="a"}  hello world"#,
+            "  20s  no metadata here",
+            "",
+        ];
+        let (streams, _) = parse_load_block("t", &lines, 0).expect("parses");
+        assert_eq!(streams.len(), 1);
+        assert_eq!(
+            streams[0].samples,
+            vec![
+                (
+                    10_000_000_000i64,
+                    r#"{"trace":"a"}"#.to_string(),
+                    "hello world".to_string()
+                ),
+                (
+                    20_000_000_000i64,
+                    String::new(),
+                    "no metadata here".to_string()
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn duration_parser_handles_units_and_compounds() {

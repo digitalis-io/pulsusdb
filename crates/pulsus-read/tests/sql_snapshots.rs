@@ -774,6 +774,51 @@ fn sliding_sql(
     )
 }
 
+/// Issue #249 — **a structured-metadata key in the STREAM SELECTOR is not
+/// an index over structured metadata.**
+///
+/// `{trace="a"}` resolves against `log_streams_idx`, which holds STREAM
+/// labels only; nothing about this issue's merge changes that, and the
+/// merge happens far downstream of stage 1. Measured on the reference at
+/// v3.7.4 over a fixture whose ONLY `trace` is per-entry metadata: the
+/// query answers an empty matrix.
+///
+/// Asserted here rather than in the corpus because `logqltest`'s hermetic
+/// store feeds every loaded row to the leaf and never applies the selector
+/// (`eval_leaf`), so a "matches nothing" corpus case would pass for the
+/// wrong reason. This is the layer where the question is actually decided.
+#[test]
+fn a_structured_metadata_key_in_the_selector_resolves_against_the_stream_index() {
+    let mp = metric_plan(
+        r#"count_over_time({trace="a"}[5m])"#,
+        &range_params(100, Direction::Backward),
+    );
+    // The selector became an index lookup on the KEY, in `log_streams_idx`.
+    assert!(
+        mp.stage1_sql.contains("log_streams_idx"),
+        "stage 1 reads the stream index: {}",
+        mp.stage1_sql
+    );
+    assert!(
+        mp.stage1_sql.contains("key = 'trace'") && mp.stage1_sql.contains("val = 'a'"),
+        "the matcher is a stream-label lookup: {}",
+        mp.stage1_sql
+    );
+    // ...and NOT a structured-metadata predicate anywhere.
+    assert!(
+        !mp.stage1_sql.contains("structured_metadata"),
+        "stage 1 never mentions structured metadata: {}",
+        mp.stage1_sql
+    );
+    let read = sliding_sql(&mp, &["'checkout'".to_string()], &[101]);
+    let (select, rest) = read.split_once("\nFROM ").expect("a SELECT list");
+    assert!(select.contains("structured_metadata"));
+    assert!(
+        !rest.contains("structured_metadata") && !rest.contains("trace"),
+        "and the scan carries neither the column nor the key below its SELECT: {read}"
+    );
+}
+
 #[test]
 fn a_line_filter_range_slides_raw_and_pushes_the_filter_down() {
     let mp = metric_plan(
