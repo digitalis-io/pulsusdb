@@ -2746,7 +2746,16 @@ RELAXED, and what stays asserted.
   declines to observe the oracle's own run boundaries and does not
   establish that they coincide.
 
-- **Not covered — a composed (non-terminal) `sort`.** The cosmetic
+- **Not covered — a composed (non-terminal) `sort`.** `ledger-marker: sort-tie-order/not-covered` — an inner sort beneath `topk`, `bottomk` or `approx_topk` truncates, so which sample survives can change; that is a subset consequence, not a cosmetic one. Open remainder on issue #406, not closed here.
+
+  *(The line above is one line on purpose: it carries this exclusion's
+  marker and every term the AC13 guard
+  (`the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger`,
+  `e2e/src/logs.rs`) asserts, and that guard requires the marker to occur
+  exactly once in this file. Rendered text, not an HTML comment, because
+  the point of recording the exclusion is that a person reads it.)*
+
+  The cosmetic
   conclusion is about a TERMINAL `sort`/`sort_desc`, whose entire result
   vector reaches the wire. LogQL's grammar admits a sort as an inner
   operand (`metricExpr: … | vectorAggregationExpr`,
@@ -2769,9 +2778,7 @@ RELAXED, and what stays asserted.
   `topk`/`bottomk`/`approx_topk` query, and every committed `sort` is
   terminal (pinned by AC20's `every_committed_sort_case_is_terminal`,
   which PARSES each committed query and inspects its AST root rather than
-  its text). Open remainder on issue #406; not closed here.
-
-  <!-- ledger-marker: sort-tie-order/not-covered — Not covered — a composed (non-terminal) sort: an inner sort under topk / bottomk / approx_topk truncates, so which sample survives can change; that is a subset consequence, not a cosmetic one. Open remainder on issue #406. This marker is asserted by the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger in e2e/src/logs.rs and must occur exactly once in this file. -->
+  its text).
 
 - **PulsusDB's own order is pinned** — by
   `shipped_sort_case_evaluates_in_the_pinned_value_order`, its `sort_desc`

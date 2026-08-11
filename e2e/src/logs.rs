@@ -3782,10 +3782,39 @@ mod tests {
         }
     }
 
-    /// The machine-readable marker the ledger carries on the "Not
-    /// covered" exclusion. Deliberately a token no prose would produce by
-    /// accident, so counting it is a meaningful uniqueness test.
+    /// The marker the ledger carries on the "Not covered" exclusion.
+    /// Deliberately a token no prose would produce by accident, so
+    /// counting it is a meaningful uniqueness test. It sits in the
+    /// bullet's RENDERED text rather than in an HTML comment: the point
+    /// of recording the exclusion is that a person reads it, and a
+    /// comment is invisible to exactly that reader.
     const NOT_COVERED_MARKER: &str = "ledger-marker: sort-tie-order/not-covered";
+
+    /// Operator names the marker line must carry, matched as WHOLE
+    /// TOKENS.
+    ///
+    /// Token equality, not `contains`, and the reason is a defect this
+    /// test shipped with: `approx_topk` contains `topk`, so a `contains`
+    /// check for `topk` is satisfied by any line carrying `approx_topk`
+    /// and can never fail. Splitting the line into `[A-Za-z0-9_]+` runs
+    /// and comparing for equality makes the three independently
+    /// breakable.
+    const MARKER_TOKENS: &[&str] = &["topk", "bottomk", "approx_topk", "composed"];
+
+    /// Phrases the marker line must carry, matched by `contains` because
+    /// they are prose. Chosen so that no phrase contains another, and no
+    /// phrase carries a [`MARKER_TOKENS`] entry — both asserted below.
+    /// The earlier list violated the second rule: its lead-in phrase
+    /// contained the word `composed`, so deleting `composed` failed on
+    /// the lead-in and the `composed` needle itself was never exercised.
+    const MARKER_PHRASES: &[&str] = &["Not covered", "#406"];
+
+    /// The `[A-Za-z0-9_]+` runs of `s`, in order.
+    fn identifier_tokens(s: &str) -> Vec<&str> {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
 
     /// AC13: the divergence is registered where the divergence discipline
     /// says it is registered, and the exclusion the AC exists to hold —
@@ -3809,22 +3838,30 @@ mod tests {
     /// `crates/pulsus-read/tests/logqltest_provenance.rs`).
     ///
     /// **Residual failure surface — written down and left alone.** Each
-    /// was measured by applying it to the committed ledger and watching
-    /// this test stay GREEN, not reasoned about:
-    /// * the marker's own prose can be edited to say something false
-    ///   while keeping every needle. Reading the sentence is the only
-    ///   thing that catches that, and this test does not claim to;
-    /// * the marker can be MOVED — to another bullet, or to another entry
-    ///   — and this test stays green. It pins that the exclusion is
-    ///   recorded ONCE in the ledger, not which heading it sits under.
-    ///   Locating it was what the deleted scanner attempted, at the cost
-    ///   of a markdown parser that took three review rounds and still had
-    ///   edge cases left;
-    /// * the marker's bullet can be wrapped in a code fence, which
-    ///   renders the exclusion as a code SAMPLE rather than as text a
-    ///   reader sees as normative. The line, and so this test, is
-    ///   unchanged. Detecting it needs fence parsing, which is the
-    ///   mechanism that was removed;
+    /// bullet below was MEASURED: the mutation was applied to the
+    /// committed ledger and this test was observed to stay GREEN. None of
+    /// them is reasoned about.
+    /// * **the bullet relocated.** Move the marker to another bullet, or
+    ///   to another entry, and this test stays green. It pins that the
+    ///   exclusion is recorded ONCE in the ledger, not which heading it
+    ///   sits under. Locating it was what the deleted scanner attempted,
+    ///   at the cost of a markdown parser that took three review rounds
+    ///   and still had edge cases left;
+    /// * **the marker fenced.** Wrap the bullet in a code fence and the
+    ///   exclusion renders as a code SAMPLE rather than as normative
+    ///   text, while the line — and so this test — is unchanged.
+    ///   Detecting it needs fence parsing, the mechanism that was
+    ///   removed;
+    /// * **an unclosed fence elsewhere in the file.** Nothing here reads
+    ///   fences, so appending one changes nothing. The guard that used to
+    ///   catch this existed only to protect the deleted scanner;
+    /// * **the entry heading demoted to `####`.** The uniqueness count
+    ///   looks for the substring ``### `sort-tie-order` ``, which
+    ///   ``#### `sort-tie-order` `` still contains, so the demotion is
+    ///   invisible here;
+    /// * **the marker's own prose edited to say something false** while
+    ///   keeping every needle. Reading the sentence is the only thing
+    ///   that catches that, and this test does not claim to;
     /// * nothing here validates the rest of the ledger. It answers one
     ///   question.
     ///
@@ -3872,20 +3909,42 @@ mod tests {
             hits.len()
         );
 
+        // Every needle must be INDEPENDENTLY breakable — removing one
+        // from the marker line must fail on that needle and on no other.
+        // Two needles that overlap cannot both be exercised, and the
+        // survivor certifies a check that does not hold. Asserted here
+        // rather than trusted, because this list has been wrong once.
+        for phrase in MARKER_PHRASES {
+            for other in MARKER_PHRASES {
+                assert!(
+                    phrase == other || !other.contains(phrase),
+                    "phrase needle {phrase:?} is contained in {other:?}, so it can never fail alone"
+                );
+            }
+            let phrase_tokens = identifier_tokens(phrase);
+            for token in MARKER_TOKENS {
+                assert!(
+                    !phrase_tokens.contains(token),
+                    "phrase needle {phrase:?} carries the token needle {token:?}, \
+                     so removing the token would fail on the phrase instead"
+                );
+            }
+        }
+
         // Everything the exclusion has to say, on the marker's own line,
         // so no part of it can drift away from the marker.
         let line = hits[0];
-        for needle in [
-            "Not covered — a composed (non-terminal) sort",
-            "topk",
-            "bottomk",
-            "approx_topk",
-            "composed",
-            "#406",
-        ] {
+        let line_tokens = identifier_tokens(line);
+        for token in MARKER_TOKENS {
             assert!(
-                line.contains(needle),
-                "the `{NOT_COVERED_MARKER}` line is missing {needle:?}:\n{line}"
+                line_tokens.contains(token),
+                "the `{NOT_COVERED_MARKER}` line carries no {token:?} token:\n{line}"
+            );
+        }
+        for phrase in MARKER_PHRASES {
+            assert!(
+                line.contains(phrase),
+                "the `{NOT_COVERED_MARKER}` line is missing {phrase:?}:\n{line}"
             );
         }
     }
