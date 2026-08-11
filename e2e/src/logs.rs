@@ -3966,29 +3966,35 @@ mod tests {
     /// The `nested-sort-order` entry's three markers, each written on
     /// purpose and each asserted to occur EXACTLY ONCE in the ledger.
     ///
-    /// **No markdown is parsed here, and that is the point** (issue #406,
-    /// code review round 1). The first version of this guard sliced the
-    /// entry out of the document between `### ` headings; the reviewer
-    /// demoted the heading to `####`, the substring `### ` was still
-    /// found inside it, and the test stayed green. That is the fourth
-    /// distinct markdown edge case this issue has hit in a
-    /// section-scanner — after a bullet inside a fence, an unclosed fence
+    /// **Nothing here extracts a section, and that is the point** (issue
+    /// #406, code review rounds 1 and 2). The first version of this guard
+    /// sliced the entry out of the document between `### ` headings; the
+    /// reviewer demoted the heading to `####`, the substring `### ` was
+    /// still found inside it, and the test stayed green. That was the
+    /// fourth distinct markdown edge case this issue hit in a section
+    /// scanner — after a bullet inside a fence, an unclosed fence
     /// elsewhere, and an indented heading — and the sibling
     /// `sort-tie-order` guard had already deleted its own scanner for
     /// exactly that reason. Patching the slicer to understand `####`
-    /// would be the fifth patch, not a fix.
+    /// would have been the fifth patch, not a fix.
     ///
     /// Uniqueness replaces extraction. A claim that reads as relational —
-    /// "recorded in THIS entry" — becomes checkable without locating the
-    /// entry at all, because a marker that occurs exactly once cannot be
-    /// satisfied by text somewhere else, and everything the claim asserts
-    /// sits on the marker's own line.
+    /// "recorded in THIS entry" — becomes checkable without ever
+    /// computing where the entry ends: each marker occurs exactly once in
+    /// the whole file, so it cannot be satisfied by text elsewhere, and
+    /// everything the claim asserts sits on the marker's own line.
     ///
-    /// [`NESTED_ENTRY_MARKER`] is the one exception, and it is not an
-    /// extraction: it lives ON the heading line, so asserting that its
-    /// line begins with the exact prefix `"### "` is a single-line shape
-    /// check that rejects the reviewer's `####` demotion (and an indented
-    /// heading) without looking at any other line.
+    /// Two single-line predicates carry the rest, and neither needs a
+    /// section:
+    /// * [`NESTED_ENTRY_MARKER`] rides the `###` heading, so asserting
+    ///   its line begins with the exact prefix `"### "` rejects the
+    ///   reviewer's `####` demotion, and an indented heading, without
+    ///   looking at any other line;
+    /// * the other two markers are bound to the entry by
+    ///   [`assert_marker_is_under_the_entry`], which asks whether an
+    ///   entry boundary was CROSSED between two line numbers uniqueness
+    ///   already gave us — three integers and the same prefix predicate.
+    ///   It never searches for the end of anything.
     const NESTED_ENTRY_MARKER: &str = "ledger-marker: nested-sort-order/entry";
     /// The entry's machine-checkable one-line record.
     const NESTED_RECORD_MARKER: &str = "ledger-marker: nested-sort-order/record";
@@ -4031,18 +4037,21 @@ mod tests {
         "group_right",
     ];
 
-    /// The one line in `ledger` carrying `marker`, with the marker
-    /// asserted to occur exactly once in the whole document first.
-    ///
-    /// This is the entire mechanism: no ranges, no headings, no fences.
-    fn unique_marker_line<'a>(ledger: &'a str, marker: &str) -> &'a str {
+    /// The index of the one line in `lines` carrying `marker`, with the
+    /// marker asserted to occur exactly once in the whole document first.
+    fn unique_marker_index(ledger: &str, lines: &[&str], marker: &str) -> usize {
         assert_eq!(
             ledger.matches(marker).count(),
             1,
             "{marker:?} must occur exactly once in the ledger, found {}",
             ledger.matches(marker).count()
         );
-        let hits: Vec<&str> = ledger.lines().filter(|l| l.contains(marker)).collect();
+        let hits: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(marker))
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(
             hits.len(),
             1,
@@ -4050,6 +4059,101 @@ mod tests {
             hits.len()
         );
         hits[0]
+    }
+
+    /// Whether `line` opens a `###` ledger entry. The SAME single-line
+    /// predicate the demotion check uses, and deliberately exact: `## `
+    /// and `#### ` are not entry headings, and `"#### x"` does not start
+    /// with `"### "` because its fourth byte is `#` rather than a space.
+    fn opens_a_ledger_entry(line: &str) -> bool {
+        line.starts_with("### ")
+    }
+
+    /// Asserts that the line at `marker_idx` belongs to the entry whose
+    /// heading is at `entry_idx`: it comes after the heading, and **no
+    /// entry heading lies strictly between them**.
+    ///
+    /// **This is not the section slicing that was deleted twice, and the
+    /// difference is what it needs to know** (issue #406, code review
+    /// rounds 1 and 2). The slicer had to find where an entry *ends*, so
+    /// it needed a next-heading search, fence handling, and a rule for
+    /// every markdown shape a heading can take — and each round found the
+    /// next shape it got wrong. This asks a different question about two
+    /// line numbers that uniqueness already handed us: *was an entry
+    /// boundary crossed between them?* Nothing is extracted, no needle is
+    /// matched against a range, and where the entry ends is never
+    /// computed.
+    ///
+    /// A bounded line window was the other candidate and is not taken: it
+    /// works, but only with a constant chosen to be larger than this
+    /// entry and smaller than the distance to a plausible relocation
+    /// target, and a constant tuned against today's document is a gate
+    /// that drifts silently as the document grows. This rule has no
+    /// constant to tune.
+    ///
+    /// **Residual, in the safe direction.** The boundary predicate does
+    /// not know about fenced code blocks, so a line beginning `### `
+    /// inside a fence between the two markers would fail this check.
+    /// That is a false RED — loud, and fixed by moving the marker or the
+    /// fence — never a false GREEN, which is the failure this whole
+    /// mechanism exists to avoid. Nothing in the committed ledger fences
+    /// a `### ` line today.
+    fn assert_marker_is_under_the_entry(
+        lines: &[&str],
+        entry_idx: usize,
+        marker_idx: usize,
+        marker: &str,
+    ) {
+        match entry_boundary_between(lines, entry_idx, marker_idx) {
+            EntryRelation::Under => {}
+            EntryRelation::BeforeTheHeading => panic!(
+                "{marker:?} is at line {} but the `nested-sort-order` heading is at line {} — \
+                 a marker that precedes its own entry belongs to an earlier one",
+                marker_idx + 1,
+                entry_idx + 1
+            ),
+            EntryRelation::PastABoundaryAt(i) => panic!(
+                "{marker:?} is at line {} but a NEW ledger entry opens at line {} between it \
+                 and the `nested-sort-order` heading at line {} — the marker has been moved \
+                 out of its entry:\n{}",
+                marker_idx + 1,
+                i + 1,
+                entry_idx + 1,
+                lines[i]
+            ),
+        }
+    }
+
+    /// Where a marker line sits relative to an entry heading.
+    #[derive(Debug, PartialEq, Eq)]
+    enum EntryRelation {
+        /// After the heading with no entry boundary in between.
+        Under,
+        /// At or before the heading.
+        BeforeTheHeading,
+        /// After the heading, but a new entry opens at this line index
+        /// first.
+        PastABoundaryAt(usize),
+    }
+
+    /// [`assert_marker_is_under_the_entry`]'s whole decision as a pure
+    /// function of three integers and a slice, so the rule can be
+    /// exercised on a synthetic document without a panic hook.
+    fn entry_boundary_between(
+        lines: &[&str],
+        entry_idx: usize,
+        marker_idx: usize,
+    ) -> EntryRelation {
+        if marker_idx <= entry_idx {
+            return EntryRelation::BeforeTheHeading;
+        }
+        match lines[entry_idx + 1..marker_idx]
+            .iter()
+            .position(|l| opens_a_ledger_entry(l))
+        {
+            None => EntryRelation::Under,
+            Some(i) => EntryRelation::PastABoundaryAt(entry_idx + 1 + i),
+        }
     }
 
     /// Issue #406 R2, AC 9: the `nested-sort-order` divergence is
@@ -4063,28 +4167,29 @@ mod tests {
     ///
     /// **Residual failure surface, measured rather than reasoned about**
     /// (each mutation applied to the committed ledger and observed):
-    /// * **the record marker's own prose edited to say something false**
+    /// * **a marker line's own prose edited to say something false**
     ///   while keeping every needle. Reading the sentence is the only
     ///   thing that catches that, and this test does not claim to;
-    /// * **the record line relocated to another entry.** The entry marker
-    ///   is on the heading, so a demotion or a duplicate heading is
-    ///   caught; a record line MOVED under a different heading, with its
-    ///   needles intact, is not. Catching that needs the extraction this
-    ///   test exists to avoid;
+    /// * **a marker relocated ELSEWHERE INSIDE its own entry** — to a
+    ///   different bullet, or above the record line. That is an ordinary
+    ///   edit and is deliberately allowed; the claim is that the marker
+    ///   is recorded under this entry, not at a fixed offset within it;
     /// * nothing here validates the rest of the ledger, or the prose
     ///   below the record line. It answers three questions.
     #[test]
     fn the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger() {
         let ledger = committed_ledger();
+        let lines: Vec<&str> = ledger.lines().collect();
 
         // (1) The entry exists, once, at `###` — the marker rides the
         // heading, so this is a one-line shape check, not a section scan.
         // `"#### x".starts_with("### ")` is FALSE (the fourth byte is
         // `#`, not a space), which is exactly the demotion the review
-        // caught the previous version on.
-        let heading = unique_marker_line(&ledger, NESTED_ENTRY_MARKER);
+        // caught an earlier version on.
+        let entry_idx = unique_marker_index(&ledger, &lines, NESTED_ENTRY_MARKER);
+        let heading = lines[entry_idx];
         assert!(
-            heading.starts_with("### "),
+            opens_a_ledger_entry(heading),
             "the `nested-sort-order` entry must be a `###` heading, not {:?}:\n{heading}",
             heading.chars().take_while(|c| *c == '#').count()
         );
@@ -4093,7 +4198,9 @@ mod tests {
             "the entry marker's line must name the entry:\n{heading}"
         );
 
-        // (2) The record, entirely on its marker's own line.
+        // (2) The record, entirely on its marker's own line, and that
+        // line under THIS entry — see `assert_marker_is_under_the_entry`
+        // for why a boundary-crossing test is not the deleted slicer.
         for needle in NESTED_RECORD_NEEDLES {
             for other in NESTED_RECORD_NEEDLES {
                 assert!(
@@ -4102,7 +4209,9 @@ mod tests {
                 );
             }
         }
-        let record = unique_marker_line(&ledger, NESTED_RECORD_MARKER);
+        let record_idx = unique_marker_index(&ledger, &lines, NESTED_RECORD_MARKER);
+        assert_marker_is_under_the_entry(&lines, entry_idx, record_idx, NESTED_RECORD_MARKER);
+        let record = lines[record_idx];
         for needle in NESTED_RECORD_NEEDLES {
             assert!(
                 record.contains(needle),
@@ -4110,8 +4219,11 @@ mod tests {
             );
         }
 
-        // (3) The exclusion, entirely on its marker's own line.
-        let line = unique_marker_line(&ledger, NESTED_NOT_COVERED_MARKER);
+        // (3) The exclusion, entirely on its marker's own line, and that
+        // line under this entry too.
+        let excl_idx = unique_marker_index(&ledger, &lines, NESTED_NOT_COVERED_MARKER);
+        assert_marker_is_under_the_entry(&lines, entry_idx, excl_idx, NESTED_NOT_COVERED_MARKER);
+        let line = lines[excl_idx];
         let tokens = identifier_tokens(line);
         for token in ["topk", "bottomk", "R1"] {
             assert!(
@@ -4142,6 +4254,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The entry-binding rule, exercised on a synthetic document so its
+    /// three answers are pinned independently of the committed ledger
+    /// (issue #406, code review round 2).
+    ///
+    /// The middle row is the one the review asked for: a line whose
+    /// content is intact but which now sits under a DIFFERENT entry. The
+    /// last row is what must NOT break — an ordinary edit inside the
+    /// entry, which moves a marker's line number without moving it out
+    /// of the entry.
+    #[test]
+    fn a_marker_moved_past_an_entry_heading_is_no_longer_under_its_entry() {
+        let doc: Vec<&str> = vec![
+            "### `a` (one)",     // 0
+            "",                  // 1
+            "marker-in-a",       // 2
+            "an added sentence", // 3
+            "another bullet",    // 4
+            "",                  // 5
+            "### `b` (two)",     // 6
+            "",                  // 7
+            "marker-in-b",       // 8
+        ];
+        // Under its own entry, at two different offsets — the rule is
+        // about the boundary, not about a distance.
+        assert_eq!(entry_boundary_between(&doc, 0, 2), EntryRelation::Under);
+        assert_eq!(entry_boundary_between(&doc, 0, 4), EntryRelation::Under);
+        // Moved past `### \`b\``: the boundary is named by line index.
+        assert_eq!(
+            entry_boundary_between(&doc, 0, 8),
+            EntryRelation::PastABoundaryAt(6)
+        );
+        // Moved ABOVE its own heading — it now belongs to whatever came
+        // before.
+        assert_eq!(
+            entry_boundary_between(&doc, 6, 2),
+            EntryRelation::BeforeTheHeading
+        );
+        // A `####` sub-heading is NOT an entry boundary, so an entry may
+        // carry sub-sections without its own markers falling out of it.
+        let with_sub: Vec<&str> = vec!["### `a`", "#### a detail", "marker-in-a"];
+        assert_eq!(
+            entry_boundary_between(&with_sub, 0, 2),
+            EntryRelation::Under
+        );
     }
 
     /// AC15: the fixture prose no longer promises a reference tie order.
