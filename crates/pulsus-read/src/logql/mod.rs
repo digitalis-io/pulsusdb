@@ -22,9 +22,11 @@
 //! per-row aggregation state — the only O(rows) path), [`fold`] (the
 //! bounded grid fold), [`variants`] (`variants(...) of (...)`),
 //! [`detected_probe`] (detected-fields probing and the tail cursor) and
-//! [`post_agg`] (post-aggregation and its byte ledger). Flat, never a
-//! subdirectory: the censuses over this directory are non-recursive, so a
-//! nested module would be invisible to them.
+//! [`post_agg`] (post-aggregation and its byte ledger), plus [`order`]
+//! (issue #406: whether a `sort`/`sort_desc`'s order sets the wire order
+//! of an instant vector). Flat, never a subdirectory: the censuses over
+//! this directory are non-recursive, so a nested module would be
+//! invisible to them.
 //!
 //! **Range-query semantics (issue #227): Loki-exact SLIDING windows.**
 //! A range metric query re-evaluates the `[range]` window `(t - range, t]` at
@@ -72,8 +74,6 @@
 //! [`plan::ProbePlan`]'s doc comment for the deferral rationale
 //! (code-review fix-plan amendment §2).
 
-use pulsus_logql::{Expr, MetricExpr, VectorAggOp};
-
 pub(crate) mod agg;
 pub(crate) mod charge;
 pub(crate) mod client_agg;
@@ -91,6 +91,7 @@ pub(crate) mod labels;
 /// sub-grammar — a module of its own rather than more of [`pipeline`],
 /// which is already over the file-size limit.
 mod logfmt_expr;
+pub mod order;
 pub mod params;
 pub mod pipeline;
 pub mod plan;
@@ -108,24 +109,6 @@ mod testkit;
 pub(crate) mod variants;
 pub(crate) mod walkbound;
 pub(crate) mod window;
-
-/// True iff the OUTERMOST node of `expr` is a terminal `sort`/`sort_desc`
-/// vector aggregation (issue M8-LQ3). Mirrors PromQL's
-/// `pulsus_promql::expr_is_sort_root` (root-only): only a terminal sort's
-/// value order survives to the wire, so the server encoder skips its
-/// deterministic label re-sort for a sort-rooted **instant** query. A sort
-/// nested under a binary op or an inner aggregation has its order destroyed
-/// upstream (matches the reference), so this returns false there. LogQL's
-/// `MetricExpr` has no `Paren` variant, so no paren-stripping is needed.
-pub fn terminal_sort(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Metric(MetricExpr::Vector {
-            op: VectorAggOp::Sort | VectorAggOp::SortDesc,
-            ..
-        })
-    )
-}
 
 pub use charge::{
     MAX_CLIENT_AGG_GROUP_BYTES, MAX_LEAF_RETAINED_BYTES, MAX_METRIC_RESULT_POINTS,
@@ -149,6 +132,21 @@ pub use explain::{ExplainStage, PlanExplain};
 /// what the `| json` collision matrix has to drive to reach the reference's
 /// LIVE-category rule.
 pub use labels::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
+/// Issue #406 R2, replacing the ROOT-ONLY predicate this module carried
+/// until `e69d3f7` (deleted here; `git log -S` finds it): an instant
+/// vector keeps the engine's order when a `sort`/`sort_desc`'s order
+/// reaches the root through order-PRESERVING wrappers, and only then.
+/// That predicate's doc justified being root-only by saying a nested
+/// sort had its order destroyed upstream, and called that a match for
+/// the reference. Measured 2026-08-11, the premise was false in both
+/// halves: the reference's `Sortable` walks the WHOLE tree and does
+/// suppress its re-sort under an aggregation — what it returns there is a
+/// Go map walk, so there was never a stable order to match — and the
+/// order is NOT destroyed under `label_replace`, a scalar operand or a
+/// vector binary operand, where both engines carry it through. See
+/// [`order`]'s module doc for the rule we implement instead and the
+/// `nested-sort-order` ledger entry for what we deliberately do not.
+pub use order::sorted_order_reaches_the_wire;
 pub use params::{
     DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec, TimeBounds,
     ValidatedDuration, validate_duration_ns,
@@ -183,46 +181,3 @@ pub use variants::{
 };
 pub use window::MAX_ADMITTED_GRID_POINTS;
 pub use window::{ClientWindow, GridWindow, MAX_CLIENT_AGG_BUCKETS, materialize_vector_lit};
-
-#[cfg(test)]
-mod tests {
-    use super::terminal_sort;
-    use pulsus_logql::parse;
-
-    /// `terminal_sort` is true only when the OUTERMOST node is a
-    /// `sort`/`sort_desc` (mirrors PromQL's root-only `expr_is_sort_root`).
-    #[test]
-    fn terminal_sort_matches_only_a_root_sort() {
-        for query in [
-            r#"sort(rate({app="x"}[5m]))"#,
-            r#"sort_desc(rate({app="x"}[5m]))"#,
-        ] {
-            assert!(terminal_sort(&parse(query).unwrap()), "{query}");
-        }
-    }
-
-    /// A sort nested under a binary op / an inner aggregation, a non-sort
-    /// aggregation, and a bare log query are all false — their order is
-    /// destroyed upstream (or there is none).
-    #[test]
-    fn terminal_sort_is_false_when_not_at_the_root() {
-        for query in [
-            r#"sum(sort(rate({app="x"}[5m])))"#,
-            r#"sort(rate({app="x"}[5m])) + 1"#,
-            r#"topk(3, rate({app="x"}[5m]))"#,
-            r#"{app="x"}"#,
-        ] {
-            assert!(!terminal_sort(&parse(query).unwrap()), "{query}");
-        }
-    }
-
-    /// Issue #221 (§risk pin): a variants root is NEVER a terminal sort,
-    /// even when a variant is `sort(...)` — the reference's `Sortable`
-    /// returns false for a variants expression, so an instant variants
-    /// result is always label-sorted on the wire.
-    #[test]
-    fn terminal_sort_is_false_for_a_variants_root() {
-        let query = r#"variants(sort(count_over_time({app="x"}[5m]))) of ({app="x"}[5m])"#;
-        assert!(!terminal_sort(&parse(query).unwrap()));
-    }
-}

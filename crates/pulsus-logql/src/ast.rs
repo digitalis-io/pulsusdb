@@ -2448,33 +2448,59 @@ impl fmt::Display for RangeAggOp {
     }
 }
 
-/// Vector aggregations. M1 implemented the five that need no extra
-/// parameter; issue M6-10 added `stddev`/`stdvar` (reductions) and
-/// `topk`/`bottomk` (per-step selections carrying a `k` parameter on
-/// [`MetricExpr::Vector::param`]) as new variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VectorAggOp {
-    Sum,
-    Avg,
-    Min,
-    Max,
-    Count,
-    Stddev,
-    Stdvar,
-    Topk,
-    Bottomk,
+/// Declares [`VectorAggOp`], its rendering and its COMPLETE variant list
+/// from one source — the [`bin_ops!`] precedent, for the same reason
+/// (issue #406): a hand-maintained `ALL` slice beside a hand-written enum
+/// is two sources, and every census and corpus that enumerates the
+/// operator space through the slice would silently cover less than the
+/// enum has.
+///
+/// Per-variant docs travel through `$(#[$meta:meta])*`, so a documented
+/// variant keeps its documentation.
+macro_rules! vector_agg_ops {
+    ($($(#[$meta:meta])* $variant:ident => $keyword:literal,)+) => {
+        /// Vector aggregations. M1 implemented the five that need no extra
+        /// parameter; issue M6-10 added `stddev`/`stdvar` (reductions) and
+        /// `topk`/`bottomk` (per-step selections carrying a `k` parameter on
+        /// [`MetricExpr::Vector::param`]) as new variants.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum VectorAggOp { $($(#[$meta])* $variant),+ }
+
+        impl VectorAggOp {
+            /// Every variant, in declaration order — emitted by the same
+            /// invocation that declares them, so no enumeration driven by
+            /// this slice can miss an operator the enum has.
+            pub const ALL: &'static [VectorAggOp] = &[$(VectorAggOp::$variant),+];
+
+            fn as_str(self) -> &'static str {
+                match self { $(VectorAggOp::$variant => $keyword),+ }
+            }
+        }
+    };
+}
+
+vector_agg_ops! {
+    Sum => "sum",
+    Avg => "avg",
+    Min => "min",
+    Max => "max",
+    Count => "count",
+    Stddev => "stddev",
+    Stdvar => "stdvar",
+    Topk => "topk",
+    Bottomk => "bottomk",
     /// `approx_topk(k, ...)` — probabilistic top-k via a count-min sketch
     /// (issue #221). Parses exactly like `topk` except grouping is
     /// rejected (`grouping not allowed for approx_topk aggregation`) and
     /// the construct is instant-only (the planner rejects it for range
     /// queries).
-    ApproxTopk,
+    ApproxTopk => "approx_topk",
     /// `sort(...)` / `sort_desc(...)` — order the instant result vector by
     /// value ascending/descending (issue M8-LQ3). A post-aggregation
     /// in-memory reordering, not a reduction; carries no parameter and no
     /// grouping.
-    Sort,
-    SortDesc,
+    Sort => "sort",
+    SortDesc => "sort_desc",
 }
 
 impl VectorAggOp {
@@ -2505,23 +2531,6 @@ impl VectorAggOp {
             self,
             VectorAggOp::Topk | VectorAggOp::Bottomk | VectorAggOp::ApproxTopk
         )
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            VectorAggOp::Sum => "sum",
-            VectorAggOp::Avg => "avg",
-            VectorAggOp::Min => "min",
-            VectorAggOp::Max => "max",
-            VectorAggOp::Count => "count",
-            VectorAggOp::Stddev => "stddev",
-            VectorAggOp::Stdvar => "stdvar",
-            VectorAggOp::Topk => "topk",
-            VectorAggOp::Bottomk => "bottomk",
-            VectorAggOp::ApproxTopk => "approx_topk",
-            VectorAggOp::Sort => "sort",
-            VectorAggOp::SortDesc => "sort_desc",
-        }
     }
 }
 
@@ -2765,6 +2774,26 @@ mod tests {
             assert_eq!(VectorAggOp::from_ident(name), Some(op));
             assert_eq!(op.to_string(), name);
         }
+    }
+
+    /// Issue #406: `from_ident`'s `_ => None` arm is a hole a hand-written
+    /// round-trip list cannot see — an operator missing from BOTH is
+    /// consistent with itself. Driving [`VectorAggOp::ALL`], which the
+    /// declaration macro emits, closes it: every variant the enum has
+    /// must resolve from the keyword it renders as.
+    #[test]
+    fn every_vector_agg_op_resolves_from_its_own_keyword() {
+        for op in VectorAggOp::ALL {
+            assert_eq!(
+                VectorAggOp::from_ident(op.as_str()),
+                Some(*op),
+                "{op} does not resolve from its own keyword"
+            );
+            assert_eq!(op.to_string(), op.as_str());
+        }
+        // The enumeration is over the enum itself, so it can only grow
+        // with the enum; pinning the size makes a deletion loud too.
+        assert_eq!(VectorAggOp::ALL.len(), 12);
     }
 
     #[test]

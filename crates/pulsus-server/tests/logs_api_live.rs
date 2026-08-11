@@ -3664,6 +3664,207 @@ async fn a_json_content_type_post_is_served_from_the_url_query() {
     drop_db(db).await;
 }
 
+// ---------------------------------------------------------------------
+// Issue #406 R2 — a WRAPPED sort keeps its value order on the wire.
+// ---------------------------------------------------------------------
+
+const FP_SORT_A: u64 = 0x8000_0000_0000_0011;
+const FP_SORT_B: u64 = 0x8000_0000_0000_0012;
+const FP_SORT_C: u64 = 0x8000_0000_0000_0013;
+
+/// Seeds three streams under one service with **2 / 1 / 3** lines.
+///
+/// **The 2/1/3 shape is the test.** It makes label order (`a, b, c`),
+/// ascending (`b, a, c`) and descending (`c, a, b`) three DIFFERENT
+/// arrangements with no equal values anywhere, so "the sort's order
+/// reached the wire" and "the encoder re-sorted by label" cannot produce
+/// the same answer. An equal-count fixture cannot distinguish them and
+/// would pass before the fix.
+async fn seed_sort_order(client: &ChClient, db: &str, base_ns: i64) {
+    let month = format!("toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns})))");
+    let streams: Vec<String> = [(FP_SORT_A, "a"), (FP_SORT_B, "b"), (FP_SORT_C, "c")]
+        .iter()
+        .map(|(fp, svc)| {
+            format!(
+                "({month}, {fp}, 'sortprobe', \
+                 '{{\"service_name\":\"sortprobe\",\"svc\":\"{svc}\"}}', 0)"
+            )
+        })
+        .collect();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 VALUES {}",
+                streams.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed sort log_streams");
+
+    let mut values = Vec::new();
+    for (fp, svc, count) in [
+        (FP_SORT_A, "a", 2),
+        (FP_SORT_B, "b", 1),
+        (FP_SORT_C, "c", 3),
+    ] {
+        for i in 0..count {
+            let ts = base_ns - (60 - i) * 1_000_000_000;
+            values.push(format!(
+                "('sortprobe', {fp}, {ts}, 0, 'svc={svc} line {i}')"
+            ));
+        }
+    }
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                 body) VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed sort log_samples");
+}
+
+/// The `svc` label of each element of an instant `vector` response, in
+/// RECEIVED order.
+fn svc_wire_sequence(res: &HttpResponse) -> Vec<String> {
+    let body = json(res);
+    assert_eq!(
+        body["data"]["resultType"].as_str(),
+        Some("vector"),
+        "expected a vector result: {}",
+        res.body
+    );
+    body["data"]["result"]
+        .as_array()
+        .expect("vector result array")
+        .iter()
+        .map(|s| {
+            s["metric"]["svc"]
+                .as_str()
+                .unwrap_or_else(|| panic!("sample has no svc label: {s}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// **Issue #406 R2, live.** A `sort`/`sort_desc` wrapped in an
+/// order-PRESERVING combinator still sets the wire order of the instant
+/// vector.
+///
+/// Pre-change all six of these arrived in LABEL order (`a, b, c`) while
+/// both digest-pinned reference images returned value order, 20/20 —
+/// measured 2026-08-11 against `grafana/loki@sha256:87f0a067…`
+/// (buildinfo `3.7.4`/`b318f282`) and `grafana/loki@sha256:58a6c186…`
+/// (`3.4.2`/`4fa045d3`), which agree with each other on every one of
+/// them. The engine already produced the right order; the encoder's
+/// default label re-sort threw it away because the gate was root-only.
+///
+/// The negative row is what stops the fix from becoming "suppress the
+/// re-sort whenever a sort appears": under a vector aggregation the
+/// surviving order is a `HashMap` walk on both sides, so `sum by (svc)
+/// (sort(…))` must still arrive label-sorted here. Ledger
+/// `nested-sort-order`.
+#[tokio::test]
+async fn a_wrapped_sort_keeps_its_value_order_on_the_wire() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_sort_order");
+    let port = 31_199;
+    drop_db(db).await;
+    let guard = spawn_ready_server_env(port, db, &[]);
+    let client = ChClient::new(data_client_config(db))
+        .await
+        .expect("connect data client");
+    let base_ns = now_ns();
+    seed_sort_order(&client, db, base_ns).await;
+
+    let base = r#"sum by (svc) (count_over_time({service_name="sortprobe"}[5m]))"#;
+    let ascending = vec!["b".to_string(), "a".to_string(), "c".to_string()];
+    let descending = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+    let label_order = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let at = base_ns.to_string();
+
+    // Control: the bare aggregation has no sort, so it is label-ordered.
+    // Without this row the six below could pass against a store that had
+    // simply stopped label-sorting anything.
+    let res = http_get(
+        port,
+        &q("/api/logs/v1/query", &[("query", base), ("time", &at)]),
+    )
+    .expect("query reachable");
+    assert_eq!(res.status, 200, "{}", res.body);
+    assert_eq!(
+        svc_wire_sequence(&res),
+        label_order,
+        "the unsorted control must be label-ordered: {}",
+        res.body
+    );
+
+    for (query, expected) in [
+        (
+            format!(r#"label_replace(sort({base}), "tag", "$1", "svc", "(.*)")"#),
+            &ascending,
+        ),
+        (
+            format!(r#"label_replace(sort_desc({base}), "tag", "$1", "svc", "(.*)")"#),
+            &descending,
+        ),
+        (format!("sort({base}) * 1"), &ascending),
+        (format!("sort_desc({base}) * 1"), &descending),
+        (format!("sort({base}) + on(svc) ({base} * 0)"), &ascending),
+        (
+            format!("sort_desc({base}) + on(svc) ({base} * 0)"),
+            &descending,
+        ),
+    ] {
+        let res = http_get(
+            port,
+            &q("/api/logs/v1/query", &[("query", &query), ("time", &at)]),
+        )
+        .expect("query reachable");
+        assert_eq!(res.status, 200, "{query}: {}", res.body);
+        let got = svc_wire_sequence(&res);
+        assert_eq!(
+            got, *expected,
+            "{query} did not reach the wire in value order"
+        );
+        assert_ne!(
+            got, label_order,
+            "{query}: value order and label order must differ, or this fixture proves nothing"
+        );
+    }
+
+    // The negative: a vector aggregation OVER a sort. Suppressing the
+    // re-sort here would put our own `HashMap` collection order on the
+    // wire — the reference returned three different arrangements in 20
+    // runs of this exact query.
+    let nested = format!("sum by (svc) (sort({base}))");
+    let res = http_get(
+        port,
+        &q("/api/logs/v1/query", &[("query", &nested), ("time", &at)]),
+    )
+    .expect("query reachable");
+    assert_eq!(res.status, 200, "{nested}: {}", res.body);
+    assert_eq!(
+        svc_wire_sequence(&res),
+        label_order,
+        "{nested} must stay label-ordered: {}",
+        res.body
+    );
+
+    drop(guard);
+    drop_db(db).await;
+}
+
 /// Sends a POST that advertises `advertised` body bytes and then writes
 /// only `sent`, and reports the response status if one arrives within a
 /// few seconds — `None` meaning the server is still waiting for the rest
