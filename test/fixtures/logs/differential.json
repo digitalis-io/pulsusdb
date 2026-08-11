@@ -279,6 +279,13 @@
       "mode": "gated",
       "kind": "metric_instant_ordered",
       "query": "sort_desc(sum by (grp) (count_over_time({run_id=\"{R}\", service_name=\"svc-sort\"} | logfmt [30m])))"
+    },
+    {
+      "case_id": "metric_sort_wrapped_order",
+      "construct": "Issue #406 R2 — a sort WRAPPED in an order-preserving combinator still sets the wire order. label_replace(sort(sum by (grp) (count_over_time(...))), \"tag\", \"$1\", \"grp\", \"(.*)\") over the SAME svc-sort counts {a:5,b:1,c:5} returns the vector ASCENDING BY VALUE, with tag copied from grp. Before the fix PulsusDB returned this label-sorted (a,b,c — value sequence 5,1,5, not monotone) while both reference images returned value order 20/20; measured against grafana/loki 3.7.4 and 3.4.2 by digest, which AGREE on this shape. Same store-vs-store value comparison as the two terminal cases (metric_instant_ordered), equal-value runs compared as an unordered set at their position; see ledgers sort-tie-order and nested-sort-order",
+      "mode": "gated",
+      "kind": "metric_instant_ordered",
+      "query": "label_replace(sort(sum by (grp) (count_over_time({run_id=\"{R}\", service_name=\"svc-sort\"} | logfmt [30m]))), \"tag\", \"$1\", \"grp\", \"(.*)\")"
     }
   ]
 }

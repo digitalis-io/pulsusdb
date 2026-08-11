@@ -3740,8 +3740,10 @@ mod tests {
         );
     }
 
-    /// AC11: both committed ordered cases share one code path, established
-    /// from the fixture rather than assumed.
+    /// AC11: every committed ordered case shares one code path,
+    /// established from the fixture rather than assumed. Issue #406 R2
+    /// added the wrapped case to the same path — a third entry here and
+    /// no third comparison function.
     #[test]
     fn both_sort_cases_share_the_ordered_comparison_path() {
         let fixture = shipped_fixture();
@@ -3754,8 +3756,12 @@ mod tests {
         ordered.sort_unstable();
         assert_eq!(
             ordered,
-            vec!["metric_sort_desc_order", "metric_sort_order"],
-            "the ordered comparison path serves exactly the two sort cases",
+            vec![
+                "metric_sort_desc_order",
+                "metric_sort_order",
+                "metric_sort_wrapped_order"
+            ],
+            "the ordered comparison path serves exactly the committed sort cases",
         );
     }
 
@@ -3949,6 +3955,182 @@ mod tests {
         }
     }
 
+    /// The committed ledger, read from the workspace.
+    fn committed_ledger() -> String {
+        let path =
+            crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    /// The text of ONE `### ` entry: from its heading to the next
+    /// `\n### ` or the end of the document.
+    ///
+    /// **Entry-SCOPED, deliberately, and this is the whole point of the
+    /// helper** (issue #406): a document-wide `contains` is satisfied by
+    /// the needle appearing anywhere, including in a different entry that
+    /// happens to cite the same file, so it certifies nothing about the
+    /// entry it names. Slicing on the heading is the smallest rule that
+    /// scopes the claim, and its residual is stated rather than reasoned
+    /// away: a line beginning `### ` **inside a fenced code block** would
+    /// end the slice early. Detecting that needs fence parsing, which the
+    /// sibling `sort-tie-order` guard removed after three review rounds
+    /// found the next markdown edge case each time. Nothing in this file
+    /// is committed inside a fence today, and the heading uniqueness
+    /// assertion at each call site is what would notice a duplicate.
+    fn ledger_entry<'a>(ledger: &'a str, heading: &str) -> &'a str {
+        assert_eq!(
+            ledger.matches(heading).count(),
+            1,
+            "the ledger must carry exactly one {heading:?} entry heading"
+        );
+        let start = ledger.find(heading).expect("the heading was just counted");
+        let rest = &ledger[start + heading.len()..];
+        let end = rest
+            .find("\n### ")
+            .map_or(ledger.len(), |i| start + heading.len() + i);
+        &ledger[start..end]
+    }
+
+    /// The `nested-sort-order` entry's unique marker.
+    const NESTED_ENTRY_MARKER: &str = "ledger-marker: nested-sort-order/entry";
+    /// Its "Not covered" bullet's unique marker.
+    const NESTED_NOT_COVERED_MARKER: &str = "ledger-marker: nested-sort-order/not-covered";
+
+    /// Everything the `nested-sort-order` entry must carry, each needle
+    /// asserted INSIDE the entry rather than anywhere in the document.
+    /// Chosen so no needle contains another — asserted below, because a
+    /// contained needle can never fail on its own and its survivor
+    /// certifies a check that does not hold.
+    const NESTED_ENTRY_NEEDLES: &[&str] = &[
+        // The reference rule and its call sites.
+        "evaluator.go:242-260",
+        "engine.go:564",
+        // The mechanism that makes its surviving order arbitrary.
+        "evaluator.go:584",
+        "map[uint64]*groupedAggregation",
+        // Our own, which is why this is a correctness argument.
+        "post_agg.rs:1122-1135",
+        // The measurement: both images by digest, both buildinfo
+        // revisions, and the repeat count.
+        "sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc",
+        "sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08",
+        "b318f282",
+        "4fa045d3",
+        "20 instant queries per store per query",
+        // Our rule, by symbol.
+        "sorted_order_reaches_the_wire",
+        // The five enumerated sub-cases where we stay deterministic.
+        "sum by (svc) (sort(X))",
+        "topk(2, sort(X))",
+        "Y * sort(X)",
+        "sort(X) or Y",
+        "variants(…) of (…)",
+        // The agreeing half, so the entry cannot be read as a wholesale
+        // divergence.
+        "sort(A) or sort(B)",
+        "group_right",
+    ];
+
+    /// Issue #406 R2, AC 9: the `nested-sort-order` divergence is
+    /// registered where the divergence discipline says it is registered —
+    /// and every assertion is scoped to THAT ENTRY, never to the
+    /// document.
+    ///
+    /// Two markers carry the two claims that are relational: the entry
+    /// exists once, and its exclusion is recorded once. Uniqueness is
+    /// what makes a relational claim checkable without a markdown parser
+    /// (the sibling guard's rationale, above); scoping the content
+    /// needles to [`ledger_entry`]'s slice is what stops a needle
+    /// satisfied by another entry counting as this one.
+    #[test]
+    fn the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger() {
+        let ledger = committed_ledger();
+        let entry = ledger_entry(&ledger, "### `nested-sort-order`");
+
+        // Both markers occur exactly once in the WHOLE document, and both
+        // occurrences are inside this entry.
+        for marker in [NESTED_ENTRY_MARKER, NESTED_NOT_COVERED_MARKER] {
+            assert_eq!(
+                ledger.matches(marker).count(),
+                1,
+                "{marker:?} must occur exactly once in the ledger"
+            );
+            assert!(
+                entry.contains(marker),
+                "{marker:?} is in the ledger but not inside the `nested-sort-order` entry"
+            );
+        }
+
+        // No needle may contain another, or it can never fail alone.
+        for needle in NESTED_ENTRY_NEEDLES {
+            for other in NESTED_ENTRY_NEEDLES {
+                assert!(
+                    needle == other || !other.contains(needle),
+                    "needle {needle:?} is contained in {other:?}, so it can never fail alone"
+                );
+            }
+        }
+        // Matched against the entry with runs of whitespace collapsed, so
+        // a needle spanning a line wrap still matches and re-flowing the
+        // prose does not redden the gate. The markers below are matched
+        // on the RAW lines, where their line-scoping is the point.
+        let compact = entry.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in NESTED_ENTRY_NEEDLES {
+            assert!(
+                compact.contains(needle),
+                "the `nested-sort-order` entry does not carry {needle:?}"
+            );
+        }
+
+        // The exclusion's own content sits on the marker's own line, so
+        // no part of it can drift away from the marker.
+        let line = entry
+            .lines()
+            .find(|l| l.contains(NESTED_NOT_COVERED_MARKER))
+            .expect("the marker was just located inside the entry");
+        let tokens = identifier_tokens(line);
+        for token in ["topk", "bottomk", "R1"] {
+            assert!(
+                tokens.contains(&token),
+                "the `{NESTED_NOT_COVERED_MARKER}` line carries no {token:?} token:\n{line}"
+            );
+        }
+        for phrase in ["Not covered", "#406", "no work"] {
+            assert!(
+                line.contains(phrase),
+                "the `{NESTED_NOT_COVERED_MARKER}` line is missing {phrase:?}:\n{line}"
+            );
+        }
+    }
+
+    /// [`ledger_entry`] slices ONE entry, so a needle that lives in a
+    /// different entry does not satisfy a claim about this one. Without
+    /// this the AC 9 guard above would be a document-wide `contains`
+    /// wearing a scoped name — the exact failure this issue spent four
+    /// review rounds on.
+    #[test]
+    fn the_ledger_entry_slice_stops_at_the_next_entry() {
+        let doc = "\
+### `a` (one)
+
+alpha only
+
+### `b` (two)
+
+beta only
+";
+        let a = ledger_entry(doc, "### `a`");
+        assert!(a.contains("alpha only"));
+        assert!(
+            !a.contains("beta only"),
+            "the slice leaked into the next entry: {a:?}"
+        );
+        let b = ledger_entry(doc, "### `b`");
+        assert!(b.contains("beta only"));
+        assert!(!b.contains("alpha only"));
+    }
+
     /// AC15: the fixture prose no longer promises a reference tie order.
     /// `construct` is the only place a case's expected response is written
     /// in words, and prose rot there is invisible to every other gate.
@@ -4052,20 +4234,39 @@ mod tests {
     const AC20_INNER: &str =
         r#"sum by (grp) (count_over_time({run_id="r", service_name="svc-sort"} | logfmt [30m]))"#;
 
-    /// AC20(a): every committed case is terminal-sort-clean and carries no
-    /// k-selector — the exact domain of the ledger's cosmetic conclusion,
-    /// established by PARSING rather than by string shape.
+    /// AC20(a), widened by issue #406 R2: every committed case either
+    /// carries no `sort`/`sort_desc` at all, or its order **reaches the
+    /// wire** — and none carries a k-selector.
+    ///
+    /// The question changed with the corpus. It used to be "is the sort
+    /// terminal", because a non-terminal sort's order was thrown away by
+    /// the encoder; the shipped `metric_sort_wrapped_order` case is a
+    /// non-terminal sort whose order now survives, so the property the
+    /// corpus actually has is the PRODUCTION predicate's
+    /// (`pulsus_read::logql::sorted_order_reaches_the_wire`). Asking the
+    /// production predicate is deliberate: it is the same function the
+    /// server consults, so a case whose order the encoder would discard
+    /// cannot be committed as an ordered one.
+    ///
+    /// The `k_selectors == 0` assertion is unchanged and unwidened — it
+    /// holds the committed set inside the `sort-tie-order` ledger's
+    /// cosmetic conclusion, which a truncating operator would leave.
     #[test]
-    fn every_committed_sort_case_is_terminal() {
+    fn every_committed_ordered_case_carries_its_sort_to_the_wire() {
         let fixture = shipped_fixture();
         for case in &fixture.cases {
             let rendered = case.query.replace("{R}", "e2e-logs-test");
             let shape = sort_shape(&rendered);
-            assert!(
-                sort_is_terminal(&rendered),
-                "case {:?} has a non-terminal sort: {shape:?} for {rendered}",
-                case.case_id
-            );
+            if shape.sorts > 0 {
+                let expr = pulsus_logql::parse(&rendered)
+                    .unwrap_or_else(|e| panic!("query does not parse: {rendered:?}: {e}"));
+                assert!(
+                    pulsus_read::logql::sorted_order_reaches_the_wire(&expr),
+                    "case {:?} has a sort whose order the encoder would discard: \
+                     {shape:?} for {rendered}",
+                    case.case_id
+                );
+            }
             assert_eq!(
                 shape.k_selectors, 0,
                 "case {:?} carries a k-selector, which truncates and so falls \
@@ -4120,16 +4321,38 @@ mod tests {
             r#"{run_id="r"} | logfmt | msg = "sort(x)""#
         ));
         // The committed queries themselves, taken from the fixture rather
-        // than retyped.
+        // than retyped. Issue #406 R2: `metric_sort_wrapped_order` is a
+        // deliberately NON-terminal sort, and the two predicates differ
+        // on it — the syntactic one rejects it, the production one
+        // accepts it. That difference is the change the case exists to
+        // gate, so it is asserted here rather than excluded.
         let fixture = shipped_fixture();
+        let mut wrapped_seen = false;
         for case in fixture
             .cases
             .iter()
             .filter(|c| c.kind() == "metric_instant_ordered")
         {
             let rendered = case.query.replace("{R}", "e2e-logs-test");
-            assert!(sort_is_terminal(&rendered), "case {:?}", case.case_id);
+            if case.case_id == "metric_sort_wrapped_order" {
+                wrapped_seen = true;
+                assert!(
+                    !sort_is_terminal(&rendered),
+                    "the wrapped case is supposed to be non-terminal: {rendered}"
+                );
+                let expr = pulsus_logql::parse(&rendered).expect("parse");
+                assert!(
+                    pulsus_read::logql::sorted_order_reaches_the_wire(&expr),
+                    "the wrapped case's order must still reach the wire: {rendered}"
+                );
+            } else {
+                assert!(sort_is_terminal(&rendered), "case {:?}", case.case_id);
+            }
         }
+        assert!(
+            wrapped_seen,
+            "the wrapped case is committed, so this loop must have reached it"
+        );
     }
 
     /// The D1 witness, hermetic half: the SHIPPED evaluator FAILS the

@@ -131,6 +131,15 @@ pub const METRIC_CASE_IDS: &[&str] = &[
     // independently. Same store-vs-store value comparison; PulsusDB's own
     // order `a, c, b` is pinned hermetically.
     "metric_sort_desc_order",
+    // Issue #406 R2 (instant; gated): the same sort WRAPPED in
+    // `label_replace`, which preserves order — so the wire order is still
+    // the sort's. This is the cross-store gate on the R2 fix; before it,
+    // PulsusDB answered label-sorted (`a, b, c`, value sequence 5,1,5 —
+    // not monotone) while both reference images answered in value order
+    // 20/20. The two images AGREE on this shape, which is what admits a
+    // gated case scored against the 3.4.2 oracle (issue #259's skew
+    // hazard, ruled on in #406).
+    "metric_sort_wrapped_order",
 ];
 
 pub const SVC_JSON: &str = "svc-json";
@@ -876,6 +885,23 @@ impl LogCorpus {
                 for (grp, count) in [("a", 5.0), ("b", 1.0), ("c", 5.0)] {
                     out.insert(
                         BTreeMap::from([("grp".to_string(), grp.to_string())]),
+                        count,
+                    );
+                }
+            }
+            // Issue #406 R2: the same counts through `label_replace(…,
+            // "tag", "$1", "grp", "(.*)")`, which copies `grp` into a new
+            // `tag` label and touches nothing else — so the values are
+            // identical to the two cases above and only the label set
+            // grows. The wire ORDER is what the case gates; this set is
+            // the order-neutral validity gate under it.
+            "metric_sort_wrapped_order" => {
+                for (grp, count) in [("a", 5.0), ("b", 1.0), ("c", 5.0)] {
+                    out.insert(
+                        BTreeMap::from([
+                            ("grp".to_string(), grp.to_string()),
+                            ("tag".to_string(), grp.to_string()),
+                        ]),
                         count,
                     );
                 }

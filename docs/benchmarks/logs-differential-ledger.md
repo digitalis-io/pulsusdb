@@ -2801,6 +2801,119 @@ RELAXED, and what stays asserted.
   `value_ordered_agreement_*` / `tie_groups_*` in `e2e/src/logs.rs`, and
   by `the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger`.
 
+### `nested-sort-order` (issue #406 R2 — where the reference's surviving order is its own map walk, ours stays deterministic)
+
+`ledger-marker: nested-sort-order/entry` — this entry records a
+**deliberate** difference in one place only: which instant `vector`
+responses keep a `sort`/`sort_desc`'s value order on the wire. No fixture
+case is downgraded and no case carries a `ledger` field for it.
+
+R2's defect itself is FIXED, not ledgered: `label_replace(sort(…), …)`,
+`sort(…) * 1` and a vector binary operand now return value order here, in
+agreement with the reference. What this entry records is the residue —
+the cases where matching the reference would mean reproducing an
+arbitrary answer.
+
+- **Reference rule, from source.** The re-sort is suppressed whenever a
+  `sort`/`sort_desc` appears **anywhere** in the AST: `Sortable`
+  (`pkg/logql/evaluator.go:242-260`) walks the whole tree with
+  `expr.Walk` (`:246-255`) and returns true on any
+  `VectorAggregationExpr` whose operation is `OpTypeSort`/`OpTypeSortDesc`;
+  its call sites are `pkg/logql/engine.go:564` and `:627`, each guarding a
+  `sort.Slice` on the label set at `:569`/`:632`. Both @ grafana/loki
+  v3.7.4 `b318f2829f0ae2094ab3a1e90780450e9e4b03be`. A variants root
+  short-circuits to `false` (`evaluator.go:244-245`).
+
+- **Why that rule cannot be copied: what it leaves on the wire is a Go
+  map walk.** Under a vector aggregation the surviving sequence is
+  `VectorAggEvaluator.Next`'s emission loop, `for _, aggr := range result`
+  over `result := map[uint64]*groupedAggregation{}`
+  (`pkg/logql/evaluator.go:584`, the map declared at `:442`, both @
+  v3.7.4). Go randomises map iteration order, so the reference's answer to
+  `sum by (svc) (sort(…))` is arbitrary. **Ours would be too:**
+  `post_agg::group_instant` collects with
+  `groups.into_iter()` out of a `HashMap<LabelSet, Vec<f64>>`
+  (`crates/pulsus-read/src/logql/post_agg.rs:1122-1135`). So suppressing
+  the re-sort there would put OUR hash walk on the wire — a correctness
+  defect, not a parity one, and it would hold even if the reference were
+  stable.
+
+- **Measured, 2026-08-11.** Corpus: three streams with **2 / 1 / 3** lines
+  pushed byte-identically to every store over `POST /loki/api/v1/push`, so
+  label order (`a,b,c`), ascending (`b,a,c`) and descending (`c,a,b`) are
+  three different arrangements and no two values are equal. 20 instant
+  queries per store per query, `time` nudged +1 s per repeat. Stores:
+  `grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+  (buildinfo `{"version":"3.7.4","revision":"b318f282"}`) and
+  `grafana/loki@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08`
+  (`{"version":"3.4.2","revision":"4fa045d3"}`, the e2e oracle,
+  `deploy/e2e/compose.single.yaml:172`).
+
+  | query | PulsusDB | loki 3.7.4 | loki 3.4.2 |
+  |---|---|---|---|
+  | `sum by (svc) (sort(X))` | `a,b,c` **20/20** | `b,a,c` 11, `a,c,b` 6, `c,b,a` 3 | `b,a,c` 17, `a,c,b` 2, `c,b,a` 1 |
+  | `X * sort(Y)` (vector LHS) | `a,b,c` **20/20** | `a,b,c` 14, `c,a,b` 6 | `a,b,c` 16, `c,a,b` 2, `b,c,a` 2 |
+
+  Sets equal in every cell; values byte-identical; the difference is order
+  only. The controls on the same run discriminate: bare `X` was
+  label-ordered 20/20 on all three stores, `sort(X)` was `b,a,c` 20/20 on
+  all three, `sort_desc(X)` was `c,a,b` 20/20 on all three. The full
+  per-query tables, including the six wrapper queries that now AGREE, are
+  posted on issue #406.
+
+- **PulsusDB rule.** An instant vector keeps the engine's order exactly
+  when a `sort`/`sort_desc`'s order reaches the root through
+  order-preserving wrappers —
+  `crates/pulsus-read/src/logql/order.rs::sorted_order_reaches_the_wire`,
+  consumed by `logs_api::handlers::preserve_vector_order`. Everywhere
+  else the encoder's label sort stands
+  (`logs_api::encode::query_response`).
+
+- **Where we AGREE with the reference** (measured above, 20/20 on both
+  images, and the reason this is a residue rather than a divergence):
+  `label_replace(sort(…), …)`; `sort(…) ⊗ <scalar>` and
+  `<scalar> ⊗ sort(…)`; the many side of a vector binary operand — the
+  left normally, the right under `group_right`; `sort(…) and Y`;
+  `sort(…) unless Y`; and `sort(A) or sort(B)`, which returned
+  `c=3|b=1|a=2` (the whole LHS in order, then the RHS-only entries in
+  order) 20/20 on both images and 20/20 here.
+
+- **Where we DIVERGE, enumerated.** Each is a shape whose reference answer
+  is the map walk above, and in each we return our deterministic label
+  order:
+  1. under any non-sort vector aggregation — `sum`, `avg`, `min`, `max`,
+     `count`, `stddev`, `stdvar` — e.g. `sum by (svc) (sort(X))`;
+  2. under a k-selection — `topk`, `bottomk`, `approx_topk` — e.g.
+     `topk(2, sort(X))`;
+  3. on the NON-many side of a vector binary operand: `Y * sort(X)`, and
+     `sort(X) + on(l) group_right Y` where the swap makes `Y` the carrier;
+  4. `sort(X) or Y` with an unsorted `Y`, where the appended RHS tail is
+     itself a map walk;
+  5. a `variants(…) of (…)` root, where the reference does not even
+     consult the tree (`evaluator.go:244-245`).
+
+- **Consumer impact.** A client that keys on `(labels, value)` sees no
+  difference at all — the multiset is identical in every case above. A
+  client that reads position sees a stable answer here and an unstable one
+  there, which is the direction the standing mandate asks for: match the
+  reference except where it is wrong, and an arbitrary answer to a
+  deterministic question is wrong.
+
+- **Not covered** — whether an inner sort changes WHICH sample a `topk`/`bottomk` keeps. `ledger-marker: nested-sort-order/not-covered` — that is R1 on issue #406, a subset consequence rather than an order one, ruled **no work** (comment 5252213426) because nothing gated reaches it and `topk` orders its input anyway. Row 2 above records only the ORDER half.
+
+  *(One line on purpose: it carries this exclusion's marker and every term
+  the AC 9 guard
+  (`the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger`,
+  `e2e/src/logs.rs`) asserts on the marker's own line, so no part of the
+  exclusion can drift away from the marker. Same shape as
+  `sort-tie-order`'s exclusion above.)*
+
+- Gated by
+  `the_nested_sort_order_divergence_is_recorded_in_the_committed_ledger`
+  (`e2e/src/logs.rs`), by
+  `crates/pulsus-read/src/logql/order.rs`'s classification tests, and by
+  `logs_api_live.rs::a_wrapped_sort_keeps_its_value_order_on_the_wire`.
+
 ### `logs-timestamp-i64-nanosecond-domain` (issue #406 Part D, rulings v3 — a representation limit with a date on it)
 
 No fixture case references this entry — nothing is downgraded. It records

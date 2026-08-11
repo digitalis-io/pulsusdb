@@ -304,7 +304,7 @@ mod tests {
             // `or` keeps the lhs order and then appends the rhs's own —
             // which here is a hash walk.
             format!("sort({X}) or {Y}"),
-            format!(r#"variants(sort(count_over_time({{app="x"}}[5m]))) of ({{app="x"}}[5m])"#),
+            r#"variants(sort(count_over_time({app="x"}[5m]))) of ({app="x"}[5m])"#.to_string(),
             format!("sum({X})"),
             r#"{app="x"}"#.to_string(),
         ] {

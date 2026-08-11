@@ -132,12 +132,13 @@ pub use explain::{ExplainStage, PlanExplain};
 /// what the `| json` collision matrix has to drive to reach the reference's
 /// LIVE-category rule.
 pub use labels::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
-/// Issue #406 R2, replacing the root-only `terminal_sort`: an instant
+/// Issue #406 R2, replacing the ROOT-ONLY predicate this module carried
+/// until `e69d3f7` (deleted here; `git log -S` finds it): an instant
 /// vector keeps the engine's order when a `sort`/`sort_desc`'s order
 /// reaches the root through order-PRESERVING wrappers, and only then.
-/// The former predicate's doc justified being root-only by saying a
-/// nested sort "has its order destroyed upstream (matches the
-/// reference)". Measured 2026-08-11, that premise was false in both
+/// That predicate's doc justified being root-only by saying a nested
+/// sort had its order destroyed upstream, and called that a match for
+/// the reference. Measured 2026-08-11, the premise was false in both
 /// halves: the reference's `Sortable` walks the WHOLE tree and does
 /// suppress its re-sort under an aggregation — what it returns there is a
 /// Go map walk, so there was never a stable order to match — and the
