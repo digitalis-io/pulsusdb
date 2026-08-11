@@ -1465,60 +1465,50 @@ fn parse_source(name: &str) -> syn::File {
     syn::parse_file(src).expect("the frame source parses")
 }
 
+/// Regenerates the pinned censuses — the ONLY sanctioned source for a
+/// number in [`PER_VARIANT_FRAMES`].
+///
+/// ```text
+/// cargo test -p pulsus-read --test logql_variants_alloc \
+///     -- --ignored zz_print_frame_censuses --nocapture
+/// ```
+///
+/// **It iterates [`PER_VARIANT_FRAMES`] itself** (issue #249 cost work).
+/// It used to carry a hand-copied parallel list of its own, which had
+/// drifted into unusability: 27 entries against the roster's 34, still
+/// naming `exec.rs` — a file the frame bodies moved out of and which
+/// [`parse_source`] no longer knows — so the generator printed the four
+/// `plan.rs` frames and then panicked with `unknown frame file exec.rs`.
+/// For as long as that stood, "regenerate, never hand-write" was
+/// un-executable and every re-pin was necessarily hand-written, which is
+/// how a real regression gets absorbed into a constant. Reading the roster
+/// makes the two unable to diverge again.
+///
+/// Emits one `FRAME <file> <key> <branches> <n_callees> :: <callees>` line
+/// per frame, in roster order. A pin's comment quotes its own line
+/// verbatim beside the command above.
 #[test]
 #[ignore = "generator: prints the frame censuses to pin"]
 fn zz_print_frame_censuses() {
-    let frames: [(&str, Option<&str>, &str); 27] = [
-        ("plan.rs", None, "build_variants_node"),
-        ("plan.rs", None, "unwrap_vector_aggs_into"),
-        ("plan.rs", None, "parse_vector_agg_params"),
-        ("plan.rs", None, "parse_plan_number"),
-        ("exec.rs", Some("VariantArena"), "build"),
-        ("exec.rs", Some("VariantsAggState"), "new"),
-        ("exec.rs", None, "variant_pipeline_entry_bytes"),
-        ("exec.rs", None, "stage_source_bytes"),
-        ("exec.rs", None, "regex_stage_count"),
-        ("exec.rs", None, "variant_state_bytes"),
-        ("exec.rs", Some("ClientAggState"), "new"),
-        ("exec.rs", Some("RangeSlideState"), "new"),
-        ("exec.rs", Some("VariantsAggState"), "push_rows"),
-        ("exec.rs", Some("VariantsAggState"), "finish"),
-        ("exec.rs", Some("VariantsAggState"), "finish_in_place"),
-        ("exec.rs", None, "append_variant_label"),
-        ("exec.rs", Some("MetricAggState"), "push_rows"),
-        ("exec.rs", Some("MetricAggState"), "finish"),
-        ("exec.rs", Some("ClientAggState"), "push_rows"),
-        ("exec.rs", Some("ClientAggState"), "finish"),
-        ("exec.rs", Some("RangeSlideState"), "push_rows"),
-        ("exec.rs", Some("RangeSlideState"), "finish"),
-        ("exec.rs", Some("RangeSlideState"), "finish_in_place"),
-        ("exec.rs", Some("RangeSlideState"), "drain_group"),
-        ("exec.rs", Some("RangeSlideState"), "finish_absent"),
-        ("exec.rs", Some("RangeSlideState"), "flush_collision"),
-        ("exec.rs", Some("FpSlide"), "finish"),
-    ];
-    for (file, ty, anchor) in frames {
-        let f = Frame {
-            file,
-            ty,
-            anchor,
-            branches: 0,
-            callees: &[],
-        };
-        let parsed = parse_source(file);
-        let src = &parsed;
-        let (br, callees) = census_of(src, &f);
+    for f in &PER_VARIANT_FRAMES {
+        let parsed = parse_source(f.file);
+        let (br, callees) = census_of(&parsed, f);
         let list: Vec<String> = callees.into_iter().collect();
         println!(
-            "FRAME {file} {} {br} {} :: {}",
-            frame_key(&f),
+            "FRAME {} {} {br} {} :: {}",
+            f.file,
+            frame_key(f),
             list.len(),
             list.join(" ")
         );
     }
 }
 
-/// The 27 per-variant frames (`W-MEM`): one entry per FUNCTION. The 12
+/// The per-variant frames (`W-MEM`): one entry per FUNCTION, and the
+/// roster [`zz_print_frame_censuses`] iterates — the array's own length is
+/// the count, asserted by `g4_frame_census_and_inventory_closure`, so no
+/// prose here can fall out of step with it (the header used to say "27"
+/// while the array held 34). The 12
 /// frames this issue creates are pinned from the implementation-commit
 /// census; the 14 pre-existing frames reproduce the plan's pinned
 /// censuses except where the plan itself edits the body (deviations
