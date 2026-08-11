@@ -2771,6 +2771,8 @@ RELAXED, and what stays asserted.
   which PARSES each committed query and inspects its AST root rather than
   its text). Open remainder on issue #406; not closed here.
 
+  <!-- ledger-marker: sort-tie-order/not-covered — Not covered — a composed (non-terminal) sort: an inner sort under topk / bottomk / approx_topk truncates, so which sample survives can change; that is a subset consequence, not a cosmetic one. Open remainder on issue #406. This marker is asserted by the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger in e2e/src/logs.rs and must occur exactly once in this file. -->
+
 - **PulsusDB's own order is pinned** — by
   `shipped_sort_case_evaluates_in_the_pinned_value_order`, its `sort_desc`
   mirror (both `e2e/src/logs.rs`), and the two `eval_ordered` rows in

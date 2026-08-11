@@ -3782,210 +3782,72 @@ mod tests {
         }
     }
 
-    /// One `### \`<id>\`` ledger entry, sliced out of the document by line
-    /// index.
-    #[derive(Debug)]
-    struct LedgerEntry {
-        /// The entry's own text: its heading line up to the next heading of
-        /// the same or a shallower level, or end of file.
-        text: String,
-        /// Everything OUTSIDE the entry, joined. Computed from the same
-        /// line indices, never with `str::replace`, which would delete
-        /// every byte-identical copy rather than this one slice.
-        outside: String,
-    }
-
-    /// Per line: is it OUTSIDE every fenced code block, i.e. is it live
-    /// Markdown rather than a code sample? A fence opens with three or
-    /// more `` ` `` or `~`, may be indented, and closes only with the
-    /// character that opened it — so `~~~` inside a ```` ``` ```` block is
-    /// content. The fence lines themselves are never live.
-    ///
-    /// Shared by both extractors on purpose. When only headings consulted
-    /// it, wrapping a bullet in an indented `~~~` fence demoted it to a
-    /// code sample while the bullet check went on matching it — the same
-    /// hole as matching bare words, one layer down.
-    ///
-    /// Panics on an unbalanced fence rather than slicing a document it
-    /// cannot read.
-    fn live_markdown_lines(lines: &[&str]) -> Vec<bool> {
-        let fence_char = |line: &str| -> Option<char> {
-            let t = line.trim_start();
-            ['`', '~']
-                .into_iter()
-                .find(|&c| t.starts_with(&String::from(c).repeat(3)))
-        };
-        let mut open: Option<char> = None;
-        let live: Vec<bool> = lines
-            .iter()
-            .map(|line| match (open, fence_char(line)) {
-                (None, Some(c)) => {
-                    open = Some(c);
-                    false
-                }
-                (Some(o), Some(c)) if o == c => {
-                    open = None;
-                    false
-                }
-                _ => open.is_none(),
-            })
-            .collect();
-        assert!(
-            open.is_none(),
-            "the text ends inside an unclosed code fence, so no slice of it \
-             can be trusted"
-        );
-        live
-    }
-
-    /// Slices one ledger entry by its `### \`<id>\`` heading.
-    ///
-    /// Scoped extraction, not a whole-file search, because the claim is a
-    /// RELATION — "the `sort-tie-order` entry records these things" — and
-    /// a `contains` over the document proves only that the strings exist
-    /// somewhere. Several of AC13's needles already occurred in unrelated
-    /// entries before that entry was written, so a document-wide form
-    /// could not fail on them.
-    ///
-    /// **What it handles, each stated because it was checked:**
-    /// * a DEEPER heading (`#### …`) does not end the entry — the prefix
-    ///   test requires the trailing space, so `"#### x"` never matches
-    ///   `"### "`. The committed ledger carries such headings;
-    /// * a heading-shaped line inside a fenced block is ignored, per
-    ///   [`live_markdown_lines`] — which an unindented-backticks-only
-    ///   rule in an earlier revision of this helper silently missed, the
-    ///   committed ledger's fences being mostly indented;
-    /// * an UNBALANCED fence panics rather than mis-slicing quietly;
-    /// * a heading may carry up to three leading spaces, which is what
-    ///   CommonMark admits as an ATX heading;
-    /// * exactly one matching heading is required. A duplicated id would
-    ///   make "inside this entry" ambiguous;
-    ///   `logqltest_provenance.rs::ledger_ids` resolves a
-    ///   `divergence(...)` marker against exactly this heading form.
-    ///
-    /// **Residual failure surface — written down, and deliberately not
-    /// instrumented further.** This is a consistency check on a prose
-    /// document, not a parser, and every guard added to it becomes the
-    /// next thing that needs guarding. What it can still get wrong:
-    /// * a line inside a LIST ITEM that is indented one-to-three spaces
-    ///   and begins with `#` reads as a heading here and would end the
-    ///   entry early. Real CommonMark block parsing is what distinguishes
-    ///   those, and importing a Markdown parser to police a nine-needle
-    ///   check is out of proportion;
-    /// * an entry whose heading is written with `setext` underlining, or
-    ///   with the id unbackticked, is not found at all — it panics with
-    ///   "found 0" rather than passing, which is the safe direction;
-    /// * a bullet whose lead-in and content are BOTH intact but whose
-    ///   meaning has been reversed by an edit inside it. Nothing short of
-    ///   reading the sentence catches that, and this check does not claim
-    ///   to;
-    /// * nothing here validates the REST of the ledger. It answers one
-    ///   question about one entry.
-    fn ledger_entry(ledger: &str, id: &str) -> LedgerEntry {
-        let heading = format!("### `{id}`");
-        let lines: Vec<&str> = ledger.lines().collect();
-        let live = live_markdown_lines(&lines);
-
-        // CommonMark admits up to three leading spaces before the `#` run.
-        let is_heading: Vec<bool> = lines
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let indent = line.len() - line.trim_start_matches(' ').len();
-                let body = &line[indent..];
-                live[i]
-                    && indent <= 3
-                    && (body.starts_with("# ")
-                        || body.starts_with("## ")
-                        || body.starts_with("### "))
-            })
-            .collect();
-
-        let starts: Vec<usize> = (0..lines.len())
-            .filter(|&i| is_heading[i] && lines[i].starts_with(&heading))
-            .collect();
-        assert_eq!(
-            starts.len(),
-            1,
-            "the ledger must carry exactly one ``### `{id}` `` heading, found {}",
-            starts.len()
-        );
-        let start = starts[0];
-        let end = (start + 1..lines.len())
-            .find(|&i| is_heading[i])
-            .unwrap_or(lines.len());
-        LedgerEntry {
-            text: lines[start..end].join("\n"),
-            outside: lines[..start]
-                .iter()
-                .chain(lines[end..].iter())
-                .copied()
-                .collect::<Vec<&str>>()
-                .join("\n"),
-        }
-    }
-
-    /// One top-level bullet of a ledger entry: the `- ` line whose text
-    /// begins with `lead_in`, plus its continuation lines, up to the next
-    /// top-level bullet, the next heading, or the end of the entry.
-    ///
-    /// Structure, not substring. An earlier revision asserted the needles
-    /// anywhere in the entry, and a reviewer showed the hole by deleting
-    /// the bullet outright and pasting `Not covered; topk; composed` into
-    /// the entry as plain prose: the check stayed green. Matching bare
-    /// words inside the right section still cannot tell a bullet from
-    /// text that happens to contain the words, so the bullet's own list
-    /// marker and bold lead-in are what is matched here, and the needles
-    /// are then required INSIDE its span.
-    ///
-    /// A top-level bullet is `- ` at column 0 — the shape every bullet in
-    /// this ledger has. An indented `- ` is a nested bullet and belongs to
-    /// the item it sits under, so it does not end the span. A `- ` inside
-    /// a fenced code block is a code sample and is not a bullet at all
-    /// ([`live_markdown_lines`]); an entry is delimited by headings, which
-    /// are themselves only recognised outside a fence, so an entry never
-    /// begins or ends mid-fence and this local scan is well defined.
-    fn ledger_bullet(entry: &str, lead_in: &str) -> String {
-        let lines: Vec<&str> = entry.lines().collect();
-        let live = live_markdown_lines(&lines);
-        let opens: Vec<usize> = (0..lines.len())
-            .filter(|&i| live[i] && lines[i].starts_with("- ") && lines[i].starts_with(lead_in))
-            .collect();
-        assert_eq!(
-            opens.len(),
-            1,
-            "the entry must carry exactly one top-level bullet opening \
-             {lead_in:?}, found {}:\n{entry}",
-            opens.len()
-        );
-        let start = opens[0];
-        let end = (start + 1..lines.len())
-            .find(|&i| live[i] && (lines[i].starts_with("- ") || lines[i].starts_with('#')))
-            .unwrap_or(lines.len());
-        lines[start..end].join("\n")
-    }
-
-    /// The exact opening of the ledger bullet AC13 exists to hold in
-    /// place. Written once so the test and its failure message cannot
-    /// drift apart.
-    const NOT_COVERED_LEAD_IN: &str = "- **Not covered — a composed (non-terminal) `sort`.**";
+    /// The machine-readable marker the ledger carries on the "Not
+    /// covered" exclusion. Deliberately a token no prose would produce by
+    /// accident, so counting it is a meaningful uniqueness test.
+    const NOT_COVERED_MARKER: &str = "ledger-marker: sort-tie-order/not-covered";
 
     /// AC13: the divergence is registered where the divergence discipline
-    /// says it is registered; THAT ENTRY names the artifacts it governs;
-    /// and the "Not covered" bullet — the composed/`topk` case the
-    /// cosmetic conclusion does NOT cover — is present AS A BULLET, with
-    /// its own content inside its own span.
+    /// says it is registered, and the exclusion the AC exists to hold —
+    /// the composed/`topk` case the cosmetic conclusion does NOT cover —
+    /// is pinned by an explicit machine-readable marker rather than by
+    /// anything about the document's shape.
+    ///
+    /// **Why a marker and not a section scan.** Three review rounds each
+    /// found the next markdown edge case in a hand-written scanner here —
+    /// whole-document versus entry, substring versus bullet, a bullet
+    /// wrapped in a fence, a malformed closing fence, an indented
+    /// heading. Every finding was correct and none of them was the
+    /// product. Markdown has more edge cases than this test will ever
+    /// have rounds, so the mechanism changed: a marker the ledger carries
+    /// on purpose, asserted UNIQUE. Uniqueness is what replaces section
+    /// extraction — a claim that was relational ("recorded in THIS
+    /// entry") becomes checkable without locating the entry at all,
+    /// because a marker that occurs exactly once cannot be satisfied by
+    /// text somewhere else. Same shape as the corpus provenance markers
+    /// (`# provenance: divergence(...)`, bound by
+    /// `crates/pulsus-read/tests/logqltest_provenance.rs`).
+    ///
+    /// **Residual failure surface — written down and left alone.** Each
+    /// was measured by applying it to the committed ledger and watching
+    /// this test stay GREEN, not reasoned about:
+    /// * the marker's own prose can be edited to say something false
+    ///   while keeping every needle. Reading the sentence is the only
+    ///   thing that catches that, and this test does not claim to;
+    /// * the marker can be MOVED — to another bullet, or to another entry
+    ///   — and this test stays green. It pins that the exclusion is
+    ///   recorded ONCE in the ledger, not which heading it sits under.
+    ///   Locating it was what the deleted scanner attempted, at the cost
+    ///   of a markdown parser that took three review rounds and still had
+    ///   edge cases left;
+    /// * the marker's bullet can be wrapped in a code fence, which
+    ///   renders the exclusion as a code SAMPLE rather than as text a
+    ///   reader sees as normative. The line, and so this test, is
+    ///   unchanged. Detecting it needs fence parsing, which is the
+    ///   mechanism that was removed;
+    /// * nothing here validates the rest of the ledger. It answers one
+    ///   question.
+    ///
+    /// That trade is deliberate: "recorded exactly once, with its content
+    /// intact" in exchange for "rendered as a bullet under that heading".
     #[test]
     fn the_sort_tie_order_divergence_is_recorded_in_the_committed_ledger() {
         let ledger_path =
             crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
         let ledger = std::fs::read_to_string(&ledger_path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", ledger_path.display()));
-        let entry = ledger_entry(&ledger, "sort-tie-order").text;
 
-        // Entry-scoped: the artifacts this entry governs.
+        // The entry exists, once. `### `<id>`` is the heading form
+        // `logqltest_provenance.rs::ledger_ids` resolves a
+        // `divergence(...)` marker against.
+        assert_eq!(
+            ledger.matches("### `sort-tie-order`").count(),
+            1,
+            "the ledger must carry exactly one `sort-tie-order` entry heading"
+        );
+
+        // The artifacts the entry governs.
         for needle in [
-            "sort-tie-order",
             "metric_sort_order",
             "metric_sort_desc_order",
             "value_ordered_sequences_agree",
@@ -3993,80 +3855,39 @@ mod tests {
             "timestamp-tie-order",
         ] {
             assert!(
-                entry.contains(needle),
-                "the `sort-tie-order` ledger entry is missing {needle:?}:\n{entry}"
+                ledger.contains(needle),
+                "the ledger does not name {needle:?}"
             );
         }
 
-        // Bullet-scoped: the exclusion the AC exists for. Asserting the
-        // lead-in gets the list marker and the bold title; asserting the
-        // needles inside the bullet's span gets its content.
-        let bullet = ledger_bullet(&entry, NOT_COVERED_LEAD_IN);
-        for needle in ["topk", "bottomk", "approx_topk", "composed", "#406"] {
-            assert!(
-                bullet.contains(needle),
-                "the entry's `Not covered` bullet is missing {needle:?}:\n{bullet}"
-            );
-        }
-    }
-
-    /// The premises the two scopings rest on, as a check rather than as
-    /// prose — so a future reader who sees a simpler form and "simplifies"
-    /// to it is told why it was not simpler.
-    ///
-    /// Measured on the committed ledger with
-    /// `grep -o '<needle>' docs/benchmarks/logs-differential-ledger.md | wc -l`
-    /// (occurrences, not matching LINES — `grep -c` counts lines and gave
-    /// a figure three too low in an earlier report of this same number):
-    /// `topk` 22 total, 3 inside the entry, 19 outside; `composed` and
-    /// `Not covered` 1 each, all inside.
-    #[test]
-    fn the_ledger_entry_scope_is_what_makes_the_not_covered_needles_bite() {
-        let ledger_path =
-            crate::engine::workspace_root().join("docs/benchmarks/logs-differential-ledger.md");
-        let ledger = std::fs::read_to_string(&ledger_path)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", ledger_path.display()));
-        let LedgerEntry { text, outside } = ledger_entry(&ledger, "sort-tie-order");
-
-        // Why the ENTRY scope is load-bearing: `topk` is satisfied by
-        // unrelated entries, so a document-wide `contains` cannot fail on
-        // it. `composed` and `Not covered` are entry-local today.
-        assert!(
-            outside.contains("topk"),
-            "`topk` no longer occurs outside the entry, so this test's premise has changed"
-        );
-        assert!(
-            !outside.contains("composed"),
-            "`composed` now occurs outside the entry, so it is no longer an entry-local needle"
-        );
-
-        // Why the BULLET scope is load-bearing on top of that: the entry
-        // holds bullets besides this one, so "somewhere in the entry" is
-        // still weaker than "in this bullet".
-        let bullet = ledger_bullet(&text, NOT_COVERED_LEAD_IN);
-        assert!(
-            text.len() > bullet.len(),
-            "the entry is exactly its `Not covered` bullet, so bullet scope adds nothing"
-        );
-        assert!(
-            text.replace(&bullet, "").contains("- **"),
-            "the entry has no other top-level bullet, so bullet scope adds nothing"
-        );
-
-        // The extraction is a strict slice: it starts at its own heading,
-        // swallows neither neighbour, and partitions the document.
-        assert!(text.starts_with("### `sort-tie-order`"));
-        assert!(!text.contains("### `logs-timestamp-i64-nanosecond-domain`"));
-        assert!(!text.contains("### `timestamp-tie-order`"));
-        // `split('\n')` rather than `lines()`: both halves were joined
-        // from `lines()`, so a half whose last element is the blank line
-        // before the next heading would lose it to `lines()` and the
-        // partition would look off by one when it is not.
+        // The exclusion, pinned by a UNIQUE marker.
+        let hits: Vec<&str> = ledger
+            .lines()
+            .filter(|l| l.contains(NOT_COVERED_MARKER))
+            .collect();
         assert_eq!(
-            text.split('\n').count() + outside.split('\n').count(),
-            ledger.lines().count(),
-            "the entry and its complement must partition the ledger's lines"
+            hits.len(),
+            1,
+            "{NOT_COVERED_MARKER:?} must occur exactly once in the ledger, found {}",
+            hits.len()
         );
+
+        // Everything the exclusion has to say, on the marker's own line,
+        // so no part of it can drift away from the marker.
+        let line = hits[0];
+        for needle in [
+            "Not covered — a composed (non-terminal) sort",
+            "topk",
+            "bottomk",
+            "approx_topk",
+            "composed",
+            "#406",
+        ] {
+            assert!(
+                line.contains(needle),
+                "the `{NOT_COVERED_MARKER}` line is missing {needle:?}:\n{line}"
+            );
+        }
     }
 
     /// AC15: the fixture prose no longer promises a reference tie order.
