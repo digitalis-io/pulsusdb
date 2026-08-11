@@ -2284,6 +2284,8 @@ mod tests {
             ("labels.rs", include_str!("labels.rs")),
             // Issue #247: the `| logfmt <id>="<expr>"` sub-grammar.
             ("logfmt_expr.rs", include_str!("logfmt_expr.rs")),
+            // Issue #406: the instant-vector wire-order predicate.
+            ("order.rs", include_str!("order.rs")),
             ("post_agg.rs", include_str!("post_agg.rs")),
             ("variants.rs", include_str!("variants.rs")),
             ("walkbound.rs", include_str!("walkbound.rs")),

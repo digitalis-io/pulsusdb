@@ -3913,6 +3913,153 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Issue #406 R2 — the fix's PREMISE, pinned where it lives.
+    //
+    // `logs_api`'s encoder skips its label re-sort when
+    // `logql::order::sorted_order_reaches_the_wire` says the order came
+    // from a `sort`/`sort_desc`. That is only sound because the wrappers
+    // it classifies as order-preserving really do return their input
+    // sequence. Nothing else in this file asserts that, and the six
+    // measured queries would go back to label order — silently, and
+    // without any test failing — if one of them started reordering.
+    // -----------------------------------------------------------------
+
+    /// The `svc` label of each sample, in RECEIVED order.
+    fn svc_sequence(items: &[VectorSample]) -> Vec<String> {
+        items
+            .iter()
+            .map(|s| {
+                s.labels
+                    .iter()
+                    .find(|(k, _)| k == "svc")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// A vector in a deliberately NON-label order, so "preserved" and
+    /// "re-sorted by label" are different answers.
+    fn unsorted_vector(rows: &[(&str, f64)]) -> QueryResult {
+        QueryResult::Vector(
+            rows.iter()
+                .map(|(svc, value)| VectorSample {
+                    labels: vec![("svc".to_string(), (*svc).to_string())],
+                    value: *value,
+                })
+                .collect(),
+        )
+    }
+
+    fn as_vector(result: QueryResult) -> Vec<VectorSample> {
+        match result {
+            QueryResult::Vector(items) => items,
+            other => panic!("expected a vector, got {other:?}"),
+        }
+    }
+
+    fn on_svc(group: Option<MatchGroup>) -> VectorMatching {
+        VectorMatching {
+            on: true,
+            labels: vec!["svc".to_string()],
+            group,
+        }
+    }
+
+    /// AC 5: every wrapper `order.rs` classifies as order-preserving
+    /// returns its many-side input sequence. The input is `b, a, c` —
+    /// what `sort` produces over values `1, 2, 3` — and label order would
+    /// be `a, b, c`, so a re-sort anywhere inside these functions is
+    /// visible.
+    #[test]
+    fn the_order_preserving_wrappers_return_their_input_order() {
+        const SORTED: [(&str, f64); 3] = [("b", 1.0), ("a", 2.0), ("c", 3.0)];
+        let want = vec!["b".to_string(), "a".to_string(), "c".to_string()];
+
+        // `label_replace` — rewrites labels in place over `items`.
+        let spec = lr_spec("tag", "$1", "svc", "(.*)");
+        let relabeled = lr_apply_vector(unsorted_vector(&SORTED), &spec);
+        assert_eq!(svc_sequence(&relabeled), want, "label_replace reordered");
+
+        // scalar ⊗ vector, both orientations — `map_samples` is a
+        // `filter_map` over `into_iter`.
+        for (lhs, rhs) in [
+            (QueryResult::Scalar(1.0), unsorted_vector(&SORTED)),
+            (unsorted_vector(&SORTED), QueryResult::Scalar(1.0)),
+        ] {
+            let out =
+                as_vector(combine_binary(BinOp::Mul, false, None, lhs, rhs).expect("combine"));
+            assert_eq!(svc_sequence(&out), want, "a scalar operand reordered");
+        }
+
+        // vector ⊗ vector, one-to-one — `instant_join` hashes the ONE
+        // side (rhs) and ranges the MANY side (lhs) in order.
+        let one_to_one = as_vector(
+            combine_binary(
+                BinOp::Add,
+                false,
+                Some(&on_svc(None)),
+                unsorted_vector(&SORTED),
+                unsorted_vector(&[("a", 0.0), ("b", 0.0), ("c", 0.0)]),
+            )
+            .expect("combine"),
+        );
+        assert_eq!(
+            svc_sequence(&one_to_one),
+            want,
+            "a one-to-one vector join did not keep its LHS order"
+        );
+
+        // `group_right` swaps the roles: the RHS becomes the many side,
+        // so the RHS sequence is the one that survives. Getting this
+        // backwards is invisible in every other shape here.
+        let grouped = as_vector(
+            combine_binary(
+                BinOp::Add,
+                false,
+                Some(&on_svc(Some(MatchGroup::Right(Vec::new())))),
+                unsorted_vector(&[("a", 0.0), ("b", 0.0), ("c", 0.0)]),
+                unsorted_vector(&SORTED),
+            )
+            .expect("combine"),
+        );
+        assert_eq!(
+            svc_sequence(&grouped),
+            want,
+            "`group_right` did not keep its RHS (many-side) order"
+        );
+
+        // The set operations: `and`/`unless` filter the LHS in place,
+        // `or` appends the LHS then the RHS-only entries.
+        let anded = as_vector(
+            combine_binary(
+                BinOp::And,
+                false,
+                Some(&on_svc(None)),
+                unsorted_vector(&SORTED),
+                unsorted_vector(&[("a", 0.0), ("b", 0.0), ("c", 0.0)]),
+            )
+            .expect("combine"),
+        );
+        assert_eq!(svc_sequence(&anded), want, "`and` reordered its LHS");
+        let ored = as_vector(
+            combine_binary(
+                BinOp::Or,
+                false,
+                Some(&on_svc(None)),
+                unsorted_vector(&[("c", 3.0)]),
+                unsorted_vector(&[("b", 1.0), ("a", 2.0)]),
+            )
+            .expect("combine"),
+        );
+        assert_eq!(
+            svc_sequence(&ored),
+            vec!["c".to_string(), "b".to_string(), "a".to_string()],
+            "`or` did not append the RHS-only entries after the whole LHS"
+        );
+    }
+
     /// The new pair lands at its SORTED position (the metric-path label
     /// invariant), and an existing `dst` is deleted before the re-set.
     #[test]

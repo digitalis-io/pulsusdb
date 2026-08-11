@@ -356,6 +356,18 @@
         "range.count_over_time",
         "parser.logfmt"
       ]
+    },
+    {
+      "source": "metric_sort_wrapped_order",
+      "kind": "e2e-differential",
+      "constructs": [
+        "func.label_replace",
+        "agg.sort",
+        "agg.sum",
+        "grouping.by",
+        "range.count_over_time",
+        "parser.logfmt"
+      ]
     }
   ]
 }
