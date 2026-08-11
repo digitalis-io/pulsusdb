@@ -3189,6 +3189,8 @@ mod tests {
 
     use super::*;
 
+    use pulsus_logql::{CompareOp, LabelFilterExpr};
+
     fn selector(src: &str) -> StreamSelector {
         parse_selector(src).expect("parse selector")
     }
@@ -5508,5 +5510,272 @@ mod tests {
         );
         // M4: the injected grouping list sorts without a scratch buffer.
         assert!(!compact.contains("labels.sort()"), "sort_unstable only");
+    }
+    // -----------------------------------------------------------------
+    // Issue #249 — a filter on a structured-metadata label is evaluated
+    // CLIENT-side, in the compiled pipeline, over the merged label set.
+    // It never becomes a SQL predicate, and `structured_metadata` never
+    // appears in `WHERE`, `PREWHERE`, `ORDER BY` or any skip index.
+    // -----------------------------------------------------------------
+
+    /// The COMPLETE `LabelFilterExpr` enumeration, as an id per form.
+    ///
+    /// Every match here is EXHAUSTIVE with no `_` arm, over
+    /// `LabelFilterExpr`, `MatchOp` and `CompareOp` alike — so adding a
+    /// label-filter form to the AST fails to COMPILE here, and the swept
+    /// enumeration cannot silently fall behind it.
+    fn label_filter_form_id(e: &LabelFilterExpr) -> &'static str {
+        match e {
+            LabelFilterExpr::Match(m) => match m.op {
+                MatchOp::Eq => "match-eq",
+                MatchOp::Neq => "match-neq",
+                MatchOp::Re => "match-re",
+                MatchOp::Nre => "match-nre",
+            },
+            LabelFilterExpr::Compare { op, .. } => match op {
+                CompareOp::Eq => "cmp-eq",
+                CompareOp::Neq => "cmp-neq",
+                CompareOp::Gt => "cmp-gt",
+                CompareOp::Gte => "cmp-gte",
+                CompareOp::Lt => "cmp-lt",
+                CompareOp::Lte => "cmp-lte",
+            },
+            LabelFilterExpr::Ip { negated, .. } => {
+                if *negated {
+                    "ip-neq"
+                } else {
+                    "ip-eq"
+                }
+            }
+            LabelFilterExpr::And(..) => "and",
+            LabelFilterExpr::Or(..) => "or",
+        }
+    }
+
+    /// Every form id `label_filter_form_id` can return. Written out rather
+    /// than derived, so the sweep below can assert it covered ALL of them —
+    /// the enumeration and the coverage claim are two separate statements
+    /// and a missed form fails the second.
+    const ALL_LABEL_FILTER_FORMS: [&str; 14] = [
+        "match-eq",
+        "match-neq",
+        "match-re",
+        "match-nre",
+        "cmp-eq",
+        "cmp-neq",
+        "cmp-gt",
+        "cmp-gte",
+        "cmp-lt",
+        "cmp-lte",
+        "ip-eq",
+        "ip-neq",
+        "and",
+        "or",
+    ];
+
+    /// The `Stage::LabelFilter` expressions a pipeline holds.
+    fn label_filters(pipeline: &[Stage]) -> Vec<&LabelFilterExpr> {
+        pipeline
+            .iter()
+            .filter_map(|st| match st {
+                Stage::LabelFilter(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The range read the engine would issue for this plan, rendered
+    /// through the same builder `client_metric_read_sql` calls.
+    fn range_read_sql(mp: &MetricPlan) -> String {
+        super::super::sql::metric_raw_samples_sliding(
+            &mp.table,
+            &["'checkout'".to_string()],
+            &[1, 2],
+            super::super::sql::TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            mp.scan_lower,
+            &mp.extra_predicates,
+            super::super::sql::ScanProjection::WithStructuredMetadata,
+        )
+    }
+
+    fn range_spec_for_filters() -> QuerySpec {
+        QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 600_000_000_000,
+            step_ns: 60_000_000_000,
+        }
+    }
+
+    /// Issue #249 AC-15 — **no label-filter operator ever renders SQL**,
+    /// over the WHOLE enumeration, with a positive control.
+    ///
+    /// The assertion is BYTE-EQUALITY of the rendered range SQL against the
+    /// same query with the label filter removed — not a substring scan,
+    /// which over `=~"a.*"` would be noise-prone. The `|= "tok"` control is
+    /// what stops the negative assertion passing vacuously: a renderer that
+    /// produced nothing at all would satisfy every negative here, and fails
+    /// the control.
+    ///
+    /// Swept at RANGE, where `is_range` forces `client = Some(..)` so both
+    /// arms genuinely render a raw scan. The instant leg is
+    /// `an_instant_metadata_filter_can_never_reach_the_pushdown_path`.
+    #[test]
+    fn no_label_filter_operator_ever_renders_sql() {
+        // The baseline: the same query with NO label filter.
+        let baseline = metric_mp(
+            r#"count_over_time({service_name="sm"}[5m])"#,
+            range_spec_for_filters(),
+        )
+        .expect("plans");
+        assert!(
+            baseline.client.is_some(),
+            "a range aggregation is client-side"
+        );
+        let baseline_sql = range_read_sql(&baseline);
+
+        // All 14 forms. `n` is the numeric structured-metadata label the
+        // b25 fixture carries; `trace` the string one.
+        let queries = [
+            r#"count_over_time({service_name="sm"} | trace="a" [5m])"#,
+            r#"count_over_time({service_name="sm"} | trace!="a" [5m])"#,
+            r#"count_over_time({service_name="sm"} | trace=~"a.*" [5m])"#,
+            r#"count_over_time({service_name="sm"} | trace!~"a.*" [5m])"#,
+            r#"count_over_time({service_name="sm"} | n == 15 [5m])"#,
+            r#"count_over_time({service_name="sm"} | n != 15 [5m])"#,
+            r#"count_over_time({service_name="sm"} | n > 15 [5m])"#,
+            r#"count_over_time({service_name="sm"} | n >= 15 [5m])"#,
+            r#"count_over_time({service_name="sm"} | n < 15 [5m])"#,
+            r#"count_over_time({service_name="sm"} | n <= 15 [5m])"#,
+            r#"count_over_time({service_name="sm"} | trace = ip("10.0.0.1") [5m])"#,
+            r#"count_over_time({service_name="sm"} | trace != ip("10.0.0.1") [5m])"#,
+            r#"count_over_time({service_name="sm"} | trace="a" and n > 15 [5m])"#,
+            r#"count_over_time({service_name="sm"} | trace="a" or n > 15 [5m])"#,
+        ];
+
+        let mut swept: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+        for q in queries {
+            let mp = metric_mp(q, range_spec_for_filters()).unwrap_or_else(|e| {
+                panic!("{q} must plan, got {e:?}");
+            });
+            let client = mp
+                .client
+                .as_ref()
+                .unwrap_or_else(|| panic!("{q}: a label filter forces the client path"));
+            let filters = label_filters(&client.pipeline);
+            assert_eq!(filters.len(), 1, "{q}: exactly one label filter");
+            for f in &filters {
+                swept.insert(label_filter_form_id(f));
+            }
+            // (i) the line-filter compiler produces nothing for it...
+            assert!(
+                compile_line_filters(&client.pipeline)
+                    .expect("compiles")
+                    .is_empty(),
+                "{q}: a label filter must compile to NO pushed predicate"
+            );
+            // (ii) ...and the plan carries no extra predicate...
+            assert!(
+                mp.extra_predicates.is_empty(),
+                "{q}: a label filter must add no SQL predicate, got {:?}",
+                mp.extra_predicates
+            );
+            // (iii) ...so the rendered SQL is byte-identical to the
+            // baseline's. This is the whole claim, and it covers `WHERE`,
+            // `PREWHERE`, `ORDER BY` and the projection at once.
+            assert_eq!(
+                range_read_sql(&mp),
+                baseline_sql,
+                "{q}: the rendered scan must be BYTE-IDENTICAL to the same query \
+                 without the label filter"
+            );
+        }
+
+        // (iv) the sweep covered the whole enumeration.
+        let want: std::collections::BTreeSet<&'static str> =
+            ALL_LABEL_FILTER_FORMS.into_iter().collect();
+        assert_eq!(
+            swept, want,
+            "the sweep must cover every `label_filter_form_id` arm"
+        );
+
+        // The POSITIVE CONTROL. A line filter DOES render, so "nothing
+        // renders at all" cannot be why the assertions above passed.
+        let control = metric_mp(
+            r#"count_over_time({service_name="sm"} |= "tok" [5m])"#,
+            range_spec_for_filters(),
+        )
+        .expect("plans");
+        let control_sql = range_read_sql(&control);
+        assert_ne!(
+            control_sql, baseline_sql,
+            "the control must NOT be byte-identical to the baseline"
+        );
+        assert!(
+            control_sql.contains("hasToken"),
+            "the control must render its own pushed predicate: {control_sql}"
+        );
+        // ...and `structured_metadata` appears ONLY in the SELECT list,
+        // in every one of these renderings.
+        for sql in [&baseline_sql, &control_sql] {
+            assert_eq!(
+                sql.matches("structured_metadata").count(),
+                1,
+                "`structured_metadata` is a projected column and nothing else: {sql}"
+            );
+            let (select, rest) = sql.split_once("\nFROM ").expect("a SELECT list");
+            assert!(
+                select.contains("structured_metadata"),
+                "the ONE occurrence must be in the SELECT list: {sql}"
+            );
+            assert!(
+                !rest.contains("structured_metadata"),
+                "and nowhere below it: {sql}"
+            );
+        }
+    }
+
+    /// Issue #249 AC-17 — the routing consequence, pinned. An instant query
+    /// carrying a structured-metadata label filter plans `client.is_some()`,
+    /// so it can never reach the SQL-pushdown consumer at all.
+    #[test]
+    fn an_instant_metadata_filter_can_never_reach_the_pushdown_path() {
+        let mp = metric_mp(
+            r#"count_over_time({service_name="sm"} | trace="a" [5m])"#,
+            QuerySpec::Instant {
+                at_ns: 600_000_000_000,
+            },
+        )
+        .expect("plans");
+        assert!(
+            mp.client.is_some(),
+            "a label filter makes `metric_pipeline_construct` report a beyond-line-filter \
+             construct, which forces the client path"
+        );
+        // The reason is the CLIENT one, not "raw: instant query": the
+        // `client.is_some()` arm is tested BEFORE the `match p.spec`
+        // (`metric_plan`'s routing decision), so a client-forced instant
+        // query reports why it is client-side rather than merely that it
+        // is instant. Asserted as measured.
+        assert_eq!(
+            mp.routing.reason,
+            "raw: client-side pipeline/unwrap aggregation"
+        );
+        // The negative control: WITHOUT the filter, the same instant query
+        // does reach the pushdown path — so `client.is_some()` above is a
+        // consequence of the filter, not of the query shape.
+        let bare = metric_mp(
+            r#"count_over_time({service_name="sm"}[5m])"#,
+            QuerySpec::Instant {
+                at_ns: 600_000_000_000,
+            },
+        )
+        .expect("plans");
+        assert!(
+            bare.client.is_none(),
+            "the same query without the filter IS the pushdown shape"
+        );
     }
 }

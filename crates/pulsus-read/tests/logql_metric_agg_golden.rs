@@ -104,6 +104,9 @@ fn row(fp: u64, ts_ns: i64, body: &str) -> MetricScanRow {
         fingerprint: fp,
         timestamp_ns: ts_ns,
         body: body.to_string(),
+        // Issue #249 added the column; every fixture in THIS file is
+        // metadata-free, so no expected value in it moves.
+        structured_metadata: String::new(),
     }
 }
 
@@ -2848,6 +2851,7 @@ fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
         },
         mp.scan_lower,
         &mp.extra_predicates,
+        pulsus_read::logql::sql::ScanProjection::WithStructuredMetadata,
     );
     assert!(
         sql.contains(&format!(

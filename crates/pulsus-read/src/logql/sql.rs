@@ -627,6 +627,25 @@ pub fn metric_range(
 /// ([`super::params::QuerySpec::Instant`]'s structural contract: no
 /// `intDiv` expression, no `step` column). See [`metric_range`]'s doc
 /// comment for the `services`/`PREWHERE` contract (fix-plan amendment §3).
+///
+/// **Grouped by `(fingerprint, structured_metadata)`** under
+/// [`ScanProjection::WithStructuredMetadata`] (issue #249): the metric path
+/// merges structured metadata into the label set, so one fingerprint covers
+/// N output series, and the client re-groups the returned rows by the merged
+/// final label set. That re-grouping is EXACT rather than approximate
+/// because every op that can reach this pushdown path is a linear sum
+/// (`count()` / `sum(length(body))`), so summing the server's per-metadata
+/// partial counts reproduces the client path's single accumulator bit for
+/// bit.
+///
+/// [`ScanProjection::Lean`] exists here for the ROLLUP source
+/// (`log_metrics_<res>`), which has no `structured_metadata` column at all.
+/// That arm is structurally unreachable for a LogQL instant plan — a
+/// `RouteChoice::Rollup` decision requires `QuerySpec::Range` (`plan.rs`'s
+/// `match p.spec` on the routing decision), so an instant query is always
+/// `Raw` over `log_samples`. The parameter exists so the builder CANNOT
+/// render a column the named table lacks, rather than resting on that
+/// reachability argument holding forever.
 pub fn metric_instant(
     source: MetricSource<'_>,
     services: &[String],
@@ -634,6 +653,7 @@ pub fn metric_instant(
     window: TimeWindow,
     lower: ScanLowerBound,
     extra_predicates: &[String],
+    projection: ScanProjection,
 ) -> String {
     let MetricSource {
         table,
@@ -644,15 +664,47 @@ pub fn metric_instant(
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
     let prewhere = metric_prewhere(services);
+    let sm = projection.column_suffix();
     let mut sql = format!(
-        "SELECT fingerprint, {agg_expr} AS n\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list}) AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+        "SELECT fingerprint, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list}) AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str(" AND ");
         sql.push_str(clause);
     }
-    sql.push_str("\nGROUP BY fingerprint");
+    sql.push_str(match projection {
+        ScanProjection::Lean => "\nGROUP BY fingerprint",
+        ScanProjection::WithStructuredMetadata => "\nGROUP BY fingerprint, structured_metadata",
+    });
     sql
+}
+
+/// Whether a raw metric scan projects `structured_metadata` (issue #249).
+///
+/// The metric path merges structured metadata into the label set, so it must
+/// normally be read. [`ScanProjection::Lean`] has exactly ONE caller —
+/// `absent_over_time` — and its exemption is proved rather than assumed:
+/// `pkg/logql/syntax/extractor.go:46-47 @ v3.7.4` forces `noLabels = true`
+/// for `OpRangeTypeAbsent`, and `pkg/logql/log/labels.go:667-668` then
+/// returns `EmptyLabelsResult`, so the reducer's label set cannot depend on
+/// metadata at all. Reading the column for it would be a permanent cost on
+/// an unbounded scan with no observable effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanProjection {
+    /// `absent_over_time` only — no `structured_metadata` column.
+    Lean,
+    /// Every other metric reducer.
+    WithStructuredMetadata,
+}
+
+impl ScanProjection {
+    /// The `SELECT` list's trailing column, or nothing.
+    fn column_suffix(self) -> &'static str {
+        match self {
+            ScanProjection::Lean => "",
+            ScanProjection::WithStructuredMetadata => ", structured_metadata",
+        }
+    }
 }
 
 /// The client-aggregated metric fetch (issue M6-10): a stage-3-shaped raw
@@ -682,6 +734,20 @@ pub fn metric_instant(
 /// claimed the first/last reducers were "additionally order-independent
 /// via their own value tie-break"; that tie-break was deleted as a wrong
 /// value — see `SimpleAcc::add`.)
+///
+/// **`structured_metadata` is in the `SELECT` list and NOWHERE else** (issue
+/// #249). It never appears in `WHERE`, `PREWHERE`, `ORDER BY` or any skip
+/// index: a filter on a metadata label is evaluated CLIENT-side, in the
+/// compiled pipeline, over the merged label set. That is the reference's
+/// shape too — a metadata filter is a pipeline stage run per entry, after
+/// `builder.Add(StructuredMetadataLabel, …)` at
+/// `pkg/logql/log/metrics_extraction.go:104 @ v3.7.4`, and
+/// `grep -n StructuredMetadata pkg/logql/syntax/*.go` at `b318f28` returns
+/// no filter, matcher or pushdown site at all. Pushing it would also be
+/// useless AND wrong: the column is an opaque canonical-JSON `String` with
+/// `DEFAULT ''` and no index (`pulsus-schema/src/catalog.rs`), so a
+/// JSON-extract predicate could prune no granule, and the merge renames a
+/// colliding key to `<k>_extracted` before any filter sees it.
 pub fn metric_raw_samples(
     samples_table: &str,
     services: &[String],
@@ -689,13 +755,15 @@ pub fn metric_raw_samples(
     window: TimeWindow,
     lower: ScanLowerBound,
     extra_predicates: &[String],
+    projection: ScanProjection,
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
+    let sm = projection.column_suffix();
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body{sm}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -718,6 +786,16 @@ pub fn metric_raw_samples(
 /// deliberately **no global `ORDER BY timestamp_ns`** (a scan-sized sort;
 /// the canonical `(ts, stream_hash, tie_rank)` fold order is imposed in
 /// Rust over the bounded retained window).
+///
+/// **And deliberately no `structured_metadata` in `ORDER BY`** (issue #249).
+/// It is a projected column only — see [`metric_raw_samples`]'s note for why
+/// it is never a predicate either. Adding it to the sort key would make
+/// `(service, fingerprint, structured_metadata, timestamp_ns)` a
+/// NON-primary-key order and force a scan-sized server-side sort, destroying
+/// `optimize_read_in_order`. The design does not need it: the fan-out
+/// `MutCells` representation is order-independent by construction, and rows
+/// within one metadata variant still arrive timestamp-ascending because the
+/// existing key order already delivers them that way.
 pub fn metric_raw_samples_sliding(
     samples_table: &str,
     services: &[String],
@@ -725,13 +803,15 @@ pub fn metric_raw_samples_sliding(
     window: TimeWindow,
     lower: ScanLowerBound,
     extra_predicates: &[String],
+    projection: ScanProjection,
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
+    let sm = projection.column_suffix();
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body{sm}\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
@@ -1285,6 +1365,7 @@ mod tests {
             },
             ScanLowerBound::Exclusive,
             &[],
+            ScanProjection::WithStructuredMetadata,
         );
         assert!(sql.contains("PREWHERE service = 'checkout'\n"));
         assert!(!sql.contains("intDiv"));
@@ -1314,6 +1395,7 @@ mod tests {
             window,
             ScanLowerBound::Inclusive,
             &[],
+            ScanProjection::WithStructuredMetadata,
         );
         assert!(
             sliding.contains(
@@ -1328,6 +1410,7 @@ mod tests {
             window,
             ScanLowerBound::Inclusive,
             &[],
+            ScanProjection::WithStructuredMetadata,
         );
         assert!(
             instant_raw.contains("timestamp_ns >= -9223372036854775808"),
@@ -1340,6 +1423,7 @@ mod tests {
             window,
             ScanLowerBound::Inclusive,
             &[],
+            ScanProjection::WithStructuredMetadata,
         );
         assert!(
             instant_agg.contains("timestamp_ns >= -9223372036854775808"),
@@ -1378,6 +1462,7 @@ mod tests {
             window,
             ScanLowerBound::Exclusive,
             &[],
+            ScanProjection::WithStructuredMetadata,
         );
         assert!(
             sliding.contains("timestamp_ns > -9223372036854775808 AND"),

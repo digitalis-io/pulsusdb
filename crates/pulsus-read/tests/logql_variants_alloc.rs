@@ -121,7 +121,7 @@
 //! | F-a | MetricAggState::push_rows kind dispatch | MetricAggState::push_rows | exec.rs MetricAggState::push_rows | NIL | Phi1/Phi4 |
 //! | F-b | ClientAggState::push_rows prologue (Vec::new scratch) | ClientAggState::push_rows, ClientAggState::push_rows_inner | exec.rs ClientAggState::push_rows | NIL | Phi4-Phi7 |
 //! | F-c | RangeSlideState::push_rows prologue/epilogue (mem::take) | RangeSlideState::push_rows | exec.rs RangeSlideState::push_rows | NIL | Phi1-Phi3 |
-//! | F-d | the row loops and everything reachable only from them | ClientAggState::push_rows, ClientAggState::push_rows_inner, ClientAggState::stage, ClientAggState::stage_bytes, ClientAggState::flush_pending, RangeSlideState::push_rows, RangeSlideState::flush_collision, FpSlide::finish | exec.rs row paths | NOT-EXEC | rows.is_empty(); the existing CLIENT_AGG_FLAT_BUDGET per-row gate |
+//! | F-d | the row loops and everything reachable only from them | ClientAggState::push_rows, ClientAggState::push_rows_inner, ClientAggState::push_one_row, RangeSlideState::push_one_row, ClientAggState::stage, ClientAggState::stage_bytes, ClientAggState::flush_pending, RangeSlideState::push_rows, RangeSlideState::flush_collision, FpSlide::finish | exec.rs row paths | NOT-EXEC | rows.is_empty(); the existing CLIENT_AGG_FLAT_BUDGET per-row gate |
 //! | F-e | MetricAggState::finish kind dispatch (Box move) | MetricAggState::finish | exec.rs MetricAggState::finish | NIL | Phi1/Phi4 |
 //! | F-f | ClientAggState::finish absent vs non-absent | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 vs Phi4/Phi5 |
 //! | F-g | absent: the finish-time absent_labels clone (1 + 2k) | ClientAggState::finish, ClientAggState::finish_folded | exec.rs ClientAggState::finish | BAND | Phi6/Phi7 (k = 2 gives 5) |
@@ -1143,6 +1143,7 @@ fn variants_allocation_gates() {
                     fingerprint: 1 + (i % 2),
                     timestamp_ns: (i as i64 % 50) * NS,
                     body: fat.clone(),
+                    structured_metadata: String::new(),
                 })
                 .collect();
             if shuffled {
@@ -1464,60 +1465,50 @@ fn parse_source(name: &str) -> syn::File {
     syn::parse_file(src).expect("the frame source parses")
 }
 
+/// Regenerates the pinned censuses — the ONLY sanctioned source for a
+/// number in [`PER_VARIANT_FRAMES`].
+///
+/// ```text
+/// cargo test -p pulsus-read --test logql_variants_alloc \
+///     -- --ignored zz_print_frame_censuses --nocapture
+/// ```
+///
+/// **It iterates [`PER_VARIANT_FRAMES`] itself** (issue #249 cost work).
+/// It used to carry a hand-copied parallel list of its own, which had
+/// drifted into unusability: 27 entries against the roster's 34, still
+/// naming `exec.rs` — a file the frame bodies moved out of and which
+/// [`parse_source`] no longer knows — so the generator printed the four
+/// `plan.rs` frames and then panicked with `unknown frame file exec.rs`.
+/// For as long as that stood, "regenerate, never hand-write" was
+/// un-executable and every re-pin was necessarily hand-written, which is
+/// how a real regression gets absorbed into a constant. Reading the roster
+/// makes the two unable to diverge again.
+///
+/// Emits one `FRAME <file> <key> <branches> <n_callees> :: <callees>` line
+/// per frame, in roster order. A pin's comment quotes its own line
+/// verbatim beside the command above.
 #[test]
 #[ignore = "generator: prints the frame censuses to pin"]
 fn zz_print_frame_censuses() {
-    let frames: [(&str, Option<&str>, &str); 27] = [
-        ("plan.rs", None, "build_variants_node"),
-        ("plan.rs", None, "unwrap_vector_aggs_into"),
-        ("plan.rs", None, "parse_vector_agg_params"),
-        ("plan.rs", None, "parse_plan_number"),
-        ("exec.rs", Some("VariantArena"), "build"),
-        ("exec.rs", Some("VariantsAggState"), "new"),
-        ("exec.rs", None, "variant_pipeline_entry_bytes"),
-        ("exec.rs", None, "stage_source_bytes"),
-        ("exec.rs", None, "regex_stage_count"),
-        ("exec.rs", None, "variant_state_bytes"),
-        ("exec.rs", Some("ClientAggState"), "new"),
-        ("exec.rs", Some("RangeSlideState"), "new"),
-        ("exec.rs", Some("VariantsAggState"), "push_rows"),
-        ("exec.rs", Some("VariantsAggState"), "finish"),
-        ("exec.rs", Some("VariantsAggState"), "finish_in_place"),
-        ("exec.rs", None, "append_variant_label"),
-        ("exec.rs", Some("MetricAggState"), "push_rows"),
-        ("exec.rs", Some("MetricAggState"), "finish"),
-        ("exec.rs", Some("ClientAggState"), "push_rows"),
-        ("exec.rs", Some("ClientAggState"), "finish"),
-        ("exec.rs", Some("RangeSlideState"), "push_rows"),
-        ("exec.rs", Some("RangeSlideState"), "finish"),
-        ("exec.rs", Some("RangeSlideState"), "finish_in_place"),
-        ("exec.rs", Some("RangeSlideState"), "drain_group"),
-        ("exec.rs", Some("RangeSlideState"), "finish_absent"),
-        ("exec.rs", Some("RangeSlideState"), "flush_collision"),
-        ("exec.rs", Some("FpSlide"), "finish"),
-    ];
-    for (file, ty, anchor) in frames {
-        let f = Frame {
-            file,
-            ty,
-            anchor,
-            branches: 0,
-            callees: &[],
-        };
-        let parsed = parse_source(file);
-        let src = &parsed;
-        let (br, callees) = census_of(src, &f);
+    for f in &PER_VARIANT_FRAMES {
+        let parsed = parse_source(f.file);
+        let (br, callees) = census_of(&parsed, f);
         let list: Vec<String> = callees.into_iter().collect();
         println!(
-            "FRAME {file} {} {br} {} :: {}",
-            frame_key(&f),
+            "FRAME {} {} {br} {} :: {}",
+            f.file,
+            frame_key(f),
             list.len(),
             list.join(" ")
         );
     }
 }
 
-/// The 27 per-variant frames (`W-MEM`): one entry per FUNCTION. The 12
+/// The per-variant frames (`W-MEM`): one entry per FUNCTION, and the
+/// roster [`zz_print_frame_censuses`] iterates — the array's own length is
+/// the count, asserted by `g4_frame_census_and_inventory_closure`, so no
+/// prose here can fall out of step with it (the header used to say "27"
+/// while the array held 34). The 12
 /// frames this issue creates are pinned from the implementation-commit
 /// census; the 14 pre-existing frames reproduce the plan's pinned
 /// censuses except where the plan itself edits the body (deviations
@@ -1525,7 +1516,7 @@ fn zz_print_frame_censuses() {
 /// (M1's `.clone` → `.cloned` plus `format_args!`) and
 /// `RangeSlideState::new` (the `vec![0; …]` macro body does not parse as
 /// an expression list, so the token fallback records `max?`).
-static PER_VARIANT_FRAMES: [Frame; 32] = [
+static PER_VARIANT_FRAMES: [Frame; 34] = [
     // --- W_plan (4) ---
     Frame {
         file: "plan.rs",
@@ -1919,19 +1910,42 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // test; neither allocates on either path, and the staging buffer
         // the flag governs starts EMPTY (`Vec::new()` allocates nothing)
         // and is charged against the collision caps when it fills.
+        //
+        // Issue #249: 2 branches — UNCHANGED — and one new callee,
+        // `slider_safe_fingerprints`. It decides ONCE per query which
+        // fingerprints may keep the per-fingerprint accumulator, which is
+        // what lets structured metadata make the final label set the
+        // output-series key without moving the metadata-free hot path.
+        // W-MEM disposition: **BAND, row C-e** — the same row that already
+        // prices the `base_labels`/`hashes` snapshot. The helper's own
+        // retained allocation is one `HashSet<u64>` of at most one entry
+        // per resolved fingerprint (8 bytes of key), i.e. strictly
+        // narrower than the `base_labels` entry C-e already charges for
+        // the same fingerprint, and it scales on the same axis
+        // (`meta.len()`) — so the row's slope covers it without a new
+        // coefficient. It allocates nothing per ROW.
+        // Issue #249 cost work: 2 branches — UNCHANGED — and no new callee;
+        // `slider_safe_fingerprints` is the #249 entry already pinned here.
+        // Listed among the eight touched anchors because this file is
+        // edited heavily by the optimisation and the pin is re-derived from
+        // the generator rather than assumed stable. W-MEM disposition:
+        // **unchanged** (BAND, row C-e).
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs ClientAggState::new 2 10 :: .insert .is_some .metric_mutates_labels Ok matches! new reducer_class series_labels slider_safe_fingerprints stream_hash
         branches: 2,
         callees: &[
             ".insert",
-            // Issue #344: the fan-out gate's grouping disjunct, NIL.
             ".is_some",
             ".metric_mutates_labels",
             "Ok",
-            // Issue #344 review round 1: the `needs_ts_order` gate, NIL.
             "matches!",
             "new",
             "reducer_class",
             "series_labels",
-            // Issue #344: the instant path's `hashes` map, BAND (C-e).
+            "slider_safe_fingerprints",
             "stream_hash",
         ],
     },
@@ -1950,15 +1964,32 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // allocate on neither path and add no per-variant band term (the
         // clause itself was cloned and charged at plan time, inside
         // `variant_spec_bytes`' range-grouping term). Inventory row C-e.
+        //
+        // Issue #249: 6 branches — UNCHANGED — and one new callee,
+        // `slider_safe_fingerprints`, the twin of the `ClientAggState::new`
+        // entry above and with the same disposition: **BAND, row C-e**. One
+        // `HashSet<u64>` sized at most one 8-byte key per resolved
+        // fingerprint, scaling on the `meta.len()` axis C-e already prices
+        // for `base_labels`/`hashes` and strictly narrower per entry than
+        // either; nothing per ROW.
+        // Issue #249 cost work: 6 branches — UNCHANGED — and no new callee.
+        // `fp_base_key` is initialised to `None`, a struct-literal field
+        // rather than a call or a branch. W-MEM disposition: **NIL** —
+        // `Option::None` allocates nothing, and the 32 bytes it adds to the
+        // state are computed by `variant_state_bytes` from
+        // `size_of::<RangeSlideState<'_>>()`, so that band self-adjusts.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs RangeSlideState::new 6 19 :: .as_deref .as_u64 .clone .get .insert .is_some .metric_mutates_labels Ok ensure_grid_resolution matches! max? new reducer_class retention_points_per_sample series_labels slider_safe_fingerprints stream_hash unreachable! vec!
         branches: 6,
         callees: &[
-            // Issue #344: the borrowed grouping, NIL.
             ".as_deref",
             ".as_u64",
             ".clone",
             ".get",
             ".insert",
-            // Issue #344: the fan-out gate's grouping disjunct, NIL.
             ".is_some",
             ".metric_mutates_labels",
             "Ok",
@@ -1969,6 +2000,7 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             "reducer_class",
             "retention_points_per_sample",
             "series_labels",
+            "slider_safe_fingerprints",
             "stream_hash",
             "unreachable!",
             "vec!",
@@ -2114,10 +2146,28 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // `zz_print_frame_censuses`. W-MEM disposition: rows F-i and
         // F-v classified exactly those two arms as UNREACH and are
         // deleted with them.
-        branches: 5,
+        //
+        // Issue #249: 5 -> 4 branches, and `.extend` joins the callee set.
+        // Routing is now per ROW, so a run can leave output in BOTH maps
+        // and the `if self.fan_out { … } else { … }` that picked ONE of
+        // them is deleted — that is the branch that left. Both maps are
+        // now drained unconditionally into one vector, `label_groups`
+        // through the existing `collect` and `fp_groups` through
+        // `.extend` (a second STATEMENT, because both drains discharge
+        // into the same `&mut group_bytes` and two closures cannot hold
+        // it at once). W-MEM disposition: **NIL** — the drains and their
+        // discharges are unchanged term for term; `.extend` reserves for
+        // an iterator whose elements this frame already allocated and
+        // charged, and on every non-mixed run one of the two drains is
+        // empty, which is every run a variants sub-state can produce
+        // (`VariantsAggState` builds one sub-state per extractor and each
+        // is wholly fan-out or wholly not).
+        branches: 4,
         callees: &[
             ".clone",
             ".collect",
+            // Issue #249: the second drain's append, NIL.
+            ".extend",
             ".filter_map",
             ".finish",
             ".get",
@@ -2137,6 +2187,20 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         file: "client_agg.rs",
         ty: Some("ClientAggState"),
         anchor: "push_rows_inner",
+        // Issue #249: 25 -> 26 branches, and two new callees, `row_route`
+        // + `.contains`. The state-level `if self.fan_out` that chose
+        // between `label_groups` and `fp_groups` becomes a per-ROW
+        // `if matches!(route, RowRoute::Labels)` — the `matches!` is the
+        // one added branch — fed by `row_route(…, self.slider_safe
+        // .contains(&row.fingerprint), &scratch, base)`. W-MEM
+        // disposition: **NIL** — `row_route` is a length test plus a
+        // zipped `&str` comparison over the label scratch and allocates
+        // nothing on either arm, and `HashSet::<u64>::contains` hashes a
+        // `Copy` key. Both run per row and both are allocation-free; the
+        // per-row allocations this frame makes are unchanged, and which
+        // map a row lands in was already priced by rows F-* of the
+        // inventory for both destinations.
+        //
         // Issue #344 review round 1: the former `push_rows` body, plus
         // the equal-timestamp staging route. 21 -> 22 branches (the
         // `needs_ts_order` arm) and two new callees: `.flush_pending`
@@ -2149,37 +2213,29 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // gone from it. The allocations are censused where they now
         // happen (BAND, `ClientAggState::stage`). Inventory rows
         // F-b/F-d.
-        branches: 25,
+        // Issue #249 cost work: 5 -> 6 branches, and `probe_slider_safe` joins the
+        // callee set. The added branch is the memo test
+        // (`row.fingerprint == memo_fp`), which replaces a per-row
+        // `HashSet` probe with a `u64` compare. W-MEM disposition: **NIL**
+        // — a `u64` equality and two stack locals, and the probe it guards
+        // allocated nothing either. The win is instructions, not bytes.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs ClientAggState::push_rows_inner 6 10 :: .get .is_empty .push_one_row Ok default merge_labels_with_structured_metadata new probe_slider_safe recycle_label_scratch take
+        branches: 6,
         callees: &[
-            ".add",
-            ".as_deref",
-            ".collect",
-            ".contains_key",
-            ".copied",
-            ".entry",
-            ".flush_pending",
             ".get",
-            ".get_mut",
-            ".insert",
-            ".into_mut",
-            ".iter",
-            ".key",
-            ".len",
-            ".map",
-            ".run_metric_into",
-            ".sort_unstable",
-            ".stage",
-            ".to_string",
-            ".unwrap_or",
-            "Err",
+            ".is_empty",
+            ".push_one_row",
             "Ok",
-            "QueryTooBroad",
-            "charge_group_bytes",
-            "check_surviving_error",
-            "group_entry_bytes",
-            "matches!",
+            "default",
+            "merge_labels_with_structured_metadata",
             "new",
-            "render_labels_json_sorted",
+            "probe_slider_safe",
+            "recycle_label_scratch",
+            "take",
         ],
     },
     Frame {
@@ -2203,6 +2259,16 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // named `TsCollisionGroup` 422 and leaves the buffer untouched.
         // The `Vec`'s capacity is returned to the state at flush, so the
         // steady state is one allocation per query. Inventory row F-d.
+        // Issue #249 cost work: 2 branches — UNCHANGED — and one callee LEAVES
+        // (`alloc_block_bytes`; the sizing sits wholly in `stage_bytes`).
+        // Re-derived from the generator rather than hand-edited. W-MEM
+        // disposition: **unchanged** — the staging funnel's
+        // size-then-check-then-allocate order and its caps are untouched.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs ClientAggState::stage 2 14 :: .collect .contains_key .iter .len .map .push .saturating_add .stage_bytes .to_string Err Ok QueryTooBroad Some render_labels_json_sorted
         branches: 2,
         callees: &[
             ".collect",
@@ -2298,21 +2364,40 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         file: "client_agg.rs",
         ty: Some("RangeSlideState"),
         anchor: "push_rows",
-        branches: 8,
+        // Issue #249: 8 branches — UNCHANGED — and two new callees.
+        // `row_route(self.fan_out, self.slider_safe.contains(&row
+        // .fingerprint), &scratch, base)` decides per ROW where the
+        // sample belongs and is computed HERE, before `stage_member`
+        // sorts the scratch in place (the comparison reads the
+        // pipeline's output order). It sits inside the existing `let`,
+        // so it adds no branch. W-MEM disposition: **NIL** for both —
+        // a length test plus a zipped `&str` compare, and a
+        // `HashSet<u64>` probe on a `Copy` key; neither allocates on
+        // either path, and this frame's per-row allocation stays zero.
+        // Issue #249 cost work: 6 -> 7 branches, and `probe_slider_safe` joins the
+        // callee set — the memo, exactly as in the instant twin above.
+        // W-MEM disposition: **NIL**, same reasoning.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs RangeSlideState::push_rows 7 12 :: .flush_collision .get .is_empty .push_one_row Err Ok default merge_labels_with_structured_metadata new probe_slider_safe recycle_label_scratch take
+        branches: 7,
         // `.into` joined with issue #230: the render-budget breach
         // (`TemplateBudgetExceeded`) converts into `ReadError` on the
         // row path — F-d's NOT-EXEC disposition covers it.
         callees: &[
             ".flush_collision",
             ".get",
-            ".into",
-            ".len",
-            ".run_metric_into",
-            ".stage_member",
+            ".is_empty",
+            ".push_one_row",
             "Err",
             "Ok",
-            "check_surviving_error",
+            "default",
+            "merge_labels_with_structured_metadata",
             "new",
+            "probe_slider_safe",
+            "recycle_label_scratch",
             "take",
         ],
     },
@@ -2346,9 +2431,29 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // absent arm gains a `?` (10 -> 11 branches). Regenerated with
         // `zz_print_frame_censuses`. W-MEM disposition: **NIL** — a
         // propagated `Result`, no allocation.
-        branches: 11,
+        // Issue #249: 11 -> 12 branches, and five new callees
+        // (`.chain`, `.map`, `.labels`, `Group`, plus the `Slider`/
+        // `Group` match itself). Per-row routing lets one query leave
+        // output in BOTH structures, so the fan-out arm's early return
+        // becomes a union: `groups` and `series_out` are collected into
+        // one `Vec<FinishItem>`, sorted on `labels()`, and emitted in
+        // that single total order — which is what keeps a mixed run's
+        // FOLDED value equal to its materialised value. The added
+        // branch is the `FinishItem` match. W-MEM disposition:
+        // **NIL** — issue #236 Part B's point-axis win is intact
+        // because the `Group` arm stays LAZY (`drain_group` still runs
+        // one group at a time inside the loop, nothing is materialised
+        // up front), and the new `Vec<FinishItem>` replaces the
+        // `Vec<(String, MutGroup)>` this frame already allocated and
+        // already sorted — one element per output series either way,
+        // on the axis rows F-* already price. A variants sub-state
+        // leaves one of the two sources empty, so its element count is
+        // unchanged.
+        branches: 12,
         callees: &[
             ".as_mut",
+            // Issue #249: the slider/group union, NIL.
+            ".chain",
             ".cmp",
             ".collect",
             ".drain_group",
@@ -2358,11 +2463,16 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             ".flush_collision",
             ".into_iter",
             ".is_empty",
+            // Issue #249: `FinishItem`'s sort key, NIL.
+            ".labels",
+            ".map",
             ".push",
             ".push_series",
             ".rotate_slider",
             ".sort_by",
             ".take",
+            // Issue #249: the lazy `FinishItem::Group` arm, NIL.
+            "Group",
             "Matrix",
             "Ok",
             "discharge_group_bytes",
@@ -2445,8 +2555,46 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
         // `zz_print_frame_censuses`. W-MEM disposition: **NIL** —
         // integer arithmetic on the same once-per-fingerprint path the
         // deleted check occupied; it allocates nothing.
-        branches: 13,
+        // Issue #249: 13 -> 18 branches, and three new callees (`.any`,
+        // `.iter`, `matches!`). The group's members are dispatched
+        // INDIVIDUALLY now: `if self.fan_out { … return }` — one
+        // whole-group decision — becomes two independent halves,
+        // `if any_fp_route { …slider… }` then `if any_label_route
+        // { …fan-out… } else { clear }`, plus the per-member
+        // `matches!(m.route, …)` skips inside each. A collision group
+        // can hold both routes once structured metadata makes the
+        // final label set the output-series key. W-MEM disposition:
+        // **NIL** — the two `.iter().any(…)` scans read a `Copy`
+        // discriminant over a buffer bounded by
+        // `AggCaps::collision_members` and allocate nothing, and each
+        // half performs exactly the allocations it performed before,
+        // for a subset of the members. A group that is wholly one
+        // route — which is every group a variants sub-state can
+        // produce, and every group of any metadata-free query — takes
+        // byte-for-byte the path it took before.
+        // Issue #249 cost work: 18 -> 20 branches; `.fan_out_sample_base`,
+        // `.iter_mut`, `.take` and `take` join the callee set while
+        // `.into_iter` leaves. Two things happened. (i) The staged buffer is
+        // taken in the FIRST statements rather than at the dispatch, so
+        // `self.coll` is empty on every exit path including the three
+        // fallible ones — that is the `take` callee and the recycle at the
+        // end. (ii) A base-routed member dispatches through
+        // `fan_out_sample_base`, which is the added branch pair (`m.base`,
+        // and the cached-key hit test inside it). W-MEM disposition:
+        // **NOT-EXEC, row F-d** — everything here is reachable only from
+        // the row loop, F-d's existing disposition, and the change strictly
+        // REMOVES per-row allocations: the base arm renders and clones once
+        // per output series instead of once per row, and the recycle hands
+        // the buffer's capacity back so the group's `coll` re-growth stops
+        // being a per-group allocation.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs RangeSlideState::flush_collision 20 32 :: .any .as_bytes .as_mut .clear .cloned .cmp .copied .covering_k .enumerate .expect .fan_out_sample .fan_out_sample_base .get .is_empty .is_none .iter .iter_mut .load_group .rotate_slider .sort_by .take .unwrap_or .unwrap_or_default Ok Some charge_group_bytes charge_result_points grid_slot_count group_entry_bytes matches! new take
+        branches: 20,
         callees: &[
+            ".any",
             ".as_bytes",
             ".as_mut",
             ".clear",
@@ -2457,10 +2605,12 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             ".enumerate",
             ".expect",
             ".fan_out_sample",
+            ".fan_out_sample_base",
             ".get",
-            ".into_iter",
             ".is_empty",
             ".is_none",
+            ".iter",
+            ".iter_mut",
             ".load_group",
             ".rotate_slider",
             ".sort_by",
@@ -2473,6 +2623,7 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             "charge_result_points",
             "grid_slot_count",
             "group_entry_bytes",
+            "matches!",
             "new",
             "take",
         ],
@@ -2489,6 +2640,104 @@ static PER_VARIANT_FRAMES: [Frame; 32] = [
             ".len",
             "Some",
             "discharge_retention",
+        ],
+    },
+    // --- issue #249: the per-ROW frames the batch loops delegate to ---
+    //
+    // `push_rows_inner`/`push_rows` used to hold the whole row body. Issue
+    // #249 moved it into `push_one_row` on each state so the metadata-free
+    // and metadata-bearing rows share ONE implementation of valuing,
+    // routing and staging a sample. The per-row allocations therefore live
+    // HERE now, and both frames are censused so that move did not hide them
+    // behind an un-censused helper.
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("ClientAggState"),
+        anchor: "push_one_row",
+        // The instant row body, moved here whole from `push_rows_inner`
+        // (which kept 5 branches: the metadata split and its buffers).
+        // W-MEM disposition: **NOT-EXEC, row F-d** — the disposition the
+        // body carried inside `push_rows_inner`, unchanged by the move, and
+        // still covered by `rows.is_empty()` plus the resident
+        // `CLIENT_AGG_FLAT_BUDGET` per-row gate.
+        // Issue #249 cost work: 24 -> 26 branches; `debug_assert_eq!`,
+        // `route_row_counted` and `row_route` join the callee set. The added
+        // branches are the inert shortcut and its `fp_slider_safe` arm.
+        // **Both route functions appear, and that is the point**: the
+        // production decision goes through the counted wrapper while the
+        // `debug_assert_eq!` oracle calls the plain one, so the gate's
+        // counter cannot see its own check. W-MEM disposition:
+        // **NOT-EXEC, row F-d** — reachable only from the row loop; the
+        // shortcut allocates on neither arm and `debug_assert_eq!` compiles
+        // out of release entirely.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs ClientAggState::push_one_row 26 32 :: .add .as_deref .collect .contains_key .copied .entry .flush_pending .get .get_mut .insert .into_mut .iter .key .len .map .run_metric_into_with_sm .sort_unstable .stage .to_string .unwrap_or Err Ok QueryTooBroad charge_group_bytes check_surviving_error debug_assert_eq! group_entry_bytes matches! new render_labels_json_sorted route_row_counted row_route
+        branches: 26,
+        callees: &[
+            ".add",
+            ".as_deref",
+            ".collect",
+            ".contains_key",
+            ".copied",
+            ".entry",
+            ".flush_pending",
+            ".get",
+            ".get_mut",
+            ".insert",
+            ".into_mut",
+            ".iter",
+            ".key",
+            ".len",
+            ".map",
+            ".run_metric_into_with_sm",
+            ".sort_unstable",
+            ".stage",
+            ".to_string",
+            ".unwrap_or",
+            "Err",
+            "Ok",
+            "QueryTooBroad",
+            "charge_group_bytes",
+            "check_surviving_error",
+            "debug_assert_eq!",
+            "group_entry_bytes",
+            "matches!",
+            "new",
+            "render_labels_json_sorted",
+            "route_row_counted",
+            "row_route",
+        ],
+    },
+    Frame {
+        file: "client_agg.rs",
+        ty: Some("RangeSlideState"),
+        anchor: "push_one_row",
+        // The sliding row body, likewise moved whole out of `push_rows`.
+        // W-MEM disposition: **NOT-EXEC, row F-d**, for the same reason.
+        // Issue #249 cost work: 5 -> 8 branches; `debug_assert_eq!`,
+        // `route_row_counted` and `row_route` join the callee set, matching
+        // the instant twin above term for term and for the same reason.
+        // The added branches are the inert shortcut, its `fp_slider_safe`
+        // arm, and `base_member`. W-MEM disposition: **NOT-EXEC, row F-d**.
+        //
+        // Regenerated, never hand-written:
+        //     cargo test -p pulsus-read --test logql_variants_alloc \
+        //         -- --ignored zz_print_frame_censuses --nocapture
+        // FRAME client_agg.rs RangeSlideState::push_one_row 8 9 :: .len .run_metric_into_with_sm .stage_member Ok check_surviving_error debug_assert_eq! matches! route_row_counted row_route
+        branches: 8,
+        callees: &[
+            ".len",
+            ".run_metric_into_with_sm",
+            ".stage_member",
+            "Ok",
+            "check_surviving_error",
+            "debug_assert_eq!",
+            "matches!",
+            "route_row_counted",
+            "row_route",
         ],
     },
 ];
@@ -2776,6 +3025,10 @@ static INVENTORY: [Row; 50] = [
         frames: &[
             "ClientAggState::push_rows",
             "ClientAggState::push_rows_inner",
+            // Issue #249: the row bodies moved out of the two batch loops
+            // into these, and they are reachable ONLY from them.
+            "ClientAggState::push_one_row",
+            "RangeSlideState::push_one_row",
             "ClientAggState::stage",
             "ClientAggState::stage_bytes",
             "ClientAggState::flush_pending",
@@ -2991,7 +3244,11 @@ static INVENTORY: [Row; 50] = [
 /// The 15 delegating boundary callees (see [`Boundary`]).
 static BOUNDARY_CALLEES: [Boundary; 13] = [
     Boundary {
-        callee: ".run_metric_into",
+        // Issue #249: the metric entrypoint became
+        // `run_metric_into_with_sm`, which the metadata-FREE row reaches
+        // through the same call with the shared empty context — one
+        // implementation, so the boundary is one name.
+        callee: ".run_metric_into_with_sm",
         rows: &["F-d"],
         disp: Disp::NotExec,
     },
@@ -3100,7 +3357,7 @@ fn module_doc() -> String {
 fn g4_frame_census_and_inventory_closure() {
     let _serial = serialize();
     // (1) 26 unique frames, each resolving to exactly one item.
-    assert_eq!(PER_VARIANT_FRAMES.len(), 32);
+    assert_eq!(PER_VARIANT_FRAMES.len(), 34);
     let mut keys = BTreeSet::new();
     for f in &PER_VARIANT_FRAMES {
         assert!(

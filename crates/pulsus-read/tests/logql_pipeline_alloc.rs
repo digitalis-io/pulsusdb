@@ -541,6 +541,9 @@ fn per_row_allocation_bounds_hold() {
             fingerprint: 1,
             timestamp_ns: (i as i64) * 1_000_000, // 20s of 1ms-spaced rows
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+            // The SM-FREE leg: issue #249's merge must leave this budget
+            // unmoved. The SM-PRESENT leg is a separate test below.
+            structured_metadata: String::new(),
         })
         .collect();
     let params = QueryParams {
@@ -612,6 +615,221 @@ fn per_row_allocation_bounds_hold() {
         total <= CLIENT_AGG_FLAT_BUDGET + ZERO_RESIDUE,
         "client-agg filter+count: {total} allocations over {rows_n} rows — the zero-per-row \
          aggregation loop regressed"
+    );
+
+    // --- Issue #249 cost work: the WITHHELD (mixed-shape) path. The
+    // --- budget above measures a fingerprint-routed run; a selection whose
+    // --- streams differ in label count withholds the slider from the
+    // --- longer one, and every one of its rows takes the LABEL route. That
+    // --- path used to render the group key and clone the `LabelSet` per
+    // --- row; a base-routed row's final label set is its fingerprint's
+    // --- base set, a per-fingerprint constant, so it is now rendered once
+    // --- per output series and looked up by `&str`.
+    //
+    // Two legs. (a) is the budget: the SAME query and rows as the
+    // fingerprint-routed leg above, so the two are directly comparable.
+    // (b) is the scale-invariant IDENTITY, and it is the stronger of the
+    // two — the same fixture at TWICE the row density over the SAME time
+    // span, so the output series and the grid are identical and every
+    // fixed cost cancels. A per-row term of even ONE allocation adds
+    // 20 000 and misses by three orders of magnitude. That is what
+    // "steady-state zero allocations per row" means as a Tier-1 gate
+    // (docs/schemas.md §9: an identity, never a wall-time assert) and it is
+    // strictly stronger than any rounded average.
+    //
+    // Raw totals are printed, not a rounded per-row figure: the initial
+    // cached key, the group entry, the `coll` buffer and the output series
+    // all land inside the measured window and are counted in them.
+    let withheld_meta: std::collections::HashMap<u64, StreamMetaRow> = [
+        (
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "checkout".to_string(),
+                labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+            },
+        ),
+        (
+            2u64,
+            StreamMetaRow {
+                fingerprint: 2,
+                service: "checkout".to_string(),
+                // One label LONGER, so the minimum-length rule withholds
+                // the slider from this fingerprint — which is the whole
+                // point of the fixture.
+                labels: r#"{"env":"prod","pod":"p","service_name":"checkout"}"#.to_string(),
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    // Rows on fp 2 — the LONGER stream, which the minimum-length rule
+    // withholds the slider from.
+    let withheld_rows = |n: usize| -> Vec<MetricScanRow> {
+        (0..n)
+            .map(|i| MetricScanRow {
+                fingerprint: 2,
+                // The same 20s SPAN whatever `n` is, so the grid and the
+                // output series do not move with density.
+                timestamp_ns: (i as i64) * (20_000_000_000 / n as i64),
+                body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+                structured_metadata: String::new(),
+            })
+            .collect()
+    };
+    let withheld_run = |rows: &[MetricScanRow]| -> (u64, usize) {
+        let warm = run_client_agg_rows(
+            rows,
+            &compiled,
+            &withheld_meta,
+            client,
+            window,
+            mp.rate_window_ns,
+        )
+        .expect("client agg");
+        let series = match &warm {
+            pulsus_read::logql::QueryResult::Matrix(m) => m.len(),
+            other => panic!("expected a matrix, got {other:?}"),
+        };
+        drop(warm);
+        let start = ALLOCS.load(Ordering::Relaxed);
+        let out = run_client_agg_rows(
+            rows,
+            &compiled,
+            &withheld_meta,
+            client,
+            window,
+            mp.rate_window_ns,
+        )
+        .expect("client agg");
+        let total = ALLOCS.load(Ordering::Relaxed) - start;
+        std::hint::black_box(&out);
+        (total, series)
+    };
+
+    const WITHHELD_N: usize = 20_000;
+    let rows_n = withheld_rows(WITHHELD_N);
+    let (total_n, series_n) = withheld_run(&rows_n);
+    assert_eq!(
+        series_n, 1,
+        "the withheld fingerprint must produce ONE output series — otherwise this \
+         leg is not measuring the base-routed path"
+    );
+    assert!(
+        total_n <= CLIENT_AGG_FLAT_BUDGET + ZERO_RESIDUE,
+        "withheld (label-routed) path: {total_n} allocations over {WITHHELD_N} rows \
+         ({:.2}/row) — the base-routed fan-out must render its key once per output \
+         series, not once per row",
+        total_n as f64 / WITHHELD_N as f64
+    );
+
+    // (b) THE IDENTITY: twice the rows, same span, same series, same grid.
+    let rows_2n = withheld_rows(2 * WITHHELD_N);
+    let (total_2n, series_2n) = withheld_run(&rows_2n);
+    assert_eq!(
+        series_2n, series_n,
+        "doubling the density must not change the series"
+    );
+    assert!(
+        total_2n <= total_n + ZERO_RESIDUE,
+        "withheld path is not steady-state zero per row: {WITHHELD_N} rows cost \
+         {total_n} allocations and {} rows cost {total_2n} — a per-row term of even \
+         one allocation would add {WITHHELD_N} here",
+        2 * WITHHELD_N
+    );
+
+    // --- Issue #249: the METRIC path's structured-metadata leg. The
+    // --- SM-FREE budget above is BLIND to this path — it is measured on
+    // --- rows whose `structured_metadata` is empty, and the merge branch
+    // --- never executes for them. So the merge gets its own leg, over
+    // --- rows with DISTINCT metadata per row (the worst shape: every row
+    // --- opens a new output group).
+    //
+    // The ceiling is set from TWO measurements, so it separates the
+    // profile it pins from the regression it exists to catch:
+    //
+    //   reused buffers (this tree)                18.00 allocations/row
+    //   `merge_buf`/`sm_buf`/`sm_scratch` freshly
+    //     allocated per row                       21.00 allocations/row
+    //
+    // Both measured by this leg with the ceiling temporarily set to 0 and
+    // reading the panic message (`cargo nextest run -p pulsus-read -E
+    // 'binary(logql_pipeline_alloc)'`), on the second of the two
+    // measurements with the three `Vec::new()`s moved inside
+    // `RangeSlideState::push_rows`' row loop. 20/row admits the first and
+    // REFUSES the second, which is what makes this leg fail for the one
+    // reason it names — a loose "100/row" would admit both and prove
+    // nothing about reuse.
+    //
+    // Strictly LINEAR: no per-row growth term, so a per-row reallocating
+    // merge or a quadratic regrouping misses by orders of magnitude.
+    const SM_METRIC_ROWS: usize = 20_000;
+    const SM_METRIC_PER_ROW: u64 = 20;
+    let sm_metric_rows: Vec<MetricScanRow> = (0..SM_METRIC_ROWS)
+        .map(|i| MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns: (i as i64) * 1_000_000,
+            body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+            // DISTINCT per row: one output group per row, so the merge and
+            // the group retention are both fully exercised.
+            structured_metadata: format!(r#"{{"trace":"t{i}"}}"#),
+        })
+        .collect();
+    let sm_expr = pulsus_logql::parse(r#"count_over_time({a="b"}[5s])"#).expect("parse");
+    let Plan::Metric(sm_mp) = plan(&sm_expr, &params, &plan_ctx).expect("plan") else {
+        panic!("expected a Metric plan");
+    };
+    let sm_client = sm_mp.client.as_ref().expect("client-aggregated");
+    let sm_compiled = CompiledPipeline::compile(&sm_client.pipeline).expect("compile");
+    let sm_window = match sm_mp.step_ns {
+        Some(step_ns) => ClientWindow::Range {
+            grid_start_ns: sm_mp.grid_start_ns,
+            end_ns: sm_mp.end_ns,
+            step_ns,
+            range_ns: sm_mp.range_ns,
+            offset_ns: sm_mp.offset_ns,
+        },
+        None => panic!("the fixture is a range query"),
+    };
+    // Warm-up (allocator internals) + prove the merge really produced one
+    // series per metadata value — the leg is worthless if it did not.
+    let sm_warm = run_client_agg_rows(
+        &sm_metric_rows,
+        &sm_compiled,
+        &meta,
+        sm_client,
+        sm_window,
+        sm_mp.rate_window_ns,
+    )
+    .expect("client agg");
+    match &sm_warm {
+        pulsus_read::logql::QueryResult::Matrix(m) => assert_eq!(
+            m.len(),
+            SM_METRIC_ROWS,
+            "the merge must yield one output series per distinct metadata value — \
+             otherwise this leg measures the metadata-free path again"
+        ),
+        other => panic!("expected a matrix, got {other:?}"),
+    }
+    let sm_n = sm_metric_rows.len() as u64;
+    let sm_start = ALLOCS.load(Ordering::Relaxed);
+    let sm_out = run_client_agg_rows(
+        &sm_metric_rows,
+        &sm_compiled,
+        &meta,
+        sm_client,
+        sm_window,
+        sm_mp.rate_window_ns,
+    )
+    .expect("client agg");
+    let sm_total = ALLOCS.load(Ordering::Relaxed) - sm_start;
+    std::hint::black_box(&sm_out);
+    assert!(
+        sm_total <= SM_METRIC_PER_ROW * sm_n + ZERO_RESIDUE,
+        "SM-bearing metric rows: {sm_total} allocations over {sm_n} rows \
+         ({:.2}/row) — the ceiling is {SM_METRIC_PER_ROW}/row; the merge buffers \
+         must stay reused across rows",
+        sm_total as f64 / sm_n as f64
     );
 
     // --- Issue #91: the binop (vector-matching) join path. The matrix
