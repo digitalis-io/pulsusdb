@@ -1102,10 +1102,12 @@ fn zipkin_decode_error_response(err: &LogsIngestError) -> Response {
 /// async `202`), so this endpoint has two observable error shapes, not
 /// three.
 ///
-/// Pinned by `tests::zipkin_sink_error_container_omits_nosniff_and_
-/// terminator`. It has NO live coverage: `api_conformance` drives a real
-/// spawn against a real ClickHouse and cannot make the sink fail, so its
-/// three Zipkin cells all land on [`zipkin_decode_error_response`].
+/// Pinned by
+/// `tests::zipkin_sink_error_container_omits_nosniff_and_terminator`.
+/// It has NO live coverage: `api_conformance` drives a real spawn against
+/// a real ClickHouse and cannot make the sink fail, so every one of its
+/// Zipkin cells (`ZIPKIN_CASES`' two, on each of `/api/v2/spans` and
+/// `/tempo/spans`) lands on [`zipkin_decode_error_response`] instead.
 fn zipkin_sink_error_response(err: &LogsIngestError) -> Response {
     let (status, _code) = classify(err);
     plain_text_response(status, err.to_string())
