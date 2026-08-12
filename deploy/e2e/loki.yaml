@@ -31,9 +31,14 @@
 #     `detected_level` structured-metadata field per entry, which its
 #     query results surface as an extra label and which PulsusDB
 #     deliberately does not synthesize.
-#   - `split_queries_by_interval: 0` (issue #301) — the oracle must
-#     evaluate the range query it was ASKED, not the step-aligned one its
-#     query-frontend rewrites it into; see the inline note below.
+#   - `split_queries_by_interval: 0` (issue #301, upheld by the owner
+#     ruling of 2026-08-12 on issue #425) — the oracle must evaluate the
+#     range query it was ASKED, not the step-aligned one its
+#     query-frontend rewrites it into. PulsusDB is deliberately and
+#     permanently start-anchored, so this setting is not a workaround
+#     awaiting a fix; it is what makes the differential compare the two
+#     engines rather than one engine against the other's request
+#     rewriter. See the inline note below.
 
 auth_enabled: false
 
@@ -66,8 +71,12 @@ schema_config:
 limits_config:
   allow_structured_metadata: true
   discover_log_levels: false
-  # Issue #301 — take the query-FRONTEND's request rewrite out of the
-  # range differential's path. Loki's metric splitter
+  # Issue #301, upheld by the owner ruling of 2026-08-12 on issue #425 —
+  # take the query-FRONTEND's request rewrite out of the range
+  # differential's path. This is a DELIBERATE, PERMANENT divergence, not
+  # a workaround pending a fix: PulsusDB will not implement the
+  # alignment, because it returns points outside the requested window
+  # (ledger `range-step-grid-start-anchored`). Loki's metric splitter
   # (`pkg/querier/queryrange/splitters.go`, `metricQuerySplitter.split`,
   # v3.4.2 L242 / v3.7.4 L236) calls `alignStartEnd` UNCONDITIONALLY,
   # flooring the request `start` to a multiple of `step` and ceiling

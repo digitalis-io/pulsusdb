@@ -3865,6 +3865,214 @@ async fn a_wrapped_sort_keeps_its_value_order_on_the_wire() {
     drop_db(db).await;
 }
 
+// --- Issue #425 Part B: the derived `step` is a whole number of seconds --
+
+const FP_STEP_GRID: u64 = 0x8000_0000_0000_0031;
+
+/// Seeds one sample per second across `[T0 - 120s, T0 + 900s]` for one
+/// fingerprint. A sliding `[1m]` window therefore holds exactly 60 samples
+/// at every grid point in `[T0, T0 + 900s]`, so every emitted value is
+/// `60` and the assertions below are about the GRID — count, first, last,
+/// spacing — and nothing else.
+async fn seed_step_grid(client: &ChClient, db: &str, t0_ns: i64) {
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t0_ns}))), \
+                 {FP_STEP_GRID}, 'stepgrid', \
+                 '{{\"service_name\":\"stepgrid\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed step-grid log_streams");
+
+    let mut values = Vec::with_capacity(1021);
+    for i in -120i64..=900 {
+        let ts = t0_ns + i * 1_000_000_000;
+        values.push(format!("('stepgrid', {FP_STEP_GRID}, {ts}, 0, 'line {i}')"));
+    }
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                 body) VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed step-grid log_samples");
+}
+
+/// The single matrix series' points as `(timestamp_ns, value_bits)`.
+/// Timestamps arrive as Prometheus-style seconds; the fixture puts every
+/// grid point on a whole second, so the widening is exact.
+fn matrix_points(res: &HttpResponse) -> Vec<(i64, u64)> {
+    let body = json(res);
+    assert_eq!(body["data"]["resultType"], "matrix", "{}", res.body);
+    let series = body["data"]["result"]
+        .as_array()
+        .expect("matrix result array");
+    assert_eq!(series.len(), 1, "expected one series: {}", res.body);
+    series[0]["values"]
+        .as_array()
+        .expect("values array")
+        .iter()
+        .map(|p| {
+            let secs = p[0].as_f64().unwrap_or_else(|| panic!("timestamp: {p}"));
+            let value: f64 = p[1]
+                .as_str()
+                .unwrap_or_else(|| panic!("value: {p}"))
+                .parse()
+                .unwrap_or_else(|e| panic!("value {p}: {e}"));
+            ((secs * 1e9).round() as i64, value.to_bits())
+        })
+        .collect()
+}
+
+/// **Issue #425 Part B, live.** A `query_range` that omits `step` derives
+/// the reference's WHOLE-SECOND step, end to end.
+///
+/// The reference's `defaultQueryRangeStep` is
+/// `int(math.Max(math.Floor(end.Sub(start).Seconds()/250), 1))` seconds
+/// (`pkg/loghttp/params.go:140-142`, reached from `step()` at `:122-126`
+/// @ grafana/loki v3.7.4 `b318f282`). Before this change we derived
+/// `span_ns / 250` NANOSECONDS, which pinned the answer at 251 points on
+/// every window: the three rows below returned 251 points spaced
+/// `1.996s`, `3.6s` and `2.004s` respectively.
+///
+/// Rows one and two are byte-for-byte in value the reference's measured
+/// answers — both bounds already sit on the derived grid, so the accepted
+/// grid divergence (below) cannot separate us there.
+///
+/// Row three is the deliberate contrast. The derived step now AGREES with
+/// the reference (`2s`); the grid does not, and by ruling never will. The
+/// reference floors `start` and ceils `end` onto the step grid
+/// (`metricQuerySplitter.split` → `alignStartEnd`,
+/// `pkg/querier/queryrange/splitters.go` @ v3.7.4) and answers 252 points
+/// ending `T0 + 502s` — two seconds PAST the `end` the caller asked for.
+/// We stay start-anchored and stop at `T0 + 500s`. Owner ruling
+/// 2026-08-12 on issue #425 (#301 stands); ledger row
+/// `range-step-grid-start-anchored` in
+/// `docs/benchmarks/logs-differential-ledger.md`.
+#[tokio::test]
+async fn query_range_derives_the_reference_whole_second_step() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_derived_step");
+    let port = 31_200;
+    drop_db(db).await;
+    let guard = spawn_ready_server(port, db);
+    let client = ChClient::new(data_client_config(db))
+        .await
+        .expect("connect data client");
+    // 60s-aligned, so every derived grid point lands on a whole second.
+    let t0_ns = (now_ns() / 60_000_000_000) * 60_000_000_000;
+    seed_step_grid(&client, db, t0_ns).await;
+
+    // (span_ns, expected point count, expected step_ns)
+    let rows: &[(i64, usize, i64)] = &[
+        (499_000_000_000, 500, 1_000_000_000),
+        (900_000_000_000, 301, 3_000_000_000),
+        (501_000_000_000, 251, 2_000_000_000),
+    ];
+    for (span_ns, want_points, want_step_ns) in rows {
+        let end_ns = t0_ns + span_ns;
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query_range",
+                &[
+                    ("query", r#"count_over_time({service_name="stepgrid"}[1m])"#),
+                    ("start", &t0_ns.to_string()),
+                    ("end", &end_ns.to_string()),
+                    // No `step` — that is the whole point of this test.
+                ],
+            ),
+        )
+        .expect("query_range reachable");
+        assert_eq!(res.status, 200, "span {span_ns} ns: {}", res.body);
+
+        let points = matrix_points(&res);
+        // The full point vector, not a spot check: count, then every
+        // timestamp and every value.
+        let want: Vec<(i64, u64)> = (0..*want_points as i64)
+            .map(|k| (t0_ns + k * want_step_ns, 60.0f64.to_bits()))
+            .collect();
+        assert_eq!(
+            points, want,
+            "span {span_ns} ns: expected {want_points} points spaced {want_step_ns} ns"
+        );
+        // Start-anchored: no point outside the requested window, ever.
+        assert!(
+            points.iter().all(|(ts, _)| *ts >= t0_ns && *ts <= end_ns),
+            "span {span_ns} ns: a point fell outside [start, end]"
+        );
+    }
+
+    drop(guard);
+    drop_db(db).await;
+}
+
+/// **Issue #425 Part B, live.** A LOG `query_range` ignores `step`
+/// entirely, so changing how the step is derived cannot move any entry.
+///
+/// This is the behavioural property the plan's grep sweep stood in for:
+/// every step-omitting `query_range` in the suites is a log query, and a
+/// log query's entries do not depend on the step. It fails if a log path
+/// ever starts consuming it.
+#[tokio::test]
+async fn derived_step_change_moves_no_log_query() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_derived_step_logs");
+    let port = 31_201;
+    drop_db(db).await;
+    let (_guard, _client, base_ns) = setup(db, port).await;
+
+    let start = (base_ns - 10_000_000_000).to_string();
+    let end = (base_ns + 10_000_000_000).to_string();
+    let entries = |step: Option<&str>| {
+        let mut params: Vec<(&str, &str)> = vec![
+            ("query", r#"{service_name="checkout"}"#),
+            ("start", &start),
+            ("end", &end),
+            ("direction", "forward"),
+        ];
+        if let Some(step) = step {
+            params.push(("step", step));
+        }
+        let res =
+            http_get(port, &q("/api/logs/v1/query_range", &params)).expect("query_range reachable");
+        assert_eq!(res.status, 200, "step {step:?}: {}", res.body);
+        let body = json(&res);
+        assert_eq!(body["data"]["resultType"], "streams", "{}", res.body);
+        body["data"]["result"].clone()
+    };
+
+    let absent = entries(None);
+    assert!(
+        !absent.as_array().expect("streams array").is_empty(),
+        "the fixture must return entries, or this test proves nothing"
+    );
+    assert_eq!(entries(Some("1s")), absent, "step=1s moved a log entry");
+    assert_eq!(
+        entries(Some("3600s")),
+        absent,
+        "step=3600s moved a log entry"
+    );
+
+    drop_db(db).await;
+}
+
 /// Sends a POST that advertises `advertised` body bytes and then writes
 /// only `sent`, and reports the response status if one arrives within a
 /// few seconds — `None` meaning the server is still waiting for the rest

@@ -829,6 +829,72 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   one, so the oracle's aligned timestamps stopped matching. Failure mode
   was `oracle diverged from the corpus expectation` on
   `metric_rate_sliding`, the first of the five range cases to run.
+- **Ruling, 2026-08-12 (issue #425 Part A).** The verdict above was
+  challenged and **upheld**. The case for reversing it was that the
+  reference's default `split_queries_by_interval` is `1h`, so every stock
+  deployment shows the aligned grid and a dashboard moved between the two
+  stores would look different. Refused: that argument is about migrating
+  existing deployments, and the aligned grid remains an artefact of query
+  splitting that hands back points **outside** the requested
+  `[start, end]`. Part A closed with no code change; the divergence is
+  recorded as its own row, `range-step-grid-start-anchored`, below.
+  Owner ruling: https://github.com/digitalis-io/pulsusdb/issues/425#issuecomment-5263485356
+
+### range-step-grid-start-anchored (issue #425, owner ruling 2026-08-12 — a deliberate divergence, not a defect)
+
+- **What we do:** a metric range query emits points on the
+  **start-anchored** grid `{start + k·step ≤ end}`, so every point lies
+  inside the window the caller requested. `step` itself, when omitted, is
+  the reference's own whole-second derivation — issue #425 Part B, which
+  carries no ledger row of its own because it restores parity rather than
+  creating a divergence. The grid's *origin* diverges; its *spacing* does
+  not.
+- **What the reference does:** rewrites the request before its engine
+  sees it. `metricQuerySplitter.split` calls
+  `alignStartEnd(step, start, end)` (`pkg/querier/queryrange/
+  splitters.go:236 @ grafana/loki v3.7.4 b318f282`, the definition at
+  `:308`), flooring `start` and ceiling `end` to absolute multiples of
+  `step`. **Measured** on the pinned image
+  `grafana/loki@sha256:87f0a067…` 2026-08-12: a 501 s window from a 60 s
+  -aligned `T0` with no `step` (both stores derive `2s` after Part B)
+  returns **252 points ending `T0 + 502s`** there against our **251
+  ending `T0 + 500s`** — two seconds past the `end` that was asked for.
+  Controls: at 499 s and 900 s both bounds already sit on the derived
+  grid and the two stores agree point for point (500 and 301 points),
+  so what the 501 s row measures is the alignment and not the fixture.
+- **Why it is accepted.** The alignment is an implementation detail of
+  **query splitting** surfacing in the API, not a documented contract:
+  the reference splits a range query into hour chunks to run them in
+  parallel, the chunks have to line up on a grid, and rather than
+  resampling the result back onto the caller's timestamps it returns the
+  chunk boundaries. One tenant limit switches it off
+  (`split_queries_by_interval: 0` returns `h.next.Do(ctx, r)` before the
+  splitter), so the same binary answers the same request two ways —
+  which is what a scaling detail looks like, not a semantic. It also
+  contradicts the reference's OWN engine (`pkg/logql` is start-anchored;
+  that is the semantics issue #227 ported). Handing back data outside
+  the window someone asked for is the reference being wrong, and the
+  standing mandate is to match it **except where it is wrong**. The
+  counter-argument — every stock deployment shows the aligned grid, so a
+  migrated dashboard shifts — is about existing deployments; the stated
+  goal is new ones, where points from your start, inside your window, at
+  your step is what the documentation implies.
+- **Close condition:** the owner reverses the 2026-08-12 ruling. Nothing
+  else reopens this; it is not waiting on a fix.
+- **Pin:** `crates/pulsus-read/tests/logqltest/corpus/
+  b9_range_sliding.test:48` — a range query from an UNALIGNED `T0`
+  (`from 7s to 37s step 10s` ⇒ `17s 1  27s 1`), which fails the moment an
+  aligned grid is reintroduced. Live: `logs_api_live.rs`'s
+  `query_range_derives_the_reference_whole_second_step` asserts no point
+  falls outside `[start, end]`. `deploy/e2e/loki.yaml` keeps
+  `split_queries_by_interval: 0` so the differential's oracle answers the
+  range query it was asked; the five `metric_range` cases stay `gated`.
+- **Not to be confused with** `frontend-step-alignment` above, which
+  records the same mechanism as an **oracle-config** note for the e2e
+  differential. This row records it as a **product divergence** and
+  carries the ruling that keeps it. Both stay: one explains why the
+  oracle is configured as it is, the other why our answer differs from a
+  stock reference.
 
 ### empty-value-oracle-version-skew (issue #259 reopen, oracle-version note — no case downgraded)
 

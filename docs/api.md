@@ -189,7 +189,7 @@ in the parameter surface).
 |-------|------|-------|
 | `query` | LogQL | required |
 | `start`, `end` | unix s (<= 10 chars) / ns / fractional s / RFC3339 (§2 preamble) | default: `end = now`, `start = min(end, now) - since`; `since` defaults to `1h`. `end < start` is `400` |
-| `step` | duration \| int (seconds) | metric queries only; derived `clamp((end-start)/250, >=1s)` when omitted |
+| `step` | duration \| int (seconds) | metric queries only; when omitted, derived as **whole seconds**: `max(floor((end-start) in seconds / 250), 1)` — the reference's `defaultQueryRangeStep` (`pkg/loghttp/params.go:140-142 @ grafana/loki v3.7.4 b318f282`). A 1 h window derives `14s`, a 900 s window `3s`, a 499 s window `1s`. The point count therefore varies between 250 and 500; it is not fixed |
 | `limit` | int | max **total** entries returned across the response, ordered by `direction` (newest-first for `backward`); global, not per-stream (default 100, hard cap 5000 — values above the cap are rejected with `400`). This is the **entry** axis; §2.6.3's same-named `limit` counts field *names* and carries no ceiling |
 | `direction` | `forward`\|`backward` | default `backward` |
 | `since` | duration | the default `start`'s lookback (default `1h`); ignored when `start` is present |
@@ -202,8 +202,40 @@ Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":
 
 - **streams**: `result: [{"stream":{k:v,...},"values":[["<ts_ns>", "<line>"],...]}, ...]`. `ts_ns` is a **string** (nanosecond precision overflows JS's safe-integer range). `stats: {"streams":N,"entries":N,"bytes":N}` (`bytes` = decoded line bytes). A pipeline with an in-engine dropping stage (a label filter, or a line filter after `line_format`) is served by fetch-until-limit keyset paging that fills exactly to `limit`; when the byte scan budget (`reader.logql_scan_budget_bytes`) is exhausted before the limit fills, the response returns the survivors gathered so far and adds `stats.pulsus_partial: true` — a PulsusDB-contract signal (Loki has no byte-budget-truncation equivalent; mirrors the traces-search `metrics.partial` precedent in §4.2) distinguishing a budget-truncated result from a complete one. The field is **omitted** on complete results (the fast path, the non-dropping path, and genuine window exhaustion), so ordinary responses are byte-identical to before; clients that don't know the key ignore it.
 - **matrix**: `result: [{"metric":{k:v,...},"values":[[<unix_seconds>, "<value>"],...]}, ...]`. Timestamps are Prometheus-style unix-seconds numbers at **millisecond** resolution — the reference store's own matrix resolution, so a step point carrying sub-millisecond nanoseconds (a range query's grid is anchored on the request `start`, issue #227) is floored to the millisecond on both stores; `value` is a quoted string (`"NaN"`/`"+Inf"`/`"-Inf"` as applicable, matching §3.1's convention). `stats: {"series":N}`.
-- **Range-query window semantics (issue #227):** a metric range query re-evaluates the `[range]` selector at every point of the **start-anchored** grid `{start + k·step ≤ end}`, over the **half-open** window `(t − range, t]` — the reference store's sliding evaluation, not fixed step-aligned buckets. Windows **overlap** when `range > step` (one entry contributes to several points), an **empty window emits no point** (a gap, never a zero), and `rate`/`bytes_rate` divide by the **`[range]`** seconds, so `rate({…}[1m])` and `rate({…}[10m])` differ. Instant queries are unaffected (one window `(time − range, time]`).
+- **Range-query window semantics (issue #227):** a metric range query re-evaluates the `[range]` selector at every point of the **start-anchored** grid `{start + k·step ≤ end}`, over the **half-open** window `(t − range, t]` — the reference store's sliding evaluation, not fixed step-aligned buckets. Windows **overlap** when `range > step` (one entry contributes to several points), an **empty window emits no point** (a gap, never a zero), and `rate`/`bytes_rate` divide by the **`[range]`** seconds, so `rate({…}[1m])` and `rate({…}[10m])` differ. Instant queries are unaffected (one window `(time − range, time]`). The grid stays anchored on the request `start` — an **accepted divergence** from the reference, recorded below.
 - With `X-Pulsus-Explain: 1`, `data.explain = {"result_type","routing":{"chosen":"rollup"|"raw","reason":"..."}|null,"stages":[{"name","sql","note"|null},...]}` is added alongside `data.stats`.
+
+**Accepted divergence — the range grid is anchored on `start`, not on the
+step (issue #425 Part A, owner ruling 2026-08-12, closed with no code
+change; supersedes nothing — it upholds the earlier #301 ruling).**
+PulsusDB emits points at `{start + k·step ≤ end}`, so **every point lies
+inside the window the caller asked for**. The reference rewrites the
+request first: `metricQuerySplitter.split` calls
+`alignStartEnd(step, start, end)` on every range metric request before
+its engine sees it, flooring `start` and ceiling `end` to absolute
+multiples of `step` (`pkg/querier/queryrange/splitters.go:236 @
+grafana/loki v3.7.4 b318f282`). Measured on the pinned image
+2026-08-12: a 501 s window from a 60 s-aligned `T0` with no `step`
+returns 252 points there, the last at `T0 + 502s` — **two seconds past
+the requested `end`** — against our 251 ending exactly at `T0 + 500s`.
+It is **accepted rather than fixed because the alignment is an artefact
+of query splitting, not a documented contract**: the reference splits a
+range query into hour chunks to run them in parallel, the chunks must
+line up on a grid, and rather than resampling back onto the caller's
+timestamps it hands the chunk boundaries out. It is switched off entirely
+by one tenant limit (`split_queries_by_interval: 0`) — the same binary
+gives two different answers to the same request — and it contradicts the
+reference's own engine (`pkg/logql`, start-anchored, which is the
+semantics issue #227 ported). Returning data outside the requested
+`[start, end]` is the reference being wrong, and the standing rule is to
+match it except where it is wrong. The migration argument (a dashboard
+moved between the two stores shifts) is about existing deployments and
+does not apply to new ones. Ledger:
+`range-step-grid-start-anchored` and `frontend-step-alignment` in
+docs/benchmarks/logs-differential-ledger.md. Pinned by
+`crates/pulsus-read/tests/logqltest/corpus/b9_range_sliding.test:48`,
+which fails if an aligned grid is ever reintroduced. Reopen only if the
+owner reverses the ruling.
 
 **Metric binary operations & vector matching (issue #91).** LogQL metric expressions support binary operations between range vectors — arithmetic, comparison (with `bool`), and the `and`/`or`/`unless` set operators — with the full `on(...)`/`ignoring(...)` and `group_left(...)`/`group_right(...)` vector-matching modifiers (semantics oracle-verified against `grafana/loki:3.4.2`). One-to-one matches output the reduced (`on`/`ignoring`) signature; `group_left`/`group_right` pass the many side's labels through whole and copy the include labels from the one side. A cardinality violation is a `400` carrying the reference store's exact message (`multiple matches for labels: many-to-one matching must be explicit …` / `… many-to-many matching not allowed: matching labels must be unique on one side`); a bare `group_left`/`group_right` with no preceding `on`/`ignoring` is a parse-time `400`. Matrix (range) binops apply the vector match independently per step. Note: the reference store returns HTTP `500` for these runtime matching errors while PulsusDB returns `400` (the semantically correct bad-request code); the error bodies agree. Streams-path error series carry both `__error__` and its human-readable `__error_details__` companion (issue #99), byte-exact against the reference where feasible; the metric pipeline-error path is unchanged.
 
@@ -450,7 +482,7 @@ Detected **log patterns** — the drilldown UI's "group these lines by shape" vi
 |-------|-------|
 | `query` | LogQL **stream selector, matchers only** — required. ANY pipeline stage is rejected `400` (line filters included, like §2.6.1: templates are precomputed and the bodies are gone), as are metric queries |
 | `start`, `end`, `since` | §2's timestamp rules; default `end = now`, `start = min(end, now) - since`, `since = 1h`. Half-open `[start, end)` over the pattern buckets. `end < start` is **not** checked here — the reference's own exemption (§2 preamble) |
-| `step` | optional bucket size; a duration string or bare seconds. Absent → derived `clamp((end-start)/250, ≥1s)`. **Floored to the 10s ingest bucket** (never smaller — a finer step would invent sub-bucket granularity the stored data lacks). The `(end-start)/step` grid is capped at **11,000** (else `400`), the same bound as the metrics endpoints |
+| `step` | optional bucket size; a duration string or bare seconds. Absent → derived as **whole seconds**, the same `max(floor((end-start) in seconds / 250), 1)` rule §2.1 gives, and for the same reason: the reference derives this endpoint's step through the *same* shared helper — `ParsePatternsQuery` calls `step(r, start, end)` (`pkg/loghttp/patterns.go:20`), which falls back to `defaultQueryRangeStep` (`params.go:122-126,140-142`, @ grafana/loki v3.7.4 `b318f282`). The 10s floor is applied **after** that derivation: the derived (or supplied) step is **floored to the 10s ingest bucket**, never smaller — a finer step would invent sub-bucket granularity the stored data lacks. The floor is not a no-op over the derivation: it changes the answer whenever the derived whole second is not a multiple of ten. The `(end-start)/step` grid is capped at **11,000** (else `400`), the same bound as the metrics endpoints |
 
 Response `200`: the Loki-interop envelope `{"status":"success","data":[{"pattern":"<_> ...","samples":[[<unix_seconds>,<count>],...]},...]}`. `samples` are ascending by second, zero-count steps omitted, both elements bare integers (`unix_seconds` is the floor of the bucket ns). **`data` is ordered total-count desc then pattern asc, truncated to the top 1000 — NOT re-sorted client-side** (the top-N presentation is the contract; a PulsusDB determinism pin — upstream order is unspecified). **Count semantics** are exact on the clean ingest path and **best-effort approximate under ingest-failure re-sends**, at parity with §2.2's `log_metrics` (the writer never auto-replays a block that could have committed; a per-request burst of >10 000 distinct templates is an under-count event, folded into the same approximate semantics — see docs/schemas.md §3.1). With `X-Pulsus-Explain: 1`, `data.explain` (the §2.1 shape) is added — its `patterns_read` stage always targets `log_patterns`.
 
