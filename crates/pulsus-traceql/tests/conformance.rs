@@ -56,10 +56,10 @@ use pulsus_traceql::{TraceQlError, parse};
 // disposition ON. Naming them as tracked interim gaps owned by #335 is
 // what makes them visible; Stage D1 fixes all three and empties both
 // lists again.
-const VALID_ISSUES: [u64; 1] = [335];
+const VALID_ISSUES: [u64; 0] = [];
 // The committed open-issue allowlist the strict closeout gate enforces:
 // every interim entry's owning_issue must be in it.
-const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[335];
+const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[];
 const DOCS_PREFIX: &str = "https://grafana.com/docs/tempo/";
 const REPO_PREFIX: &str = "https://github.com/digitalis-io/pulsusdb/";
 
@@ -591,13 +591,16 @@ fn differential_categories_are_pinned() {
     // see a construct we never implemented. So `supported` 112 − 1 + 5 =
     // 116, and the three spellings the reference resolves and we refuse
     // are the first tracked interim gaps since #192 emptied the set.
-    // Stage D1 fixes all three and returns this to 119 / 0.
+    // Stage D1 then fixed all three — `unspecified` is the sixth
+    // SpanKindValue variant and `minInt`/`maxInt` resolve in
+    // `static_value_of` — so each flipped to `supported` with its own
+    // corpus case: 119, and the interim set is empty again.
     assert_eq!(
-        supported, 116,
+        supported, 119,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(
-        tracked_interim, 3,
+        tracked_interim, 0,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(

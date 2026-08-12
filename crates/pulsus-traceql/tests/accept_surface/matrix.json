@@ -124,12 +124,15 @@
       "reference": "'unspecified' is the first member of the Kind enum and a `static` terminal of its own (expr.y:436), so it is a value wherever any other kind keyword is.",
       "pulsus": "SpanKindValue enumerates five members; the bare identifier 'unspecified' is a positioned parse error in every operand and hint position.",
       "impact": "accept-surface",
-      "status": "open",
+      "status": "closed",
       "subject_kind": "lexical",
       "subject_atoms": [
         "unspecified"
       ],
-      "stage": "D1"
+      "stage": "D1",
+      "closed_by": 335,
+      "wire_status": "open",
+      "wire_note": "PARSE axis closed, wire axis not. Stage D1 added the sixth SpanKindValue variant, so all five probes parse and validate. On the WIRE (parse -> validate -> plan) one of them is still a planner 400 where the reference answers 2xx: `{ .a = unspecified }` compares an ATTRIBUTE against a kind static, and traces/filter.rs's attribute predicate has arms for string, bool, number, duration and regex values but none for a kind or status keyword. That gap predates D13 (`{ .a = server }` has the same shape) and D13 is what made it reachable through a probe. The four kind-INTRINSIC and hint probes reach 2xx. See wire_baseline.json."
     },
     {
       "id": "D14",
@@ -137,13 +140,14 @@
       "reference": "The `static` production resolves the bare identifiers minInt and maxInt to math.MinInt / math.MaxInt from the token alone, with no left context (expr.y:442-452); every other identifier is 'unknown identifier'.",
       "pulsus": "No identifier resolves to a numeric static; both spellings are a positioned parse error.",
       "impact": "accept-surface",
-      "status": "open",
+      "status": "closed",
       "subject_kind": "lexical",
       "subject_atoms": [
         "maxInt",
         "minInt"
       ],
-      "stage": "D1"
+      "stage": "D1",
+      "closed_by": 335
     },
     {
       "id": "D15",
@@ -246,10 +250,11 @@
       "reference": "`root: root hints` (expr.y:134) is recursive, so a root query may carry more than one with(...) clause and their hints concatenate.",
       "pulsus": "The root hint clause is parsed once; a second with(...) is trailing input.",
       "impact": "accept-surface",
-      "status": "open",
+      "status": "closed",
       "subject_kind": "positional",
       "subject_atoms": [],
-      "stage": "D1"
+      "stage": "D1",
+      "closed_by": 335
     },
     {
       "id": "D24",
@@ -1726,168 +1731,75 @@
     {
       "query": "{ .a = 1 } with(k=unspecified)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D13",
-      "reachability": "r1-client-emitted",
-      "subject": "unspecified",
-      "reachability_evidence": {
-        "kind": "capture",
-        "capture": "cap.kind-tag-values",
-        "observed_value": "unspecified"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D13"
     },
     {
       "query": "{ .a = unspecified }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D13",
-      "reachability": "r1-client-emitted",
-      "subject": "unspecified",
-      "reachability_evidence": {
-        "kind": "capture",
-        "capture": "cap.kind-tag-values",
-        "observed_value": "unspecified"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D13",
+      "owning_issue": 335
     },
     {
       "query": "{ kind != unspecified }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D13",
-      "reachability": "r1-client-emitted",
-      "subject": "unspecified",
-      "reachability_evidence": {
-        "kind": "capture",
-        "capture": "cap.kind-tag-values",
-        "observed_value": "unspecified"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D13"
     },
     {
       "query": "{ kind = unspecified }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D13",
-      "reachability": "r1-client-emitted",
-      "subject": "unspecified",
-      "reachability_evidence": {
-        "kind": "capture",
-        "capture": "cap.kind-tag-values",
-        "observed_value": "unspecified"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D13"
     },
     {
       "query": "{ span:kind = unspecified }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D13",
-      "reachability": "r1-client-emitted",
-      "subject": "unspecified",
-      "reachability_evidence": {
-        "kind": "capture",
-        "capture": "cap.kind-tag-values",
-        "observed_value": "unspecified"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D13"
     },
     {
       "query": "{ .a < maxInt }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D14",
-      "reachability": "r4-no-traceql-surface-path",
-      "subject": "maxInt",
-      "reachability_evidence": {
-        "kind": "absence-sweep",
-        "tool": "git grep",
-        "flags": [
-          "-n",
-          "-i",
-          "-F"
-        ],
-        "token": "maxInt",
-        "revision": "v13.1.5",
-        "scope": [
-          ""
-        ],
-        "hits": 0
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D14"
     },
     {
       "query": "{ .a = 1 } with(k=maxInt)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D14",
-      "reachability": "r4-no-traceql-surface-path",
-      "subject": "maxInt",
-      "reachability_evidence": {
-        "kind": "absence-sweep",
-        "tool": "git grep",
-        "flags": [
-          "-n",
-          "-i",
-          "-F"
-        ],
-        "token": "maxInt",
-        "revision": "v13.1.5",
-        "scope": [
-          ""
-        ],
-        "hits": 0
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D14"
     },
     {
       "query": "{ .a = maxInt - 1 }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D14",
-      "reachability": "r4-no-traceql-surface-path",
-      "subject": "maxInt",
-      "reachability_evidence": {
-        "kind": "absence-sweep",
-        "tool": "git grep",
-        "flags": [
-          "-n",
-          "-i",
-          "-F"
-        ],
-        "token": "maxInt",
-        "revision": "v13.1.5",
-        "scope": [
-          ""
-        ],
-        "hits": 0
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D14"
     },
     {
       "query": "{ .a = minInt }",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D14",
-      "reachability": "r4-no-traceql-surface-path",
-      "subject": "minInt",
-      "reachability_evidence": {
-        "kind": "absence-sweep",
-        "tool": "git grep",
-        "flags": [
-          "-n",
-          "-i",
-          "-F"
-        ],
-        "token": "minInt",
-        "revision": "v13.1.5",
-        "scope": [
-          ""
-        ],
-        "hits": 0
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D14"
     },
     {
       "query": "{ !.a = nil }",
@@ -2533,17 +2445,10 @@
     {
       "query": "{ .a = 1 } with(a=1) with(b=2)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D23",
-      "reachability": "r3-highlighted-only",
-      "reachability_evidence": {
-        "kind": "highlight-only",
-        "anchors": [
-          "ds.keyword-list",
-          "ds.empty-situation"
-        ]
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D23"
     },
     {
       "query": "avg(.a) > 1",

@@ -1,0 +1,26 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Unscoped,
+                            key: "a",
+                        },
+                    ),
+                    rhs: Literal(
+                        Number(
+                            "-9223372036854775808",
+                        ),
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}

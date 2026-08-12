@@ -36,6 +36,7 @@ accept/field_or
 accept/field_parens
 accept/field_precedence
 accept/hints_most_recent
+accept/hints_repeated
 accept/intrinsic_colon_space_after
 accept/intrinsic_event_name
 accept/intrinsic_event_time_since_start
@@ -108,6 +109,9 @@ accept/spanset_precedence
 accept/static_kind_client
 accept/static_kind_consumer
 accept/static_kind_internal
+accept/static_kind_unspecified
+accept/static_max_int
+accept/static_min_int
 accept/string_escape_hex
 accept/string_escape_octal
 accept/string_escape_unicode

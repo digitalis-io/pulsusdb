@@ -406,8 +406,8 @@ struct ClosedMeaningProbe {
 /// 2xx. The class row carries `wire_status: "open"` saying so. Read these
 /// constants as "the grammar agrees", never as "these queries work".
 const TOTAL: usize = 306;
-const AGREE: usize = 250;
-const DIVERGE: usize = 56;
+const AGREE: usize = 260;
+const DIVERGE: usize = 46;
 const MEANING: usize = 6;
 const CLOSED_MEANING: usize = 7;
 
@@ -1793,10 +1793,15 @@ fn the_reachability_schema_header_records_its_residual() {
 /// from a committed summary. *RED when:* any probe changes tier in a way
 /// that moves a total.
 const TIER_HISTOGRAM: [(&str, usize); 4] = [
-    ("r1-client-emitted", 5),
+    // Stage D1 closed D13 (all 5 r1 probes), D14 (4 of r4) and D23 (1 of
+    // r3), and a closed probe drops its reachability record — the field is
+    // present exactly while the probe diverges. r1 is 0 because the ONE
+    // class a client actually emits is the one that got fixed first, which
+    // is the ranking doing its job rather than an empty bucket.
+    ("r1-client-emitted", 0),
     ("r2-skeleton-inserted", 8),
-    ("r3-highlighted-only", 18),
-    ("r4-no-traceql-surface-path", 25),
+    ("r3-highlighted-only", 17),
+    ("r4-no-traceql-surface-path", 21),
 ];
 
 #[test]
@@ -1852,16 +1857,16 @@ fn the_reachability_tier_histogram_is_pinned() {
 /// the FNV-1a prime and must not be "fixed".
 #[test]
 fn the_reachability_classification_is_frozen_against_a_silent_swap() {
-    const REACHABILITY_DIGEST: u64 = 0x81f8_4937_80c6_a07c;
+    const REACHABILITY_DIGEST: u64 = 0x2f31_d21e_1cdd_12db;
     let m = matrix();
     let r: Reachability = fixture("reachability.json");
 
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut byte = |b: u8, h: &mut u64| {
+    let byte = |b: u8, h: &mut u64| {
         *h ^= u64::from(b);
         *h = h.wrapping_mul(0x1000_0000_01b3);
     };
-    let mut field = |s: &str, h: &mut u64| {
+    let field = |s: &str, h: &mut u64| {
         for b in (s.len() as u64).to_be_bytes() {
             byte(b, h);
         }
@@ -1869,7 +1874,7 @@ fn the_reachability_classification_is_frozen_against_a_silent_swap() {
             byte(*b, h);
         }
     };
-    let mut list = |items: &[&str], h: &mut u64| {
+    let list = |items: &[&str], h: &mut u64| {
         for b in (items.len() as u64).to_be_bytes() {
             byte(b, h);
         }

@@ -560,8 +560,22 @@ fn status_code(v: StatusValue) -> i8 {
     }
 }
 
+/// The stored `kind` code is OTLP's `SpanKind`, not the reference's own
+/// `Kind` enum — the two order the members differently, and the column
+/// this predicate compares against is written from OTLP on ingest. So
+/// `unspecified` is 0, matching `metrics_sql.rs`'s `KIND_MAP`, which has
+/// mapped `0 -> 'unspecified'` since before the keyword was parseable
+/// (issue #335 Stage D1, class D13).
+///
+/// **This `match` is exhaustive with no wildcard on purpose.** It is the
+/// only one of the three read-path sites that interpret a span kind where
+/// the compiler can refuse a new variant: `search_eval.rs`'s
+/// `kind_keyword` has a `_ =>` arm and `metrics_sql.rs`'s `KIND_MAP` is a
+/// SQL string constant, so neither would have complained. Adding a
+/// wildcard here would remove the only type-checked one.
 fn kind_code(v: SpanKindValue) -> i8 {
     match v {
+        SpanKindValue::Unspecified => 0,
         SpanKindValue::Internal => 1,
         SpanKindValue::Server => 2,
         SpanKindValue::Client => 3,
