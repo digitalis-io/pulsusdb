@@ -38,7 +38,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChRow, QuerySettings, Row};
 use pulsus_logql::parse;
-use pulsus_read::logql::escape::ch_string;
+use pulsus_read::logql::predicate::{CheckedLiteral, MonthLiteral, literal};
 use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, StreamsPlan, plan};
@@ -106,7 +106,7 @@ struct ServiceRow {
 /// Derives the stage-3 `service` set from `log_streams_idx` **without**
 /// hydrating labels (variant `late_idx`) — `service_name` is a queryable
 /// key in `log_streams_idx` (docs/schemas.md §3.1).
-fn service_set_from_idx(streams_idx_table: &str, months: &[String], fps: &[u64]) -> String {
+fn service_set_from_idx(streams_idx_table: &str, months: &[MonthLiteral], fps: &[u64]) -> String {
     format!(
         "SELECT DISTINCT val AS service\nFROM {streams_idx_table}\nWHERE {} AND key = 'service_name' AND fingerprint IN ({})",
         month_clause(months),
@@ -123,11 +123,18 @@ fn service_set_from_streams(streams_table: &str, fps: &[u64]) -> String {
     )
 }
 
-fn month_clause(months: &[String]) -> String {
+fn month_clause(months: &[MonthLiteral]) -> String {
     if months.len() == 1 {
-        format!("month = {}", months[0])
+        format!("month = {}", months[0].as_sql())
     } else {
-        format!("month IN ({})", months.join(", "))
+        format!(
+            "month IN ({})",
+            months
+                .iter()
+                .map(MonthLiteral::as_sql)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -324,7 +331,7 @@ pub async fn run_variant_once(
     client: &ChClient,
     tables: &Tables,
     sp: &StreamsPlan,
-    months: &[String],
+    months: &[MonthLiteral],
     breadth: u32,
     variant: Variant,
     base_id: &str,
@@ -393,7 +400,7 @@ pub async fn run_variant_once(
             svcs
         }
     };
-    let escaped: Vec<String> = services.iter().map(|s| ch_string(s)).collect();
+    let escaped: Vec<CheckedLiteral> = services.iter().map(|s| literal(s)).collect();
 
     // Stage 3 — samples, the production shape unmodified (never the gate's
     // total-order variant — that is F5's gate-only tool, see
@@ -522,7 +529,7 @@ pub async fn correctness_gate(
     tables: &Tables,
     summary: &BroadDatasetSummary,
     sp: &StreamsPlan,
-    months: &[String],
+    months: &[MonthLiteral],
     fps: &[u64],
     reference_envelope: &mut Option<ResultEnvelope>,
 ) -> anyhow::Result<(Vec<u64>, u64)> {
@@ -605,7 +612,7 @@ pub async fn correctness_gate(
         ("late_idx", &idx_services),
         ("late_proj", &proj_services),
     ] {
-        let escaped: Vec<String> = services.iter().map(|s| ch_string(s)).collect();
+        let escaped: Vec<CheckedLiteral> = services.iter().map(|s| literal(s)).collect();
         let sql3 = sql::stage3(
             &tables.samples,
             &escaped,

@@ -6,8 +6,16 @@
 //! direction/limit variants; and the `Instant`/`Range` `QuerySpec` shapes.
 
 use pulsus_logql::parse;
-use pulsus_read::logql::sql::{self, ScanLowerBound, ScanProjection, TimeWindow};
+use pulsus_read::logql::predicate::{CheckedFragment, literal, month_literal};
+use pulsus_read::logql::sql::{self, MetricShape, ScanLowerBound, ScanProjection, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
+
+/// Issue #286: `StreamsPlan::line_filters` / `MetricPlan::extra_predicates`
+/// are `Vec<CheckedFragment>`, so the byte-exact expectations below compare
+/// against the rendered text. Accessor only — no expected literal moved.
+fn sqls(fs: &[CheckedFragment]) -> Vec<&str> {
+    fs.iter().map(CheckedFragment::as_sql).collect()
+}
 
 fn ctx() -> PlanCtx<'static> {
     PlanCtx {
@@ -135,7 +143,7 @@ fn a_non_ascii_label_name_plans_identically_to_an_ascii_one() {
         &range_params(100, Direction::Backward),
     );
     let fps = [18374u64, 99120];
-    let services = ["'checkout'".to_string()];
+    let services = [literal("checkout")];
     assert_eq!(
         sliding_sql(&ascii, &services, &fps),
         sliding_sql(&non_ascii, &services, &fps),
@@ -144,7 +152,10 @@ fn a_non_ascii_label_name_plans_identically_to_an_ascii_one() {
     assert_eq!(ascii.table, non_ascii.table);
     assert_eq!(ascii.rollup, non_ascii.rollup);
     assert_eq!(ascii.routing.reason, non_ascii.routing.reason);
-    assert_eq!(ascii.extra_predicates, non_ascii.extra_predicates);
+    assert_eq!(
+        sqls(&ascii.extra_predicates),
+        sqls(&non_ascii.extra_predicates)
+    );
     let grouping = |mp: &pulsus_read::logql::MetricPlan| {
         mp.vector_aggs[0]
             .1
@@ -153,8 +164,8 @@ fn a_non_ascii_label_name_plans_identically_to_an_ascii_one() {
             .labels
             .clone()
     };
-    assert_eq!(grouping(&ascii), vec!["ex".to_string()]);
-    assert_eq!(grouping(&non_ascii), vec!["éx".to_string()]);
+    assert_eq!(grouping(&ascii), vec!["ex"]);
+    assert_eq!(grouping(&non_ascii), vec!["éx"]);
 }
 
 #[test]
@@ -231,10 +242,9 @@ fn line_filter_contains_pushes_down_token_prefilter_and_exact_predicate() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
-        sp.line_filters,
+        sqls(&sp.line_filters),
         vec![
             "hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0"
-                .to_string()
         ]
     );
 }
@@ -246,10 +256,9 @@ fn line_filter_not_contains_negates_the_whole_compound_predicate() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
-        sp.line_filters,
+        sqls(&sp.line_filters),
         vec![
             "NOT (hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0)"
-                .to_string()
         ]
     );
 }
@@ -260,7 +269,7 @@ fn line_filter_regex_uses_match_without_a_prefilter_when_not_a_plain_literal() {
         r#"{service_name="checkout"} |~ "err.*""#,
         &range_params(100, Direction::Backward),
     );
-    assert_eq!(sp.line_filters, vec!["match(body, 'err.*')".to_string()]);
+    assert_eq!(sqls(&sp.line_filters), vec!["match(body, 'err.*')"]);
 }
 
 #[test]
@@ -270,10 +279,9 @@ fn line_filter_regex_extracts_a_token_prefilter_for_a_plain_literal_pattern() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
-        sp.line_filters,
+        sqls(&sp.line_filters),
         vec![
             "hasToken(body, 'connection') AND hasToken(body, 'refused') AND match(body, 'connection refused')"
-                .to_string()
         ]
     );
 }
@@ -284,10 +292,7 @@ fn line_filter_not_regex_negates_the_whole_compound_predicate() {
         r#"{service_name="checkout"} !~ "err.*""#,
         &range_params(100, Direction::Backward),
     );
-    assert_eq!(
-        sp.line_filters,
-        vec!["NOT (match(body, 'err.*'))".to_string()]
-    );
+    assert_eq!(sqls(&sp.line_filters), vec!["NOT (match(body, 'err.*'))"]);
 }
 
 #[test]
@@ -299,10 +304,9 @@ fn or_line_filter_of_literals_pushes_down_as_a_parenthesized_disjunction() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
-        sp.line_filters,
+        sqls(&sp.line_filters),
         vec![
             "((hasToken(body, 'foo') AND position(body, 'foo') > 0) OR (hasToken(body, 'bar') AND position(body, 'bar') > 0))"
-                .to_string()
         ]
     );
 }
@@ -314,10 +318,9 @@ fn or_line_filter_negative_op_wraps_the_disjunction_in_not() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
-        sp.line_filters,
+        sqls(&sp.line_filters),
         vec![
             "NOT ((hasToken(body, 'foo') AND position(body, 'foo') > 0) OR (hasToken(body, 'bar') AND position(body, 'bar') > 0))"
-                .to_string()
         ]
     );
 }
@@ -332,14 +335,14 @@ fn ip_line_filter_is_not_pushed_down_while_a_sibling_literal_filter_is() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
-        sp.line_filters,
-        vec!["hasToken(body, 'boot') AND position(body, 'boot') > 0".to_string()],
+        sqls(&sp.line_filters),
+        vec!["hasToken(body, 'boot') AND position(body, 'boot') > 0"],
         "only the literal filter pushes down; the ip() filter is client-side"
     );
     assert!(
-        !sp.line_filters
-            .iter()
-            .any(|f| f.contains("10.0.0.0") || f.to_ascii_lowercase().contains("ip")),
+        !sp.line_filters.iter().any(|f| {
+            f.as_sql().contains("10.0.0.0") || f.as_sql().to_ascii_lowercase().contains("ip")
+        }),
         "no ip() predicate may leak into the pushed-down SQL: {:?}",
         sp.line_filters
     );
@@ -353,7 +356,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
     );
     let sql = sql::stage3(
         &sp.samples_table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[18374, 99120],
         TimeWindow {
             start_ns: sp.start_ns,
@@ -398,7 +401,7 @@ fn stage3_breaks_timestamp_ties_with_the_same_total_order_as_the_keyset_builder(
         };
         let fast = sql::stage3(
             "log_samples",
-            &["'checkout'".to_string()],
+            &[literal("checkout")],
             &[1],
             window,
             &[],
@@ -407,7 +410,7 @@ fn stage3_breaks_timestamp_ties_with_the_same_total_order_as_the_keyset_builder(
         );
         let paged = sql::stage3_keyset(
             "log_samples",
-            &["'checkout'".to_string()],
+            &[literal("checkout")],
             &[1],
             window,
             sql::KeysetLower::First,
@@ -435,7 +438,7 @@ fn stage3_breaks_timestamp_ties_with_the_same_total_order_as_the_keyset_builder(
 fn stage3_uses_in_list_for_more_than_one_service() {
     let sql = sql::stage3(
         "log_samples",
-        &["'checkout'".to_string(), "'billing'".to_string()],
+        &[literal("checkout"), literal("billing")],
         &[1, 2],
         TimeWindow {
             start_ns: START_NS,
@@ -452,7 +455,7 @@ fn stage3_uses_in_list_for_more_than_one_service() {
 fn direction_forward_orders_ascending() {
     let sql = sql::stage3(
         "log_samples",
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[1],
         TimeWindow {
             start_ns: START_NS,
@@ -470,7 +473,7 @@ fn direction_forward_orders_ascending() {
 fn direction_backward_orders_descending() {
     let sql = sql::stage3(
         "log_samples",
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[1],
         TimeWindow {
             start_ns: START_NS,
@@ -502,14 +505,14 @@ fn a_line_filter_before_a_parser_still_pushes_down_byte_identically() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
-        with_parser.line_filters, plain.line_filters,
+        sqls(&with_parser.line_filters),
+        sqls(&plain.line_filters),
         "the parser/label-filter stages must not disturb the pushdown predicate"
     );
     assert_eq!(
-        with_parser.line_filters,
+        sqls(&with_parser.line_filters),
         vec![
             "hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0"
-                .to_string()
         ]
     );
     // The label filter is an unpushed dropping stage: the scan oversamples
@@ -519,7 +522,7 @@ fn a_line_filter_before_a_parser_still_pushes_down_byte_identically() {
 
     let sql = sql::stage3(
         &with_parser.samples_table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[18374],
         TimeWindow {
             start_ns: with_parser.start_ns,
@@ -550,7 +553,7 @@ fn a_line_filter_after_line_format_is_absent_from_stage3_sql() {
     );
     let sql = sql::stage3(
         &sp.samples_table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[18374],
         TimeWindow {
             start_ns: sp.start_ns,
@@ -597,7 +600,8 @@ fn a_leading_line_filter_before_the_new_stages_pushes_down_byte_identically() {
     ] {
         let sp = streams_plan(query, &range_params(100, Direction::Backward));
         assert_eq!(
-            sp.line_filters, plain.line_filters,
+            sqls(&sp.line_filters),
+            sqls(&plain.line_filters),
             "the new stage must not disturb the leading pushdown predicate: {query}"
         );
     }
@@ -631,8 +635,8 @@ fn a_line_filter_after_drop_or_keep_still_pushes_down() {
     ] {
         let sp = streams_plan(query, &range_params(100, Direction::Backward));
         assert_eq!(
-            sp.line_filters,
-            vec!["hasToken(body, 'err') AND position(body, 'err') > 0".to_string()],
+            sqls(&sp.line_filters),
+            vec!["hasToken(body, 'err') AND position(body, 'err') > 0"],
             "a line filter after drop/keep must still push down: {query}"
         );
     }
@@ -757,7 +761,7 @@ fn projection_of(mp: &pulsus_read::logql::MetricPlan) -> ScanProjection {
 /// (PK-prefix engagement) stays pinned.
 fn sliding_sql(
     mp: &pulsus_read::logql::MetricPlan,
-    services: &[String],
+    services: &[pulsus_read::logql::predicate::CheckedLiteral],
     fingerprints: &[u64],
 ) -> String {
     sql::metric_raw_samples_sliding(
@@ -810,7 +814,7 @@ fn a_structured_metadata_key_in_the_selector_resolves_against_the_stream_index()
         "stage 1 never mentions structured metadata: {}",
         mp.stage1_sql
     );
-    let read = sliding_sql(&mp, &["'checkout'".to_string()], &[101]);
+    let read = sliding_sql(&mp, &[literal("checkout")], &[101]);
     let (select, rest) = read.split_once("\nFROM ").expect("a SELECT list");
     assert!(select.contains("structured_metadata"));
     assert!(
@@ -832,7 +836,7 @@ fn a_line_filter_range_slides_raw_and_pushes_the_filter_down() {
     assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = sliding_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
+    let sql = sliding_sql(&mp, &[literal("checkout")], &[101, 205]);
     assert!(
         sql.contains("PREWHERE service = 'checkout'\n"),
         "sliding raw scan must carry PREWHERE service, got:\n{sql}"
@@ -849,7 +853,7 @@ fn bytes_range_with_a_line_filter_slides_raw() {
     assert!(mp.client.is_some());
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = sliding_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
+    let sql = sliding_sql(&mp, &[literal("checkout")], &[101, 205]);
     assert!(
         sql.contains("PREWHERE service = 'checkout'\n"),
         "sliding raw scan must carry PREWHERE service, got:\n{sql}"
@@ -873,11 +877,7 @@ fn a_non_dividing_step_still_slides_raw_for_range() {
     assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = sliding_sql(
-        &mp,
-        &["'checkout'".to_string(), "'billing'".to_string()],
-        &[101, 205],
-    );
+    let sql = sliding_sql(&mp, &[literal("checkout"), literal("billing")], &[101, 205]);
     assert!(
         sql.contains("PREWHERE service IN ('checkout', 'billing')\n"),
         "sliding raw scan must carry PREWHERE service IN (...) for multiple services, got:\n{sql}"
@@ -898,16 +898,12 @@ fn a_range_query_never_routes_to_the_rollup() {
     // The sliding raw scan DOES carry a service PREWHERE (unlike the old
     // rollup path) to keep the `(service, fingerprint, timestamp_ns)` PK
     // prefix engaged.
-    let sql = sliding_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
+    let sql = sliding_sql(&mp, &[literal("checkout")], &[101, 205]);
     assert!(sql.contains("PREWHERE service = 'checkout'\n"));
 }
 
 fn rollup_source() -> sql::MetricSource<'static> {
-    sql::MetricSource {
-        table: "log_metrics_5s",
-        bucket_col: "bucket_ns",
-        agg_expr: "sum(count)",
-    }
+    sql::MetricSource::new("log_metrics_5s", MetricShape::RollupCount)
 }
 
 #[test]
@@ -1029,7 +1025,7 @@ const ACTIVE_UNSCOPED: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
 fn detected_labels_unscoped_is_byte_exact() {
     let sql = sql::detected_labels(
         "log_streams_idx",
-        &["'2026-07-01'".to_string()],
+        &[month_literal(2026, 7)],
         None,
         "log_metrics_5s",
         DISCOVERY_WINDOW,
@@ -1059,7 +1055,7 @@ fn detected_labels_unscoped_is_byte_exact() {
 fn detected_labels_scoped_is_byte_exact() {
     let sql = sql::detected_labels(
         "log_streams_idx",
-        &["'2026-07-01'".to_string(), "'2026-08-01'".to_string()],
+        &[month_literal(2026, 7), month_literal(2026, 8)],
         Some(&[101, 205]),
         "log_metrics_5s",
         DISCOVERY_WINDOW,
@@ -1087,7 +1083,7 @@ fn label_names_is_byte_exact() {
     assert_eq!(
         sql::label_names(
             "log_streams_idx",
-            &["'2026-07-01'".to_string()],
+            &[month_literal(2026, 7)],
             "log_metrics_5s",
             DISCOVERY_WINDOW,
             DISCOVERY_RES_NS,
@@ -1110,8 +1106,8 @@ fn label_values_is_byte_exact() {
     assert_eq!(
         sql::label_values(
             "log_streams_idx",
-            &["'2026-07-01'".to_string()],
-            "'env'",
+            &[month_literal(2026, 7)],
+            &literal("env"),
             "log_metrics_5s",
             DISCOVERY_WINDOW,
             DISCOVERY_RES_NS,
@@ -1209,7 +1205,7 @@ fn vector_agg_sum_by_captures_the_grouping_labels() {
     assert_eq!(*op, pulsus_logql::VectorAggOp::Sum);
     let grouping = grouping.as_ref().expect("by grouping");
     assert_eq!(grouping.kind, pulsus_logql::GroupingKind::By);
-    assert_eq!(grouping.labels, vec!["service_name".to_string()]);
+    assert_eq!(grouping.labels, vec!["service_name"]);
     // `unwrap_vector_aggs` strips the `sum by (...)` wrapper before the
     // routing decision is made, so a vector-agg-wrapped range agg routes
     // identically to the bare `rate(...)` it wraps — issue #227: the
@@ -1259,7 +1255,7 @@ fn client_metric_sql(mp: &pulsus_read::logql::MetricPlan) -> String {
     // Issue #227: a range client query reads via the PK-ordered sliding scan.
     pulsus_read::logql::sql::metric_raw_samples_sliding(
         &mp.table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[18374, 99120],
         TimeWindow {
             start_ns: mp.start_ns,
@@ -1421,7 +1417,7 @@ fn n_variants(n: usize, common: &str) -> String {
 /// extra probe, no extra round-trip.
 #[test]
 fn variants_scan_sql_is_byte_identical_to_the_single_extractor_plan() {
-    let services = &["'checkout'".to_string()];
+    let services = &[literal("checkout")];
     let fps = &[101u64, 205];
     for params in [
         range_params(100, Direction::Backward),
@@ -1499,7 +1495,8 @@ fn variants_scan_sql_is_byte_identical_to_the_single_extractor_plan() {
             "a live variant prefix must not reach stage-1 SQL"
         );
         assert_eq!(
-            wrapped.extra_predicates, stripped.extra_predicates,
+            sqls(&wrapped.extra_predicates),
+            sqls(&stripped.extra_predicates),
             "a live variant prefix must not become a scan predicate"
         );
         assert_eq!(
@@ -1548,12 +1545,12 @@ const OFFSET_AT_NS: i64 = i64::MAX - 3_600_000_000_000 + 1;
 /// that would reach ClickHouse.
 fn instant_sql(mp: &pulsus_read::logql::MetricPlan, fingerprints: &[u64]) -> String {
     sql::metric_instant(
-        sql::MetricSource {
-            table: &mp.table,
-            bucket_col: mp.bucket_col,
-            agg_expr: mp.agg_expr,
-        },
-        &["'checkout'".to_string()],
+        sql::MetricSource::new(
+            &mp.table,
+            mp.source_shape()
+                .expect("plan::metric_plan writes both columns out of MetricShape"),
+        ),
+        &[literal("checkout")],
         fingerprints,
         TimeWindow {
             start_ns: mp.start_ns,

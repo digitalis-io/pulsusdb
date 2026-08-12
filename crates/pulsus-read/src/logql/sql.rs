@@ -4,8 +4,18 @@
 //! [`super::plan`]) are responsible for pre-escaping every user-controlled
 //! fragment via [`super::escape`] before it reaches these builders — that
 //! is the injection boundary, not this module.
+//!
+//! **Issue #286 made most of that responsibility a type, not a convention.**
+//! Boolean predicate fragments arrive as [`super::predicate::CheckedFragment`],
+//! string literals as [`super::predicate::CheckedLiteral`], month partition
+//! literals as [`super::predicate::MonthLiteral`], and a metric read's
+//! bucket/aggregate columns as a [`MetricShape`] — none of which can be built
+//! from unchecked text outside `logql::predicate`. The table-name parameters
+//! deliberately stay `&str`; `predicate.rs`'s module doc records that residual
+//! and why neither candidate mechanism was taken.
 
 use super::params::Direction;
+use super::predicate::{CheckedFragment, CheckedLiteral, MonthLiteral};
 
 /// A half-open-below/closed-above nanosecond time bound (`ts > start AND ts
 /// <= end`, docs/schemas.md §3.2), grouped into one parameter so the stage
@@ -50,17 +60,176 @@ impl ScanLowerBound {
     }
 }
 
+/// Declares [`MetricShape`], its COMPLETE variant list and both column
+/// renderings from one source — the `vector_agg_ops!` precedent
+/// (`crates/pulsus-logql/src/ast.rs:2460-2504`, issue #406), for the same
+/// reason it gives: a hand-maintained `ALL` beside a hand-written enum is two
+/// sources, and [`MetricShape::from_columns`] enumerates through `ALL`.
+///
+/// A fifth shape cannot be added without supplying both column literals and
+/// landing in `ALL`, so the round-trip test covers it without being edited.
+/// There is **no `_ =>` arm** in any [`MetricShape`] impl and no second
+/// invocation is possible (`E0428`).
+///
+/// Per-variant docs travel through `$(#[$meta:meta])*`.
+macro_rules! metric_shapes {
+    ($($(#[$meta:meta])* $variant:ident => ($bucket:literal, $agg:literal),)+) => {
+        /// The complete set of `(bucket_col, agg_expr)` column shapes a
+        /// metric read can have: rollup vs raw × bytes vs count. Sealed so
+        /// [`MetricSource`] cannot carry caller text (issue #286).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum MetricShape { $($(#[$meta])* $variant),+ }
+
+        impl MetricShape {
+            /// Every variant, in declaration order — emitted by the same
+            /// invocation that declares them, so nothing that enumerates
+            /// through this slice can miss a shape the enum has.
+            pub const ALL: &'static [MetricShape] = &[$(MetricShape::$variant),+];
+
+            /// Wildcard-free by construction: the macro emits one arm per
+            /// variant and there is no `_ =>` arm to add one to.
+            pub const fn bucket_col(self) -> &'static str {
+                match self { $(MetricShape::$variant => $bucket),+ }
+            }
+
+            /// Wildcard-free by construction, as [`MetricShape::bucket_col`].
+            pub const fn agg_expr(self) -> &'static str {
+                match self { $(MetricShape::$variant => $agg),+ }
+            }
+        }
+    };
+}
+
+metric_shapes! {
+    /// `log_metrics_<res>` serving a count-family reducer.
+    RollupCount => ("bucket_ns", "sum(count)"),
+    /// `log_metrics_<res>` serving a bytes-family reducer.
+    RollupBytes => ("bucket_ns", "sum(bytes)"),
+    /// The `log_samples` raw fallback, count family.
+    RawCount => ("timestamp_ns", "count()"),
+    /// The `log_samples` raw fallback, bytes family.
+    RawBytes => ("timestamp_ns", "sum(length(body))"),
+}
+
+impl MetricShape {
+    /// The rollup shape for a count/bytes reducer.
+    pub const fn rollup(is_bytes: bool) -> Self {
+        if is_bytes {
+            MetricShape::RollupBytes
+        } else {
+            MetricShape::RollupCount
+        }
+    }
+
+    /// The raw-fallback shape for a count/bytes reducer.
+    pub const fn raw(is_bytes: bool) -> Self {
+        if is_bytes {
+            MetricShape::RawBytes
+        } else {
+            MetricShape::RawCount
+        }
+    }
+
+    /// The inverse, derived from [`MetricShape::ALL`] — so a shape added to
+    /// the `metric_shapes!` invocation is covered here without this function
+    /// being edited, and no `_ =>` arm exists that could swallow one.
+    /// `None` for any other column pair.
+    pub fn from_columns(bucket_col: &str, agg_expr: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|s| s.bucket_col() == bucket_col && s.agg_expr() == agg_expr)
+    }
+}
+
 /// Which physical table a metric read targets, and that table's
 /// bucket/aggregate column shape — the rollup-vs-raw routing decision
 /// [`super::plan::metric_plan`] makes, grouped into one parameter (same
 /// clippy argument-count reason as [`TimeWindow`]). Rollup-served reads
 /// `log_metrics_<res>` with `bucket_ns`/`sum(count)`|`sum(bytes)`; the raw
 /// fallback reads `log_samples` with `timestamp_ns`/`count()`|`sum(length(body))`.
+///
+/// **Issue #286 — the fields are private and the columns are an enum.**
+/// `bucket_col`/`agg_expr` were `pub &'a str` interpolated verbatim into the
+/// `SELECT` list and the `WHERE`, so a caller could pass
+/// `&format!("match(body, {…})", …)`. They are now a [`MetricShape`], which
+/// has exactly four inhabitants. The asymmetry with
+/// [`super::plan::MetricPlan`], whose equivalents are still strings, is not a
+/// design preference: that struct's field set is pinned by issue #293's
+/// frozen `tests/golden/plan_build_differential.txt` — see
+/// [`super::plan::MetricPlan::source_shape`].
+///
+/// **`table` deliberately stays `&str`.** No enforced property covers it;
+/// `predicate.rs`'s module doc carries that residual, its ground (an
+/// observation about `PlanCtx`, of the kind review round 2 refused for
+/// `services`), and the two candidate mechanisms that were measured and
+/// declined.
 #[derive(Debug, Clone, Copy)]
 pub struct MetricSource<'a> {
-    pub table: &'a str,
-    pub bucket_col: &'a str,
-    pub agg_expr: &'a str,
+    table: &'a str,
+    shape: MetricShape,
+}
+
+impl<'a> MetricSource<'a> {
+    /// The ONLY constructor. The column shape can only be one of
+    /// [`MetricShape::ALL`]; `table` is a trusted schema name — see the
+    /// residual note on the type.
+    ///
+    /// The pre-#286 bypass — caller text straight into the `SELECT` list —
+    /// no longer compiles:
+    ///
+    /// ```compile_fail,E0560
+    /// let _ = pulsus_read::logql::sql::MetricSource {
+    ///     table: "t",
+    ///     bucket_col: "b",
+    ///     agg_expr: "match(body, '(')",
+    /// };
+    /// ```
+    ///
+    /// **The code above is `E0560`, not the `E0451` a reader might expect**,
+    /// and it was measured rather than assumed: the two column fields no
+    /// longer exist, so rustc reports `struct MetricSource<'_> has no field
+    /// named bucket_col`/`agg_expr` and aborts before the privacy check on
+    /// `table`. The privacy seal on its own is this, naming only real fields:
+    ///
+    /// ```compile_fail,E0451
+    /// use pulsus_read::logql::sql::{MetricShape, MetricSource};
+    /// let _ = MetricSource { table: "t", shape: MetricShape::RawCount };
+    /// ```
+    ///
+    /// **Note on what a `compile_fail` fence does and does not check
+    /// (measured, issue #286):** rustdoc runs the snippet and requires it to
+    /// FAIL, but it does **not** verify the annotated error code —
+    /// `compile_fail,E0999`, a code that does not exist, passes. The codes
+    /// above are therefore documentation of a measurement, not a gate. What
+    /// makes a fence worth something is its REMOVAL TEST, and both of these
+    /// have been watched go green when the property they name is deleted:
+    /// `pub table` + `pub shape` turns the second one green, and the first
+    /// one goes green **only** when the entire pre-#286
+    /// `{ pub table, pub bucket_col, pub agg_expr }` shape is restored —
+    /// re-adding just the two column fields leaves it red on the missing
+    /// `shape`, which was measured rather than assumed (`predicate.rs`'s
+    /// module doc carries the whole table). The compiling twin below shares
+    /// their skeleton so a typo cannot make them pass for the wrong reason.
+    ///
+    /// ```
+    /// use pulsus_read::logql::sql::{MetricShape, MetricSource};
+    /// let s = MetricSource::new("log_samples", MetricShape::RawCount);
+    /// assert_eq!(s.shape().agg_expr(), "count()");
+    /// ```
+    pub fn new(table: &'a str, shape: MetricShape) -> Self {
+        MetricSource { table, shape }
+    }
+
+    /// The physical table name.
+    pub fn table(&self) -> &'a str {
+        self.table
+    }
+
+    /// The sealed bucket/aggregate column shape.
+    pub fn shape(&self) -> MetricShape {
+        self.shape
+    }
 }
 
 /// Stage 1 — single-pass stream resolution over `log_streams_idx`
@@ -76,21 +245,24 @@ pub struct MetricSource<'a> {
 /// the snapshot contract.
 pub fn stage1(
     streams_idx_table: &str,
-    months: &[String],
-    positive_branches: &[String],
-    negative_branches: &[String],
+    months: &[MonthLiteral],
+    positive_branches: &[CheckedFragment],
+    negative_branches: &[CheckedFragment],
 ) -> String {
     let month_clause = month_clause(months);
 
-    let mut where_branches: Vec<&str> = positive_branches.iter().map(String::as_str).collect();
-    where_branches.extend(negative_branches.iter().map(String::as_str));
+    let mut where_branches: Vec<&str> = positive_branches
+        .iter()
+        .map(CheckedFragment::as_sql)
+        .collect();
+    where_branches.extend(negative_branches.iter().map(CheckedFragment::as_sql));
     let where_or_list = where_branches.join(" OR ");
 
     let having = if negative_branches.is_empty() {
         format!("uniqExact(key, val) = {}", positive_branches.len())
     } else {
-        let pos_or = positive_branches.join(" OR ");
-        let neg_or = negative_branches.join(" OR ");
+        let pos_or = join_fragments(positive_branches);
+        let neg_or = join_fragments(negative_branches);
         format!(
             "uniqExactIf((key, val), {pos_or}) = {}\n   AND countIf({neg_or}) = 0",
             positive_branches.len()
@@ -108,8 +280,13 @@ pub fn stage1(
 /// selector contains at least one regex matcher — pure-equality selectors
 /// are point ranges and skip probes entirely (architect plan: "Selectivity
 /// probes").
-pub fn probe(streams_idx_table: &str, months: &[String], key_literal: &str) -> String {
+pub fn probe(
+    streams_idx_table: &str,
+    months: &[MonthLiteral],
+    key_literal: &CheckedLiteral,
+) -> String {
     let month_clause = month_clause(months);
+    let key_literal = key_literal.as_sql();
     format!(
         "SELECT count() AS n\nFROM {streams_idx_table}\nWHERE {month_clause} AND key = {key_literal}"
     )
@@ -130,7 +307,7 @@ pub fn probe(streams_idx_table: &str, months: &[String], key_literal: &str) -> S
 /// deferred (docs/api.md §2.3), so this form is always unscoped.
 pub fn label_names(
     streams_idx_table: &str,
-    months: &[String],
+    months: &[MonthLiteral],
     rollup_table: &str,
     window: TimeWindow,
     rollup_res_ns: u64,
@@ -154,27 +331,19 @@ pub fn label_names(
 /// semi-join applies the request's own window.
 pub fn label_values(
     streams_idx_table: &str,
-    months: &[String],
-    key_literal: &str,
+    months: &[MonthLiteral],
+    key_literal: &CheckedLiteral,
     rollup_table: &str,
     window: TimeWindow,
     rollup_res_ns: u64,
 ) -> String {
+    let key_literal = key_literal.as_sql();
     format!(
         "SELECT DISTINCT val AS value\nFROM {streams_idx_table}\nWHERE {} AND key = {key_literal}\n  AND fingerprint IN ({})\nORDER BY value",
         month_clause(months),
         active_fingerprints(rollup_table, None, window, rollup_res_ns)
     )
 }
-
-/// The four textual forms Go's `uuid.Parse` accepts (issue #170,
-/// `/detected_labels`' ID-likeness reference, grafana/loki:3.4.2
-/// `containsAllIDTypes`): plain hyphenated 8-4-4-4-12 (optionally
-/// `urn:uuid:`-prefixed), `{hyphenated}` (both braces required), and bare
-/// 32-hex. Case-insensitive (`(?i)`), fully anchored — rendered through
-/// [`super::escape::ch_string`] into [`detected_labels`]' `match(val, ...)`
-/// predicate, the single implementation (SQL only, no Rust twin to drift).
-const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}|[0-9a-f]{32})$";
 
 /// Detected-labels aggregation over the stream index (issue #170,
 /// docs/api.md §2.6): one output row per distinct key within `months`,
@@ -185,7 +354,8 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 /// per-family measurements and the cost that decided it) and
 /// `non_id_values` counting
 /// values that are neither a float (`toFloat64OrNull`) nor a UUID
-/// ([`UUID_RE`]) — the server-side half of the reference's
+/// ([`super::predicate::non_id_values_expr`], whose `UUID_RE` constant moved
+/// there with it in issue #286) — the server-side half of the reference's
 /// `containsAllIDTypes` relevance filter (the keep rule — static label OR
 /// `non_id_values > 0` — applies client-side in `exec`). `fingerprints` =
 /// `None` for the unscoped form; `Some` pushes the caller's stage-1 result
@@ -202,17 +372,18 @@ const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 /// ten-minute request was answered from the whole calendar month.
 pub fn detected_labels(
     streams_idx_table: &str,
-    months: &[String],
+    months: &[MonthLiteral],
     fingerprints: Option<&[u64]>,
     rollup_table: &str,
     window: TimeWindow,
     rollup_res_ns: u64,
 ) -> String {
     let month_clause = month_clause(months);
-    let uuid_literal = super::escape::ch_string(UUID_RE);
+    let non_id_values = super::predicate::non_id_values_expr();
+    let non_id_values = non_id_values.as_sql();
     let active = active_fingerprints(rollup_table, fingerprints, window, rollup_res_ns);
     format!(
-        "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {uuid_literal})) AS non_id_values\nFROM {streams_idx_table}\nWHERE {month_clause}\n  AND fingerprint IN ({active})\nGROUP BY key\nORDER BY key"
+        "SELECT key, uniqExact(val) AS cardinality, {non_id_values} AS non_id_values\nFROM {streams_idx_table}\nWHERE {month_clause}\n  AND fingerprint IN ({active})\nGROUP BY key\nORDER BY key"
     )
 }
 
@@ -272,12 +443,29 @@ pub fn active_fingerprints(
 /// The `month = '...'` / `month IN (...)` clause shared by every stage-1-
 /// style `log_streams_idx` scan in this module (`months` is at least one
 /// pre-rendered `'YYYY-MM-01'` date literal).
-fn month_clause(months: &[String]) -> String {
+fn month_clause(months: &[MonthLiteral]) -> String {
     if months.len() == 1 {
-        format!("month = {}", months[0])
+        format!("month = {}", months[0].as_sql())
     } else {
-        format!("month IN ({})", months.join(", "))
+        format!(
+            "month IN ({})",
+            months
+                .iter()
+                .map(MonthLiteral::as_sql)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
+}
+
+/// `" OR "`-joins a fragment list — the one place [`stage1`]'s `HAVING`
+/// conditional form unwraps its branches.
+fn join_fragments(branches: &[CheckedFragment]) -> String {
+    branches
+        .iter()
+        .map(CheckedFragment::as_sql)
+        .collect::<Vec<_>>()
+        .join(" OR ")
 }
 
 /// Stage 2 — hydration (docs/schemas.md §3.2 line 307), byte-exact to the
@@ -334,10 +522,10 @@ pub fn stage2(streams_table: &str, fingerprints: &[u64]) -> String {
 /// with the probe, both sequences, and why matching it is separate work.
 pub fn stage3(
     samples_table: &str,
-    services: &[String],
+    services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: TimeWindow,
-    line_filters: &[String],
+    line_filters: &[CheckedFragment],
     direction: Direction,
     limit: u32,
 ) -> String {
@@ -354,7 +542,7 @@ pub fn stage3(
     );
     for clause in line_filters {
         sql.push_str("\n  AND ");
-        sql.push_str(clause);
+        sql.push_str(clause.as_sql());
     }
     sql.push_str(&format!(
         "\nORDER BY timestamp_ns {order}, fingerprint {order}, cityHash64(body) {order}, body \
@@ -421,12 +609,12 @@ pub enum KeysetLower {
 #[allow(clippy::too_many_arguments)]
 pub fn stage3_keyset(
     samples_table: &str,
-    services: &[String],
+    services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: TimeWindow,
     lower: KeysetLower,
     direction: Direction,
-    line_filters: &[String],
+    line_filters: &[CheckedFragment],
     limit: u32,
 ) -> String {
     let service_pred = service_predicate(services);
@@ -467,7 +655,7 @@ pub fn stage3_keyset(
     }
     for clause in line_filters {
         sql.push_str("\n  AND ");
-        sql.push_str(clause);
+        sql.push_str(clause.as_sql());
     }
     let ord = match direction {
         Direction::Forward => "ASC",
@@ -508,10 +696,10 @@ pub fn log_stats_rollup(rollup_table: &str, fingerprints: &[u64], window: TimeWi
 /// count matching lines exactly.
 pub fn log_stats_raw(
     samples_table: &str,
-    services: &[String],
+    services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: TimeWindow,
-    line_filters: &[String],
+    line_filters: &[CheckedFragment],
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
@@ -521,7 +709,7 @@ pub fn log_stats_raw(
     );
     for clause in line_filters {
         sql.push_str("\n  AND ");
-        sql.push_str(clause);
+        sql.push_str(clause.as_sql());
     }
     sql
 }
@@ -596,18 +784,15 @@ pub fn log_patterns_read(
 /// the one this file documents against docs/schemas.md §3.2.
 pub fn metric_range(
     source: MetricSource<'_>,
-    services: &[String],
+    services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: TimeWindow,
     lower: ScanLowerBound,
     step_ns: u64,
-    extra_predicates: &[String],
+    extra_predicates: &[CheckedFragment],
 ) -> String {
-    let MetricSource {
-        table,
-        bucket_col,
-        agg_expr,
-    } = source;
+    let MetricSource { table, shape } = source;
+    let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
@@ -617,7 +802,7 @@ pub fn metric_range(
     );
     for clause in extra_predicates {
         sql.push_str(" AND ");
-        sql.push_str(clause);
+        sql.push_str(clause.as_sql());
     }
     sql.push_str("\nGROUP BY fingerprint, step");
     sql
@@ -648,18 +833,15 @@ pub fn metric_range(
 /// reachability argument holding forever.
 pub fn metric_instant(
     source: MetricSource<'_>,
-    services: &[String],
+    services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: TimeWindow,
     lower: ScanLowerBound,
-    extra_predicates: &[String],
+    extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
 ) -> String {
-    let MetricSource {
-        table,
-        bucket_col,
-        agg_expr,
-    } = source;
+    let MetricSource { table, shape } = source;
+    let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
     let fp_list = fp_list(fingerprints);
     let TimeWindow { start_ns, end_ns } = window;
     let lower_op = lower.sql_op();
@@ -670,7 +852,7 @@ pub fn metric_instant(
     );
     for clause in extra_predicates {
         sql.push_str(" AND ");
-        sql.push_str(clause);
+        sql.push_str(clause.as_sql());
     }
     sql.push_str(match projection {
         ScanProjection::Lean => "\nGROUP BY fingerprint",
@@ -750,11 +932,11 @@ impl ScanProjection {
 /// colliding key to `<k>_extracted` before any filter sees it.
 pub fn metric_raw_samples(
     samples_table: &str,
-    services: &[String],
+    services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: TimeWindow,
     lower: ScanLowerBound,
-    extra_predicates: &[String],
+    extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
 ) -> String {
     let service_pred = service_predicate(services);
@@ -767,7 +949,7 @@ pub fn metric_raw_samples(
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
-        sql.push_str(clause);
+        sql.push_str(clause.as_sql());
     }
     sql.push_str("\nORDER BY timestamp_ns ASC, fingerprint ASC, body ASC");
     sql
@@ -798,11 +980,11 @@ pub fn metric_raw_samples(
 /// existing key order already delivers them that way.
 pub fn metric_raw_samples_sliding(
     samples_table: &str,
-    services: &[String],
+    services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: TimeWindow,
     lower: ScanLowerBound,
-    extra_predicates: &[String],
+    extra_predicates: &[CheckedFragment],
     projection: ScanProjection,
 ) -> String {
     let service_pred = service_predicate(services);
@@ -815,7 +997,7 @@ pub fn metric_raw_samples_sliding(
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
-        sql.push_str(clause);
+        sql.push_str(clause.as_sql());
     }
     sql.push_str("\nORDER BY service ASC, fingerprint ASC, timestamp_ns ASC");
     sql
@@ -824,7 +1006,7 @@ pub fn metric_raw_samples_sliding(
 /// Renders the metric-read `PREWHERE service ...\n` line, or an empty
 /// string when `services` is empty (the rollup path — no `service` column
 /// to filter on).
-fn metric_prewhere(services: &[String]) -> String {
+fn metric_prewhere(services: &[CheckedLiteral]) -> String {
     if services.is_empty() {
         String::new()
     } else {
@@ -842,17 +1024,132 @@ fn fp_list(fingerprints: &[u64]) -> String {
 
 /// The singleton-equality/`IN` split shared by every stage 3 style
 /// predicate over a resolved value set (architect plan amendment §2).
-fn service_predicate(services: &[String]) -> String {
+fn service_predicate(services: &[CheckedLiteral]) -> String {
     if services.len() == 1 {
-        format!("service = {}", services[0])
+        format!("service = {}", services[0].as_sql())
     } else {
-        format!("service IN ({})", services.join(", "))
+        format!(
+            "service IN ({})",
+            services
+                .iter()
+                .map(CheckedLiteral::as_sql)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logql::predicate::{literal, month_literal};
+
+    /// The pushed-down fragment fixture these builders' loop tests append.
+    ///
+    /// Issue #286 replaced the previous hand-written
+    /// `positionCaseSensitive(body, 'err') > 0` string with a genuinely
+    /// minted one: [`CheckedFragment`] has no constructor outside
+    /// `logql::predicate`, and no mint renders `positionCaseSensitive`, so
+    /// the old fixture is not expressible. `|= "err"` renders
+    /// `hasToken(body, 'err') AND position(body, 'err') > 0`, and the three
+    /// expectations below carry that text instead. The property under test
+    /// — the builder appends each fragment behind its own `AND` — is
+    /// unchanged.
+    fn err_line_filter() -> CheckedFragment {
+        crate::logql::predicate::line_filter(&pulsus_logql::LineFilter {
+            op: pulsus_logql::LineFilterOp::Contains,
+            value: "err".to_string(),
+            value_is_ip: false,
+            or_matches: Vec::new(),
+        })
+        .expect("a Contains filter compiles no regex")
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #286: `MetricShape` — single-sourced, wildcard-free, total.
+    // -----------------------------------------------------------------
+
+    /// AC13(b): the inverse is derived from [`MetricShape::ALL`], which the
+    /// declaring `metric_shapes!` invocation emits — so a fifth shape is
+    /// covered here without this test being edited.
+    #[test]
+    fn metric_shape_round_trips_through_from_columns_for_every_variant() {
+        let mut covered = 0usize;
+        for &shape in MetricShape::ALL {
+            assert_eq!(
+                MetricShape::from_columns(shape.bucket_col(), shape.agg_expr()),
+                Some(shape),
+                "{shape:?} must round-trip"
+            );
+            covered += 1;
+        }
+        // Derived from the enum, NOT hand-listed: `ALL` is emitted by the
+        // same `metric_shapes!` invocation that declares the variants, so a
+        // shape added there is covered here without this test being edited
+        // (issue #286 AC16 — demonstrated by adding a fifth line and
+        // watching `covered` become 5).
+        assert_eq!(covered, MetricShape::ALL.len());
+        println!("metric_shape round-trip covered {covered} shapes");
+    }
+
+    /// AC13(c): caller text cannot masquerade as a column pair.
+    #[test]
+    fn metric_shape_from_columns_refuses_a_foreign_pair() {
+        assert_eq!(
+            MetricShape::from_columns("timestamp_ns", "match(body, '(')"),
+            None
+        );
+        assert_eq!(MetricShape::from_columns("bucket_ns", "count()"), None);
+        assert_eq!(MetricShape::from_columns("", ""), None);
+    }
+
+    /// AC13(d): the four pairs are, verbatim, the literals `plan.rs`'s
+    /// `metric_plan` spelled by hand before issue #286 sealed them.
+    #[test]
+    fn metric_shape_columns_are_the_pre_286_literals_verbatim() {
+        assert_eq!(MetricShape::rollup(false), MetricShape::RollupCount);
+        assert_eq!(MetricShape::rollup(true), MetricShape::RollupBytes);
+        assert_eq!(MetricShape::raw(false), MetricShape::RawCount);
+        assert_eq!(MetricShape::raw(true), MetricShape::RawBytes);
+        assert_eq!(
+            (
+                MetricShape::RollupCount.bucket_col(),
+                MetricShape::RollupCount.agg_expr()
+            ),
+            ("bucket_ns", "sum(count)")
+        );
+        assert_eq!(
+            (
+                MetricShape::RollupBytes.bucket_col(),
+                MetricShape::RollupBytes.agg_expr()
+            ),
+            ("bucket_ns", "sum(bytes)")
+        );
+        assert_eq!(
+            (
+                MetricShape::RawCount.bucket_col(),
+                MetricShape::RawCount.agg_expr()
+            ),
+            ("timestamp_ns", "count()")
+        );
+        assert_eq!(
+            (
+                MetricShape::RawBytes.bucket_col(),
+                MetricShape::RawBytes.agg_expr()
+            ),
+            ("timestamp_ns", "sum(length(body))")
+        );
+    }
+
+    /// The sealed source hands back exactly what it was built from.
+    #[test]
+    fn metric_source_new_is_the_only_way_in_and_reads_back_its_shape() {
+        let s = MetricSource::new("log_metrics_5s", MetricShape::RollupBytes);
+        assert_eq!(s.table(), "log_metrics_5s");
+        assert_eq!(s.shape(), MetricShape::RollupBytes);
+        assert_eq!(s.shape().bucket_col(), "bucket_ns");
+        assert_eq!(s.shape().agg_expr(), "sum(bytes)");
+    }
 
     #[test]
     fn stage2_renders_the_canonical_hydration_shape() {
@@ -877,7 +1174,7 @@ mod tests {
         assert_eq!(
             label_names(
                 "log_streams_idx",
-                &["'2026-07-01'".to_string()],
+                &[month_literal(2026, 7)],
                 "log_metrics_5s",
                 DISCOVERY_WINDOW,
                 RES_5S
@@ -892,7 +1189,7 @@ mod tests {
     fn label_names_renders_a_month_in_list_for_a_boundary_spanning_window() {
         let sql = label_names(
             "log_streams_idx",
-            &["'2026-07-01'".to_string(), "'2026-08-01'".to_string()],
+            &[month_literal(2026, 7), month_literal(2026, 8)],
             "log_metrics_5s",
             DISCOVERY_WINDOW,
             RES_5S,
@@ -905,8 +1202,8 @@ mod tests {
         assert_eq!(
             label_values(
                 "log_streams_idx",
-                &["'2026-07-01'".to_string()],
-                "'env'",
+                &[month_literal(2026, 7)],
+                &literal("env"),
                 "log_metrics_5s",
                 DISCOVERY_WINDOW,
                 RES_5S
@@ -921,7 +1218,7 @@ mod tests {
     fn detected_labels_unscoped_renders_one_row_per_key_with_the_id_predicate() {
         let sql = detected_labels(
             "log_streams_idx",
-            &["'2026-07-01'".to_string()],
+            &[month_literal(2026, 7)],
             None,
             "log_metrics_5s",
             DISCOVERY_WINDOW,
@@ -940,7 +1237,7 @@ mod tests {
     fn detected_labels_scoped_pushes_the_fingerprint_list_into_the_activity_subquery() {
         let scoped = detected_labels(
             "log_streams_idx",
-            &["'2026-07-01'".to_string()],
+            &[month_literal(2026, 7)],
             Some(&[7, 9]),
             "log_metrics_5s",
             DISCOVERY_WINDOW,
@@ -957,7 +1254,7 @@ mod tests {
         );
         let unscoped = detected_labels(
             "log_streams_idx",
-            &["'2026-07-01'".to_string()],
+            &[month_literal(2026, 7)],
             None,
             "log_metrics_5s",
             DISCOVERY_WINDOW,
@@ -1034,7 +1331,7 @@ mod tests {
     #[test]
     fn service_predicate_is_bare_equality_for_one_service() {
         assert_eq!(
-            service_predicate(&["'checkout'".to_string()]),
+            service_predicate(&[literal("checkout")]),
             "service = 'checkout'"
         );
     }
@@ -1042,7 +1339,7 @@ mod tests {
     #[test]
     fn service_predicate_is_in_list_for_multiple_services() {
         assert_eq!(
-            service_predicate(&["'checkout'".to_string(), "'billing'".to_string()]),
+            service_predicate(&[literal("checkout"), literal("billing")]),
             "service IN ('checkout', 'billing')"
         );
     }
@@ -1055,11 +1352,7 @@ mod tests {
     #[test]
     fn metric_range_omits_prewhere_when_services_is_empty_the_rollup_path() {
         let sql = metric_range(
-            MetricSource {
-                table: "log_metrics_5s",
-                bucket_col: "bucket_ns",
-                agg_expr: "sum(count)",
-            },
+            MetricSource::new("log_metrics_5s", MetricShape::RollupCount),
             &[],
             &[1, 2],
             TimeWindow {
@@ -1076,12 +1369,8 @@ mod tests {
     #[test]
     fn metric_range_renders_singleton_prewhere_for_the_raw_fallback() {
         let sql = metric_range(
-            MetricSource {
-                table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
-            },
-            &["'checkout'".to_string()],
+            MetricSource::new("log_samples", MetricShape::RawCount),
+            &[literal("checkout")],
             &[1, 2],
             TimeWindow {
                 start_ns: 0,
@@ -1097,12 +1386,8 @@ mod tests {
     #[test]
     fn metric_range_renders_in_list_prewhere_for_multiple_services() {
         let sql = metric_range(
-            MetricSource {
-                table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
-            },
-            &["'checkout'".to_string(), "'billing'".to_string()],
+            MetricSource::new("log_samples", MetricShape::RawCount),
+            &[literal("checkout"), literal("billing")],
             &[1, 2],
             TimeWindow {
                 start_ns: 0,
@@ -1122,7 +1407,7 @@ mod tests {
     fn stage3_keyset_first_page_is_byte_exact_with_the_exclusive_start_bound() {
         let sql = stage3_keyset(
             "log_samples",
-            &["'checkout'".to_string()],
+            &[literal("checkout")],
             &[18374],
             TimeWindow {
                 start_ns: 1_000,
@@ -1153,7 +1438,7 @@ mod tests {
     fn stage3_keyset_later_page_is_byte_exact_with_inclusive_tuple_and_offset() {
         let sql = stage3_keyset(
             "log_samples",
-            &["'checkout'".to_string(), "'billing'".to_string()],
+            &[literal("checkout"), literal("billing")],
             &[1, 2],
             TimeWindow {
                 start_ns: 1_000,
@@ -1164,7 +1449,7 @@ mod tests {
                 offset: 3,
             },
             Direction::Forward,
-            &["positionCaseSensitive(body, 'err') > 0".to_string()],
+            &[err_line_filter()],
             500,
         );
         assert_eq!(
@@ -1175,7 +1460,7 @@ mod tests {
              WHERE fingerprint IN (1, 2)\n\
              \x20 AND timestamp_ns >= 1500 AND timestamp_ns <= 2000\n\
              \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) >= (1500, 7, 42)\n\
-             \x20 AND positionCaseSensitive(body, 'err') > 0\n\
+             \x20 AND hasToken(body, 'err') AND position(body, 'err') > 0\n\
              ORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC\n\
              LIMIT 500 OFFSET 3"
         );
@@ -1190,7 +1475,7 @@ mod tests {
     fn stage3_keyset_backward_first_page_is_byte_exact_desc_with_the_window_bounds() {
         let sql = stage3_keyset(
             "log_samples",
-            &["'checkout'".to_string()],
+            &[literal("checkout")],
             &[18374],
             TimeWindow {
                 start_ns: 1_000,
@@ -1222,7 +1507,7 @@ mod tests {
     fn stage3_keyset_backward_later_page_is_byte_exact_with_le_tuple_and_offset() {
         let sql = stage3_keyset(
             "log_samples",
-            &["'checkout'".to_string(), "'billing'".to_string()],
+            &[literal("checkout"), literal("billing")],
             &[1, 2],
             TimeWindow {
                 start_ns: 1_000,
@@ -1233,7 +1518,7 @@ mod tests {
                 offset: 3,
             },
             Direction::Backward,
-            &["positionCaseSensitive(body, 'err') > 0".to_string()],
+            &[err_line_filter()],
             500,
         );
         assert_eq!(
@@ -1244,7 +1529,7 @@ mod tests {
              WHERE fingerprint IN (1, 2)\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 1500\n\
              \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) <= (1500, 7, 42)\n\
-             \x20 AND positionCaseSensitive(body, 'err') > 0\n\
+             \x20 AND hasToken(body, 'err') AND position(body, 'err') > 0\n\
              ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC\n\
              LIMIT 500 OFFSET 3"
         );
@@ -1257,7 +1542,7 @@ mod tests {
     fn stage3_keyset_limit_is_the_callers_clamped_fetch_limit_verbatim() {
         let sql = stage3_keyset(
             "log_samples",
-            &["'checkout'".to_string()],
+            &[literal("checkout")],
             &[1],
             TimeWindow {
                 start_ns: 0,
@@ -1330,13 +1615,13 @@ mod tests {
     fn log_stats_raw_is_byte_exact_with_line_filter_pushdown() {
         let sql = log_stats_raw(
             "log_samples",
-            &["'checkout'".to_string()],
+            &[literal("checkout")],
             &[18374],
             TimeWindow {
                 start_ns: 1_000,
                 end_ns: 2_000,
             },
-            &["positionCaseSensitive(body, 'err') > 0".to_string()],
+            &[err_line_filter()],
         );
         assert_eq!(
             sql,
@@ -1345,19 +1630,15 @@ mod tests {
              PREWHERE service = 'checkout'\n\
              WHERE fingerprint IN (18374)\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
-             \x20 AND positionCaseSensitive(body, 'err') > 0"
+             \x20 AND hasToken(body, 'err') AND position(body, 'err') > 0"
         );
     }
 
     #[test]
     fn metric_instant_renders_the_same_prewhere_contract() {
         let sql = metric_instant(
-            MetricSource {
-                table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
-            },
-            &["'checkout'".to_string()],
+            MetricSource::new("log_samples", MetricShape::RawCount),
+            &[literal("checkout")],
             &[1],
             TimeWindow {
                 start_ns: 0,
@@ -1382,12 +1663,8 @@ mod tests {
             start_ns: i64::MIN,
             end_ns: i64::MIN,
         };
-        let raw_source = MetricSource {
-            table: "log_samples",
-            bucket_col: "timestamp_ns",
-            agg_expr: "count()",
-        };
-        let svc = ["'checkout'".to_string()];
+        let raw_source = MetricSource::new("log_samples", MetricShape::RawCount);
+        let svc = [literal("checkout")];
         let sliding = metric_raw_samples_sliding(
             "log_samples",
             &svc,
@@ -1454,7 +1731,7 @@ mod tests {
             start_ns: i64::MIN,
             end_ns: i64::MIN + 1,
         };
-        let svc = ["'checkout'".to_string()];
+        let svc = [literal("checkout")];
         let sliding = metric_raw_samples_sliding(
             "log_samples",
             &svc,

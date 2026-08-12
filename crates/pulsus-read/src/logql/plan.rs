@@ -17,19 +17,19 @@ use std::ops::ControlFlow;
 
 use pulsus_logql::walk;
 use pulsus_logql::{
-    BinModifier, BinOp, Expr, Grouping, GroupingKind, LineFilter, LineFilterOp, LogExpr, LogRange,
-    MatchOp, Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
+    BinModifier, BinOp, Expr, Grouping, GroupingKind, LineFilter, LogExpr, LogRange, MatchOp,
+    Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
     VectorMatching,
 };
 
 use super::charge::AggCaps;
 use super::error::{ReadError, TooBroadReason};
-use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
-use super::pipeline::{CompiledPipeline, PipelineError, RangeGrouping};
-use super::sql::ScanLowerBound;
+use super::pipeline::{CompiledPipeline, RangeGrouping};
+use super::predicate::{CheckedFragment, MonthLiteral};
+use super::sql::{self, ScanLowerBound};
 use super::window::{ClientWindow, GridWindow};
 
 /// A pure fetch plan for either query shape. See the module docs for why
@@ -84,7 +84,7 @@ pub struct StreamsPlan {
     /// together by [`super::sql::stage3`]. Line filters after a
     /// `line_format` reference the rewritten line and evaluate in-engine
     /// instead ([`super::pipeline::CompiledPipeline`]).
-    pub line_filters: Vec<String>,
+    pub line_filters: Vec<CheckedFragment>,
     /// The full ordered pipeline, compiled per query by
     /// [`super::exec::LogQlEngine`] into the in-engine evaluator.
     pub pipeline: Vec<Stage>,
@@ -204,6 +204,21 @@ pub struct RoutingDecision {
 /// encode the rollup-vs-raw routing decision (docs/schemas.md §3.2);
 /// `rate_window_ns` is `Some` only for `rate`/`bytes_rate` (the divisor
 /// [`super::exec`] applies), never for the `*_over_time` count ops.
+///
+/// **This struct's FIELD SET is pinned by issue #293's frozen
+/// `tests/golden/plan_build_differential.txt`**, which `Debug`-prints it in
+/// full (178 occurrences), so adding, removing or retyping a field moves
+/// those bytes and fails both `tests/characterization_freeze.rs`' digest and
+/// the replay in `tests/logql_plan_build_differential.rs`. That oracle
+/// exists to freeze planner BEHAVIOUR; freezing the struct shape is a side
+/// effect of `Debug`-printing it, and it is wider than #293 intended (noted
+/// on #293, not fixed here).
+///
+/// The constraint is the golden, not the design: `bucket_col`/`agg_expr`
+/// would otherwise be one `shape: super::sql::MetricShape` field. Issue #286
+/// sealed the equivalent columns on [`super::sql::MetricSource`] instead and
+/// reaches them here through [`MetricPlan::source_shape`] — a METHOD, so the
+/// `Debug` output does not move.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricPlan {
     pub stage1_sql: String,
@@ -220,7 +235,7 @@ pub struct MetricPlan {
     /// Line-filter pushdown for the raw fallback (the rollup table has no
     /// `body` column — a metric query with a line filter can never be
     /// rollup-served, see [`metric_plan`]).
-    pub extra_predicates: Vec<String>,
+    pub extra_predicates: Vec<CheckedFragment>,
     /// The scan lower bound (`timestamp_ns > start_ns`, or `>=` when
     /// `scan_lower` is [`ScanLowerBound::Inclusive`]). For a range query
     /// this is widened to `query_start - range` (issue #227) so the first
@@ -322,6 +337,21 @@ pub struct MetricPlan {
     /// (rollup-or-raw) path, byte-identical to pre-M6-10 plans.
     pub client: Option<ClientAgg>,
     pub probes: Vec<ProbePlan>,
+}
+
+impl MetricPlan {
+    /// The sealed column shape for [`super::sql::MetricSource`] (issue
+    /// #286). A METHOD, not a field: this struct's `Debug` — and issue
+    /// #293's frozen `tests/golden/plan_build_differential.txt` — must not
+    /// move (see the type's own doc).
+    ///
+    /// Total for every plan [`metric_plan`] builds, because that function
+    /// writes `bucket_col`/`agg_expr` out of [`super::sql::MetricShape`];
+    /// `None` only for a `MetricPlan` assembled by hand with a column pair
+    /// no shape renders.
+    pub fn source_shape(&self) -> Option<sql::MetricShape> {
+        sql::MetricShape::from_columns(self.bucket_col, self.agg_expr)
+    }
 }
 
 /// The client-aggregated execution spec (issue M6-10): what
@@ -1975,23 +2005,22 @@ fn metric_plan(
         RangeAggOp::Rate | RangeAggOp::BytesRate | RangeAggOp::RateCounter
     );
 
-    let (table, bucket_col, agg_expr) = if rollup_eligible {
-        (
-            ctx.rollup_table.to_string(),
-            "bucket_ns",
-            if is_bytes { "sum(bytes)" } else { "sum(count)" },
-        )
+    // Issue #286: the column pair is written OUT of the sealed
+    // [`super::sql::MetricShape`], so "the set is fixed" is a property the
+    // compiler holds rather than a convention this call site happens to
+    // follow. The emitted strings are byte-identical to the four literals
+    // this block spelled by hand before.
+    let shape = if rollup_eligible {
+        sql::MetricShape::rollup(is_bytes)
     } else {
-        (
-            ctx.samples.to_string(),
-            "timestamp_ns",
-            if is_bytes {
-                "sum(length(body))"
-            } else {
-                "count()"
-            },
-        )
+        sql::MetricShape::raw(is_bytes)
     };
+    let table = if rollup_eligible {
+        ctx.rollup_table.to_string()
+    } else {
+        ctx.samples.to_string()
+    };
+    let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
 
     Ok(MetricPlan {
         stage1_sql,
@@ -2827,12 +2856,16 @@ fn window_bounds_for_streams(spec: &QuerySpec) -> (i64, i64) {
     }
 }
 
-fn build_probes(ctx: &PlanCtx<'_>, months: &[String], probe_keys: &[String]) -> Vec<ProbePlan> {
+fn build_probes(
+    ctx: &PlanCtx<'_>,
+    months: &[MonthLiteral],
+    probe_keys: &[String],
+) -> Vec<ProbePlan> {
     probe_keys
         .iter()
         .map(|key| ProbePlan {
             key: key.clone(),
-            sql: super::sql::probe(ctx.streams_idx, months, &ch_string(key)),
+            sql: super::sql::probe(ctx.streams_idx, months, &super::predicate::literal(key)),
         })
         .collect()
 }
@@ -2845,12 +2878,12 @@ struct NormalizedMatchers {
     /// key** — the collapse that keeps `HAVING uniqExact(key, val) = n`
     /// (or its `If`-conditional form) valid (architect plan: "Matcher
     /// normalisation").
-    positive_branches: Vec<String>,
+    positive_branches: Vec<CheckedFragment>,
     /// One pre-rendered, parenthesized OR-branch per negative matcher
     /// (`Neq`/`Nre`) — deliberately *not* collapsed per key: `countIf(...)
     /// = 0` is correct whether one or several negative branches target the
     /// same key.
-    negative_branches: Vec<String>,
+    negative_branches: Vec<CheckedFragment>,
     /// Distinct label keys carrying a regex matcher (`Re` or `Nre`) — the
     /// only case that warrants a selectivity probe (architect plan:
     /// "Selectivity probes").
@@ -2877,7 +2910,7 @@ fn push_probe_key(probe_keys: &mut Vec<String>, key: &str) {
 fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, ReadError> {
     let mut positive_order: Vec<String> = Vec::new();
     let mut positive_groups: HashMap<String, PositiveGroup> = HashMap::new();
-    let mut negative_branches: Vec<String> = Vec::new();
+    let mut negative_branches: Vec<CheckedFragment> = Vec::new();
     let mut probe_keys: Vec<String> = Vec::new();
 
     for Matcher { name, op, value } in &selector.matchers {
@@ -2913,19 +2946,11 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
                 }
             }
             MatchOp::Neq => {
-                negative_branches.push(format!(
-                    "(key = {} AND val = {})",
-                    ch_string(name),
-                    ch_string(value)
-                ));
+                negative_branches.push(super::predicate::index_neq_branch(name, value));
             }
             MatchOp::Nre => {
                 push_probe_key(&mut probe_keys, name);
-                negative_branches.push(format!(
-                    "(key = {} AND match(val, {}))",
-                    ch_string(name),
-                    ch_regex_anchored_checked(value)?
-                ));
+                negative_branches.push(super::predicate::index_nre_branch(name, value)?);
             }
         }
     }
@@ -2934,17 +2959,14 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
         return Err(ReadError::EmptyMatcherSet);
     }
 
-    let mut positive_branches: Vec<String> = Vec::with_capacity(positive_order.len());
+    let mut positive_branches: Vec<CheckedFragment> = Vec::with_capacity(positive_order.len());
     for key in &positive_order {
         let group = &positive_groups[key];
-        let mut conds = vec![format!("key = {}", ch_string(&group.key))];
-        if let Some(v) = &group.eq_value {
-            conds.push(format!("val = {}", ch_string(v)));
-        }
-        for pat in &group.re_patterns {
-            conds.push(format!("match(val, {})", ch_regex_anchored_checked(pat)?));
-        }
-        positive_branches.push(format!("({})", conds.join(" AND ")));
+        positive_branches.push(super::predicate::index_positive_branch(
+            &group.key,
+            group.eq_value.as_deref(),
+            &group.re_patterns,
+        )?);
     }
 
     Ok(NormalizedMatchers {
@@ -2971,7 +2993,7 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
 /// never compiles a client pipeline (`exec.rs` plans via `plan::plan`),
 /// so a validator behind the client-compile path would leave `stats`
 /// still returning 500.
-pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<String>, ReadError> {
+pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFragment>, ReadError> {
     let mut out = Vec::new();
     for stage in pipeline {
         match stage {
@@ -2980,7 +3002,7 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<String>, Re
             // in the client pipeline — never emit SQL for them here (doing so
             // would drop lines the client scan must keep / re-test).
             Stage::LineFilter(lf) if is_pushable_line_filter(lf) => {
-                out.push(compile_line_filter(lf)?)
+                out.push(super::predicate::line_filter(lf)?)
             }
             Stage::LineFilter(_) => {}
             // `line_format`/`decolorize`/`unpack` rewrite the line — a line
@@ -3007,107 +3029,6 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<String>, Re
 /// token prefilter.
 pub(crate) fn is_pushable_line_filter(lf: &LineFilter) -> bool {
     !lf.value_is_ip && lf.or_matches.iter().all(|m| !m.is_ip)
-}
-
-/// ClickHouse's `tokenbf_v1` splits on non-alphanumeric ASCII; a `hasToken`
-/// prefilter must extract tokens the same way or it misses granules that
-/// truly contain the phrase.
-fn tokenize(literal: &str) -> Vec<String> {
-    literal
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-const REGEX_METACHARS: &[char] = &[
-    '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\',
-];
-
-/// Conservative, safe-by-construction heuristic: a pattern with zero regex
-/// metacharacters is a plain literal, so its tokens can seed a `hasToken`
-/// prefilter exactly like a `|=` phrase. Anything else skips the prefilter
-/// (never wrong, just less pruning) rather than attempting regex analysis
-/// (out of scope — see the AST's own "regex not validated" contract).
-fn is_plain_literal(pattern: &str) -> bool {
-    !pattern.chars().any(|c| REGEX_METACHARS.contains(&c))
-}
-
-/// Compiles one `LineFilter`. Positive ops (`|=`, `|~`) render `hasToken`
-/// prefilter(s) ANDed with the exact predicate. Negative ops (`!=`, `!~`)
-/// wrap the *same* compound predicate in `NOT (...)` rather than negating
-/// only the exact predicate: `hasToken` never has false negatives (a bloom
-/// filter can only ever say "maybe present" or "definitely absent"), so
-/// `hasToken(...) AND exact(...)` is exactly equivalent to `exact(...)`
-/// alone — `NOT (hasToken(...) AND exact(...))` is therefore provably
-/// equivalent to `NOT exact(...)`, the correct exclusion semantic, while
-/// still surfacing the prefilter for ClickHouse's optimizer to exploit
-/// where it can (architect plan: "Prefilter is always paired with the
-/// exact predicate").
-///
-/// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
-/// per-alternative compound predicate: `((a) OR (b) …)` for positive ops,
-/// `NOT ((a) OR (b) …)` for negative ops (each disjunct's `hasToken`
-/// prefilter is preserved, so the `tokenbf_v1` skip index still prunes). A
-/// single-value filter is left un-wrapped so its pushed-down SQL is
-/// byte-identical to the pre-`or` output. Callers must gate on
-/// [`is_pushable_line_filter`]: this only ever sees literal/regex
-/// alternatives (`ip(…)` is served client-side).
-pub(crate) fn compile_line_filter(lf: &LineFilter) -> Result<String, PipelineError> {
-    let mut disjuncts: Vec<String> = Vec::new();
-    for (value, _) in lf.alternatives() {
-        disjuncts.push(match lf.op {
-            LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
-            LineFilterOp::Regex | LineFilterOp::NotRegex => regex_predicate(value)?,
-        });
-    }
-    let core = if lf.or_matches.is_empty() {
-        disjuncts
-            .into_iter()
-            .next()
-            .expect("a line filter always has a head alternative")
-    } else {
-        disjuncts
-            .iter()
-            .map(|p| format!("({p})"))
-            .collect::<Vec<_>>()
-            .join(" OR ")
-    };
-    Ok(match lf.op {
-        LineFilterOp::Contains | LineFilterOp::Regex => {
-            if lf.or_matches.is_empty() {
-                core
-            } else {
-                format!("({core})")
-            }
-        }
-        LineFilterOp::NotContains | LineFilterOp::NotRegex => format!("NOT ({core})"),
-    })
-}
-
-fn contains_predicate(phrase: &str) -> String {
-    let mut parts: Vec<String> = tokenize(phrase)
-        .iter()
-        .map(|t| format!("hasToken(body, {})", ch_string(t)))
-        .collect();
-    parts.push(format!("position(body, {}) > 0", ch_string(phrase)));
-    parts.join(" AND ")
-}
-
-fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
-    let mut parts: Vec<String> = Vec::new();
-    if is_plain_literal(pattern) {
-        parts.extend(
-            tokenize(pattern)
-                .iter()
-                .map(|t| format!("hasToken(body, {})", ch_string(t))),
-        );
-    }
-    parts.push(format!(
-        "match(body, {})",
-        ch_regex_unanchored_checked(pattern)?
-    ));
-    Ok(parts.join(" AND "))
 }
 
 /// Days since the Unix epoch, per nanosecond. Local to this module rather
@@ -3148,12 +3069,17 @@ pub(crate) fn year_month(ts_ns: i64) -> (i64, u32) {
 /// "Multi-month ranges"). `pub` (issue #170): the `detected_labels`
 /// aggregation builder takes pre-rendered months, and the EXPLAIN gate
 /// (`tests/explain_indexes.rs`) renders them the same way the engine does.
-pub fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<String> {
+///
+/// Issue #286: the literals are [`MonthLiteral`]s. The mint takes
+/// `(i64, u32)` integers, so no caller text can enter the month predicate —
+/// a property rustc holds up, not an observation about this function's
+/// callers.
+pub fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<MonthLiteral> {
     let (mut y, mut m) = year_month(start_ns);
     let (end_y, end_m) = year_month(end_ns.max(start_ns));
     let mut out = Vec::new();
     loop {
-        out.push(format!("'{y:04}-{m:02}-01'"));
+        out.push(super::predicate::month_literal(y, m));
         if (y, m) == (end_y, end_m) {
             break;
         }
@@ -3193,6 +3119,17 @@ mod tests {
 
     fn selector(src: &str) -> StreamSelector {
         parse_selector(src).expect("parse selector")
+    }
+
+    /// Issue #286 accessor: the rendered text of a fragment list. No
+    /// expected literal below moved.
+    fn frags(fs: &[CheckedFragment]) -> Vec<&str> {
+        fs.iter().map(CheckedFragment::as_sql).collect()
+    }
+
+    /// The same, for month literals.
+    fn frags_of_months(ms: &[MonthLiteral]) -> Vec<&str> {
+        ms.iter().map(MonthLiteral::as_sql).collect()
     }
 
     fn test_ctx() -> PlanCtx<'static> {
@@ -4241,6 +4178,78 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Issue #286 AC17: `MetricPlan::source_shape` is total for every plan
+    // `metric_plan` builds — the property `exec::metric_source`'s `.expect`
+    // rests on.
+    // -----------------------------------------------------------------
+
+    /// Every plan shape this crate can actually produce carries a renderable
+    /// column pair.
+    ///
+    /// **Both reachable routes are covered, and the third is unreachable by
+    /// construction, not by omission:** `metric_plan` sets `client = Some(..)`
+    /// for every range query (issue #227 retired the range rollup fast path),
+    /// so `RouteChoice::Rollup` — and with it `MetricShape::Rollup*` — cannot
+    /// be reached from a plan at all today. `sql.rs`'s `metric_range` records
+    /// the same fact. The rollup half of the inverse is covered by
+    /// `sql::tests::metric_shape_round_trips_through_from_columns_for_every_variant`,
+    /// which iterates `MetricShape::ALL`.
+    #[test]
+    fn source_shape_is_total_for_every_plan_metric_plan_builds() {
+        for (query, spec) in [
+            (
+                r#"rate({env="prod"}[5m])"#,
+                QuerySpec::Range {
+                    start_ns: 0,
+                    end_ns: 1_000_000_000_000,
+                    step_ns: 60_000_000_000,
+                },
+            ),
+            (
+                r#"bytes_over_time({env="prod"}[5m])"#,
+                QuerySpec::Range {
+                    start_ns: 0,
+                    end_ns: 1_000_000_000_000,
+                    step_ns: 60_000_000_000,
+                },
+            ),
+            (
+                r#"count_over_time({env="prod"}[5m])"#,
+                QuerySpec::Instant { at_ns: 1_000 },
+            ),
+            (
+                r#"bytes_over_time({env="prod"}[5m])"#,
+                QuerySpec::Instant { at_ns: 1_000 },
+            ),
+        ] {
+            let mp = metric_mp(query, spec).unwrap();
+            let shape = mp
+                .source_shape()
+                .unwrap_or_else(|| panic!("no renderable shape for {query}"));
+            assert_eq!(shape.bucket_col(), mp.bucket_col);
+            assert_eq!(shape.agg_expr(), mp.agg_expr);
+        }
+    }
+
+    /// The `None` arm exists, is reachable only by hand-building a plan
+    /// outside `metric_plan`, and is what `exec::metric_source`'s `.expect`
+    /// fails closed on.
+    #[test]
+    fn source_shape_is_none_for_a_hand_built_plan_carrying_a_foreign_column_pair() {
+        let mut mp = metric_mp(
+            r#"count_over_time({env="prod"}[5m])"#,
+            QuerySpec::Instant { at_ns: 1_000 },
+        )
+        .unwrap();
+        assert!(mp.source_shape().is_some());
+        mp.agg_expr = "match(body, '(')";
+        assert!(mp.source_shape().is_none());
+        mp.agg_expr = "count()";
+        mp.bucket_col = "not_a_column";
+        assert!(mp.source_shape().is_none());
+    }
+
     /// Issue #227: a non-dividing step is also the sliding raw path (there is
     /// no longer a rollup-vs-raw distinction for range reads).
     #[test]
@@ -4372,7 +4381,7 @@ mod tests {
     fn single_positive_matcher_collapses_to_one_branch() {
         let n = normalize_matchers(&selector(r#"{service_name="checkout"}"#)).unwrap();
         assert_eq!(
-            n.positive_branches,
+            frags(&n.positive_branches),
             vec!["(key = 'service_name' AND val = 'checkout')"]
         );
         assert!(n.negative_branches.is_empty());
@@ -4402,7 +4411,7 @@ mod tests {
         let n = normalize_matchers(&selector(r#"{env="prod", env=~"prod|staging"}"#)).unwrap();
         assert_eq!(n.positive_branches.len(), 1);
         assert_eq!(
-            n.positive_branches[0],
+            n.positive_branches[0].as_sql(),
             "(key = 'env' AND val = 'prod' AND match(val, '^(?:prod|staging)$'))"
         );
         assert_eq!(n.probe_keys, vec!["env".to_string()]);
@@ -4429,8 +4438,8 @@ mod tests {
         let start = 1_783_641_600_000_000_000;
         let end = 1_784_073_600_000_000_000;
         assert_eq!(
-            months_overlapping(start, end),
-            vec!["'2026-07-01'".to_string()]
+            frags_of_months(&months_overlapping(start, end)),
+            vec!["'2026-07-01'"]
         );
     }
 
@@ -4440,8 +4449,8 @@ mod tests {
         let start = 1_785_538_800_000_000_000;
         let end = 1_785_546_000_000_000_000;
         assert_eq!(
-            months_overlapping(start, end),
-            vec!["'2026-07-01'".to_string(), "'2026-08-01'".to_string()]
+            frags_of_months(&months_overlapping(start, end)),
+            vec!["'2026-07-01'", "'2026-08-01'"]
         );
     }
 
@@ -4451,8 +4460,8 @@ mod tests {
         let start = 1_797_292_800_000_000_000;
         let end = 1_799_971_200_000_000_000;
         assert_eq!(
-            months_overlapping(start, end),
-            vec!["'2026-12-01'".to_string(), "'2027-01-01'".to_string()]
+            frags_of_months(&months_overlapping(start, end)),
+            vec!["'2026-12-01'", "'2027-01-01'"]
         );
     }
 
@@ -4737,8 +4746,8 @@ mod tests {
             1,
             "only the pre-line_format filter pushes down"
         );
-        assert!(mp.extra_predicates[0].contains("'a'"));
-        assert!(!mp.extra_predicates[0].contains("'b'"));
+        assert!(mp.extra_predicates[0].as_sql().contains("'a'"));
+        assert!(!mp.extra_predicates[0].as_sql().contains("'b'"));
         // The full ordered pipeline (including the unpushed filter) rides
         // the client spec for in-engine evaluation.
         assert_eq!(mp.client.as_ref().unwrap().pipeline.len(), 3);
@@ -4934,19 +4943,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tokenize_splits_on_non_alphanumeric_boundaries() {
-        assert_eq!(
-            tokenize("connection refused"),
-            vec!["connection".to_string(), "refused".to_string()]
-        );
-    }
-
-    #[test]
-    fn is_plain_literal_rejects_regex_metacharacters() {
-        assert!(is_plain_literal("connection refused"));
-        assert!(!is_plain_literal("test.*"));
-    }
     // -----------------------------------------------------------------
     // Issue #221: `variants(...) of (...)` — plan-time validation,
     // charges (I8–I13) and censuses.
@@ -5589,7 +5585,7 @@ mod tests {
     fn range_read_sql(mp: &MetricPlan) -> String {
         super::super::sql::metric_raw_samples_sliding(
             &mp.table,
-            &["'checkout'".to_string()],
+            &[super::super::predicate::literal("checkout")],
             &[1, 2],
             super::super::sql::TimeWindow {
                 start_ns: mp.start_ns,

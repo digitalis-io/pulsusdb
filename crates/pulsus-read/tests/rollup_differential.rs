@@ -43,8 +43,9 @@ use futures::StreamExt;
 use pulsus_clickhouse::Row;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_logql::{RangeAggOp, parse};
+use pulsus_read::logql::predicate::literal;
 use pulsus_read::logql::rows::MetricBucketRow;
-use pulsus_read::logql::sql::{self, TimeWindow};
+use pulsus_read::logql::sql::{self, MetricShape, TimeWindow};
 use pulsus_read::logql::{
     Direction, EngineConfig, LogQlEngine, MatrixSeries, Plan, PlanCtx, QueryParams, QueryResult,
     QuerySpec, plan,
@@ -399,21 +400,9 @@ async fn assert_rollup_matches_raw(
 
     let is_bytes = matches!(mp.op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime);
     let rollup_table = format!("{db}.log_metrics_5s");
-    let rollup_source = sql::MetricSource {
-        table: &rollup_table,
-        bucket_col: "bucket_ns",
-        agg_expr: if is_bytes { "sum(bytes)" } else { "sum(count)" },
-    };
+    let rollup_source = sql::MetricSource::new(&rollup_table, MetricShape::rollup(is_bytes));
     let raw_table = format!("{db}.log_samples");
-    let raw_source = sql::MetricSource {
-        table: &raw_table,
-        bucket_col: "timestamp_ns",
-        agg_expr: if is_bytes {
-            "sum(length(body))"
-        } else {
-            "count()"
-        },
-    };
+    let raw_source = sql::MetricSource::new(&raw_table, MetricShape::raw(is_bytes));
 
     let rollup_sql = sql::metric_range(
         rollup_source,
@@ -426,7 +415,7 @@ async fn assert_rollup_matches_raw(
     );
     let raw_sql = sql::metric_range(
         raw_source,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         fps,
         w,
         mp.scan_lower,

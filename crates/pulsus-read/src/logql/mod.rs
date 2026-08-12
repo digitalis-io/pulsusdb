@@ -96,6 +96,12 @@ pub mod params;
 pub mod pipeline;
 pub mod plan;
 pub(crate) mod post_agg;
+/// Issue #286: the LEAF module holding `CheckedFragment`/`CheckedLiteral`/
+/// `MonthLiteral` and every LogQL renderer that can emit a ClickHouse
+/// `match(…)`. `pub`, not `pub(crate)`: the types appear in `pub fn`
+/// signatures of the `pub` [`sql`] module, and `pulsus-server` passes
+/// fragments through.
+pub mod predicate;
 pub mod rows;
 pub mod sql;
 pub mod template;

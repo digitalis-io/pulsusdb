@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
+use pulsus_read::logql::predicate::{self, literal, month_literal};
 use pulsus_read::logql::sql::{self, ScanLowerBound, ScanProjection, TimeWindow};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
@@ -696,18 +697,25 @@ fn aligned_step_center_ns(step_ns: i64) -> i64 {
 /// here, `pub(crate)` to that crate), sufficient for the short
 /// couple-of-hours windows this suite uses (at most one calendar-month
 /// boundary can fall inside one).
-fn months_spanned(start_ns: i64, end_ns: i64) -> Vec<String> {
-    let mut months: Vec<String> = [start_ns, end_ns]
+fn months_spanned(start_ns: i64, end_ns: i64) -> Vec<predicate::MonthLiteral> {
+    // Issue #286: `sql::stage1` takes `MonthLiteral`s, whose only mint takes
+    // integers — so the year/month are extracted rather than formatted.
+    let mut months: Vec<(i64, u32)> = [start_ns, end_ns]
         .iter()
         .map(|&ns| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(ns)
-                .format("'%Y-%m-01'")
-                .to_string()
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(ns);
+            (
+                i64::from(chrono::Datelike::year(&dt)),
+                chrono::Datelike::month(&dt),
+            )
         })
         .collect();
     months.sort();
     months.dedup();
     months
+        .into_iter()
+        .map(|(y, m)| month_literal(y, m))
+        .collect()
 }
 
 /// POST golden (round-1 code-review finding 2, ratified; round-3
@@ -820,8 +828,10 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
         "log_streams_idx",
         &months,
         &[
-            "(key = 'service_name' AND val = 'checkout')".to_string(),
-            "(key = 'env' AND val = 'prod')".to_string(),
+            predicate::index_positive_branch("service_name", Some("checkout"), &[])
+                .expect("no regex to compile"),
+            predicate::index_positive_branch("env", Some("prod"), &[])
+                .expect("no regex to compile"),
         ],
         &[],
     );
@@ -832,7 +842,7 @@ async fn query_range_post_explain_is_byte_exact_against_a_computed_golden() {
     // `window_start` so the first grid point sees its whole lookback.
     let metric_sql = sql::metric_raw_samples_sliding(
         "log_samples",
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[FP_A],
         TimeWindow {
             start_ns: window_start - POST_GOLDEN_STEP_NS,
