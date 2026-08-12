@@ -3966,7 +3966,7 @@ async fn query_range_derives_the_reference_whole_second_step() {
         return;
     }
     let db = &pulsus_testkit::test_db("pulsus_logs_api_it_derived_step");
-    let port = 31_200;
+    let port = 31_204;
     drop_db(db).await;
     let guard = spawn_ready_server(port, db);
     let client = ChClient::new(data_client_config(db))
@@ -4034,7 +4034,7 @@ async fn derived_step_change_moves_no_log_query() {
         return;
     }
     let db = &pulsus_testkit::test_db("pulsus_logs_api_it_derived_step_logs");
-    let port = 31_201;
+    let port = 31_205;
     drop_db(db).await;
     let (_guard, _client, base_ns) = setup(db, port).await;
 
