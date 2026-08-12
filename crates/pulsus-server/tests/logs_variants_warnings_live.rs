@@ -105,9 +105,21 @@ fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> Opti
     stream.read_to_end(&mut raw).ok()?;
     let text = String::from_utf8_lossy(&raw).into_owned();
     let (head, rest) = text.split_once("\r\n\r\n")?;
-    let status: u16 = head.lines().next()?.split_whitespace().nth(1)?.parse().ok()?;
-    let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
-    let body = if chunked { dechunk(rest) } else { rest.to_string() };
+    let status: u16 = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let chunked = head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked");
+    let body = if chunked {
+        dechunk(rest)
+    } else {
+        rest.to_string()
+    };
     Some(HttpResponse { status, body })
 }
 
@@ -323,7 +335,10 @@ async fn three_variants_of_four_hundred_series_each_are_served() {
     let body: serde_json::Value = serde_json::from_str(&res.body).expect("JSON body");
     assert_eq!(body["data"]["stats"]["series"], 1_200);
     assert_eq!(
-        body["data"]["result"].as_array().expect("result array").len(),
+        body["data"]["result"]
+            .as_array()
+            .expect("result array")
+            .len(),
         1_200
     );
     assert!(
@@ -336,7 +351,12 @@ async fn three_variants_of_four_hundred_series_each_are_served() {
         .as_array()
         .expect("result array")
         .iter()
-        .map(|s| s["metric"]["__variant__"].as_str().unwrap_or("").to_string())
+        .map(|s| {
+            s["metric"]["__variant__"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
         .collect();
     assert_eq!(
         indices,
@@ -371,7 +391,11 @@ async fn logs_api_returns_200_with_surviving_variants_when_one_breaches() {
             &[("query", &cap_query(501)), ("time", &at_ns.to_string())],
         ),
     );
-    assert_eq!(res.status, 200, "a skip is a 200, never a 422: {}", res.body);
+    assert_eq!(
+        res.status, 200,
+        "a skip is a 200, never a 422: {}",
+        res.body
+    );
 
     let secs = at_ns / 1_000_000_000;
     let expected = format!(
@@ -421,7 +445,11 @@ async fn logs_api_query_range_returns_200_with_surviving_variants_when_one_breac
             ],
         ),
     );
-    assert_eq!(res.status, 200, "a skip is a 200, never a 422: {}", res.body);
+    assert_eq!(
+        res.status, 200,
+        "a skip is a 200, never a 422: {}",
+        res.body
+    );
 
     let secs = at_ns / 1_000_000_000;
     let expected = format!(
@@ -496,8 +524,8 @@ fn top_level_key_sequence(body: &str) -> Vec<String> {
 }
 
 fn observe(status: u16, body: &str) -> Observed {
-    let json: serde_json::Value = serde_json::from_str(body)
-        .unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"));
+    let json: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"));
     let warnings = json
         .get("warnings")
         .and_then(|w| w.as_array())
@@ -669,7 +697,10 @@ async fn variant_skips_agree_with_the_pinned_reference() {
     ] {
         let ours = ours_instant(&query);
         let theirs = theirs_instant(&query);
-        assert_eq!(theirs.status, 200, "case {case}: the reference must serve it");
+        assert_eq!(
+            theirs.status, 200,
+            "case {case}: the reference must serve it"
+        );
         assert_eq!(ours.status, 200, "case {case}: PulsusDB must serve it");
         assert_eq!(
             ours.key_sequence, theirs.key_sequence,

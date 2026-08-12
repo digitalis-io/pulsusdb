@@ -1439,7 +1439,9 @@ mod tests {
     fn cap_query(n: usize, range: bool) -> String {
         let common = format!(r#"{{app="v277"}} | logfmt | id < {n} [1m]"#);
         let _ = range;
-        format!("variants(sum by (id) (count_over_time({common})), sum(count_over_time({common}))) of ({common})")
+        format!(
+            "variants(sum by (id) (count_over_time({common})), sum(count_over_time({common}))) of ({common})"
+        )
     }
 
     fn cap_rows(n: usize) -> Vec<MetricScanRow> {
@@ -1612,13 +1614,9 @@ mod tests {
         )
         .expect("arena");
         let meta = cap_meta();
-        let mut st = VariantsAggState::new(
-            &arena,
-            &variants,
-            &meta,
-            MAX_VARIANT_FANOUT_STATE_BYTES,
-        )
-        .expect("state");
+        let mut st =
+            VariantsAggState::new(&arena, &variants, &meta, MAX_VARIANT_FANOUT_STATE_BYTES)
+                .expect("state");
         st.push_rows(&cap_rows(501)).expect("push");
         let base = st.base;
         assert!(
@@ -1645,11 +1643,9 @@ mod tests {
     #[test]
     fn every_breaching_variant_contributes_exactly_one_warning() {
         let common = r#"{app="v277"} | logfmt | id < 501 [1m]"#;
-        let query = format!(
-            "variants(count_over_time({common}), bytes_over_time({common})) of ({common})"
-        );
-        let (scan, variants, _) =
-            variants_fixture(&query, QuerySpec::Instant { at_ns: 60 * VSEC });
+        let query =
+            format!("variants(count_over_time({common}), bytes_over_time({common})) of ({common})");
+        let (scan, variants, _) = variants_fixture(&query, QuerySpec::Instant { at_ns: 60 * VSEC });
         let common_pipeline = scan.client.expect("client scan").pipeline;
         let mut warnings = Warnings::new();
         let out = run_variants_rows(

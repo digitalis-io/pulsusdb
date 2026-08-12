@@ -742,7 +742,11 @@ fn parse_eval(
             }
             let w = w.trim();
             if w.is_empty() {
-                return Err(fmt_err(file, idx, "`warning:` line has an empty value".into()));
+                return Err(fmt_err(
+                    file,
+                    idx,
+                    "`warning:` line has an empty value".into(),
+                ));
             }
             expected_warnings.push(w.to_string());
             idx += 1;
@@ -1164,8 +1168,14 @@ pub fn eval_node(
                     .client
                     .as_ref()
                     .ok_or_else(|| "variants scan plan must be client-aggregated".to_string())?;
-                run_variants_rows(&store.rows, &store.meta, &common.pipeline, variants, warnings)
-                    .map_err(|e| e.to_string())?
+                run_variants_rows(
+                    &store.rows,
+                    &store.meta,
+                    &common.pipeline,
+                    variants,
+                    warnings,
+                )
+                .map_err(|e| e.to_string())?
             }
         };
         vals.push(v);

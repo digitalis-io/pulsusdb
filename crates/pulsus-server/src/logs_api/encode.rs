@@ -1883,13 +1883,8 @@ mod tests {
         ];
 
         for (name, result) in arms {
-            let with_empty = query_response_warned(
-                result.clone(),
-                None,
-                5_500_000_000,
-                false,
-                &Warnings::new(),
-            );
+            let with_empty =
+                query_response_warned(result.clone(), None, 5_500_000_000, false, &Warnings::new());
             let plain = query_response(result, None, 5_500_000_000, false);
             assert_eq!(
                 with_empty.status(),

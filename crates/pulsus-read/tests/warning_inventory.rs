@@ -92,8 +92,9 @@ fn repo_root() -> PathBuf {
 /// assertions below cannot be satisfied by text sitting somewhere else in
 /// a 2 000-line document.
 fn ledger_entry_d() -> String {
-    let text = std::fs::read_to_string(repo_root().join("docs/benchmarks/logs-differential-ledger.md"))
-        .expect("the differential ledger is readable");
+    let text =
+        std::fs::read_to_string(repo_root().join("docs/benchmarks/logs-differential-ledger.md"))
+            .expect("the differential ledger is readable");
     let section_at = text
         .find("### `variants-label-collision-and-fanout-bounds`")
         .expect("the variants section exists");
@@ -146,7 +147,10 @@ fn the_reference_warning_inventory_is_three_families() {
         .map(|(_, m)| *m)
         .expect("family 1");
     // Family 1's shape with its two verbs substituted.
-    assert_eq!(ours, family1.replace("(%d)", "(500)").replace("(%s)", "(0)"));
+    assert_eq!(
+        ours,
+        family1.replace("(%d)", "(500)").replace("(%s)", "(0)")
+    );
     // …and specifically NOT family 2's wording, which differs by exactly
     // the word this project has already mistaken once.
     assert!(
@@ -162,7 +166,10 @@ fn the_reference_warning_inventory_is_three_families() {
             2u8,
             "maximum number of series (%d) reached for a single query;",
         ),
-        (3, "Query was executed using the new experimental query engine"),
+        (
+            3,
+            "Query was executed using the new experimental query engine",
+        ),
     ] {
         assert!(
             d.contains(key),
