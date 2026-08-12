@@ -475,10 +475,22 @@ pub enum PlainTextWriter {
 /// into a `false` that also means "no rule" is the conflation that
 /// produced issue #264's round-one finding — an assertion dropped on a
 /// property the writers actually shared, which hid a genuinely missing
-/// header. But no writer needs "no rule" any more, and a variant with no
-/// construction site fails the hermetic `route_inventory` build under
-/// `RUSTFLAGS: -D warnings` (`.github/workflows/ci.yml:30`), so it is
-/// removed rather than deprecated.
+/// header. But no writer needs "no rule" any more, so it is removed
+/// rather than deprecated — a kept-but-unused variant is a claim that
+/// some writer still has no derivable rule, and none does.
+///
+/// That removal is enforced by the compiler, though NOT by the dead-code
+/// lint, which is worth writing down because the obvious guess is wrong.
+/// Measured on this tree: re-adding `Unasserted` fails
+/// `cargo test -p pulsus-server --tests --no-run` with `E0004
+/// non-exhaustive patterns: NosniffRule::Unasserted not covered` from
+/// `api_conformance.rs`'s `match writer.nosniff_rule()` — a hard error,
+/// so `RUSTFLAGS: -D warnings` (`.github/workflows/ci.yml:30`) is not
+/// what catches it. Re-adding it *with* a match arm compiles clean under
+/// `-D warnings`: an unconstructed variant of a `pub` enum in a test
+/// support module does not trip `dead_code`. The gate is the exhaustive
+/// match, and it lives in a test target the hermetic build still has to
+/// COMPILE even though the suite itself is live-gated.
 ///
 /// [`Absent`]: NosniffRule::Absent
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
