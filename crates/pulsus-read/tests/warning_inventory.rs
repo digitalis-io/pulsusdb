@@ -205,6 +205,15 @@ fn the_reference_warning_inventory_is_three_families() {
 /// The inventory is only meaningful if the ledger entry it points at is
 /// the one carrying the range over-acceptance too — the two halves were
 /// adjudicated together and a split would let either be deleted alone.
+///
+/// **Its strength, measured rather than claimed.** Each assertion is a
+/// PRESENCE test over entry `(d)`'s body, and that is the whole claim:
+/// "entry (d) names X". Verified by breaking it — replacing every
+/// ``!ok`` in the ledger with prose reddens the second assertion;
+/// editing ONE of the entry's two mentions does not, because the entry
+/// still names it. Anyone wanting a stronger property (each mention in
+/// its own sentence, say) has to state which sentence, and that is a
+/// claim about prose this test deliberately does not make.
 #[test]
 fn ledger_entry_d_carries_the_range_over_acceptance_as_well() {
     let d = ledger_entry_d();

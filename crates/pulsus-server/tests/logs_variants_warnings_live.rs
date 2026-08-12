@@ -524,8 +524,11 @@ fn top_level_key_sequence(body: &str) -> Vec<String> {
 }
 
 fn observe(status: u16, body: &str) -> Observed {
-    let json: serde_json::Value =
-        serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"));
+    // The STATUS goes in the message: a rejection's body is bare text on
+    // this surface, so a regression to a 422 arrives here as a parse
+    // failure and the code is what names it.
+    let json: serde_json::Value = serde_json::from_str(body)
+        .unwrap_or_else(|e| panic!("HTTP {status}: invalid JSON ({e}): {body}"));
     let warnings = json
         .get("warnings")
         .and_then(|w| w.as_array())
