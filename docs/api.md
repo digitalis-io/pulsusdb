@@ -335,6 +335,7 @@ one to the other.
 |-------|------|
 | Malformed params, malformed LogQL, empty/contradictory matchers, invalid `step` | `400` |
 | LogQL query text of **131,072 bytes or more** (`pulsus_logql::MAX_QUERY_BYTES`, an exclusive maximum — the longest accepted query is **131,071 bytes**; the reference's `maxInputSize` at grafana/loki v3.7.4 `pkg/logql/syntax/parser.go:42`, enforced `>=` at `:86`; applies at every LogQL parse, incl. per `match[]` value and `/tail`) | `400` |
+| LogQL nesting past **64 levels** (`MAX_DEPTH`, `crates/pulsus-logql/src/error.rs:24`) or label-filter parenthesis nesting past **91** (`LABEL_FILTER_MAX_DEPTH`, `:43`), body `query nesting exceeds the N level limit`. The reference has no such bound — accepted divergence, below | `400` |
 | Pipeline/plan rejection (bad regex — **including an uncompilable pushed-down line-filter or stream-matcher regex, since #240** — bad parser expression, unwrap-arity, …) | `400` |
 | Query rejected as too broad (scan-budget or stream-count cap exceeded) | `422` |
 | Metric result over **500 series** (`max_query_series`, the reference's own threshold and `> cap` test, applied to the FINAL result — never to scanned or inner-aggregation groups) | `422` |
@@ -359,24 +360,80 @@ at 123 bytes; the LogQL corpus runner's pushdown blind spot is #278.
 
 **Transport bound on the query-text cap (#279).** The 131,072-byte row
 above is reachable only where the query arrives in a **POST form body**,
-on one of the five routes that **both take a query parameter and accept
+on one of the eight routes that **both take a query parameter and accept
 a POST form body**: `/query`, `/query_range`, `/series` (per `match[]`),
-`/detected_labels`, `/detected_fields` — each on both the native and
-`/loki/api/v1` prefixes. That set is narrower than "the `GET|POST` form
-routes", of which there are six: `/labels` is `GET|POST` form-encoded too
-but accepts no `query` parameter (only `start`/`end`, per the route table
-above), so no query of any length reaches the cap through it. Our HTTP
-stack caps the whole request-target at **65,534 bytes** (`http::Uri`), so
+`/detected_labels`, `/detected_fields`, and — since issue #406 Part B2
+added `POST` to them — `/stats`, `/volume` and `/patterns`, each on both
+the native and `/loki/api/v1` prefixes
+(`crates/pulsus-server/src/logs_api/mod.rs:56-94,128-174`; all three of
+the late additions reach the cap through the same `parse_logql` seam).
+That set is narrower than "the `GET|POST` form routes", of which there
+are ten: `/labels` and `/label/{name}/values` are `GET|POST`
+form-encoded too but accept no `query` parameter (only `start`/`end`, per
+the route table above), so no query of any length reaches the cap through
+them. Our HTTP stack caps the whole request-target at
+**65,534 bytes** (`http::Uri`), so
 on any GET a request-target past that is answered `414 URI Too Long` with
 an empty body by hyper, before routing — never the `400`
 envelope above.
 That ceiling is below the cap, so it also blocks legitimate sub-cap
-queries above roughly 65.5 KB, and it applies to the GET-only routes
-(`/tail`, `/stats`, `/volume`, `/patterns`, `/label/{name}/values`,
-`/index/*`) as a whole. The reference serves such GETs; measured
-divergence and re-derivation in
+queries above roughly 65.5 KB, and it applies to every route alike —
+it is charged on the request-target, not on any one parameter, so a
+`GET` to `/tail`, `/stats`, `/volume`, `/patterns`,
+`/label/{name}/values` or `/index/*` meets it exactly as `/query` does.
+The reference serves such GETs; measured divergence and re-derivation in
 docs/benchmarks/logs-differential-ledger.md
 (`get-request-target-uri-bound`).
+
+**Accepted divergence — the GET request-target bound (issue #296, closed
+2026-08-11 with no code change).** The 65,534-byte ceiling is neither a
+PulsusDB choice nor configurable: the `http` crate packs a `Uri`'s
+component offsets into 16-bit fields, so its hard maximum is
+`u16::MAX - 1` (`http-1.4.2/src/uri/mod.rs:145`, refused at parse at
+`:296`), and that type sits under the whole HTTP stack — raising it means
+not using it. The reference sets no equivalent bound (no `MaxHeaderBytes`
+anywhere in grafana/loki @ v3.7.4 `b318f282`), so it inherits Go's 1 MB
+`DefaultMaxHeaderBytes`. It is **accepted rather than fixed because no
+deployed path reaches it**: every layer in front of the database cuts
+first — nginx at a 4 KB request line, Apache httpd at 8 KB, Chrome at
+32 KiB, all below ours, against the reference's 1 MB (the ceilings
+recorded in issue #296's closing comment). A browser-originated query is
+capped before it leaves the client and a proxied one an order of
+magnitude below our limit, so what remains is a non-browser client
+talking straight to the database — and that client has a carrier: since
+issue #406 Part B2 **every query-carrying log route accepts a POST form
+body** (`crates/pulsus-server/src/logs_api/mod.rs:56-94,128-174`), where
+the 131,071-byte text cap is the only bound. The sole exception is
+`/tail`, which is `GET`-only here and effectively `GET`-only there too (a
+POST cannot carry a WebSocket handshake; the reference's `POST`
+registration is nominal and it answers `400` to one — measured
+2026-08-10, `mod.rs:122-127`). Reopen if a client turns up that can only
+`GET` and needs more than ~65.5 KB of request-target.
+
+**Accepted divergence — LogQL nesting depth (issue #256, closed
+2026-08-11 with no code change).** The nesting row above refuses at 64
+and 91 levels; the reference serves far deeper, probed to
+20,000. Exactly three shapes consume that depth — nested aggregations
+(`sum(sum(… sum(count_over_time({app="x"}[5m])) …))`), nested parentheses
+(`((((… ))))`), and label-filter parentheses
+(`{app="x"} | ((((… (status="500") …))))`, the 91 limit). **A long binary
+chain does not**: `parse_binary_expr`
+(`crates/pulsus-logql/src/parser.rs:405-425`) loops over same-precedence
+operands and recurses only on a right operand at *higher* precedence, so
+`a + b + c + …` over fifty series stays shallow. That is why this is
+accepted — the machine sources that emit LogQL at scale (dashboard
+templating, query builders, recording-rule expansion) generate long
+chains, not 65-deep aggregations, and **the 20,000 is a probe result
+rather than any client's requirement**. Raising the limit would also be a
+regression today: after issue #272 converted the LogQL AST/plan walks to
+iterative form the parser's own recursive descent is still what this
+guard bounds (`crates/pulsus-logql/src/error.rs:16-23`), and the
+equivalent walks on the other query languages are issue #262, open and
+not scheduled — so a higher ceiling trades a clean `400` for a stack
+abort until that work lands. This is the same pragmatism as the five-year
+LogQL time-range cap: where the reference attempts something no real
+client sends, we answer `400`. Reopen if a query generator emitting
+nested aggregations or bracket chains at this depth turns up.
 
 ### 2.4 `GET /api/logs/v1/tail` (WebSocket)
 
@@ -993,7 +1050,7 @@ Routing note: the alias `GET /api/traces/{traceId}` coexists with native `/api/t
 - **v1 flat tags:** `/api/search/tags` and `/api/search/tag/{tag}/values` serve Tempo's legacy v1 flat shapes — `{"tagNames":[...]}` (distinct keys, catalog order, deduplicated across scopes) and `{"tagValues":["a","b"]}` (bare strings). A server-side projection of the native scoped/typed §4.3 result: scope, value types, and `truncated` are dropped.
 - **v2 tags:** `/api/v2/search/tags` and `/api/v2/search/tag/{tag}/values` serve the native scoped/typed shapes minus the PulsusDB-only top-level `truncated` field (Tempo's v2 wire shape has no equivalent — alias consumers lose the truncation signal; use the native routes to observe it).
 - **Intrinsic scope:** not synthesized — `scope=intrinsic` is a `400 bad_data` on native and alias alike (§4.3), a delta from Tempo, which reports a static `intrinsic` scope. If intrinsic autocomplete proves load-bearing for real Grafana usage, the fix is adding intrinsic scope to the **native** v2 tags endpoint in a follow-up (the alias stays a pure projection of native) — never alias-side synthesis.
-- **`/api/echo`:** `200` with the constant body `echo`.
+- **`/api/echo`:** `200` with the constant body `echo` — four bytes, no trailing newline, `text/plain; charset=utf-8`, and no `X-Content-Type-Options`. **Accepted divergence (issue #405, closed 2026-08-11 with no code change):** Tempo answers `echo\n` and sets `X-Content-Type-Options: nosniff`. Neither shape was chosen — its handler is `http.Error(w, "echo", http.StatusOK)` (`cmd/tempo/app/modules.go:846-850` @ tempo v3.0.2 `0c4b926d`) and Go's `http.Error` sets `Content-Type` and `nosniff` before calling `fmt.Fprintln`, so the trailing `0x0a` and the header both fall out of the standard-library call it happens to use; ours writes the bytes directly. **This one closed for a weaker reason than §2.3's three, and that is worth stating plainly.** Their grounds are not even the same as each other: #296's input **cannot arrive** on any proxied or browser path (each cuts below our limit) and the direct path that remains has a POST carrier, while #291's and #256's inputs can arrive perfectly well and are accepted because **no known client sends them** — no generator emitting a thousand line filters or sixty-five nested `sum(` has been named. This endpoint is weaker than either: it is reachable by anyone who calls it, and a caller gets the divergent bytes on every single request without having to try. It is accepted only because **nothing branches on the difference** — a trailing newline on a plain-text body and a sniff header over a four-byte constant give a client nothing to act on; there is no content to sniff and no value to parse. The counter-argument is real and was weighed: this is the first endpoint a compatibility probe or health check touches, so it is disproportionately likely to be the thing someone diffs, and the fix is two lines. If a diff-based compatibility claim ever becomes a goal, reopen this first — it is the cheapest item on the list. `crates/pulsus-server/tests/api_conformance.rs` pins the four bytes, and that assertion pins **this divergence**, not parity.
 
 ### 8.2 Ingest receivers (M6)
 
@@ -1173,6 +1230,8 @@ Measured against `grafana/loki:3.7.4` at the wire, both before and after the cap
 The rows before `(?i)\p{L}`×1000 and from 12,729 atoms on are agreement; the middle is the divergence. Both alternation boundaries were bisected one atom at a time rather than projected — ours over the estimator, the reference's against the pinned container — so the residue can be named exactly: **the reference serves and we refuse over `\p{L}|…` alternations of 10,014 to 12,728 atoms, a band 2,715 atoms wide against the 12,728 it accepts.** Outside that band the two agree on this family. **We refuse nothing on length alone**: a literal is the cheapest shape there is, `a`×292624 still estimates under the cap, and the 131,071-byte query-text cap bites long before this one does.
 
 Ledgered as `regex-compile-budget` in `docs/benchmarks/logs-differential-ledger.md`, with the cap itself pinned by `crates/pulsus-re2/tests/regex_compile_budget.rs`.
+
+**Accepted limit — the cap is per compile, not per query (issue #291, remainder closed 2026-08-11 with no code change).** Both bounds above are charged on **one** pattern. Nothing bounds what a single query's patterns cost in aggregate, and the shape that shows it was measured: 1,000 line filters of 89 bytes each — 95,009 query bytes, comfortably inside the 131,071-byte text cap — allocate **5.24 GB over 5.9 s** while peak resident memory stays at **3.6 MB**, because each compiled pattern is dropped as soon as it has been validated. Every individual compile is small and well-behaved, so a per-compile cap is structurally incapable of seeing it. **The reference has nothing query-scoped here either** — its `maxHeight`/`maxSize`/`maxRunes` are per-limit caps on one parse tree, as cited above — so this is an availability question rather than an accept/reject divergence: one request buying seconds of work and gigabytes of churn. It is accepted because nobody writes a thousand line filters, and where untrusted users *can* send queries the answer is a query timeout and a rate limit at the front door, which are operator controls rather than engine work. **If it is ever wanted, build the cheap version**: one counter capping the number of compiled patterns per query, or their total pattern bytes — not a budget threaded through the nine compile sites, which was planned and deliberately abandoned. Reopen if untrusted query access enters the threat model.
 
 **Correction (issue #246, measured 2026-08-08).** This paragraph used to end by saying `[a--b]` is rejected by PulsusDB *and* by the reference, so it is agreement rather than a divergence. That holds only on the **rewritten** routes. On every LogQL route that compiles a pattern **as written** — twelve of the thirteen — `{app=~"[a--b]"}` is a `200` here and a `400` there, because the Rust crate reads it as set difference (§9.2) and compiles it happily; only `label_replace`, which rewrites first, agrees with the reference. `\u{263A}` splits exactly the same way. Both are in §9.3's direction, not this one, and the point-by-point measurement is `crates/pulsus-read/tests/logql_regex_accept_matrix.rs`.
 
