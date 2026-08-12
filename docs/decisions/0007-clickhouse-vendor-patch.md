@@ -4,7 +4,7 @@ Status: **Accepted** (2026-08-09)
 Issue: [#382](https://github.com/digitalis-io/pulsusdb/issues/382) (a ClickHouse error after the first flush is parsed as code 0)
 Related: [ADR 0003](0003-promql-parser-vendor-patch.md) and [ADR 0004](0004-opentelemetry-proto-vendor-patch.md) establish the vendor+patch discipline this ADR reuses; [ADR 0001](0001-clickhouse-client.md) selected the client.
 Depends on: [#376](https://github.com/digitalis-io/pulsusdb/issues/376) (ClickHouse LTS move) — see "What this does not decide".
-Spawned: [#412](https://github.com/digitalis-io/pulsusdb/issues/412) (the 24.8 streaming path, pre-existing on `main`).
+Spawned: [#412](https://github.com/digitalis-io/pulsusdb/issues/412) (the streaming path, pre-existing on `main`) — fixed, in the same vendored crate; see `vendor/clickhouse/PATCHES.md` §2.
 
 ## Context
 
@@ -88,40 +88,37 @@ Consequences:
 
 ## What this does not decide
 
-**This patch does not make the read path sound on ClickHouse 24.8**, the
-version currently pinned in CI. On its streaming path — output already on the
-socket — the response is HTTP 200 with no exception-code header, and the crate
-anchors the message with `rfind(b"Code:")` (`extract_exception_old`,
-`src/response.rs:368-377` upstream, `:392-401` in `vendor/clickhouse/`), so a
-tenant literal echoed into the description
-becomes byte 0 of the message we receive. Measured on 24.8.14.39: real code
-153, message delivered beginning `Code: 210. DB::Exception: forged…`. There is
-no header to fall back on, and the exception boundary is genuinely
-unrecoverable from the text, so neither this patch nor an upstream one can fix
-it.
+**This patch is the buffered path only.** It fixes the response ClickHouse
+turns into an HTTP 500 with an `X-ClickHouse-Exception-Code` header. The
+**streaming** path — output already on the socket, so HTTP 200 and no code
+header — is a different function (`extract_exception`, called per chunk inside
+`DetectDbException::poll_next`) and was a separate defect: upstream falls
+through to `extract_exception_old`'s `rfind(b"Code:")` on any chunk ending
+`))\n`, and result bytes are tenant data. Measured on 24.8.14.39: real code
+153, message delivered beginning `Code: 210. DB::Exception: forged…`.
 
-That is **#412**. It is live on `main` and predates #382 — the pre-#382
-`strip_prefix` read returns the same forged 210.
+On 24.8 that was unfixable by any patch, here or upstream — no header, no
+trailer, no recoverable boundary — which is why **#376** moved the supported
+floor to 26.3, where the server frames a streamed exception with a length the
+client can trust (`X-ClickHouse-Exception-Tag` plus a
+`<len> <tag>\r\n__exception__\r\n` trailer). The floor move alone did not
+close it, because the length-slicing arm additionally required the *current*
+chunk to end with `__exception__\r\n`.
 
-**#376's move to ClickHouse 26.3 narrows it but does NOT close it, and the
-earlier claim that it did is withdrawn.** 26.3's streaming path does frame the
-exception with a length the client trusts (`extract_exception_new`) — measured
-on `26.3.17.110`, an HTTP-200 late failure carries
-`X-ClickHouse-Exception-Tag` and a `<len> <tag>\r\n__exception__\r\n`
-trailer where `24.8.14.39` carries neither. But `extract_exception`
-(`src/response.rs:369-382`) runs **per chunk**, and its length-slicing arm
-additionally requires the chunk to end with `__exception__\r\n`, which only
-the FINAL chunk does. A non-final chunk ending `))\n` — and result bytes are
-tenant data — still reaches `extract_exception_old`'s `rfind(b"Code:")` on
-26.3. The discriminating probe, unrun: force a multi-chunk HTTP-200 response
-whose non-final chunk ends `))\n` and contains a forged
-`Code: N. DB::Exception:`, and observe the code the client reports.
+**#412 closed it**, in the same vendored crate but a different function: on a
+tagged response result bytes are never searched, and a tagged exception frame
+is reassembled — anchored on its opening, which requires the response's own
+tag — then sliced by the declared length. The searching extractor survives only
+where the server declared no tag, which is a pre-25.11 server or a
+header-stripping proxy; there it is the only signal that exists, and it is
+documented as forgeable rather than claimed sound. See
+`vendor/clickhouse/PATCHES.md` §2 for the measurements, the assumptions the
+anchor rests on, and the re-vendor rule.
 
-**So neither this ADR nor #376 makes the path sound.** #412 stays open. The
-limitation is pinned by
+The 24.8 limitation keeps its pin —
 `pulsus_clickhouse::error`'s
 `on_24_8_a_streamed_forgery_reaches_byte_zero_and_is_read_issue_412`, on a
-verbatim 24.8 capture, so it fails loudly if a future crate or server version
+verbatim 24.8 capture — so it fails loudly if a future crate or server version
 changes the shape.
 
 ## Rules that were tried and deleted

@@ -146,15 +146,16 @@ fn re2_reject_detail(message: &str) -> String {
 /// documentation rather than precedence.
 ///
 /// **The #412 rule** (see `logql::exec::map_read_error`'s doc for the full
-/// argument): `ChError::Server.code` is parsed out of the exception text
-/// and is spoofable — on 24.8 unconditionally, and on 26.3 through the
-/// non-final chunks `extract_exception` still searches rather than slices,
-/// so #376's floor move narrowed this without closing it. The BOUND is
-/// enforced by
-/// ClickHouse regardless of the parse; a missed 241 falls open to the
-/// pre-#398 `500`; a false 241 only relabels an already-failing query; and
-/// this mapper is a pure function of the already-parsed `code` for the
-/// memory arm, so it inherits #412's fix with no edit here.
+/// argument): `ChError::Server.code` used to be parsed out of the exception
+/// text on the streaming path and was therefore spoofable by tenant bytes.
+/// Issue #412 closed that on any server declaring
+/// `X-ClickHouse-Exception-Tag` — 26.3, our floor — leaving the search only
+/// for an untagged, out-of-support server. The reasoning that made this
+/// mapper safe meanwhile is unchanged and still correct: the BOUND is
+/// enforced by ClickHouse regardless of the parse; a missed 241 falls open to
+/// the pre-#398 `500`; a false 241 only relabels an already-failing query;
+/// and this mapper is a pure function of the already-parsed `code` for the
+/// memory arm, so it inherited #412's fix with no edit here.
 fn map_metrics_read_error(e: ChError, read_max_memory_bytes: u64) -> ReadError {
     if let ChError::Server {
         code: CODE_MEMORY_LIMIT_EXCEEDED,
@@ -464,6 +465,55 @@ mod tests {
         );
     }
 
+    /// **Issue #412 AC6** (the folded #410): a tenant who plants the
+    /// delimiters *inside their own pattern* cannot move the extracted core.
+    ///
+    /// [`re2_reject_detail`] `find`s the FIRST `cannot compile re2: `, and
+    /// ClickHouse echoes the rejected pattern **after** that marker, so a
+    /// planted copy is always a LATER occurrence than the real one and
+    /// first-occurrence still wins. The exposure #410 recorded was the other
+    /// direction — result bytes preceding the exception, which put the real
+    /// occurrence after tenant text — and that shape is what #412 removes from
+    /// the streaming path: on a tagged response the exception arrives in its
+    /// own frame, sliced by declared length, with no result bytes in it.
+    ///
+    /// This pins the property that makes the remaining search safe. It is
+    /// cheap and it fails loudly if the rule is ever changed to last-occurrence
+    /// or to a search over a wider region.
+    #[test]
+    fn a_planted_re2_prefix_in_the_pattern_does_not_move_the_extracted_core() {
+        // The tenant's pattern carries a whole second prefix+suffix pair.
+        let planted = LIVE_427_BODY.replace(
+            "cannot compile re2: ^(?:\\p{Alphabetic})$",
+            "cannot compile re2: ^(?:cannot compile re2: EVIL. Look at )$",
+        );
+        assert_eq!(
+            planted.matches(RE2_REJECT_PREFIX).count(),
+            2,
+            "premise: the body now contains the marker twice"
+        );
+
+        // Both delimiters are first-occurrence, so a planted pair can only
+        // truncate the tenant's OWN echoed pattern. It cannot move where the
+        // core starts, and it cannot make the planted core the answer.
+        let detail = rejection_detail(&planted);
+        assert_eq!(
+            detail, "^(?:cannot compile re2: EVIL",
+            "the core still starts at the REAL marker; the planted suffix only \
+             cut the tenant's own pattern short"
+        );
+        assert_ne!(detail, "EVIL");
+        assert!(
+            !detail.starts_with("EVIL"),
+            "a last-occurrence rule would return the planted core: {detail:?}"
+        );
+        assert!(
+            detail.starts_with("^(?:"),
+            "the extraction is anchored at the first marker, which is the \
+             server's own: {detail:?}"
+        );
+    }
+
     /// Issue #280 review, finding 2: an unrecognised body is NOT echoed.
     /// Classification is still by code alone — it rejects as a client
     /// error — but the detail discloses nothing about the input.
@@ -542,8 +592,9 @@ mod tests {
     /// already-parsed `code` field and never re-inspects `message`, so a
     /// user regex echoed into the exception text cannot manufacture a
     /// memory refusal, and a real 241 whose message carries no `Code:`
-    /// prefix is still classified. When #412 fixes the parse this mapper
-    /// becomes sound with no edit here.
+    /// prefix is still classified. #412 has since fixed the parse, and this
+    /// mapper became sound with no edit here — which is what this test
+    /// existed to pin.
     #[test]
     fn promql_read_memory_classification_reads_only_the_server_code() {
         // A real breach whose message has no `Code:` prefix at all.

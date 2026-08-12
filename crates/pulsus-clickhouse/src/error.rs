@@ -138,37 +138,37 @@ impl ChError {
     /// that upstream returned. So this function reads byte 0 and nothing else,
     /// and what it reads came from the header.
     ///
-    /// # What is still not sound, and whose it is
+    /// # The streaming path, and where its code now comes from (issue #412)
     ///
-    /// **ClickHouse 24.8 remains forgeable and the patch does not help it.**
-    /// On its streaming path the response is HTTP 200 with no exception-code
-    /// header, and the crate anchors the message with `rfind(b"Code:")`
-    /// (`extract_exception_old`, `vendor/clickhouse/src/response.rs:392-401`),
-    /// so a tenant literal echoed in the description becomes byte 0 and this
-    /// function reads it. That is issue #412 — it is live on `main`, predates
-    /// #382, and cannot be fixed by any patch here or upstream, because at
-    /// HTTP 200 the exception boundary is genuinely unrecoverable from the
-    /// text.
+    /// The streamed HTTP-200 case — output already on the socket, so no
+    /// exception-code header exists — used to reach this function through
+    /// `extract_exception_old`'s `rfind(b"Code:")`, which anchors the message
+    /// at whatever `Code:` appears last in the chunk. Result bytes are tenant
+    /// data, so that made byte 0 tenant-chosen: measured on 26.3.17.110, a
+    /// **successful** query whose last row ended `))\n` came back as zero rows
+    /// and a fabricated `Code: 210`.
     ///
-    /// **#376's move to 26.3 narrows this but does NOT close it, and the
-    /// earlier claim that it did is withdrawn.** What was measured is that
-    /// the FINAL-chunk path is sound on 26.3 — the server sends
-    /// `X-ClickHouse-Exception-Tag` and a `<len> <tag>\r\n__exception__\r\n`
-    /// trailer, so `extract_exception_new` slices by a declared length
-    /// instead of searching. But `extract_exception`
-    /// (`vendor/clickhouse/src/response.rs:369-382`) runs **per chunk**, and
-    /// its length-slicing arm additionally requires the chunk to end with
-    /// `__exception__\r\n`, which only the final chunk does. A non-final
-    /// chunk ending `))\n` — and result bytes are tenant data — still
-    /// reaches `extract_exception_old`'s `rfind(b"Code:")` on 26.3. So #412
-    /// stays open and this parse is **not** sound on the version we run
-    /// either; see the note on #412 for the probe that would settle it.
+    /// That is fixed in the vendored crate (`vendor/clickhouse/PATCHES.md`
+    /// §2): on a response the server tagged, result bytes are never searched.
+    /// A tagged exception frame is reassembled — anchored on its opening,
+    /// which requires the response's own tag — and sliced by the length the
+    /// server declared. The searching extractor is reached only when the
+    /// server declared **no** tag, which is a pre-25.11 server or a
+    /// header-stripping proxy; there it is the only signal that exists, and
+    /// deleting it turns a real exception into a `Decode` misdiagnosis
+    /// (measured on 24.8.14.39). That out-of-support arm remains forgeable and
+    /// is documented as such rather than silently relied on.
+    ///
+    /// So the code this function reads has exactly three sources, none of them
+    /// a search over tenant bytes: the tagged trailer's declared length; the
+    /// `X-ClickHouse-Exception-Code` header via the ADR 0007 patch on the
+    /// buffered path; and — only on an untagged server — the text search.
     ///
     /// # Shapes this receives, all measured through this client
     ///
     /// | shape | source |
     /// |---|---|
-    /// | `Code: N. DB::Exception: …` | an exception with no output before it, both versions |
+    /// | `Code: N. DB::Exception: …` | an exception with no output before it; also the tagged trailer, sliced by declared length |
     /// | `Code: N` alone | the crate's header-derived `reason()`, `vendor/clickhouse/src/response.rs:203-211` |
     /// | `Code: N\n<result bytes>Code: N. DB::Exception: …` | the ADR 0007 patch, 26.3 buffered path |
     pub(crate) fn server_from_bad_response(message: String) -> ChError {
@@ -183,8 +183,9 @@ const EXCEPTION_CODE_MARKER: &str = "Code: ";
 
 /// Reads `Code: <ascii digits>` at byte 0. Deliberately positional: see
 /// [`ChError::server_from_bad_response`] for why nothing past byte 0 can be
-/// believed, and what remains unsound (#412 — on 24.8 unconditionally, and
-/// on 26.3 for a non-final chunk).
+/// believed, and for the three sources byte 0 can now come from (#412 gated
+/// the text search behind "the server declared no exception tag", which is the
+/// out-of-support arm and the only one still forgeable).
 ///
 /// Compatible with the `strip_prefix("Code: ").split(['.', ' '])` read this
 /// replaces for every body that begins with a run of ASCII digits that fits
@@ -546,18 +547,28 @@ mod tests {
     /// **An archived record, not a detector.** It states what this parser
     /// does with one captured byte sequence; it cannot notice if the server
     /// or the crate stops producing that sequence, because the bytes are
-    /// written down here rather than derived. The live detector for that
-    /// belongs on issue #412 and is deliberately not in this suite.
+    /// written down here rather than derived. The live detectors for that
+    /// landed with issue #412 and live in this crate's test suites —
+    /// `tests/live_clickhouse.rs` (real server) and `tests/mock_clickhouse.rs`
+    /// (chosen chunk splits) — deliberately not here.
     ///
     /// What the bytes are: ClickHouse 24.8's streaming path, which this parse
-    /// cannot make sound and which the ADR 0007 patch does not reach (#412,
-    /// which #376 narrows but does NOT close — the final-chunk path is sound
-    /// on 26.3, the non-final-chunk path is unverified and looks reachable).
-    /// At HTTP 200 there is no exception-code header, and
-    /// the crate anchors the message with `rfind(b"Code:")`
-    /// (`extract_exception_old`, `vendor/clickhouse/src/response.rs:392-401`),
-    /// so a tenant literal echoed into the description becomes byte 0. The
-    /// real failure was 153.
+    /// cannot make sound and which the ADR 0007 patch does not reach. At HTTP
+    /// 200 there is no exception-code header, and the crate anchored the
+    /// message with `rfind(b"Code:")` (`extract_exception_old`), so a tenant
+    /// literal echoed into the description became byte 0. The real failure was
+    /// 153.
+    ///
+    /// **What #412 changed, and what it did not.** On a response the server
+    /// **tagged** (26.3 and newer), result bytes are no longer searched at
+    /// all: the exception arrives in a frame the client reassembles and slices
+    /// by declared length (`vendor/clickhouse/PATCHES.md` §2). On an
+    /// **untagged** response — a pre-25.11 server like the one that produced
+    /// these bytes, or a header-stripping proxy — the search is retained,
+    /// because it is the only signal that exists and deleting it turns a real
+    /// exception into a `Decode` misdiagnosis. So these bytes still parse
+    /// exactly as recorded, and that arm is documented as forgeable rather
+    /// than claimed sound.
     ///
     /// # Provenance, replayable without cargo
     ///
@@ -641,8 +652,10 @@ mod tests {
         assert_eq!(
             parse_exception_code(body),
             Some(210),
-            "#412: on 24.8 the crate hands us the forgery AT byte 0, and no \
-             parse can recover the real 153 — the pre-#382 read returns 210 here too"
+            "#412: on an UNTAGGED response the crate hands us the forgery AT \
+             byte 0, and no parse can recover the real 153 — the pre-#382 read \
+             returns 210 here too. That is why #412 gated the text search on \
+             the server having declared a tag instead of trying to parse better"
         );
     }
 
