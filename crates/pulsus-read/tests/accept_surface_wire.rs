@@ -69,6 +69,17 @@ use serde::Deserialize;
 struct WireBaseline {
     WIRE_AGREE_BASELINE: usize,
     WIRE_DIVERGE_BASELINE: usize,
+    /// Why the two constants are where they are, beside the constants
+    /// themselves (issue #335 Stage D0). A reader meeting
+    /// `WIRE_DIVERGE_BASELINE = 60` in six months, with the plan comment
+    /// long gone, would read a sixfold rise over Stage C's 10 as decay;
+    /// it is the accept-surface enumeration widening from 24 of the
+    /// reference grammar's 33 productions to all 33. The field is not
+    /// decoration: [`the_baselines_note_explains_the_numbers_beside_it`]
+    /// asserts it is non-empty and names BOTH the old and the new
+    /// divergence count, so it cannot drift into a comfortable sentence
+    /// while the numbers move under it.
+    note: String,
     wire_baseline: Vec<WireProbe>,
 }
 
@@ -248,5 +259,48 @@ fn every_committed_wire_verdict_is_reproduced_by_the_planner() {
         baseline.WIRE_AGREE_BASELINE + baseline.WIRE_DIVERGE_BASELINE,
         baseline.wire_baseline.len(),
         "the two constants must partition the probe set"
+    );
+}
+
+/// The two constants rose sharply at Stage D0 (10 diverging probes → 63)
+/// and that rise is an ENUMERATION WIDENING, not a regression. The
+/// explanation has to live where the numbers live: a reader meeting
+/// `WIRE_DIVERGE_BASELINE` with no plan comment to hand reads a sixfold
+/// rise as decay, and a note nothing checks rots away from the numbers it
+/// claims to explain.
+///
+/// So this asserts the note is present, non-empty, and names BOTH the old
+/// count and the current committed one — the `wire_note` posture one file
+/// over. *RED when:* the note is emptied, or the constant moves without
+/// the sentence beside it moving too.
+#[test]
+fn the_baselines_note_explains_the_numbers_beside_it() {
+    let baseline: WireBaseline = read_json("wire_baseline.json");
+    assert!(
+        !baseline.note.trim().is_empty(),
+        "wire_baseline.json's `note` is what stops WIRE_DIVERGE_BASELINE reading as decay; \
+         it may not be emptied"
+    );
+    // Stage C's committed divergence count, the number this rise is read
+    // against. It is a historical fact, so it is spelled here rather than
+    // derived — and if a later stage lowers the count below it the note
+    // still has to name both ends.
+    const STAGE_C_DIVERGE: usize = 10;
+    for (label, value) in [
+        ("the pre-Stage-D0 divergence count", STAGE_C_DIVERGE),
+        ("the committed WIRE_DIVERGE_BASELINE", baseline.WIRE_DIVERGE_BASELINE),
+    ] {
+        assert!(
+            baseline.note.contains(&value.to_string()),
+            "wire_baseline.json's `note` does not mention {label} ({value}) — the note and the \
+             constants must move together, or the sentence stops explaining the number it sits \
+             beside. Note: {:?}",
+            baseline.note
+        );
+    }
+    assert!(
+        baseline.note.contains("33"),
+        "wire_baseline.json's `note` must say WHY the count rose — the enumeration widening from \
+         a subset of the reference grammar's 33 productions to all 33 — not merely that it did"
     );
 }

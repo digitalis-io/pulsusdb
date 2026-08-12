@@ -117,6 +117,150 @@
       "pulsus": "one node pair: bare and '!= nil' both parse to Exists and evaluate as presence; '!' and '= nil' both parse to Not(Exists) and evaluate as absence, with identical canonical text.",
       "impact": "quiet meaning",
       "status": "open"
+    },
+    {
+      "id": "D13",
+      "title": "'unspecified' missing from the span-kind statics",
+      "reference": "'unspecified' is the first member of the Kind enum and a `static` terminal of its own (expr.y:436), so it is a value wherever any other kind keyword is.",
+      "pulsus": "SpanKindValue enumerates five members; the bare identifier 'unspecified' is a positioned parse error in every operand and hint position.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "lexical",
+      "subject_atoms": [
+        "unspecified"
+      ],
+      "stage": "D1"
+    },
+    {
+      "id": "D14",
+      "title": "'minInt' / 'maxInt' statics missing",
+      "reference": "The `static` production resolves the bare identifiers minInt and maxInt to math.MinInt / math.MaxInt from the token alone, with no left context (expr.y:442-452); every other identifier is 'unknown identifier'.",
+      "pulsus": "No identifier resolves to a numeric static; both spellings are a positioned parse error.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "lexical",
+      "subject_atoms": [
+        "maxInt",
+        "minInt"
+      ],
+      "stage": "D1"
+    },
+    {
+      "id": "D15",
+      "title": "'nil' legal only as an '='/'!=' operand on a bare field",
+      "reference": "Six dedicated productions (expr.y:408-413) make NIL an operand of '=' and '!=' against a whole fieldExpression on either side, and NIL = NIL / NIL != NIL fold to the boolean false.",
+      "pulsus": "'nil' is recognised only as the right-hand side of '='/'!=' against a bare Field; every other position is a positioned parse error.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "lexical",
+      "subject_atoms": [
+        "nil"
+      ],
+      "stage": "held"
+    },
+    {
+      "id": "D16",
+      "title": "spanset by() takes ONE field expression, not a comma list of fields",
+      "reference": "groupOperation is `BY OPEN_PARENS fieldExpression CLOSE_PARENS` (expr.y:177-179): exactly one operand, and that operand is a full field expression. There is no COMMA in the production and fieldExpression has none either.",
+      "pulsus": "A comma-separated list of bare Fields — wider in one direction (the list) and narrower in the other (no arithmetic, unary, parentheses or comparison operand).",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "positional",
+      "subject_atoms": [],
+      "stage": "D2"
+    },
+    {
+      "id": "D17",
+      "title": "compare()'s optional numeric arguments",
+      "reference": "Three arities (expr.y:324-326): compare(f), compare(f, topN) and compare(f, topN, start, end), defaulting 10, 0, 0.",
+      "pulsus": "Only the one-argument form parses; a comma after the spanset filter is a positioned parse error.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "positional",
+      "subject_atoms": [],
+      "stage": "held"
+    },
+    {
+      "id": "D18",
+      "title": "negative aggregate / metrics thresholds",
+      "reference": "scalarExpression carries SUB INTEGER|FLOAT|DURATION (expr.y:290-292) and metricsFilter carries `metricsFilterOperation SUB …` (expr.y:353-355), so a threshold may be negative.",
+      "pulsus": "Both threshold positions take an unsigned literal only; the leading '-' is a positioned parse error.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "positional",
+      "subject_atoms": [],
+      "stage": "held"
+    },
+    {
+      "id": "D19",
+      "title": "a parenthesised spanset PIPELINE is an operand everywhere a spanset expression is",
+      "reference": "wrappedSpansetPipeline is `'(' spansetPipeline ')'` (expr.y:162-163), an alternative of spansetPipelineExpression (expr.y:159) and therefore an operand of every structural and logical operator at that level, and a root form (expr.y:130).",
+      "pulsus": "Parentheses at the spanset level wrap a spanset EXPRESSION only; a '|' inside them is a positioned parse error.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "positional",
+      "subject_atoms": [],
+      "stage": "held"
+    },
+    {
+      "id": "D20",
+      "title": "a parenthesised scalar expression at a scalar-filter operand",
+      "reference": "scalarExpression is self-parenthesising (expr.y:279), so `(count()) > 4` is the same shape as `count() > 4`.",
+      "pulsus": "A pipeline stage must begin with a stage keyword; '(' there is a positioned parse error.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "positional",
+      "subject_atoms": [],
+      "stage": "held"
+    },
+    {
+      "id": "D21",
+      "title": "a metrics threshold after a second-stage function, and chains of them",
+      "reference": "metricsSecondStagePipeline is left-recursive over both `PIPE metricsSecondStage` and `metricsFilter` (expr.y:361-366), so filters and second-stage functions interleave freely.",
+      "pulsus": "At most one trailing threshold, and only directly after the first-stage function; anything further is trailing input.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "positional",
+      "subject_atoms": [],
+      "stage": "held"
+    },
+    {
+      "id": "D22",
+      "title": "a second-stage function with no first-stage metrics aggregation",
+      "reference": "metricsSecondStagePipeline is reachable only from `spansetPipeline PIPE metricsAggregation metricsSecondStagePipeline` (expr.y:133), so topk/bottomk without a first stage is a parse error.",
+      "pulsus": "topk(n)/bottomk(n) parse as an ordinary pipeline stage anywhere after a '|'.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "lexical",
+      "subject_atoms": [
+        "bottomk",
+        "topk"
+      ],
+      "stage": "held",
+      "wire_status": "closed",
+      "wire_note": "PARSE axis only. Our parser accepts `| topk(n)` / `| bottomk(n)` with no first-stage metrics aggregation, which the reference parse-rejects. On the WIRE (parse -> validate -> plan) the two axes AGREE: metrics_plan.rs and search_plan.rs both refuse a bare second stage, so every probe of this class is a 400 on both sides. The gap is the parser's alone; see wire_baseline.json."
+    },
+    {
+      "id": "D23",
+      "title": "repeated root with() clauses",
+      "reference": "`root: root hints` (expr.y:134) is recursive, so a root query may carry more than one with(...) clause and their hints concatenate.",
+      "pulsus": "The root hint clause is parsed once; a second with(...) is trailing input.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "positional",
+      "subject_atoms": [],
+      "stage": "D1"
+    },
+    {
+      "id": "D24",
+      "title": "a pipeline may BEGIN with a stage that is not a spanset filter",
+      "reference": "spansetPipeline has four leading alternatives (expr.y:165-169) — spansetExpression, scalarFilter, groupOperation, selectOperation — and three of them are not `{ … }`.",
+      "pulsus": "A query must begin with a spanset filter or '('; a leading by()/select()/count() is a positioned parse error.",
+      "impact": "accept-surface",
+      "status": "open",
+      "subject_kind": "positional",
+      "subject_atoms": [],
+      "stage": "held"
     }
   ],
   "accept_surface_probes": [
@@ -1575,6 +1719,1146 @@
     },
     {
       "query": "{ .a } && { .b } || { .c }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } with(k=unspecified)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D13",
+      "reachability": "r1-client-emitted",
+      "subject": "unspecified",
+      "reachability_evidence": {
+        "kind": "capture",
+        "capture": "cap.kind-tag-values",
+        "observed_value": "unspecified"
+      }
+    },
+    {
+      "query": "{ .a = unspecified }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D13",
+      "reachability": "r1-client-emitted",
+      "subject": "unspecified",
+      "reachability_evidence": {
+        "kind": "capture",
+        "capture": "cap.kind-tag-values",
+        "observed_value": "unspecified"
+      }
+    },
+    {
+      "query": "{ kind != unspecified }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D13",
+      "reachability": "r1-client-emitted",
+      "subject": "unspecified",
+      "reachability_evidence": {
+        "kind": "capture",
+        "capture": "cap.kind-tag-values",
+        "observed_value": "unspecified"
+      }
+    },
+    {
+      "query": "{ kind = unspecified }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D13",
+      "reachability": "r1-client-emitted",
+      "subject": "unspecified",
+      "reachability_evidence": {
+        "kind": "capture",
+        "capture": "cap.kind-tag-values",
+        "observed_value": "unspecified"
+      }
+    },
+    {
+      "query": "{ span:kind = unspecified }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D13",
+      "reachability": "r1-client-emitted",
+      "subject": "unspecified",
+      "reachability_evidence": {
+        "kind": "capture",
+        "capture": "cap.kind-tag-values",
+        "observed_value": "unspecified"
+      }
+    },
+    {
+      "query": "{ .a < maxInt }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D14",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "maxInt",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "maxInt",
+        "revision": "v13.1.5",
+        "scope": [
+          ""
+        ],
+        "hits": 0
+      }
+    },
+    {
+      "query": "{ .a = 1 } with(k=maxInt)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D14",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "maxInt",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "maxInt",
+        "revision": "v13.1.5",
+        "scope": [
+          ""
+        ],
+        "hits": 0
+      }
+    },
+    {
+      "query": "{ .a = maxInt - 1 }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D14",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "maxInt",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "maxInt",
+        "revision": "v13.1.5",
+        "scope": [
+          ""
+        ],
+        "hits": 0
+      }
+    },
+    {
+      "query": "{ .a = minInt }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D14",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "minInt",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "minInt",
+        "revision": "v13.1.5",
+        "scope": [
+          ""
+        ],
+        "hits": 0
+      }
+    },
+    {
+      "query": "{ !.a = nil }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D15",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "nil",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "nil",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ (.a = 1) = nil }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D15",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "nil",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "nil",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a + 1 = nil }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D15",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "nil",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "nil",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ nil != .a }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D15",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "nil",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "nil",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ nil != nil }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D15",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "nil",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "nil",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ nil = .a + 1 }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D15",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "nil",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "nil",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ nil = .a }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D15",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "nil",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "nil",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ nil = nil }",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D15",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "nil",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "nil",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | by(!.b)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D16",
+      "reachability": "r2-skeleton-inserted",
+      "reachability_evidence": {
+        "kind": "insertion",
+        "anchor": "ds.by-insertion"
+      }
+    },
+    {
+      "query": "{ .a = 1 } | by((.b))",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D16",
+      "reachability": "r2-skeleton-inserted",
+      "reachability_evidence": {
+        "kind": "insertion",
+        "anchor": "ds.by-insertion"
+      }
+    },
+    {
+      "query": "{ .a = 1 } | by(-.b)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D16",
+      "reachability": "r2-skeleton-inserted",
+      "reachability_evidence": {
+        "kind": "insertion",
+        "anchor": "ds.by-insertion"
+      }
+    },
+    {
+      "query": "{ .a = 1 } | by(.b + .c)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D16",
+      "reachability": "r2-skeleton-inserted",
+      "reachability_evidence": {
+        "kind": "insertion",
+        "anchor": "ds.by-insertion"
+      }
+    },
+    {
+      "query": "{ .a = 1 } | by(.b = 1)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D16",
+      "reachability": "r2-skeleton-inserted",
+      "reachability_evidence": {
+        "kind": "insertion",
+        "anchor": "ds.by-insertion"
+      }
+    },
+    {
+      "query": "{ .a = 1 } | by(.b, .c)",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D16",
+      "reachability": "r2-skeleton-inserted",
+      "reachability_evidence": {
+        "kind": "insertion",
+        "anchor": "ds.by-insertion"
+      }
+    },
+    {
+      "query": "{ .a = 1 } | compare({ .b = 2 }, 10)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D17",
+      "reachability": "r2-skeleton-inserted",
+      "reachability_evidence": {
+        "kind": "insertion",
+        "anchor": "ds.compare-insertion"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | compare({ .b = 2 }, 10, 0, 0)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D17",
+      "reachability": "r2-skeleton-inserted",
+      "reachability_evidence": {
+        "kind": "insertion",
+        "anchor": "ds.compare-insertion"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | avg(.b) > -1s",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D18",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.operator-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | count() > -1",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D18",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.operator-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | rate() > -1",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D18",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.operator-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | rate() > -1.5",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D18",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.operator-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | rate() > -1s",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D18",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.operator-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "(({ .a = 1 } | count() > 1))",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | avg(.b) > 1)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | by(.b))",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | coalesce())",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | count() > 1)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | count() > 1) && ({ .b = 2 } | count() > 1)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | count() > 1) >> ({ .b = 2 } | count() > 1)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | count() > 1) || ({ .b = 2 } | count() > 1)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | count() > 1) ~ ({ .b = 2 } | count() > 1)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "({ .a = 1 } | select(.b))",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D19",
+      "reachability": "r4-no-traceql-surface-path",
+      "reachability_evidence": {
+        "kind": "citation",
+        "anchor": "ds.completion-list"
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | (count()) > 4",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D20",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.operator-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | rate() > 1 | topk(5) > 2",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D21",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.operator-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | rate() | topk(5) > 1",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D21",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.operator-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | bottomk(3)",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D22",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "bottomk",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "bottomk",
+        "revision": "v13.1.5",
+        "scope": [
+          ""
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | topk(10)",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D22",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "topk",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "topk",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } | topk(5) | rate()",
+      "reference": "reject",
+      "pulsus": "accept",
+      "verdict": "diverge",
+      "class": "D22",
+      "reachability": "r4-no-traceql-surface-path",
+      "subject": "topk",
+      "reachability_evidence": {
+        "kind": "absence-sweep",
+        "tool": "git grep",
+        "flags": [
+          "-n",
+          "-i",
+          "-F"
+        ],
+        "token": "topk",
+        "revision": "v13.1.5",
+        "scope": [
+          "src/traceql/",
+          "src/language_provider.ts"
+        ],
+        "hits": 0
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "{ .a = 1 } with(a=1) with(b=2)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D23",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.keyword-list",
+          "ds.empty-situation"
+        ]
+      }
+    },
+    {
+      "query": "avg(.a) > 1",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "by(.a + 1)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "by(.a)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "by(name)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "count() > 1",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "count() > 1 | select(.b)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "select(.a)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "select(.a) | by(.b)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "select(.a, .b)",
+      "reference": "accept",
+      "pulsus": "reject",
+      "verdict": "diverge",
+      "class": "D24",
+      "reachability": "r3-highlighted-only",
+      "reachability_evidence": {
+        "kind": "highlight-only",
+        "anchors": [
+          "ds.token-list",
+          "ds.empty-situation"
+        ]
+      },
+      "owning_issue": 335
+    },
+    {
+      "query": "coalesce()",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "by(.a) && { .b = 1 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "({ .a = 1 } | count() > 1) && { .b = 2 }",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "({ .a = 1 } && { .b = 2 }) >> { .c = 3 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } >> { .b = 2 } && { .c = 3 }",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "(({ .a = 1 }))",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | count() = 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | count() != 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | count() < 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | count() <= 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | count() > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | count() >= 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | count() =~ 1",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | rate() = 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | rate() != 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | rate() < 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | rate() <= 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | rate() > 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | rate() >= 1",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | rate() =~ 1",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "({ .a = 1 } | count()) > 1",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "({ .a = 1 } | count()) + 1 > 2",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "({ .a = 1 } | count()) > ({ .b = 2 } | count())",
+      "reference": "reject",
+      "pulsus": "reject",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | coalesce()",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | by(.b)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | by(span.b)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | by(name)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | by(span:kind)",
+      "reference": "accept",
+      "pulsus": "accept",
+      "verdict": "agree"
+    },
+    {
+      "query": "{ .a = 1 } | by(resource.service.name)",
       "reference": "accept",
       "pulsus": "accept",
       "verdict": "agree"

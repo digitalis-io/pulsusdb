@@ -1,6 +1,7 @@
 {
-  "WIRE_AGREE_BASELINE": 211,
-  "WIRE_DIVERGE_BASELINE": 10,
+  "WIRE_AGREE_BASELINE": 243,
+  "WIRE_DIVERGE_BASELINE": 63,
+  "note": "Stage D0 (issue #335, 2026-08-12) appended 85 probes and raised WIRE_DIVERGE_BASELINE from 10 to 63. NOTHING REGRESSED. The first enumeration covered the precedence table and the field-expression operand positions - 24 of the reference grammar's 33 productions. Stage D0 enumerated all 33; the nine that had never been probed carry two classes on their own. The rise is the enumeration widening from a subset of the grammar to the whole of it, not decay. See accept_surface/grammar_slots.json, accept_surface/PROVENANCE.md section 'Stage D0' and the doc block above TOTAL/AGREE/DIVERGE in pulsus-traceql/tests/accept_surface.rs.",
   "wire_baseline": [
     {
       "pulsus_wire": "reject",
@@ -885,6 +886,346 @@
     {
       "pulsus_wire": "accept",
       "query": "{ .a } && { .b } || { .c }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } with(k=unspecified)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = unspecified }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ kind != unspecified }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ kind = unspecified }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ span:kind = unspecified }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a < maxInt }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } with(k=maxInt)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = maxInt - 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = minInt }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ !.a = nil }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ (.a = 1) = nil }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a + 1 = nil }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ nil != .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ nil != nil }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ nil = .a + 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ nil = .a }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ nil = nil }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | by(!.b)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | by((.b))"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | by(-.b)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | by(.b + .c)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | by(.b = 1)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | by(.b, .c)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | compare({ .b = 2 }, 10)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | compare({ .b = 2 }, 10, 0, 0)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | avg(.b) > -1s"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | count() > -1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | rate() > -1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | rate() > -1.5"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | rate() > -1s"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "(({ .a = 1 } | count() > 1))"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | avg(.b) > 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | by(.b))"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | coalesce())"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count() > 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count() > 1) && ({ .b = 2 } | count() > 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count() > 1) >> ({ .b = 2 } | count() > 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count() > 1) || ({ .b = 2 } | count() > 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count() > 1) ~ ({ .b = 2 } | count() > 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | select(.b))"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | (count()) > 4"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | rate() > 1 | topk(5) > 2"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | rate() | topk(5) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | bottomk(3)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | topk(10)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | topk(5) | rate()"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } with(a=1) with(b=2)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "avg(.a) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "by(.a + 1)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "by(.a)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "by(name)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "count() > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "count() > 1 | select(.b)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "select(.a)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "select(.a) | by(.b)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "select(.a, .b)"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "coalesce()"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "by(.a) && { .b = 1 }"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count() > 1) && { .b = 2 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "({ .a = 1 } && { .b = 2 }) >> { .c = 3 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } >> { .b = 2 } && { .c = 3 }"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "(({ .a = 1 }))"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | count() = 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | count() != 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | count() < 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | count() <= 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | count() > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | count() >= 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | count() =~ 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | rate() = 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | rate() != 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | rate() < 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | rate() <= 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | rate() > 1"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | rate() >= 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "{ .a = 1 } | rate() =~ 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count()) > 1"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count()) + 1 > 2"
+    },
+    {
+      "pulsus_wire": "reject",
+      "query": "({ .a = 1 } | count()) > ({ .b = 2 } | count())"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | coalesce()"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | by(.b)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | by(span.b)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | by(name)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | by(span:kind)"
+    },
+    {
+      "pulsus_wire": "accept",
+      "query": "{ .a = 1 } | by(resource.service.name)"
     }
   ]
 }
