@@ -325,12 +325,12 @@ pub async fn ingest_remote_write(
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
-        Err(err) => return rw_error_response(&err),
+        Err(err) => return remote_write_error_response(&err),
     };
 
     let request = match decode_remote_write_request(&body) {
         Ok(request) => request,
-        Err(err) => return rw_error_response(&err),
+        Err(err) => return remote_write_error_response(&err),
     };
 
     // Fallible, unlike the logs parse: the remote-write parser's expansion
@@ -339,22 +339,22 @@ pub async fn ingest_remote_write(
     // failure gets.
     let parsed = match remote_write::parse(&request, now_ns) {
         Ok(parsed) => parsed,
-        Err(err) => return rw_error_response(&err),
+        Err(err) => return remote_write_error_response(&err),
     };
 
     if is_async(&headers) {
         return match sink.admit(parsed) {
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
-            Err(Backpressure) => rw_backpressure_response(),
+            Err(Backpressure) => remote_write_backpressure_response(),
         };
     }
 
     match sink.admit_flush(parsed) {
         Ok(wait) => match wait.await {
             Ok(()) => rw_success_response(StatusCode::NO_CONTENT),
-            Err(err) => rw_error_response(&err),
+            Err(err) => remote_write_error_response(&err),
         },
-        Err(Backpressure) => rw_backpressure_response(),
+        Err(Backpressure) => remote_write_backpressure_response(),
     }
 }
 
@@ -470,10 +470,14 @@ fn loki_stream_errors_response(errors: Vec<String>) -> Response {
 /// three responders that reach here, and the live wire leg is
 /// `api_conformance`'s `PlainTextWriter::LokiPushHttpError` arm.
 ///
-/// Deliberately NOT [`plain_text_response`]: that one is shared by
-/// `/api/v1/write` and `/api/v2/spans`, whose references are different and
-/// do not agree with each other, so setting `nosniff` there could not be
-/// right for both. Issue #385 owns that; see [`rw_error_response`].
+/// Deliberately NOT [`go_http_error_response`], which composes a
+/// byte-identical container for `/api/v1/write` and for `/api/v2/spans`'s
+/// pre-admission rejections. Two writers whose rules coincide are still
+/// two rules: this one answers to Loki, that one to Prometheus and Tempo,
+/// and a change to either reference must not propagate silently into the
+/// other's endpoint. Refactoring the two onto one helper was explicitly
+/// out of scope for issue #385, which existed to UNDO exactly that kind of
+/// coupling.
 fn loki_plain_text_response(status: StatusCode, message: String) -> Response {
     let mut response = plain_text_response(status, message);
     response
@@ -497,10 +501,12 @@ fn loki_plain_text_response(status: StatusCode, message: String) -> Response {
 /// the 20 bytes `label name is empty\n`, and a malformed JSON body ends in
 /// `\n` too.
 ///
-/// Deliberately NOT shared with [`rw_error_response`]: `/api/v1/write` and
-/// `/api/v2/spans` answer to other references, and to each other's
-/// detriment — issue #385. The OTLP receiver has no terminator at all —
-/// its body is a `google.rpc.Status` protobuf, where the message is a
+/// Deliberately not shared with [`remote_write_error_response`] or
+/// [`zipkin_decode_error_response`], which reach the same three properties
+/// through [`go_http_error_response`] because THEIR references also build
+/// on Go's `http.Error` — a coincidence of rules, not one rule (see
+/// [`loki_plain_text_response`]). The OTLP receiver has no terminator at
+/// all — its body is a `google.rpc.Status` protobuf, where the message is a
 /// length-delimited field (see [`LogsIngestError::InvalidLabelName`]).
 fn loki_error_response(err: &LogsIngestError) -> Response {
     let (status, _code) = classify(err);
@@ -604,22 +610,23 @@ fn decode_loki_push(
 pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
     let now_ns = now_unix_nanos();
 
+    // Pre-admission: the reference `http.Error`s the capped body read and
+    // the decode alike, so both take `zipkin_decode_error_response`. Past
+    // admission it switches writers — see `zipkin_sink_error_response`.
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
         Ok(body) => body,
-        // Reuses the signal-neutral empty-body/plain-text response family
-        // (the `rw_*` helpers), like the Loki push receiver.
-        Err(err) => return rw_error_response(&err),
+        Err(err) => return zipkin_decode_error_response(&err),
     };
 
     let parsed = match decode_zipkin(&headers, &body, now_ns) {
         Ok(parsed) => parsed,
-        Err(err) => return rw_error_response(&err),
+        Err(err) => return zipkin_decode_error_response(&err),
     };
 
     if is_async(&headers) {
         return match sink.admit(parsed) {
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
-            Err(Backpressure) => rw_backpressure_response(),
+            Err(Backpressure) => zipkin_backpressure_response(),
         };
     }
 
@@ -628,9 +635,9 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
             // 202 (not 200) on sync success too — the Zipkin oracle answers
             // 202 Accepted regardless of the async header.
             Ok(()) => rw_success_response(StatusCode::ACCEPTED),
-            Err(err) => rw_error_response(&err),
+            Err(err) => zipkin_sink_error_response(&err),
         },
-        Err(Backpressure) => rw_backpressure_response(),
+        Err(Backpressure) => zipkin_backpressure_response(),
     }
 }
 
@@ -929,9 +936,11 @@ fn protobuf_response(status: StatusCode, body: Vec<u8>) -> Response {
 const PLAIN_TEXT_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("text/plain; charset=utf-8");
 
 /// `X-Content-Type-Options: nosniff` — set by Go's `http.Error`, and so by
-/// every reference writer built on it. Used by
-/// [`loki_plain_text_response`] only; see its doc for why the other
-/// plain-text receivers do not share it.
+/// every reference writer built on it. Two helpers insert it, one per
+/// reference: [`loki_plain_text_response`] (Loki's `push.HTTPError`) and
+/// [`go_http_error_response`] (Prometheus remote write, and Tempo's Zipkin
+/// receiver before admission). They are deliberately not merged — see
+/// [`go_http_error_response`].
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 
 /// `/api/v1/write`'s empty-body success/accepted response (architect plan:
@@ -943,28 +952,178 @@ fn rw_success_response(status: StatusCode) -> Response {
     response
 }
 
-/// `/api/v1/write`'s whole-request error response: `err`'s [`classify`]d
-/// status with a plain-text body — never [`status_response`]'s
-/// `google.rpc.Status` protobuf (architect plan edge case 3).
+/// The container Go's `http.Error` produces, and therefore the container
+/// BOTH writer-side references produce for every **pre-admission**
+/// rejection: [`plain_text_response`]'s `text/plain; charset=utf-8`, plus
+/// `X-Content-Type-Options: nosniff` and a single LF terminator.
 ///
-/// **KNOWN DIVERGENCE — see issue #385, which owns it.** This function and
-/// [`rw_backpressure_response`] are called from BOTH
-/// [`ingest_remote_write`] (`/api/v1/write`) and [`ingest_zipkin`]
-/// (`/api/v2/spans`), whose references are different and do not agree with
-/// each other, so one writer cannot match both. #385 carries the
-/// measurements and the decision; do not restate them here.
+/// **Prometheus remote write** binds ONE writer to the whole endpoint at
+/// every status. The handler Prometheus mounts is
+/// `remoteapi.NewWriteHandler` (`storage/remote/write_handler.go:81 @
+/// v3.13.0`) from `github.com/prometheus/client_golang/exp`, pinned at
+/// `3537b20ac86b` (`go.mod:67`), and every error it writes — decode, media
+/// type, size, and 5xx alike — leaves through the single call
+/// `http.Error(w, storeErr.Error(), writeResponse.statusCode)`
+/// (`exp/api/remote/remote_api.go:611`, reached from `:467,474,479,486,491,
+/// 499,571,583,590` and from the 5xx branch at `:605-610`). Measured on
+/// `prom/prometheus:v3.13.0` across five error classes (non-snappy body,
+/// valid snappy carrying garbage protobuf, out-of-bounds timestamp,
+/// out-of-order sample, wrong media type): all five `text/plain;
+/// charset=utf-8` + `nosniff` + exactly one LF.
 ///
-/// Splitting the writer is out of scope for issue #264. Until #385 lands,
-/// `tests/support/manifest.rs`'s `PlainTextWriter::WriterSideReceiver`
-/// asserts no reference-derived rule for either route.
-fn rw_error_response(err: &LogsIngestError) -> Response {
+/// **Tempo's OTel Zipkin receiver** writes the same container for every
+/// PRE-admission rejection: `http.Error(w, err.Error(),
+/// http.StatusBadRequest)` (`receiver/zipkinreceiver/trace_receiver.go:236
+/// @ tempo v3.0.2 0c4b926d`), plus the `Content-Encoding` rejection one
+/// layer below it, which `confighttp`'s decompressor refuses before the
+/// receiver ever runs (`config/confighttp/compression.go:280`, written
+/// through `defaultErrorHandler` -> `http.Error` at `:285-288`). Measured
+/// on the CI-pinned `grafana/tempo` v3.0.2 image across eleven decode
+/// probes: the same three properties every time.
+///
+/// So the two references AGREE here, and issue #385's premise — that they
+/// could not agree, so one writer could not serve both — was false for
+/// this stage. The boundary that is real is **stage, not endpoint**: they
+/// diverge only after admission, where Prometheus keeps this container and
+/// Tempo's Zipkin receiver switches to a bare `w.Write`. See
+/// [`zipkin_sink_error_response`].
+///
+/// Deliberately NOT shared with [`loki_plain_text_response`], which
+/// composes a byte-identical container for `/loki/api/v1/push` (issue
+/// #374). Two writers whose rules coincide today are still two rules:
+/// they answer to different references, and coupling them through one
+/// helper is what made this endpoint pair a divergence in the first place.
+fn go_http_error_response(status: StatusCode, message: String) -> Response {
+    let mut response = plain_text_response(status, message);
+    response
+        .headers_mut()
+        .insert(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF);
+    response
+}
+
+/// `/api/v1/write`'s ONLY error writer, at every status — matching the
+/// reference's single `http.Error` exit ([`go_http_error_response`]).
+/// Never [`status_response`]'s `google.rpc.Status` protobuf (architect
+/// plan edge case 3): a remote-write sender must not have to guess whether
+/// an error body is protobuf or text.
+///
+/// The body's terminator is the reference's, not a style choice: the last
+/// act of Go's `http.Error` is `fmt.Fprintln(w, error)`.
+///
+/// Pinned by `tests::remote_write_error_container_is_go_http_error`, and
+/// live by `api_conformance`'s `PlainTextWriter::PromRemoteWriteHttpError`
+/// arm.
+fn remote_write_error_response(err: &LogsIngestError) -> Response {
+    let (status, _code) = classify(err);
+    go_http_error_response(status, format!("{err}\n"))
+}
+
+/// `/api/v1/write`'s sink-backpressure response. Same container as every
+/// other error this endpoint writes, because the reference has exactly
+/// one; `Retry-After` is deliberately NOT set, because the reference
+/// handler never sets it (`TooManyRequests` and `Retry-After` occur in
+/// `remote_api.go` only on the CLIENT side, `:384-385` — source-derived,
+/// since an absence cannot be captured).
+///
+/// The rule below is CANONICAL here and copied verbatim into docs/api.md
+/// §1.2; `crates/pulsus-write/tests/backpressure_divergence_recorded.rs`
+/// compares the two byte for byte. Edit it here, then copy it there — and
+/// do not use trailing-space Markdown hard breaks, which editors and
+/// `rustfmt` trim.
+///
+/// <!-- copied-rule:rw-backpressure:start -->
+/// Sink backpressure answers **`429`** with a plain-text body. The reference has no
+/// `429` on this endpoint at all — Prometheus's remote-write receiver does not rate-limit,
+/// and every error it writes goes through one `http.Error` call
+/// (`exp/api/remote/remote_api.go:611` @ client_golang/exp `3537b20ac86b`, the module
+/// `prometheus` v3.13.0 pins at `go.mod:67`). A **default-configured** Prometheus sender
+/// treats `429` as non-recoverable and **drops** the batch, where it would retry a `5xx`
+/// indefinitely (`storage/remote/client.go:321-324` @ v3.13.0; `retry_on_http_429` is
+/// absent from `DefaultQueueConfig` and so defaults to false). That data loss is
+/// deliberate and is what backpressure asks for: shedding load is the designed response
+/// to a rate-limit signal, and answering `5xx` instead would tell the sender we are broken
+/// and make it retry into a queue we are already failing to drain. Senders that prefer to
+/// retry set `retry_on_http_429: true`, which flips exactly this branch. `Retry-After` is
+/// never sent, matching the reference, which never sets it either.
+/// <!-- copied-rule:rw-backpressure:end -->
+///
+/// Ledgered as a divergence? No — the owner ruled that this one is
+/// recorded as prose in docs/api.md §1.2 rather than in a new metrics
+/// differential ledger, of which there is none (ruling v2, issue #385).
+/// Whether `429` or `5xx` is the right answer under load is with the
+/// owner; this documents current behaviour.
+fn remote_write_backpressure_response() -> Response {
+    go_http_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "sink is applying backpressure: buffers are full\n".to_string(),
+    )
+}
+
+/// `/api/v2/spans`'s PRE-admission error writer — the capped body read and
+/// the decode, i.e. everything the reference answers through its
+/// `http.Error` exit (`trace_receiver.go:236 @ tempo v3.0.2`, and
+/// `confighttp/compression.go:280,285-288` for the `Content-Encoding`
+/// refusal one layer below it).
+///
+/// Separate from [`remote_write_error_response`] even though the two
+/// compose the identical container: different references, and the next
+/// divergence must not propagate silently into the endpoint nobody was
+/// thinking about. The post-admission half of THIS endpoint already
+/// differs — [`zipkin_sink_error_response`].
+///
+/// Pinned by `tests::zipkin_decode_error_container_is_go_http_error`, and
+/// live by `api_conformance`'s `PlainTextWriter::ZipkinDecodeHttpError`
+/// arm.
+fn zipkin_decode_error_response(err: &LogsIngestError) -> Response {
+    let (status, _code) = classify(err);
+    go_http_error_response(status, format!("{err}\n"))
+}
+
+/// `/api/v2/spans`'s POST-admission sink-failure writer. Deliberately NOT
+/// [`go_http_error_response`]: past admission the reference leaves this
+/// branch to a bare `w.WriteHeader` + `w.Write` with no header set and no
+/// terminator (`receiver/zipkinreceiver/trace_receiver.go:255-262 @ tempo
+/// v3.0.2`, the constants at `:38-39`), so Go sniffs the content type,
+/// `nosniff` is ABSENT and the body does NOT end in `\n`. Measured on the
+/// CI-pinned image with `ingestion.rate_limit_bytes: 1000`, 3/3 identical
+/// reps: `500`, `text/plain; charset=utf-8`, no `nosniff`, body
+/// `"Internal Server Error"`, last byte `0x22`.
+///
+/// The reference's literal 23-byte body is NOT copied. It is valid JSON,
+/// which would break `api_conformance`'s "a plain-text error body never
+/// parses as JSON" invariant, and error prose is not matched by standing
+/// rule. The CONTAINER is the reference's; the message is ours.
+///
+/// The reference reaches a `400 "Bad Request"` here only for a permanent
+/// consumer error, and Tempo produces none — `consumererror.NewPermanent`
+/// appears nowhere in Tempo outside `vendor/`. Three consumer-error
+/// classes were attempted against the container and none reached it (rate
+/// limit `500` 3/3; `max_bytes_per_trace` and `max_traces_per_user` both
+/// async `202`), so this endpoint has two observable error shapes, not
+/// three.
+///
+/// Pinned by
+/// `tests::zipkin_sink_error_container_omits_nosniff_and_terminator`.
+/// It has NO live coverage: `api_conformance` drives a real spawn against
+/// a real ClickHouse and cannot make the sink fail, so every one of its
+/// Zipkin cells (`ZIPKIN_CASES`' two, on each of `/api/v2/spans` and
+/// `/tempo/spans`) lands on [`zipkin_decode_error_response`] instead.
+fn zipkin_sink_error_response(err: &LogsIngestError) -> Response {
     let (status, _code) = classify(err);
     plain_text_response(status, err.to_string())
 }
 
-/// `/api/v1/write`'s sink-backpressure response: `429`, plain text (the
-/// remote-write-shaped counterpart of [`backpressure_response`]).
-fn rw_backpressure_response() -> Response {
+/// `/api/v2/spans`'s sink-backpressure response: `429` in
+/// [`zipkin_sink_error_response`]'s container, not `http.Error`'s —
+/// backpressure is refused at the sink, i.e. post-admission, so it takes
+/// the post-admission shape.
+///
+/// The `429` itself is a deliberate divergence: the reference has no `429`
+/// on this endpoint at all and answers its ingestion rate-limit rejection
+/// `500`. Ledgered as `zipkin-backpressure-429-not-500` in
+/// docs/benchmarks/traces-differential-ledger.md, whose entry is canonical
+/// for the docs/api.md §8.2 statement.
+fn zipkin_backpressure_response() -> Response {
     plain_text_response(
         StatusCode::TOO_MANY_REQUESTS,
         "sink is applying backpressure: buffers are full".to_string(),
@@ -3529,5 +3688,280 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+    // -- issue #385: the error CONTAINERS, per stage -----------------------
+    // Both writer-side references write every PRE-admission rejection
+    // through Go's `http.Error` and agree on all three properties asserted
+    // here; they part company after admission, where Prometheus keeps that
+    // container and Tempo's Zipkin receiver switches to a bare `w.Write`.
+    // So the two endpoints are split by STAGE, and these three tests are
+    // one per container.
+    //
+    // They are the hermetic evidence for the whole change:
+    // `api_conformance`'s live cells reach only the 400 decode family (a
+    // real spawn against a real ClickHouse cannot make the sink fail), so
+    // the post-admission rule has no live coverage at all.
+
+    /// `/api/v2/spans`'s [`call_remote_write`] counterpart: drives the
+    /// handler core directly with a hand-built `HeaderMap`/`Body`, for the
+    /// same reason (no generic-`State` router mount point exists here).
+    async fn call_zipkin(
+        sink: &MockTraceSink,
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        let mut header_map = HeaderMap::new();
+        for (name, value) in headers {
+            header_map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        ingest_zipkin(sink, header_map, Body::from(body)).await
+    }
+
+    /// Asserts Go's `http.Error` container: the exact content type, the
+    /// `nosniff` header, and a body ending in EXACTLY one `\n` (a doubled
+    /// terminator fails too — `fmt.Fprintln` writes one).
+    async fn assert_go_http_error_container(
+        res: Response,
+        status: StatusCode,
+        ctx: &str,
+    ) -> String {
+        assert_eq!(res.status(), status, "{ctx}: status");
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.as_bytes()),
+            Some(b"text/plain; charset=utf-8".as_slice()),
+            "{ctx}: content type"
+        );
+        assert_eq!(
+            res.headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .map(|v| v.as_bytes()),
+            Some(b"nosniff".as_slice()),
+            "{ctx}: Go's `http.Error` sets nosniff before writing the body"
+        );
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            bytes.ends_with(b"\n") && !bytes.ends_with(b"\n\n"),
+            "{ctx}: `http.Error`'s last act is `fmt.Fprintln` — exactly one trailing \
+             newline, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A `WriteRequest` body whose per-label heap floor alone overshoots
+    /// `remote_write::MAX_EXPANDED_BYTES`, so `remote_write::parse` — not
+    /// the decode, and not the count caps — is what rejects it.
+    ///
+    /// Mirrors `remote_write::tests::expansion_budget_rejects_near_empty_
+    /// label_fan_out`'s construction, which asserts `validate_bounds`
+    /// ADMITS this shape. Every label is `("", "")`, so the wire form stays
+    /// a few MiB (well under the 64 MiB body cap) while the estimate is
+    /// carried entirely by the floor.
+    ///
+    /// `LABEL_FLOOR` mirrors `remote_write`'s private `LABEL_ROW_OVERHEAD`.
+    /// A retune cannot make this silently vacuous: the caller asserts the
+    /// body names the expansion-budget field, so too small a fan-out fails
+    /// loudly rather than admitting.
+    fn expansion_budget_tripping_remote_write_body() -> Vec<u8> {
+        const LABEL_FLOOR: usize = 128;
+        let num_series = remote_write::MAX_EXPANDED_BYTES
+            / (LABEL_FLOOR * remote_write::MAX_LABELS_PER_SERIES)
+            + 2;
+        let empty = Label {
+            name: String::new(),
+            value: String::new(),
+        };
+        let req = WriteRequest {
+            timeseries: (0..num_series)
+                .map(|_| TimeSeries {
+                    labels: vec![empty.clone(); remote_write::MAX_LABELS_PER_SERIES],
+                    samples: vec![],
+                    histograms: vec![],
+                })
+                .collect(),
+            metadata: vec![],
+        };
+        snappy_compress(&req.encode_to_vec())
+    }
+
+    /// AC1 (issue #385): `/api/v1/write` writes EVERY error in Go's
+    /// `http.Error` container, at every status — because the reference
+    /// does. Prometheus mounts `remoteapi.NewWriteHandler`
+    /// (`storage/remote/write_handler.go:81 @ v3.13.0`) and every error it
+    /// answers, decode through 5xx, leaves through the single call
+    /// `http.Error(w, storeErr.Error(), writeResponse.statusCode)`
+    /// (`exp/api/remote/remote_api.go:611` @ client_golang/exp
+    /// `3537b20ac86b`, the module that handler's version pins at
+    /// `go.mod:67`). Measured on `prom/prometheus:v3.13.0` across five
+    /// error classes: `text/plain; charset=utf-8`, `nosniff`, one LF, every
+    /// time.
+    ///
+    /// The five cases below are every error EXIT this handler has — the
+    /// capped body read, the decode, the parse, the flush failure, and
+    /// backpressure in both modes — not five samples of them, so a new
+    /// error path cannot quietly leave through a different container.
+    #[tokio::test]
+    async fn remote_write_error_container_is_go_http_error() {
+        // Body read/cap and decode share one exit and one status; the
+        // non-snappy body drives the decode.
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = call_remote_write(&sink, b"\xFF\xFF\xFF not snappy".to_vec(), &[]).await;
+        assert_go_http_error_container(res, StatusCode::BAD_REQUEST, "bad snappy").await;
+
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res =
+            call_remote_write(&sink, expansion_budget_tripping_remote_write_body(), &[]).await;
+        let body =
+            assert_go_http_error_container(res, StatusCode::BAD_REQUEST, "parse rejection").await;
+        assert!(
+            body.contains("expanded metric row bytes (estimated)"),
+            "the parse-rejection case must be rejected by `remote_write::parse`'s expansion \
+             budget, not by the decode or the count caps — got {body:?}"
+        );
+
+        let sink = MockMetricSink::new(Outcome::FlushFails);
+        let res = call_remote_write(&sink, valid_remote_write_body(), &[]).await;
+        assert_go_http_error_container(res, StatusCode::INTERNAL_SERVER_ERROR, "flush failure")
+            .await;
+
+        let sink = MockMetricSink::new(Outcome::Backpressure);
+        let res = call_remote_write(&sink, valid_remote_write_body(), &[]).await;
+        assert_go_http_error_container(res, StatusCode::TOO_MANY_REQUESTS, "backpressure, sync")
+            .await;
+
+        let sink = MockMetricSink::new(Outcome::Backpressure);
+        let res =
+            call_remote_write(&sink, valid_remote_write_body(), &[("x-pulsus-async", "1")]).await;
+        assert_go_http_error_container(res, StatusCode::TOO_MANY_REQUESTS, "backpressure, async")
+            .await;
+    }
+
+    /// AC2 (issue #385): `/api/v2/spans`'s PRE-admission rejections take
+    /// the same container, because Tempo's OTel Zipkin receiver
+    /// `http.Error`s them too — the decode at
+    /// `receiver/zipkinreceiver/trace_receiver.go:236 @ tempo v3.0.2`, and
+    /// the `Content-Encoding` refusal one layer below it at
+    /// `config/confighttp/compression.go:280,285-288`, where `confighttp`'s
+    /// decompressor rejects the request before the receiver runs.
+    ///
+    /// That second one is the reason this rule is container-measured and
+    /// not read off the source: `processBodyIfNecessary`
+    /// (`trace_receiver.go:172-183`) ends in `default: return req.Body`,
+    /// which alone says an unknown `Content-Encoding` passes through and
+    /// succeeds. The container answers `400 unsupported Content-Encoding:
+    /// br\n`.
+    ///
+    /// Both of this handler's pre-admission exits are driven: the capped
+    /// body read and the decode.
+    #[tokio::test]
+    async fn zipkin_decode_error_container_is_go_http_error() {
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = call_zipkin(
+            &sink,
+            vec![0u8; decompress::MAX_DECOMPRESSED_BYTES + 1024],
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_go_http_error_container(res, StatusCode::BAD_REQUEST, "over the 64 MiB cap").await;
+
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = call_zipkin(
+            &sink,
+            b"not a json span array".to_vec(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_go_http_error_container(res, StatusCode::BAD_REQUEST, "malformed span array").await;
+    }
+
+    /// AC3 (issue #385): `/api/v2/spans` changes container AFTER admission,
+    /// because the reference does. Past the decode, its receiver leaves the
+    /// consumer failure to a bare `w.WriteHeader` + `w.Write` with no
+    /// header set and no terminator
+    /// (`receiver/zipkinreceiver/trace_receiver.go:255-262 @ tempo v3.0.2`,
+    /// constants at `:38-39`), so Go sniffs the content type, `nosniff` is
+    /// ABSENT and the body does not end in `\n`. Measured on the CI-pinned
+    /// image with `ingestion.rate_limit_bytes: 1000`, 3/3 identical reps:
+    /// `500`, `text/plain; charset=utf-8`, no `nosniff`, body
+    /// `"Internal Server Error"`, last byte `0x22`.
+    ///
+    /// The `429`s are ours, not the reference's — it has no `429` on this
+    /// endpoint at all and answers its rate-limit rejection `500`. That is
+    /// a deliberate divergence, ledgered as
+    /// `zipkin-backpressure-429-not-500`; the CONTAINER is still the
+    /// reference's, since backpressure is refused at the sink and so is
+    /// post-admission.
+    ///
+    /// This is the ONLY coverage of the post-admission rule:
+    /// `api_conformance` drives a real spawn against a real ClickHouse and
+    /// cannot make the sink fail, so all three of its Zipkin cells land on
+    /// the decode writer.
+    #[tokio::test]
+    async fn zipkin_sink_error_container_omits_nosniff_and_terminator() {
+        async fn assert_bare_writer_container(res: Response, status: StatusCode, ctx: &str) {
+            assert_eq!(res.status(), status, "{ctx}: status");
+            assert_eq!(
+                res.headers()
+                    .get(header::CONTENT_TYPE)
+                    .map(|v| v.as_bytes()),
+                Some(b"text/plain; charset=utf-8".as_slice()),
+                "{ctx}: content type"
+            );
+            assert_eq!(
+                res.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                None,
+                "{ctx}: past admission the reference sets NO header at all — nosniff must \
+                 be absent"
+            );
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                !bytes.is_empty() && !bytes.ends_with(b"\n"),
+                "{ctx}: the reference's bare `w.Write` appends no terminator, got {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+
+        let valid = br#"[{"traceId":"0000000000000001","id":"0000000000000002","timestamp":1700000000000000}]"#;
+
+        let sink = MockTraceSink::new(Outcome::FlushFails);
+        let res = call_zipkin(
+            &sink,
+            valid.to_vec(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_bare_writer_container(res, StatusCode::INTERNAL_SERVER_ERROR, "flush failure").await;
+
+        let sink = MockTraceSink::new(Outcome::Backpressure);
+        let res = call_zipkin(
+            &sink,
+            valid.to_vec(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_bare_writer_container(res, StatusCode::TOO_MANY_REQUESTS, "backpressure, sync")
+            .await;
+
+        let sink = MockTraceSink::new(Outcome::Backpressure);
+        let res = call_zipkin(
+            &sink,
+            valid.to_vec(),
+            &[
+                ("content-type", "application/json"),
+                ("x-pulsus-async", "1"),
+            ],
+        )
+        .await;
+        assert_bare_writer_container(res, StatusCode::TOO_MANY_REQUESTS, "backpressure, async")
+            .await;
     }
 }

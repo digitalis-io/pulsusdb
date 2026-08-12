@@ -78,16 +78,19 @@
 //! none, `fmt.Fprintln` writes an LF. Tempo's frontend agrees with THIS
 //! one on the terminator (neither writes one) and differs on `nosniff`.
 //! `tests/support/manifest.rs`'s `PlainTextWriter` therefore carries two
-//! independent per-writer rules, and its `NosniffRule` is three-valued so
-//! "absent by rule" cannot be spelled the same way as "no rule".
+//! independent per-writer rules, and its `NosniffRule` is an enum rather
+//! than a `bool` so that "absent by rule" cannot be spelled the same way
+//! as "no rule at all" (issue #385 retired the latter value; the reason
+//! for the enum did not go with it).
 //!
-//! The writers themselves are separate: `pulsus-write`'s ingest module has
-//! nine response builders and none of them is reachable from `logs_api` —
-//! the crates do not call into each other's responders at all. Two of
-//! those nine ARE shared across references, though (`rw_error_response`
-//! and `rw_backpressure_response` serve both `/api/v1/write` and
-//! `/api/v2/spans`), which is a live divergence recorded on
-//! `rw_error_response` — not a claim of separation anywhere but here.
+//! The writers themselves are separate: every response builder lives in
+//! `pulsus-write`'s ingest module or here, and none of the ingest ones is
+//! reachable from `logs_api` — the crates do not call into each other's
+//! responders at all. Since issue #385 no ingest builder is shared across
+//! references either: `/api/v1/write` and `/api/v2/spans` used to share
+//! one, which was a live divergence, and each now has its own writer per
+//! STAGE (both references `http.Error` their pre-admission rejections and
+//! part company after admission).
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -489,6 +492,26 @@ mod tests {
         });
         let (status, _) = rendered(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Issue #312 AC-14: the streams result-budget reason rides the same
+    /// `QueryTooBroad(_)` wildcard arm — no mapper change was needed, and
+    /// this proves it, body included.
+    #[tokio::test]
+    async fn read_error_streams_result_bytes_maps_to_422() {
+        let err =
+            ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::StreamsResultBytes {
+                bytes: 1_073_741_825,
+                cap: pulsus_read::logql::MAX_STREAMS_RESULT_BYTES,
+            });
+        let expected = err.to_string();
+        let (status, body) = rendered(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, expected);
+        assert!(
+            body.contains("streams result retained 1073741825 bytes"),
+            "the 422 body must name the counter that refused: {body}"
+        );
     }
 
     /// Issue #272: the walk-admission reason rides the same

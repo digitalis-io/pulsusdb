@@ -543,3 +543,56 @@ re-decide from the evidence rather than re-derive it.
   oracle that does not read the body — the `405 Allow: GET,HEAD` cell and
   the `Vary: accept` header on the `404` are both candidates — and then
   emptying the body.
+
+### `zipkin-backpressure-429-not-500` (issue #385)
+
+- **What:** `POST /api/v2/spans` answers sink backpressure `429` with a plain-text
+  body. The reference answers its nearest equivalent — the distributor's ingestion
+  rate-limit rejection — `500`, with the 23-byte body `"Internal Server Error"`, no
+  `X-Content-Type-Options` and no trailing newline. Measured on the CI-pinned oracle
+  (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`,
+  the digest at `.github/workflows/ci.yml:483`) with
+  `overrides.defaults.ingestion.rate_limit_bytes: 1000`, 3/3 identical reps.
+  There is no `429` anywhere on that endpoint: its handler has exactly two error
+  exits, `http.Error` for decode failures and a bare `w.Write` for consumer failures
+  (`receiver/zipkinreceiver/trace_receiver.go:236` and `:255-262` @ tempo v3.0.2
+  `0c4b926d`), and the consumer exit is `500` for every error Tempo produces.
+
+- **Why we do not match it.** `500` tells a sender *we are broken*; `429` tells it
+  *slow down*. Those call for different sender behaviour, and collapsing them destroys
+  information the sender can act on in exchange for matching a code that misdescribes
+  what happened — the FULL PARITY MANDATE's "except where they are wrong" clause.
+  `429`-on-backpressure is already the documented cross-receiver PulsusDB contract
+  (docs/api.md §8.2 states it for this receiver and for `/loki/api/v1/push`), so
+  keeping it preserves an existing commitment rather than inventing one.
+
+- **Consumer impact.** None for the sender we can read: the OpenTelemetry Collector's
+  Zipkin exporter closes the response body without reading it and treats every
+  non-2xx identically (`exporter/zipkinexporter/zipkin.go:94-97` @ tempo v3.0.2), so
+  `429` and `500` are the same event to it. Other Zipkin senders (Brave,
+  `zipkin-reporter-java`, `zipkin-go`'s HTTP reporter) are not checked out here and
+  are not claimed.
+
+- **Where it is enforced.** `pulsus-write`'s
+  `zipkin_sink_error_container_omits_nosniff_and_terminator` (status `429` and the
+  container) and `backpressure_divergence_is_recorded` (the docs copy). User-facing
+  write-up: docs/api.md §8.2.
+
+- **Retiring this row** means deciding that matching a status code matters more than
+  describing the condition — which would also have to retire the identical `429` on
+  `/loki/api/v1/push` and the OTLP receivers, since the contract is cross-receiver.
+
+The user-facing statement of this divergence is CANONICAL below and
+copied verbatim into docs/api.md §8.2;
+`crates/pulsus-write/tests/backpressure_divergence_recorded.rs` compares
+the two byte for byte, so edit it here and copy it there. Wrapping and
+interior spacing are part of the comparison.
+
+<!-- copied-rule:zipkin-backpressure:start -->
+and sink backpressure is **429** plain-text — a **deliberate divergence** from the
+reference, which answers its ingestion rate-limit rejection **500** with the body
+`"Internal Server Error"` (measured on the pinned `grafana/tempo` v3.0.2 image; its
+Zipkin receiver has no `429` path at all). `500` would tell a sender we are broken
+when we are asking it to slow down, so we keep `429`; recorded as
+`zipkin-backpressure-429-not-500` in docs/benchmarks/traces-differential-ledger.md.
+<!-- copied-rule:zipkin-backpressure:end -->
