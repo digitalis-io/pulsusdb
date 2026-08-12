@@ -3943,6 +3943,8 @@ often than they agree about it.
 
   **The domain is narrower than the escape half's**: ClickHouse's RE2 evaluates every pushed-down predicate and agrees with the reference, so this is confined to §9.1's **as written** positions plus `label_replace`. **Recorded here because a fix that closes only the lexer looks complete.**
 
+  **Ruled ACCEPTED on 2026-08-12, and the family is eight patterns rather than three.** It now carries its own row — `logql-class-algebra-wrong-rows` below — with the owner's ruling, both sides' selections subject by subject, and the reference parser's own rule. One reading of the table above is worth correcting while the table stays: `[a[b]]` shows `nothing` for the reference because *that* measurement's subjects carried no `]`. Over a subject set that does, the reference selects the `a]` line — the class is `a`, `[`, `b` and the trailing `]` is a literal, so it matches something; just not what the crate's nested-class reading matches.
+
 - **Backtick raw strings agree, and this was checked rather than assumed.** Go's own `strconv.Unquote` STRIPS carriage returns from a raw string literal; the fork Loki calls does not (`quote.go:76-81` has no carriage-return branch), and neither does `scan_backtick`. Discriminated at the wire over a line carrying a raw CR: the filter whose backtick pattern contains a raw CR returns that line on the reference — so the CR survived into the pattern — while the control whose pattern has the CR removed returns nothing. This tree's parser yields the same bytes for the backtick and the double-quoted spelling alike (`63 72 0D 61 66 74 65 72`). A raw CR inside a double-quoted literal is likewise kept by both: `Unquote` refuses a raw newline (`quote.go:85-87`) and says nothing about a carriage return.
 
 - **Status parity, in contrast, holds everywhere.** Every rejection above
@@ -4107,6 +4109,151 @@ often than they agree about it.
   re-measures the reference's `Accept` at the short-circuit positions
   rather than assuming it, and the `\xff` rows of
   `crates/pulsus-read/tests/logqltest/corpus/b24_string_escapes.test`.
+
+### `logql-class-algebra-wrong-rows` (issue #400, owner ruling 2026-08-12 — ACCEPTED, deliberately not fixed)
+
+- **What differs.** Eight patterns are accepted by **both** engines and
+  read differently by each, so the same filter selects different lines
+  and **neither side reports anything**:
+
+  ```
+  [a&&b]   [a~~b]   [a[b]]   [[a][b]]   [\w&&\d]   [!--b]   [+--b]   [ --a]
+  ```
+
+  This is the wrong-rows severity, not an accept-surface one. Every one
+  of the eight is `200` there and `200` here; no status moves, no error
+  is raised, and the answer is simply a different set of lines. It is the
+  residue of `logql-regex-accept-surface-divergence` above: Stage 1
+  closed the string-escape half of Class R and Stage 2 closed Class S2,
+  and this is what neither reached.
+
+- **Measured, both sides, 2026-08-12.** Thirteen lines were pushed as one
+  stream, each line being *exactly* one subject and nothing else (extra
+  bytes would match instead of the subject): `x`, `a`, `b`, `&`, `~`,
+  `-`, `[`, `]`, `a]`, `1`, `!`, `+`, `Z Z`.
+
+  **Reference:** the digest-pinned image from `.github/workflows/ci.yml`,
+  `grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+  booted on `ci/logql/config.yaml` with no delta of its own as container
+  `pulsus-i400led-loki` on port 13411 — its own
+  `/loki/api/v1/status/buildinfo` reports `3.7.4` / `b318f282`. Asked
+  over `/loki/api/v1/query_range` with a window ending after the last
+  line pushed.
+
+  **PulsusDB:** the same thirteen lines and the same eight queries
+  through the hermetic `logqltest` runner
+  (`crates/pulsus-read/tests/logqltest/runner.rs`'s `run_file`), which
+  executes the real pipeline and no SQL — so what it reports is the
+  in-process reading, which is the position this divergence lives at.
+
+  Both sides at `| decolorize |~`, and both in the **backtick** spelling
+  (`` |~ `[a&&b]` ``). Both details are load-bearing: `| decolorize`
+  clears the pushdown so the filter is evaluated in process rather than
+  by ClickHouse (see the domain note below), and a backtick literal takes
+  no string escapes, so `[\w&&\d]` reaches the regex parser — the
+  double-quoted `"[\w&&\d]"` is a `400` on **both** sides since Stage 1,
+  which measures the lexer and not the class. Measured on the same
+  container: `{service_name="ca401"} | decolorize |~ "[\w&&\d]"` is
+  `400 parse error at line 1, col 40: invalid char escape`, and our own
+  side is pinned for `\w` at the selector, the line filter and
+  `| regexp` by `crates/pulsus-logql/tests/string_escapes.rs`'s
+  `an_escape_go_does_not_define_is_refused`.
+  Control first: `` |~ `.` `` returns all thirteen lines on both sides.
+
+  | pattern | the reference selects | PulsusDB in process selects |
+  |---|---|---|
+  | `[a&&b]` | `&`, `a`, `a]`, `b` | **nothing** |
+  | `[a~~b]` | `a`, `a]`, `b`, `~` | `a`, `a]`, `b` |
+  | `[a[b]]` | `a]` | `a`, `a]`, `b` |
+  | `[[a][b]]` | **nothing** | `a`, `a]`, `b` |
+  | `[\w&&\d]` | `&`, `1`, `Z Z`, `a`, `a]`, `b`, `x` | `1` |
+  | `[!--b]` | `!`, `&`, `+`, `-`, `b` | `!` |
+  | `[+--b]` | `+`, `-`, `b` | `+` |
+  | `[ --a]` | `!`, `&`, `+`, `-`, `Z Z`, `a`, `a]` | `Z Z` |
+
+  The `Z Z` line is how the **space** subject is carried: the corpus DSL
+  `trim_start`s a body, so a line that is *only* a space cannot be
+  written in it, and a space between two word characters can. It is the
+  only one of the thirteen carrying a space, which is why it is the only
+  line PulsusDB returns for `[ --a]`.
+
+- **The mechanism, read from the reference rather than inferred from the
+  table.** `parseClass`
+  (`vendor/github.com/grafana/regexp/syntax/parse.go:1736-1825 @
+  grafana/loki v3.7.4 b318f2829f0ae2094ab3a1e90780450e9e4b03be`) has
+  **no set-operation syntax and no nested-class branch at all**. Inside a
+  class it recognises exactly three structured members — `[:name:]`
+  (`:1766`, which requires the next byte to be `:`), `\p{…}` (`:1778`)
+  and a Perl class escape (`:1788`) — and everything else falls through
+  to "single character or simple range" at `:1793`. So `&`, `~` and `[`
+  are ordinary members; the loop ends at the first unescaped `]` that is
+  not in first position (`:1756`), which is why `[a[b]]` closes after
+  `b` and leaves a **literal `]`** behind it; and the one operator a
+  class has is `X-Y`, whose `hi < lo` is `ErrInvalidCharRange`
+  (`:1806-1809`) — which is why `[!--b]` is the valid range `!`..`-`
+  plus `b` and not an error.
+
+  The Rust `regex` crate 1.13.0 reads the same bytes as its documented
+  character-class operators: `&&` intersection, `~~` symmetric
+  difference, `--` difference, and `[…]` nested inside a class as a
+  union. `[a&&b]` is therefore `[a] ∩ [b]` = empty (and a pattern that
+  can never match is not an error there), `[a[b]]` and `[[a][b]]` are
+  both the union `{a, b}`, `[\w&&\d]` is `\w ∩ \d` = the decimal digits
+  (Unicode `Nd`, since the crate's classes are Unicode where RE2's are
+  ASCII — §9.2's first row), and `[!--b]` is `[!] - [b]` = `!`. Each of
+  those readings is exactly the right-hand column above.
+
+- **The domain, and it is narrower than the table suggests.** At every
+  position the planner pushes the predicate into the scan (§9.1 of
+  `docs/api.md`), the pattern is evaluated by **ClickHouse's `match()`,
+  which is RE2 itself** — and it agrees with the reference subject for
+  subject. Measured 2026-08-12 on the shared ClickHouse
+  (`SELECT version()` = `26.3.17.110`, HTTP 18123) as
+  `SELECT match(<subject>, <pattern>)` over the same thirteen subjects
+  and the same eight patterns: the hit set is identical to the
+  reference's column above on **all eight**. So the divergence is
+  confined to §9.1's **as written** rows — a line filter after a
+  `line_format` or with an `ip(…)` alternative, `| regexp`, a
+  parsed-label filter, `drop`/`keep` — plus `label_replace`.
+
+- **Why it is accepted — the owner's judgement, recorded as such.**
+  Owner ruling 2026-08-12, on all eight: **"rare, so who cares"**.
+  Writing `&&`, `~~` or a nested class inside a log-filter regex is not
+  something a Grafana user does by accident, and nobody has hit it. The
+  one-line fix is cheap; the plan, review, implementation and review
+  round around it are not, and the same cycle spent elsewhere buys more.
+  This is a judgement about cost and reach, **not** a technical finding
+  that the divergence is harmless — the rows above are a query silently
+  reading different lines, and that is what makes it worth a ledger row
+  even though it is not worth a fix.
+
+  Recorded here because the issue trail does **not** survive the fresh
+  repository at release. A decision that lives only in a GitHub comment
+  is a decision that will be re-litigated from scratch by whoever meets
+  `[a&&b]` next.
+
+- **Close condition:** the owner reverses the 2026-08-12 ruling. Nothing
+  else reopens this; it is not waiting on a fix. No route to one is
+  sketched here on purpose — the mechanism that would close the
+  class-form classes is the `re2_pattern_to_rust` rewrite at the **as
+  written** sites, which `logql-regex-accept-surface-divergence`'s "What
+  is NOT here" records as deferred on #331/#336 with the decision owned
+  by #400. This row is that decision, and it is "keep it".
+
+- **Fixture status, stated at its real strength.** No test pins the eight
+  READINGS. What is pinned is that the eight stay **served**:
+  `crates/pulsus-re2/tests/re2_reject_classes.rs`'s
+  `rule_g_is_the_range_rule_and_not_a_double_dash_rule` asserts
+  `!re2_definitely_rejects(p)` for `[!--b]`, `[+--b]`, `[ --a]`,
+  `[a&&b]` and `[a~~b]` — five of the eight — so a later change that
+  "fixed" this family by over-rejecting would fail there rather than
+  silently refusing patterns the reference serves. `[a[b]]`,
+  `[[a][b]]` and `[\w&&\d]` have no such assertion, and nothing anywhere
+  asserts which lines any of the eight select. The natural home for the
+  readings is that file's `the_rust_crate_reads_these_as_a_different_pattern`,
+  which already pins Stage 2's classes over eleven subjects; it was
+  **not** widened here, because this task was to record the ruling and
+  not to fix or to fence the family.
 
 ## Issue #374 — the per-stream label rules at log ingest
 
