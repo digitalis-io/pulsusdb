@@ -188,8 +188,35 @@ fn every_case_reproduces_its_pinned_golden() {
     }
 }
 
+/// Accept cases whose rendering re-parses to a DIFFERENT tree, with the
+/// tree it re-parses to pinned beside them (issue #335 Stage D1).
+///
+/// There is exactly one, and the reason is a property of the value rather
+/// than of our renderer. `minInt` folds to `i64::MIN`, whose only literal
+/// spelling carries a leading `-`; in this grammar `-` is an operator, so
+/// re-parsing that rendering necessarily yields a unary negation of the
+/// magnitude. **No renderer can avoid it** — the value has no positive
+/// literal form.
+///
+/// **The reference cannot re-parse its own rendering of it either, and
+/// fails harder.** Measured against the pinned oracle
+/// (`grafana/tempo@sha256:aa8df8d0…`, `/status/version` → v3.0.2):
+/// `{ .a = minInt && "x" }` echoes `(.a = -9223372036854775808) && \`x\``,
+/// and feeding that literal straight back — `{ .a = -9223372036854775808 }`
+/// — is a **400** there: `parse error at line 1, col 9: strconv.Atoi:
+/// parsing "9223372036854775808": value out of range`. So identity here
+/// would be demanding MORE than parity, not less.
+///
+/// The exception is not a hole: the excepted case still has to re-parse,
+/// and it has to re-parse to the exact recorded rendering below, so the
+/// alternative shape is pinned rather than waved through. Adding an entry
+/// is a visible source-line edit with a reason attached.
+const RENDERING_IS_NOT_ROUND_TRIP: [(&str, &str); 1] =
+    [("accept/static_min_int", "{ .a = -9223372036854775808 }")];
+
 #[test]
 fn accept_cases_round_trip_through_display() {
+    let excepted: BTreeMap<&str, &str> = RENDERING_IS_NOT_ROUND_TRIP.iter().copied().collect();
     for case in verify_corpus_layout() {
         if !case.starts_with("accept/") {
             continue;
@@ -199,6 +226,19 @@ fn accept_cases_round_trip_through_display() {
         let rendered = ast.to_string();
         let reparsed = parse(&rendered)
             .unwrap_or_else(|e| panic!("{case}: rendered form {rendered:?} must reparse, got {e}"));
+        if let Some(want_rendering) = excepted.get(case.as_str()) {
+            assert_eq!(
+                &rendered, want_rendering,
+                "{case} is on the round-trip exception list, so its RENDERING is pinned — if it \
+                 changed, re-check whether the exception is still needed"
+            );
+            assert_ne!(
+                reparsed, ast,
+                "{case} round-trips now — remove it from RENDERING_IS_NOT_ROUND_TRIP rather than \
+                 leaving an exception nothing needs"
+            );
+            continue;
+        }
         assert_eq!(
             reparsed, ast,
             "{case}: parse(ast.to_string()) != ast (rendered: {rendered:?})"

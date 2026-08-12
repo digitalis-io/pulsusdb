@@ -727,8 +727,28 @@ impl fmt::Display for StatusValue {
 }
 
 /// The closed `kind` keyword set (task-manager adjudication 2).
+///
+/// **Six members, `Unspecified` first** (issue #335 Stage D1, class D13).
+/// The reference's `Kind` enum opens with `KindUnspecified`
+/// (`pkg/traceql/enum_statics.go:146-155` @ Tempo v3.0.2), its lexer maps
+/// the bare word unconditionally (`pkg/traceql/lexer.go:43`), and `static`
+/// carries `KIND_UNSPECIFIED` as a terminal of its own
+/// (`pkg/traceql/expr.y:436`) — so `unspecified` is a value wherever any
+/// other kind keyword is, including a `with(...)` hint value.
+///
+/// **This one is not a grammar corner: our own product emits it and could
+/// not read it back.** `pulsus-read` renders `unspecified` into a
+/// `by(kind)` group value and a `select(kind)` projection
+/// (`traces/search_eval.rs`'s `kind_keyword`) and into the `by(kind)`
+/// series label of served SQL (`traces/metrics_sql.rs`'s `KIND_MAP`, which
+/// maps code 0 to `'unspecified'`). The reference offers the same word
+/// back from `/api/v2/search/tag/kind/values`, and the Grafana datasource
+/// writes an enum-intrinsic ad-hoc value UNQUOTED — so the query a user
+/// gets handed is `{kind=unspecified}`. The reference served it 200; we
+/// answered 400.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpanKindValue {
+    Unspecified,
     Internal,
     Server,
     Client,
@@ -739,6 +759,7 @@ pub enum SpanKindValue {
 impl SpanKindValue {
     pub(crate) fn from_ident(name: &str) -> Option<Self> {
         match name {
+            "unspecified" => Some(Self::Unspecified),
             "internal" => Some(Self::Internal),
             "server" => Some(Self::Server),
             "client" => Some(Self::Client),
@@ -750,6 +771,7 @@ impl SpanKindValue {
 
     fn as_str(self) -> &'static str {
         match self {
+            SpanKindValue::Unspecified => "unspecified",
             SpanKindValue::Internal => "internal",
             SpanKindValue::Server => "server",
             SpanKindValue::Client => "client",
@@ -794,11 +816,28 @@ pub enum PipelineStage {
     /// `select(field, ...)` — one or more fields; `select()` is a
     /// positioned parse error.
     Select { fields: Vec<Field> },
-    /// `by(field, ...)` — a spanset-level grouping stage (issue #185,
-    /// `pipeline.by`): regroups the matched spans into per-key spansets.
-    /// Distinct from the metric `by(...)` clause carried by
+    /// `by(<field expression>)` — a spanset-level grouping stage (issue
+    /// #185, `pipeline.by`): regroups the matched spans into per-key
+    /// spansets. Distinct from the metric `by(...)` clause carried by
     /// [`MetricStage`]. Empty `by()` is a positioned parse error.
-    By { fields: Vec<Field> },
+    ///
+    /// **ONE key, and that key is a whole [`FieldExpr`]** (issue #335
+    /// Stage D2, class D16). The reference's `groupOperation` is
+    /// `BY OPEN_PARENS fieldExpression CLOSE_PARENS`
+    /// (`pkg/traceql/expr.y:177-179` @ Tempo v3.0.2) — one operand, and
+    /// that operand is a full field expression. The production has no
+    /// `COMMA` and `fieldExpression` has none either.
+    ///
+    /// This was wrong in BOTH directions before: we took a comma list of
+    /// bare [`Field`]s, so `| by(.b, .c)` was accepted **and served**
+    /// here while the reference answers `400`, and `| by(.b + .c)` was a
+    /// parse error here while the reference answers `200`. The comma list
+    /// is the worse half — a query that works here and cannot be run at
+    /// the thing we claim compatibility with — and it is withdrawn, with
+    /// a row in `docs/benchmarks/traces-differential-ledger.md`. The
+    /// METRICS `by(...)` is untouched: it is `attributeList`
+    /// (`expr.y:195-198`) and its comma list is correct.
+    By { key: FieldExpr },
     /// `coalesce()` — a spanset-level stage (issue #185, `pipeline.coalesce`)
     /// that merges the spanset arrays. Zero-arity.
     Coalesce,
@@ -845,16 +884,7 @@ impl fmt::Display for PipelineStage {
                 }
                 write!(f, ")")
             }
-            PipelineStage::By { fields } => {
-                write!(f, "by(")?;
-                for (i, field) in fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{field}")?;
-                }
-                write!(f, ")")
-            }
+            PipelineStage::By { key } => write!(f, "by({key})"),
             PipelineStage::Coalesce => write!(f, "coalesce()"),
             PipelineStage::Metric(stage) => write!(f, "{stage}"),
             PipelineStage::MetricSecondStage(stage) => write!(f, "{stage}"),
@@ -1005,6 +1035,17 @@ pub enum HintValue {
     Number(String),
     String(String),
     Duration(Duration),
+    /// A `status` keyword as a hint value. The reference's hint is
+    /// `IDENTIFIER EQ static` (`pkg/traceql/expr.y:371-373` @ Tempo
+    /// v3.0.2) — the value position is the WHOLE `static` production, so
+    /// every static spelling is legal there, not only the four literal
+    /// types (issue #335 Stage D1).
+    Status(StatusValue),
+    /// A `kind` keyword as a hint value, for the same reason. This is the
+    /// position `{ .a = 1 } with(k=unspecified)` occupies — one of D13's
+    /// five probes, and the reason the class could not be closed by
+    /// widening the field-expression atom alone.
+    Kind(SpanKindValue),
 }
 
 impl fmt::Display for HintValue {
@@ -1014,6 +1055,8 @@ impl fmt::Display for HintValue {
             HintValue::Number(n) => write!(f, "{n}"),
             HintValue::String(s) => write!(f, "{}", quote(s)),
             HintValue::Duration(d) => write!(f, "{d}"),
+            HintValue::Status(s) => write!(f, "{s}"),
+            HintValue::Kind(k) => write!(f, "{k}"),
         }
     }
 }
@@ -1300,6 +1343,11 @@ mod tests {
     #[test]
     fn kind_values_round_trip_and_the_set_is_closed() {
         for (name, kind) in [
+            // Issue #335 Stage D1, class D13. The reference's Kind enum
+            // opens with KindUnspecified (enum_statics.go:146-155 @
+            // v3.0.2) and its lexer maps the bare word unconditionally
+            // (lexer.go:43).
+            ("unspecified", SpanKindValue::Unspecified),
             ("internal", SpanKindValue::Internal),
             ("server", SpanKindValue::Server),
             ("client", SpanKindValue::Client),

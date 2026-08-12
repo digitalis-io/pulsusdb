@@ -280,6 +280,70 @@ jobs:
                 printf '%s\n' "$DUP_HEAD_ORACLE"
                 exit 1
               fi
+              # ------------------------------------------------------------
+              # THE ADDITION RULE (issue 335 Stage D0, clauses A1-A5).
+              #
+              # Why it exists, stated rather than assumed: before it, this
+              # job and the hermetic wire suite DEADLOCKED on any probe
+              # addition. Adding one probe to both files fired UNJOINABLE
+              # (a key main's matrix does not know); adding it to
+              # matrix.json alone failed accept_surface_wire.rs's
+              # positional-bijection assert. So the audit could not admit a
+              # new TRUE measurement at all — a gap in the gate, not a
+              # reason to refuse the improvement, which is the same
+              # adjudication the Stage C direction rule got.
+              #
+              # This is a GENERAL rule, not a waiver for one PR. It splits
+              # an ADDITION (new keys only) from a RE-PIN (an existing
+              # oracle value moved), which REFERENCE_DIGEST alone cannot
+              # tell apart because both move it.
+              #
+              # STATED EDGE, so it is not discovered later: an added
+              # probe's `reference` value is supplied by the PR, so THIS
+              # JOB CANNOT SCORE IT. Its protection is elsewhere and is
+              # named here — accept_surface.rs::recorded_reference_verdicts_still_hold
+              # re-measures EVERY probe's `reference` against the
+              # digest-pinned container and runs as its own CI step
+              # ("TraceQL parser accept-surface audit (oracle leg)" in
+              # schema-it). That is an honest weaker statement than "this
+              # gate scores it", and it is the true one.
+              ADDED=$(jq -r -n --slurpfile new "$BASELINE" --slurpfile old "$TMP/old_baseline.json" '
+                ([ $old[0].wire_baseline[].query ] | map({key: ., value: true}) | from_entries) as $had
+                | [ $new[0].wire_baseline[].query | select(($had[.] // false) | not) ] | sort | .[]')
+              ADDED_M=$(jq -r -n --slurpfile new "$MATRIX" --slurpfile old "$TMP/old_matrix.json" '
+                ([ $old[0].accept_surface_probes[].query ] | map({key: ., value: true}) | from_entries) as $had
+                | [ $new[0].accept_surface_probes[].query | select(($had[.] // false) | not) ] | sort | .[]')
+              # A1 - an addition is an addition on BOTH sides. A baseline
+              # key added without its matrix row is unscoreable; a matrix
+              # row added without its baseline entry breaks the hermetic
+              # positional bijection.
+              if [ "$ADDED" != "$ADDED_M" ]; then
+                echo "::error::the added key sets differ between the wire baseline and the probe matrix — an addition must add the SAME keys to both, or a probe scores off nothing (issue 335 Stage D0 addition rule, clause A1)."
+                echo "--- added to wire_baseline.json only:"
+                comm -23 <(printf '%s\n' "$ADDED") <(printf '%s\n' "$ADDED_M") || true
+                echo "--- added to matrix.json only:"
+                comm -13 <(printf '%s\n' "$ADDED") <(printf '%s\n' "$ADDED_M") || true
+                exit 1
+              fi
+              # A3 - THE LOAD-BEARING CLAUSE. An existing key's oracle
+              # verdict may not move alongside an addition. Without it the
+              # addition rule becomes a hole through which any baseline is
+              # rewritten by calling it an addition. The message names the
+              # probe and BOTH values, so nobody is sent to diff two files.
+              REPINNED=$(jq -r -n --slurpfile new "$MATRIX" --slurpfile old "$TMP/old_matrix.json" '
+                ($new[0].accept_surface_probes | map({key: .query, value: .reference}) | from_entries) as $head
+                | [ $old[0].accept_surface_probes[]
+                    | select($head[.query] != null and $head[.query] != .reference)
+                    | "\(.query)  origin/main=\(.reference)  HEAD=\($head[.query])" ]
+                | .[]')
+              if [ -n "$REPINNED" ]; then
+                echo "::error::oracle re-pin — a pre-existing probe's reference verdict moved in a PR that also touches the wire baseline. An addition may only ADD keys; moving an existing oracle value is a re-pin and a human must look (issue 335 Stage D0 addition rule, clause A3):"
+                printf '%s\n' "$REPINNED"
+                exit 1
+              fi
+              ADDED_COUNT=$(printf '%s\n' "$ADDED" | grep -c . || true)
+              echo "addition rule: $ADDED_COUNT added key(s), identical on both sides, no pre-existing oracle verdict moved"
+              # ------------------------------------------------------------
               MISSING=$(jq -r --slurpfile new "$BASELINE" '
                 ([ $new[0].wire_baseline[].query ]
                    | map({key: ., value: true}) | from_entries) as $have
@@ -300,14 +364,25 @@ jobs:
               # "both before-sides come from origin/main" rule exists to
               # deny (Stage C review, [medium]).
               #
-              # The consequence is deliberate: ADDING a probe and MOVING
-              # the baseline cannot happen in one PR. Land the probe with
-              # its oracle row first, then move the baseline.
+              # A5 (issue 335 Stage D0) narrows this by exactly one set and
+              # no more: it keeps its no-fallback rule for every key in the
+              # INTERSECTION, and no longer fires on a key in ADDED — which
+              # A1 has already proved was added to both files and A3 has
+              # already proved arrived without moving any existing oracle
+              # value. Before A5 this clause made adding a probe impossible
+              # in principle, which is why the issue's own follow-up
+              # ("adding probes for that class is follow-up") had no
+              # implementable form.
               UNJOINABLE=$(jq -r \
-                --slurpfile omtx "$TMP/old_matrix.json" '
+                --slurpfile omtx "$TMP/old_matrix.json" \
+                --slurpfile old "$TMP/old_baseline.json" '
                   ($omtx[0].accept_surface_probes
                      | map({key: .query, value: .reference}) | from_entries) as $oref
-                  | [ .wire_baseline[].query | select($oref[.] == null) ]
+                  | ($old[0].wire_baseline
+                     | map({key: .query, value: true}) | from_entries) as $had
+                  | [ .wire_baseline[].query
+                      | select($oref[.] == null)
+                      | select($had[.] // false) ]
                   | .[]' "$BASELINE")
               if [ -n "$UNJOINABLE" ]; then
                 echo "::error::wire baseline probes with no reference verdict on origin/main — the oracle comes from origin/main with no fallback, so a probe added in this PR cannot be scored by a reference row this PR also supplies; land the probe first, move the baseline after (issue 335 Stage C direction rule):"
@@ -346,25 +421,52 @@ jobs:
                 | [ .wire_baseline[]
                     | select($ref[.query] != null)
                     | select(.pulsus_wire != $ref[.query]) ] | length' "$TMP/old_baseline.json")
+              # A2 (issue 335 Stage D0): NEW_DERIVED is computed over the
+              # INTERSECTION only — every key origin/main knows — scored
+              # with origin/main's oracle. An addition therefore cannot
+              # mask a regression, and the direction rule is unchanged for
+              # every key main knows. The `select($ref[.query] != null)`
+              # guard is what restricts it; without it an added key scores
+              # against a null reference and counts as a divergence, which
+              # would make every honest addition look like decay.
               NEW_DERIVED=$(jq -r --slurpfile omtx "$TMP/old_matrix.json" '
                 ($omtx[0].accept_surface_probes
                    | map({key: .query, value: .reference}) | from_entries) as $ref
-                | [ .wire_baseline[] | select(.pulsus_wire != $ref[.query]) ]
+                | [ .wire_baseline[]
+                    | select($ref[.query] != null)
+                    | select(.pulsus_wire != $ref[.query]) ]
                 | length' "$BASELINE")
               if [ "$NEW_DERIVED" -gt "$OLD_DERIVED" ]; then
-                echo "::error::the wire baseline's derived divergence count rose ($OLD_DERIVED -> $NEW_DERIVED) — the baseline may only move toward fewer divergences (issue 335 Stage C direction rule)"
+                echo "::error::the wire baseline's derived divergence count rose over the keys origin/main already knew ($OLD_DERIVED -> $NEW_DERIVED) — the baseline may only move toward fewer divergences (issue 335 Stage C direction rule, clause A2)"
                 exit 1
               fi
-              # The committed constants must move the same way as the data
-              # they claim to summarise.
+              # A4 (issue 335 Stage D0): the ADDED keys' divergences,
+              # computed with HEAD's oracle — necessarily, because main has
+              # none — and PRINTED, so a fourfold rise arrives with its
+              # arithmetic beside it instead of looking like decay. The
+              # committed constant is then DERIVED BY THE JOIN and asserted
+              # equal, never merely bounded: this identity replaces the old
+              # `NEW_DIVERGE <= OLD_DIVERGE` bound and is strictly stronger,
+              # because a bound cannot see a constant that is wrong in the
+              # allowed direction.
+              ADDED_DERIVED=$(jq -r --slurpfile omtx "$TMP/old_matrix.json" --slurpfile nmtx "$MATRIX" '
+                ($omtx[0].accept_surface_probes
+                   | map({key: .query, value: .reference}) | from_entries) as $oref
+                | ($nmtx[0].accept_surface_probes
+                   | map({key: .query, value: .reference}) | from_entries) as $href
+                | [ .wire_baseline[]
+                    | select($oref[.query] == null)
+                    | select(.pulsus_wire != $href[.query]) ]
+                | length' "$BASELINE")
               OLD_DIVERGE=$(jq -r '.WIRE_DIVERGE_BASELINE' "$TMP/old_baseline.json")
               NEW_DIVERGE=$(jq -r '.WIRE_DIVERGE_BASELINE' "$BASELINE")
-              if [ "$NEW_DIVERGE" -gt "$OLD_DIVERGE" ]; then
-                echo "::error::the wire baseline's committed WIRE_DIVERGE_BASELINE rose ($OLD_DIVERGE -> $NEW_DIVERGE) — the baseline may only move toward fewer divergences (issue 335 Stage C direction rule)"
+              WANT_DIVERGE=$(( NEW_DERIVED + ADDED_DERIVED ))
+              if [ "$NEW_DIVERGE" -ne "$WANT_DIVERGE" ]; then
+                echo "::error::the committed WIRE_DIVERGE_BASELINE ($NEW_DIVERGE) is not the count the join derives ($NEW_DERIVED over the keys origin/main knows + $ADDED_DERIVED over the $ADDED_COUNT added key(s) = $WANT_DIVERGE) — the constant must be derived, never asserted (issue 335 Stage D0 addition rule, clause A4)"
                 exit 1
               fi
               KEYS=$(jq -r '[ .wire_baseline[].query ] | unique | length' "$BASELINE")
-              echo "wire baseline moved toward agreement: derived diverge $OLD_DERIVED -> $NEW_DERIVED (committed $OLD_DIVERGE -> $NEW_DIVERGE) over $KEYS unique probe keys, every origin/main key still present, none regressed"
+              echo "wire baseline: derived diverge over origin/main's keys $OLD_DERIVED -> $NEW_DERIVED, plus $ADDED_DERIVED over $ADDED_COUNT added key(s); committed $OLD_DIVERGE -> $NEW_DIVERGE = $NEW_DERIVED + $ADDED_DERIVED, over $KEYS unique probe keys, every origin/main key still present, none regressed"
             fi
           else
             if printf '%s\n' "$CHANGED" | grep -qx "$BASELINE"; then
@@ -378,6 +480,48 @@ jobs:
               exit 1
             fi
           fi
+
+  conformance-evidence-debt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Conformance evidence debt may only shrink (issue 335 Stage D0)
+        run: |
+          set -u
+          set -o pipefail
+          DISP=crates/pulsus-traceql/tests/conformance/dispositions.json
+          FILTER=ci/jq/conformance-evidence-debt.jq
+          TMP=$(mktemp -d)
+          if ! git cat-file -e origin/main:"$DISP" 2>/dev/null; then
+            echo "origin/main has no $DISP yet; nothing to compare against"
+            exit 0
+          fi
+          git show origin/main:"$DISP" > "$TMP/old_dispositions.json"
+          # FAIL OPEN, LOUDLY. The first cut of this gate interpolated the
+          # filter through a shell variable; jq errored on the subset step,
+          # printed to stderr, and the shell read an empty result — so the
+          # gate PASSED on every case including both attacks. It failed
+          # open and looked green. Hence: the filter lives in a file, jq
+          # runs with -e so an error is distinguishable from an empty
+          # result, and a non-0/1 exit is reported as GATE ERROR rather
+          # than swallowed.
+          set +e
+          GROWN=$(jq -r -e --slurpfile old "$TMP/old_dispositions.json" -f "$FILTER" "$DISP")
+          RC=$?
+          set -e
+          if [ "$RC" -gt 1 ]; then
+            echo "::error::GATE ERROR — jq exited $RC evaluating $FILTER against $DISP. This gate did not run; it is NOT a pass."
+            exit 2
+          fi
+          if [ -n "$GROWN" ]; then
+            echo "::error::the conformance evidence debt GREW — a 'supported' disposition with no evidence is a claim with no witness, and the set may only SHRINK (issue 335 Stage D0). New debt on this branch:"
+            printf '%s\n' "$GROWN"
+            exit 1
+          fi
+          echo "conformance evidence debt did not grow"
 
   schema-it:
     needs: ci

@@ -4,7 +4,7 @@ Query {
             body: Some(
                 Binary {
                     op: Cmp(
-                        Eq,
+                        Lt,
                     ),
                     lhs: Field(
                         Attribute {
@@ -14,22 +14,13 @@ Query {
                     ),
                     rhs: Literal(
                         Number(
-                            "1",
+                            "9223372036854775807",
                         ),
                     ),
                 },
             ),
         },
     ),
-    pipeline: [
-        By {
-            key: Field(
-                Attribute {
-                    scope: Resource,
-                    key: "service.name",
-                },
-            ),
-        },
-    ],
+    pipeline: [],
     hints: [],
 }

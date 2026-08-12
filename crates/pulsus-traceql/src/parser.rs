@@ -98,7 +98,7 @@ pub fn parse(input: &str) -> Result<Query, TraceQlError> {
     }
     // A trailing `with(...)` on a non-metric query carries search hints
     // (issue #185, `hints.most_recent`): `{ … } with(most_recent=true)`.
-    let hints = parse_optional_with(&mut cursor)?;
+    let hints = parse_root_hints(&mut cursor)?;
     expect_eof(&cursor)?;
     Ok(Query {
         spanset,
@@ -594,8 +594,15 @@ fn parse_field_atom(
 
 const FIELD_ATOM_EXPECTED: &str = "a field, a literal, or '('";
 
-/// The ten reserved words that are VALUES wherever they appear — the
-/// reference's static terminals. Resolved here, from the token alone.
+/// The reserved words that are VALUES wherever they appear — the
+/// reference's static terminals. Resolved here, from the token alone,
+/// because that is where the reference resolves them: `static` is a
+/// terminal alternation plus one `IDENTIFIER` action block
+/// (`pkg/traceql/expr.y:426-453` @ Tempo v3.0.2), with no left context.
+///
+/// Thirteen words: the three `status` keywords, the six `kind` keywords
+/// (`unspecified` included since issue #335 Stage D1, class D13),
+/// `true`/`false`, and the two integer bounds below.
 fn static_value_of(name: &str) -> Option<Value> {
     if let Some(status) = StatusValue::from_ident(name) {
         return Some(Value::Status(status));
@@ -606,6 +613,27 @@ fn static_value_of(name: &str) -> Option<Value> {
     match name {
         "true" => Some(Value::Bool(true)),
         "false" => Some(Value::Bool(false)),
+        // Issue #335 Stage D1, class D14. The reference's `static`
+        // production resolves exactly these two identifiers to
+        // `math.MinInt` / `math.MaxInt` inside its own action block
+        // (`expr.y:442-452`), and errors `unknown identifier: …` on every
+        // other one.
+        //
+        // **Why i64 and not isize.** `math.MinInt`/`math.MaxInt` are Go's
+        // PLATFORM int, so the value is the build target's. The pinned
+        // oracle image is `linux/amd64` (`/status/version` reports
+        // `platform: linux/amd64`), i.e. a 64-bit build, so the reference
+        // this repository is measured against resolves them to the 64-bit
+        // bounds. That is what these constants match, and the reason is
+        // written here rather than left for a reader to reconstruct from
+        // an image tag.
+        //
+        // `Value::Number` carries the raw literal text, so the folded
+        // integer both renders and re-parses unchanged — the identifier
+        // spelling does NOT survive, exactly as at the reference, whose
+        // `NewStaticInt` keeps no trace of how the value was written.
+        "minInt" => Some(Value::Number(i64::MIN.to_string())),
+        "maxInt" => Some(Value::Number(i64::MAX.to_string())),
         _ => None,
     }
 }
@@ -869,30 +897,43 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
     })
 }
 
-/// `By := "by" "(" Field { "," Field } ")"` (issue #185, `pipeline.by`):
-/// a spanset-level grouping stage. Empty `by()` is a positioned error.
+/// `By := "by" "(" FieldExpr ")"` — the spanset-level grouping stage
+/// (issue #185, `pipeline.by`; rewritten by issue #335 Stage D2, class
+/// D16). Empty `by()` is a positioned error.
+///
+/// **Both halves of this signature are the reference's, and both were
+/// wrong here before.** `groupOperation` is
+/// `BY OPEN_PARENS fieldExpression CLOSE_PARENS` (`expr.y:177-179` @
+/// Tempo v3.0.2):
+///
+/// * **ONE operand.** The production carries no `COMMA`, and
+///   `fieldExpression` has none either, so `| by(.b, .c)` is a parse
+///   error at the reference — measured `400`. We accepted it AND served
+///   it, which is the worst shape an accept-surface divergence takes: the
+///   query works, the user builds on it, and it is not portable to the
+///   system we claim compatibility with. Withdrawn here, ledgered in
+///   `docs/benchmarks/traces-differential-ledger.md`.
+/// * **A FULL field expression.** `by(.b + .c)`, `by(-.b)`, `by(!.b)`,
+///   `by((.b))` and `by(.b = 1)` are all reference `200`s that we
+///   refused.
+///
+/// The METRICS `by(...)` is a different production sharing one keyword —
+/// `attributeList` (`expr.y:195-198`) — and keeps its comma list; see
+/// [`parse_optional_by`].
 fn parse_by_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
     cursor.expect(&TokenKind::LParen, "'('")?;
     if matches!(cursor.peek().kind, TokenKind::RParen) {
         let span = cursor.peek().span;
         return Err(TraceQlError::UnexpectedToken {
             found: "')'".to_string(),
-            expected: "a grouping field (by() requires at least one field)".to_string(),
+            expected: "a grouping key (by() requires exactly one field expression)".to_string(),
             span,
         });
     }
-    let mut fields = Vec::new();
-    loop {
-        let (field, _) = parse_field(cursor)?;
-        fields.push(field);
-        if matches!(cursor.peek().kind, TokenKind::Comma) {
-            cursor.advance();
-            continue;
-        }
-        break;
-    }
+    let mut binary_nodes = 0usize;
+    let key = parse_field_expr(cursor, 0, &mut binary_nodes)?;
     cursor.expect(&TokenKind::RParen, "')'")?;
-    Ok(PipelineStage::By { fields })
+    Ok(PipelineStage::By { key })
 }
 
 /// `Coalesce := "coalesce" "(" ")"` (issue #185, `pipeline.coalesce`):
@@ -1178,6 +1219,43 @@ fn parse_optional_by(cursor: &mut Cursor<'_>) -> Result<Vec<Field>, TraceQlError
     Ok(fields)
 }
 
+/// The ROOT hint position, where a query may carry MORE THAN ONE
+/// `with(...)` clause (issue #335 Stage D1, class D23).
+///
+/// `root: root hints` (`pkg/traceql/expr.y:134` @ Tempo v3.0.2) is
+/// left-recursive, so `{ .a = 1 } with(a=1) with(b=2)` is a legal root
+/// query at the reference and a 200 there, while our single call read the
+/// second clause as trailing input and answered 400.
+///
+/// **The LAST clause wins; clauses do NOT concatenate.** The reference's
+/// action is `yylex.(*lexer).expr.withHints($2)` and `withHints` is
+/// `r.Hints = h` — a plain assignment, not an append
+/// (`pkg/traceql/ast.go:112-115` @ v3.0.2). So the recursion's effect is
+/// replacement: `with(a=1) with(b=2)` means `with(b=2)`, and only a
+/// single clause's comma list (`hintList`, `expr.y:379-382`) accumulates.
+/// This is worth stating because the intuitive reading — that repeated
+/// clauses merge — is wrong, and shipping it would be a quiet semantic
+/// divergence behind an accept-surface fix that looked complete.
+///
+/// Only this call site loops. The metric-stage and `compare()` hint
+/// positions keep their single-clause shape: their grammar
+/// (`metricsAggregation`, `expr.y:307-327`) has no such recursion, and
+/// `| rate() with(a=1) with(b=2)` is accepted by both sides through the
+/// existing single call because the trailing clause is the ROOT's.
+fn parse_root_hints(cursor: &mut Cursor<'_>) -> Result<Vec<MetricHint>, TraceQlError> {
+    let mut hints = Vec::new();
+    loop {
+        let clause = parse_optional_with(cursor)?;
+        if clause.is_empty() {
+            // `parse_optional_with` returns empty only when no `with`
+            // follows — an empty `with()` is a positioned error there, so
+            // this cannot loop forever on a well-formed clause.
+            return Ok(hints);
+        }
+        hints = clause;
+    }
+}
+
 /// Parses an optional trailing `with (key=value, ...)` hint clause.
 /// Returns the empty vector when no `with` follows.
 fn parse_optional_with(cursor: &mut Cursor<'_>) -> Result<Vec<MetricHint>, TraceQlError> {
@@ -1207,14 +1285,41 @@ fn parse_optional_with(cursor: &mut Cursor<'_>) -> Result<Vec<MetricHint>, Trace
     Ok(hints)
 }
 
-/// `Hint := Ident "=" (Bool | Number | Duration | String)`.
+/// What a hint value may be, in one place because three arms report it.
+/// The list follows `static` (`expr.y:426-453` @ Tempo v3.0.2), which is
+/// what the reference's `hint` production takes.
+const HINT_VALUE_EXPECTED: &str =
+    "a hint value (a status or kind keyword, true, false, a number, a duration, or a string)";
+
+/// `Hint := Ident "=" Static` — the value is the whole `static`
+/// production (`expr.y:371-373` @ Tempo v3.0.2), not a shorter list.
 fn parse_hint(cursor: &mut Cursor<'_>) -> Result<MetricHint, TraceQlError> {
     let (key, _) = cursor.expect_ident("a hint name (e.g. sample, exemplars)")?;
     cursor.expect(&TokenKind::Eq, "'=' (hints are key=value pairs)")?;
     let tok = cursor.peek().clone();
     let value = match &tok.kind {
-        TokenKind::Ident(word) if word == "true" => HintValue::Bool(true),
-        TokenKind::Ident(word) if word == "false" => HintValue::Bool(false),
+        // `hint: IDENTIFIER EQ static` (`expr.y:371-373` @ Tempo v3.0.2):
+        // the value position is the WHOLE `static` production, so it is
+        // resolved by the same function the field-expression atom uses
+        // rather than by a shorter hand-written list. Before issue #335
+        // Stage D1 this arm knew `true`/`false` only, which is why
+        // `with(k=unspecified)` and `with(k=maxInt)` were 400s here and
+        // 200s at the reference — and why `with(k=server)` was too,
+        // though no probe happened to name it.
+        TokenKind::Ident(word) => match static_value_of(word) {
+            Some(Value::Bool(b)) => HintValue::Bool(b),
+            Some(Value::Number(raw)) => HintValue::Number(raw),
+            Some(Value::Status(s)) => HintValue::Status(s),
+            Some(Value::Kind(k)) => HintValue::Kind(k),
+            // `static_value_of` returns only the four kinds above.
+            Some(Value::String(_) | Value::Duration(_)) | None => {
+                return Err(TraceQlError::UnexpectedToken {
+                    found: describe(&tok.kind),
+                    expected: HINT_VALUE_EXPECTED.to_string(),
+                    span: tok.span,
+                });
+            }
+        },
         TokenKind::Number(raw) => HintValue::Number(raw.clone()),
         TokenKind::Duration(raw) => {
             let parsed = duration::parse_duration(raw, tok.span)?;
@@ -1227,16 +1332,14 @@ fn parse_hint(cursor: &mut Cursor<'_>) -> Result<MetricHint, TraceQlError> {
         TokenKind::String(s) => HintValue::String(s.clone()),
         TokenKind::Eof => {
             return Err(TraceQlError::UnexpectedEof {
-                expected: "a hint value (true, false, a number, a duration, or a string)"
-                    .to_string(),
+                expected: HINT_VALUE_EXPECTED.to_string(),
                 span: tok.span,
             });
         }
         _ => {
             return Err(TraceQlError::UnexpectedToken {
                 found: describe(&tok.kind),
-                expected: "a hint value (true, false, a number, a duration, or a string)"
-                    .to_string(),
+                expected: HINT_VALUE_EXPECTED.to_string(),
                 span: tok.span,
             });
         }
@@ -2574,13 +2677,48 @@ mod tests {
         assert_eq!(
             parsed.pipeline,
             vec![PipelineStage::By {
-                fields: vec![Field::Attribute {
+                key: FieldExpr::Field(Field::Attribute {
                     scope: AttrScope::Resource,
                     key: "service.name".to_string(),
-                }],
+                }),
             }]
         );
         assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
+    }
+
+    /// Issue #335 Stage D2, class D16. `groupOperation` is
+    /// `BY '(' fieldExpression ')'` (`expr.y:177-179` @ Tempo v3.0.2):
+    /// ONE operand, and a full field expression. Both halves are asserted
+    /// here, because the old shape was wrong in both directions.
+    #[test]
+    fn the_spanset_by_takes_one_key_and_that_key_is_a_field_expression() {
+        // Widened: every one of these is a reference 200 that we refused.
+        for query in [
+            "{ .a = 1 } | by(.b + .c)",
+            "{ .a = 1 } | by(-.b)",
+            "{ .a = 1 } | by(!.b)",
+            "{ .a = 1 } | by((.b))",
+            "{ .a = 1 } | by(.b = 1)",
+        ] {
+            let parsed = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                matches!(parsed.pipeline[..], [PipelineStage::By { .. }]),
+                "{query}"
+            );
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
+        }
+        // Narrowed: the comma list is a reference parse error, and was a
+        // shipped, SERVED accept here until this stage withdrew it.
+        for query in ["{ .a = 1 } | by(.b, .c)", "{ .a = 1 } | by(.b, .c, name)"] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                matches!(err, TraceQlError::UnexpectedToken { .. }),
+                "{query}: expected a positioned error, got {err}"
+            );
+        }
+        // The METRICS by(...) is attributeList and keeps its comma list.
+        let metrics = parse("{} | rate() by(.a, .b)").unwrap();
+        assert!(matches!(metrics.pipeline[..], [PipelineStage::Metric(_)]));
     }
 
     #[test]

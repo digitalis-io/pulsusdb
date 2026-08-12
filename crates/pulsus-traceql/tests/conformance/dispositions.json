@@ -489,9 +489,67 @@
       "tempo": "accept"
     },
     {
-      "construct": "static.kind_enum",
+      "construct": "static.kind_unspecified",
       "status": "supported",
-      "evidence": [],
+      "evidence": [
+        "accept/static_kind_unspecified"
+      ],
+      "tempo": "accept"
+    },
+    {
+      "construct": "static.kind_internal",
+      "status": "supported",
+      "evidence": [
+        "accept/static_kind_internal"
+      ],
+      "tempo": "accept"
+    },
+    {
+      "construct": "static.kind_server",
+      "status": "supported",
+      "evidence": [
+        "accept/intrinsic_kind_eq_server"
+      ],
+      "tempo": "accept"
+    },
+    {
+      "construct": "static.kind_client",
+      "status": "supported",
+      "evidence": [
+        "accept/static_kind_client"
+      ],
+      "tempo": "accept"
+    },
+    {
+      "construct": "static.kind_producer",
+      "status": "supported",
+      "evidence": [
+        "accept/intrinsic_kind_neq_producer"
+      ],
+      "tempo": "accept"
+    },
+    {
+      "construct": "static.kind_consumer",
+      "status": "supported",
+      "evidence": [
+        "accept/static_kind_consumer"
+      ],
+      "tempo": "accept"
+    },
+    {
+      "construct": "static.min_int",
+      "status": "supported",
+      "evidence": [
+        "accept/static_min_int"
+      ],
+      "tempo": "accept"
+    },
+    {
+      "construct": "static.max_int",
+      "status": "supported",
+      "evidence": [
+        "accept/static_max_int"
+      ],
       "tempo": "accept"
     },
     {

@@ -265,6 +265,120 @@ measured, the pre-fix tree is 12/12 green on exactly that mutant. This is
 the Rust spelling of the weakness `wire-baseline-freeze` rejects in every
 file it builds a join from.
 
+## Stage D0 (issue #335, 2026-08-12) — the enumeration becomes the whole grammar
+
+**`DIVERGE` moved 0 → 56 and `WIRE_DIVERGE_BASELINE` 10 → 63 in this
+commit. Nothing regressed. The surface became measured.** Everything
+above enumerated from the reference's precedence table and its
+*field-expression* operand positions, which is **24 of the grammar's 33
+productions**. This stage enumerates all 33, one committed row each in
+`grammar_slots.json`, with the command that produced the list:
+
+```
+awk '/^%%$/{n++; next} n==1 && /^[a-zA-Z_]+:/{sub(/:.*/,""); print NR": "$0}' pkg/traceql/expr.y
+```
+
+→ 33 lines at `0c4b926d0` (Tempo v3.0.2). The nine productions the first
+enumeration never touched are `root` (`expr.y:128-135`),
+`spansetPipelineExpression` (`:140-160`), `spansetPipeline` (`:165-175`),
+`coalesceOperation` (`:181-183`), `spansetExpression` (`:208-231`),
+`scalarFilterOperation` (`:242-249`), `scalarPipelineExpression`
+(`:259-268`), `scalarPipeline` (`:274-276`) and `metricsFilterOperation`
+(`:340-347`); two divergence classes live there and nowhere else. A tenth,
+`wrappedSpansetPipeline` (`:162-163`), was on the old list but had never
+been probed as an OPERAND — only as a root form — which is why D19 is ten
+probes and not two. Four more productions were listed but only
+partly probed: `groupOperation` (`:177-179`), `metricsFilter`
+(`:349-356`), `metricsSecondStagePipeline` (`:361-366`) and `static`
+(`:426-453`), together with the `hints` recursion at `root: root hints`
+(`:134`).
+
+**85 probes: 29 agree, 56 diverge.** Every one replayed twice against
+`grafana/tempo@sha256:aa8df8d0…` (`/status/version` → v3.0.2, revision
+`0c4b926d0`), routed exactly as `reference_accepts` routes, with
+identical verdicts both times and no inconclusive (non-200/400) answer.
+Classes D13–D24. **Not one of them was visible to any existing gate**:
+the tokens `unspecified`, `minInt`, `maxInt`, `nil`, `topk`, `bottomk`,
+`compare(` and `with(` appear in **zero** of the previous 221 probe
+queries, and all 13 probes containing `by(` are `{ true } | rate() by(…)`
+— the metrics `attributeList`, not `groupOperation`.
+
+**The agreements are as much the output as the divergences.** Three of
+them are class BOUNDARIES and both sides reject them: `coalesce()` alone
+is legal only after a `PIPE` (`expr.y:173`), `by(.a) && { .b = 1 }` fails
+because a `groupOperation` is a pipeline and not a `spansetExpression`
+operand, and `({ … } | count() > 1) && { .b = 2 }` fails because the
+right-hand operand must be a pipeline expression too. Those three pin
+where D19's and D24's fixes must stop. The remaining 26 cover
+`spansetExpression`'s parenthesising and structural-vs-logical
+precedence, both six-operator comparison sets
+(`scalarFilterOperation`, `metricsFilterOperation`, plus `=~` rejected on
+both sides), the whole `scalarPipeline` / `scalarPipelineExpression`
+family (reject on both — the reference parses them and then refuses at
+its own `scalar filter lhs of type (%v) not yet supported`), and the five
+spanset `by()` key forms both sides accept.
+
+### What this enumeration cannot see — stated, not left implicit
+
+1. **Anything the lexer decides.** The grammar file names tokens, not
+   spellings; a keyword our lexer spells differently is invisible here.
+2. **Anything the reference rejects after a successful parse.** The
+   grammar says a shape is *parseable*, never *served* — which is why
+   every row carries a measured HTTP verdict and not only a citation, and
+   why the `scalarPipeline` family reads as a both-reject agreement.
+3. **Evaluation semantics.** The echoed-parse channel exposes GROUPING,
+   never the value an operator computes; `traceql-pow-integer-operand-swap`
+   is the standing proof that those come apart. Group (c) — both accept,
+   different answer — is EMPTY for this enumeration, and that is a claim
+   about trees, not about values.
+4. **Reachability through a client.** Recorded per probe instead, in
+   `reachability.json`'s tiers, with its own stated residual.
+
+### Reachability, and what the ranking is for
+
+Every diverging probe records which client path reaches its construct:
+5 `r1-client-emitted`, 8 `r2-skeleton-inserted`, 18
+`r3-highlighted-only`, 25 `r4-no-traceql-surface-path`. It re-orders the
+held classes; it changes no fix decision.
+
+**D13 leads because our own product breaks the loop.** `pulsus-read`
+renders the word `unspecified` into a `by(kind)` group value, a
+`select(kind)` projection and a `rate() by(kind)` series label; the
+reference offers it back as a filter value (captured — all six kinds on
+`/api/v2/search/tag/kind/values`); the Grafana datasource emits an
+enum-intrinsic ad-hoc value UNQUOTED, so the query written back is
+`{kind=unspecified}`; the reference serves that 200 with the matching
+trace (captured). We answered 400. **D22 goes to the back**: it is the
+group where we are more permissive than the reference, and `topk` has
+zero hits on the datasource's query-emitting surface while `bottomk` has
+zero anywhere at the tag — so no Tempo client can emit it.
+
+### Staging
+
+`D13`, `D14`, `D23` are fixed in Stage D1. **Stage D1 is not
+parser-local, and saying so would be false**: `SpanKindValue` gains a
+sixth variant, and `crates/pulsus-read/src/traces/filter.rs`'s
+`kind_code` matches all five with no wildcard, so the read path does not
+compile until it gains an arm. That is the intended constraint rather
+than an accident — of the three read-path sites that interpret a span
+kind, it is the only type-checked one (`metrics_sql.rs`'s `KIND_MAP` is
+a SQL string constant and `search_eval.rs`'s `kind_keyword` has a `_ =>`
+arm, and both already emitted `unspecified`). No gate is bypassed: a
+diff-path check on `crates/pulsus-read/src/**` was considered and
+withdrawn before implementation, because the AST is a TYPE CONTRACT
+(`pulsus-read` lowers `pulsus_traceql::Query`), so such a check is
+incomplete if it lists only the read path and vacuous if it lists the
+parser too. What holds each D1 change down is therefore per-change and
+unequal: D13 the compiler, D14 and D23 nothing from the type system.
+`D16` is fixed
+in Stage D2, in both directions at once — the comma list is removed and
+the single operand widened to a field expression, because they are the
+same production. The remaining eight — `D15`, `D17`, `D18`, `D19`,
+`D20`, `D21`, `D22`, `D24` — are **`held`: measured, owned, unscheduled.**
+That is not "won't fix". Each keeps `status: "open"`, each keeps at least
+one diverging probe so the class-closure gate has teeth, and every one of
+their probes names issue 335 as its owner.
+
 ## Operator precedence and associativity
 
 Tightest first. `=` marks agreement from the audit capture, `✔` a
@@ -274,9 +388,9 @@ divergence this commit closed, `≠` one still open.
 |---|---|---|---|
 | 1 | `^`, **right**-associative (`2^3^2` ≡ `2^8`; the folded value 64 alone does not establish this — see the method note) | same since D8 was fixed; the grouping agrees and the OPERATOR diverges deliberately (`traceql-pow-integer-operand-swap`) | ✔ |
 | 2 | `* / %`, left-associative | same | = |
-| 3 | unary `!`, unary `-` (so `-2^2` = -4, `-.a*2` = `-(.a*2)`) | unary `-` matches since D9 was fixed; unary `!` is still not at this level | ✔ / ≠ D1 |
+| 3 | unary `!`, unary `-` (so `-2^2` = -4, `-.a*2` = `-(.a*2)`) | unary `-` matches since D9 was fixed; unary `!` matches since the Stage B collapse closed D1 | ✔ |
 | 4 | `+ -`, left-associative | same | = |
-| 5 | `= != < <= > >= =~ !~`, left-associative and **chainable** | one comparison only; a second is a grammar error | ≠ D6 |
+| 5 | `= != < <= > >= =~ !~`, left-associative and **chainable** | same since the Stage B collapse closed D6 | ✔ |
 | 6 | `&&` and `||` — **one level**, left-associative | same since D10 was fixed | ✔ |
 | — | spanset structural `> >> < << ~` (and `!`/`&` forms) bind tighter than the spanset logical operators, left-associative | same | = |
 | — | spanset `&&` / `||` — one level, left-associative (established by a result differential, not by status) | same since D11 was fixed | ✔ |
@@ -294,27 +408,47 @@ behaviour, not a transcription slip: `!.a * 2` groups as `!(.a * 2)` while
 | comparison RHS — bare intrinsic (all 11) | yes | = |
 | comparison RHS — colon-scoped intrinsic (all 18) | yes | ✔ since D2 was fixed |
 | comparison RHS — arithmetic, parentheses, unary `-` | yes | = |
-| comparison RHS — unary `!` | yes | **≠ D1** |
+| comparison RHS — unary `!` | yes | ✔ since D1 was fixed |
 | comparison LHS — attribute / intrinsic / arithmetic | yes | = |
 | comparison LHS — colon-scoped intrinsic | yes | = |
-| comparison LHS — literal, or literal-only comparison | yes | **≠ D4** |
-| comparison LHS — parenthesised expression | yes | **≠ D5** |
-| comparison LHS — unary `-` / `!` | yes | **≠ D1, D3** |
+| comparison LHS — literal, or literal-only comparison | yes | ✔ since D4 was fixed |
+| comparison LHS — parenthesised expression | yes | ✔ since D5 was fixed |
+| comparison LHS — unary `-` / `!` | yes | ✔ since D1 and D3 were fixed |
 | aggregate argument (`avg/min/max/sum`) — attribute, `duration` | yes | = |
 | aggregate argument — colon intrinsic, arithmetic, parentheses | yes | ✔ since D7 was fixed (parse axis; three of the four are still planner 400s — see the Stage C section) |
 | aggregate argument — literal, empty, two arguments; `count(x)` | no | = |
 | aggregate comparison RHS — attribute or another aggregate | no | = |
 | `select(...)` — attribute, bare intrinsic, colon intrinsic, list | yes | = |
 | `select(...)` — literal, arithmetic, unary, parentheses, empty, comparison | no | = (14/14) |
-| `by(...)` — attribute, scoped attribute, intrinsic, colon intrinsic, list | yes | = |
-| `by(...)` — literal, arithmetic, unary, parentheses, empty | no | = (11/11) |
+| spanset `by(...)` — attribute, scoped attribute, intrinsic, colon intrinsic | yes | = | <!-- production: groupOperation | probe: `{ .a = 1 } | by(.b)` -->
+| spanset `by(...)` — arithmetic, unary, parentheses, comparison | yes | **≠ D16** | <!-- production: groupOperation | probe: `{ .a = 1 } | by(.b + .c)` -->
+| spanset `by(...)` — comma list | no | **≠ D16** (we accept AND serve it) | <!-- production: groupOperation | probe: `{ .a = 1 } | by(.b, .c)` -->
+| metrics `by(...)` — attribute, scoped attribute, intrinsic, colon intrinsic, comma list | yes | = | <!-- production: attributeList | probe: `{ true } | rate() by(.a, .b)` -->
+| metrics `by(...)` — literal, arithmetic, unary, parentheses, empty | no | = (7/7) | <!-- production: attributeList | probe: `{ true } | rate() by(.a + 1)` -->
 | structural operands — spanset on both sides | yes | = |
 | bare attribute (existence), `= nil` / `!= nil` | yes | = |
 | bare intrinsic with no comparison | no | = |
 
-`select()` and `by()` agree completely — 25 probes, no divergence. That
-result is as much the audit's output as the divergences are: those two
-positions do not need work.
+**The two `by(...)` rows above replace one pair that was false in BOTH
+directions** (issue #335 Stage D0). The old rows read "attribute, scoped
+attribute, intrinsic, colon intrinsic, **list** — reference accepts" and
+"literal, **arithmetic, unary, parentheses**, empty — reference rejects",
+unqualified, as though there were one `by(...)`. There are two: the
+spanset `groupOperation` (`expr.y:177-179`) takes exactly ONE operand and
+that operand is a full field expression, while the metrics `by(...)` is
+`attributeList` (`expr.y:195-198`) and its comma list is correct. The old
+rows described the metrics one and all thirteen backing probes were
+metrics probes, so the reference's real spanset behaviour — accepting
+`by(.b + .c)`, rejecting `by(.b, .c)` — was invisible. That is class D16.
+
+`select()` agrees completely — 15 probes, no divergence, argument grammar
+and all. That result is as much the audit's output as the divergences
+are. Every row above now carries a trailer naming the production it is
+about and the probe that backs it, and
+`accept_surface.rs::every_operand_position_row_agrees_with_its_probe`
+compares the row's own `yes`/`no` claim against that probe's measured
+reference verdict — so a row cannot say `yes` while its probe records
+`reject` again.
 
 ## Divergence classes
 

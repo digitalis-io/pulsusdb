@@ -21,15 +21,13 @@ Query {
             ),
         },
     ),
-    pipeline: [
-        By {
-            key: Field(
-                Attribute {
-                    scope: Resource,
-                    key: "service.name",
-                },
+    pipeline: [],
+    hints: [
+        MetricHint {
+            key: "b",
+            value: Number(
+                "2",
             ),
         },
     ],
-    hints: [],
 }

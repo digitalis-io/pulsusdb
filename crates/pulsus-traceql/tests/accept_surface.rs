@@ -73,6 +73,36 @@ struct DivergenceClass {
     /// to go looking. Required (and non-empty) whenever `wire_status` is.
     #[serde(default)]
     wire_note: Option<String>,
+    /// How this class's construct is IDENTIFIED, and therefore what may
+    /// discharge a reachability claim about it (issue #335 Stage D0).
+    ///
+    /// * `lexical` — the construct is a TOKEN. An absence sweep can mean
+    ///   something, and the probe carries a `subject` drawn from
+    ///   [`DivergenceClass::subject_atoms`].
+    /// * `positional` — the construct is a PLACE in the grammar. There is
+    ///   nothing to sweep, and sweeping something adjacent is exactly the
+    ///   defect this field exists to make unrepresentable: `.a = 1` really
+    ///   does sweep to zero hits, so a record built that way is honest and
+    ///   meaningless. A positional class must discharge r4 with a
+    ///   citation.
+    ///
+    /// Only the pre-Stage-D0 classes may omit it — they predate the field
+    /// and carry no reachability records.
+    #[serde(default)]
+    subject_kind: Option<String>,
+    /// The closed set of tokens a `lexical` class's probes may name as
+    /// their `subject`, so a probe cannot invent one. Empty for a
+    /// `positional` class.
+    #[serde(default)]
+    subject_atoms: Vec<String>,
+    /// What this class commits to: `D1` | `D2` | `held`. Each value has a
+    /// mechanical consequence, checked here or named as a convention —
+    /// see [`every_divergence_carries_a_class_and_every_class_is_used`].
+    /// `held` means MEASURED, OWNED, UNSCHEDULED. It never means "won't
+    /// fix": a held class stays `status: "open"`, its probes keep
+    /// diverging, and every one of them names its owning issue.
+    #[serde(default)]
+    stage: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -99,8 +129,126 @@ struct Probe {
     /// it agrees on the wire, so a closed gap cannot leave a stale
     /// pointer behind. See
     /// [`a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue`].
+    ///
+    /// **Widened at Stage D0 to carry the `held` ownership too.** A class
+    /// staged `held` is measured and unscheduled, and the plan's rule is
+    /// that every one of its probes names the issue that owns it. Those
+    /// two populations are disjoint by construction — a wire-only
+    /// divergence has no `class`, a held-class member always has one — so
+    /// one field carries both without ambiguity, and the "forbidden once
+    /// it agrees" half still stops a pointer rotting in place.
     #[serde(default)]
     owning_issue: Option<u32>,
+    /// Which client path can reach this probe's construct — one of the
+    /// four tiers in [`REACHABILITY_TIERS`] (issue #335 Stage D0).
+    /// Required exactly when the probe DIVERGES and forbidden otherwise:
+    /// an agreement has no divergence to justify a reachability claim
+    /// about, which is the `class` field's posture one column over.
+    #[serde(default)]
+    reachability: Option<String>,
+    /// The token under classification, for a probe in a `lexical` class.
+    /// Three things are compared, and each one closes a forgery that was
+    /// actually built against an earlier cut of this schema: it must be
+    /// one of its class's declared `subject_atoms`; it must occur in this
+    /// probe's own query; and an absence sweep's `token` must EQUAL it,
+    /// not merely contain it.
+    #[serde(default)]
+    subject: Option<String>,
+    /// How the reachability claim is discharged. Every field in it is
+    /// compared against something, or it is not a field — see
+    /// [`every_probe_records_its_reachability`].
+    #[serde(default)]
+    reachability_evidence: Option<ReachabilityEvidence>,
+}
+
+/// A reachability record. It carries no `path`, no `lines`, no `request`
+/// and no `observed_field`: those belong to a declared anchor or capture
+/// in `reachability.json` and are named by ID, so there is one place to
+/// review them rather than one per probe.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReachabilityEvidence {
+    /// `capture` (r1) | `insertion` (r2) | `highlight-only` (r3) |
+    /// `absence-sweep` (r4, lexical) | `citation` (r4, positional).
+    kind: String,
+    /// r1: the capture id.
+    #[serde(default)]
+    capture: Option<String>,
+    /// r1: the value observed in the capture's `observed_field`. Must
+    /// EQUAL the probe's `subject` — the captured value IS the construct.
+    #[serde(default)]
+    observed_value: Option<String>,
+    /// r2 / r4-positional: the anchor id.
+    #[serde(default)]
+    anchor: Option<String>,
+    /// r3: two DISTINCT anchor ids — the token list and the omission.
+    /// "Highlighted but not offered" is a two-part claim and may not be
+    /// made with one citation.
+    #[serde(default)]
+    anchors: Vec<String>,
+    /// r4-lexical: the sweep, every field of it compared.
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    flags: Vec<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    scope: Vec<String>,
+    #[serde(default)]
+    hits: Option<usize>,
+}
+
+/// The declared citation targets — nine anchors and one capture, read
+/// once and joined by id. See `reachability.json`'s `what_this_is`.
+#[derive(Deserialize)]
+struct Reachability {
+    datasource_revision: String,
+    schema_header: String,
+    declared_paths: Vec<String>,
+    declared_scopes: BTreeMap<String, String>,
+    anchors: BTreeMap<String, Anchor>,
+    captures: BTreeMap<String, Capture>,
+}
+
+#[derive(Deserialize)]
+struct Anchor {
+    revision: String,
+    path: String,
+    lines: String,
+    shows: String,
+    #[serde(default)]
+    insert_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Capture {
+    endpoint: String,
+    request: String,
+    observed_field: String,
+    #[allow(dead_code)]
+    observed_body: String,
+    emitters: Vec<String>,
+    #[allow(dead_code)]
+    why_this_is_r1: String,
+}
+
+/// One row per production in the reference grammar's rule section.
+#[derive(Deserialize)]
+struct GrammarSlots {
+    slots: Vec<GrammarSlot>,
+}
+
+#[derive(Deserialize)]
+struct GrammarSlot {
+    production: String,
+    ref_lines: String,
+    disposition: String,
+    #[serde(default)]
+    probes: Vec<String>,
+    why: String,
 }
 
 /// A probe both implementations accept and parse *differently*. `pulsus_parse`
@@ -195,11 +343,132 @@ struct ClosedMeaningProbe {
 /// numeric aggregation path and `avg(.a + 1)` is a composite source. The
 /// class row carries `wire_status: "open"` saying so. Read this constant
 /// as "the grammar agrees", never as "these queries work".
-const TOTAL: usize = 221;
-const AGREE: usize = 221;
-const DIVERGE: usize = 0;
+/// **Stage D0 (#335, 2026-08-12) raised `TOTAL` 221 → 306 and `DIVERGE`
+/// 0 → 56. NOTHING REGRESSED.** The first enumeration was built from the
+/// reference's precedence table and its *field-expression* operand
+/// positions — **24 of the grammar's 33 productions**. Stage D0
+/// enumerated all 33 (`accept_surface/grammar_slots.json`, with the
+/// command that produced the list). The nine that had never been probed —
+/// `root`, `spansetPipelineExpression`, `spansetPipeline`,
+/// `coalesceOperation`, `spansetExpression`, `scalarFilterOperation`,
+/// `scalarPipelineExpression`, `scalarPipeline`, `metricsFilterOperation`
+/// — carry two divergence classes on their own
+/// (D19, D24), and the tokens `unspecified`, `minInt`, `maxInt`, `nil`,
+/// `topk`, `bottomk`, `compare(` and `with(` appeared in **zero** of the
+/// old 221 probes. `DIVERGE` rose because the surface became MEASURED,
+/// not because anything decayed. The 85 new probes are 29 agreeing and 56
+/// diverging across classes D13–D24; every one was replayed twice against
+/// the digest-pinned oracle with identical verdicts and no inconclusive
+/// (non-200/400) answer. See `accept_surface/PROVENANCE.md` §Stage D0.
+///
+/// Agreements / divergences pinned exactly. These only move with a
+/// deliberate grammar change: a fix lowers `DIVERGE` and raises `AGREE` by
+/// the same amount, and a regression fails here first.
+///
+/// Audit capture (#335): 221 probes, 176 agree, 45 diverge, 7 meaning
+/// divergences. First fix wave (#335, classes D2/D8/D9/D10/D11): D2's
+/// twenty probes flipped reject→accept, so `AGREE` 176 + 20 = 196 and
+/// `DIVERGE` 45 − 20 = 25; no agreement became a divergence. D8/D9/D10/D11
+/// are meaning-only and carry no accept-surface probe, so they move
+/// `MEANING` 7 − 4 = 3 and leave the probe counts alone.
+///
+/// Stage A (#335): [`accepts`] became `parse ∘ validate` to match what the
+/// reference verdict measures, flipping exactly two D1 probes
+/// (`{ !name + 1 = 2 }`, `{ !name * 2 = 3 }`) diverge→agree — our
+/// validator already rejects them; only the scoreboard scored parse alone
+/// — so `AGREE` 196 + 2 = 198 and `DIVERGE` 25 − 2 = 23, with no probe
+/// moving agree→diverge. The remaining 23 are D1 (5), D3 (7), D4 (4),
+/// D5 (2), D6 (1), D7 (4) — the field-expression regrammar.
+///
+/// Stage B capture (#335 AC 4, binding ruling): the `!`/absence
+/// de-conflation may not begin until the reference behaviour of every
+/// spelling our tree conflates onto existence is measured. The
+/// mechanism class is "spellings that parse to `Exists`/`Not(Exists)`
+/// here" — bare, `!`, `= nil`, `!= nil`, at both scopes — and the
+/// result differential found the conflation WIDER than the `!`/nil
+/// pair the plan named. Class D12 records all of it; `MEANING` 3 + 6 = 9.
+///
+/// Stage B (#335), the grammar collapse: one precedence-climbing routine
+/// replaces the layered field-expression parser, closing **D1** (5),
+/// **D3** (7), **D4** (4), **D5** (2) and **D6** (1) — 19 probes
+/// diverge→agree and none the other way, so `AGREE` 198 + 19 = 217 and
+/// `DIVERGE` 23 − 19 = 4. The 4 residuals are all **D7**.
+///
+/// Stage C (#335), the aggregate argument: `parse_aggregate` takes a
+/// full field expression and `validate` gained rule 11, so **D7**'s 4
+/// probes flip diverge→agree — `AGREE` 217 + 4 = 221 and `DIVERGE` 4 − 0
+/// = 0.
+///
+/// **`DIVERGE` is a statement about the PARSE axis and nothing more.** D7
+/// is not closed for a user: on the wire
+/// (`parse → validate → plan`, `pulsus-read/tests/accept_surface_wire.rs`)
+/// three of its four probes are still planner 400s against a reference
+/// 2xx. The class row carries `wire_status: "open"` saying so. Read these
+/// constants as "the grammar agrees", never as "these queries work".
+const TOTAL: usize = 306;
+const AGREE: usize = 266;
+const DIVERGE: usize = 40;
 const MEANING: usize = 6;
 const CLOSED_MEANING: usize = 7;
+
+/// The four reachability tiers, closed. Each says what the Grafana
+/// TraceQL client DOES with the construct, not how likely a divergence
+/// feels — a warrant wider than the command behind it is what round 3 of
+/// this issue shipped and round 4 caught.
+///
+/// * `r1-client-emitted` — the datasource writes the exact query text.
+/// * `r2-skeleton-inserted` — a completion puts the construct on screen
+///   with an empty slot; the divergent ARGUMENT form is typed by hand.
+/// * `r3-highlighted-only` — the token is marked wherever it appears; no
+///   completion path reaches the form.
+/// * `r4-no-traceql-surface-path` — nothing on the TraceQL surface
+///   emits, inserts or highlights it.
+const REACHABILITY_TIERS: [&str; 4] = [
+    "r1-client-emitted",
+    "r2-skeleton-inserted",
+    "r3-highlighted-only",
+    "r4-no-traceql-surface-path",
+];
+
+/// Every production in the reference grammar's rule section, in file
+/// order. The LENGTH is in the type, so deleting a row from
+/// `grammar_slots.json` does not compile — the `MOVED_TO_VALIDATE`
+/// posture this file already uses, one artefact over.
+const GRAMMAR_SLOTS: [&str; 33] = [
+    "root",
+    "spansetPipelineExpression",
+    "wrappedSpansetPipeline",
+    "spansetPipeline",
+    "groupOperation",
+    "coalesceOperation",
+    "selectOperation",
+    "attribute",
+    "attributeList",
+    "numericList",
+    "spansetExpression",
+    "spansetFilter",
+    "scalarFilter",
+    "scalarFilterOperation",
+    "scalarPipelineExpressionFilter",
+    "scalarPipelineExpression",
+    "wrappedScalarPipeline",
+    "scalarPipeline",
+    "scalarExpression",
+    "aggregate",
+    "metricsAggregation",
+    "metricsSecondStage",
+    "metricsFilterOperation",
+    "metricsFilter",
+    "metricsSecondStagePipeline",
+    "hint",
+    "hints",
+    "hintList",
+    "fieldExpression",
+    "static",
+    "intrinsicField",
+    "scopedIntrinsicField",
+    "attributeField",
+];
 
 /// The audit matrix, **validated at load** on the two properties every
 /// gate in this file reads through:
@@ -255,6 +524,15 @@ fn matrix() -> Matrix {
         malformed.join("\n")
     );
     m
+}
+
+fn fixture<T: serde::de::DeserializeOwned>(name: &str) -> T {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("accept_surface")
+        .join(name);
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{name} must parse: {e}"))
 }
 
 /// The committed WIRE-axis column. Only the two fields the joins below
@@ -514,6 +792,74 @@ fn every_divergence_carries_a_class_and_every_class_is_used() {
             c.id,
             c.impact
         );
+
+        // Stage D0's three class fields. They are optional in the schema
+        // only so the pre-Stage-D0 classes, which predate them and carry
+        // no reachability records, keep parsing; a class that declares
+        // one must declare all three coherently.
+        let Some(stage) = c.stage.as_deref() else {
+            assert!(
+                c.subject_kind.is_none() && c.subject_atoms.is_empty(),
+                "class {}: subject_kind/subject_atoms without a stage",
+                c.id
+            );
+            continue;
+        };
+        assert!(
+            matches!(stage, "D1" | "D2" | "held"),
+            "class {}: bad stage {stage:?} (D1 | D2 | held)",
+            c.id
+        );
+        let subject_kind = c
+            .subject_kind
+            .as_deref()
+            .unwrap_or_else(|| panic!("class {}: a staged class needs a subject_kind", c.id));
+        match subject_kind {
+            "lexical" => assert!(
+                !c.subject_atoms.is_empty(),
+                "class {}: a lexical class must declare the atoms its probes may name",
+                c.id
+            ),
+            "positional" => assert!(
+                c.subject_atoms.is_empty(),
+                "class {}: a positional class has no token to name — its construct is a PLACE in \
+                 the grammar, and sweeping something adjacent is the defect this split exists to \
+                 make unrepresentable",
+                c.id
+            ),
+            other => panic!("class {}: bad subject_kind {other:?}", c.id),
+        }
+        // `held` means MEASURED, OWNED, UNSCHEDULED — never "won't fix".
+        // The enforceable half: the class stays open (which the teeth
+        // above then back with a still-diverging probe), and every one of
+        // its probes names the issue that owns it. The unenforceable half
+        // is a stated CONVENTION and is labelled one: no artefact carries
+        // "a held class may not be described in prose as closed" in a
+        // form a test can read, so it is enforced at review.
+        if stage == "held" {
+            assert_eq!(
+                c.status, "open",
+                "class {} is staged `held` — measured, owned and unscheduled — but recorded \
+                 {:?}. A held class that is really closed is mis-staged; a held class nobody \
+                 will act on is a ledgered divergence, not a row left to age",
+                c.id, c.status
+            );
+            let unowned: Vec<&str> = m
+                .accept_surface_probes
+                .iter()
+                .filter(|p| p.class.as_deref() == Some(c.id.as_str()))
+                .filter(|p| p.owning_issue.is_none())
+                .map(|p| p.query.as_str())
+                .collect();
+            assert!(
+                unowned.is_empty(),
+                "class {} is staged `held` but {} of its probes name no owning_issue — an \
+                 unscheduled gap tracked by nothing is the shape `held` exists to deny: {:?}",
+                c.id,
+                unowned.len(),
+                unowned
+            );
+        }
     }
 }
 
@@ -637,6 +983,20 @@ fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
     let m = matrix();
     let wire = wire_dispositions(&m);
 
+    // Stage D0 widened the field: a probe of a `held` class also names
+    // its owner (the plan's "measured, owned, unscheduled"), and those
+    // probes are not wire-only divergences. The two populations are
+    // disjoint — a wire-only divergence has no `class` by construction —
+    // so the "forbidden once it agrees" half is narrowed by exactly that
+    // set and by nothing else.
+    let held_classes: BTreeSet<&str> = m
+        .divergence_classes
+        .iter()
+        .filter(|c| c.stage.as_deref() == Some("held"))
+        .map(|c| c.id.as_str())
+        .collect();
+    let is_held_member = |p: &Probe| p.class.as_deref().is_some_and(|c| held_classes.contains(c));
+
     let mut unowned = Vec::new();
     let mut stale = Vec::new();
     for p in &m.accept_surface_probes {
@@ -650,7 +1010,9 @@ fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
         let diverges = diverges_on_wire(&wire, p);
         match (diverges, p.verdict.as_str(), p.owning_issue) {
             (true, "agree", None) => unowned.push(p.query.clone()),
-            (false, _, Some(issue)) => stale.push(format!("{:?} -> #{issue}", p.query)),
+            (false, _, Some(issue)) if !is_held_member(p) => {
+                stale.push(format!("{:?} -> #{issue}", p.query))
+            }
             _ => {}
         }
     }
@@ -721,7 +1083,7 @@ fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
 /// comment is a snapshot nothing re-checks; the command is the answer.
 #[test]
 fn the_reference_column_is_frozen_against_silent_re_pinning() {
-    const REFERENCE_DIGEST: u64 = 0x95bd_d72a_11e5_6743;
+    const REFERENCE_DIGEST: u64 = 0xd3fa_a287_0705_cfe4;
     let m = matrix();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut feed = |b: &[u8]| {
@@ -779,10 +1141,16 @@ fn agreement_and_divergence_counts_are_pinned() {
             .all(|p| p.closed_by.is_none() || p.verdict == "agree"),
         "a probe recorded as closed must now agree"
     );
+    // Every divergence this audit has ever recorded is either closed or
+    // still open — nothing may leave the accounting. 45 came from the
+    // original capture and 56 more from Stage D0's grammar-slot
+    // enumeration, so the invariant is 101 and each fix moves a probe
+    // from the right-hand term to the left, never off the ledger.
     assert_eq!(
         closed + DIVERGE,
-        45,
-        "closed + still-diverging must equal the audit capture's 45 divergences"
+        101,
+        "closed + still-diverging must equal every divergence this audit has recorded: the \
+         capture's 45 plus Stage D0's 56"
     );
 }
 
@@ -886,7 +1254,10 @@ fn every_parse_axis_flip_is_explained_by_the_class_list() {
         unexplained.len(),
         unexplained.join("\n")
     );
-    assert_eq!(flips, 72, "the parse-axis flip set moved");
+    // 72 through Stage C; Stage D0 added one — `{ .a = 1 } | count() =~ 1`
+    // parses and is refused by `illegal-operator`, which is already on the
+    // list above. A flip whose rule is NOT on the list still fails here.
+    assert_eq!(flips, 73, "the parse-axis flip set moved");
 }
 
 /// Closure is proved, not asserted: our parse of the bare query must equal
@@ -957,6 +1328,775 @@ fn meaning_probes_still_parse_the_way_this_parser_recorded() {
         drift.len(),
         drift.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stage D0 (#335): the enumeration, its reachability ranking, and the
+// two constants that stop either being edited quietly.
+// ---------------------------------------------------------------------------
+
+/// The accept-surface audit's SUBJECT is the reference grammar's whole
+/// production set. That claim used to be prose, and it was false: the
+/// first enumeration covered 24 of 33 productions, and the nine it
+/// omitted carried two divergence classes nothing could see.
+///
+/// This is the checkable half. `GRAMMAR_SLOTS` is a fixed-size array, so
+/// deleting a row does not compile; every row must carry a disposition
+/// from the closed set, a non-empty reason, and probe queries that
+/// actually exist in `matrix.json`.
+///
+/// **What it does NOT check, stated rather than implied:** that the list
+/// is 33 rows and not 34. The reference grammar is AGPL and deliberately
+/// not vendored, and CI has no Tempo checkout, so nothing here can
+/// compare the manifest against `expr.y`. The list is documentation with
+/// a recorded reproduction command in the file's own header — the honest
+/// form. A hand-maintained enumeration claiming completeness is exactly
+/// what failed on this issue before.
+#[test]
+fn every_grammar_production_is_enumerated_and_dispositioned() {
+    let slots: GrammarSlots = fixture("grammar_slots.json");
+    let m = matrix();
+    let probes: BTreeSet<&str> = m
+        .accept_surface_probes
+        .iter()
+        .map(|p| p.query.as_str())
+        .collect();
+
+    assert_eq!(
+        slots.slots.len(),
+        GRAMMAR_SLOTS.len(),
+        "grammar_slots.json must carry one row per production in the reference grammar's rule \
+         section; the count is pinned in the type"
+    );
+    let named: Vec<&str> = slots.slots.iter().map(|s| s.production.as_str()).collect();
+    assert_eq!(
+        named,
+        GRAMMAR_SLOTS.to_vec(),
+        "grammar_slots.json's productions must be exactly GRAMMAR_SLOTS, in grammar file order"
+    );
+
+    let mut faults = Vec::new();
+    for s in &slots.slots {
+        if !matches!(
+            s.disposition.as_str(),
+            "probed" | "covered-by" | "no-operand-slot"
+        ) {
+            faults.push(format!(
+                "{}: bad disposition {:?}",
+                s.production, s.disposition
+            ));
+        }
+        if s.why.trim().is_empty() {
+            faults.push(format!("{}: empty `why`", s.production));
+        }
+        if !s.ref_lines.starts_with("expr.y:") {
+            faults.push(format!(
+                "{}: ref_lines {:?} must cite the grammar file and its line range",
+                s.production, s.ref_lines
+            ));
+        }
+        if s.disposition == "probed" && s.probes.is_empty() {
+            faults.push(format!(
+                "{}: dispositioned `probed` with no probe — say `covered-by` and name what covers \
+                 it, or probe it",
+                s.production
+            ));
+        }
+        for q in &s.probes {
+            if !probes.contains(q.as_str()) {
+                faults.push(format!(
+                    "{}: cites probe {q:?}, which is in no matrix row — a manifest that names a \
+                     query nobody measured is the enumeration failing one layer down",
+                    s.production
+                ));
+            }
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "{} grammar-slot row fault(s):\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+}
+
+/// The 85 Stage D0 probes must be present by exact string, mirroring
+/// [`stage_b_not_absence_meaning_probes_are_captured`] one stage over:
+/// the enumeration's value is the SET, and a set is only committed if
+/// editing a member fails.
+///
+/// One probe per divergence class is named here plus the two boundary
+/// agreements that bound D19 and D24 — the negative results that stop a
+/// later fix over-widening. *RED when:* any named probe string is edited
+/// or dropped.
+#[test]
+fn stage_d0_probes_are_captured() {
+    let m = matrix();
+    let by_query: BTreeMap<&str, &Probe> = m
+        .accept_surface_probes
+        .iter()
+        .map(|p| (p.query.as_str(), p))
+        .collect();
+
+    for (q, class) in [
+        ("{ kind = unspecified }", Some("D13")),
+        ("{ .a = minInt }", Some("D14")),
+        ("{ nil = nil }", Some("D15")),
+        ("{ .a = 1 } | by(.b, .c)", Some("D16")),
+        ("{ .a = 1 } | compare({ .b = 2 }, 10)", Some("D17")),
+        ("{ .a = 1 } | rate() > -1", Some("D18")),
+        ("({ .a = 1 } | count() > 1)", Some("D19")),
+        ("{ .a = 1 } | (count()) > 4", Some("D20")),
+        ("{ .a = 1 } | rate() | topk(5) > 1", Some("D21")),
+        ("{ .a = 1 } | topk(10)", Some("D22")),
+        ("{ .a = 1 } with(a=1) with(b=2)", Some("D23")),
+        ("by(.a)", Some("D24")),
+        // The two boundaries. Both sides REJECT these, and that is the
+        // point: they pin where D19's and D24's fixes must stop.
+        ("({ .a = 1 } | count() > 1) && { .b = 2 }", None),
+        ("by(.a) && { .b = 1 }", None),
+    ] {
+        let p = by_query
+            .get(q)
+            .unwrap_or_else(|| panic!("Stage D0: {q:?} must be in the probe matrix"));
+        match class {
+            Some(c) => assert!(
+                p.class.as_deref() == Some(c) || p.closed_class.as_deref() == Some(c),
+                "{q:?}: expected class {c}, got class={:?} closed_class={:?}",
+                p.class,
+                p.closed_class
+            ),
+            None => assert_eq!(
+                p.verdict, "agree",
+                "{q:?} is a class BOUNDARY and must agree — both sides reject it"
+            ),
+        }
+    }
+}
+
+/// Every diverging probe records WHICH CLIENT PATH reaches its
+/// construct, and the record's every field is compared against something
+/// — or it is not a field.
+///
+/// **Why the form is this strict.** Two earlier cuts of this schema were
+/// forged in review. A free-text evidence string took no scope and proved
+/// no execution; a `token` merely *occurring in* the probe's query let
+/// `.a = 1` discharge an absence claim, which is honest and meaningless.
+/// So: the tier comes from a closed set; the subject comes from its
+/// class's declared atoms and must occur in the query; an absence sweep's
+/// token must EQUAL the subject, its scope must be a declared pathspec,
+/// its flags must include `-i` (a case-sensitive sweep is what produced a
+/// false zero here), its revision must be the pinned one, and its hits
+/// must be zero. A POSITIONAL class may not sweep at all: its construct
+/// is a place in the grammar, and there is nothing to sweep.
+///
+/// **Residual — what this cannot see**, reproduced from
+/// `reachability.json`'s `schema_header` so a reader of the test meets it
+/// too: nothing here executes or reads anything outside this repository,
+/// so a recorded sweep that was never run — or was run against a
+/// different tree than the one it names — passes, and so does a citation
+/// whose line range nobody read. CI has no Tempo checkout and no
+/// Grafana-datasource checkout; the anchors and commands are reproducible
+/// by hand at the named revision, and that reproduction, by a human at
+/// review time, is the whole of the guarantee. **This instrument stops
+/// here on purpose.**
+#[test]
+fn every_probe_records_its_reachability() {
+    let m = matrix();
+    let r: Reachability = fixture("reachability.json");
+    let classes: BTreeMap<&str, &DivergenceClass> = m
+        .divergence_classes
+        .iter()
+        .map(|c| (c.id.as_str(), c))
+        .collect();
+    let declared_paths: BTreeSet<&str> = r.declared_paths.iter().map(String::as_str).collect();
+
+    let mut faults = Vec::new();
+    let mut fault = |q: &str, msg: String| faults.push(format!("{q:?}: {msg}"));
+
+    for p in &m.accept_surface_probes {
+        let diverges = p.verdict == "diverge";
+        // Present iff diverging — the `class` posture. An agreement has
+        // no divergence to justify a reachability claim about.
+        if !diverges {
+            if p.reachability.is_some() || p.reachability_evidence.is_some() || p.subject.is_some()
+            {
+                fault(
+                    &p.query,
+                    "agrees, so it may not carry a reachability record".to_string(),
+                );
+            }
+            continue;
+        }
+        let Some(class) = p.class.as_deref().and_then(|c| classes.get(c)) else {
+            continue; // an undeclared class is the other test's failure
+        };
+        // Pre-Stage-D0 classes carry no reachability records.
+        if class.stage.is_none() {
+            continue;
+        }
+        let Some(tier) = p.reachability.as_deref() else {
+            fault(&p.query, "diverges but records no reachability tier".into());
+            continue;
+        };
+        if !REACHABILITY_TIERS.contains(&tier) {
+            fault(&p.query, format!("tier {tier:?} is outside the closed set"));
+            continue;
+        }
+        let lexical = class.subject_kind.as_deref() == Some("lexical");
+        match (&p.subject, lexical) {
+            (Some(s), true) => {
+                if !class.subject_atoms.iter().any(|a| a == s) {
+                    fault(
+                        &p.query,
+                        format!(
+                            "subject {s:?} is not a declared atom of {} {:?}",
+                            class.id, class.subject_atoms
+                        ),
+                    );
+                }
+                if !p.query.contains(s.as_str()) {
+                    fault(
+                        &p.query,
+                        format!("subject {s:?} does not occur in the probe it is the subject of"),
+                    );
+                }
+            }
+            (None, true) => fault(
+                &p.query,
+                "a lexical class's probe must name its subject".into(),
+            ),
+            (Some(s), false) => fault(
+                &p.query,
+                format!(
+                    "{} is positional, so probe subject {s:?} is meaningless",
+                    class.id
+                ),
+            ),
+            (None, false) => {}
+        }
+        let Some(ev) = &p.reachability_evidence else {
+            fault(&p.query, "records a tier with no evidence".into());
+            continue;
+        };
+        let want_kind = match tier {
+            "r1-client-emitted" => "capture",
+            "r2-skeleton-inserted" => "insertion",
+            "r3-highlighted-only" => "highlight-only",
+            _ if lexical => "absence-sweep",
+            _ => "citation",
+        };
+        if ev.kind != want_kind {
+            fault(
+                &p.query,
+                format!(
+                    "tier {tier} must be discharged by {want_kind:?}, got {:?}",
+                    ev.kind
+                ),
+            );
+            continue;
+        }
+        match ev.kind.as_str() {
+            "capture" => {
+                let Some(id) = ev.capture.as_deref() else {
+                    fault(&p.query, "r1 must name a capture".into());
+                    continue;
+                };
+                let Some(cap) = r.captures.get(id) else {
+                    fault(&p.query, format!("capture {id:?} is not declared"));
+                    continue;
+                };
+                if ev.observed_value.as_deref() != p.subject.as_deref() {
+                    fault(
+                        &p.query,
+                        format!(
+                            "observed_value {:?} != subject {:?} — the captured value IS the \
+                             construct",
+                            ev.observed_value, p.subject
+                        ),
+                    );
+                }
+                for e in &cap.emitters {
+                    if !r.anchors.contains_key(e) {
+                        fault(
+                            &p.query,
+                            format!("capture emitter {e:?} is not a declared anchor"),
+                        );
+                    }
+                }
+            }
+            "insertion" => {
+                let Some(id) = ev.anchor.as_deref() else {
+                    fault(&p.query, "r2 must name an anchor".into());
+                    continue;
+                };
+                let Some(a) = r.anchors.get(id) else {
+                    fault(&p.query, format!("anchor {id:?} is not declared"));
+                    continue;
+                };
+                let Some(text) = a.insert_text.as_deref() else {
+                    fault(
+                        &p.query,
+                        format!(
+                            "anchor {id:?} declares no insert_text, so it cannot discharge r2 — \
+                             r2 means the SKELETON is inserted"
+                        ),
+                    );
+                    continue;
+                };
+                // r2 means the completion puts the construct on screen
+                // with an EMPTY slot and the argument is hand-typed. An
+                // inserted text carrying a comma or an arithmetic
+                // operator would be claiming the client emits the
+                // divergent form itself, which is r1.
+                if text.contains(',') || text.contains(['+', '-', '*', '/', '%', '^', '!', '=']) {
+                    fault(
+                        &p.query,
+                        format!(
+                            "anchor {id:?} inserts {text:?}, which carries an argument — that is \
+                             r1's claim, not r2's"
+                        ),
+                    );
+                }
+            }
+            "highlight-only" => {
+                if ev.anchors.len() != 2 || ev.anchors[0] == ev.anchors[1] {
+                    fault(
+                        &p.query,
+                        format!(
+                            "r3 is a two-part claim — the token list AND the omission — so it \
+                             needs two DISTINCT anchors, got {:?}",
+                            ev.anchors
+                        ),
+                    );
+                }
+                for id in &ev.anchors {
+                    if !r.anchors.contains_key(id) {
+                        fault(&p.query, format!("anchor {id:?} is not declared"));
+                    }
+                }
+            }
+            "absence-sweep" => {
+                if ev.token.as_deref() != p.subject.as_deref() {
+                    fault(
+                        &p.query,
+                        format!(
+                            "sweep token {:?} != subject {:?} — a sweep must be OF the construct \
+                             under classification",
+                            ev.token, p.subject
+                        ),
+                    );
+                }
+                if ev.revision.as_deref() != Some(r.datasource_revision.as_str()) {
+                    fault(
+                        &p.query,
+                        format!(
+                            "sweep revision {:?} is not the pinned {:?}",
+                            ev.revision, r.datasource_revision
+                        ),
+                    );
+                }
+                if !ev.flags.iter().any(|f| f == "-i") {
+                    fault(
+                        &p.query,
+                        "a sweep must be case-insensitive (-i); a case-sensitive sweep is what \
+                         produced a false zero on this issue"
+                            .into(),
+                    );
+                }
+                if ev.scope.is_empty() {
+                    fault(&p.query, "a sweep must declare its scope".into());
+                }
+                for s in &ev.scope {
+                    if !r.declared_scopes.contains_key(s) {
+                        fault(
+                            &p.query,
+                            format!("sweep scope {s:?} is not a declared pathspec"),
+                        );
+                    }
+                }
+                if ev.hits != Some(0) {
+                    fault(
+                        &p.query,
+                        format!("claims no client path but records {:?} hits", ev.hits),
+                    );
+                }
+                if ev.tool.as_deref() != Some("git grep") {
+                    fault(&p.query, format!("unexpected sweep tool {:?}", ev.tool));
+                }
+            }
+            "citation" => {
+                let Some(id) = ev.anchor.as_deref() else {
+                    fault(&p.query, "a citation must name an anchor".into());
+                    continue;
+                };
+                if !r.anchors.contains_key(id) {
+                    fault(&p.query, format!("anchor {id:?} is not declared"));
+                }
+            }
+            other => fault(&p.query, format!("unknown evidence kind {other:?}")),
+        }
+    }
+
+    // The declared tables themselves: every anchor's revision is the
+    // pinned one and its path is on the declared list, so an anchor
+    // cannot quietly cite somewhere else.
+    for (id, a) in &r.anchors {
+        assert_eq!(
+            a.revision, r.datasource_revision,
+            "anchor {id}: revision {:?} is not the pinned {:?}",
+            a.revision, r.datasource_revision
+        );
+        assert!(
+            declared_paths.contains(a.path.as_str()),
+            "anchor {id}: path {:?} is not on the declared file list",
+            a.path
+        );
+        assert!(!a.lines.trim().is_empty(), "anchor {id}: empty line range");
+        assert!(!a.shows.trim().is_empty(), "anchor {id}: empty `shows`");
+    }
+    for (id, c) in &r.captures {
+        assert!(
+            c.endpoint.starts_with('/') && !c.request.trim().is_empty(),
+            "capture {id}: an endpoint and the request that produced it are required"
+        );
+        assert!(
+            !c.observed_field.trim().is_empty(),
+            "capture {id}: name the field the value was read out of"
+        );
+    }
+
+    assert!(
+        faults.is_empty(),
+        "{} reachability record fault(s):\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+}
+
+/// The residual paragraph is part of the artefact, not part of a review
+/// conversation. A gate whose boundary is only in a plan comment has no
+/// boundary six months later.
+#[test]
+fn the_reachability_schema_header_records_its_residual() {
+    let r: Reachability = fixture("reachability.json");
+    for phrase in [
+        // The two surviving shapes.
+        "never run",
+        "different tree",
+        "never read",
+        // The shapes that are NOT residual, named beside them so a later
+        // reader does not assume they were overlooked.
+        "not a declared pathspec",
+        "not the construct under classification",
+        "per-record line range",
+        "inserts an argument",
+        "r3 with one citation",
+        // The stopping rule, in applicable form.
+        "stops here on purpose",
+    ] {
+        assert!(
+            r.schema_header.contains(phrase),
+            "reachability.json's schema_header no longer records {phrase:?} — the residual is the \
+             deliverable, and deleting a line of it makes the gate claim more than it checks"
+        );
+    }
+}
+
+/// The tier totals, DERIVED from the probe rows rather than read back
+/// from a committed summary. *RED when:* any probe changes tier in a way
+/// that moves a total.
+const TIER_HISTOGRAM: [(&str, usize); 4] = [
+    // Stage D1 closed D13 (all 5 r1 probes), D14 (4 of r4) and D23 (1 of
+    // r3), and a closed probe drops its reachability record — the field is
+    // present exactly while the probe diverges. r1 is 0 because the ONE
+    // class a client actually emits is the one that got fixed first, which
+    // is the ranking doing its job rather than an empty bucket.
+    ("r1-client-emitted", 0),
+    // Stage D2 closed D16, r2's other six.
+    ("r2-skeleton-inserted", 2),
+    ("r3-highlighted-only", 17),
+    ("r4-no-traceql-surface-path", 21),
+];
+
+#[test]
+fn the_reachability_tier_histogram_is_pinned() {
+    let m = matrix();
+    let mut counts: BTreeMap<&str, usize> = REACHABILITY_TIERS.iter().map(|t| (*t, 0)).collect();
+    for p in &m.accept_surface_probes {
+        if let Some(t) = p.reachability.as_deref() {
+            *counts.get_mut(t).expect("tier is in the closed set") += 1;
+        }
+    }
+    let want: BTreeMap<&str, usize> = TIER_HISTOGRAM.iter().copied().collect();
+    assert_eq!(
+        counts, want,
+        "the reachability tier totals moved. That is a re-classification, which decides which \
+         divergences get fixed first — re-pin TIER_HISTOGRAM deliberately, in the same change"
+    );
+}
+
+/// **The histogram alone cannot see a swap.** Two probes exchanging
+/// tiers preserves every total, and an unexamined row hiding behind an
+/// unchanged number is precisely the failure this audit keeps paying
+/// for. So the classification carries its own digest.
+///
+/// **The feed is CONTENT-INCLUSIVE, and that is the load-bearing word.**
+/// An anchor's `lines` is fed, so editing `294-299` to `1` moves the
+/// digest and forces a source-line re-pin in the same diff. An id-only
+/// join would accept that edit silently. **Do not "simplify" this to an
+/// id join** — the same shape as the `git log` simplification the B0 gate
+/// warns about.
+///
+/// Encoding, injective by construction: one record per item, tagged with
+/// a kind byte; every field as an 8-byte big-endian length followed by
+/// its bytes; every LIST field as an 8-byte big-endian element count
+/// followed by each element in that same length-prefixed form. No two
+/// states produce the same stream, whatever bytes appear inside a query,
+/// a path or a `shows` string.
+///
+/// | kind | per | fields fed, in this order |
+/// |---|---|---|
+/// | `0x01` | diverging probe, in `matrix.json` order | `query`, `class`, `reachability`, `subject` (empty for a positional class), `discharge_ref` |
+/// | `0x02` | divergence class, by id | `id`, `subject_kind`, `subject_atoms`, `stage`, `status` |
+/// | `0x03` | anchor, by id | `id`, `revision`, `path`, `lines`, `shows`, `insert_text` (empty when absent) |
+/// | `0x04` | capture, by id | `id`, `endpoint`, `request`, `observed_field`, `emitters` |
+///
+/// `discharge_ref` is the list identifying HOW the probe is discharged:
+/// the capture id (r1), the anchor id (r2 and r4-positional), the two
+/// anchor ids in order (r3), or the sweep token (r4-lexical).
+///
+/// The digest function is the same FNV-1a-SHAPED rolling multiplicative
+/// digest [`the_reference_column_is_frozen_against_silent_re_pinning`]
+/// uses, and the same caveat applies: the multiplier is deliberately not
+/// the FNV-1a prime and must not be "fixed".
+#[test]
+fn the_reachability_classification_is_frozen_against_a_silent_swap() {
+    const REACHABILITY_DIGEST: u64 = 0xb72d_4863_e6e9_59f8;
+    let m = matrix();
+    let r: Reachability = fixture("reachability.json");
+
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let byte = |b: u8, h: &mut u64| {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(0x1000_0000_01b3);
+    };
+    let field = |s: &str, h: &mut u64| {
+        for b in (s.len() as u64).to_be_bytes() {
+            byte(b, h);
+        }
+        for b in s.as_bytes() {
+            byte(*b, h);
+        }
+    };
+    let list = |items: &[&str], h: &mut u64| {
+        for b in (items.len() as u64).to_be_bytes() {
+            byte(b, h);
+        }
+        for it in items {
+            field(it, h);
+        }
+    };
+
+    for p in &m.accept_surface_probes {
+        let Some(tier) = p.reachability.as_deref() else {
+            continue;
+        };
+        byte(0x01, &mut h);
+        field(&p.query, &mut h);
+        field(p.class.as_deref().unwrap_or(""), &mut h);
+        field(tier, &mut h);
+        field(p.subject.as_deref().unwrap_or(""), &mut h);
+        let ev = p
+            .reachability_evidence
+            .as_ref()
+            .expect("a classified probe carries its evidence");
+        let refs: Vec<&str> = match ev.kind.as_str() {
+            "capture" => vec![ev.capture.as_deref().unwrap_or("")],
+            "insertion" | "citation" => vec![ev.anchor.as_deref().unwrap_or("")],
+            "highlight-only" => ev.anchors.iter().map(String::as_str).collect(),
+            "absence-sweep" => vec![ev.token.as_deref().unwrap_or("")],
+            _ => vec![],
+        };
+        list(&refs, &mut h);
+    }
+
+    let mut classes: Vec<&DivergenceClass> = m.divergence_classes.iter().collect();
+    classes.sort_by(|a, b| a.id.cmp(&b.id));
+    for c in classes {
+        byte(0x02, &mut h);
+        field(&c.id, &mut h);
+        field(c.subject_kind.as_deref().unwrap_or(""), &mut h);
+        let atoms: Vec<&str> = c.subject_atoms.iter().map(String::as_str).collect();
+        list(&atoms, &mut h);
+        field(c.stage.as_deref().unwrap_or(""), &mut h);
+        field(&c.status, &mut h);
+    }
+    for (id, a) in &r.anchors {
+        byte(0x03, &mut h);
+        field(id, &mut h);
+        field(&a.revision, &mut h);
+        field(&a.path, &mut h);
+        field(&a.lines, &mut h);
+        field(&a.shows, &mut h);
+        field(a.insert_text.as_deref().unwrap_or(""), &mut h);
+    }
+    for (id, c) in &r.captures {
+        byte(0x04, &mut h);
+        field(id, &mut h);
+        field(&c.endpoint, &mut h);
+        field(&c.request, &mut h);
+        field(&c.observed_field, &mut h);
+        let emitters: Vec<&str> = c.emitters.iter().map(String::as_str).collect();
+        list(&emitters, &mut h);
+    }
+
+    assert_eq!(
+        h, REACHABILITY_DIGEST,
+        "the reachability classification moved. A compensating swap keeps every total, so this \
+         is the constant that sees it — and an anchor's line range is fed too, so editing one \
+         lands here. Re-pin to {h:#x} only with the reclassification written down"
+    );
+}
+
+/// PROVENANCE.md's operand-position table used to carry two rows about
+/// `by(...)` that were false **in both directions**: they said the
+/// reference rejects arithmetic/unary/parenthesised keys and accepts a
+/// comma list, and the opposite is true. They described the METRICS
+/// `by(...)` — `attributeList` — while claiming to describe the spanset
+/// one, and all thirteen backing probes were metrics probes.
+///
+/// A row citing a query was not enough to catch that; the row's CLAIM has
+/// to be compared with the measurement. Each row now carries a trailer
+/// the test parses — `<!-- production: X | probe: `Q` -->` — and this
+/// asserts the named production is one of the 33, the probe exists, and
+/// **the row's "reference accepts?" column equals that probe's recorded
+/// `reference` verdict**.
+///
+/// *RED when:* a row says `yes` and its probe records `reject` — which is
+/// exactly the old unqualified `by(...)` row.
+#[test]
+fn every_operand_position_row_agrees_with_its_probe() {
+    let m = matrix();
+    let by_query: BTreeMap<&str, &Probe> = m
+        .accept_surface_probes
+        .iter()
+        .map(|p| (p.query.as_str(), p))
+        .collect();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("accept_surface")
+        .join("PROVENANCE.md");
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+    let mut rows = 0usize;
+    let mut faults = Vec::new();
+    for line in text.lines() {
+        let Some((row, trailer)) = line.split_once("<!-- production:") else {
+            continue;
+        };
+        rows += 1;
+        let trailer = trailer.trim_end().trim_end_matches("-->").trim();
+        let Some((production, probe)) = trailer.split_once('|') else {
+            faults.push(format!("malformed trailer: {trailer:?}"));
+            continue;
+        };
+        let production = production.trim();
+        let probe = probe
+            .trim()
+            .strip_prefix("probe:")
+            .unwrap_or(probe)
+            .trim()
+            .trim_matches('`');
+        if !GRAMMAR_SLOTS.contains(&production) {
+            faults.push(format!("{production:?} is not one of the 33 productions"));
+        }
+        let Some(p) = by_query.get(probe) else {
+            faults.push(format!("{production}: probe {probe:?} is in no matrix row"));
+            continue;
+        };
+        // The row's own claim: the "reference accepts?" column.
+        let claim = if row.contains("| yes ") {
+            "accept"
+        } else if row.contains("| no ") {
+            "reject"
+        } else {
+            faults.push(format!(
+                "{production}: row does not state a `yes`/`no` reference verdict: {row:?}"
+            ));
+            continue;
+        };
+        if p.reference != claim {
+            faults.push(format!(
+                "{production}: the row claims the reference {claim}s {probe:?}, but the measured \
+                 verdict is {}",
+                p.reference
+            ));
+        }
+    }
+    assert!(
+        rows >= 4,
+        "PROVENANCE.md's operand-position table must carry its `by(...)` rows with production \
+         trailers — found {rows}"
+    );
+    assert!(
+        faults.is_empty(),
+        "{} operand-position row fault(s):\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+}
+
+/// The Stage D0 section of PROVENANCE.md must exist and name the
+/// productions whose omission is the whole finding — deleting one from
+/// the section is how the record quietly narrows back to the subset it
+/// started as.
+#[test]
+fn the_provenance_records_the_grammar_slot_enumeration() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("accept_surface")
+        .join("PROVENANCE.md");
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let start = text
+        .find("## Stage D0")
+        .expect("PROVENANCE.md needs its `## Stage D0` section");
+    let section = &text[start..];
+    for production in [
+        "root",
+        "spansetPipeline",
+        "wrappedSpansetPipeline",
+        "spansetPipelineExpression",
+        "spansetExpression",
+        "coalesceOperation",
+        "scalarFilterOperation",
+        "scalarPipelineExpression",
+        "scalarPipeline",
+        "metricsFilterOperation",
+        "groupOperation",
+        "metricsSecondStagePipeline",
+        "metricsFilter",
+        "static",
+        "hints",
+    ] {
+        assert!(
+            section.contains(production),
+            "PROVENANCE.md §Stage D0 no longer names the production {production:?}"
+        );
+    }
+    for blind_spot in [
+        "the lexer decides",
+        "after a successful parse",
+        "Evaluation semantics",
+        "Reachability",
+    ] {
+        assert!(
+            section.contains(blind_spot),
+            "PROVENANCE.md §Stage D0 must keep stating what the enumeration CANNOT see \
+             ({blind_spot:?}) — an enumeration with unstated blind spots is the defect, not the \
+             fix"
+        );
+    }
 }
 
 fn is_metrics(q: &str) -> bool {

@@ -1,0 +1,392 @@
+{
+  "language_target": "TraceQL as shipped in Tempo v3.0.2",
+  "reference_grammar": "pkg/traceql/expr.y @ v3.0.2 (0c4b926d09234186de39833e9c7ecb5b7614c8b9)",
+  "owning_issue": 335,
+  "captured": "2026-08-12",
+  "what_this_is": "One row per production in the reference grammar's rule section, so the accept-surface audit's SUBJECT is the whole production set rather than whichever slots somebody thought of. The first enumeration (#335 Stages A-C) covered the precedence table and the field-expression operand positions - 24 of these 33 - and the nine it omitted carry two divergence classes of their own (D19, D24). That is why this file exists: an enumeration whose completeness is asserted in prose cannot be checked, and this one is checked row by row.",
+  "how_the_list_was_produced": "awk '/^%%$/{n++; next} n==1 && /^[a-zA-Z_]+:/{sub(/:.*/,\"\"); print NR\": \"$0}' pkg/traceql/expr.y   -> 33 lines at 0c4b926d0. Each row's ref_lines runs from that line to the last non-blank, non-comment line before the next production.",
+  "what_is_NOT_gated": "That this list is 33 rows and not 34 CANNOT be gated in CI. The reference grammar is AGPL and is deliberately not vendored, and CI has no Tempo checkout, so nothing in this tree can compare the manifest against expr.y. What IS gated, by accept_surface.rs: the array length (GRAMMAR_SLOTS is a fixed-size array, so deleting a row does not compile), every row carrying a disposition from the closed set, every listed probe query existing in matrix.json, every row carrying a non-empty `why`, and every `probed` row listing at least one probe. The LIST itself is documentation with a recorded reproduction command above - stated plainly rather than dressed as a gate, because a hand-maintained enumeration claiming completeness is exactly what failed here before.",
+  "dispositions": {
+    "probed": "at least one Stage D0 probe in matrix.json exercises this production's operand slots",
+    "covered-by": "the production's operand slots are exercised by probes recorded elsewhere - the pre-Stage-D0 matrix, the conformance registry or the golden corpus - named in `why`",
+    "no-operand-slot": "the production's right-hand sides contain no expression operand at all (a terminal alternation or a zero-arity form); any probes listed are boundary checks, not operand coverage"
+  },
+  "slots": [
+    {
+      "production": "root",
+      "ref_lines": "expr.y:128-135",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } with(a=1) with(b=2)",
+        "count() > 1",
+        "({ .a = 1 } | count() > 1)"
+      ],
+      "why": "six alternatives; `root hints` (:134) is LEFT-RECURSIVE, so a root query may carry more than one with(...) clause (D23), and three of the remaining five start the query with something other than a spanset pipeline."
+    },
+    {
+      "production": "spansetPipelineExpression",
+      "ref_lines": "expr.y:140-160",
+      "disposition": "probed",
+      "probes": [
+        "({ .a = 1 } | count() > 1) && ({ .b = 2 } | count() > 1)",
+        "({ .a = 1 } | count() > 1) >> ({ .b = 2 } | count() > 1)",
+        "({ .a = 1 } | count() > 1) || ({ .b = 2 } | count() > 1)",
+        "({ .a = 1 } | count() > 1) ~ ({ .b = 2 } | count() > 1)",
+        "(({ .a = 1 } | count() > 1))",
+        "({ .a = 1 } | count() > 1) && { .b = 2 }"
+      ],
+      "why": "every structural and logical operator at this level takes a wrappedSpansetPipeline operand (:159), which we reject (D19). The last probe is the class BOUNDARY and both sides reject it: the right-hand side must be a pipeline expression too, so a bare `{ … }` there is an error at the reference as well - it pins where a fix must stop."
+    },
+    {
+      "production": "wrappedSpansetPipeline",
+      "ref_lines": "expr.y:162-163",
+      "disposition": "probed",
+      "probes": [
+        "({ .a = 1 } | count() > 1)",
+        "({ .a = 1 } | avg(.b) > 1)",
+        "({ .a = 1 } | by(.b))",
+        "({ .a = 1 } | coalesce())",
+        "({ .a = 1 } | select(.b))"
+      ],
+      "why": "one production, `'(' spansetPipeline ')'`, and its operand is a whole PIPELINE - so every pipeline stage is legal inside the parentheses. Ours wraps a spanset EXPRESSION only (D19)."
+    },
+    {
+      "production": "spansetPipeline",
+      "ref_lines": "expr.y:165-175",
+      "disposition": "probed",
+      "probes": [
+        "by(.a)",
+        "by(name)",
+        "by(.a + 1)",
+        "select(.a)",
+        "select(.a, .b)",
+        "count() > 1",
+        "avg(.a) > 1",
+        "count() > 1 | select(.b)",
+        "select(.a) | by(.b)",
+        "coalesce()",
+        "by(.a) && { .b = 1 }"
+      ],
+      "why": "four LEADING alternatives (:166-169) and three of them are not a spanset filter, so a pipeline may begin with by()/select()/a scalar filter (D24). The last two probes are the class boundary and both sides reject them: `coalesce()` is legal only after a PIPE (:173), and a groupOperation is a pipeline rather than a spansetExpression, so it is not an operand of `&&`."
+    },
+    {
+      "production": "groupOperation",
+      "ref_lines": "expr.y:177-179",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } | by(.b + .c)",
+        "{ .a = 1 } | by(-.b)",
+        "{ .a = 1 } | by(!.b)",
+        "{ .a = 1 } | by((.b))",
+        "{ .a = 1 } | by(.b = 1)",
+        "{ .a = 1 } | by(.b, .c)",
+        "{ .a = 1 } | by(.b)",
+        "{ .a = 1 } | by(span.b)",
+        "{ .a = 1 } | by(name)",
+        "{ .a = 1 } | by(span:kind)",
+        "{ .a = 1 } | by(resource.service.name)"
+      ],
+      "why": "`BY '(' fieldExpression ')'` - ONE operand, and that operand is a full field expression. There is no COMMA in the production and fieldExpression has none either, so this production is wider than ours in one direction and narrower in the other (D16). Distinct from the metrics `by`, which is attributeList."
+    },
+    {
+      "production": "coalesceOperation",
+      "ref_lines": "expr.y:181-183",
+      "disposition": "no-operand-slot",
+      "probes": [
+        "{ .a = 1 } | coalesce()",
+        "coalesce()"
+      ],
+      "why": "`COALESCE '(' ')'` is zero-arity: no expression operand exists to probe. The two probes are POSITION checks, not operand coverage - the first agrees, and the second pins that a bare leading coalesce() is rejected by both sides, bounding D24."
+    },
+    {
+      "production": "selectOperation",
+      "ref_lines": "expr.y:185-187",
+      "disposition": "probed",
+      "probes": [
+        "select(.a)",
+        "select(.a, .b)",
+        "select(.a) | by(.b)",
+        "count() > 1 | select(.b)"
+      ],
+      "why": "the leading position is D24's. The ARGUMENT grammar (attributeList) was enumerated before Stage D0 and diverges nowhere: the 15 `{ true } | select(...)` probes already in this matrix cover the literal, arithmetic, unary, parenthesised, comparison and empty forms."
+    },
+    {
+      "production": "attribute",
+      "ref_lines": "expr.y:189-193",
+      "disposition": "covered-by",
+      "probes": [
+        "{ .a = 1 } | by(span.b)",
+        "{ .a = 1 } | by(name)",
+        "{ .a = 1 } | by(span:kind)"
+      ],
+      "why": "a three-way alternation over intrinsicField / attributeField / scopedIntrinsicField, each of which has its own row below; the pre-Stage-D0 matrix probes all three in every field-expression operand position, including #335 class D2's eighteen colon-scoped spellings."
+    },
+    {
+      "production": "attributeList",
+      "ref_lines": "expr.y:195-198",
+      "disposition": "covered-by",
+      "probes": [],
+      "why": "the COMMA list of the metrics `by(...)` and of `select(...)`. Covered by the 13 `{ true } | rate() by(...)` probes and the 15 `{ true } | select(...)` probes already in this matrix, which is precisely the coverage the old PROVENANCE `by(...)` rows mistook for groupOperation coverage - see the Stage D0 section there."
+    },
+    {
+      "production": "numericList",
+      "ref_lines": "expr.y:201-206",
+      "disposition": "covered-by",
+      "probes": [],
+      "why": "reachable only from `quantile_over_time(attribute, numericList)` (:320-321); covered by `{ true } | quantile_over_time(.a, .5) > 1` in the pre-Stage-D0 matrix."
+    },
+    {
+      "production": "spansetExpression",
+      "ref_lines": "expr.y:208-231",
+      "disposition": "probed",
+      "probes": [
+        "({ .a = 1 } && { .b = 2 }) >> { .c = 3 }",
+        "{ .a = 1 } >> { .b = 2 } && { .c = 3 }",
+        "(({ .a = 1 }))"
+      ],
+      "why": "self-parenthesising, nesting, and structural-versus-logical precedence at the spanset level. Probed and CLEAN - a negative result is a deliverable here, because it bounds D19 to the wrapped-PIPELINE form rather than to parentheses in general."
+    },
+    {
+      "production": "spansetFilter",
+      "ref_lines": "expr.y:233-236",
+      "disposition": "covered-by",
+      "probes": [
+        "{ .a = 1 } | compare({ .b = 2 }, 10)"
+      ],
+      "why": "`{ }` and `{ fieldExpression }`; every one of the 221 pre-Stage-D0 probes exercises it, `{ }` and `{ true }` included. Listed here only for its appearance as compare()'s first argument (:324-326)."
+    },
+    {
+      "production": "scalarFilter",
+      "ref_lines": "expr.y:238-240",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } | count() > 1",
+        "count() > 1",
+        "{ .a = 1 } | (count()) > 4",
+        "{ .a = 1 } | count() > -1"
+      ],
+      "why": "`scalarExpression op scalarExpression` - BOTH operands are full scalar expressions, which is where the parenthesised aggregate (D20) and the negative threshold (D18) come from."
+    },
+    {
+      "production": "scalarFilterOperation",
+      "ref_lines": "expr.y:242-249",
+      "disposition": "no-operand-slot",
+      "probes": [
+        "{ .a = 1 } | count() = 1",
+        "{ .a = 1 } | count() != 1",
+        "{ .a = 1 } | count() < 1",
+        "{ .a = 1 } | count() <= 1",
+        "{ .a = 1 } | count() > 1",
+        "{ .a = 1 } | count() >= 1",
+        "{ .a = 1 } | count() =~ 1"
+      ],
+      "why": "a terminal alternation over exactly six comparison tokens: no expression operand. All six are probed as a SET check and all six agree; the seventh probe pins that the regex operator is absent from this production and is rejected by both sides."
+    },
+    {
+      "production": "scalarPipelineExpressionFilter",
+      "ref_lines": "expr.y:254-257",
+      "disposition": "probed",
+      "probes": [
+        "({ .a = 1 } | count()) > 1",
+        "({ .a = 1 } | count()) > ({ .b = 2 } | count())"
+      ],
+      "why": "a root alternative (:131) comparing two scalar PIPELINE expressions, or one against a static. Both sides REJECT these: the reference parses them and then refuses at its own `scalar filter lhs of type (%v) not yet supported`, and the audit scores parse-plus-validate, so the two agree."
+    },
+    {
+      "production": "scalarPipelineExpression",
+      "ref_lines": "expr.y:259-268",
+      "disposition": "probed",
+      "probes": [
+        "({ .a = 1 } | count()) + 1 > 2"
+      ],
+      "why": "the arithmetic level over wrapped scalar pipelines. Rejected by both sides for the same reason as the row above."
+    },
+    {
+      "production": "wrappedScalarPipeline",
+      "ref_lines": "expr.y:270-272",
+      "disposition": "probed",
+      "probes": [
+        "({ .a = 1 } | count()) > 1"
+      ],
+      "why": "`'(' scalarPipeline ')'`. Reject on both sides, so the parenthesised scalar pipeline is NOT a live divergence - which is what separates it from D19's wrapped spanset pipeline, where the reference answers 2xx."
+    },
+    {
+      "production": "scalarPipeline",
+      "ref_lines": "expr.y:274-276",
+      "disposition": "probed",
+      "probes": [
+        "({ .a = 1 } | count()) > 1"
+      ],
+      "why": "`spansetPipeline PIPE aggregate`, reachable only inside wrappedScalarPipeline; same probe, same both-reject verdict."
+    },
+    {
+      "production": "scalarExpression",
+      "ref_lines": "expr.y:278-293",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } | (count()) > 4",
+        "{ .a = 1 } | count() > -1",
+        "{ .a = 1 } | avg(.b) > -1s"
+      ],
+      "why": "self-parenthesising (:279 -> D20) and carrying `SUB INTEGER|FLOAT|DURATION` (:290-292 -> D18), so an aggregate threshold may be parenthesised and may be negative."
+    },
+    {
+      "production": "aggregate",
+      "ref_lines": "expr.y:295-301",
+      "disposition": "probed",
+      "probes": [
+        "avg(.a) > 1",
+        "({ .a = 1 } | avg(.b) > 1)",
+        "{ .a = 1 } | avg(.b) > -1s"
+      ],
+      "why": "count() plus the four one-arity forms over a full fieldExpression. The ARGUMENT grammar is #335 Stage C's D7 and is closed; these probes cover the aggregate in the three POSITIONS Stage D0 added - leading (D24), inside a wrapped pipeline (D19), and against a negative threshold (D18)."
+    },
+    {
+      "production": "metricsAggregation",
+      "ref_lines": "expr.y:307-327",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } | compare({ .b = 2 }, 10)",
+        "{ .a = 1 } | compare({ .b = 2 }, 10, 0, 0)"
+      ],
+      "why": "21 alternatives. The `BY '(' attributeList ')'` slot on ten of them is covered by the 13 pre-Stage-D0 metrics-`by` probes; the arity slot compare() carries (:324-326) had never been probed and diverges (D17)."
+    },
+    {
+      "production": "metricsSecondStage",
+      "ref_lines": "expr.y:332-335",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } | topk(10)",
+        "{ .a = 1 } | bottomk(3)",
+        "{ .a = 1 } | topk(5) | rate()",
+        "{ .a = 1 } | rate() | topk(5) > 1"
+      ],
+      "why": "topk/bottomk take an INTEGER and are reachable ONLY through metricsSecondStagePipeline, i.e. only after a first-stage metrics aggregation (:133). We parse them as an ordinary pipeline stage anywhere (D22)."
+    },
+    {
+      "production": "metricsFilterOperation",
+      "ref_lines": "expr.y:340-347",
+      "disposition": "no-operand-slot",
+      "probes": [
+        "{ .a = 1 } | rate() = 1",
+        "{ .a = 1 } | rate() != 1",
+        "{ .a = 1 } | rate() < 1",
+        "{ .a = 1 } | rate() <= 1",
+        "{ .a = 1 } | rate() > 1",
+        "{ .a = 1 } | rate() >= 1",
+        "{ .a = 1 } | rate() =~ 1"
+      ],
+      "why": "the metrics-side twin of scalarFilterOperation: six comparison tokens, no expression operand. All six probed as a set, all six agreeing; the seventh pins the regex operator's absence on both sides."
+    },
+    {
+      "production": "metricsFilter",
+      "ref_lines": "expr.y:349-356",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } | rate() > -1",
+        "{ .a = 1 } | rate() > -1.5",
+        "{ .a = 1 } | rate() > -1s"
+      ],
+      "why": "six alternatives, and three of them carry a leading SUB (:353-355), so a metrics threshold may be negative in all three literal types (D18)."
+    },
+    {
+      "production": "metricsSecondStagePipeline",
+      "ref_lines": "expr.y:361-366",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } | rate() > 1 | topk(5) > 2",
+        "{ .a = 1 } | rate() | topk(5) > 1"
+      ],
+      "why": "left-recursive over BOTH `PIPE metricsSecondStage` and `metricsFilter` (:364-365), so thresholds and second-stage functions interleave freely after the first stage. We allow at most one trailing threshold, directly after the first stage (D21)."
+    },
+    {
+      "production": "hint",
+      "ref_lines": "expr.y:371-373",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } with(k=unspecified)",
+        "{ .a = 1 } with(k=maxInt)"
+      ],
+      "why": "`IDENTIFIER EQ static` - the hint VALUE is the whole `static` production, which is why the two new static spellings are probed in this position as well as in a field expression (D13, D14)."
+    },
+    {
+      "production": "hints",
+      "ref_lines": "expr.y:375-377",
+      "disposition": "probed",
+      "probes": [
+        "{ .a = 1 } with(a=1) with(b=2)"
+      ],
+      "why": "one clause is `WITH '(' hintList ')'`; the REPETITION lives in `root: root hints` (:134) rather than here, and that recursion is D23."
+    },
+    {
+      "production": "hintList",
+      "ref_lines": "expr.y:379-382",
+      "disposition": "covered-by",
+      "probes": [],
+      "why": "a COMMA list whose only operand is `hint` (row above). The multi-hint clause is covered by the conformance registry construct `hints.with` (syntax `with(k=v, ...)`) and the golden corpus case `accept/hints_most_recent`; no accept-surface divergence was found in either."
+    },
+    {
+      "production": "fieldExpression",
+      "ref_lines": "expr.y:388-421",
+      "disposition": "probed",
+      "probes": [
+        "{ nil = .a }",
+        "{ nil != .a }",
+        "{ nil = nil }",
+        "{ nil != nil }",
+        "{ nil = .a + 1 }",
+        "{ .a + 1 = nil }",
+        "{ !.a = nil }",
+        "{ (.a = 1) = nil }"
+      ],
+      "why": "the production the FIRST enumeration was built from: its 24 binary/unary/atom alternatives and the precedence table are the pre-Stage-D0 221 probes, re-measured 47/47 at parity this stage. What that enumeration missed is the six NIL alternatives (:408-413), where NIL is an operand against a whole fieldExpression on either side (D15)."
+    },
+    {
+      "production": "static",
+      "ref_lines": "expr.y:426-453",
+      "disposition": "probed",
+      "probes": [
+        "{ kind = unspecified }",
+        "{ kind != unspecified }",
+        "{ span:kind = unspecified }",
+        "{ .a = unspecified }",
+        "{ .a = 1 } with(k=unspecified)",
+        "{ .a = minInt }",
+        "{ .a < maxInt }",
+        "{ .a = maxInt - 1 }",
+        "{ .a = 1 } with(k=maxInt)"
+      ],
+      "why": "16 terminal alternatives plus the IDENTIFIER action block. Two of the terminals we never had - KIND_UNSPECIFIED (:436, D13) - and the action block resolves minInt/maxInt from the token alone (:442-452, D14). The registry could not see either, because it was built from OUR construct list: an absence has no entry to carry a disposition."
+    },
+    {
+      "production": "intrinsicField",
+      "ref_lines": "expr.y:457-470",
+      "disposition": "covered-by",
+      "probes": [
+        "{ kind = unspecified }",
+        "{ .a = 1 } | by(name)"
+      ],
+      "why": "twelve bare intrinsic terminals; the pre-Stage-D0 matrix probes them in every field-expression operand position. Listed here for the two POSITIONS Stage D0 added - a kind static's left-hand side, and a groupOperation key."
+    },
+    {
+      "production": "scopedIntrinsicField",
+      "ref_lines": "expr.y:472-496",
+      "disposition": "covered-by",
+      "probes": [
+        "{ span:kind = unspecified }",
+        "{ .a = 1 } | by(span:kind)"
+      ],
+      "why": "eighteen colon-scoped spellings; #335 class D2 probed every one of them on both sides of a comparison and is closed. Listed here for the two positions Stage D0 added."
+    },
+    {
+      "production": "attributeField",
+      "ref_lines": "expr.y:498-508",
+      "disposition": "covered-by",
+      "probes": [
+        "{ .a = 1 } | by(span.b)",
+        "{ .a = 1 } | by(resource.service.name)"
+      ],
+      "why": "nine dotted-attribute spellings, all probed in the pre-Stage-D0 matrix's field-expression positions. Listed here for the groupOperation key position Stage D0 added."
+    }
+  ]
+}

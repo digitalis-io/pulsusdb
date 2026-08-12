@@ -1,0 +1,89 @@
+{
+  "owning_issue": 335,
+  "captured": "2026-08-12",
+  "datasource_revision": "v13.1.5",
+  "datasource_repo": "grafana/tempo-datasource (the Grafana TraceQL client this audit ranks reachability against)",
+  "what_this_is": "The citation targets every reachability record points at. A record does NOT carry a path, a line range, a request or an observed field: it names an entry here. That turns 56 independent opportunities to type something arbitrary into nine anchors and one capture, reviewed once, and every one of them is fed to REACHABILITY_DIGEST content-and-all, so editing an anchor's line range forces a visible source-line re-pin in the same diff.",
+  "schema_header": "Residual - what this gate cannot see. TWO SHAPES, both the same limitation: nothing here executes or reads anything outside this repository. (1) SWEEPS. A recorded sweep whose fields are all internally consistent but which was never run, or was run against a different tree than the one it names, passes. (2) CITATIONS. A citation whose path and revision are valid, and whose `lines` and `observed_field` were never read, passes. The anchor table narrows this from 56 records to nine anchors and one capture, reviewed once - but a wrong line range INSIDE an anchor is not detectable here. CI has no Tempo checkout and no Grafana-datasource checkout, so neither a replay nor a file read is possible; the recorded commands and anchors are reproducible by hand at the named revision, and that reproduction - by a human, at review time - is the whole of the guarantee. SHAPES THAT ARE NOT RESIDUAL, because they are unrepresentable: a sweep whose scope is not a declared pathspec; a sweep whose token is not the construct under classification; a per-record line range (there is none); an r2 discharged by an anchor that inserts an argument; an r3 with one citation. DO NOT ADD A LAYER THAT PRETENDS OTHERWISE. Fetching the datasource in CI to replay the sweep would make this gate depend on a network fetch of an AGPL tree and would still only prove the grep, not the classification. This instrument stops here on purpose, and the stopping rule is applicable rather than sentimental: a finding that moves none of a probe's `class`, its `reachability` tier, or its class's `stage` is recorded in this paragraph and reported - it is not fixed with another instrument.",
+  "declared_paths": [
+    "src/traceql/autocomplete.ts",
+    "src/traceql/traceql.ts",
+    "src/language_provider.ts"
+  ],
+  "declared_scopes": {
+    "": "every tracked file at the named revision",
+    "src/traceql/": "the TraceQL editor surface - the Monarch language, the completion provider and the situation resolver",
+    "src/language_provider.ts": "the ad-hoc-filter query emitter"
+  },
+  "anchors": {
+    "ds.completion-list": {
+      "revision": "v13.1.5",
+      "path": "src/traceql/autocomplete.ts",
+      "lines": "259-361",
+      "shows": "the whole function completion list - nothing in it inserts a parenthesised pipeline. The range STARTS at 259 rather than at `static readonly functions` (292) because that declaration spreads `...this.aggregatorFunctions` (293), whose five entries are declared at 259-290; a range omitting them could not support a 'nothing in it' claim."
+    },
+    "ds.by-insertion": {
+      "revision": "v13.1.5",
+      "path": "src/traceql/autocomplete.ts",
+      "lines": "294-299",
+      "shows": "the `by` completion item, documented 'Groups by arbitrary attributes'",
+      "insert_text": "by($0)"
+    },
+    "ds.compare-insertion": {
+      "revision": "v13.1.5",
+      "path": "src/traceql/autocomplete.ts",
+      "lines": "300-306",
+      "shows": "the `compare` completion item; its documentation string names the optional topN/start/end parameters, but that is popup prose, not inserted text",
+      "insert_text": "compare($0)"
+    },
+    "ds.empty-situation": {
+      "revision": "v13.1.5",
+      "path": "src/traceql/autocomplete.ts",
+      "lines": "477-481",
+      "shows": "at situation EMPTY - the start of a query - the completion list is scopes, intrinsics and tags WRAPPED in '{ ' … ' }'. A bare leading by(/select(/count() is never offered."
+    },
+    "ds.token-list": {
+      "revision": "v13.1.5",
+      "path": "src/traceql/traceql.ts",
+      "lines": "67-80",
+      "shows": "the highlighted FUNCTION token list - `aggregatorFunctions` at :67 (avg, count, max, min, sum) concatenated with by, compare, select and the metrics functions at :68-80. The range starts at 67 because :68's `functions` is built by concatenating :67's array, and the D24 probes use `count` and `avg`, which live in it."
+    },
+    "ds.operator-list": {
+      "revision": "v13.1.5",
+      "path": "src/traceql/traceql.ts",
+      "lines": "29,102",
+      "shows": "the highlighted operator surface. `operators` at :29 is the comparison and regex set, which the tokenizer classifies as `delimiter`; the `symbols` regex at :102 is [=><!~?:&|+\\-*/^%]+ and also matches '-', which falls through to the default token. So a leading '-' before a threshold is TOKENIZED but not specially coloured, and neither line offers any completion."
+    },
+    "ds.keyword-list": {
+      "revision": "v13.1.5",
+      "path": "src/traceql/traceql.ts",
+      "lines": "83,86",
+      "shows": "`withClauseKeywords = ['with']` at :83, concatenated into the highlighted `keywords` set at :86 - so `with` is marked wherever it appears, including a second time"
+    },
+    "ds.enum-intrinsics": {
+      "revision": "v13.1.5",
+      "path": "src/traceql/traceql.ts",
+      "lines": "65",
+      "shows": "`enumIntrinsics = ['kind', 'span:kind', 'status', 'span:status']` - the keys whose ad-hoc values are emitted UNQUOTED"
+    },
+    "ds.adhoc-emitter": {
+      "revision": "v13.1.5",
+      "path": "src/language_provider.ts",
+      "lines": "225-233",
+      "shows": "`generateQueryFromAdHocFilters` builds `${f.key}${f.operator}${this.adHocValueHelper(f)}`, and `adHocValueHelper` returns the value BARE when the key is an enum intrinsic - so a kind filter picked from the tag-value list is emitted as `kind=unspecified`, not `kind=\"unspecified\"`"
+    }
+  },
+  "captures": {
+    "cap.kind-tag-values": {
+      "endpoint": "/api/v2/search/tag/kind/values",
+      "request": "start,end over a store holding one span pushed with kind: 0, against grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7 (/status/version -> v3.0.2, revision 0c4b926d0)",
+      "observed_field": "tagValues[].value",
+      "observed_body": "{\"tagValues\":[{\"type\":\"keyword\",\"value\":\"server\"},{\"type\":\"keyword\",\"value\":\"producer\"},{\"type\":\"keyword\",\"value\":\"consumer\"},{\"type\":\"keyword\",\"value\":\"internal\"},{\"type\":\"keyword\",\"value\":\"unspecified\"},{\"type\":\"keyword\",\"value\":\"client\"}],\"metrics\":{}}",
+      "emitters": [
+        "ds.enum-intrinsics",
+        "ds.adhoc-emitter"
+      ],
+      "why_this_is_r1": "The loop closes through OUR OWN product. pulsus-read renders the word `unspecified` into a by(kind) group value, a select(kind) projection and a rate() by(kind) series label; the client displays it; the reference offers it back as a filter value in the body above; the client's ad-hoc emitter writes it back unquoted as `{kind=unspecified}`; the reference serves that with 200 and the matching trace (measured, same container). We answered 400."
+    }
+  }
+}

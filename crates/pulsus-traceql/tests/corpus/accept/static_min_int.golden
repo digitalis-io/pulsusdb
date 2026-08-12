@@ -14,22 +14,13 @@ Query {
                     ),
                     rhs: Literal(
                         Number(
-                            "1",
+                            "-9223372036854775808",
                         ),
                     ),
                 },
             ),
         },
     ),
-    pipeline: [
-        By {
-            key: Field(
-                Attribute {
-                    scope: Resource,
-                    key: "service.name",
-                },
-            ),
-        },
-    ],
+    pipeline: [],
     hints: [],
 }

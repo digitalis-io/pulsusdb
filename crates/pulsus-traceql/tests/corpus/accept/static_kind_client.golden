@@ -1,0 +1,25 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Intrinsic(
+                            Kind,
+                        ),
+                    ),
+                    rhs: Literal(
+                        Kind(
+                            Client,
+                        ),
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}
