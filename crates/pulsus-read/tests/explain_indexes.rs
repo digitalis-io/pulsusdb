@@ -48,6 +48,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_logql::parse;
+use pulsus_read::logql::predicate::literal;
 use pulsus_read::logql::sql::{self, ScanProjection, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
@@ -900,7 +901,7 @@ async fn stage3_sql(db: &str, ts_ns: i64, query: &str) -> String {
     let table = format!("{db}.log_samples");
     sql::stage3(
         &table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[FP_PROD],
         TimeWindow {
             start_ns: sp.start_ns,
@@ -1165,7 +1166,7 @@ async fn keyset_page_usage(
     let table = format!("{db}.log_samples");
     let sql = sql::stage3_keyset(
         &table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[FP_PROD],
         TimeWindow {
             start_ns: ts_ns - 6 * 3_600_000_000_000,
@@ -1262,7 +1263,7 @@ async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp
     let table = format!("{db}.log_samples");
     let sql = sql::metric_raw_samples_sliding(
         &table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,
@@ -1607,7 +1608,14 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
     ]);
     assert_eq!(explain(&client, &names_sql).await, v(&expected));
 
-    let values_sql = sql::label_values(&idx, &months, "'env'", &rollup, window, ROLLUP_RES_NS);
+    let values_sql = sql::label_values(
+        &idx,
+        &months,
+        &literal("env"),
+        &rollup,
+        window,
+        ROLLUP_RES_NS,
+    );
     let mut expected: Vec<&str> = month_blocks.to_vec();
     expected.extend([
         "PrimaryKey",
@@ -1682,12 +1690,12 @@ async fn metric_instant_read_routes_to_raw_and_uses_the_service_fingerprint_time
     assert!(mp.step_ns.is_none());
     let table = format!("{db}.log_samples");
     let sql = sql::metric_instant(
-        sql::MetricSource {
-            table: &table,
-            bucket_col: mp.bucket_col,
-            agg_expr: mp.agg_expr,
-        },
-        &["'checkout'".to_string()],
+        sql::MetricSource::new(
+            &table,
+            mp.source_shape()
+                .expect("plan::metric_plan writes both columns out of MetricShape"),
+        ),
+        &[literal("checkout")],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,
@@ -2353,7 +2361,7 @@ async fn m6_10_unpiped_count_over_time_range_slides_raw() {
     let table = format!("{db}.log_samples");
     let sql = sql::metric_raw_samples_sliding(
         &table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,
@@ -2389,7 +2397,7 @@ async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key(
     let table = format!("{db}.log_samples");
     let sql = sql::metric_raw_samples(
         &table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,
@@ -2436,7 +2444,7 @@ async fn a_grouped_range_aggregation_plans_the_same_single_raw_scan_as_its_ungro
         );
         let sql = sql::metric_raw_samples(
             &table,
-            &["'checkout'".to_string()],
+            &[literal("checkout")],
             &[FP_PROD],
             TimeWindow {
                 start_ns: mp.start_ns,
@@ -2498,7 +2506,7 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
     // (`metric_raw_samples_sliding`), the filter pushed down as a predicate.
     let sql = sql::metric_raw_samples_sliding(
         &table,
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,

@@ -13,6 +13,7 @@ use super::explain::PlanExplain;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
 use super::pipeline::CompiledPipeline;
 use super::plan::{self, ClientAgg, MetricNode, MetricPlan, Plan, StreamsPlan};
+use super::predicate::CheckedLiteral;
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow,
     MetricScanRow, PatternFetchRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
@@ -395,7 +396,7 @@ impl LogQlEngine {
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<String>, ReadError> {
         let months = plan::months_overlapping(b.start_ns, b.end_ns);
-        let key_literal = super::escape::ch_string(name);
+        let key_literal = super::predicate::literal(name);
         let sql = super::sql::label_values(
             &self.config.streams_idx,
             &months,
@@ -1084,7 +1085,7 @@ impl LogQlEngine {
         sp: &StreamsPlan,
         compiled: &super::pipeline::CompiledPipeline,
         meta: &HashMap<u64, StreamMetaRow>,
-        services: &[String],
+        services: &[CheckedLiteral],
         fingerprints: &[u64],
     ) -> Result<(Vec<StreamResult>, bool), ReadError> {
         let budget = self.config.scan_budget_bytes;
@@ -1297,11 +1298,7 @@ impl LogQlEngine {
         } else {
             distinct_escaped_services(&meta)
         };
-        let source = super::sql::MetricSource {
-            table: &mp.table,
-            bucket_col: mp.bucket_col,
-            agg_expr: mp.agg_expr,
-        };
+        let source = metric_source(mp);
 
         if is_instant {
             let sql = super::sql::metric_instant(
@@ -1828,11 +1825,7 @@ impl LogQlEngine {
             // `explain_indexes` gates validate a query we never issue.
             client_metric_read_sql(mp, &services, &fingerprints, window)
         } else {
-            let source = super::sql::MetricSource {
-                table: &mp.table,
-                bucket_col: mp.bucket_col,
-                agg_expr: mp.agg_expr,
-            };
+            let source = metric_source(mp);
             match mp.step_ns {
                 Some(step_ns) => super::sql::metric_range(
                     source,
@@ -2893,7 +2886,7 @@ impl LogQlEngine {
         sp: &StreamsPlan,
         compiled: &CompiledPipeline,
         base_labels: &HashMap<u64, Vec<(String, String)>>,
-        services: &[String],
+        services: &[CheckedLiteral],
         fingerprints: &[u64],
         line_limit: u32,
         acc: &mut FieldAccumulator,
@@ -3734,7 +3727,7 @@ impl PushdownInstantGroups {
 /// whether `structured_metadata` is read (issue #249).
 fn client_metric_read_sql(
     mp: &MetricPlan,
-    services: &[String],
+    services: &[CheckedLiteral],
     fingerprints: &[u64],
     window: super::sql::TimeWindow,
 ) -> String {
@@ -3965,11 +3958,41 @@ pub(in crate::logql) fn apply_rate(n: f64, rate_window_ns: Option<u64>) -> f64 {
     }
 }
 
-fn distinct_escaped_services(meta: &HashMap<u64, StreamMetaRow>) -> Vec<String> {
+/// The sealed [`super::sql::MetricSource`] for a planned metric read
+/// (issue #286).
+///
+/// The `.expect` is an in-crate construction invariant, the pattern this
+/// module already uses. `plan::metric_plan` writes
+/// `MetricPlan::{bucket_col, agg_expr}` out of
+/// [`super::sql::MetricShape`], so
+/// [`super::sql::MetricShape::from_columns`] is total for every plan this
+/// crate builds; a `MetricPlan` assembled by hand out-of-crate with a
+/// foreign column pair fails closed here instead of interpolating its text
+/// into SQL.
+fn metric_source(mp: &MetricPlan) -> super::sql::MetricSource<'_> {
+    super::sql::MetricSource::new(
+        &mp.table,
+        mp.source_shape().expect(
+            "invariant violated: plan::metric_plan writes MetricPlan::{bucket_col, agg_expr} \
+             out of MetricShape (plan.rs), so MetricShape::from_columns is total for every \
+             plan this crate builds — this MetricPlan carries a column pair no MetricShape \
+             renders, so it was not built by metric_plan",
+        ),
+    )
+}
+
+/// Issue #286: returns [`CheckedLiteral`]s. The mint IS
+/// [`super::escape::ch_string`], so "every service literal reaching a
+/// `logql::sql` builder was escaped" stops being a fact about this function
+/// and becomes one rustc holds up at the parameter.
+fn distinct_escaped_services(meta: &HashMap<u64, StreamMetaRow>) -> Vec<CheckedLiteral> {
     let mut services: Vec<&str> = meta.values().map(|m| m.service.as_str()).collect();
     services.sort_unstable();
     services.dedup();
-    services.into_iter().map(super::escape::ch_string).collect()
+    services
+        .into_iter()
+        .map(super::predicate::literal)
+        .collect()
 }
 
 /// The label-name set a volume query keys on (issue #169, oracle
@@ -4114,7 +4137,7 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
         };
-        let svc = ["'checkout'".to_string()];
+        let svc = [super::super::predicate::literal("checkout")];
         let mk = |spec| {
             let expr = pulsus_logql::parse(r#"count_over_time({env="prod"} | logfmt [5m])"#)
                 .expect("parse");
@@ -4881,16 +4904,44 @@ mod tests {
     /// literals + 1 MiB of pre-rendered line-filter predicate text ≈ 3.73
     /// MiB — comfortably under the 8 MiB cap, comfortably over the
     /// ClickHouse default.
-    fn worst_case_envelope() -> (Vec<u64>, Vec<String>, Vec<String>) {
+    fn worst_case_envelope() -> (
+        Vec<u64>,
+        Vec<CheckedLiteral>,
+        Vec<super::super::predicate::CheckedFragment>,
+    ) {
         let fps: Vec<u64> =
             std::iter::repeat_n(u64::MAX, super::super::params::DEFAULT_MAX_STREAMS).collect();
-        // Pre-escaped 64-byte literals (`'` + 62 chars + `'`), matching
-        // `stage3`'s documented "services are pre-escaped string literals"
-        // contract — the SQL builders never re-escape these.
-        let services: Vec<String> = (0..10_000).map(|i| format!("'{i:062}'")).collect();
+        // 64-byte literals (`'` + 62 chars + `'`). Issue #286: minted, not
+        // hand-written — `predicate::literal` IS `ch_string`, and a
+        // 62-digit value escapes to nothing, so the rendered bytes are the
+        // same 64 as before.
+        let services: Vec<CheckedLiteral> = (0..10_000)
+            .map(|i| super::super::predicate::literal(&format!("{i:062}")))
+            .collect();
         // 16 × 64 KiB pre-rendered predicates ≈ 1 MiB, a generous multiple
         // of any realistic compiled line-filter chain.
-        let line_filters: Vec<String> = std::iter::repeat_n("x".repeat(65_536), 16).collect();
+        //
+        // Issue #286: a raw 65,536-byte string is no longer constructible
+        // as a fragment, so the envelope is MINTED at exactly that size and
+        // the size is asserted rather than assumed. `-` is neither
+        // alphanumeric nor `_`, so `tokenize` yields no token and
+        // `ch_string` escapes nothing: a `|=` filter over N dashes renders
+        // `position(body, '<N dashes>') > 0`, which is `15 + (N + 2) + 5`
+        // bytes. N = 65,514 gives exactly 65,536.
+        let filter = super::super::predicate::line_filter(&pulsus_logql::LineFilter {
+            op: pulsus_logql::LineFilterOp::Contains,
+            value: "-".repeat(65_514),
+            value_is_ip: false,
+            or_matches: Vec::new(),
+        })
+        .expect("a Contains filter compiles no regex");
+        assert_eq!(
+            filter.as_sql().len(),
+            65_536,
+            "the envelope's per-filter size is the pre-#286 figure, exactly"
+        );
+        let line_filters: Vec<super::super::predicate::CheckedFragment> =
+            std::iter::repeat_n(filter, 16).collect();
         (fps, services, line_filters)
     }
 

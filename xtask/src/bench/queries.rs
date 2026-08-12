@@ -65,6 +65,7 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChRow, QuerySettings, Row};
+use pulsus_read::logql::predicate::{CheckedLiteral, MonthLiteral, month_literal};
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
@@ -1065,9 +1066,9 @@ async fn run_streams_once(
     let mut services: Vec<&str> = meta.iter().map(|m| m.service.as_str()).collect();
     services.sort_unstable();
     services.dedup();
-    let escaped: Vec<String> = services
+    let escaped: Vec<CheckedLiteral> = services
         .into_iter()
-        .map(pulsus_read::logql::escape::ch_string)
+        .map(pulsus_read::logql::predicate::literal)
         .collect();
 
     let s3_id = format!("{base_id}-s3");
@@ -1504,21 +1505,21 @@ async fn run_metric_shape(
             product: ProductMode::Flat,
         });
 
-        let services: Vec<String> = if mp.rollup {
+        let services: Vec<CheckedLiteral> = if mp.rollup {
             Vec::new()
         } else {
             let mut s: Vec<&str> = meta.iter().map(|m| m.service.as_str()).collect();
             s.sort_unstable();
             s.dedup();
             s.into_iter()
-                .map(pulsus_read::logql::escape::ch_string)
+                .map(pulsus_read::logql::predicate::literal)
                 .collect()
         };
-        let source = sql::MetricSource {
-            table: &mp.table,
-            bucket_col: mp.bucket_col,
-            agg_expr: mp.agg_expr,
-        };
+        let source = sql::MetricSource::new(
+            &mp.table,
+            mp.source_shape()
+                .expect("plan::metric_plan writes both columns out of MetricShape"),
+        );
         let s3_id = format!("{query_id}-s3");
         let sql3 = sql::metric_range(
             source,
@@ -1648,7 +1649,7 @@ async fn run_metric_shape(
 /// months_overlapping` (`pub(crate)` there, not reachable from this
 /// crate): same Howard Hinnant civil-calendar algorithm `pulsus_model::
 /// Date` is built on.
-pub(crate) fn month_literals(start_ns: i64, end_ns: i64) -> Vec<String> {
+pub(crate) fn month_literals(start_ns: i64, end_ns: i64) -> Vec<MonthLiteral> {
     const NANOS_PER_DAY: i64 = 86_400_000_000_000;
     let day_of = |ns: i64| ns.div_euclid(NANOS_PER_DAY);
     let ymd = |days: i64| {
@@ -1666,7 +1667,7 @@ pub(crate) fn month_literals(start_ns: i64, end_ns: i64) -> Vec<String> {
     let (end_y, end_m) = ymd(day_of(end_ns.max(start_ns)));
     let mut out = Vec::new();
     loop {
-        out.push(format!("'{y:04}-{m:02}-01'"));
+        out.push(month_literal(y, u32::try_from(m).expect("month 1..=12")));
         if (y, m) == (end_y, end_m) {
             break;
         }

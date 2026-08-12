@@ -1034,7 +1034,7 @@ mod tests {
 
         let sql = pulsus_read::logql::sql::stage3_keyset(
             "log_samples",
-            &["'checkout'".to_string()],
+            &[pulsus_read::logql::predicate::literal("checkout")],
             &[1],
             pulsus_read::logql::sql::TimeWindow {
                 start_ns: 0,
