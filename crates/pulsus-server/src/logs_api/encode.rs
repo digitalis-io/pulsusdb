@@ -60,6 +60,9 @@ where
 {
     enum Step {
         Prefix,
+        /// The `,` between items — its own zero-copy static chunk (issue
+        /// #312), so an item is never copied into a separator-bearing Vec.
+        Sep(usize),
         Item(usize),
         Suffix,
         Done,
@@ -92,12 +95,15 @@ where
                 };
                 Some((Ok::<_, std::io::Error>(Bytes::from(bytes)), state))
             }
+            Step::Sep(i) => {
+                state.step = Step::Item(i);
+                Some((Ok(Bytes::from_static(b",")), state))
+            }
             Step::Item(i) => {
-                let mut chunk = if i > 0 { vec![b','] } else { Vec::new() };
-                chunk.extend((state.render)(&state.items[i]));
+                let chunk = (state.render)(&state.items[i]);
                 let next = i + 1;
                 state.step = if next < state.items.len() {
-                    Step::Item(next)
+                    Step::Sep(next)
                 } else {
                     Step::Suffix
                 };
@@ -233,27 +239,44 @@ fn format_value_json(v: f64) -> String {
     json_string(&text)
 }
 
-fn render_entries(entries: &[(i64, String)]) -> String {
-    let mut out = String::new();
-    for (i, (ts, line)) in entries.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!("[\"{ts}\",{}]", json_string(line)));
-    }
-    out
+/// The UNESCAPED rendered size of one stream item — an exact reservation
+/// for the common case (no `\u00XX` expansion), computed in `O(entries)`
+/// with no per-byte work.
+fn stream_item_estimate(s: &StreamResult) -> usize {
+    23 + s.labels_json.len()
+        + s.entries
+            .iter()
+            .map(|(_, line)| 28 + line.len())
+            .sum::<usize>()
 }
 
-fn render_stream_item_str(s: &StreamResult) -> String {
-    format!(
-        "{{\"stream\":{},\"values\":[{}]}}",
-        s.labels_json,
-        render_entries(&s.entries)
-    )
+/// Renders one stream item into ONE buffer (issue #312): entry framing,
+/// timestamps and JSON-escaped lines are written in place, so no
+/// per-entry `String` and no whole-item second copy is ever live.
+fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult) {
+    use std::io::Write;
+    out.extend_from_slice(b"{\"stream\":");
+    out.extend_from_slice(s.labels_json.as_bytes());
+    out.extend_from_slice(b",\"values\":[");
+    for (i, (ts, line)) in s.entries.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(b"[\"");
+        let _ = write!(&mut *out, "{ts}");
+        out.extend_from_slice(b"\",");
+        if serde_json::to_writer(&mut *out, line).is_err() {
+            out.extend_from_slice(b"\"\"");
+        }
+        out.push(b']');
+    }
+    out.extend_from_slice(b"]}");
 }
 
 fn render_stream_item(s: &StreamResult) -> Vec<u8> {
-    render_stream_item_str(s).into_bytes()
+    let mut out: Vec<u8> = Vec::with_capacity(stream_item_estimate(s));
+    render_stream_item_into(&mut out, s);
+    out
 }
 
 /// Encodes a `/api/logs/v1/stats` result (issue #74, docs/api.md §2.5):
@@ -543,14 +566,16 @@ pub(crate) fn tail_frame(
             .iter()
             .map(|d| d.labels_json.len() + 48)
             .sum::<usize>();
-    let mut out = String::with_capacity(capacity);
-    out.push_str("{\"streams\":[");
+    let mut buf: Vec<u8> = Vec::with_capacity(capacity);
+    buf.extend_from_slice(b"{\"streams\":[");
     for (i, s) in streams.iter().enumerate() {
         if i > 0 {
-            out.push(',');
+            buf.push(b',');
         }
-        out.push_str(&render_stream_item_str(s));
+        // Rendered IN PLACE (issue #312): no per-item `String` copy.
+        render_stream_item_into(&mut buf, s);
     }
+    let mut out = String::from_utf8(buf).expect("rendered JSON is UTF-8");
     out.push_str("],\"dropped_entries\":[");
     for (i, d) in dropped.iter().enumerate() {
         if i > 0 {
@@ -851,6 +876,203 @@ mod tests {
                 .map(|(ts, line)| (ts, line.to_string()))
                 .collect(),
         }
+    }
+
+    fn probe312_item(n: usize, line_len: usize, ctrl: bool) -> StreamResult {
+        let ch = if ctrl { '\u{1}' } else { 'a' };
+        let line: String = std::iter::repeat_n(ch, line_len).collect();
+        StreamResult {
+            fingerprint: 1,
+            service: "svc".to_string(),
+            labels_json: r#"{"service_name":"svc"}"#.to_string(),
+            entries: (0..n)
+                .map(|i| (1_700_000_000_000_000_000i64 + i as i64, line.clone()))
+                .collect(),
+        }
+    }
+
+    /// AC-19 (issue #312): the render path's PEAK LIVE BYTES and its
+    /// allocation profile, both pinned, both measured over the whole call.
+    /// Peak bytes is the quantity #312 guarantees; the count is a companion
+    /// that is blind to allocation SIZE (round 6's compensating pair).
+    #[test]
+    fn ac19_render_path_peak_and_allocation_profile() {
+        let benign = probe312_item(200, 512, false);
+        let est = stream_item_estimate(&benign);
+        let (out, allocs, peak) = crate::probe_alloc::measure(|| render_stream_item(&benign));
+        // PEAK BYTES is the load-bearing figure: #312 guarantees a memory
+        // bound, and peak live bytes is that quantity in its own unit. The
+        // allocation COUNT is a companion — cheap and structural, but blind
+        // to SIZE, so a compensating pair (add an allocation, remove a
+        // doubling) preserves it while moving the peak.
+        //
+        // benign: one allocation of exactly the reservation, nothing else
+        // live, so peak == reservation.
+        assert_eq!(
+            (allocs, peak, out.len(), out.capacity()),
+            (1, est as u64, 107_844, est),
+            "the unescaped render's allocation profile moved"
+        );
+
+        let adversarial = probe312_item(200, 512, true);
+        let est_a = stream_item_estimate(&adversarial);
+        let (out_a, allocs_a, peak_a) =
+            crate::probe_alloc::measure(|| render_stream_item(&adversarial));
+
+        // adversarial: reservation is the UNESCAPED size and each 0x01 byte
+        // renders as a six-character escape, so the buffer doubles until it
+        // fits: 108,045 -> 216,090 -> 432,180 -> 864,360 >= 619,844. Three
+        // doublings, four allocations, final capacity 8x the reservation,
+        // and a peak of 432,180 + 864,360 = 1,296,540 at the last realloc,
+        // where both blocks are live for the copy.
+        assert_eq!(
+            (allocs_a, peak_a, out_a.len(), out_a.capacity()),
+            (4, 1_296_540, 619_844, est_a * 8),
+            "the escaped-line render's allocation profile moved"
+        );
+
+        eprintln!("AC19 benign=({allocs},peak={peak}) adversarial=({allocs_a},peak={peak_a})");
+    }
+
+    /// Drives a REAL `StreamAccumulator` over `bodies` and returns
+    /// `(items, charged)` — the shipped ledger's own figure, never one
+    /// recomputed by the test.
+    fn probe312_accumulate(bodies: &[String]) -> (Vec<StreamResult>, u64) {
+        use pulsus_read::logql::exec::StreamAccumulator;
+        use pulsus_read::logql::pipeline::CompiledPipeline;
+        use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
+
+        let meta = std::collections::HashMap::from([(
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "svc".to_string(),
+                labels: r#"{"service_name":"svc"}"#.to_string(),
+            },
+        )]);
+        let pulsus_logql::Expr::Log(log) = pulsus_logql::parse(r#"{a="b"}"#).expect("parse") else {
+            panic!("expected a log query");
+        };
+        let compiled = CompiledPipeline::compile(&log.pipeline).expect("compile");
+        let mut acc = StreamAccumulator::new(&meta, u32::MAX);
+        for (i, body) in bodies.iter().enumerate() {
+            acc.push_row(
+                SampleRow {
+                    fingerprint: 1,
+                    timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
+                    body: body.clone(),
+                    structured_metadata: String::new(),
+                },
+                &compiled,
+            )
+            .expect("well inside the shipped cap");
+        }
+        acc.flush_chunk(&compiled).expect("well inside the cap");
+        let charged = acc.charged();
+        (acc.into_streams(), charged)
+    }
+
+    /// AC-4 (issue #312) — the internal ledger and the WIRE cannot drift
+    /// apart: `stats.bytes <= charged <= MAX_STREAMS_RESULT_BYTES` for a
+    /// served streams response.
+    ///
+    /// A break test, not a formula check: the corpus goes through a real
+    /// `StreamAccumulator`, the response through the PRODUCTION encoder
+    /// (`query_response_warned` — `query_response` has been `#[cfg(test)]`
+    /// since #277), and `data.stats.bytes` is parsed back off the
+    /// serialized body. Bodies straddle the 32-byte `MIN_ALLOC_BYTES`
+    /// floor in both directions, so a charge that stopped pricing the line
+    /// is visible.
+    #[tokio::test]
+    async fn wire_stats_bytes_never_exceeds_the_charged_ledger() {
+        let bodies: Vec<String> = (0..400)
+            .map(|i| "x".repeat(if i % 4 == 0 { 3 } else { 40 + i }))
+            .collect();
+        let (items, charged) = probe312_accumulate(&bodies);
+        assert!(!items.is_empty(), "the fixture must produce output");
+
+        let res = query_response_warned(
+            QueryResult::Streams {
+                items,
+                partial: false,
+            },
+            None,
+            0,
+            false,
+            &Warnings::new(),
+        );
+        let body = body_string(res).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        let stats_bytes = parsed["data"]["stats"]["bytes"]
+            .as_u64()
+            .expect("data.stats.bytes is a number");
+
+        assert!(
+            stats_bytes > 0 && stats_bytes <= charged,
+            "stats.bytes = {stats_bytes} exceeds the charged ledger {charged} — the internal \
+             ledger and the wire have drifted apart"
+        );
+        assert!(
+            charged <= pulsus_read::logql::MAX_STREAMS_RESULT_BYTES,
+            "a served response charged {charged}, past the shipped cap"
+        );
+    }
+
+    /// AC-17 (issue #312) — the DOCUMENTED encoded-body factor is the one
+    /// the renderer produces.
+    ///
+    /// The factor is parsed out of the committed ledger at RUN TIME (the
+    /// `the_docs_quote_the_shipped_bound` precedent), so breaking the
+    /// DOCUMENT alone fails this test with no recompilation. Two-sided:
+    /// the documented factor must not be too small (the renderer stays
+    /// under it) and must not be too large (this corpus is still the worst
+    /// case, so one less multiple would not hold).
+    #[test]
+    fn the_encoder_body_factor_matches_what_the_renderer_produces() {
+        let item = probe312_item(200, 512, true);
+        // `charged` comes from the real accumulator, not from a formula
+        // written here.
+        let bodies: Vec<String> = item.entries.iter().map(|(_, l)| l.clone()).collect();
+        let (_items, charged) = probe312_accumulate(&bodies);
+        let rendered = render_stream_item(&item).len() as u64;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ledger =
+            std::fs::read_to_string(root.join("docs/benchmarks/logs-differential-ledger.md"))
+                .expect("ledger readable");
+        // The anchor line, verbatim:
+        //   - **Encoded-body factor:** a rendered stream item is at most
+        //     `3 ×` its charged bytes.
+        const ANCHOR: &str = "- **Encoded-body factor:** a rendered stream item is at most `";
+        let tail = ledger
+            .split(ANCHOR)
+            .nth(1)
+            .expect("the ledger's streams-result-budget entry carries the encoded-body anchor");
+        let factor: u64 = tail
+            .split(" ×`")
+            .next()
+            .expect("the anchor names a factor")
+            .trim()
+            .parse()
+            .expect("the documented factor is an integer");
+
+        assert!(
+            rendered <= factor * charged,
+            "the renderer emitted {rendered} B for {charged} charged B — MORE than the \
+             documented factor {factor}x ({} B). The documented bound is too small.",
+            factor * charged
+        );
+        assert!(
+            rendered > (factor - 1) * charged,
+            "the renderer emitted only {rendered} B for {charged} charged B — under {}x. The \
+             documented factor {factor}x is not tight, or this corpus is no longer the worst \
+             case.",
+            factor - 1
+        );
+        eprintln!(
+            "AC17 rendered={rendered} charged={charged} ratio={:.3} documented_factor={factor}",
+            rendered as f64 / charged as f64
+        );
     }
 
     #[tokio::test]
@@ -1538,8 +1760,10 @@ mod tests {
             total_len += chunk.len();
         }
 
-        // One prefix chunk + one chunk per stream + one suffix chunk.
-        assert_eq!(chunk_count, NUM_STREAMS + 2);
+        // One prefix chunk, one chunk per stream, one zero-copy `,` chunk
+        // between consecutive streams (issue #312 — the separator is no
+        // longer copied into the item's buffer), one suffix chunk.
+        assert_eq!(chunk_count, 2 * NUM_STREAMS + 1);
         // Total output is large (~100k entries' worth of text) ...
         assert!(total_len > 5_000_000, "total_len = {total_len}");
         // ... but no single chunk is anywhere near that size: each stream

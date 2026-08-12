@@ -5240,3 +5240,107 @@ mechanism stayed unmodelled. Two axes, one moved.
   a `divergence(...)` marker naming this id, and it would then be
   excluded from the live replay leg — which is the one thing that would
   notice if the reference's answer ever changed.
+
+### `streams-result-budget` (issue #312, bounded divergence)
+
+PulsusDB refuses a streams query whose PEAK RETENTION — staged rows plus
+the assembled result — would exceed `MAX_STREAMS_RESULT_BYTES` = 1 GiB,
+with a named `422 query_too_broad` carrying
+`TooBroadReason::StreamsResultBytes`. The reference refuses too, at a far
+smaller size and far worse; that difference is why this is a bounded
+divergence rather than a gap.
+
+- **Reference behaviour, container-measured against `grafana/loki:3.7.4`
+  (`buildinfo.revision = b318f282`)** on a corpus of 5,000 x 1 KiB lines
+  under `{job="i312b"}`, `query_range` over an 11 s window. Provenance:
+  the capture posted on issue #312 as comment `5265167134`'s round-1
+  table; reproduced here rather than re-derived.
+
+  | query | HTTP | body / bytes | latency |
+  |---|---|---|---|
+  | `{job="i312b"}` limit=3000 | 200 | 3,156,741 B JSON | 0.17 s |
+  | `{job="i312b"}` limit=3900 | 200 | **4,102,645 B JSON** | 0.058 s |
+  | `{job="i312b"}` limit=3990 / 4000 / 4500 / 5000 | **no response at all** — server log records `(504) 1m0.008s` | 0 B | 60 s |
+  | `… \| line_format "{{ repeat 1000 __line__ }}"` limit=1 | 200 | 1,027,734 B | 0.34 s |
+  | `… \| line_format "{{ repeat 1000 __line__ }}"` limit=10 | **500** | 104 B `text/plain; charset=utf-8` | 17.1 s (4 internal retries) |
+  | `… \| line_format "{{ repeat 100 __line__ }}"` limit=5000 | **500** | 104 B `text/plain` | 16.8 s |
+
+  Verbatim 500 body: `rpc error: code = ResourceExhausted desc = trying to
+  send message larger than max (13113586 vs. 4194304)`. Server-log cause
+  of the 504 class: `rpc error: code = ResourceExhausted desc = grpc:
+  received message larger than max (4733318 vs. 4194304)` /
+  `(5258815 vs. 4194304)`. Two `4194304`-byte gRPC ceilings sit on the
+  reference read path — ingester→querier (batches of 128 entries;
+  `13113586 = 128 x 102400` confirms the batch size) and
+  querier→frontend (the whole result). Neither truncates. Neither serves.
+
+- **What we do instead, and why it is the "except where they are wrong"
+  clause:** the reference's three experiences at its ceiling are a raw
+  gRPC internals string leaked as `text/plain`, a 60-second hang ending
+  in a `504`, or a served result. Refusal is therefore parity in kind;
+  only the size and the message differ. PulsusDB answers a named `422`
+  with a legible body, at a cap **256x** the largest streams response the
+  reference could serve here (4,102,645 B), so nothing the reference
+  serves is refused — the `#236 (f)` direction.
+
+- **Units.** The cap is denominated in RETAINED bytes; the observable
+  guarantee is `stats.bytes <= MAX_STREAMS_RESULT_BYTES` on the wire, and
+  the ratio is about two because `alloc_block_bytes` doubles. Wide-label
+  results are charged up to 3x their true footprint, so their effective
+  ceiling is ~357,913,941 B (~341 MiB) — still ~87x the reference's
+  largest served response.
+
+- **Residual (issue #312, not fixed here) — the ENCODED BODY.** The cap
+  bounds retained bytes. It does not bound the encoded response, which is
+  bounded only derivatively:
+
+  - **Encoded-body factor:** a rendered stream item is at most `3 ×` its
+    charged bytes. Derived over everything the item carries — the
+    `{"stream":` / `,"values":[` / `]}` wrapper (23 B), `labels_json`,
+    per-entry framing plus up to 20 timestamp digits plus the separator
+    comma and `json_string`'s two quotes (28 B/entry), and `serde_json`'s
+    six-for-one `\u00XX` expansion of a C0 control byte — against the
+    same item's charge (`map_entry_bytes(STREAM_GROUP_SLOT)` = 840,
+    `6·|labels_json|` from `grown_alloc_bytes`, `STREAM_ENTRY_SLOT` = 32
+    per entry, and `≥ 2·Σ|line|`). Every term of the output is dominated
+    by three times its own contribution to the charge, and `6L ≤ 3·2L`
+    is exact, so the factor is tight rather than nominal. Hence at most
+    **3,221,225,472 B (~3.0 GiB)** encoded for a query at the cap.
+  - **The input that reaches it:** one stream, 5,000 entries, every line
+    107,340 B of `0x01`. That is admitted (`5,000 × (alloc_block_bytes
+    (107,340) + 32)` = 1,073,560,000 B plus a ~1,256 B group charge,
+    inside 1,073,741,824) and renders `5,000 × 107,340 × 6` =
+    3,220,200,000 B.
+  - **Measured at CI scale:** 200 entries × 512 B of `0x01`,
+    `labels_json` 22 B — `rendered = 619,844 B`, `charged = 212,204 B`,
+    ratio **2.921**. Pinned by
+    `logs_api/encode.rs::the_encoder_body_factor_matches_what_the_renderer_produces`,
+    which parses the `3 ×` above out of THIS file at run time, so
+    breaking the document alone reddens the test.
+
+- **Peak HEAP while rendering — measured, and reduced by this issue.**
+  The encoder renders one item at a time, so the transient is one item,
+  never the whole body. Before #312 that item cost **1,612** allocations
+  and a peak of **4.28 × R** (`R` = the rendered item's length); the
+  single-buffer render (`render_stream_item_into`, writing framing,
+  timestamps and `serde_json::to_writer`-escaped lines in place) and the
+  zero-copy `Step::Sep` separator chunk bring it to **1** allocation and
+  **1.00 × R** for lines needing no escape, **2.09 × R** at the escaped
+  extreme. Whole-response figures over the same corpus: **15**
+  allocations and **1.01 × R** benign, **18** and **2.22 × R**
+  adversarial. Those whole-response numbers are a recorded MEASUREMENT
+  (reproduced by issue #312's round-4 reviewer), not a gated property;
+  the per-item figures ARE gated, by
+  `logs_api/encode.rs::ac19_render_path_peak_and_allocation_profile`,
+  which pins peak live BYTES — `(1, 108045, …)` benign and
+  `(4, 1296540, …)` adversarial — because an allocation COUNT is blind to
+  allocation SIZE.
+
+  When escaping expands past the reservation the buffer grows, and the
+  house model prices that peak at `grown_alloc_bytes(R) = 3 ×
+  alloc_block_bytes(R) ≤ 6R` (`charge.rs`) — **measured 2.09 R**, so the
+  MODEL is conservative by ~2.9x. Composed with the `3 ×` encoded-body
+  factor: peak ≤ **18 × charged** modelled, ≈ **6.7 × charged** measured
+  at the worst shape. The `6R` figure is a model; the `2.09 R` is a
+  measurement, and they are labelled here so nobody quotes one as the
+  other.

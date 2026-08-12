@@ -164,8 +164,16 @@ fn every_row_budget_variant_has_its_own_term_in_the_published_total() {
 /// field silently zeroed still fails.
 #[test]
 fn the_published_row_term_is_the_sum_of_the_declared_budgets() {
-    use pulsus_read::logql::{MAX_LEAF_RETAINED_BYTES, MAX_QUERY_RETAINED_BYTES};
-    let row_term = MAX_QUERY_RETAINED_BYTES - MAX_LEAF_RETAINED_BYTES;
+    use pulsus_read::logql::{MAX_QUERY_RETAINED_BYTES, RESULT_BUDGETS, ResultBudgets};
+    // Issue #312 added a second RESULT budget beside the metric leaf, so
+    // the row term is the query bound minus EVERY result term — read out
+    // of a destructured `ResultBudgets`, so a third one cannot be
+    // forgotten here either.
+    let ResultBudgets {
+        metric_leaf,
+        streams_result,
+    } = RESULT_BUDGETS;
+    let row_term = MAX_QUERY_RETAINED_BYTES - (metric_leaf + streams_result);
     assert_eq!(row_term, 134_217_728);
     assert_eq!(
         row_term,
