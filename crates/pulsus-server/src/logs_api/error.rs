@@ -78,16 +78,19 @@
 //! none, `fmt.Fprintln` writes an LF. Tempo's frontend agrees with THIS
 //! one on the terminator (neither writes one) and differs on `nosniff`.
 //! `tests/support/manifest.rs`'s `PlainTextWriter` therefore carries two
-//! independent per-writer rules, and its `NosniffRule` is three-valued so
-//! "absent by rule" cannot be spelled the same way as "no rule".
+//! independent per-writer rules, and its `NosniffRule` is an enum rather
+//! than a `bool` so that "absent by rule" cannot be spelled the same way
+//! as "no rule at all" (issue #385 retired the latter value; the reason
+//! for the enum did not go with it).
 //!
-//! The writers themselves are separate: `pulsus-write`'s ingest module has
-//! nine response builders and none of them is reachable from `logs_api` —
-//! the crates do not call into each other's responders at all. Two of
-//! those nine ARE shared across references, though (`rw_error_response`
-//! and `rw_backpressure_response` serve both `/api/v1/write` and
-//! `/api/v2/spans`), which is a live divergence recorded on
-//! `rw_error_response` — not a claim of separation anywhere but here.
+//! The writers themselves are separate: every response builder lives in
+//! `pulsus-write`'s ingest module or here, and none of the ingest ones is
+//! reachable from `logs_api` — the crates do not call into each other's
+//! responders at all. Since issue #385 no ingest builder is shared across
+//! references either: `/api/v1/write` and `/api/v2/spans` used to share
+//! one, which was a live divergence, and each now has its own writer per
+//! STAGE (both references `http.Error` their pre-admission rejections and
+//! part company after admission).
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
