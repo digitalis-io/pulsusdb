@@ -355,7 +355,22 @@ zero anywhere at the tag — so no Tempo client can emit it.
 
 ### Staging
 
-`D13`, `D14`, `D23` are fixed in Stage D1 (parser-local). `D16` is fixed
+`D13`, `D14`, `D23` are fixed in Stage D1. **Stage D1 is not
+parser-local, and saying so would be false**: `SpanKindValue` gains a
+sixth variant, and `crates/pulsus-read/src/traces/filter.rs`'s
+`kind_code` matches all five with no wildcard, so the read path does not
+compile until it gains an arm. That is the intended constraint rather
+than an accident — of the three read-path sites that interpret a span
+kind, it is the only type-checked one (`metrics_sql.rs`'s `KIND_MAP` is
+a SQL string constant and `search_eval.rs`'s `kind_keyword` has a `_ =>`
+arm, and both already emitted `unspecified`). No gate is bypassed: a
+diff-path check on `crates/pulsus-read/src/**` was considered and
+withdrawn before implementation, because the AST is a TYPE CONTRACT
+(`pulsus-read` lowers `pulsus_traceql::Query`), so such a check is
+incomplete if it lists only the read path and vacuous if it lists the
+parser too. What holds each D1 change down is therefore per-change and
+unequal: D13 the compiler, D14 and D23 nothing from the type system.
+`D16` is fixed
 in Stage D2, in both directions at once — the comma list is removed and
 the single operand widened to a field expression, because they are the
 same production. The remaining eight — `D15`, `D17`, `D18`, `D19`,

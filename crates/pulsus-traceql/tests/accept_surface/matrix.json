@@ -250,7 +250,7 @@
     {
       "id": "D23",
       "title": "repeated root with() clauses",
-      "reference": "`root: root hints` (expr.y:134) is recursive, so a root query may carry more than one with(...) clause and their hints concatenate.",
+      "reference": "`root: root hints` (expr.y:134) is LEFT-RECURSIVE, so a root query may carry more than one with(...) clause. The clauses do NOT concatenate: the rule's action is `expr.withHints($2)` and withHints is `r.Hints = h`, a plain ASSIGNMENT (ast.go:112-115 @ v3.0.2), so the LAST clause wins; only a single clause's comma list (hintList, expr.y:379-382) accumulates. Every clause order is accepted 200 (measured), which is what this accept-surface class scores; the last-wins RESULT is a semantic fact, established from the rule above and pinned on our side by accept/hints_repeated.golden.",
       "pulsus": "The root hint clause is parsed once; a second with(...) is trailing input.",
       "impact": "accept-surface",
       "status": "closed",
