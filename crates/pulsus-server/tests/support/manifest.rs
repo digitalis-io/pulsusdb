@@ -426,38 +426,67 @@ pub enum PlainTextWriter {
     /// `pkg/api/http.go:67` — an internal path, not this surface's
     /// reference.)
     TempoFrontendResponse,
-    /// `/api/v1/write` (Prometheus remote write) and `/api/v2/spans`
-    /// (OpenZipkin) — which share ONE PulsusDB responder,
-    /// `pulsus_write::ingest::http::rw_error_response`, while answering to
-    /// two references that do not agree with each other. **Issue #385 owns
-    /// that question and carries the measurements.**
+    /// `/api/v1/write` (Prometheus remote write) — the reference binds ONE
+    /// writer for the whole endpoint at EVERY status:
+    /// `http.Error(w, storeErr.Error(), writeResponse.statusCode)`
+    /// (`exp/api/remote/remote_api.go:611` @ client_golang/exp
+    /// `3537b20ac86b`, the module prometheus v3.13.0 pins at `go.mod:67`),
+    /// reached by the decode, media-type, size and 5xx branches alike.
+    /// Asserted: `nosniff` PRESENT and **exactly one** trailing `\n`.
+    PromRemoteWriteHttpError,
+    /// `/api/v2/spans`, PRE-admission rejections only — Tempo's OTel
+    /// Zipkin receiver `http.Error`s every decode failure
+    /// (`receiver/zipkinreceiver/trace_receiver.go:236 @ tempo v3.0.2`),
+    /// and `confighttp`'s decompressor refuses an unsupported
+    /// `Content-Encoding` one layer below it through the same call
+    /// (`config/confighttp/compression.go:280,285-288`). Asserted:
+    /// `nosniff` PRESENT and **exactly one** trailing `\n`.
     ///
-    /// So NEITHER reference-derived rule can be asserted for this variant:
-    /// it gets only the checks every variant gets (PulsusDB's own exact
-    /// content type, non-empty, non-JSON). That is a genuine gap, not a
-    /// resolved one — it closes with #385.
-    WriterSideReceiver,
+    /// Identical rules to [`PlainTextWriter::PromRemoteWriteHttpError`]
+    /// today, and deliberately a SEPARATE variant anyway (issue #385,
+    /// task-manager ruling Q1): **two rules that agree are not one rule.**
+    /// Collapsing them would encode a claim — that these two references
+    /// will go on agreeing — which this very issue disproved for the
+    /// POST-admission family, where Prometheus keeps `http.Error` at 5xx
+    /// and Tempo's Zipkin receiver switches to a bare `w.Write`. The next
+    /// divergence would then propagate silently into whichever endpoint
+    /// nobody was thinking about.
+    ///
+    /// That post-admission writer is **unreachable from this matrix**: it
+    /// needs a failing sink, and these cases drive a real spawn against a
+    /// real ClickHouse. Its rule — `nosniff` ABSENT, no terminator — has
+    /// no live coverage at all and is pinned only by `pulsus-write`'s
+    /// hermetic
+    /// `zipkin_sink_error_container_omits_nosniff_and_terminator`.
+    ZipkinDecodeHttpError,
 }
 
 /// What a writer's reference says about `X-Content-Type-Options`.
 ///
-/// **Three-valued on purpose.** [`NosniffRule::Absent`] is a rule the
-/// reference gives us and must be asserted; [`NosniffRule::Unasserted`] is
-/// the ABSENCE of a rule, where two references sharing one responder
-/// disagree and issue #385 owns the question. Collapsing the two — which
-/// is what a `sets_nosniff() -> bool` does, since `false` has to stand for
-/// both — is the conflation that produced issue #264's round-one finding:
-/// an assertion dropped on a property the writers actually shared, which
-/// hid a genuinely missing header. Adding Tempo's frontend, whose rule IS
-/// absence, under that same spelling would have reintroduced it.
+/// **Two-valued since issue #385.** It was three-valued, with an
+/// `Unasserted` arm for "two references share one responder and disagree,
+/// so no rule can be derived". That reading was wrong: measured against
+/// both references, they AGREE on every pre-admission rejection, and the
+/// shared responder was simply missing two properties both of them set.
+///
+/// The distinction the three-valued shape drew is still real and is why
+/// this is an enum rather than a `sets_nosniff() -> bool`: [`Absent`] is a
+/// RULE the reference gives us and must be asserted, and collapsing it
+/// into a `false` that also means "no rule" is the conflation that
+/// produced issue #264's round-one finding — an assertion dropped on a
+/// property the writers actually shared, which hid a genuinely missing
+/// header. But no writer needs "no rule" any more, and a variant with no
+/// construction site fails the hermetic `route_inventory` build under
+/// `RUSTFLAGS: -D warnings` (`.github/workflows/ci.yml:30`), so it is
+/// removed rather than deprecated.
+///
+/// [`Absent`]: NosniffRule::Absent
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NosniffRule {
     /// The reference sets the header; assert it is present.
     Present,
     /// The reference sets no header; assert it is absent.
     Absent,
-    /// No reference-derived rule exists for this writer; assert nothing.
-    Unasserted,
 }
 
 impl PlainTextWriter {
@@ -468,15 +497,18 @@ impl PlainTextWriter {
     /// byte — see [`PlainTextWriter`]'s doc for the two axes.
     pub fn nosniff_rule(self) -> NosniffRule {
         match self {
-            // Go's `http.Error` and Loki's `WriteError` both set it.
-            PlainTextWriter::LogqlWriteError | PlainTextWriter::LokiPushHttpError => {
-                NosniffRule::Present
-            }
+            // Go's `http.Error` and Loki's `WriteError` both set it — and
+            // so, for their pre-admission rejections, do Prometheus's
+            // remote-write receiver and Tempo's Zipkin receiver, which
+            // route every one of them through `http.Error` too. Four
+            // writers, three references, one shared property; they are
+            // listed separately because agreeing is not being the same.
+            PlainTextWriter::LogqlWriteError
+            | PlainTextWriter::LokiPushHttpError
+            | PlainTextWriter::PromRemoteWriteHttpError
+            | PlainTextWriter::ZipkinDecodeHttpError => NosniffRule::Present,
             // Tempo's frontend sets no headers at all.
             PlainTextWriter::TempoFrontendResponse => NosniffRule::Absent,
-            // Two references, one responder, and they disagree — #385.
-            // Do NOT opportunistically promote this to `Absent`.
-            PlainTextWriter::WriterSideReceiver => NosniffRule::Unasserted,
         }
     }
 }
@@ -1398,7 +1430,7 @@ const REMOTE_WRITE_CASES: &[CaseClass] = &[CaseClass {
     name: "bad_snappy",
     build: rw_bad_snappy,
     expect_status: 400,
-    expect: ExpectedError::PlainText(PlainTextWriter::WriterSideReceiver),
+    expect: ExpectedError::PlainText(PlainTextWriter::PromRemoteWriteHttpError),
 }];
 
 // -- Loki push (issue #77, docs/api.md §8.2) ----------------------------
@@ -1455,6 +1487,14 @@ const LOKI_PUSH_CASES: &[CaseClass] = &[
 // likewise a 400. The success/async cells are exercised in
 // `assert_ingest_route`; these generic cases cover the two 400 plain-text
 // rows.
+//
+// The error-SHAPE oracle for those two rows is not openzipkin (issue
+// #385): our reference stack is Loki/Prometheus/Tempo, and Tempo accepts
+// Zipkin through the OTel Collector's Zipkin receiver. Measured on the
+// CI-pinned `grafana/tempo` v3.0.2 image, both of these classes — a
+// malformed body and an unsupported `Content-Encoding` — answer 400 in
+// Go's `http.Error` container. Hence `ZipkinDecodeHttpError`, whose doc
+// carries the citations.
 
 /// A body that is not a decodable Zipkin v2 JSON span array — a
 /// whole-request `ZipkinDecode` 400 plain-text (oracle: 400 "Expected a
@@ -1478,13 +1518,13 @@ const ZIPKIN_CASES: &[CaseClass] = &[
         name: "malformed_json",
         build: zipkin_malformed_json,
         expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::WriterSideReceiver),
+        expect: ExpectedError::PlainText(PlainTextWriter::ZipkinDecodeHttpError),
     },
     CaseClass {
         name: "unsupported_content_encoding",
         build: zipkin_unsupported_content_encoding,
         expect_status: 400,
-        expect: ExpectedError::PlainText(PlainTextWriter::WriterSideReceiver),
+        expect: ExpectedError::PlainText(PlainTextWriter::ZipkinDecodeHttpError),
     },
 ];
 
