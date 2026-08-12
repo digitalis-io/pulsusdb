@@ -176,6 +176,15 @@ clear
 - **Metric expected line:** `{labelset} <value>` (exact f64). A bare
   scalar result is a single bare `<value>` line. Ordered evals compare the
   vector positionally.
+- **Warning line (issue #277):** `warning: <text>` inside an
+  `eval`/`eval_ordered` block, one per expected response warning. The set
+  is compared for EXACT equality **including order**, because the
+  reference renders its warning set byte-lexicographically, so a case that
+  pins two warnings pins their sequence. A block with no `warning:` line
+  asserts the query emitted **none** — every pre-#277 case therefore
+  asserts silence. `warning:` on an `eval_fail` is a grammar error (that
+  verb owns `msg:`/`msg_exact:`, and a query that errors serves no
+  envelope to carry a warning).
 - **Dataset == query scope:** an eval replays every loaded line through the
   query pipeline (the stream selector is pushed to SQL in the real engine and
   is not re-applied here). Author each `load`…`clear` section so its streams
@@ -1020,3 +1029,90 @@ modelling, not yet in the DSL". The DSL now has it: an `sm{...}` token
 after a sample's offset, parsed by the same `parse_labelset` the stream
 header uses and rendered by the same `labels_to_json`. See
 `the_sm_dsl_token_round_trips_and_sm_braces_escape_a_literal_body`.
+
+## Issue #277 — the per-variant series cap (`b21_variant_series_cap.test`)
+
+- **Image:** `grafana/loki:3.7.4`, digest
+  `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`.
+  Identity read from the RUNNING process
+  (`/loki/api/v1/status/buildinfo` →
+  `{"version":"3.7.4","revision":"b318f282","branch":"release-3.7.x",...}`),
+  not from a header. Captured 2026-08-12 against a freshly-created
+  container on a private port.
+- **Config delta:** `limits_config.enable_multi_variant_queries: true`
+  (`ci/logql/config.yaml`, the same file `b10`/`b13` use) — the bare
+  container 400s every `variants(...)` query with `multi variant queries
+  are disabled for this instance`. `b21_variant_series_cap.test` is
+  therefore in `CONFIG_DELTA_FILES` and no row of it is replayed live.
+- **Dataset:** one stream `{service_name="v277"}`, 501 lines `id=<N>`,
+  100 ms apart, id `N` at DSL offset `(N+1)*100ms` (so id 0 at `100ms`,
+  id 500 at `50100ms`). Every line is inside the `[1m]` window at the
+  `at 60s` instant.
+- **Anchoring:** DSL `at 60s` was mapped to a wall clock instant on an
+  exact 60 s boundary, so the container's `/query_range` grid points
+  coincide with the DSL's — the `b15` anchoring rule, and it is what makes
+  the range cases' captured points correspond to DSL offsets at all.
+- **Reaching a group count:** by filtering the **COMMON** range,
+  `{service_name="v277"} | logfmt | id < N [1m]`. A bare variant's own
+  selector and filters are dead syntax (`b13_variants.test` case 3), so
+  filtering inside a variant changes nothing.
+- **Query shape:** variant 0 is `sum by (id) (count_over_time(C))` — one
+  series per surviving group, so it is the variant that walks the cap —
+  and variant 1 is `sum(count_over_time(C))`, exactly one series, so it is
+  the variant that survives a skip.
+
+### Generated, never transcribed
+
+Every expectation in the file was written by a script that reads the
+container's JSON response and renders corpus lines from it (the
+"generate the literal from the bytes" rule). The label sets drop
+`detected_level`/`detected_level_extracted`, which PulsusDB's label model
+has no analogue for; values are unaffected.
+
+### The measured boundary
+
+| grid | 498 | 499 | 500 | 501 |
+|---|---|---|---|---|
+| instant | served | served | served | **variant 0 skipped + warning** |
+| range, `from 60s to 120s step 30s` | served | served | **variant 0 skipped + warning** | variant 0 skipped + warning |
+| range, `from 60s to 60s step 30s` (single point) | — | served | served | variant 0 skipped + warning |
+
+The skipped variant is removed **entirely**, never truncated, and the
+status is **200** on every skip. The message is
+`maximum of series (500) reached for variant (0)` — note *"maximum of
+series"*, which is **not** the plain query's *"maximum number of
+series"*.
+
+**The single-step row is a correction to the plan's wording**, which said
+the reference skips at range-500 "at a single step as well as many". It
+does not: measured on this dataset a single-point grid serves 500. That is
+exactly what the missing `!ok` guard predicts —
+`multiVariantVectorsToSeries` (`pkg/logql/engine.go:474-508 @ v3.7.4
+b318f282`) tests `len(sm[variantLabel]) >= maxSeries` **before** looking up
+whether the incoming point's series already exists, so the delete can only
+fire when a later grid point revisits an already-counted series. Its own
+sibling `vectorsToSeriesWithLimit` (`:440-471`) has that guard.
+
+PulsusDB applies `> 500` uniformly, so it serves the range-500 case the
+reference drops (case 8). See
+`docs/benchmarks/logs-differential-ledger.md` entry (d).
+
+### The root-only rule, and the pair that pins it
+
+Corpus cases 3 and 10 differ **only** by a trailing `+ 1` and land on
+opposite verdicts:
+
+- case 3, `variants(…) of (…)` at 500 common groups → **200**, 501 result
+  series across two variants, no warning;
+- case 10, the identical expression `+ 1` → **400**
+  `maximum number of series (500) reached for a single query; consider
+  reducing query cardinality by adding more specific stream selectors,
+  reducing the time range, or aggregating results with functions like
+  sum(), count() or topk()`.
+
+Both captured. The cause is in the reference's own dispatch: it
+type-switches on the **root** expression (`pkg/logql/engine.go:321-322 @
+v3.7.4 b318f282`, "A VariantsExpr is a specific type of SampleExpr, so
+make sure this case is evaluated first") into `evalVariants` →
+`JoinMultiVariantSampleVector`, which caps per variant; every other root
+goes to `JoinSampleVector` and its plain cap.
