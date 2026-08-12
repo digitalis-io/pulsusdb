@@ -43,8 +43,10 @@ pub(crate) const MAX_TARGET_LABEL_BYTES: usize = 256;
 /// `defaultSince = 1 * time.Hour` (`pkg/loghttp/params.go:23 @ v3.7.4
 /// b318f282`).
 pub(crate) const DEFAULT_SINCE_NS: i64 = 3_600_000_000_000;
-/// `step`'s target point count when derived rather than supplied
-/// (architect plan: "derived `clamp((end-start)/250, >=1s)`").
+/// `step`'s target point count when derived rather than supplied — the
+/// `250` divisor of the reference's `defaultQueryRangeStep`
+/// (`pkg/loghttp/params.go:140-142 @ grafana/loki v3.7.4 b318f282`). See
+/// [`derive_step_ns`] for the rule the divisor sits inside.
 const DERIVED_STEP_TARGET_POINTS: i64 = 250;
 const ONE_SECOND_NS: u64 = 1_000_000_000;
 
@@ -519,9 +521,9 @@ pub(crate) fn parse_direction(raw: Option<&str>) -> Result<Direction, ParamError
 }
 
 /// `step` (query_range, metric queries only): a duration string or a
-/// plain-integer number of seconds; absent ⇒ derived
-/// `clamp((end-start)/250, >=1s)`; an explicit non-positive step is a
-/// `400` (architect plan "Param parsing").
+/// plain-integer number of seconds; absent ⇒ derived by [`derive_step_ns`]
+/// as `max(floor(span_seconds / 250), 1)` **whole seconds**; an explicit
+/// non-positive step is a `400` (architect plan "Param parsing").
 pub(crate) fn parse_step(raw: Option<&str>, start_ns: i64, end_ns: i64) -> Result<u64, ParamError> {
     match raw {
         None => Ok(derive_step_ns(start_ns, end_ns)),
@@ -573,11 +575,80 @@ pub(crate) fn parse_pattern_step(
     Ok(step)
 }
 
+/// `step` when the caller omits it: the reference's `defaultQueryRangeStep`,
+/// a whole number of SECONDS — never a fraction. Read from the local
+/// checkout at `grafana/loki v3.7.4` / `b318f282`:
+///
+/// ```text
+/// // pkg/loghttp/patterns.go:20 — /patterns derives its step through the
+/// // same shared helper as query_range
+/// calculatedStep, err := step(r, start, end)
+///
+/// // pkg/loghttp/params.go:122-126 — the helper, falling back when absent
+/// func step(r *http.Request, start, end time.Time) (time.Duration, error) {
+///     value := r.Form.Get("step")
+///     if value == "" {
+///         return time.Duration(defaultQueryRangeStep(start, end)) * time.Second, nil
+///     }
+///     return parseSecondsOrDuration(value)
+/// }
+///
+/// // pkg/loghttp/params.go:140-142 — whole seconds, via Floor, clamped to 1
+/// func defaultQueryRangeStep(start time.Time, end time.Time) int {
+///     return int(math.Max(math.Floor(end.Sub(start).Seconds()/250), 1))
+/// }
+/// ```
+///
+/// Container-measured on `grafana/loki@sha256:87f0a067…` (the digest
+/// `.github/workflows/ci.yml` pins) 2026-08-12, issue #425: a 1 h window
+/// derives `14s` — the reference's own `pkg/loghttp/params_test.go:34-38`
+/// expectation, *"should return 14s if input time range is 1h"* — a 501 s
+/// window `2s`, a 900 s window `3s`. We previously derived `span_ns / 250`
+/// **nanoseconds**, which pinned the point count at 251 and made the
+/// spacing arbitrary (a 499 s window: 500 points at `1s` there, 251 at
+/// `1.996s` here).
+///
+/// Go's arithmetic is reproduced rather than approximated by integer
+/// division, and the two are NOT the same function. `Duration.Seconds()`
+/// is `float64(sec) + float64(nsec)/1e9`, so past ~2^52 ns of span the sum
+/// rounds up and the float floors one second higher than integer division
+/// would. The disagreement is a widening interval `[bandLo(k), k·250e9)`
+/// just below each multiple of `250e9`, first non-empty at `k = 67_109`
+/// (spans of 194.18 days and up) and growing with the `f64` ULP: measured
+/// widths 1 ns at `k = 67_109`, 14 ns at `k = 1_000_000`, 238 ns at
+/// `k = 10_000_000`, 953 ns at `k = 36_893_488` (issue #425 sweep).
+/// MEASURED on the pinned image with `max_query_length: 0s` (the stock
+/// default `30d1h` refuses the span, so the wall was moved rather than
+/// reasoned around; derivation runs in param parsing, upstream of every
+/// limit and of the splitter): span `16_777_249_999_999_999` ns derives
+/// **67_109 s** there, where integer division gives 67_108. Reachable
+/// here, our only span bound being the five-year cap (issue #343). We
+/// implement the expression. The reference builds with go1.26.5
+/// (`go.mod:3`, `cmd/loki/Dockerfile:1 ARG GO_VERSION=1.26.5`), so that is
+/// the toolchain whose answer was measured.
+///
+/// Total, and cannot overflow or panic:
+/// * the span is `i64::saturating_sub`, matching Go's `time.Time.Sub`,
+///   which clamps rather than widening (the same saturation
+///   [`ensure_range_resolution`] already relies on);
+/// * a NEGATIVE span (only `/patterns` admits one — `patterns.rs` reads
+///   unordered bounds by design) yields a negative float, floors negative,
+///   and `max(1.0)` returns `1s`, which is what the reference returns for
+///   the same input;
+/// * the result is bounded above by `floor(i64::MAX / 1e9 / 250) =
+///   36_893_488` seconds, so the multiply into nanoseconds is at most
+///   3.69e16 and fits `u64` with four orders of magnitude to spare.
 fn derive_step_ns(start_ns: i64, end_ns: i64) -> u64 {
-    let span_ns = end_ns.saturating_sub(start_ns).max(0);
-    // `span_ns >= 0` (just clamped above), so this is a lossless widen.
-    let span_ns = span_ns as u64;
-    (span_ns / DERIVED_STEP_TARGET_POINTS as u64).max(ONE_SECOND_NS)
+    let span_ns = end_ns.saturating_sub(start_ns);
+    // Go's `Duration.Seconds()`, term for term: truncating `/` and `%` on
+    // both sides (Rust and Go agree — quotient truncates toward zero, the
+    // remainder takes the dividend's sign), so a negative span reproduces
+    // there too.
+    let secs = (span_ns / ONE_SECOND_NS as i64) as f64
+        + (span_ns % ONE_SECOND_NS as i64) as f64 / ONE_SECOND_NS as f64;
+    let step_s = (secs / DERIVED_STEP_TARGET_POINTS as f64).floor().max(1.0);
+    debug_assert!(step_s <= 36_893_488.0);
+    step_s as u64 * ONE_SECOND_NS
 }
 
 /// A minimal compound duration parser (`"30s"`, `"1m30s"`, or a bare
@@ -2087,6 +2158,328 @@ mod tests {
         assert_eq!(step, ONE_SECOND_NS);
     }
 
+    // -- Issue #425 Part B: the derived `step` is WHOLE SECONDS -----------
+    //
+    // `defaultQueryRangeStep` = `int(math.Max(math.Floor(
+    //  end.Sub(start).Seconds()/250), 1))`, multiplied by `time.Second`
+    // (`pkg/loghttp/params.go:140-142`, reached from `step()` at `:122-126`
+    // @ grafana/loki v3.7.4 `b318f282`).
+
+    /// AC 1 — the rule, at the values measured on the pinned reference
+    /// container (`grafana/loki@sha256:87f0a067…`, 2026-08-12).
+    ///
+    /// **Discriminator:** the 499 s and 501.5 s rows rule out the
+    /// fractional-nanosecond form this replaced (which gives 1.996 s and
+    /// 2.006 s) and any round-to-nearest spelling (2 s and 2 s). They do
+    /// **not** rule out whole-second integer division — every span here is
+    /// below the float band, where the two agree.
+    /// [`derive_step_reproduces_the_reference_float_arithmetic`] is the
+    /// test that supplies that discriminator; this one is not to be read as
+    /// covering it.
+    #[test]
+    fn derive_step_matches_the_reference_whole_second_rule() {
+        // (span_ns, expected step_ns) — the reference's measured answers.
+        let rows: &[(i64, u64)] = &[
+            (249_000_000_000, 1_000_000_000),    // 249 s   -> 1 s (clamp)
+            (250_000_000_000, 1_000_000_000),    // 250 s   -> 1 s
+            (499_000_000_000, 1_000_000_000),    // 499 s   -> 1 s  *
+            (500_000_000_000, 2_000_000_000),    // 500 s   -> 2 s
+            (501_000_000_000, 2_000_000_000),    // 501 s   -> 2 s  *
+            (501_500_000_000, 2_000_000_000),    // 501.5 s -> 2 s  *
+            (749_000_000_000, 2_000_000_000),    // 749 s   -> 2 s  *
+            (750_000_000_000, 3_000_000_000),    // 750 s   -> 3 s
+            (900_000_000_000, 3_000_000_000),    // 900 s   -> 3 s  *
+            (3_600_000_000_000, 14_000_000_000), // 1 h    -> 14 s *
+        ];
+        for (span_ns, want) in rows {
+            assert_eq!(
+                parse_step(None, 0, *span_ns).unwrap(),
+                *want,
+                "span {span_ns} ns"
+            );
+        }
+    }
+
+    /// AC 2 — the reference's arithmetic is `f64`, and that is observable.
+    ///
+    /// `Duration.Seconds()` is `float64(sec) + float64(nsec)/1e9`, so past
+    /// ~2^52 ns of span the sum rounds up and `math.Floor(…/250)` lands one
+    /// second above what whole-second integer division gives. All three
+    /// values below are the REFERENCE's own measured answers, captured on
+    /// the pinned image with `max_query_length: 0s` (the stock `30d1h`
+    /// default refuses a 194-day span with `400`; derivation happens in
+    /// param parsing, upstream of every limit and of the splitter, so
+    /// lifting the limit changes what the container will *answer*, never
+    /// how it derives). The reference builds with go1.26.5 (`go.mod:3`,
+    /// `cmd/loki/Dockerfile:1 ARG GO_VERSION=1.26.5`), so this is that
+    /// toolchain's answer, not a local reproduction of it.
+    ///
+    /// The first row is the discriminator: integer division gives 67_108
+    /// there. The two controls prove the test is not simply insensitive.
+    #[test]
+    fn derive_step_reproduces_the_reference_float_arithmetic() {
+        // `k·250e9 - 1` for k = 67_109 — inside the float band.
+        assert_eq!(
+            parse_step(None, 0, 16_777_249_999_999_999).unwrap(),
+            67_109 * ONE_SECOND_NS,
+            "float band: integer division would give 67_108 s"
+        );
+        // Control: `k·250e9`, where both rules agree.
+        assert_eq!(
+            parse_step(None, 0, 16_777_250_000_000_000).unwrap(),
+            67_109 * ONE_SECOND_NS
+        );
+        // Control: well below the band, where both rules agree.
+        assert_eq!(
+            parse_step(None, 0, 16_777_000_000_000_000).unwrap(),
+            67_108 * ONE_SECOND_NS
+        );
+    }
+
+    /// AC 3 — the derivation is total over the `i64` bounds: no overflow,
+    /// no panic, no `debug_assert!` trip (this runs in debug, so the
+    /// assertion in `derive_step_ns` is live).
+    #[test]
+    fn derive_step_is_total_over_the_i64_bounds() {
+        // The widest possible span saturates to `i64::MAX` ns, deriving the
+        // largest step any request can produce.
+        assert_eq!(
+            parse_step(None, i64::MIN, i64::MAX).unwrap(),
+            36_893_488 * ONE_SECOND_NS
+        );
+        // A NEGATIVE span — only `/patterns` admits one, by design. Go's
+        // float floors negative and `math.Max(_, 1)` returns 1 s.
+        assert_eq!(parse_step(None, i64::MAX, i64::MIN).unwrap(), ONE_SECOND_NS);
+        assert_eq!(parse_step(None, 0, 0).unwrap(), ONE_SECOND_NS);
+        assert_eq!(parse_step(None, 0, 1).unwrap(), ONE_SECOND_NS);
+        // A pre-1970 lower bound is the ordinary way to reach a very wide
+        // span; it derives from the span alone, like any other.
+        assert_eq!(
+            parse_step(None, i64::MIN + 1, 0).unwrap(),
+            parse_step(None, 0, i64::MAX).unwrap()
+        );
+    }
+
+    /// AC 4 — `/patterns` follows the same derivation, and moves exactly
+    /// where it should.
+    ///
+    /// `/patterns` derives its step through the SAME shared helper at the
+    /// reference: `ParsePatternsQuery` calls `step(r, start, end)`
+    /// (`pkg/loghttp/patterns.go:20` @ v3.7.4 `b318f282`), which falls back
+    /// to `defaultQueryRangeStep` (`params.go:122-126`). So this endpoint's
+    /// step moves TOWARD the reference here, and the old values recorded
+    /// below are a fix, not an invariant: at `k = 67_110` we served
+    /// `67_100 s` and the reference answers `67_110 s` (measured on the
+    /// pinned image with `max_query_length: 0s`, with controls one
+    /// nanosecond either side).
+    ///
+    /// It moves only where the float band straddles a multiple of 10 s:
+    /// for `3_682_638` values of `k`, all `≡ 0 (mod 10)`, covering
+    /// `1_331_549_145` spans (issue #425 exhaustive sweep). Groups 2 and 3
+    /// are the discriminators — a change that floors differently, or that
+    /// moves the whole band rather than the `k ≡ 0 (mod 10)` subset, fails
+    /// on them.
+    #[test]
+    fn pattern_step_follows_the_reference_derivation() {
+        const S: u64 = ONE_SECOND_NS;
+
+        // Group 1 — MOVES (the fix). Old value in the comment.
+        // k = 67_110, band width 1 ns. Was 67_100 s.
+        assert_eq!(
+            parse_pattern_step(None, 0, 16_777_499_999_999_999).unwrap(),
+            67_110 * S
+        );
+        // k = 1_000_000, band width 14 ns — both endpoints, to pin that the
+        // band is an interval and not a single point. Was 999_990 s.
+        assert_eq!(
+            parse_pattern_step(None, 0, 249_999_999_999_999_986).unwrap(),
+            1_000_000 * S
+        );
+        assert_eq!(
+            parse_pattern_step(None, 0, 249_999_999_999_999_999).unwrap(),
+            1_000_000 * S
+        );
+
+        // Group 2 — does NOT move, inside/beside the band.
+        // One nanosecond below that band's bottom.
+        assert_eq!(
+            parse_pattern_step(None, 0, 249_999_999_999_999_985).unwrap(),
+            999_990 * S
+        );
+        // In the float band, but k = 67_109 is not a multiple of 10, so the
+        // 10 s ingest-bucket floor absorbs the change.
+        assert_eq!(
+            parse_pattern_step(None, 0, 16_777_249_999_999_999).unwrap(),
+            67_100 * S
+        );
+
+        // Group 3 — does NOT move, ordinary spans: every span in AC 1's
+        // table, plus the `k`-boundary spans.
+        for span_ns in [
+            249_000_000_000i64,
+            250_000_000_000,
+            499_000_000_000,
+            500_000_000_000,
+            501_000_000_000,
+            501_500_000_000,
+            749_000_000_000,
+            750_000_000_000,
+            900_000_000_000,
+            3_600_000_000_000,
+            2_500_000_000_000,
+            2_999_000_000_000,
+        ] {
+            assert_eq!(
+                parse_pattern_step(None, 0, span_ns).unwrap(),
+                PATTERN_STEP_FLOOR_NS,
+                "span {span_ns} ns"
+            );
+        }
+        assert_eq!(
+            parse_pattern_step(None, 0, 30_000_000_000_000).unwrap(),
+            120 * S
+        );
+        assert_eq!(
+            parse_pattern_step(None, 0, 30_249_000_000_000).unwrap(),
+            120 * S
+        );
+    }
+
+    /// AC 6 — the `(end - start) / step > 11_000` resolution fence is never
+    /// tripped by a DERIVED step, and the point count never exceeds 500,
+    /// over every reachable span. Exhaustive, not sampled.
+    ///
+    /// Every span `s` lies in exactly one bucket `k = s / 250e9`. Its
+    /// derived step is `k` or `k+1` seconds — never less, the float only
+    /// ever rounds up — so
+    /// `points(s) = floor(s/step) + 1 <= floor(hi_k/(k·1e9)) + 1` where
+    /// `hi_k` is the bucket's top span. Checking that one bound per bucket
+    /// therefore bounds EVERY span in the bucket, on both sides of the
+    /// float band, not just the endpoints tested.
+    ///
+    /// The bound is computed in `i128` so the final bucket's unclamped
+    /// endpoint (`250·(k+1)·1e9 - 1` at `k = 36_893_488`, which exceeds
+    /// `i64::MAX`) cannot overflow rather than merely being avoided.
+    ///
+    /// The distribution of that bound is **asserted below, not described
+    /// here** — see `expected`. Its shape: **251 for 36_893_239 of the
+    /// 36_893_488 buckets**, so 251 is the ORDINARY value and not an
+    /// anomaly to be re-derived; 252 for 125; 121 more spread over
+    /// 253..=313; then 334 at `k = 3`, 375 at `k = 2`, and the maximum
+    /// **500 at `k = 1`**. The small-`k` end is where the interesting
+    /// cases live.
+    #[test]
+    fn derived_step_never_trips_the_11000_point_fence() {
+        const BUCKET: i128 = 250 * 1_000_000_000;
+        let mut worst = 0i128;
+        let mut worst_k = 0i128;
+        let mut hist = std::collections::BTreeMap::<i128, u64>::new();
+        for k in 1i128..=36_893_488 {
+            let hi_k = std::cmp::min(i64::MAX as i128, BUCKET * (k + 1) - 1);
+            let lo_k = BUCKET * k;
+
+            let hi_ns = hi_k as i64;
+            let lo_ns = lo_k as i64;
+            let hi_step = parse_step(None, 0, hi_ns).unwrap();
+            let lo_step = parse_step(None, 0, lo_ns).unwrap();
+            assert!(
+                ensure_range_resolution(0, hi_ns, hi_step).is_ok(),
+                "fence tripped at bucket k={k} top"
+            );
+            assert!(
+                ensure_range_resolution(0, lo_ns, lo_step).is_ok(),
+                "fence tripped at bucket k={k} bottom"
+            );
+
+            let bound = hi_k / (k * 1_000_000_000) + 1;
+            assert!(bound <= 500, "bucket k={k} bounds {bound} points");
+            if bound > worst {
+                worst = bound;
+                worst_k = k;
+            }
+            *hist.entry(bound).or_insert(0u64) += 1;
+        }
+        assert_eq!((worst, worst_k), (500, 1), "the maximum is 500, at k = 1");
+
+        // The distribution, asserted rather than described. It is written
+        // down because 251 reads like a special case and is not one — it is
+        // what 36_893_239 of the 36_893_488 buckets give — and because a
+        // histogram quoted in a comment is a claim nobody can check. Every
+        // pair below was read off this loop's own output; the totals are
+        // re-derived here so a typo cannot survive.
+        let expected: &[(i128, u64)] = &[
+            (251, 36_893_239),
+            (252, 125),
+            (253, 41),
+            (254, 21),
+            (255, 13),
+            (256, 8),
+            (257, 6),
+            (258, 4),
+            (259, 4),
+            (260, 3),
+            (261, 2),
+            (262, 2),
+            (263, 1),
+            (264, 2),
+            (265, 1),
+            (266, 1),
+            (267, 1),
+            (268, 1),
+            (270, 1),
+            (271, 1),
+            (273, 1),
+            (275, 1),
+            (278, 1),
+            (282, 1),
+            (286, 1),
+            (292, 1),
+            (300, 1),
+            (313, 1),
+            (334, 1), // k = 3
+            (375, 1), // k = 2
+            (500, 1), // k = 1 — the maximum
+        ];
+        assert_eq!(
+            hist,
+            expected.iter().copied().collect(),
+            "the per-bucket point-count distribution moved"
+        );
+        assert_eq!(
+            hist.values().sum::<u64>(),
+            36_893_488,
+            "the histogram must account for every bucket"
+        );
+        let mid: u64 = hist.range(253..=313).map(|(_, count)| *count).sum();
+        assert_eq!(mid, 121, "buckets bounded at 253..=313");
+
+        // The `k = 0` clamp region, where the step is pinned at 1 s.
+        for span_ns in [0i64, 1, 249_000_000_000, 249_999_999_999] {
+            let step = parse_step(None, 0, span_ns).unwrap();
+            assert_eq!(step, ONE_SECOND_NS, "span {span_ns} ns");
+            assert!(ensure_range_resolution(0, span_ns, step).is_ok());
+            let points = span_ns as u64 / step + 1;
+            assert!(points <= 250, "span {span_ns} ns yields {points} points");
+        }
+    }
+
+    /// AC 6(4) — the final span bucket is truncated at `i64::MAX`, and
+    /// yields **251** points: the ordinary per-bucket value, shared with
+    /// 36_893_239 of the 36_893_488 buckets. The outlier worth naming is at
+    /// the other end — `k = 1`, 500 points.
+    #[test]
+    fn final_span_bucket_is_truncated_at_the_i64_maximum() {
+        // The unclamped endpoint for k = 36_893_488 overflows `i64`:
+        // 250·(k+1)·1e9 - 1 = 9_223_372_249_999_999_999 > i64::MAX.
+        const BUCKET: i128 = 250 * 1_000_000_000;
+        assert!(BUCKET * (36_893_488 + 1) - 1 > i64::MAX as i128);
+
+        let step = parse_step(None, 0, i64::MAX).unwrap();
+        assert_eq!(step, 36_893_488 * ONE_SECOND_NS);
+        assert!(ensure_range_resolution(0, i64::MAX, step).is_ok());
+        assert_eq!(i64::MAX as u64 / step + 1, 251);
+    }
+
     #[test]
     fn parse_step_accepts_a_bare_integer_as_seconds() {
         assert_eq!(parse_step(Some("30"), 0, 0).unwrap(), 30_000_000_000);
@@ -2413,6 +2806,9 @@ mod tests {
             parse_step(get(&empty, "k"), start_ns, end_ns).unwrap(),
             parse_step(None, start_ns, end_ns).unwrap()
         );
+        // …and `14s` is a value, not just prose: the reference's own
+        // `pkg/loghttp/params_test.go:34-38` expectation (issue #425).
+        assert_eq!(parse_step(None, start_ns, end_ns).unwrap(), 14_000_000_000);
 
         // `/patterns`' step rides the same seam through `parse_step`.
         assert_eq!(

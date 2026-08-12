@@ -43,6 +43,10 @@ eval range from 0s to 60s step 20s count_over_time({service_name="checkout"}[10s
   {env="prod", service_name="checkout"} 40s 1 60s 1
 
 # --- start-anchored grid under an UNALIGNED T0 ------------------------
+# This row is the PIN for ledger `range-step-grid-start-anchored`
+# (issue #425 Part A, owner ruling 2026-08-12): the grid is anchored on
+# the request `start`, never floored/ceiled onto step multiples, so no
+# point escapes `[start, end]`. Reintroducing alignment fails here.
 # grid {7s,17s,27s,37s} (NOT epoch multiples), window (t-10s, t]:
 #   7s empty; 17s→{10s}=1; 27s→{25s}=1; 37s empty (25s≤27s excluded, 40s>37s)
 eval range from 7s to 37s step 10s count_over_time({service_name="checkout"}[10s])
