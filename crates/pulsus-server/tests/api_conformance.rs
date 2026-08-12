@@ -985,8 +985,22 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             );
         }
         (Surface::Echo, _) => {
-            // Issue #61: the constant Tempo echo — exact body, exact
+            // Issue #61: the constant echo — exact body, exact
             // content-type (axum's `&'static str` response).
+            //
+            // These four bytes pin a KNOWN DIVERGENCE, not parity.
+            // Tempo answers `echo\n` and sets
+            // `X-Content-Type-Options: nosniff`, because its handler is
+            // `http.Error(w, "echo", http.StatusOK)`
+            // (`cmd/tempo/app/modules.go:846-850` @ tempo v3.0.2
+            // `0c4b926d`) and Go's `http.Error` writes through
+            // `fmt.Fprintln` after setting the sniff header. Issue #405
+            // closed that as an accepted divergence on 2026-08-11 —
+            // nothing branches on a trailing newline or a sniff header
+            // over a four-byte constant — and this assertion is
+            // deliberately left asserting OUR bytes. Do not "fix" it
+            // towards the reference without reopening #405; see
+            // docs/api.md §8.1's `/api/echo` bullet.
             assert_eq!(
                 res.content_type(),
                 Some("text/plain; charset=utf-8"),
