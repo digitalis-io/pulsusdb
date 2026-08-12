@@ -40,16 +40,26 @@ use pulsus_traceql::{TraceQlError, parse};
 // #192 owned the 9 schema-blocked event/link/instrumentation-scope
 // constructs (the residual interim set after the M7-TQ6 closeout, issue
 // #185); its final PR-C flipped the last 3 to `supported`, so the interim
-// set is now EMPTY. The closeout gate (`interim_entries_are_allowlisted`)
-// therefore enforces `interim_count == 0`: any newly-added interim
-// disposition would name an issue absent from the (empty) allowlist and go
-// RED. Re-populate both lists in lockstep if a future issue reopens an
-// interim gap.
-const VALID_ISSUES: [u64; 0] = [];
+// set was EMPTY and this pair of lists was empty with it — the gate
+// reading as a hard `interim_count == 0`. The comment left there said to
+// re-populate both in lockstep if a future issue reopened an interim gap,
+// and #335 Stage D0 is that issue.
+//
+// **It reopened for a reason worth stating, because it is the registry
+// doing its job.** The registry is built from the REFERENCE's construct
+// list, so it can now carry a construct we do not implement: the span
+// kind `unspecified` (`expr.y:436`) and the `minInt`/`maxInt` statics
+// (`expr.y:442-452`) are three spellings the reference resolves and our
+// parser refuses. Before the Stage D0 split there was no entry for any of
+// them — `static.kind_enum` listed six spellings, probed one, and was
+// dispositioned `supported`, so an absence had nothing to be a
+// disposition ON. Naming them as tracked interim gaps owned by #335 is
+// what makes them visible; Stage D1 fixes all three and empties both
+// lists again.
+const VALID_ISSUES: [u64; 1] = [335];
 // The committed open-issue allowlist the strict closeout gate enforces:
-// every interim entry's owning_issue must be in it. Empty now that #192
-// closed out the last interim constructs — the gate is a hard `interim == 0`.
-const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[];
+// every interim entry's owning_issue must be in it.
+const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[335];
 const DOCS_PREFIX: &str = "https://grafana.com/docs/tempo/";
 const REPO_PREFIX: &str = "https://github.com/digitalis-io/pulsusdb/";
 
@@ -573,12 +583,21 @@ fn differential_categories_are_pinned() {
     // tracked_interim 9 → 6), PR-B the 3 span-event constructs (106 → 109,
     // tracked_interim 6 → 3), PR-C the 3 span-link constructs (109 → 112,
     // tracked_interim 3 → 0). The interim set is now empty.
+    // #335 Stage D0: `static.kind_enum` (one `supported` row carrying six
+    // spellings and one probe) became six per-spelling constructs — five
+    // `supported` with corpus evidence, plus `static.kind_unspecified` —
+    // and `static.min_int` / `static.max_int` were ADDED, because the
+    // registry is built from the reference's list and could not previously
+    // see a construct we never implemented. So `supported` 112 − 1 + 5 =
+    // 116, and the three spellings the reference resolves and we refuse
+    // are the first tracked interim gaps since #192 emptied the set.
+    // Stage D1 fixes all three and returns this to 119 / 0.
     assert_eq!(
-        supported, 112,
+        supported, 116,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(
-        tracked_interim, 0,
+        tracked_interim, 3,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(
@@ -601,6 +620,151 @@ fn differential_categories_are_pinned() {
             );
         }
     }
+}
+
+/// **A construct whose `syntax` enumerates spellings must probe every one
+/// of them** (issue #335 Stage D0).
+///
+/// The defect this closes, exactly: `static.kind_enum` declared
+/// `client|server|producer|consumer|internal|unspecified` in `syntax`,
+/// carried the single probe `{ kind = consumer }`, and was dispositioned
+/// `supported`. Five of the six spellings had no check at all, and one of
+/// those five — `unspecified` — is a value the reference accepts and our
+/// parser refused. **A claim whose subject is a SET, verified on one
+/// member.** Nothing in the registry could see it, because the registry
+/// asked whether the construct's probe parses, and it did.
+///
+/// The rule is general and carries no exemption: split `syntax` on `|`,
+/// and if every part is a bare identifier-shaped spelling, every part must
+/// occur in the probe. Two constructs whose `syntax` named a CATEGORY in a
+/// single bare word (`integer`, `float`) were reworded to `integer
+/// literal` / `float literal` — matching `duration literal`, which already
+/// read that way — so the rule needs no carve-out for them. An exemption
+/// is where the next instance of a defect lives.
+///
+/// *RED when:* a spelling is listed in `syntax` with no probe covering it.
+#[test]
+fn every_enumerated_spelling_in_a_construct_syntax_has_a_probe() {
+    let registry = load_registry();
+    let mut faults = Vec::new();
+    for c in &registry.constructs {
+        let parts: Vec<&str> = c.syntax.split('|').map(str::trim).collect();
+        let spellings = parts.iter().all(|p| {
+            !p.is_empty()
+                && p.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                && p.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '.')
+        });
+        if !spellings {
+            continue;
+        }
+        for p in parts {
+            if !c.probe.contains(p) {
+                faults.push(format!(
+                    "{}: `syntax` declares the spelling {p:?} and the probe {:?} does not \
+                     exercise it",
+                    c.id, c.probe
+                ));
+            }
+        }
+    }
+    assert!(
+        faults.is_empty(),
+        "{} construct(s) declare a spelling nothing probes — a claim whose subject is a set, \
+         checked on a subset:\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+}
+
+/// The two `by(...)` productions are separately declared AND separately
+/// probed (issue #335 Stage D0).
+///
+/// TraceQL has two constructs sharing one keyword: the spanset
+/// `groupOperation` (`expr.y:177-179` — ONE full field expression) and
+/// the metrics `by(...)`, which is `attributeList` (`expr.y:195-198` — a
+/// comma list of attributes). The accept-surface audit's PROVENANCE
+/// described the metrics one while claiming to describe both, in a row
+/// backed only by metrics probes, and the reference's real spanset
+/// behaviour was invisible for four stages. The registry must not repeat
+/// that: each construct's probe has to route to its OWN production.
+#[test]
+fn the_two_by_productions_are_probed_separately() {
+    let registry = load_registry();
+    let probe = |id: &str| -> String {
+        registry
+            .constructs
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("{id} must be a registry construct"))
+            .probe
+            .clone()
+    };
+    let pipeline = probe("pipeline.by");
+    let metrics = probe("metrics.by");
+    assert_ne!(
+        pipeline, metrics,
+        "the spanset `by()` and the metrics `by()` are different productions and may not share a \
+         probe"
+    );
+    const METRICS_HEADS: [&str; 3] = ["rate(", "_over_time(", "count_over_time("];
+    assert!(
+        !METRICS_HEADS.iter().any(|h| pipeline.contains(h)),
+        "pipeline.by's probe {pipeline:?} runs through a metrics function, so it exercises \
+         attributeList rather than groupOperation — the exact conflation this test exists to \
+         stop"
+    );
+    assert!(
+        METRICS_HEADS.iter().any(|h| metrics.contains(h)),
+        "metrics.by's probe {metrics:?} has no metrics function, so it does not reach the \
+         attributeList production it claims"
+    );
+}
+
+/// **A `supported` disposition with no evidence is a claim with no
+/// witness** (issue #335 Stage D0). 33 of the 116 rows carried
+/// `evidence: []` while claiming `supported` — 29% — and
+/// `static.kind_enum` was one of them, which is why five span-kind
+/// spellings and a whole missing static could sit there unnoticed.
+///
+/// The ceiling may only be LOWERED, and lowering it is a visible
+/// source-line edit. This is the hermetic half; the CI half
+/// (`conformance-evidence-debt` in `ci.yml`) computes the same debt as a
+/// SET DIFFERENCE against `origin/main` and fails on any arrival, so a
+/// new row cannot be admitted by raising a number. Two halves because
+/// neither alone is enough: a count cannot see a compensating swap, and
+/// a set difference cannot run in a hermetic test.
+///
+/// *RED when:* a `supported` row lands with `evidence: []` and the
+/// ceiling is not lowered to match, or the ceiling is raised.
+#[test]
+fn every_supported_disposition_has_evidence_or_is_declared_debt() {
+    /// Measured, not predicted: 33 before Stage D0, 32 after it retired
+    /// `static.kind_enum` into six per-spelling constructs with corpus
+    /// evidence on the five we support.
+    const EVIDENCE_DEBT_CEILING: usize = 32;
+    let disp = load_dispositions();
+    let debt: Vec<&str> = disp
+        .entries
+        .iter()
+        .filter(|d| d.status == Status::Supported && d.evidence.is_empty())
+        .map(|d| d.construct.as_str())
+        .collect();
+    assert!(
+        debt.len() <= EVIDENCE_DEBT_CEILING,
+        "{} `supported` disposition(s) carry no evidence, over the ceiling of \
+         {EVIDENCE_DEBT_CEILING}. A claim with no witness is what let a six-spelling construct \
+         ship on one member's probe — give the new row evidence, do not raise the ceiling:\n{}",
+        debt.len(),
+        debt.join("\n")
+    );
+    assert_eq!(
+        debt.len(),
+        EVIDENCE_DEBT_CEILING,
+        "the evidence debt FELL to {} without the ceiling moving with it. Lower \
+         EVIDENCE_DEBT_CEILING in the same change, or the gate quietly stops being tight",
+        debt.len()
+    );
 }
 
 #[test]

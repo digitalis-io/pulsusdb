@@ -105,6 +105,9 @@ accept/spanset_and
 accept/spanset_or
 accept/spanset_parens
 accept/spanset_precedence
+accept/static_kind_client
+accept/static_kind_consumer
+accept/static_kind_internal
 accept/string_escape_hex
 accept/string_escape_octal
 accept/string_escape_unicode
