@@ -266,7 +266,14 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // empty where it does not), so refusing it was a divergence
         // dressed as safety. Both out, none in: 18 stands, and so do
         // #240's sweep numbers.
-        ("plan.rs", 16),
+        // Issue #400 Stage 2 adds `LabelReplaceSpec::compile`'s
+        // reject-only pre-check, taken on the UNREWRITTEN pattern before
+        // `re2_pattern_to_rust` runs. #240's sweep numbers stand: the
+        // refusal keeps the site's existing `invalid regex in
+        // label_replace: ` prefix and quotes no reference-verbatim text,
+        // and the WRAPPED-form reporting (#276) is on the other branch,
+        // untouched.
+        ("plan.rs", 17),
         ("exec.rs", 12),
         ("client_agg.rs", 1),
         ("fold.rs", 1),
@@ -1913,7 +1920,11 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// behaviour beside it as a `# reference:` annotation rather than as a
 /// `divergence(...)` marker, because the row's own expectation is still a
 /// capture of the reference's values — only the skip DECISION is ours.
-const CAPTURED: usize = 1_427;
+/// Issue #400's second stage added `b25_re2_reject_parity.test`, whose
+/// rows are all `captured`: its `eval` controls and its `eval_fail` rows
+/// were each measured on `pulsus-c400-loki` (the pinned digest) at the
+/// query text committed in the file, on the date its header records.
+const CAPTURED: usize = 1_441;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1933,9 +1944,10 @@ const DERIVED: usize = 31;
 /// ported reference order — the reference specifies none.
 const DIVERGENCE: usize = 30;
 const PORTED: usize = 30;
-/// Issue #249 grew this by `b25_structured_metadata.test`'s rows, and
-/// issue #277 by `b21_variant_series_cap.test`'s.
-const TOTAL: usize = 1_518;
+/// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
+/// #277 by `b21_variant_series_cap.test`'s, and issue #400's second
+/// stage by `b25_re2_reject_parity.test`'s.
+const TOTAL: usize = 1_532;
 // corpus-counts: end (provenance-corpus-constants)
 
 // ---------------------------------------------------------------------

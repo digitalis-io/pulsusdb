@@ -27,6 +27,13 @@
 //!   user-supplied pattern in the workspace compiles through, bounding
 //!   what compiling it may allocate before it allocates it. See
 //!   `compile_budget`'s module doc.
+//! * [`re2_definitely_rejects`] (#400 Stage 2) — the reject-only
+//!   pre-check LogQL's compile seams consult BEFORE compiling a pattern,
+//!   for the constructs where a successful compile is the wrong answer
+//!   rather than a slow one. Deliberately INDEPENDENT of the acceptance
+//!   screen: it touches neither [`scan`] nor
+//!   [`pattern_requires_re2_authority`], so the frozen
+//!   `screen_verdicts.txt` baseline cannot move by construction.
 //!
 //! # Why three values
 //!
@@ -68,11 +75,32 @@
 //! `screen_verdicts.txt` corpus — otherwise review of THIS CRATE is
 //! the only guard. The mechanism that would close that is #336's
 //! RE2-syntax parser, deliberately not built here.
+//!
+//! **Issue #400 Stage 2 changed what the paragraph above enumerates,
+//! and the distinction is easy to lose.** The six `Undecidable` SITES
+//! and their classes are unchanged — nothing in [`scan`] moved. What
+//! changed is that [`re2_verdict`] consults
+//! [`re2_definitely_rejects`] FIRST, so eight of the fourteen rows the
+//! census used to carry now answer `Rejects` before the scan is
+//! reached. **The site census is therefore no longer the `Unknown`
+//! set**: it is the set of places the scan defers, of which the ones
+//! that still SURFACE as `Unknown` are those no rule decides. Three
+//! sites are decided in full and their rows were deleted with the
+//! reason written at the deletion
+//! (`every_unknown_return_site_has_a_named_class_representative`); two
+//! survive with a substituted representative, because deleting a
+//! surviving site's row is exactly how a site loses its cover
+//! unnoticed.
 
 use std::borrow::Cow;
 
 mod compile_budget;
 mod re2_syntax;
+mod unicode_property_names;
+
+pub use unicode_property_names::{
+    go_unicode_property_name_count, go_unicode_property_names, is_go_unicode_property_name,
+};
 
 pub use compile_budget::{
     MAX_REGEX_COMPILE_TRANSIENT_BYTES, REGEX_PROGRAM_SIZE_LIMIT, RegexCompileError,
@@ -109,6 +137,13 @@ pub enum Re2Verdict {
     /// accept, which is why docs/api.md §9.3 can list rows reachable on
     /// no route but trace validation. Membership of either direction is
     /// §9.3 and §9.4; do not re-enumerate it here.
+    ///
+    /// **Since #400 Stage 2 this is NOT the scan's deferral set.**
+    /// [`re2_definitely_rejects`] is consulted first, so the eight rule
+    /// families it decides answer [`Re2Verdict::Rejects`] however the
+    /// scan would have classified them. `Unknown` is what is left: a
+    /// deferral no rule reaches. `\p{L}` still lands here (the name IS
+    /// in `unicodeTable`) while `\p{Alphabetic}` no longer does.
     Unknown,
 }
 
@@ -131,6 +166,14 @@ pub enum Re2Verdict {
 ///    containment, so a false hit costs an `Unknown`, never a
 ///    rejection), else `Rejects`.
 pub fn re2_verdict(pattern: &str) -> Re2Verdict {
+    // Issue #400 Stage 2: the DECIDABLE rejections come first. Eight of
+    // this function's `Unknown` answers were "the Rust crate accepts it
+    // and only a real RE2 knows" — for the eight rule families below the
+    // reference's own parser settles it in-process, so the verdict is
+    // taken here rather than deferred.
+    if re2_definitely_rejects(pattern) {
+        return Re2Verdict::Rejects;
+    }
     match scan(pattern) {
         Scan::Undecidable => Re2Verdict::Unknown,
         Scan::JointReject => Re2Verdict::Rejects,
@@ -166,6 +209,538 @@ fn rust_rejects_beyond_its_remit(pattern: &str) -> bool {
     let b = pattern.as_bytes();
     b.windows(2)
         .any(|w| w[0] == b'\\' && (w[1] == b'Q' || w[1] == b'E' || (b'0'..=b'7').contains(&w[1])))
+}
+
+/// Constructs RE2 decidably REJECTS (issue #400 Stage 2).
+///
+/// The reason the function exists is the subset RE2 rejects and the Rust
+/// `regex` crate ACCEPTS — that is the divergence, and it is the one that
+/// serves a query the reference refuses while reading it as a different
+/// pattern (`a**` as `(a*)*`, `[[:foo:]]` as a class of `:`/`f`/`o`; the
+/// readings are pinned by `tests/re2_reject_classes.rs`'s
+/// `the_rust_crate_reads_these_as_a_different_pattern`). But rejecting is
+/// **not conditioned on the Rust side**, so a joint rejection the rules
+/// also catch (`\p{Word}`, `\p{}`) answers `true` here and merely
+/// re-attributes an outcome that was already agreement.
+///
+/// Independent of the acceptance SCREEN: [`scan`] and
+/// [`pattern_requires_re2_authority`] are untouched by this, so
+/// `pulsus-read`'s committed `screen_verdicts.txt` baseline cannot move —
+/// by construction rather than by assertion. One left-to-right byte scan;
+/// no allocation, no compilation.
+///
+/// **Conservative in ONE direction only.** A `false` costs nothing (the
+/// compile decides, as today); a `true` REFUSES a query, so every rule
+/// carries a control set of patterns the reference is measured to serve
+/// (criterion 10) and the whole rule set is swept over the frozen 4,315-
+/// pattern `re2_screen` corpus with every flagged pattern put to the
+/// pinned container individually (criterion 21). Where a read is not
+/// confident the scan declines rather than guessing.
+///
+/// # The rules, and where each comes from
+///
+/// | # | rule | reference |
+/// |---|---|---|
+/// | 0 | the pattern contains `\Q` → `false`, no opinion | `\Q…\E` is literal, so no rule may fire inside one |
+/// | a | a repetition applied to a repetition | `ErrInvalidRepeatOp`, `parse.go:414 @ v3.7.4` |
+/// | b | a `{n,m}` bound above [`RE2_MAX_REPEAT`] | `ErrInvalidRepeatSize`, `parse.go:436` |
+/// | c | a `(?…` flag run carrying `u`, `x` or `R` | `parsePerlFlags` takes `i m s U - : )` only, `parse.go:1142-1253` |
+/// | d | a `\u`/`\U` escape, bare or in a class | `ErrInvalidEscape`, `parse.go:1559` |
+/// | e | an unknown POSIX class name inside a class | `posixGroup`, `perl_groups.go:105-134`; `ErrInvalidCharRange`, `parse.go:1610` |
+/// | f | a `\p{…}`/`\P{…}`/`\pL` name outside [`is_go_unicode_property_name`] | `unicodeTable`, `parse.go:1646-1658`; raised at `:1707` |
+/// | g | inside a class, a `-` in range-operator position immediately followed by an unescaped `-`, where the preceding single char is `> 0x2D` | `ErrInvalidCharRange`, `parse.go:1815` |
+/// | h | a `(?P<name>`/`(?<name>` whose name carries a byte outside `[A-Za-z0-9_]` | `isValidCaptureName`, `parse.go:1261-1272`, raised at `:1185` |
+///
+/// Rule 0 is a conservative BAIL-OUT rather than region tracking, the
+/// same shape as [`rust_rejects_beyond_its_remit`]: 27 of the first
+/// draft's false rejections were constructs sitting inside a `\Q…\E`
+/// region, where the reference reads them as literal text and answers
+/// `200`. A false `false` costs nothing, and at the LogQL surface costs
+/// nothing at all — the Rust crate refuses `\Q` outright.
+///
+/// Rule (g) is a RANGE rule and not a double-dash rule. `[!--b]`,
+/// `[+--b]`, `[ --a]`, `[--a]`, `[--]`, `[a-z--b]`, `[\w--a]`,
+/// `[a\--b]`, `[[:alpha:]--b]` and `[\n--b]` are all `200` at the
+/// reference, and a "literal `--` is invalid" reading refuses every one
+/// of them.
+#[must_use]
+pub fn re2_definitely_rejects(pattern: &str) -> bool {
+    re2_rejection_construct(pattern).is_some()
+}
+
+/// The construct that made [`re2_definitely_rejects`] answer `true`, as a
+/// short noun phrase, or `None` when no rule fires.
+///
+/// It exists for ONE reason: the LogQL seams' refusal message names the
+/// construct rather than restating the engine's prose, and a `bool`
+/// cannot carry that. No parity is claimed for the text — #246's owner
+/// rulings (2026-07-26, 2026-08-08) pin the status and the accept/reject
+/// decision only. Same single scan, same absence of allocation.
+#[must_use]
+pub fn re2_rejection_construct(pattern: &str) -> Option<&'static str> {
+    let b = pattern.as_bytes();
+    // Rule 0. Substring containment on purpose, so an escaped `\\Q` also
+    // bails — that only widens the no-opinion set, which is the safe
+    // direction.
+    if b.windows(2).any(|w| w[0] == b'\\' && w[1] == b'Q') {
+        return None;
+    }
+    let mut i = 0;
+    let mut prev = Prev::Nothing;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => match escape_at(b, i) {
+                Escape::Rejects(what) => return Some(what),
+                Escape::Consumed(next) => {
+                    i = next;
+                    prev = Prev::Atom;
+                }
+            },
+            b'[' => match class_at(b, i) {
+                ClassScan::Rejects(what) => return Some(what),
+                ClassScan::Consumed(next) => {
+                    i = next;
+                    prev = Prev::Atom;
+                }
+            },
+            b'(' if b.get(i + 1) == Some(&b'?') => match group_head_at(b, i) {
+                GroupHead::Rejects(what) => return Some(what),
+                GroupHead::Consumed(next) => {
+                    i = next;
+                    prev = Prev::Nothing;
+                }
+            },
+            b'(' | b'|' => {
+                i += 1;
+                prev = Prev::Nothing;
+            }
+            // Rule (a), the `*`/`+` half.
+            b'*' | b'+' => {
+                if matches!(prev, Prev::Repeat | Prev::LazyRepeat) {
+                    return Some(REPEAT_OF_REPEAT);
+                }
+                i += 1;
+                prev = Prev::Repeat;
+            }
+            b'?' => {
+                match prev {
+                    // The non-greedy marker — legal in both engines.
+                    Prev::Repeat => prev = Prev::LazyRepeat,
+                    // Rule (a), the lazy-chain half.
+                    Prev::LazyRepeat => return Some(REPEAT_OF_REPEAT),
+                    _ => prev = Prev::Repeat,
+                }
+                i += 1;
+            }
+            b'{' => match parse_repetition(b, i + 1) {
+                Some(Repetition { end, over_max }) => {
+                    // Rule (b), then rule (a)'s `{n,m}`-after-repetition
+                    // half.
+                    if over_max {
+                        return Some(OVER_MAX_REPEAT);
+                    }
+                    if matches!(prev, Prev::Repeat | Prev::LazyRepeat) {
+                        return Some(REPEAT_OF_REPEAT);
+                    }
+                    i = end + 1;
+                    prev = Prev::Repeat;
+                }
+                // Not a well-formed repetition: a literal brace in RE2
+                // (`a{bbb}c`, `a{,5}`, `a{}` are all `200` there).
+                None => {
+                    i += 1;
+                    prev = Prev::Atom;
+                }
+            },
+            _ => {
+                i += 1;
+                prev = Prev::Atom;
+            }
+        }
+    }
+    None
+}
+
+// The construct names the LogQL seams' refusal message carries. Short
+// noun phrases, one per rule; no parity is claimed for the text.
+const REPEAT_OF_REPEAT: &str = "a repetition applied to a repetition";
+const OVER_MAX_REPEAT: &str = "a repetition bound above RE2's limit of 1000";
+const RUST_ONLY_FLAG: &str = "a `(?x`/`(?u`/`(?R` group flag RE2 does not have";
+const RUST_ONLY_ESCAPE: &str = "a `\\u`/`\\U` escape RE2 does not have";
+const UNKNOWN_POSIX_CLASS: &str = "an unrecognised POSIX character class name";
+const UNKNOWN_PROPERTY: &str = "an unrecognised Unicode property name";
+const INVERTED_DASH_RANGE: &str = "a character-class range whose end is below its start";
+const INVALID_CAPTURE_NAME: &str = "a capture name outside [A-Za-z0-9_]";
+
+/// What reading one escape produced: a decidable rejection, or the index
+/// just past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escape {
+    Rejects(&'static str),
+    Consumed(usize),
+}
+
+/// Reads the escape at `b[i]` (a backslash) OUTSIDE a character class,
+/// applying rules (d) and (f).
+///
+/// **A brace-form escape is consumed WHOLE** — `\x{…}`, `\p{…}`, `\P{…}`,
+/// `\b{…}`, `\B{…}`. This is not a nicety: a naive `i += 2` leaves `{41}`
+/// of `\x{41}` to be read as a repetition, so `\x{41}{2}` and `\p{L}{2}`
+/// — both `200` at the reference — would fire rule (a). That was the
+/// second of the two first-draft false-rejection causes.
+fn escape_at(b: &[u8], i: usize) -> Escape {
+    match b.get(i + 1) {
+        // A trailing backslash: `ErrTrailingBackslash` there and an
+        // error in the Rust crate too — already agreement, so no rule
+        // needs to claim it.
+        None => Escape::Consumed(i + 1),
+        // Rule (d). RE2 has no `\u`/`\U` escape in any spelling:
+        // `A`, `\u{263A}`, `\U00000041`, `\U0001F600` and
+        // `\U{1F600}` are each `invalid escape sequence` there, while the
+        // Rust crate compiles all of them.
+        Some(b'u' | b'U') => Escape::Rejects(RUST_ONLY_ESCAPE),
+        // Rule (f).
+        Some(b'p' | b'P') => property_escape_at(b, i),
+        // The brace-form escapes that are NOT properties.
+        Some(b'x' | b'b' | b'B') if b.get(i + 2) == Some(&b'{') => {
+            Escape::Consumed(brace_end(b, i + 2))
+        }
+        // The backslash plus ONE RUNE, so a multi-byte escaped character
+        // cannot leave the scan straddling a code point.
+        Some(&c) => Escape::Consumed((i + 1 + utf8_len(c)).min(b.len())),
+    }
+}
+
+/// The index just past the `}` closing the brace opened at `open`, or the
+/// end of the pattern when there is none.
+fn brace_end(b: &[u8], open: usize) -> usize {
+    match b[open..].iter().position(|&c| c == b'}') {
+        Some(off) => open + off + 1,
+        None => b.len(),
+    }
+}
+
+/// Rule (f): `b[i]` is the backslash of a `\p`/`\P` escape.
+///
+/// Mirrors `parseUnicodeClass` (`parse.go:1663-1708 @ v3.7.4`): a
+/// single-letter form `\pL`, or a braced form whose name runs to the
+/// FIRST `}` anywhere in the remainder — then a single leading `^` is
+/// stripped and the sign flipped (`parse.go:1698-1701`), so `\p{^L}` is
+/// `\P{L}` and is SERVED. The name that survives that stripping is what
+/// `unicodeTable` is asked about.
+fn property_escape_at(b: &[u8], i: usize) -> Escape {
+    match b.get(i + 2) {
+        // `\p` at the end of the pattern: `ErrInvalidCharRange` there,
+        // and the Rust crate rejects it too — agreement, and the rule
+        // declines rather than re-attributing a truncation.
+        None => Escape::Consumed(b.len()),
+        Some(b'{') => {
+            let Some(off) = b[i + 3..].iter().position(|&c| c == b'}') else {
+                // No `}` at all: `ErrInvalidCharRange` there and an error
+                // in the Rust crate — agreement, and the name cannot be
+                // read, so decline.
+                return Escape::Consumed(b.len());
+            };
+            let end = i + 3 + off;
+            let name = &b[i + 3..end];
+            if property_name_rejects(name) {
+                Escape::Rejects(UNKNOWN_PROPERTY)
+            } else {
+                Escape::Consumed(end + 1)
+            }
+        }
+        Some(_) => {
+            // Single-letter form: `parseUnicodeClass` takes ONE RUNE, not
+            // one byte, so `\pé` is the name `é`.
+            let rest = &b[i + 2..];
+            let len = utf8_len(rest[0]);
+            let end = (i + 2 + len).min(b.len());
+            if property_name_rejects(&b[i + 2..end]) {
+                Escape::Rejects(UNKNOWN_PROPERTY)
+            } else {
+                Escape::Consumed(end)
+            }
+        }
+    }
+}
+
+/// `true` when `unicodeTable` would answer `nil` for this raw property
+/// name — i.e. the reference raises `ErrInvalidCharRange`.
+///
+/// An empty name (`\p{}`) is a rejection there; so is a bare `^`
+/// (`\p{^}`), because stripping it leaves nothing for the table.
+fn property_name_rejects(raw: &[u8]) -> bool {
+    let name = match raw.first() {
+        Some(b'^') => &raw[1..],
+        _ => raw,
+    };
+    match std::str::from_utf8(name) {
+        Ok(name) => !is_go_unicode_property_name(name),
+        // Not UTF-8: `checkUTF8` refuses it there and the Rust crate
+        // cannot hold it either — but this scan is handed a `&str`, so
+        // the arm is unreachable in practice and declines rather than
+        // guessing.
+        Err(_) => false,
+    }
+}
+
+/// The byte length of the UTF-8 sequence `first` opens. A continuation
+/// byte answers 1 so a scan that ever lands mid-rune re-synchronises
+/// instead of stepping over the next construct.
+fn utf8_len(first: u8) -> usize {
+    match first {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
+/// What reading one `(?…` head produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupHead {
+    Rejects(&'static str),
+    Consumed(usize),
+}
+
+/// Rules (c) and (h): `b[i]` is a `(` followed by a `?`.
+///
+/// `parsePerlFlags` (`parse.go:1142-1253 @ v3.7.4`) tries the three named
+/// -capture spellings first and otherwise reads a flag run.
+fn group_head_at(b: &[u8], i: usize) -> GroupHead {
+    // Go: `startsWithP := len(t) > 4 && t[2] == 'P' && t[3] == '<'` and
+    // `startsWithName := len(t) > 3 && t[2] == '<'`, with `t` starting at
+    // the `(` — so the shorter forms fall through to the flag run.
+    let t = &b[i..];
+    let starts_with_p = t.len() > 4 && t[2] == b'P' && t[3] == b'<';
+    let starts_with_name = t.len() > 3 && t[2] == b'<';
+    if starts_with_p || starts_with_name {
+        let name_start = if starts_with_p { 4 } else { 3 };
+        // Go takes the FIRST `>` in the whole remainder, not the first
+        // inside the head.
+        let Some(off) = t.iter().position(|&c| c == b'>') else {
+            // `ErrInvalidNamedCapture` there and an error in the Rust
+            // crate — agreement; decline.
+            return GroupHead::Consumed(b.len());
+        };
+        let name = &t[name_start..off];
+        // Rule (h). An EMPTY name is `(?P<>a)`, which the Rust crate also
+        // refuses, so the rule does not claim it.
+        if !name.is_empty()
+            && name
+                .iter()
+                .any(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+        {
+            return GroupHead::Rejects(INVALID_CAPTURE_NAME);
+        }
+        return GroupHead::Consumed(i + off + 1);
+    }
+    // Rule (c): the flag run. `{u, x, R}` is exactly the Rust-valid
+    // minus RE2-valid flag set, so a run carrying one of them is
+    // `ErrInvalidPerlOp` there and compiles here.
+    let mut j = i + 2;
+    let mut saw_rust_only = false;
+    while j < b.len() {
+        match b[j] {
+            b'u' | b'x' | b'R' => {
+                saw_rust_only = true;
+                j += 1;
+            }
+            b'i' | b'm' | b's' | b'U' | b'-' => j += 1,
+            b':' | b')' => {
+                return if saw_rust_only {
+                    GroupHead::Rejects(RUST_ONLY_FLAG)
+                } else {
+                    GroupHead::Consumed(j + 1)
+                };
+            }
+            // Not a flag run at all — `(?#c)`, `(?'n'…)`, `(?=…)`,
+            // `(?P=n)`. Every one of these is `ErrInvalidPerlOp` there
+            // AND an error in the Rust crate, so no rule claims them.
+            _ => return GroupHead::Consumed(i + 2),
+        }
+    }
+    // An unterminated head: `ErrInvalidPerlOp` there, error here.
+    GroupHead::Consumed(b.len())
+}
+
+/// What scanning one character class produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassScan {
+    Rejects(&'static str),
+    Consumed(usize),
+}
+
+/// The fourteen POSIX class names `posixGroup` carries
+/// (`perl_groups.go:105-134 @ v3.7.4`), each of which also has a `[:^…:]`
+/// form. Anything else inside a class is `ErrInvalidCharRange`.
+const POSIX_CLASS_NAMES: &[&str] = &[
+    "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph", "lower", "print", "punct",
+    "space", "upper", "word", "xdigit",
+];
+
+/// Scans the character class opened at `open`, applying rules (d), (e),
+/// (f) and (g); returns the index just past the closing `]`.
+///
+/// Follows `parseClass` (`parse.go:1736-1830 @ v3.7.4`) item by item,
+/// because rule (g) is about POSITION: a `-` is a range operator only
+/// directly after a SINGLE CHARACTER, and only when what follows it is
+/// neither the class's own `]` nor the end of the pattern. After a
+/// completed range, after a class-shaped item (`\w`, `[:alpha:]`,
+/// `\p{L}`), at class start or after `^`, a `-` is an ordinary member.
+///
+/// An unterminated class is not this function's business: both engines
+/// reject it (issue #328's `Scan::JointReject`), so it declines.
+fn class_at(b: &[u8], open: usize) -> ClassScan {
+    let mut i = open + 1;
+    if b.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    // Go: `first := true // ] and - are okay as first char in class`.
+    let mut first = true;
+    while i < b.len() {
+        if b[i] == b']' && !first {
+            return ClassScan::Consumed(i + 1);
+        }
+        first = false;
+
+        // Rule (e): a POSIX named class. Go requires the closing `:]`;
+        // without one the bytes are ordinary members (`[[:foo]` is
+        // `200`), so the rule must require it too.
+        if b[i] == b'['
+            && b.get(i + 1) == Some(&b':')
+            && i + 2 < b.len()
+            && let Some(off) = find(&b[i + 2..], b":]")
+        {
+            let name = &b[i + 2..i + 2 + off];
+            let bare = match name.first() {
+                Some(b'^') => &name[1..],
+                _ => name,
+            };
+            let known = std::str::from_utf8(bare)
+                .is_ok_and(|n| POSIX_CLASS_NAMES.binary_search(&n).is_ok());
+            if !known {
+                return ClassScan::Rejects(UNKNOWN_POSIX_CLASS);
+            }
+            i = i + 2 + off + 2;
+            continue;
+        }
+
+        if b[i] == b'\\' {
+            match b.get(i + 1) {
+                // Rule (d), inside a class.
+                Some(b'u' | b'U') => return ClassScan::Rejects(RUST_ONLY_ESCAPE),
+                // Rule (f), inside a class.
+                Some(b'p' | b'P') => match property_escape_at(b, i) {
+                    Escape::Rejects(what) => return ClassScan::Rejects(what),
+                    Escape::Consumed(next) => {
+                        i = next;
+                        continue;
+                    }
+                },
+                // A Perl class escape is a class-shaped item: the `-`
+                // after it is a member, not an operator.
+                Some(b'd' | b'D' | b's' | b'S' | b'w' | b'W') => {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // A single character — `parseClassChar`, which is `parseEscape`
+        // or one rune.
+        let (lo, next) = class_char_at(b, i);
+        i = next;
+
+        // Go: `if len(t) >= 2 && t[0] == '-' && t[1] != ']'`. Both
+        // clauses are load-bearing: `[a-]` is `(a|-)` there, and so is
+        // a `-` that ends the pattern.
+        if b.len() - i >= 2 && b[i] == b'-' && b[i + 1] != b']' {
+            if b[i + 1] == b'-' {
+                // Rule (g). `X--` is the range `X`..`-`, invalid exactly
+                // when `X > 0x2D`.
+                if lo.is_some_and(|lo| lo > 0x2D) {
+                    return ClassScan::Rejects(INVERTED_DASH_RANGE);
+                }
+                i += 2;
+            } else {
+                let (_, next) = class_char_at(b, i + 1);
+                i = next;
+            }
+        }
+    }
+    // Unterminated.
+    ClassScan::Consumed(b.len())
+}
+
+/// One `parseClassChar`: the code point it contributes (`None` when the
+/// escape is one this scan will not decode, which makes rule (g) decline
+/// rather than guess) and the index just past it.
+fn class_char_at(b: &[u8], i: usize) -> (Option<u32>, usize) {
+    if b[i] != b'\\' {
+        let len = utf8_len(b[i]).min(b.len() - i);
+        let cp = std::str::from_utf8(&b[i..i + len])
+            .ok()
+            .and_then(|s| s.chars().next())
+            .map(u32::from);
+        return (cp, i + len);
+    }
+    match b.get(i + 1) {
+        None => (None, b.len()),
+        Some(b'x') => {
+            if b.get(i + 2) == Some(&b'{') {
+                let end = brace_end(b, i + 2);
+                // `brace_end` answers `b.len()` when there is no `}` at
+                // all, in which case there is no value to read.
+                let closed = b.get(end - 1) == Some(&b'}');
+                let hex = if closed { &b[i + 3..end - 1] } else { &b[..0] };
+                (hex_value(hex), end)
+            } else {
+                let end = (i + 4).min(b.len());
+                (hex_value(&b[i + 2..end]), end)
+            }
+        }
+        Some(c @ (b'a' | b'f' | b'n' | b'r' | b't' | b'v')) => {
+            let cp = match c {
+                b'a' => 0x07,
+                b'f' => 0x0C,
+                b'n' => 0x0A,
+                b'r' => 0x0D,
+                b't' => 0x09,
+                _ => 0x0B,
+            };
+            (Some(cp), i + 2)
+        }
+        // An octal escape (`\0`-`\7`, up to three digits) and every
+        // punctuation escape (`\-`, `\\`, `\]`) decode to a code point,
+        // but only the punctuation forms matter to rule (g) and only via
+        // the `<= 0x2D` half, so both decline: `None` can never make the
+        // rule fire.
+        Some(&c) if c.is_ascii_punctuation() => (Some(u32::from(c)), i + 2),
+        // The backslash plus ONE RUNE, so the scan cannot straddle a code
+        // point; `None` can never make rule (g) fire.
+        Some(&c) => (None, (i + 1 + utf8_len(c)).min(b.len())),
+    }
+}
+
+/// The value of a run of hex digits, or `None` if it is empty or carries
+/// a non-hex byte.
+fn hex_value(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for &c in bytes {
+        let d = (c as char).to_digit(16)?;
+        v = v.checked_mul(16)?.checked_add(d)?;
+    }
+    Some(v)
+}
+
+/// The index of the first occurrence of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// A narrow test seam kept for `pulsus-read`'s corpus differential
@@ -691,11 +1266,21 @@ mod tests {
             // cannot shift.
             assert!(pattern_requires_re2_authority(pattern), "{pattern:?}");
         }
-        // The escape still decides when the class DOES close.
+        // The escape still decides when the class DOES close — and the
+        // SCAN is unmoved for all three, which is the property #400
+        // Stage 2 had to preserve: `re2_definitely_rejects` is a
+        // separate mechanism consulted ahead of the scan, so the frozen
+        // `screen_verdicts.txt` baseline cannot shift.
         for pattern in [r"[\p{L}]", r"[\p{Alphabetic}]", r"[\u{263A}]"] {
             assert_eq!(scan(pattern), Scan::Undecidable, "{pattern:?}");
-            assert_eq!(re2_verdict(pattern), Re2Verdict::Unknown, "{pattern:?}");
         }
+        // The VERDICT moved for two of the three, and only where a rule
+        // reads the reference's own table: `Alphabetic` is outside
+        // `unicodeTable` (rule (f)) and `\u` is no escape RE2 has (rule
+        // (d)), while `L` is in the table and stays undecided.
+        assert_eq!(re2_verdict(r"[\p{L}]"), Re2Verdict::Unknown);
+        assert_eq!(re2_verdict(r"[\p{Alphabetic}]"), Re2Verdict::Rejects);
+        assert_eq!(re2_verdict(r"[\u{263A}]"), Re2Verdict::Rejects);
     }
 
     /// AC 13: the `re2_verdict` unit table — the D1′ measured list,
@@ -715,9 +1300,14 @@ mod tests {
             // nothing about RE2.
             (r"\Qa*\E", Re2Verdict::Unknown),
             (r"\12", Re2Verdict::Unknown),
-            // Rust accepts, RE2 rejects: the screened classes.
-            (r"\p{Alphabetic}", Re2Verdict::Unknown),
-            ("a{1001}", Re2Verdict::Unknown),
+            // Rust accepts, RE2 rejects. **Issue #400 Stage 2 moved the
+            // first two from `Unknown` to `Rejects`** — rules (f) and
+            // (b) decide them from the reference's own parser, so they
+            // no longer need a real RE2. `(?P<n>a)` stays `Unknown`
+            // because BOTH engines accept it: no rule claims a valid
+            // capture name, and the screen defers group heads wholesale.
+            (r"\p{Alphabetic}", Re2Verdict::Rejects),
+            ("a{1001}", Re2Verdict::Rejects),
             ("(?P<n>a)", Re2Verdict::Unknown),
             // Both accept — including the shapes only the rewrite makes
             // compilable in-process.
@@ -751,28 +1341,49 @@ mod tests {
         for (site, class, pattern) in [
             // scan site 1: the bare-escape check
             // (`escape_requires_re2_authority`)
-            ("scan/bare-escape", "unicode-property", r"\p{Alphabetic}"),
-            ("scan/bare-escape", "rust-only-escape", r"\u{263A}"),
+            //
+            // Issue #400 Stage 2 re-representatived this site. It used to
+            // be `\p{Alphabetic}`, which rule (f) now DECIDES — the name
+            // is outside `unicodeTable`'s 202 — so it answers `Rejects`
+            // and would have reddened this row for the right reason.
+            // `\p{L}` reaches the same site and stays `Unknown`: the name
+            // IS in the table, so no rule fires and only the scan speaks.
+            ("scan/bare-escape", "unicode-property", r"\p{L}"),
+            // ...and `rust-only-escape` was DELETED here: rule (d)
+            // refuses every `\u`/`\U` spelling there is, so the class has
+            // no `Unknown` member left to represent.
             ("scan/bare-escape", "boundary-escape", r"\<word\>"),
             ("scan/bare-escape", "trailing-backslash", "a\\"),
-            // scan site 2: the same escapes inside a class (`class_end`)
-            ("scan/class-escape", "unicode-property", r"[\p{Alphabetic}]"),
-            // scan site 3: non-portable `(?…` group heads
+            // scan site 2: the same escapes inside a class (`class_end`).
+            // Re-representatived for the same reason as site 1.
+            ("scan/class-escape", "unicode-property", r"[\p{L}]"),
+            // scan site 3: non-portable `(?…` group heads. `(?x)a b` now
+            // answers `Rejects` (rule (c)), so the class is represented
+            // by `(?#c)a` — a head rule (c) deliberately does not claim,
+            // because `#` is not one of the `{u, x, R}` flags and the
+            // reference's own refusal of it is matched by the Rust
+            // crate's.
             ("scan/group-head", "lookaround", "(?=x)"),
             ("scan/group-head", "named-group", "(?P<n>a)"),
-            ("scan/group-head", "nonportable-group-head", "(?x)a b"),
-            // scan site 4: `*`/`+` applied to a repetition
-            ("scan/star-after-repeat", "repetition-of-repetition", "a**"),
-            // scan site 5: `?` applied to an already-lazy repetition
-            ("scan/lazy-chain", "repetition-of-repetition", "a*??"),
-            // scan site 6: `{n,m}` above kMaxRepeat, or after a repetition
-            ("scan/repetition-bounds", "over-max-repeat", "a{1001}"),
-            (
-                "scan/repetition-bounds",
-                "repetition-of-repetition",
-                "a{2}{3}",
-            ),
-            // compile arm: Rust rejects within RE2's accept set
+            ("scan/group-head", "nonportable-group-head", "(?#c)a"),
+            // **Three sites were DELETED by #400 Stage 2, and deleting a
+            // row is only correct when the rules decide the site IN
+            // FULL** — otherwise the site loses its cover silently, which
+            // is the failure mode this census exists to prevent. Each of
+            // these three is decided by a rule with no residue:
+            //
+            // * `scan/star-after-repeat` (`a**`, `a*+`) — rule (a) fires
+            //   for every `*`/`+` whose operand is a repetition.
+            // * `scan/lazy-chain` (`a*??`) — rule (a)'s other half fires
+            //   for every `?` after a lazy repetition.
+            // * `scan/repetition-bounds` (`a{1001}`, `a{2}{3}`) — the
+            //   site returns `Undecidable` on exactly two conditions,
+            //   `over_max` and a repetition operand, and rules (b) and
+            //   (a) take one each.
+            //
+            // compile arm: Rust rejects within RE2's accept set. Both
+            // survive: rule 0 bails out of any pattern containing `\Q`,
+            // and no rule looks at octal escapes.
             ("compile/untrusted-reject", "literal-quoting", r"\Qa*\E"),
             ("compile/untrusted-reject", "octal-escape", r"\12"),
             // compile arm: the Rust crate's size budget, not RE2's

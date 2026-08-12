@@ -71,24 +71,41 @@ but keeps the entry for history.
     on all four (vectors `rx-u7`–`rx-u10`). The commonest member of the
     residual by far.
   - **`unicode-property`** (`\p`/`\P`, bare or inside a class) —
-    verdict varies BY MEMBER: properties in RE2's fixed table are 200
-    (`\p{L}`, `rx-u17`), the rest 400 (`\p{Alphabetic}` bare and in
-    class position, `rx-u4`/`rx-u16`).
-  - **`rust-only-escape`** (`\u`, `\U`) — reference **400**
-    (`rx-u12`/`rx-u13`).
+    verdict varies BY MEMBER, and **#400 Stage 2 split the class along
+    exactly that line**: properties in RE2's fixed 202-name table are
+    200 and stay `Unknown` (`\p{L}`, `rx-u17`); the rest are 400 and are
+    now DECIDED in-process, so `rx-u4` and `rx-u16`
+    (`\p{Alphabetic}` bare and in class position) moved
+    `pulsus: accept → reject` and left the residual. The class survives
+    on its in-table half alone.
   - **`trailing-backslash`** (`a\`) — reference **400** (`rx-u11`;
     jointly rejected in fact — the Rust crate rejects it too — but the
     scan defers before compiling, by design; deciding it is #336's).
   - **`nonportable-group-head`** (`(?x`, `(?u`, `(?#`, …) — reference
-    **400** (`rx-u18`–`rx-u20`).
-  - **`over-max-repeat`** (`{n}` above `kMaxRepeat = 1000`) — reference
-    **400** (`rx-u5`).
-  - **`repetition-of-repetition`** (`a**`, `a{2}{3}`, `a*??`) —
-    reference **400** (`rx-u6`/`rx-u21`/`rx-u22`).
+    **400**. **#400 Stage 2 decided the `{u, x, R}` flag members**, so
+    `rx-u18` (`(?x)a b`) and `rx-u19` (`(?u:a)`) moved
+    `pulsus: accept → reject`; the class survives on `rx-u20`
+    (`(?#c)a`), which is a comment group and not a flag run — the
+    Rust crate refuses it too, so it was already agreement everywhere
+    but here.
   - **`compiled-too-big`** (`regex::Error::CompiledTooBig` — the Rust
     crate's compiled-size budget, which is not RE2's; per-member the
     verdict depends on the two engines' budgets) — the measured member
     is a reference **400** (`rx-u23`).
+  - **RETIRED by #400 Stage 2 — three classes, every member decided.**
+    `over-max-repeat` (`{n}` above `kMaxRepeat = 1000`, `rx-u5`),
+    `repetition-of-repetition` (`a**`, `a{2}{3}`, `a*??`,
+    `rx-u6`/`rx-u21`/`rx-u22`) and `rust-only-escape` (`\u`, `\U`,
+    `rx-u12`/`rx-u13`) were each a reference **400** in every member,
+    and `pulsus_re2::re2_definitely_rejects` — which `re2_verdict` now
+    consults before the scan — decides all of them. They are gone from
+    `UNKNOWN_CLASSES` in `validate_corpus.rs`; their vectors remain, as
+    reject/reject rows carrying no `unknown_class` and no `divergence`.
+    **Ten vectors moved in all, every one toward parity**: each already
+    recorded `tempo: reject, tempo_status: 400`, and
+    `every_vector_reproduces_its_recorded_pulsus_verdict` now asserts
+    that direction from a committed id list, so a move the other way is
+    RED rather than merely reviewable.
   - **Agreement classes** — `Unknown` here AND accepted by the
     reference, so no consumer-visible divergence: `named-group`
     (`(?P<n>`, `(?<n>` — plan v3 wrongly listed this as rejected;
@@ -97,6 +114,12 @@ but keeps the entry for history.
     the reference reads them as literals/boundary-plus-braces and
     accepts, `rx-u14`/`rx-u15`; the MEANING differs, which is the
     screen's original subject and precisely why they defer).
+- **The residual SHRANK without this row's mechanism changing** (#400
+  Stage 2). `check_regex` is untouched: it still rejects exactly when
+  `re2_verdict` says `Rejects` and still accepts `Unknown`. What moved
+  is `re2_verdict`, which consults a reject-only pre-check built from
+  the REFERENCE's own parser before the scan. Closing #336 still retires
+  this row; Stage 2 removed three of its classes and half of two more.
 - **Which paths the residual reaches:** on search's `q=` and on the
   metrics query parameter the expression is planned and EXECUTED, so
   ClickHouse's RE2 rejects the diverging members at execution

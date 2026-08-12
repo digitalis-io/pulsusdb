@@ -530,6 +530,81 @@ async fn no_re2_rejected_pattern_escapes_the_screen() {
     );
 }
 
+/// **Criterion 23b — `\p{LC}` and the three engines that disagree about
+/// it** (issue #400 Stage 2).
+///
+/// One pattern, three answers, and the point is that the third is not
+/// the second:
+///
+/// * **grafana/loki v3.7.4 SERVES it.** `LC` is a `unicode.Categories`
+///   key, so `unicodeTable` resolves it
+///   (`vendor/github.com/grafana/regexp/syntax/parse.go:1646-1658 @
+///   v3.7.4`). Measured `200` on the pinned container; pinned in
+///   `logql_regex_accept_matrix.rs` as the both-accept `PATTERNS` row
+///   `unicode_prop_lc_category`, at all sixteen positions.
+/// * **The Rust `regex` crate compiles it** — asserted here.
+/// * **ClickHouse's RE2 REFUSES it**, `Code: 427 CANNOT_COMPILE_REGEXP`
+///   — measured here, live, rather than recorded.
+///
+/// So `re2_definitely_rejects` must answer **`false`**: rule (f) reads
+/// the REFERENCE's table, and refusing a pattern the reference serves is
+/// the harmful direction whatever the storage engine thinks. This test
+/// is the storage half of that claim and the matrix row is the reference
+/// half; a rule (f) narrowed to exclude `LC` reddens both, from opposite
+/// sides.
+///
+/// **The cause sentence stays at its measured strength.** The
+/// reference's table is Go's `unicode` package, READ at
+/// `parse.go:1646-1658`. ClickHouse's is upstream RE2's own generated
+/// table, NOT read. That the two differ on this name is the
+/// MEASUREMENT below; why they differ is not claimed. Ledgered as
+/// `logql-storage-re2-property-table`.
+#[tokio::test]
+async fn the_property_table_the_storage_engine_carries_is_not_the_references() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-read/tests/re2_screen_differential.rs for setup)"
+        );
+        return;
+    }
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    // The Rust crate compiles it.
+    assert!(
+        regex::Regex::new(r"\p{LC}").is_ok(),
+        "premise: the Rust crate must compile `\\p{{LC}}`"
+    );
+    // The pre-check declines it, because the REFERENCE serves it.
+    assert!(
+        !pulsus_re2::re2_definitely_rejects(r"\p{LC}"),
+        "`\\p{{LC}}` is `200` at grafana/loki v3.7.4 — `LC` is a `unicode.Categories` key — so \
+         rule (f) must not claim it, whatever the storage engine answers"
+    );
+    // ...and the control that keeps this from being about `\p{…}` in
+    // general: `Lc` is NOT a key there, and is claimed.
+    assert!(
+        pulsus_re2::re2_definitely_rejects(r"\p{Lc}"),
+        "`\\p{{Lc}}` is `400` at the reference: `unicodeTable` does no case folding of the NAME"
+    );
+
+    // The storage engine, measured now.
+    assert!(
+        !re2_accepts(&client, r"\p{LC}").await,
+        "ClickHouse's RE2 used to answer `Code: 427 CANNOT_COMPILE_REGEXP` for `\\p{{LC}}`. If \
+         it now compiles it, the three-way disagreement this test records has closed on the \
+         storage side — re-measure and update `logql-storage-re2-property-table` rather than \
+         deleting this"
+    );
+    // The discriminator: a property name BOTH RE2 tables carry, so the
+    // line above is about this NAME and not about `\p{…}` support.
+    assert!(
+        re2_accepts(&client, r"\p{L}").await,
+        "ClickHouse's RE2 must compile `\\p{{L}}` — otherwise the `\\p{{LC}}` refusal above says \
+         nothing about the table and everything about the syntax"
+    );
+}
+
 /// Whether the vendored PromQL parser would admit a matcher carrying this
 /// pattern at all — it compiles every matcher itself
 /// (`vendor/promql-parser` `Matcher::try_parse_re`), with a brace-escaping
