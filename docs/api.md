@@ -189,7 +189,7 @@ in the parameter surface).
 |-------|------|-------|
 | `query` | LogQL | required |
 | `start`, `end` | unix s (<= 10 chars) / ns / fractional s / RFC3339 (§2 preamble) | default: `end = now`, `start = min(end, now) - since`; `since` defaults to `1h`. `end < start` is `400` |
-| `step` | duration \| int (seconds) | metric queries only; when omitted, derived as **whole seconds**: `max(floor((end-start) in seconds / 250), 1)` — the reference's `defaultQueryRangeStep` (`pkg/loghttp/params.go:140-142 @ grafana/loki v3.7.4 b318f282`). A 1 h window derives `14s`, a 900 s window `3s`, a 499 s window `1s`. The point count therefore varies between 250 and 500; it is not fixed |
+| `step` | duration \| int (seconds) | metric queries only; when omitted, derived as **whole seconds**: `max(floor((end-start) in seconds / 250), 1)` — the reference's `defaultQueryRangeStep` (`pkg/loghttp/params.go:140-142 @ grafana/loki v3.7.4 b318f282`). A 1 h window derives `14s`, a 900 s window `3s`, a 499 s window `1s`. The point count therefore varies with the window instead of being fixed, and is **at most 500** — the maximum, at a 499 s window. There is no lower bound worth quoting: any window under 250 s derives `1s`, so a 10 s window is 11 points and a zero-length one is a single point |
 | `limit` | int | max **total** entries returned across the response, ordered by `direction` (newest-first for `backward`); global, not per-stream (default 100, hard cap 5000 — values above the cap are rejected with `400`). This is the **entry** axis; §2.6.3's same-named `limit` counts field *names* and carries no ceiling |
 | `direction` | `forward`\|`backward` | default `backward` |
 | `since` | duration | the default `start`'s lookback (default `1h`); ignored when `start` is present |
