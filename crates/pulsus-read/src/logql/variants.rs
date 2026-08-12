@@ -18,12 +18,13 @@ use std::ops::ControlFlow;
 
 use super::agg::LabelSet;
 use super::charge::{
-    AggCaps, alloc_block_bytes, ensure_result_series, grown_alloc_bytes, label_set_bytes,
-    map_entry_bytes,
+    AggCaps, alloc_block_bytes, grown_alloc_bytes, label_set_bytes, map_entry_bytes,
+    result_series_breach,
 };
 use super::client_agg::{ClientAggState, MetricAggState, RangeSlideState};
 use super::exec::{MatrixSeries, QueryResult, VectorSample};
 use super::post_agg::apply_vector_aggs;
+use super::warnings::{Warnings, variant_series_warning};
 use super::window::{ClientWindow, grid_point_count};
 
 /// The reference's variant-index label (`__variant__`), set to the plain
@@ -742,7 +743,7 @@ impl<'q> VariantsAggState<'q> {
     /// no `__variant__` (reference `engine.go:485-487`); instant keeps
     /// them (`engine.go:620-634`) — the reference's instant/range
     /// asymmetry.
-    fn finish_in_place(&mut self) -> Result<QueryResult, ReadError> {
+    fn finish_in_place(&mut self, warnings: &mut Warnings) -> Result<QueryResult, ReadError> {
         let is_range = matches!(
             self.variants.first().map(plan::VariantSpec::window),
             Some(ClientWindow::Range { .. })
@@ -786,12 +787,25 @@ impl<'q> VariantsAggState<'q> {
             // variant, not to the concatenated whole). Strictly more
             // permissive than capping the concat: a 3-variant query
             // returning 400 series each is served (1 200 result series).
-            // The remaining divergence is that the reference SKIPS the
-            // breaching variant with a warning where PulsusDB 422s —
-            // that needs a `warnings` response envelope and is #277.
-            ensure_result_series(&out)?;
+            //
+            // Issue #277: a breach SKIPS the variant and records a
+            // warning; it is not an error. The reference removes the
+            // whole variant — never truncates it — and serves the rest at
+            // 200 (`pkg/logql/engine.go:500-508 @ grafana/loki v3.7.4
+            // b318f2829f0ae2094ab3a1e90780450e9e4b03be`).
+            //
+            // THE DISCHARGE RUNS ON BOTH ARMS, and above the decision.
+            // Before #277 the `?` on the gate returned before it, which
+            // was invisible only because the error propagated past
+            // `finish`'s `debug_assert_eq!(self.charged, self.base)`.
+            // Now that a breach continues, leaving it below would fire
+            // that assert on the first skip in any debug build.
+            let breach = result_series_breach(&out);
             discharge_fanout_bytes(&mut self.charged, self.sub_charged[i]);
-            per_variant.push(out);
+            match breach {
+                Some(cap) => warnings.add(variant_series_warning(cap, spec.index())),
+                None => per_variant.push(out),
+            }
         }
         if is_range {
             let total: usize = per_variant
@@ -831,8 +845,9 @@ impl<'q> VariantsAggState<'q> {
     }
 
     /// Finalizes, asserting every per-sub-state charge was released.
-    pub fn finish(mut self) -> Result<QueryResult, ReadError> {
-        let out = self.finish_in_place()?;
+    /// `warnings` collects one message per SKIPPED variant (issue #277).
+    pub fn finish(mut self, warnings: &mut Warnings) -> Result<QueryResult, ReadError> {
+        let out = self.finish_in_place(warnings)?;
         debug_assert_eq!(
             self.charged, self.base,
             "every variants fan-out charge must be discharged at finish"
@@ -871,6 +886,7 @@ pub fn run_variants_rows(
     meta: &HashMap<u64, StreamMetaRow>,
     common: &[Stage],
     variants: &[plan::VariantSpec],
+    warnings: &mut Warnings,
 ) -> Result<QueryResult, ReadError> {
     let arena = VariantArena::build(common, variants, MAX_VARIANT_FANOUT_STATE_BYTES, 0)?;
     let mut state = VariantsAggState::new(&arena, variants, meta, MAX_VARIANT_FANOUT_STATE_BYTES)?;
@@ -896,7 +912,7 @@ pub fn run_variants_rows(
     } else {
         state.push_rows(rows)?;
     }
-    state.finish()
+    state.finish(warnings)
 }
 
 #[cfg(test)]

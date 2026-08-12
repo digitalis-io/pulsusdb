@@ -45,9 +45,10 @@ use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, DetectedFieldOut, DetectedFieldsProbe, Direction, MatrixSeries,
-    MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec,
+    MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, Warnings,
     apply_label_replace, apply_vector_aggs, combine_binary, ensure_result_series,
-    materialize_vector_lit, plan, run_client_agg_rows_folded, run_variants_rows,
+    final_series_gate_applies, materialize_vector_lit, plan, run_client_agg_rows_folded,
+    run_variants_rows,
 };
 
 /// A sorted label set.
@@ -345,6 +346,15 @@ pub struct EvalCmd {
     /// `eval_fail` only: the required error assertion (issue #240 —
     /// exactly one per `eval_fail`, enforced at parse time).
     pub fail_msg: Option<FailAssert>,
+    /// `eval`/`eval_ordered` only: the `warning: <text>` assertion lines
+    /// (issue #277), in the order written. Compared for EXACT equality
+    /// including order against the accumulated
+    /// [`pulsus_read::Warnings`], so the reference's byte-lexicographic
+    /// render is pinned by the corpus and not only by a unit test. An
+    /// empty vector asserts the query produced NO warnings — every
+    /// pre-#277 case therefore asserts silence, which is what makes a
+    /// spurious warning a corpus failure.
+    pub expected_warnings: Vec<String>,
 }
 
 /// `eval_fail`'s single assert line (issue #240): `msg:` gates a
@@ -698,6 +708,7 @@ fn parse_eval(
     };
 
     let mut expected = Vec::new();
+    let mut expected_warnings: Vec<String> = Vec::new();
     let mut fail_msg = None;
     let mut idx = directive_idx + 1;
     while idx < lines.len() {
@@ -711,6 +722,29 @@ fn parse_eval(
         }
         let content = raw.trim();
         if content.starts_with('#') {
+            idx += 1;
+            continue;
+        }
+        // Issue #277: `warning: <text>` inside an `eval`/`eval_ordered`
+        // block. Rejected file-fatally on `eval_fail`, which owns
+        // `msg:`/`msg_exact:` — a query that ERRORS produces no response
+        // envelope, so a warning assertion there could never be
+        // satisfied and is a mistake rather than an expectation.
+        if let Some(w) = content.strip_prefix("warning:") {
+            if mode == EvalMode::Fail {
+                return Err(fmt_err(
+                    file,
+                    idx,
+                    "eval_fail carries `msg:`/`msg_exact:`, never `warning:` (a failing query \
+                     emits no warnings envelope)"
+                        .into(),
+                ));
+            }
+            let w = w.trim();
+            if w.is_empty() {
+                return Err(fmt_err(file, idx, "`warning:` line has an empty value".into()));
+            }
+            expected_warnings.push(w.to_string());
             idx += 1;
             continue;
         }
@@ -776,6 +810,7 @@ fn parse_eval(
             query,
             expected,
             fail_msg,
+            expected_warnings,
         },
         idx,
     ))
@@ -855,7 +890,11 @@ impl Store {
 enum Outcome {
     /// `(sorted labels, timestamp_ns, line)` per surviving entry.
     Streams(Vec<StreamEntry>),
-    Metric(QueryResult),
+    /// The metric result and the [`pulsus_read::Warnings`] the evaluation
+    /// accumulated, already rendered in wire order (issue #277). Log and
+    /// detected-field queries have no warnings surface at all, so their
+    /// arms carry none.
+    Metric(QueryResult, Vec<String>),
     /// Label-sorted `/detected_fields` entries (issue #244).
     Detected(Vec<DetectedFieldOut>),
 }
@@ -1002,21 +1041,37 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
                 limit: 100,
                 direction: Direction::Backward,
             };
-            let result = match plan(&expr, &params, &ctx()).map_err(|e| e.to_string())? {
-                Plan::Metric(mp) => eval_leaf(&mp, store)?,
-                Plan::MetricBinary(node) => eval_node(&node, store)?,
-                Plan::Streams(_) => {
-                    return Err("a metric expression planned to a streams query".to_string());
-                }
-            };
+            let mut warnings = Warnings::new();
             // Issue #236: the SAME final-result series gate the engine
             // applies on its `Plan::Metric`/`Plan::MetricBinary` arms, so
             // corpus `eval_fail` cases can pin the reference's verbatim
             // `maximum number of series (500) …` body. Applied here and
             // never inside `eval_leaf`/`eval_node`, mirroring the engine:
             // intermediates are uncapped.
-            ensure_result_series(&result).map_err(|e| e.to_string())?;
-            Ok(Outcome::Metric(result))
+            //
+            // Issue #277: and the gate is skipped for a ROOT
+            // `variants(...)` through the engine's OWN predicate
+            // (`final_series_gate_applies`), never a copy of it — that
+            // root is capped per variant and skips-with-a-warning
+            // instead.
+            let result = match plan(&expr, &params, &ctx()).map_err(|e| e.to_string())? {
+                Plan::Metric(mp) => {
+                    let r = eval_leaf(&mp, store)?;
+                    ensure_result_series(&r).map_err(|e| e.to_string())?;
+                    r
+                }
+                Plan::MetricBinary(node) => {
+                    let r = eval_node(&node, store, &mut warnings)?;
+                    if final_series_gate_applies(&node) {
+                        ensure_result_series(&r).map_err(|e| e.to_string())?;
+                    }
+                    r
+                }
+                Plan::Streams(_) => {
+                    return Err("a metric expression planned to a streams query".to_string());
+                }
+            };
+            Ok(Outcome::Metric(result, warnings.as_strings()))
         }
     }
 }
@@ -1063,7 +1118,11 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
 /// engine's `run_metric_node`. Left-to-right post-order evaluates `lhs`'s
 /// whole subtree before `rhs`'s, so every corpus expectation is
 /// unchanged.
-pub fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {
+pub fn eval_node(
+    node: &MetricNode,
+    store: &Store,
+    warnings: &mut Warnings,
+) -> Result<QueryResult, String> {
     let mut nodes = Vec::new();
     pulsus_logql::walk::postorder_into::<pulsus_read::logql::MetricNodeScc>(node, &mut nodes);
     let mut vals: Vec<QueryResult> = Vec::with_capacity(nodes.len());
@@ -1105,7 +1164,7 @@ pub fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String
                     .client
                     .as_ref()
                     .ok_or_else(|| "variants scan plan must be client-aggregated".to_string())?;
-                run_variants_rows(&store.rows, &store.meta, &common.pipeline, variants)
+                run_variants_rows(&store.rows, &store.meta, &common.pipeline, variants, warnings)
                     .map_err(|e| e.to_string())?
             }
         };
@@ -1139,10 +1198,41 @@ fn judge(cmd: &EvalCmd, outcome: Result<Outcome, String>) -> (bool, String) {
         },
         EvalMode::Value | EvalMode::Ordered => match outcome {
             Err(text) => (false, format!("query errored: {text}")),
-            Ok(Outcome::Streams(actual)) => compare_streams(&cmd.expected, actual),
-            Ok(Outcome::Metric(result)) => compare_metric(cmd, result),
-            Ok(Outcome::Detected(fields)) => compare_detected(&cmd.expected, &fields),
+            Ok(Outcome::Streams(actual)) => {
+                judge_warnings(cmd, &[], compare_streams(&cmd.expected, actual))
+            }
+            Ok(Outcome::Metric(result, warnings)) => {
+                judge_warnings(cmd, &warnings, compare_metric(cmd, result))
+            }
+            Ok(Outcome::Detected(fields)) => {
+                judge_warnings(cmd, &[], compare_detected(&cmd.expected, &fields))
+            }
         },
+    }
+}
+
+/// Issue #277: folds the `warning:` assertion into a case's verdict.
+/// EXACT equality including ORDER — the reference renders its warning set
+/// byte-lexicographically (`pkg/logqlmodel/metadata/context.go:80-92 @
+/// grafana/loki v3.7.4 b318f2829f0ae2094ab3a1e90780450e9e4b03be`), so a
+/// case that pins two warnings pins their sequence too. A case with no
+/// `warning:` line asserts the query emitted NONE.
+fn judge_warnings(cmd: &EvalCmd, actual: &[String], value: (bool, String)) -> (bool, String) {
+    if cmd.expected_warnings == actual {
+        return value;
+    }
+    let detail = format!(
+        "warnings mismatch:\n  want ({}): {:?}\n  got  ({}): {:?}",
+        cmd.expected_warnings.len(),
+        cmd.expected_warnings,
+        actual.len(),
+        actual,
+    );
+    // A value mismatch is reported alongside, never hidden by, the
+    // warning mismatch.
+    match value {
+        (true, _) => (false, detail),
+        (false, d) => (false, format!("{detail}\n{d}")),
     }
 }
 
@@ -1547,9 +1637,9 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                 };
                 match &outcome {
                     Ok(Outcome::Streams(_)) => counts.streams_cases += 1,
-                    Ok(Outcome::Metric(QueryResult::Scalar(_))) => counts.scalar_cases += 1,
-                    Ok(Outcome::Metric(QueryResult::Matrix(_))) => counts.matrix_cases += 1,
-                    Ok(Outcome::Metric(_)) => counts.vector_cases += 1,
+                    Ok(Outcome::Metric(QueryResult::Scalar(_), _)) => counts.scalar_cases += 1,
+                    Ok(Outcome::Metric(QueryResult::Matrix(_), _)) => counts.matrix_cases += 1,
+                    Ok(Outcome::Metric(..)) => counts.vector_cases += 1,
                     Ok(Outcome::Detected(_)) => counts.detected_cases += 1,
                     Err(_) => {}
                 }

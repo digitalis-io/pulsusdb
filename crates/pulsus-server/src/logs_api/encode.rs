@@ -39,6 +39,7 @@ use serde::Serialize;
 use pulsus_read::{
     DetectedFieldOut, DetectedFields, DetectedLabelOut, ExplainStage, LogStats, MatrixSeries,
     PatternSeries, PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample, VolumeEntry,
+    Warnings,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -602,8 +603,68 @@ fn explain_suffix(mut suffix: String, explain: Option<&PlanExplain>) -> String {
     suffix
 }
 
+/// Issue #277: the `warnings` envelope suffix — a TOP-LEVEL sibling of
+/// `data`, appended AFTER `data`'s own closing brace and never nested
+/// inside it (unlike [`explain_suffix`], whose `explain` key lives
+/// *inside* `data`).
+///
+/// **Warnings come LAST, after `data`** — captured from the pinned
+/// reference, not read off its encoder. `pkg/util/marshal/query.go:201-228`
+/// (`EncodeResult`) writes `status`, `warnings`, `data`, and that is NOT
+/// the encoder a user's query reaches: the query-frontend path serialises
+/// `queryrangebase.PrometheusResponse`
+/// (`pkg/querier/queryrange/queryrangebase/queryrange.proto:36-46` —
+/// `Status`=1, `Data`=2, … `Warnings`=6 `json:"warnings,omitempty"`), so
+/// the captured body puts `warnings` after `data`:
+///
+/// ```text
+/// {"status":"success","data":{…},"warnings":["maximum of series (500) reached for variant (0)"]}
+/// ```
+///
+/// Empty ⇒ zero bytes (`omitempty`), so every non-variants response stays
+/// byte-identical.
+fn warnings_suffix(warnings: &Warnings) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(",\"warnings\":[");
+    for (i, w) in warnings.as_strings().iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&json_string(w));
+    }
+    s.push(']');
+    s
+}
+
+/// [`query_response_warned`] with no warnings.
+///
+// Test-only since issue #277: the production caller
+// (`handlers::run_query`) passes the engine's accumulated warnings
+// through `query_response_warned`. Kept as a thin convenience so every
+// pre-existing byte-exact envelope test is untouched — an empty
+// `Warnings` renders zero extra bytes, which is exactly the property
+// `empty_warnings_leaves_every_query_response_arm_byte_identical` pins.
+#[cfg(test)]
+pub(crate) fn query_response(
+    result: QueryResult,
+    explain: Option<PlanExplain>,
+    at_ns: i64,
+    preserve_vector_order: bool,
+) -> Response {
+    query_response_warned(
+        result,
+        explain,
+        at_ns,
+        preserve_vector_order,
+        &Warnings::new(),
+    )
+}
+
 /// Encodes a `query`/`query_range` result: `data.resultType`/`result`/
-/// `stats`(/`explain`) per docs/api.md §2.1/§2.2. `at_ns` is the instant
+/// `stats`(/`explain`) per docs/api.md §2.1/§2.2, plus the top-level
+/// `warnings` array (issue #277) **after** `data`. `at_ns` is the instant
 /// evaluation time (`/query`'s `time` param) — only read when `result` is
 /// [`QueryResult::Vector`] (never produced by a `Range` spec, so
 /// `query_range` callers may pass any placeholder).
@@ -616,12 +677,17 @@ fn explain_suffix(mut suffix: String, explain: Option<&PlanExplain>) -> String {
 /// keep their deterministic label-sort (a range `sort(...)` yields a
 /// matrix with no per-series value order, so no HashMap nondeterminism
 /// reaches the wire).
-pub(crate) fn query_response(
+///
+/// `warnings` renders zero bytes when empty, so every non-variants
+/// response is byte-identical to the pre-#277 encoder.
+pub(crate) fn query_response_warned(
     result: QueryResult,
     explain: Option<PlanExplain>,
     at_ns: i64,
     preserve_vector_order: bool,
+    warnings: &Warnings,
 ) -> Response {
+    let warns = warnings_suffix(warnings);
     match result {
         QueryResult::Streams { mut items, partial } => {
             items.sort_by(|a, b| {
@@ -642,7 +708,7 @@ pub(crate) fn query_response(
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"streams\",\"result\":["
                     .to_vec();
             let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain.as_ref());
-            let suffix = format!("{suffix}}}}}").into_bytes();
+            let suffix = format!("{suffix}}}{warns}}}").into_bytes();
             json_response(stream_array(prefix, items, render_stream_item, suffix))
         }
         QueryResult::Matrix(mut items) => {
@@ -655,7 +721,7 @@ pub(crate) fn query_response(
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"matrix\",\"result\":["
                     .to_vec();
             let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain.as_ref());
-            let suffix = format!("{suffix}}}}}").into_bytes();
+            let suffix = format!("{suffix}}}{warns}}}").into_bytes();
             json_response(stream_array(prefix, items, render_matrix_item, suffix))
         }
         QueryResult::Vector(mut items) => {
@@ -672,7 +738,7 @@ pub(crate) fn query_response(
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":["
                     .to_vec();
             let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain.as_ref());
-            let suffix = format!("{suffix}}}}}").into_bytes();
+            let suffix = format!("{suffix}}}{warns}}}").into_bytes();
             json_response(stream_array(
                 prefix,
                 items,
@@ -696,7 +762,7 @@ pub(crate) fn query_response(
                 ),
                 explain.as_ref(),
             );
-            json_response(Body::from(format!("{body}}}")))
+            json_response(Body::from(format!("{body}{warns}}}")))
         }
         // Unreachable: `QueryResult::String` is a PromQL-only variant of
         // the shared enum (issue #86; a top-level string-literal metrics
