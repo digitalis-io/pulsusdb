@@ -168,10 +168,13 @@
       "reference": "groupOperation is `BY OPEN_PARENS fieldExpression CLOSE_PARENS` (expr.y:177-179): exactly one operand, and that operand is a full field expression. There is no COMMA in the production and fieldExpression has none either.",
       "pulsus": "A comma-separated list of bare Fields — wider in one direction (the list) and narrower in the other (no arithmetic, unary, parentheses or comparison operand).",
       "impact": "accept-surface",
-      "status": "open",
+      "status": "closed",
       "subject_kind": "positional",
       "subject_atoms": [],
-      "stage": "D2"
+      "stage": "D2",
+      "closed_by": 335,
+      "wire_status": "open",
+      "wire_note": "PARSE axis closed, wire axis not. Stage D2 rewrote groupOperation in both directions: the comma list is gone (a reference parse error we accepted AND served, withdrawn and ledgered) and the single operand is a full field expression. All six probes agree on parse. On the WIRE (parse -> validate -> plan) four of them are still planner 400s where the reference answers 2xx: by(.b + .c), by(-.b), by(!.b) and by(.b = 1) are COMPOSITE keys, and a grouping key must resolve to one per-span value, so search_plan.rs refuses them with a clean 400 naming the rendered key rather than answering a silent flat 200. by((.b)) reaches 2xx because parentheses group without surviving into the AST, so it IS by(.b). See wire_baseline.json."
     },
     {
       "id": "D17",
@@ -2012,74 +2015,54 @@
     {
       "query": "{ .a = 1 } | by(!.b)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D16",
-      "reachability": "r2-skeleton-inserted",
-      "reachability_evidence": {
-        "kind": "insertion",
-        "anchor": "ds.by-insertion"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D16",
+      "owning_issue": 335
     },
     {
       "query": "{ .a = 1 } | by((.b))",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D16",
-      "reachability": "r2-skeleton-inserted",
-      "reachability_evidence": {
-        "kind": "insertion",
-        "anchor": "ds.by-insertion"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D16"
     },
     {
       "query": "{ .a = 1 } | by(-.b)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D16",
-      "reachability": "r2-skeleton-inserted",
-      "reachability_evidence": {
-        "kind": "insertion",
-        "anchor": "ds.by-insertion"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D16",
+      "owning_issue": 335
     },
     {
       "query": "{ .a = 1 } | by(.b + .c)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D16",
-      "reachability": "r2-skeleton-inserted",
-      "reachability_evidence": {
-        "kind": "insertion",
-        "anchor": "ds.by-insertion"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D16",
+      "owning_issue": 335
     },
     {
       "query": "{ .a = 1 } | by(.b = 1)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D16",
-      "reachability": "r2-skeleton-inserted",
-      "reachability_evidence": {
-        "kind": "insertion",
-        "anchor": "ds.by-insertion"
-      }
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D16",
+      "owning_issue": 335
     },
     {
       "query": "{ .a = 1 } | by(.b, .c)",
       "reference": "reject",
-      "pulsus": "accept",
-      "verdict": "diverge",
-      "class": "D16",
-      "reachability": "r2-skeleton-inserted",
-      "reachability_evidence": {
-        "kind": "insertion",
-        "anchor": "ds.by-insertion"
-      }
+      "pulsus": "reject",
+      "verdict": "agree",
+      "closed_by": 335,
+      "closed_class": "D16"
     },
     {
       "query": "{ .a = 1 } | compare({ .b = 2 }, 10)",

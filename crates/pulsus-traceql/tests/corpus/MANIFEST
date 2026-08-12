@@ -19,6 +19,7 @@ accept/attr_unscoped_number
 accept/bare_attribute
 accept/bare_bool_true
 accept/bracketed_attribute
+accept/by_expression_key
 accept/duration_frac_half
 accept/duration_frac_leading_dot
 accept/duration_frac_ns_boundary
@@ -138,6 +139,7 @@ reject/attr_dot_space_after_scope
 reject/attr_dot_space_before_scope
 reject/bare_parent_word
 reject/bare_unscoped_word
+reject/by_multi_key
 reject/count_with_argument
 reject/deep_nesting
 reject/duration_compound

@@ -897,30 +897,43 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
     })
 }
 
-/// `By := "by" "(" Field { "," Field } ")"` (issue #185, `pipeline.by`):
-/// a spanset-level grouping stage. Empty `by()` is a positioned error.
+/// `By := "by" "(" FieldExpr ")"` — the spanset-level grouping stage
+/// (issue #185, `pipeline.by`; rewritten by issue #335 Stage D2, class
+/// D16). Empty `by()` is a positioned error.
+///
+/// **Both halves of this signature are the reference's, and both were
+/// wrong here before.** `groupOperation` is
+/// `BY OPEN_PARENS fieldExpression CLOSE_PARENS` (`expr.y:177-179` @
+/// Tempo v3.0.2):
+///
+/// * **ONE operand.** The production carries no `COMMA`, and
+///   `fieldExpression` has none either, so `| by(.b, .c)` is a parse
+///   error at the reference — measured `400`. We accepted it AND served
+///   it, which is the worst shape an accept-surface divergence takes: the
+///   query works, the user builds on it, and it is not portable to the
+///   system we claim compatibility with. Withdrawn here, ledgered in
+///   `docs/benchmarks/traces-differential-ledger.md`.
+/// * **A FULL field expression.** `by(.b + .c)`, `by(-.b)`, `by(!.b)`,
+///   `by((.b))` and `by(.b = 1)` are all reference `200`s that we
+///   refused.
+///
+/// The METRICS `by(...)` is a different production sharing one keyword —
+/// `attributeList` (`expr.y:195-198`) — and keeps its comma list; see
+/// [`parse_optional_by`].
 fn parse_by_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
     cursor.expect(&TokenKind::LParen, "'('")?;
     if matches!(cursor.peek().kind, TokenKind::RParen) {
         let span = cursor.peek().span;
         return Err(TraceQlError::UnexpectedToken {
             found: "')'".to_string(),
-            expected: "a grouping field (by() requires at least one field)".to_string(),
+            expected: "a grouping key (by() requires exactly one field expression)".to_string(),
             span,
         });
     }
-    let mut fields = Vec::new();
-    loop {
-        let (field, _) = parse_field(cursor)?;
-        fields.push(field);
-        if matches!(cursor.peek().kind, TokenKind::Comma) {
-            cursor.advance();
-            continue;
-        }
-        break;
-    }
+    let mut binary_nodes = 0usize;
+    let key = parse_field_expr(cursor, 0, &mut binary_nodes)?;
     cursor.expect(&TokenKind::RParen, "')'")?;
-    Ok(PipelineStage::By { fields })
+    Ok(PipelineStage::By { key })
 }
 
 /// `Coalesce := "coalesce" "(" ")"` (issue #185, `pipeline.coalesce`):
@@ -2664,13 +2677,48 @@ mod tests {
         assert_eq!(
             parsed.pipeline,
             vec![PipelineStage::By {
-                fields: vec![Field::Attribute {
+                key: FieldExpr::Field(Field::Attribute {
                     scope: AttrScope::Resource,
                     key: "service.name".to_string(),
-                }],
+                }),
             }]
         );
         assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
+    }
+
+    /// Issue #335 Stage D2, class D16. `groupOperation` is
+    /// `BY '(' fieldExpression ')'` (`expr.y:177-179` @ Tempo v3.0.2):
+    /// ONE operand, and a full field expression. Both halves are asserted
+    /// here, because the old shape was wrong in both directions.
+    #[test]
+    fn the_spanset_by_takes_one_key_and_that_key_is_a_field_expression() {
+        // Widened: every one of these is a reference 200 that we refused.
+        for query in [
+            "{ .a = 1 } | by(.b + .c)",
+            "{ .a = 1 } | by(-.b)",
+            "{ .a = 1 } | by(!.b)",
+            "{ .a = 1 } | by((.b))",
+            "{ .a = 1 } | by(.b = 1)",
+        ] {
+            let parsed = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                matches!(parsed.pipeline[..], [PipelineStage::By { .. }]),
+                "{query}"
+            );
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
+        }
+        // Narrowed: the comma list is a reference parse error, and was a
+        // shipped, SERVED accept here until this stage withdrew it.
+        for query in ["{ .a = 1 } | by(.b, .c)", "{ .a = 1 } | by(.b, .c, name)"] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                matches!(err, TraceQlError::UnexpectedToken { .. }),
+                "{query}: expected a positioned error, got {err}"
+            );
+        }
+        // The METRICS by(...) is attributeList and keeps its comma list.
+        let metrics = parse("{} | rate() by(.a, .b)").unwrap();
+        assert!(matches!(metrics.pipeline[..], [PipelineStage::Metric(_)]));
     }
 
     #[test]

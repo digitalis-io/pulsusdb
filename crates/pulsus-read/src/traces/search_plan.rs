@@ -1102,22 +1102,42 @@ fn plan_pipeline(
             // resolvable by-key produces a grouped `By` stage; a genuinely
             // un-groupable key form (span-event / span-link intrinsic) is a
             // clean `400` from `plan_group_key`, never a silent flat 200.
-            PipelineStage::By { fields } => {
-                group_by.extend(fields.iter().cloned());
-                let mut keys = Vec::with_capacity(fields.len());
-                for field in fields {
-                    keys.push(plan_group_key(
-                        field,
-                        agg_fields,
-                        select_attrs,
-                        nested_set,
-                        trace_ctx,
-                        child_count,
-                    )?);
-                }
-                if !keys.is_empty() {
-                    post_stages.push(SpansetStage::By(keys));
-                }
+            // Issue #335 Stage D2: the stage carries ONE key and that key
+            // is a full `FieldExpr`, matching `groupOperation`
+            // (`expr.y:177-179` @ Tempo v3.0.2). A bare-field key takes
+            // the existing `plan_group_key` path unchanged — the plan it
+            // produces is byte-identical, which
+            // `tests/traces_by_key_plan_freeze.rs` pins across all
+            // nineteen served by-key kinds — and a COMPOSITE key (an
+            // arithmetic, unary, parenthesised-away or comparison
+            // expression) is a clean `400` naming the rendered key rather
+            // than a silent flat 200. That is the Stage C
+            // aggregate-argument pattern one production over: the parser
+            // must not answer a semantic question, and the planner must
+            // not answer it silently.
+            //
+            // `SpansetStage::By(Vec<_>)` and everything below it are
+            // deliberately NOT changed: a one-element vector keeps the
+            // executor, the `reader.traceql_max_series` backstop and the
+            // generated SQL identical.
+            PipelineStage::By { key } => {
+                let FieldExpr::Field(field) = key else {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "by({key}) is not a group key this engine can execute: a grouping key \
+                         must resolve to a single per-span value, so it must be an attribute or \
+                         an intrinsic"
+                    )));
+                };
+                group_by.push(field.clone());
+                let planned = plan_group_key(
+                    field,
+                    agg_fields,
+                    select_attrs,
+                    nested_set,
+                    trace_ctx,
+                    child_count,
+                )?;
+                post_stages.push(SpansetStage::By(vec![planned]));
             }
             PipelineStage::Coalesce => {
                 coalesce = true;

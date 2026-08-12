@@ -23,12 +23,23 @@ Query {
     ),
     pipeline: [
         By {
-            key: Field(
-                Attribute {
-                    scope: Resource,
-                    key: "service.name",
-                },
-            ),
+            key: Binary {
+                op: Arith(
+                    Add,
+                ),
+                lhs: Field(
+                    Attribute {
+                        scope: Unscoped,
+                        key: "b",
+                    },
+                ),
+                rhs: Field(
+                    Attribute {
+                        scope: Unscoped,
+                        key: "c",
+                    },
+                ),
+            },
         },
     ],
     hints: [],

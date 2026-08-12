@@ -288,7 +288,10 @@ fn the_baselines_note_explains_the_numbers_beside_it() {
     const STAGE_C_DIVERGE: usize = 10;
     for (label, value) in [
         ("the pre-Stage-D0 divergence count", STAGE_C_DIVERGE),
-        ("the committed WIRE_DIVERGE_BASELINE", baseline.WIRE_DIVERGE_BASELINE),
+        (
+            "the committed WIRE_DIVERGE_BASELINE",
+            baseline.WIRE_DIVERGE_BASELINE,
+        ),
     ] {
         assert!(
             baseline.note.contains(&value.to_string()),

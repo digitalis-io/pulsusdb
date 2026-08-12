@@ -406,8 +406,8 @@ struct ClosedMeaningProbe {
 /// 2xx. The class row carries `wire_status: "open"` saying so. Read these
 /// constants as "the grammar agrees", never as "these queries work".
 const TOTAL: usize = 306;
-const AGREE: usize = 260;
-const DIVERGE: usize = 46;
+const AGREE: usize = 266;
+const DIVERGE: usize = 40;
 const MEANING: usize = 6;
 const CLOSED_MEANING: usize = 7;
 
@@ -995,8 +995,7 @@ fn a_wire_divergence_the_parse_axis_cannot_see_names_its_owning_issue() {
         .filter(|c| c.stage.as_deref() == Some("held"))
         .map(|c| c.id.as_str())
         .collect();
-    let is_held_member =
-        |p: &Probe| p.class.as_deref().is_some_and(|c| held_classes.contains(c));
+    let is_held_member = |p: &Probe| p.class.as_deref().is_some_and(|c| held_classes.contains(c));
 
     let mut unowned = Vec::new();
     let mut stale = Vec::new();
@@ -1382,7 +1381,10 @@ fn every_grammar_production_is_enumerated_and_dispositioned() {
             s.disposition.as_str(),
             "probed" | "covered-by" | "no-operand-slot"
         ) {
-            faults.push(format!("{}: bad disposition {:?}", s.production, s.disposition));
+            faults.push(format!(
+                "{}: bad disposition {:?}",
+                s.production, s.disposition
+            ));
         }
         if s.why.trim().is_empty() {
             faults.push(format!("{}: empty `why`", s.production));
@@ -1560,10 +1562,16 @@ fn every_probe_records_its_reachability() {
                     );
                 }
             }
-            (None, true) => fault(&p.query, "a lexical class's probe must name its subject".into()),
+            (None, true) => fault(
+                &p.query,
+                "a lexical class's probe must name its subject".into(),
+            ),
             (Some(s), false) => fault(
                 &p.query,
-                format!("{} is positional, so probe subject {s:?} is meaningless", class.id),
+                format!(
+                    "{} is positional, so probe subject {s:?} is meaningless",
+                    class.id
+                ),
             ),
             (None, false) => {}
         }
@@ -1581,7 +1589,10 @@ fn every_probe_records_its_reachability() {
         if ev.kind != want_kind {
             fault(
                 &p.query,
-                format!("tier {tier} must be discharged by {want_kind:?}, got {:?}", ev.kind),
+                format!(
+                    "tier {tier} must be discharged by {want_kind:?}, got {:?}",
+                    ev.kind
+                ),
             );
             continue;
         }
@@ -1607,7 +1618,10 @@ fn every_probe_records_its_reachability() {
                 }
                 for e in &cap.emitters {
                     if !r.anchors.contains_key(e) {
-                        fault(&p.query, format!("capture emitter {e:?} is not a declared anchor"));
+                        fault(
+                            &p.query,
+                            format!("capture emitter {e:?} is not a declared anchor"),
+                        );
                     }
                 }
             }
@@ -1799,7 +1813,8 @@ const TIER_HISTOGRAM: [(&str, usize); 4] = [
     // class a client actually emits is the one that got fixed first, which
     // is the ranking doing its job rather than an empty bucket.
     ("r1-client-emitted", 0),
-    ("r2-skeleton-inserted", 8),
+    // Stage D2 closed D16, r2's other six.
+    ("r2-skeleton-inserted", 2),
     ("r3-highlighted-only", 17),
     ("r4-no-traceql-surface-path", 21),
 ];
@@ -1857,7 +1872,7 @@ fn the_reachability_tier_histogram_is_pinned() {
 /// the FNV-1a prime and must not be "fixed".
 #[test]
 fn the_reachability_classification_is_frozen_against_a_silent_swap() {
-    const REACHABILITY_DIGEST: u64 = 0x2f31_d21e_1cdd_12db;
+    const REACHABILITY_DIGEST: u64 = 0xb72d_4863_e6e9_59f8;
     let m = matrix();
     let r: Reachability = fixture("reachability.json");
 

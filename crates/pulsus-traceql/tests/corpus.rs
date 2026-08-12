@@ -211,10 +211,8 @@ fn every_case_reproduces_its_pinned_golden() {
 /// and it has to re-parse to the exact recorded rendering below, so the
 /// alternative shape is pinned rather than waved through. Adding an entry
 /// is a visible source-line edit with a reason attached.
-const RENDERING_IS_NOT_ROUND_TRIP: [(&str, &str); 1] = [(
-    "accept/static_min_int",
-    "{ .a = -9223372036854775808 }",
-)];
+const RENDERING_IS_NOT_ROUND_TRIP: [(&str, &str); 1] =
+    [("accept/static_min_int", "{ .a = -9223372036854775808 }")];
 
 #[test]
 fn accept_cases_round_trip_through_display() {

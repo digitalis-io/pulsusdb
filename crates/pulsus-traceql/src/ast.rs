@@ -816,11 +816,28 @@ pub enum PipelineStage {
     /// `select(field, ...)` — one or more fields; `select()` is a
     /// positioned parse error.
     Select { fields: Vec<Field> },
-    /// `by(field, ...)` — a spanset-level grouping stage (issue #185,
-    /// `pipeline.by`): regroups the matched spans into per-key spansets.
-    /// Distinct from the metric `by(...)` clause carried by
+    /// `by(<field expression>)` — a spanset-level grouping stage (issue
+    /// #185, `pipeline.by`): regroups the matched spans into per-key
+    /// spansets. Distinct from the metric `by(...)` clause carried by
     /// [`MetricStage`]. Empty `by()` is a positioned parse error.
-    By { fields: Vec<Field> },
+    ///
+    /// **ONE key, and that key is a whole [`FieldExpr`]** (issue #335
+    /// Stage D2, class D16). The reference's `groupOperation` is
+    /// `BY OPEN_PARENS fieldExpression CLOSE_PARENS`
+    /// (`pkg/traceql/expr.y:177-179` @ Tempo v3.0.2) — one operand, and
+    /// that operand is a full field expression. The production has no
+    /// `COMMA` and `fieldExpression` has none either.
+    ///
+    /// This was wrong in BOTH directions before: we took a comma list of
+    /// bare [`Field`]s, so `| by(.b, .c)` was accepted **and served**
+    /// here while the reference answers `400`, and `| by(.b + .c)` was a
+    /// parse error here while the reference answers `200`. The comma list
+    /// is the worse half — a query that works here and cannot be run at
+    /// the thing we claim compatibility with — and it is withdrawn, with
+    /// a row in `docs/benchmarks/traces-differential-ledger.md`. The
+    /// METRICS `by(...)` is untouched: it is `attributeList`
+    /// (`expr.y:195-198`) and its comma list is correct.
+    By { key: FieldExpr },
     /// `coalesce()` — a spanset-level stage (issue #185, `pipeline.coalesce`)
     /// that merges the spanset arrays. Zero-arity.
     Coalesce,
@@ -867,16 +884,7 @@ impl fmt::Display for PipelineStage {
                 }
                 write!(f, ")")
             }
-            PipelineStage::By { fields } => {
-                write!(f, "by(")?;
-                for (i, field) in fields.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{field}")?;
-                }
-                write!(f, ")")
-            }
+            PipelineStage::By { key } => write!(f, "by({key})"),
             PipelineStage::Coalesce => write!(f, "coalesce()"),
             PipelineStage::Metric(stage) => write!(f, "{stage}"),
             PipelineStage::MetricSecondStage(stage) => write!(f, "{stage}"),

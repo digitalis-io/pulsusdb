@@ -83,8 +83,7 @@ fn render_plan(key: &str) -> String {
     let text = format!("{{ .x = 1 }} | by({key})");
     let query = pulsus_traceql::parse(&text)
         .unwrap_or_else(|e| panic!("{text:?} must parse — it is a served by-key: {e}"));
-    pulsus_traceql::validate(&query)
-        .unwrap_or_else(|e| panic!("{text:?} must validate: {e}"));
+    pulsus_traceql::validate(&query).unwrap_or_else(|e| panic!("{text:?} must validate: {e}"));
     let plan = plan_search(
         &query,
         &SearchParams {

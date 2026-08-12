@@ -1,7 +1,7 @@
 {
-  "WIRE_AGREE_BASELINE": 252,
-  "WIRE_DIVERGE_BASELINE": 54,
-  "note": "Stage D0 (issue #335, 2026-08-12) appended 85 probes and raised WIRE_DIVERGE_BASELINE from 10 to 63, and Stage D1 lowered it to 54. NOTHING REGRESSED. The first enumeration covered the precedence table and the field-expression operand positions - 24 of the reference grammar's 33 productions. Stage D0 enumerated all 33; the nine that had never been probed carry two classes on their own. The rise is the enumeration widening from a subset of the grammar to the whole of it, not decay. See accept_surface/grammar_slots.json, accept_surface/PROVENANCE.md section 'Stage D0' and the doc block above TOTAL/AGREE/DIVERGE in pulsus-traceql/tests/accept_surface.rs.",
+  "WIRE_AGREE_BASELINE": 254,
+  "WIRE_DIVERGE_BASELINE": 52,
+  "note": "Stage D0 (issue #335, 2026-08-12) appended 85 probes and raised WIRE_DIVERGE_BASELINE from 10 to 63, and Stages D1 and D2 lowered it to 52. NOTHING REGRESSED. The first enumeration covered the precedence table and the field-expression operand positions - 24 of the reference grammar's 33 productions. Stage D0 enumerated all 33; the nine that had never been probed carry two classes on their own. The rise is the enumeration widening from a subset of the grammar to the whole of it, not decay. See accept_surface/grammar_slots.json, accept_surface/PROVENANCE.md section 'Stage D0' and the doc block above TOTAL/AGREE/DIVERGE in pulsus-traceql/tests/accept_surface.rs.",
   "wire_baseline": [
     {
       "pulsus_wire": "reject",
@@ -960,7 +960,7 @@
       "query": "{ .a = 1 } | by(!.b)"
     },
     {
-      "pulsus_wire": "reject",
+      "pulsus_wire": "accept",
       "query": "{ .a = 1 } | by((.b))"
     },
     {
@@ -976,7 +976,7 @@
       "query": "{ .a = 1 } | by(.b = 1)"
     },
     {
-      "pulsus_wire": "accept",
+      "pulsus_wire": "reject",
       "query": "{ .a = 1 } | by(.b, .c)"
     },
     {

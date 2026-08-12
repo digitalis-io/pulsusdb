@@ -654,7 +654,9 @@ fn every_enumerated_spelling_in_a_construct_syntax_has_a_probe() {
         let parts: Vec<&str> = c.syntax.split('|').map(str::trim).collect();
         let spellings = parts.iter().all(|p| {
             !p.is_empty()
-                && p.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                && p.chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
                 && p.chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '.')
         });

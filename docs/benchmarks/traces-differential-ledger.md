@@ -520,3 +520,52 @@ re-decide from the evidence rather than re-derive it.
   oracle that does not read the body — the `405 Allow: GET,HEAD` cell and
   the `Vary: accept` header on the `404` are both candidates — and then
   emptying the body.
+
+### `traceql-spanset-by-multi-key-withdrawn` (issue #335 Stage D2) — **an accept REMOVED to restore parity**
+
+- **What was withdrawn.** PulsusDB parsed **and served** a comma-separated
+  spanset grouping stage — `{ … } | by(.b, .c)` — planning a multi-key
+  `SpansetStage::By` and returning `200` with grouped results. The
+  reference **parse-rejects** it: `groupOperation` is
+  `BY OPEN_PARENS fieldExpression CLOSE_PARENS`
+  (`pkg/traceql/expr.y:177-179` @ Tempo v3.0.2), which carries no `COMMA`,
+  and `fieldExpression` has none either. Measured at the pinned digest
+  (`grafana/tempo@sha256:aa8df8d0…`, `/status/version` → v3.0.2, revision
+  `0c4b926d0`): `400 parse error at line 1, col 19: syntax error:
+  unexpected ,`.
+
+- **Why an accept was deleted rather than ledgered as a permissive
+  divergence.** This is the only shape in the whole accept-surface audit
+  where a user gets a **wrong-looking `200` here and a `400` there**. Every
+  other divergence is an error on one side, which a user notices
+  immediately; this one works, so the user builds on it, and the query is
+  then not portable to the system PulsusDB claims compatibility with. A
+  rejection is honest; an answer nobody else will give is a trap. The cost
+  is zero — PulsusDB has never shipped, so no deployment depends on it.
+
+- **Witnessed by a probe that now REJECTS**, not by one that passes: the
+  accept-surface probe `{ .a = 1 } | by(.b, .c)` moved `accept → reject`
+  on both the parse and the wire axis and now AGREES with the reference,
+  and `reject/by_multi_key` pins the positioned parse error. That is the
+  same shape as `traceql-validate-nil-spelling-conflation`'s closure —
+  the check is that the divergence is gone, in the direction it was gone
+  in.
+
+- **The same change widened the production in the other direction**, which
+  is why it is one stage rather than two: the single operand became a full
+  field expression, so `by(.b + .c)`, `by(-.b)`, `by(!.b)`, `by((.b))` and
+  `by(.b = 1)` now parse, as they always have at the reference. Four of
+  those five are still a clean planner `400` here — a grouping key must
+  resolve to one per-span value — recorded as class D16's `wire_status:
+  "open"` with its note, and each of those probes names issue 335.
+
+- **Nothing served moved.** `crates/pulsus-read/tests/golden_sql_freeze.rs`
+  (`PINNED_SQL_CORPUS`, 69 frozen goldens) is unchanged, and
+  `crates/pulsus-read/tests/traces_by_key_plan_freeze.rs` — pinned in
+  Stage D0, *before* this change, over **all nineteen** served by-key
+  kinds — re-derives every plan byte-identically. The frozen SQL corpus
+  alone would have been corroboration over three of the nineteen.
+
+- **Where it is enforced.** `parser::tests::the_spanset_by_takes_one_key_and_that_key_is_a_field_expression`,
+  the `reject/by_multi_key` corpus case, and the accept-surface matrix's
+  D16 rows. User-facing write-up: docs/api.md §4.2.
