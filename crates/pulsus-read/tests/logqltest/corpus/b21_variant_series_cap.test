@@ -1,0 +1,3143 @@
+# b21_variant_series_cap.test — issue #277: the per-variant result-series
+# cap SKIPS the breaching variant and warns; it never fails the query.
+#
+# Every expectation below (case 8 excepted, see its own note) was CAPTURED
+# from the pinned reference container and generated from its response
+# bytes, never written from the expected rule:
+#   image  docker.io/grafana/loki:3.7.4
+#   digest sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc
+#   buildinfo version 3.7.4, revision b318f282
+#   date   2026-08-12 (capture session)
+#   config delta: `limits_config.enable_multi_variant_queries: true`
+#   (`ci/logql/config.yaml`) — the bare container 400s EVERY variants query
+#   with `multi variant queries are disabled for this instance`.
+#   Anchoring: DSL `at 60s` was mapped to a wall clock instant on an exact
+#   60 s boundary, so the container's /query_range grid points coincide
+#   with the DSL's (the b15 anchoring rule).
+#   Transcription discipline (PROVENANCE.md): the container's
+#   `detected_level`/`detected_level_extracted` labels have no analogue in
+#   PulsusDB's label model and are dropped from every expected label set;
+#   values are unaffected.
+#
+# Dataset: one stream, 501 lines `id=<N>` 100 ms apart, N at offset
+# (N+1)*100ms. Group counts are reached by filtering the COMMON range
+# (`| logfmt | id < N`), because a bare variant's own selector and filters
+# are dead syntax (`b13_variants.test` case 3).
+#
+# Shape: variant 0 is `sum by (id) (...)` — one series per surviving group,
+# so it is the variant that walks the cap — and variant 1 is `sum(...)`,
+# one series, so it is the variant that survives a skip. That pairing is
+# what makes case 3 the per-variant-not-total proof: 500 + 1 = 501 RESULT
+# series, served.
+#
+# PRE-COMMITTED EXCLUSION (a selection rule, not a post-hoc filter):
+#   - case 8 (range at exactly 500) is a DELIBERATE DIVERGENCE. The
+#     reference skips the variant there; PulsusDB serves it. Its captured
+#     behaviour is recorded beside the case as a `# reference:` annotation
+#     and MUST NOT be used to "correct" our verdict — see
+#     docs/benchmarks/logs-differential-ledger.md entry (d) and
+#     `range_variant_at_the_cap_is_served_where_the_reference_skips_it`.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.)
+
+load
+  {service_name="v277"}
+  100ms  id=0
+  200ms  id=1
+  300ms  id=2
+  400ms  id=3
+  500ms  id=4
+  600ms  id=5
+  700ms  id=6
+  800ms  id=7
+  900ms  id=8
+  1000ms  id=9
+  1100ms  id=10
+  1200ms  id=11
+  1300ms  id=12
+  1400ms  id=13
+  1500ms  id=14
+  1600ms  id=15
+  1700ms  id=16
+  1800ms  id=17
+  1900ms  id=18
+  2000ms  id=19
+  2100ms  id=20
+  2200ms  id=21
+  2300ms  id=22
+  2400ms  id=23
+  2500ms  id=24
+  2600ms  id=25
+  2700ms  id=26
+  2800ms  id=27
+  2900ms  id=28
+  3000ms  id=29
+  3100ms  id=30
+  3200ms  id=31
+  3300ms  id=32
+  3400ms  id=33
+  3500ms  id=34
+  3600ms  id=35
+  3700ms  id=36
+  3800ms  id=37
+  3900ms  id=38
+  4000ms  id=39
+  4100ms  id=40
+  4200ms  id=41
+  4300ms  id=42
+  4400ms  id=43
+  4500ms  id=44
+  4600ms  id=45
+  4700ms  id=46
+  4800ms  id=47
+  4900ms  id=48
+  5000ms  id=49
+  5100ms  id=50
+  5200ms  id=51
+  5300ms  id=52
+  5400ms  id=53
+  5500ms  id=54
+  5600ms  id=55
+  5700ms  id=56
+  5800ms  id=57
+  5900ms  id=58
+  6000ms  id=59
+  6100ms  id=60
+  6200ms  id=61
+  6300ms  id=62
+  6400ms  id=63
+  6500ms  id=64
+  6600ms  id=65
+  6700ms  id=66
+  6800ms  id=67
+  6900ms  id=68
+  7000ms  id=69
+  7100ms  id=70
+  7200ms  id=71
+  7300ms  id=72
+  7400ms  id=73
+  7500ms  id=74
+  7600ms  id=75
+  7700ms  id=76
+  7800ms  id=77
+  7900ms  id=78
+  8000ms  id=79
+  8100ms  id=80
+  8200ms  id=81
+  8300ms  id=82
+  8400ms  id=83
+  8500ms  id=84
+  8600ms  id=85
+  8700ms  id=86
+  8800ms  id=87
+  8900ms  id=88
+  9000ms  id=89
+  9100ms  id=90
+  9200ms  id=91
+  9300ms  id=92
+  9400ms  id=93
+  9500ms  id=94
+  9600ms  id=95
+  9700ms  id=96
+  9800ms  id=97
+  9900ms  id=98
+  10000ms  id=99
+  10100ms  id=100
+  10200ms  id=101
+  10300ms  id=102
+  10400ms  id=103
+  10500ms  id=104
+  10600ms  id=105
+  10700ms  id=106
+  10800ms  id=107
+  10900ms  id=108
+  11000ms  id=109
+  11100ms  id=110
+  11200ms  id=111
+  11300ms  id=112
+  11400ms  id=113
+  11500ms  id=114
+  11600ms  id=115
+  11700ms  id=116
+  11800ms  id=117
+  11900ms  id=118
+  12000ms  id=119
+  12100ms  id=120
+  12200ms  id=121
+  12300ms  id=122
+  12400ms  id=123
+  12500ms  id=124
+  12600ms  id=125
+  12700ms  id=126
+  12800ms  id=127
+  12900ms  id=128
+  13000ms  id=129
+  13100ms  id=130
+  13200ms  id=131
+  13300ms  id=132
+  13400ms  id=133
+  13500ms  id=134
+  13600ms  id=135
+  13700ms  id=136
+  13800ms  id=137
+  13900ms  id=138
+  14000ms  id=139
+  14100ms  id=140
+  14200ms  id=141
+  14300ms  id=142
+  14400ms  id=143
+  14500ms  id=144
+  14600ms  id=145
+  14700ms  id=146
+  14800ms  id=147
+  14900ms  id=148
+  15000ms  id=149
+  15100ms  id=150
+  15200ms  id=151
+  15300ms  id=152
+  15400ms  id=153
+  15500ms  id=154
+  15600ms  id=155
+  15700ms  id=156
+  15800ms  id=157
+  15900ms  id=158
+  16000ms  id=159
+  16100ms  id=160
+  16200ms  id=161
+  16300ms  id=162
+  16400ms  id=163
+  16500ms  id=164
+  16600ms  id=165
+  16700ms  id=166
+  16800ms  id=167
+  16900ms  id=168
+  17000ms  id=169
+  17100ms  id=170
+  17200ms  id=171
+  17300ms  id=172
+  17400ms  id=173
+  17500ms  id=174
+  17600ms  id=175
+  17700ms  id=176
+  17800ms  id=177
+  17900ms  id=178
+  18000ms  id=179
+  18100ms  id=180
+  18200ms  id=181
+  18300ms  id=182
+  18400ms  id=183
+  18500ms  id=184
+  18600ms  id=185
+  18700ms  id=186
+  18800ms  id=187
+  18900ms  id=188
+  19000ms  id=189
+  19100ms  id=190
+  19200ms  id=191
+  19300ms  id=192
+  19400ms  id=193
+  19500ms  id=194
+  19600ms  id=195
+  19700ms  id=196
+  19800ms  id=197
+  19900ms  id=198
+  20000ms  id=199
+  20100ms  id=200
+  20200ms  id=201
+  20300ms  id=202
+  20400ms  id=203
+  20500ms  id=204
+  20600ms  id=205
+  20700ms  id=206
+  20800ms  id=207
+  20900ms  id=208
+  21000ms  id=209
+  21100ms  id=210
+  21200ms  id=211
+  21300ms  id=212
+  21400ms  id=213
+  21500ms  id=214
+  21600ms  id=215
+  21700ms  id=216
+  21800ms  id=217
+  21900ms  id=218
+  22000ms  id=219
+  22100ms  id=220
+  22200ms  id=221
+  22300ms  id=222
+  22400ms  id=223
+  22500ms  id=224
+  22600ms  id=225
+  22700ms  id=226
+  22800ms  id=227
+  22900ms  id=228
+  23000ms  id=229
+  23100ms  id=230
+  23200ms  id=231
+  23300ms  id=232
+  23400ms  id=233
+  23500ms  id=234
+  23600ms  id=235
+  23700ms  id=236
+  23800ms  id=237
+  23900ms  id=238
+  24000ms  id=239
+  24100ms  id=240
+  24200ms  id=241
+  24300ms  id=242
+  24400ms  id=243
+  24500ms  id=244
+  24600ms  id=245
+  24700ms  id=246
+  24800ms  id=247
+  24900ms  id=248
+  25000ms  id=249
+  25100ms  id=250
+  25200ms  id=251
+  25300ms  id=252
+  25400ms  id=253
+  25500ms  id=254
+  25600ms  id=255
+  25700ms  id=256
+  25800ms  id=257
+  25900ms  id=258
+  26000ms  id=259
+  26100ms  id=260
+  26200ms  id=261
+  26300ms  id=262
+  26400ms  id=263
+  26500ms  id=264
+  26600ms  id=265
+  26700ms  id=266
+  26800ms  id=267
+  26900ms  id=268
+  27000ms  id=269
+  27100ms  id=270
+  27200ms  id=271
+  27300ms  id=272
+  27400ms  id=273
+  27500ms  id=274
+  27600ms  id=275
+  27700ms  id=276
+  27800ms  id=277
+  27900ms  id=278
+  28000ms  id=279
+  28100ms  id=280
+  28200ms  id=281
+  28300ms  id=282
+  28400ms  id=283
+  28500ms  id=284
+  28600ms  id=285
+  28700ms  id=286
+  28800ms  id=287
+  28900ms  id=288
+  29000ms  id=289
+  29100ms  id=290
+  29200ms  id=291
+  29300ms  id=292
+  29400ms  id=293
+  29500ms  id=294
+  29600ms  id=295
+  29700ms  id=296
+  29800ms  id=297
+  29900ms  id=298
+  30000ms  id=299
+  30100ms  id=300
+  30200ms  id=301
+  30300ms  id=302
+  30400ms  id=303
+  30500ms  id=304
+  30600ms  id=305
+  30700ms  id=306
+  30800ms  id=307
+  30900ms  id=308
+  31000ms  id=309
+  31100ms  id=310
+  31200ms  id=311
+  31300ms  id=312
+  31400ms  id=313
+  31500ms  id=314
+  31600ms  id=315
+  31700ms  id=316
+  31800ms  id=317
+  31900ms  id=318
+  32000ms  id=319
+  32100ms  id=320
+  32200ms  id=321
+  32300ms  id=322
+  32400ms  id=323
+  32500ms  id=324
+  32600ms  id=325
+  32700ms  id=326
+  32800ms  id=327
+  32900ms  id=328
+  33000ms  id=329
+  33100ms  id=330
+  33200ms  id=331
+  33300ms  id=332
+  33400ms  id=333
+  33500ms  id=334
+  33600ms  id=335
+  33700ms  id=336
+  33800ms  id=337
+  33900ms  id=338
+  34000ms  id=339
+  34100ms  id=340
+  34200ms  id=341
+  34300ms  id=342
+  34400ms  id=343
+  34500ms  id=344
+  34600ms  id=345
+  34700ms  id=346
+  34800ms  id=347
+  34900ms  id=348
+  35000ms  id=349
+  35100ms  id=350
+  35200ms  id=351
+  35300ms  id=352
+  35400ms  id=353
+  35500ms  id=354
+  35600ms  id=355
+  35700ms  id=356
+  35800ms  id=357
+  35900ms  id=358
+  36000ms  id=359
+  36100ms  id=360
+  36200ms  id=361
+  36300ms  id=362
+  36400ms  id=363
+  36500ms  id=364
+  36600ms  id=365
+  36700ms  id=366
+  36800ms  id=367
+  36900ms  id=368
+  37000ms  id=369
+  37100ms  id=370
+  37200ms  id=371
+  37300ms  id=372
+  37400ms  id=373
+  37500ms  id=374
+  37600ms  id=375
+  37700ms  id=376
+  37800ms  id=377
+  37900ms  id=378
+  38000ms  id=379
+  38100ms  id=380
+  38200ms  id=381
+  38300ms  id=382
+  38400ms  id=383
+  38500ms  id=384
+  38600ms  id=385
+  38700ms  id=386
+  38800ms  id=387
+  38900ms  id=388
+  39000ms  id=389
+  39100ms  id=390
+  39200ms  id=391
+  39300ms  id=392
+  39400ms  id=393
+  39500ms  id=394
+  39600ms  id=395
+  39700ms  id=396
+  39800ms  id=397
+  39900ms  id=398
+  40000ms  id=399
+  40100ms  id=400
+  40200ms  id=401
+  40300ms  id=402
+  40400ms  id=403
+  40500ms  id=404
+  40600ms  id=405
+  40700ms  id=406
+  40800ms  id=407
+  40900ms  id=408
+  41000ms  id=409
+  41100ms  id=410
+  41200ms  id=411
+  41300ms  id=412
+  41400ms  id=413
+  41500ms  id=414
+  41600ms  id=415
+  41700ms  id=416
+  41800ms  id=417
+  41900ms  id=418
+  42000ms  id=419
+  42100ms  id=420
+  42200ms  id=421
+  42300ms  id=422
+  42400ms  id=423
+  42500ms  id=424
+  42600ms  id=425
+  42700ms  id=426
+  42800ms  id=427
+  42900ms  id=428
+  43000ms  id=429
+  43100ms  id=430
+  43200ms  id=431
+  43300ms  id=432
+  43400ms  id=433
+  43500ms  id=434
+  43600ms  id=435
+  43700ms  id=436
+  43800ms  id=437
+  43900ms  id=438
+  44000ms  id=439
+  44100ms  id=440
+  44200ms  id=441
+  44300ms  id=442
+  44400ms  id=443
+  44500ms  id=444
+  44600ms  id=445
+  44700ms  id=446
+  44800ms  id=447
+  44900ms  id=448
+  45000ms  id=449
+  45100ms  id=450
+  45200ms  id=451
+  45300ms  id=452
+  45400ms  id=453
+  45500ms  id=454
+  45600ms  id=455
+  45700ms  id=456
+  45800ms  id=457
+  45900ms  id=458
+  46000ms  id=459
+  46100ms  id=460
+  46200ms  id=461
+  46300ms  id=462
+  46400ms  id=463
+  46500ms  id=464
+  46600ms  id=465
+  46700ms  id=466
+  46800ms  id=467
+  46900ms  id=468
+  47000ms  id=469
+  47100ms  id=470
+  47200ms  id=471
+  47300ms  id=472
+  47400ms  id=473
+  47500ms  id=474
+  47600ms  id=475
+  47700ms  id=476
+  47800ms  id=477
+  47900ms  id=478
+  48000ms  id=479
+  48100ms  id=480
+  48200ms  id=481
+  48300ms  id=482
+  48400ms  id=483
+  48500ms  id=484
+  48600ms  id=485
+  48700ms  id=486
+  48800ms  id=487
+  48900ms  id=488
+  49000ms  id=489
+  49100ms  id=490
+  49200ms  id=491
+  49300ms  id=492
+  49400ms  id=493
+  49500ms  id=494
+  49600ms  id=495
+  49700ms  id=496
+  49800ms  id=497
+  49900ms  id=498
+  50000ms  id=499
+  50100ms  id=500
+
+# case 1 — instant, 498 common groups: both variants served,
+# no warning.
+eval instant at 60s variants(sum by (id) (count_over_time({service_name="v277"} | logfmt | id < 498 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 498 [1m]))) of ({service_name="v277"} | logfmt | id < 498 [1m])
+  {__variant__="0", id="0"} 1
+  {__variant__="0", id="1"} 1
+  {__variant__="0", id="10"} 1
+  {__variant__="0", id="100"} 1
+  {__variant__="0", id="101"} 1
+  {__variant__="0", id="102"} 1
+  {__variant__="0", id="103"} 1
+  {__variant__="0", id="104"} 1
+  {__variant__="0", id="105"} 1
+  {__variant__="0", id="106"} 1
+  {__variant__="0", id="107"} 1
+  {__variant__="0", id="108"} 1
+  {__variant__="0", id="109"} 1
+  {__variant__="0", id="11"} 1
+  {__variant__="0", id="110"} 1
+  {__variant__="0", id="111"} 1
+  {__variant__="0", id="112"} 1
+  {__variant__="0", id="113"} 1
+  {__variant__="0", id="114"} 1
+  {__variant__="0", id="115"} 1
+  {__variant__="0", id="116"} 1
+  {__variant__="0", id="117"} 1
+  {__variant__="0", id="118"} 1
+  {__variant__="0", id="119"} 1
+  {__variant__="0", id="12"} 1
+  {__variant__="0", id="120"} 1
+  {__variant__="0", id="121"} 1
+  {__variant__="0", id="122"} 1
+  {__variant__="0", id="123"} 1
+  {__variant__="0", id="124"} 1
+  {__variant__="0", id="125"} 1
+  {__variant__="0", id="126"} 1
+  {__variant__="0", id="127"} 1
+  {__variant__="0", id="128"} 1
+  {__variant__="0", id="129"} 1
+  {__variant__="0", id="13"} 1
+  {__variant__="0", id="130"} 1
+  {__variant__="0", id="131"} 1
+  {__variant__="0", id="132"} 1
+  {__variant__="0", id="133"} 1
+  {__variant__="0", id="134"} 1
+  {__variant__="0", id="135"} 1
+  {__variant__="0", id="136"} 1
+  {__variant__="0", id="137"} 1
+  {__variant__="0", id="138"} 1
+  {__variant__="0", id="139"} 1
+  {__variant__="0", id="14"} 1
+  {__variant__="0", id="140"} 1
+  {__variant__="0", id="141"} 1
+  {__variant__="0", id="142"} 1
+  {__variant__="0", id="143"} 1
+  {__variant__="0", id="144"} 1
+  {__variant__="0", id="145"} 1
+  {__variant__="0", id="146"} 1
+  {__variant__="0", id="147"} 1
+  {__variant__="0", id="148"} 1
+  {__variant__="0", id="149"} 1
+  {__variant__="0", id="15"} 1
+  {__variant__="0", id="150"} 1
+  {__variant__="0", id="151"} 1
+  {__variant__="0", id="152"} 1
+  {__variant__="0", id="153"} 1
+  {__variant__="0", id="154"} 1
+  {__variant__="0", id="155"} 1
+  {__variant__="0", id="156"} 1
+  {__variant__="0", id="157"} 1
+  {__variant__="0", id="158"} 1
+  {__variant__="0", id="159"} 1
+  {__variant__="0", id="16"} 1
+  {__variant__="0", id="160"} 1
+  {__variant__="0", id="161"} 1
+  {__variant__="0", id="162"} 1
+  {__variant__="0", id="163"} 1
+  {__variant__="0", id="164"} 1
+  {__variant__="0", id="165"} 1
+  {__variant__="0", id="166"} 1
+  {__variant__="0", id="167"} 1
+  {__variant__="0", id="168"} 1
+  {__variant__="0", id="169"} 1
+  {__variant__="0", id="17"} 1
+  {__variant__="0", id="170"} 1
+  {__variant__="0", id="171"} 1
+  {__variant__="0", id="172"} 1
+  {__variant__="0", id="173"} 1
+  {__variant__="0", id="174"} 1
+  {__variant__="0", id="175"} 1
+  {__variant__="0", id="176"} 1
+  {__variant__="0", id="177"} 1
+  {__variant__="0", id="178"} 1
+  {__variant__="0", id="179"} 1
+  {__variant__="0", id="18"} 1
+  {__variant__="0", id="180"} 1
+  {__variant__="0", id="181"} 1
+  {__variant__="0", id="182"} 1
+  {__variant__="0", id="183"} 1
+  {__variant__="0", id="184"} 1
+  {__variant__="0", id="185"} 1
+  {__variant__="0", id="186"} 1
+  {__variant__="0", id="187"} 1
+  {__variant__="0", id="188"} 1
+  {__variant__="0", id="189"} 1
+  {__variant__="0", id="19"} 1
+  {__variant__="0", id="190"} 1
+  {__variant__="0", id="191"} 1
+  {__variant__="0", id="192"} 1
+  {__variant__="0", id="193"} 1
+  {__variant__="0", id="194"} 1
+  {__variant__="0", id="195"} 1
+  {__variant__="0", id="196"} 1
+  {__variant__="0", id="197"} 1
+  {__variant__="0", id="198"} 1
+  {__variant__="0", id="199"} 1
+  {__variant__="0", id="2"} 1
+  {__variant__="0", id="20"} 1
+  {__variant__="0", id="200"} 1
+  {__variant__="0", id="201"} 1
+  {__variant__="0", id="202"} 1
+  {__variant__="0", id="203"} 1
+  {__variant__="0", id="204"} 1
+  {__variant__="0", id="205"} 1
+  {__variant__="0", id="206"} 1
+  {__variant__="0", id="207"} 1
+  {__variant__="0", id="208"} 1
+  {__variant__="0", id="209"} 1
+  {__variant__="0", id="21"} 1
+  {__variant__="0", id="210"} 1
+  {__variant__="0", id="211"} 1
+  {__variant__="0", id="212"} 1
+  {__variant__="0", id="213"} 1
+  {__variant__="0", id="214"} 1
+  {__variant__="0", id="215"} 1
+  {__variant__="0", id="216"} 1
+  {__variant__="0", id="217"} 1
+  {__variant__="0", id="218"} 1
+  {__variant__="0", id="219"} 1
+  {__variant__="0", id="22"} 1
+  {__variant__="0", id="220"} 1
+  {__variant__="0", id="221"} 1
+  {__variant__="0", id="222"} 1
+  {__variant__="0", id="223"} 1
+  {__variant__="0", id="224"} 1
+  {__variant__="0", id="225"} 1
+  {__variant__="0", id="226"} 1
+  {__variant__="0", id="227"} 1
+  {__variant__="0", id="228"} 1
+  {__variant__="0", id="229"} 1
+  {__variant__="0", id="23"} 1
+  {__variant__="0", id="230"} 1
+  {__variant__="0", id="231"} 1
+  {__variant__="0", id="232"} 1
+  {__variant__="0", id="233"} 1
+  {__variant__="0", id="234"} 1
+  {__variant__="0", id="235"} 1
+  {__variant__="0", id="236"} 1
+  {__variant__="0", id="237"} 1
+  {__variant__="0", id="238"} 1
+  {__variant__="0", id="239"} 1
+  {__variant__="0", id="24"} 1
+  {__variant__="0", id="240"} 1
+  {__variant__="0", id="241"} 1
+  {__variant__="0", id="242"} 1
+  {__variant__="0", id="243"} 1
+  {__variant__="0", id="244"} 1
+  {__variant__="0", id="245"} 1
+  {__variant__="0", id="246"} 1
+  {__variant__="0", id="247"} 1
+  {__variant__="0", id="248"} 1
+  {__variant__="0", id="249"} 1
+  {__variant__="0", id="25"} 1
+  {__variant__="0", id="250"} 1
+  {__variant__="0", id="251"} 1
+  {__variant__="0", id="252"} 1
+  {__variant__="0", id="253"} 1
+  {__variant__="0", id="254"} 1
+  {__variant__="0", id="255"} 1
+  {__variant__="0", id="256"} 1
+  {__variant__="0", id="257"} 1
+  {__variant__="0", id="258"} 1
+  {__variant__="0", id="259"} 1
+  {__variant__="0", id="26"} 1
+  {__variant__="0", id="260"} 1
+  {__variant__="0", id="261"} 1
+  {__variant__="0", id="262"} 1
+  {__variant__="0", id="263"} 1
+  {__variant__="0", id="264"} 1
+  {__variant__="0", id="265"} 1
+  {__variant__="0", id="266"} 1
+  {__variant__="0", id="267"} 1
+  {__variant__="0", id="268"} 1
+  {__variant__="0", id="269"} 1
+  {__variant__="0", id="27"} 1
+  {__variant__="0", id="270"} 1
+  {__variant__="0", id="271"} 1
+  {__variant__="0", id="272"} 1
+  {__variant__="0", id="273"} 1
+  {__variant__="0", id="274"} 1
+  {__variant__="0", id="275"} 1
+  {__variant__="0", id="276"} 1
+  {__variant__="0", id="277"} 1
+  {__variant__="0", id="278"} 1
+  {__variant__="0", id="279"} 1
+  {__variant__="0", id="28"} 1
+  {__variant__="0", id="280"} 1
+  {__variant__="0", id="281"} 1
+  {__variant__="0", id="282"} 1
+  {__variant__="0", id="283"} 1
+  {__variant__="0", id="284"} 1
+  {__variant__="0", id="285"} 1
+  {__variant__="0", id="286"} 1
+  {__variant__="0", id="287"} 1
+  {__variant__="0", id="288"} 1
+  {__variant__="0", id="289"} 1
+  {__variant__="0", id="29"} 1
+  {__variant__="0", id="290"} 1
+  {__variant__="0", id="291"} 1
+  {__variant__="0", id="292"} 1
+  {__variant__="0", id="293"} 1
+  {__variant__="0", id="294"} 1
+  {__variant__="0", id="295"} 1
+  {__variant__="0", id="296"} 1
+  {__variant__="0", id="297"} 1
+  {__variant__="0", id="298"} 1
+  {__variant__="0", id="299"} 1
+  {__variant__="0", id="3"} 1
+  {__variant__="0", id="30"} 1
+  {__variant__="0", id="300"} 1
+  {__variant__="0", id="301"} 1
+  {__variant__="0", id="302"} 1
+  {__variant__="0", id="303"} 1
+  {__variant__="0", id="304"} 1
+  {__variant__="0", id="305"} 1
+  {__variant__="0", id="306"} 1
+  {__variant__="0", id="307"} 1
+  {__variant__="0", id="308"} 1
+  {__variant__="0", id="309"} 1
+  {__variant__="0", id="31"} 1
+  {__variant__="0", id="310"} 1
+  {__variant__="0", id="311"} 1
+  {__variant__="0", id="312"} 1
+  {__variant__="0", id="313"} 1
+  {__variant__="0", id="314"} 1
+  {__variant__="0", id="315"} 1
+  {__variant__="0", id="316"} 1
+  {__variant__="0", id="317"} 1
+  {__variant__="0", id="318"} 1
+  {__variant__="0", id="319"} 1
+  {__variant__="0", id="32"} 1
+  {__variant__="0", id="320"} 1
+  {__variant__="0", id="321"} 1
+  {__variant__="0", id="322"} 1
+  {__variant__="0", id="323"} 1
+  {__variant__="0", id="324"} 1
+  {__variant__="0", id="325"} 1
+  {__variant__="0", id="326"} 1
+  {__variant__="0", id="327"} 1
+  {__variant__="0", id="328"} 1
+  {__variant__="0", id="329"} 1
+  {__variant__="0", id="33"} 1
+  {__variant__="0", id="330"} 1
+  {__variant__="0", id="331"} 1
+  {__variant__="0", id="332"} 1
+  {__variant__="0", id="333"} 1
+  {__variant__="0", id="334"} 1
+  {__variant__="0", id="335"} 1
+  {__variant__="0", id="336"} 1
+  {__variant__="0", id="337"} 1
+  {__variant__="0", id="338"} 1
+  {__variant__="0", id="339"} 1
+  {__variant__="0", id="34"} 1
+  {__variant__="0", id="340"} 1
+  {__variant__="0", id="341"} 1
+  {__variant__="0", id="342"} 1
+  {__variant__="0", id="343"} 1
+  {__variant__="0", id="344"} 1
+  {__variant__="0", id="345"} 1
+  {__variant__="0", id="346"} 1
+  {__variant__="0", id="347"} 1
+  {__variant__="0", id="348"} 1
+  {__variant__="0", id="349"} 1
+  {__variant__="0", id="35"} 1
+  {__variant__="0", id="350"} 1
+  {__variant__="0", id="351"} 1
+  {__variant__="0", id="352"} 1
+  {__variant__="0", id="353"} 1
+  {__variant__="0", id="354"} 1
+  {__variant__="0", id="355"} 1
+  {__variant__="0", id="356"} 1
+  {__variant__="0", id="357"} 1
+  {__variant__="0", id="358"} 1
+  {__variant__="0", id="359"} 1
+  {__variant__="0", id="36"} 1
+  {__variant__="0", id="360"} 1
+  {__variant__="0", id="361"} 1
+  {__variant__="0", id="362"} 1
+  {__variant__="0", id="363"} 1
+  {__variant__="0", id="364"} 1
+  {__variant__="0", id="365"} 1
+  {__variant__="0", id="366"} 1
+  {__variant__="0", id="367"} 1
+  {__variant__="0", id="368"} 1
+  {__variant__="0", id="369"} 1
+  {__variant__="0", id="37"} 1
+  {__variant__="0", id="370"} 1
+  {__variant__="0", id="371"} 1
+  {__variant__="0", id="372"} 1
+  {__variant__="0", id="373"} 1
+  {__variant__="0", id="374"} 1
+  {__variant__="0", id="375"} 1
+  {__variant__="0", id="376"} 1
+  {__variant__="0", id="377"} 1
+  {__variant__="0", id="378"} 1
+  {__variant__="0", id="379"} 1
+  {__variant__="0", id="38"} 1
+  {__variant__="0", id="380"} 1
+  {__variant__="0", id="381"} 1
+  {__variant__="0", id="382"} 1
+  {__variant__="0", id="383"} 1
+  {__variant__="0", id="384"} 1
+  {__variant__="0", id="385"} 1
+  {__variant__="0", id="386"} 1
+  {__variant__="0", id="387"} 1
+  {__variant__="0", id="388"} 1
+  {__variant__="0", id="389"} 1
+  {__variant__="0", id="39"} 1
+  {__variant__="0", id="390"} 1
+  {__variant__="0", id="391"} 1
+  {__variant__="0", id="392"} 1
+  {__variant__="0", id="393"} 1
+  {__variant__="0", id="394"} 1
+  {__variant__="0", id="395"} 1
+  {__variant__="0", id="396"} 1
+  {__variant__="0", id="397"} 1
+  {__variant__="0", id="398"} 1
+  {__variant__="0", id="399"} 1
+  {__variant__="0", id="4"} 1
+  {__variant__="0", id="40"} 1
+  {__variant__="0", id="400"} 1
+  {__variant__="0", id="401"} 1
+  {__variant__="0", id="402"} 1
+  {__variant__="0", id="403"} 1
+  {__variant__="0", id="404"} 1
+  {__variant__="0", id="405"} 1
+  {__variant__="0", id="406"} 1
+  {__variant__="0", id="407"} 1
+  {__variant__="0", id="408"} 1
+  {__variant__="0", id="409"} 1
+  {__variant__="0", id="41"} 1
+  {__variant__="0", id="410"} 1
+  {__variant__="0", id="411"} 1
+  {__variant__="0", id="412"} 1
+  {__variant__="0", id="413"} 1
+  {__variant__="0", id="414"} 1
+  {__variant__="0", id="415"} 1
+  {__variant__="0", id="416"} 1
+  {__variant__="0", id="417"} 1
+  {__variant__="0", id="418"} 1
+  {__variant__="0", id="419"} 1
+  {__variant__="0", id="42"} 1
+  {__variant__="0", id="420"} 1
+  {__variant__="0", id="421"} 1
+  {__variant__="0", id="422"} 1
+  {__variant__="0", id="423"} 1
+  {__variant__="0", id="424"} 1
+  {__variant__="0", id="425"} 1
+  {__variant__="0", id="426"} 1
+  {__variant__="0", id="427"} 1
+  {__variant__="0", id="428"} 1
+  {__variant__="0", id="429"} 1
+  {__variant__="0", id="43"} 1
+  {__variant__="0", id="430"} 1
+  {__variant__="0", id="431"} 1
+  {__variant__="0", id="432"} 1
+  {__variant__="0", id="433"} 1
+  {__variant__="0", id="434"} 1
+  {__variant__="0", id="435"} 1
+  {__variant__="0", id="436"} 1
+  {__variant__="0", id="437"} 1
+  {__variant__="0", id="438"} 1
+  {__variant__="0", id="439"} 1
+  {__variant__="0", id="44"} 1
+  {__variant__="0", id="440"} 1
+  {__variant__="0", id="441"} 1
+  {__variant__="0", id="442"} 1
+  {__variant__="0", id="443"} 1
+  {__variant__="0", id="444"} 1
+  {__variant__="0", id="445"} 1
+  {__variant__="0", id="446"} 1
+  {__variant__="0", id="447"} 1
+  {__variant__="0", id="448"} 1
+  {__variant__="0", id="449"} 1
+  {__variant__="0", id="45"} 1
+  {__variant__="0", id="450"} 1
+  {__variant__="0", id="451"} 1
+  {__variant__="0", id="452"} 1
+  {__variant__="0", id="453"} 1
+  {__variant__="0", id="454"} 1
+  {__variant__="0", id="455"} 1
+  {__variant__="0", id="456"} 1
+  {__variant__="0", id="457"} 1
+  {__variant__="0", id="458"} 1
+  {__variant__="0", id="459"} 1
+  {__variant__="0", id="46"} 1
+  {__variant__="0", id="460"} 1
+  {__variant__="0", id="461"} 1
+  {__variant__="0", id="462"} 1
+  {__variant__="0", id="463"} 1
+  {__variant__="0", id="464"} 1
+  {__variant__="0", id="465"} 1
+  {__variant__="0", id="466"} 1
+  {__variant__="0", id="467"} 1
+  {__variant__="0", id="468"} 1
+  {__variant__="0", id="469"} 1
+  {__variant__="0", id="47"} 1
+  {__variant__="0", id="470"} 1
+  {__variant__="0", id="471"} 1
+  {__variant__="0", id="472"} 1
+  {__variant__="0", id="473"} 1
+  {__variant__="0", id="474"} 1
+  {__variant__="0", id="475"} 1
+  {__variant__="0", id="476"} 1
+  {__variant__="0", id="477"} 1
+  {__variant__="0", id="478"} 1
+  {__variant__="0", id="479"} 1
+  {__variant__="0", id="48"} 1
+  {__variant__="0", id="480"} 1
+  {__variant__="0", id="481"} 1
+  {__variant__="0", id="482"} 1
+  {__variant__="0", id="483"} 1
+  {__variant__="0", id="484"} 1
+  {__variant__="0", id="485"} 1
+  {__variant__="0", id="486"} 1
+  {__variant__="0", id="487"} 1
+  {__variant__="0", id="488"} 1
+  {__variant__="0", id="489"} 1
+  {__variant__="0", id="49"} 1
+  {__variant__="0", id="490"} 1
+  {__variant__="0", id="491"} 1
+  {__variant__="0", id="492"} 1
+  {__variant__="0", id="493"} 1
+  {__variant__="0", id="494"} 1
+  {__variant__="0", id="495"} 1
+  {__variant__="0", id="496"} 1
+  {__variant__="0", id="497"} 1
+  {__variant__="0", id="5"} 1
+  {__variant__="0", id="50"} 1
+  {__variant__="0", id="51"} 1
+  {__variant__="0", id="52"} 1
+  {__variant__="0", id="53"} 1
+  {__variant__="0", id="54"} 1
+  {__variant__="0", id="55"} 1
+  {__variant__="0", id="56"} 1
+  {__variant__="0", id="57"} 1
+  {__variant__="0", id="58"} 1
+  {__variant__="0", id="59"} 1
+  {__variant__="0", id="6"} 1
+  {__variant__="0", id="60"} 1
+  {__variant__="0", id="61"} 1
+  {__variant__="0", id="62"} 1
+  {__variant__="0", id="63"} 1
+  {__variant__="0", id="64"} 1
+  {__variant__="0", id="65"} 1
+  {__variant__="0", id="66"} 1
+  {__variant__="0", id="67"} 1
+  {__variant__="0", id="68"} 1
+  {__variant__="0", id="69"} 1
+  {__variant__="0", id="7"} 1
+  {__variant__="0", id="70"} 1
+  {__variant__="0", id="71"} 1
+  {__variant__="0", id="72"} 1
+  {__variant__="0", id="73"} 1
+  {__variant__="0", id="74"} 1
+  {__variant__="0", id="75"} 1
+  {__variant__="0", id="76"} 1
+  {__variant__="0", id="77"} 1
+  {__variant__="0", id="78"} 1
+  {__variant__="0", id="79"} 1
+  {__variant__="0", id="8"} 1
+  {__variant__="0", id="80"} 1
+  {__variant__="0", id="81"} 1
+  {__variant__="0", id="82"} 1
+  {__variant__="0", id="83"} 1
+  {__variant__="0", id="84"} 1
+  {__variant__="0", id="85"} 1
+  {__variant__="0", id="86"} 1
+  {__variant__="0", id="87"} 1
+  {__variant__="0", id="88"} 1
+  {__variant__="0", id="89"} 1
+  {__variant__="0", id="9"} 1
+  {__variant__="0", id="90"} 1
+  {__variant__="0", id="91"} 1
+  {__variant__="0", id="92"} 1
+  {__variant__="0", id="93"} 1
+  {__variant__="0", id="94"} 1
+  {__variant__="0", id="95"} 1
+  {__variant__="0", id="96"} 1
+  {__variant__="0", id="97"} 1
+  {__variant__="0", id="98"} 1
+  {__variant__="0", id="99"} 1
+  {__variant__="1"} 498
+
+# case 2 — instant, 499 common groups.
+eval instant at 60s variants(sum by (id) (count_over_time({service_name="v277"} | logfmt | id < 499 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 499 [1m]))) of ({service_name="v277"} | logfmt | id < 499 [1m])
+  {__variant__="0", id="0"} 1
+  {__variant__="0", id="1"} 1
+  {__variant__="0", id="10"} 1
+  {__variant__="0", id="100"} 1
+  {__variant__="0", id="101"} 1
+  {__variant__="0", id="102"} 1
+  {__variant__="0", id="103"} 1
+  {__variant__="0", id="104"} 1
+  {__variant__="0", id="105"} 1
+  {__variant__="0", id="106"} 1
+  {__variant__="0", id="107"} 1
+  {__variant__="0", id="108"} 1
+  {__variant__="0", id="109"} 1
+  {__variant__="0", id="11"} 1
+  {__variant__="0", id="110"} 1
+  {__variant__="0", id="111"} 1
+  {__variant__="0", id="112"} 1
+  {__variant__="0", id="113"} 1
+  {__variant__="0", id="114"} 1
+  {__variant__="0", id="115"} 1
+  {__variant__="0", id="116"} 1
+  {__variant__="0", id="117"} 1
+  {__variant__="0", id="118"} 1
+  {__variant__="0", id="119"} 1
+  {__variant__="0", id="12"} 1
+  {__variant__="0", id="120"} 1
+  {__variant__="0", id="121"} 1
+  {__variant__="0", id="122"} 1
+  {__variant__="0", id="123"} 1
+  {__variant__="0", id="124"} 1
+  {__variant__="0", id="125"} 1
+  {__variant__="0", id="126"} 1
+  {__variant__="0", id="127"} 1
+  {__variant__="0", id="128"} 1
+  {__variant__="0", id="129"} 1
+  {__variant__="0", id="13"} 1
+  {__variant__="0", id="130"} 1
+  {__variant__="0", id="131"} 1
+  {__variant__="0", id="132"} 1
+  {__variant__="0", id="133"} 1
+  {__variant__="0", id="134"} 1
+  {__variant__="0", id="135"} 1
+  {__variant__="0", id="136"} 1
+  {__variant__="0", id="137"} 1
+  {__variant__="0", id="138"} 1
+  {__variant__="0", id="139"} 1
+  {__variant__="0", id="14"} 1
+  {__variant__="0", id="140"} 1
+  {__variant__="0", id="141"} 1
+  {__variant__="0", id="142"} 1
+  {__variant__="0", id="143"} 1
+  {__variant__="0", id="144"} 1
+  {__variant__="0", id="145"} 1
+  {__variant__="0", id="146"} 1
+  {__variant__="0", id="147"} 1
+  {__variant__="0", id="148"} 1
+  {__variant__="0", id="149"} 1
+  {__variant__="0", id="15"} 1
+  {__variant__="0", id="150"} 1
+  {__variant__="0", id="151"} 1
+  {__variant__="0", id="152"} 1
+  {__variant__="0", id="153"} 1
+  {__variant__="0", id="154"} 1
+  {__variant__="0", id="155"} 1
+  {__variant__="0", id="156"} 1
+  {__variant__="0", id="157"} 1
+  {__variant__="0", id="158"} 1
+  {__variant__="0", id="159"} 1
+  {__variant__="0", id="16"} 1
+  {__variant__="0", id="160"} 1
+  {__variant__="0", id="161"} 1
+  {__variant__="0", id="162"} 1
+  {__variant__="0", id="163"} 1
+  {__variant__="0", id="164"} 1
+  {__variant__="0", id="165"} 1
+  {__variant__="0", id="166"} 1
+  {__variant__="0", id="167"} 1
+  {__variant__="0", id="168"} 1
+  {__variant__="0", id="169"} 1
+  {__variant__="0", id="17"} 1
+  {__variant__="0", id="170"} 1
+  {__variant__="0", id="171"} 1
+  {__variant__="0", id="172"} 1
+  {__variant__="0", id="173"} 1
+  {__variant__="0", id="174"} 1
+  {__variant__="0", id="175"} 1
+  {__variant__="0", id="176"} 1
+  {__variant__="0", id="177"} 1
+  {__variant__="0", id="178"} 1
+  {__variant__="0", id="179"} 1
+  {__variant__="0", id="18"} 1
+  {__variant__="0", id="180"} 1
+  {__variant__="0", id="181"} 1
+  {__variant__="0", id="182"} 1
+  {__variant__="0", id="183"} 1
+  {__variant__="0", id="184"} 1
+  {__variant__="0", id="185"} 1
+  {__variant__="0", id="186"} 1
+  {__variant__="0", id="187"} 1
+  {__variant__="0", id="188"} 1
+  {__variant__="0", id="189"} 1
+  {__variant__="0", id="19"} 1
+  {__variant__="0", id="190"} 1
+  {__variant__="0", id="191"} 1
+  {__variant__="0", id="192"} 1
+  {__variant__="0", id="193"} 1
+  {__variant__="0", id="194"} 1
+  {__variant__="0", id="195"} 1
+  {__variant__="0", id="196"} 1
+  {__variant__="0", id="197"} 1
+  {__variant__="0", id="198"} 1
+  {__variant__="0", id="199"} 1
+  {__variant__="0", id="2"} 1
+  {__variant__="0", id="20"} 1
+  {__variant__="0", id="200"} 1
+  {__variant__="0", id="201"} 1
+  {__variant__="0", id="202"} 1
+  {__variant__="0", id="203"} 1
+  {__variant__="0", id="204"} 1
+  {__variant__="0", id="205"} 1
+  {__variant__="0", id="206"} 1
+  {__variant__="0", id="207"} 1
+  {__variant__="0", id="208"} 1
+  {__variant__="0", id="209"} 1
+  {__variant__="0", id="21"} 1
+  {__variant__="0", id="210"} 1
+  {__variant__="0", id="211"} 1
+  {__variant__="0", id="212"} 1
+  {__variant__="0", id="213"} 1
+  {__variant__="0", id="214"} 1
+  {__variant__="0", id="215"} 1
+  {__variant__="0", id="216"} 1
+  {__variant__="0", id="217"} 1
+  {__variant__="0", id="218"} 1
+  {__variant__="0", id="219"} 1
+  {__variant__="0", id="22"} 1
+  {__variant__="0", id="220"} 1
+  {__variant__="0", id="221"} 1
+  {__variant__="0", id="222"} 1
+  {__variant__="0", id="223"} 1
+  {__variant__="0", id="224"} 1
+  {__variant__="0", id="225"} 1
+  {__variant__="0", id="226"} 1
+  {__variant__="0", id="227"} 1
+  {__variant__="0", id="228"} 1
+  {__variant__="0", id="229"} 1
+  {__variant__="0", id="23"} 1
+  {__variant__="0", id="230"} 1
+  {__variant__="0", id="231"} 1
+  {__variant__="0", id="232"} 1
+  {__variant__="0", id="233"} 1
+  {__variant__="0", id="234"} 1
+  {__variant__="0", id="235"} 1
+  {__variant__="0", id="236"} 1
+  {__variant__="0", id="237"} 1
+  {__variant__="0", id="238"} 1
+  {__variant__="0", id="239"} 1
+  {__variant__="0", id="24"} 1
+  {__variant__="0", id="240"} 1
+  {__variant__="0", id="241"} 1
+  {__variant__="0", id="242"} 1
+  {__variant__="0", id="243"} 1
+  {__variant__="0", id="244"} 1
+  {__variant__="0", id="245"} 1
+  {__variant__="0", id="246"} 1
+  {__variant__="0", id="247"} 1
+  {__variant__="0", id="248"} 1
+  {__variant__="0", id="249"} 1
+  {__variant__="0", id="25"} 1
+  {__variant__="0", id="250"} 1
+  {__variant__="0", id="251"} 1
+  {__variant__="0", id="252"} 1
+  {__variant__="0", id="253"} 1
+  {__variant__="0", id="254"} 1
+  {__variant__="0", id="255"} 1
+  {__variant__="0", id="256"} 1
+  {__variant__="0", id="257"} 1
+  {__variant__="0", id="258"} 1
+  {__variant__="0", id="259"} 1
+  {__variant__="0", id="26"} 1
+  {__variant__="0", id="260"} 1
+  {__variant__="0", id="261"} 1
+  {__variant__="0", id="262"} 1
+  {__variant__="0", id="263"} 1
+  {__variant__="0", id="264"} 1
+  {__variant__="0", id="265"} 1
+  {__variant__="0", id="266"} 1
+  {__variant__="0", id="267"} 1
+  {__variant__="0", id="268"} 1
+  {__variant__="0", id="269"} 1
+  {__variant__="0", id="27"} 1
+  {__variant__="0", id="270"} 1
+  {__variant__="0", id="271"} 1
+  {__variant__="0", id="272"} 1
+  {__variant__="0", id="273"} 1
+  {__variant__="0", id="274"} 1
+  {__variant__="0", id="275"} 1
+  {__variant__="0", id="276"} 1
+  {__variant__="0", id="277"} 1
+  {__variant__="0", id="278"} 1
+  {__variant__="0", id="279"} 1
+  {__variant__="0", id="28"} 1
+  {__variant__="0", id="280"} 1
+  {__variant__="0", id="281"} 1
+  {__variant__="0", id="282"} 1
+  {__variant__="0", id="283"} 1
+  {__variant__="0", id="284"} 1
+  {__variant__="0", id="285"} 1
+  {__variant__="0", id="286"} 1
+  {__variant__="0", id="287"} 1
+  {__variant__="0", id="288"} 1
+  {__variant__="0", id="289"} 1
+  {__variant__="0", id="29"} 1
+  {__variant__="0", id="290"} 1
+  {__variant__="0", id="291"} 1
+  {__variant__="0", id="292"} 1
+  {__variant__="0", id="293"} 1
+  {__variant__="0", id="294"} 1
+  {__variant__="0", id="295"} 1
+  {__variant__="0", id="296"} 1
+  {__variant__="0", id="297"} 1
+  {__variant__="0", id="298"} 1
+  {__variant__="0", id="299"} 1
+  {__variant__="0", id="3"} 1
+  {__variant__="0", id="30"} 1
+  {__variant__="0", id="300"} 1
+  {__variant__="0", id="301"} 1
+  {__variant__="0", id="302"} 1
+  {__variant__="0", id="303"} 1
+  {__variant__="0", id="304"} 1
+  {__variant__="0", id="305"} 1
+  {__variant__="0", id="306"} 1
+  {__variant__="0", id="307"} 1
+  {__variant__="0", id="308"} 1
+  {__variant__="0", id="309"} 1
+  {__variant__="0", id="31"} 1
+  {__variant__="0", id="310"} 1
+  {__variant__="0", id="311"} 1
+  {__variant__="0", id="312"} 1
+  {__variant__="0", id="313"} 1
+  {__variant__="0", id="314"} 1
+  {__variant__="0", id="315"} 1
+  {__variant__="0", id="316"} 1
+  {__variant__="0", id="317"} 1
+  {__variant__="0", id="318"} 1
+  {__variant__="0", id="319"} 1
+  {__variant__="0", id="32"} 1
+  {__variant__="0", id="320"} 1
+  {__variant__="0", id="321"} 1
+  {__variant__="0", id="322"} 1
+  {__variant__="0", id="323"} 1
+  {__variant__="0", id="324"} 1
+  {__variant__="0", id="325"} 1
+  {__variant__="0", id="326"} 1
+  {__variant__="0", id="327"} 1
+  {__variant__="0", id="328"} 1
+  {__variant__="0", id="329"} 1
+  {__variant__="0", id="33"} 1
+  {__variant__="0", id="330"} 1
+  {__variant__="0", id="331"} 1
+  {__variant__="0", id="332"} 1
+  {__variant__="0", id="333"} 1
+  {__variant__="0", id="334"} 1
+  {__variant__="0", id="335"} 1
+  {__variant__="0", id="336"} 1
+  {__variant__="0", id="337"} 1
+  {__variant__="0", id="338"} 1
+  {__variant__="0", id="339"} 1
+  {__variant__="0", id="34"} 1
+  {__variant__="0", id="340"} 1
+  {__variant__="0", id="341"} 1
+  {__variant__="0", id="342"} 1
+  {__variant__="0", id="343"} 1
+  {__variant__="0", id="344"} 1
+  {__variant__="0", id="345"} 1
+  {__variant__="0", id="346"} 1
+  {__variant__="0", id="347"} 1
+  {__variant__="0", id="348"} 1
+  {__variant__="0", id="349"} 1
+  {__variant__="0", id="35"} 1
+  {__variant__="0", id="350"} 1
+  {__variant__="0", id="351"} 1
+  {__variant__="0", id="352"} 1
+  {__variant__="0", id="353"} 1
+  {__variant__="0", id="354"} 1
+  {__variant__="0", id="355"} 1
+  {__variant__="0", id="356"} 1
+  {__variant__="0", id="357"} 1
+  {__variant__="0", id="358"} 1
+  {__variant__="0", id="359"} 1
+  {__variant__="0", id="36"} 1
+  {__variant__="0", id="360"} 1
+  {__variant__="0", id="361"} 1
+  {__variant__="0", id="362"} 1
+  {__variant__="0", id="363"} 1
+  {__variant__="0", id="364"} 1
+  {__variant__="0", id="365"} 1
+  {__variant__="0", id="366"} 1
+  {__variant__="0", id="367"} 1
+  {__variant__="0", id="368"} 1
+  {__variant__="0", id="369"} 1
+  {__variant__="0", id="37"} 1
+  {__variant__="0", id="370"} 1
+  {__variant__="0", id="371"} 1
+  {__variant__="0", id="372"} 1
+  {__variant__="0", id="373"} 1
+  {__variant__="0", id="374"} 1
+  {__variant__="0", id="375"} 1
+  {__variant__="0", id="376"} 1
+  {__variant__="0", id="377"} 1
+  {__variant__="0", id="378"} 1
+  {__variant__="0", id="379"} 1
+  {__variant__="0", id="38"} 1
+  {__variant__="0", id="380"} 1
+  {__variant__="0", id="381"} 1
+  {__variant__="0", id="382"} 1
+  {__variant__="0", id="383"} 1
+  {__variant__="0", id="384"} 1
+  {__variant__="0", id="385"} 1
+  {__variant__="0", id="386"} 1
+  {__variant__="0", id="387"} 1
+  {__variant__="0", id="388"} 1
+  {__variant__="0", id="389"} 1
+  {__variant__="0", id="39"} 1
+  {__variant__="0", id="390"} 1
+  {__variant__="0", id="391"} 1
+  {__variant__="0", id="392"} 1
+  {__variant__="0", id="393"} 1
+  {__variant__="0", id="394"} 1
+  {__variant__="0", id="395"} 1
+  {__variant__="0", id="396"} 1
+  {__variant__="0", id="397"} 1
+  {__variant__="0", id="398"} 1
+  {__variant__="0", id="399"} 1
+  {__variant__="0", id="4"} 1
+  {__variant__="0", id="40"} 1
+  {__variant__="0", id="400"} 1
+  {__variant__="0", id="401"} 1
+  {__variant__="0", id="402"} 1
+  {__variant__="0", id="403"} 1
+  {__variant__="0", id="404"} 1
+  {__variant__="0", id="405"} 1
+  {__variant__="0", id="406"} 1
+  {__variant__="0", id="407"} 1
+  {__variant__="0", id="408"} 1
+  {__variant__="0", id="409"} 1
+  {__variant__="0", id="41"} 1
+  {__variant__="0", id="410"} 1
+  {__variant__="0", id="411"} 1
+  {__variant__="0", id="412"} 1
+  {__variant__="0", id="413"} 1
+  {__variant__="0", id="414"} 1
+  {__variant__="0", id="415"} 1
+  {__variant__="0", id="416"} 1
+  {__variant__="0", id="417"} 1
+  {__variant__="0", id="418"} 1
+  {__variant__="0", id="419"} 1
+  {__variant__="0", id="42"} 1
+  {__variant__="0", id="420"} 1
+  {__variant__="0", id="421"} 1
+  {__variant__="0", id="422"} 1
+  {__variant__="0", id="423"} 1
+  {__variant__="0", id="424"} 1
+  {__variant__="0", id="425"} 1
+  {__variant__="0", id="426"} 1
+  {__variant__="0", id="427"} 1
+  {__variant__="0", id="428"} 1
+  {__variant__="0", id="429"} 1
+  {__variant__="0", id="43"} 1
+  {__variant__="0", id="430"} 1
+  {__variant__="0", id="431"} 1
+  {__variant__="0", id="432"} 1
+  {__variant__="0", id="433"} 1
+  {__variant__="0", id="434"} 1
+  {__variant__="0", id="435"} 1
+  {__variant__="0", id="436"} 1
+  {__variant__="0", id="437"} 1
+  {__variant__="0", id="438"} 1
+  {__variant__="0", id="439"} 1
+  {__variant__="0", id="44"} 1
+  {__variant__="0", id="440"} 1
+  {__variant__="0", id="441"} 1
+  {__variant__="0", id="442"} 1
+  {__variant__="0", id="443"} 1
+  {__variant__="0", id="444"} 1
+  {__variant__="0", id="445"} 1
+  {__variant__="0", id="446"} 1
+  {__variant__="0", id="447"} 1
+  {__variant__="0", id="448"} 1
+  {__variant__="0", id="449"} 1
+  {__variant__="0", id="45"} 1
+  {__variant__="0", id="450"} 1
+  {__variant__="0", id="451"} 1
+  {__variant__="0", id="452"} 1
+  {__variant__="0", id="453"} 1
+  {__variant__="0", id="454"} 1
+  {__variant__="0", id="455"} 1
+  {__variant__="0", id="456"} 1
+  {__variant__="0", id="457"} 1
+  {__variant__="0", id="458"} 1
+  {__variant__="0", id="459"} 1
+  {__variant__="0", id="46"} 1
+  {__variant__="0", id="460"} 1
+  {__variant__="0", id="461"} 1
+  {__variant__="0", id="462"} 1
+  {__variant__="0", id="463"} 1
+  {__variant__="0", id="464"} 1
+  {__variant__="0", id="465"} 1
+  {__variant__="0", id="466"} 1
+  {__variant__="0", id="467"} 1
+  {__variant__="0", id="468"} 1
+  {__variant__="0", id="469"} 1
+  {__variant__="0", id="47"} 1
+  {__variant__="0", id="470"} 1
+  {__variant__="0", id="471"} 1
+  {__variant__="0", id="472"} 1
+  {__variant__="0", id="473"} 1
+  {__variant__="0", id="474"} 1
+  {__variant__="0", id="475"} 1
+  {__variant__="0", id="476"} 1
+  {__variant__="0", id="477"} 1
+  {__variant__="0", id="478"} 1
+  {__variant__="0", id="479"} 1
+  {__variant__="0", id="48"} 1
+  {__variant__="0", id="480"} 1
+  {__variant__="0", id="481"} 1
+  {__variant__="0", id="482"} 1
+  {__variant__="0", id="483"} 1
+  {__variant__="0", id="484"} 1
+  {__variant__="0", id="485"} 1
+  {__variant__="0", id="486"} 1
+  {__variant__="0", id="487"} 1
+  {__variant__="0", id="488"} 1
+  {__variant__="0", id="489"} 1
+  {__variant__="0", id="49"} 1
+  {__variant__="0", id="490"} 1
+  {__variant__="0", id="491"} 1
+  {__variant__="0", id="492"} 1
+  {__variant__="0", id="493"} 1
+  {__variant__="0", id="494"} 1
+  {__variant__="0", id="495"} 1
+  {__variant__="0", id="496"} 1
+  {__variant__="0", id="497"} 1
+  {__variant__="0", id="498"} 1
+  {__variant__="0", id="5"} 1
+  {__variant__="0", id="50"} 1
+  {__variant__="0", id="51"} 1
+  {__variant__="0", id="52"} 1
+  {__variant__="0", id="53"} 1
+  {__variant__="0", id="54"} 1
+  {__variant__="0", id="55"} 1
+  {__variant__="0", id="56"} 1
+  {__variant__="0", id="57"} 1
+  {__variant__="0", id="58"} 1
+  {__variant__="0", id="59"} 1
+  {__variant__="0", id="6"} 1
+  {__variant__="0", id="60"} 1
+  {__variant__="0", id="61"} 1
+  {__variant__="0", id="62"} 1
+  {__variant__="0", id="63"} 1
+  {__variant__="0", id="64"} 1
+  {__variant__="0", id="65"} 1
+  {__variant__="0", id="66"} 1
+  {__variant__="0", id="67"} 1
+  {__variant__="0", id="68"} 1
+  {__variant__="0", id="69"} 1
+  {__variant__="0", id="7"} 1
+  {__variant__="0", id="70"} 1
+  {__variant__="0", id="71"} 1
+  {__variant__="0", id="72"} 1
+  {__variant__="0", id="73"} 1
+  {__variant__="0", id="74"} 1
+  {__variant__="0", id="75"} 1
+  {__variant__="0", id="76"} 1
+  {__variant__="0", id="77"} 1
+  {__variant__="0", id="78"} 1
+  {__variant__="0", id="79"} 1
+  {__variant__="0", id="8"} 1
+  {__variant__="0", id="80"} 1
+  {__variant__="0", id="81"} 1
+  {__variant__="0", id="82"} 1
+  {__variant__="0", id="83"} 1
+  {__variant__="0", id="84"} 1
+  {__variant__="0", id="85"} 1
+  {__variant__="0", id="86"} 1
+  {__variant__="0", id="87"} 1
+  {__variant__="0", id="88"} 1
+  {__variant__="0", id="89"} 1
+  {__variant__="0", id="9"} 1
+  {__variant__="0", id="90"} 1
+  {__variant__="0", id="91"} 1
+  {__variant__="0", id="92"} 1
+  {__variant__="0", id="93"} 1
+  {__variant__="0", id="94"} 1
+  {__variant__="0", id="95"} 1
+  {__variant__="0", id="96"} 1
+  {__variant__="0", id="97"} 1
+  {__variant__="0", id="98"} 1
+  {__variant__="0", id="99"} 1
+  {__variant__="1"} 499
+
+# case 3 — instant, 500 common groups. THE PER-VARIANT-NOT-TOTAL
+# PROOF: 500 + 1 = 501 RESULT series, served with no warning.
+# Deleting the root-only exemption in `exec.rs` reddens this.
+eval instant at 60s variants(sum by (id) (count_over_time({service_name="v277"} | logfmt | id < 500 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 500 [1m]))) of ({service_name="v277"} | logfmt | id < 500 [1m])
+  {__variant__="0", id="0"} 1
+  {__variant__="0", id="1"} 1
+  {__variant__="0", id="10"} 1
+  {__variant__="0", id="100"} 1
+  {__variant__="0", id="101"} 1
+  {__variant__="0", id="102"} 1
+  {__variant__="0", id="103"} 1
+  {__variant__="0", id="104"} 1
+  {__variant__="0", id="105"} 1
+  {__variant__="0", id="106"} 1
+  {__variant__="0", id="107"} 1
+  {__variant__="0", id="108"} 1
+  {__variant__="0", id="109"} 1
+  {__variant__="0", id="11"} 1
+  {__variant__="0", id="110"} 1
+  {__variant__="0", id="111"} 1
+  {__variant__="0", id="112"} 1
+  {__variant__="0", id="113"} 1
+  {__variant__="0", id="114"} 1
+  {__variant__="0", id="115"} 1
+  {__variant__="0", id="116"} 1
+  {__variant__="0", id="117"} 1
+  {__variant__="0", id="118"} 1
+  {__variant__="0", id="119"} 1
+  {__variant__="0", id="12"} 1
+  {__variant__="0", id="120"} 1
+  {__variant__="0", id="121"} 1
+  {__variant__="0", id="122"} 1
+  {__variant__="0", id="123"} 1
+  {__variant__="0", id="124"} 1
+  {__variant__="0", id="125"} 1
+  {__variant__="0", id="126"} 1
+  {__variant__="0", id="127"} 1
+  {__variant__="0", id="128"} 1
+  {__variant__="0", id="129"} 1
+  {__variant__="0", id="13"} 1
+  {__variant__="0", id="130"} 1
+  {__variant__="0", id="131"} 1
+  {__variant__="0", id="132"} 1
+  {__variant__="0", id="133"} 1
+  {__variant__="0", id="134"} 1
+  {__variant__="0", id="135"} 1
+  {__variant__="0", id="136"} 1
+  {__variant__="0", id="137"} 1
+  {__variant__="0", id="138"} 1
+  {__variant__="0", id="139"} 1
+  {__variant__="0", id="14"} 1
+  {__variant__="0", id="140"} 1
+  {__variant__="0", id="141"} 1
+  {__variant__="0", id="142"} 1
+  {__variant__="0", id="143"} 1
+  {__variant__="0", id="144"} 1
+  {__variant__="0", id="145"} 1
+  {__variant__="0", id="146"} 1
+  {__variant__="0", id="147"} 1
+  {__variant__="0", id="148"} 1
+  {__variant__="0", id="149"} 1
+  {__variant__="0", id="15"} 1
+  {__variant__="0", id="150"} 1
+  {__variant__="0", id="151"} 1
+  {__variant__="0", id="152"} 1
+  {__variant__="0", id="153"} 1
+  {__variant__="0", id="154"} 1
+  {__variant__="0", id="155"} 1
+  {__variant__="0", id="156"} 1
+  {__variant__="0", id="157"} 1
+  {__variant__="0", id="158"} 1
+  {__variant__="0", id="159"} 1
+  {__variant__="0", id="16"} 1
+  {__variant__="0", id="160"} 1
+  {__variant__="0", id="161"} 1
+  {__variant__="0", id="162"} 1
+  {__variant__="0", id="163"} 1
+  {__variant__="0", id="164"} 1
+  {__variant__="0", id="165"} 1
+  {__variant__="0", id="166"} 1
+  {__variant__="0", id="167"} 1
+  {__variant__="0", id="168"} 1
+  {__variant__="0", id="169"} 1
+  {__variant__="0", id="17"} 1
+  {__variant__="0", id="170"} 1
+  {__variant__="0", id="171"} 1
+  {__variant__="0", id="172"} 1
+  {__variant__="0", id="173"} 1
+  {__variant__="0", id="174"} 1
+  {__variant__="0", id="175"} 1
+  {__variant__="0", id="176"} 1
+  {__variant__="0", id="177"} 1
+  {__variant__="0", id="178"} 1
+  {__variant__="0", id="179"} 1
+  {__variant__="0", id="18"} 1
+  {__variant__="0", id="180"} 1
+  {__variant__="0", id="181"} 1
+  {__variant__="0", id="182"} 1
+  {__variant__="0", id="183"} 1
+  {__variant__="0", id="184"} 1
+  {__variant__="0", id="185"} 1
+  {__variant__="0", id="186"} 1
+  {__variant__="0", id="187"} 1
+  {__variant__="0", id="188"} 1
+  {__variant__="0", id="189"} 1
+  {__variant__="0", id="19"} 1
+  {__variant__="0", id="190"} 1
+  {__variant__="0", id="191"} 1
+  {__variant__="0", id="192"} 1
+  {__variant__="0", id="193"} 1
+  {__variant__="0", id="194"} 1
+  {__variant__="0", id="195"} 1
+  {__variant__="0", id="196"} 1
+  {__variant__="0", id="197"} 1
+  {__variant__="0", id="198"} 1
+  {__variant__="0", id="199"} 1
+  {__variant__="0", id="2"} 1
+  {__variant__="0", id="20"} 1
+  {__variant__="0", id="200"} 1
+  {__variant__="0", id="201"} 1
+  {__variant__="0", id="202"} 1
+  {__variant__="0", id="203"} 1
+  {__variant__="0", id="204"} 1
+  {__variant__="0", id="205"} 1
+  {__variant__="0", id="206"} 1
+  {__variant__="0", id="207"} 1
+  {__variant__="0", id="208"} 1
+  {__variant__="0", id="209"} 1
+  {__variant__="0", id="21"} 1
+  {__variant__="0", id="210"} 1
+  {__variant__="0", id="211"} 1
+  {__variant__="0", id="212"} 1
+  {__variant__="0", id="213"} 1
+  {__variant__="0", id="214"} 1
+  {__variant__="0", id="215"} 1
+  {__variant__="0", id="216"} 1
+  {__variant__="0", id="217"} 1
+  {__variant__="0", id="218"} 1
+  {__variant__="0", id="219"} 1
+  {__variant__="0", id="22"} 1
+  {__variant__="0", id="220"} 1
+  {__variant__="0", id="221"} 1
+  {__variant__="0", id="222"} 1
+  {__variant__="0", id="223"} 1
+  {__variant__="0", id="224"} 1
+  {__variant__="0", id="225"} 1
+  {__variant__="0", id="226"} 1
+  {__variant__="0", id="227"} 1
+  {__variant__="0", id="228"} 1
+  {__variant__="0", id="229"} 1
+  {__variant__="0", id="23"} 1
+  {__variant__="0", id="230"} 1
+  {__variant__="0", id="231"} 1
+  {__variant__="0", id="232"} 1
+  {__variant__="0", id="233"} 1
+  {__variant__="0", id="234"} 1
+  {__variant__="0", id="235"} 1
+  {__variant__="0", id="236"} 1
+  {__variant__="0", id="237"} 1
+  {__variant__="0", id="238"} 1
+  {__variant__="0", id="239"} 1
+  {__variant__="0", id="24"} 1
+  {__variant__="0", id="240"} 1
+  {__variant__="0", id="241"} 1
+  {__variant__="0", id="242"} 1
+  {__variant__="0", id="243"} 1
+  {__variant__="0", id="244"} 1
+  {__variant__="0", id="245"} 1
+  {__variant__="0", id="246"} 1
+  {__variant__="0", id="247"} 1
+  {__variant__="0", id="248"} 1
+  {__variant__="0", id="249"} 1
+  {__variant__="0", id="25"} 1
+  {__variant__="0", id="250"} 1
+  {__variant__="0", id="251"} 1
+  {__variant__="0", id="252"} 1
+  {__variant__="0", id="253"} 1
+  {__variant__="0", id="254"} 1
+  {__variant__="0", id="255"} 1
+  {__variant__="0", id="256"} 1
+  {__variant__="0", id="257"} 1
+  {__variant__="0", id="258"} 1
+  {__variant__="0", id="259"} 1
+  {__variant__="0", id="26"} 1
+  {__variant__="0", id="260"} 1
+  {__variant__="0", id="261"} 1
+  {__variant__="0", id="262"} 1
+  {__variant__="0", id="263"} 1
+  {__variant__="0", id="264"} 1
+  {__variant__="0", id="265"} 1
+  {__variant__="0", id="266"} 1
+  {__variant__="0", id="267"} 1
+  {__variant__="0", id="268"} 1
+  {__variant__="0", id="269"} 1
+  {__variant__="0", id="27"} 1
+  {__variant__="0", id="270"} 1
+  {__variant__="0", id="271"} 1
+  {__variant__="0", id="272"} 1
+  {__variant__="0", id="273"} 1
+  {__variant__="0", id="274"} 1
+  {__variant__="0", id="275"} 1
+  {__variant__="0", id="276"} 1
+  {__variant__="0", id="277"} 1
+  {__variant__="0", id="278"} 1
+  {__variant__="0", id="279"} 1
+  {__variant__="0", id="28"} 1
+  {__variant__="0", id="280"} 1
+  {__variant__="0", id="281"} 1
+  {__variant__="0", id="282"} 1
+  {__variant__="0", id="283"} 1
+  {__variant__="0", id="284"} 1
+  {__variant__="0", id="285"} 1
+  {__variant__="0", id="286"} 1
+  {__variant__="0", id="287"} 1
+  {__variant__="0", id="288"} 1
+  {__variant__="0", id="289"} 1
+  {__variant__="0", id="29"} 1
+  {__variant__="0", id="290"} 1
+  {__variant__="0", id="291"} 1
+  {__variant__="0", id="292"} 1
+  {__variant__="0", id="293"} 1
+  {__variant__="0", id="294"} 1
+  {__variant__="0", id="295"} 1
+  {__variant__="0", id="296"} 1
+  {__variant__="0", id="297"} 1
+  {__variant__="0", id="298"} 1
+  {__variant__="0", id="299"} 1
+  {__variant__="0", id="3"} 1
+  {__variant__="0", id="30"} 1
+  {__variant__="0", id="300"} 1
+  {__variant__="0", id="301"} 1
+  {__variant__="0", id="302"} 1
+  {__variant__="0", id="303"} 1
+  {__variant__="0", id="304"} 1
+  {__variant__="0", id="305"} 1
+  {__variant__="0", id="306"} 1
+  {__variant__="0", id="307"} 1
+  {__variant__="0", id="308"} 1
+  {__variant__="0", id="309"} 1
+  {__variant__="0", id="31"} 1
+  {__variant__="0", id="310"} 1
+  {__variant__="0", id="311"} 1
+  {__variant__="0", id="312"} 1
+  {__variant__="0", id="313"} 1
+  {__variant__="0", id="314"} 1
+  {__variant__="0", id="315"} 1
+  {__variant__="0", id="316"} 1
+  {__variant__="0", id="317"} 1
+  {__variant__="0", id="318"} 1
+  {__variant__="0", id="319"} 1
+  {__variant__="0", id="32"} 1
+  {__variant__="0", id="320"} 1
+  {__variant__="0", id="321"} 1
+  {__variant__="0", id="322"} 1
+  {__variant__="0", id="323"} 1
+  {__variant__="0", id="324"} 1
+  {__variant__="0", id="325"} 1
+  {__variant__="0", id="326"} 1
+  {__variant__="0", id="327"} 1
+  {__variant__="0", id="328"} 1
+  {__variant__="0", id="329"} 1
+  {__variant__="0", id="33"} 1
+  {__variant__="0", id="330"} 1
+  {__variant__="0", id="331"} 1
+  {__variant__="0", id="332"} 1
+  {__variant__="0", id="333"} 1
+  {__variant__="0", id="334"} 1
+  {__variant__="0", id="335"} 1
+  {__variant__="0", id="336"} 1
+  {__variant__="0", id="337"} 1
+  {__variant__="0", id="338"} 1
+  {__variant__="0", id="339"} 1
+  {__variant__="0", id="34"} 1
+  {__variant__="0", id="340"} 1
+  {__variant__="0", id="341"} 1
+  {__variant__="0", id="342"} 1
+  {__variant__="0", id="343"} 1
+  {__variant__="0", id="344"} 1
+  {__variant__="0", id="345"} 1
+  {__variant__="0", id="346"} 1
+  {__variant__="0", id="347"} 1
+  {__variant__="0", id="348"} 1
+  {__variant__="0", id="349"} 1
+  {__variant__="0", id="35"} 1
+  {__variant__="0", id="350"} 1
+  {__variant__="0", id="351"} 1
+  {__variant__="0", id="352"} 1
+  {__variant__="0", id="353"} 1
+  {__variant__="0", id="354"} 1
+  {__variant__="0", id="355"} 1
+  {__variant__="0", id="356"} 1
+  {__variant__="0", id="357"} 1
+  {__variant__="0", id="358"} 1
+  {__variant__="0", id="359"} 1
+  {__variant__="0", id="36"} 1
+  {__variant__="0", id="360"} 1
+  {__variant__="0", id="361"} 1
+  {__variant__="0", id="362"} 1
+  {__variant__="0", id="363"} 1
+  {__variant__="0", id="364"} 1
+  {__variant__="0", id="365"} 1
+  {__variant__="0", id="366"} 1
+  {__variant__="0", id="367"} 1
+  {__variant__="0", id="368"} 1
+  {__variant__="0", id="369"} 1
+  {__variant__="0", id="37"} 1
+  {__variant__="0", id="370"} 1
+  {__variant__="0", id="371"} 1
+  {__variant__="0", id="372"} 1
+  {__variant__="0", id="373"} 1
+  {__variant__="0", id="374"} 1
+  {__variant__="0", id="375"} 1
+  {__variant__="0", id="376"} 1
+  {__variant__="0", id="377"} 1
+  {__variant__="0", id="378"} 1
+  {__variant__="0", id="379"} 1
+  {__variant__="0", id="38"} 1
+  {__variant__="0", id="380"} 1
+  {__variant__="0", id="381"} 1
+  {__variant__="0", id="382"} 1
+  {__variant__="0", id="383"} 1
+  {__variant__="0", id="384"} 1
+  {__variant__="0", id="385"} 1
+  {__variant__="0", id="386"} 1
+  {__variant__="0", id="387"} 1
+  {__variant__="0", id="388"} 1
+  {__variant__="0", id="389"} 1
+  {__variant__="0", id="39"} 1
+  {__variant__="0", id="390"} 1
+  {__variant__="0", id="391"} 1
+  {__variant__="0", id="392"} 1
+  {__variant__="0", id="393"} 1
+  {__variant__="0", id="394"} 1
+  {__variant__="0", id="395"} 1
+  {__variant__="0", id="396"} 1
+  {__variant__="0", id="397"} 1
+  {__variant__="0", id="398"} 1
+  {__variant__="0", id="399"} 1
+  {__variant__="0", id="4"} 1
+  {__variant__="0", id="40"} 1
+  {__variant__="0", id="400"} 1
+  {__variant__="0", id="401"} 1
+  {__variant__="0", id="402"} 1
+  {__variant__="0", id="403"} 1
+  {__variant__="0", id="404"} 1
+  {__variant__="0", id="405"} 1
+  {__variant__="0", id="406"} 1
+  {__variant__="0", id="407"} 1
+  {__variant__="0", id="408"} 1
+  {__variant__="0", id="409"} 1
+  {__variant__="0", id="41"} 1
+  {__variant__="0", id="410"} 1
+  {__variant__="0", id="411"} 1
+  {__variant__="0", id="412"} 1
+  {__variant__="0", id="413"} 1
+  {__variant__="0", id="414"} 1
+  {__variant__="0", id="415"} 1
+  {__variant__="0", id="416"} 1
+  {__variant__="0", id="417"} 1
+  {__variant__="0", id="418"} 1
+  {__variant__="0", id="419"} 1
+  {__variant__="0", id="42"} 1
+  {__variant__="0", id="420"} 1
+  {__variant__="0", id="421"} 1
+  {__variant__="0", id="422"} 1
+  {__variant__="0", id="423"} 1
+  {__variant__="0", id="424"} 1
+  {__variant__="0", id="425"} 1
+  {__variant__="0", id="426"} 1
+  {__variant__="0", id="427"} 1
+  {__variant__="0", id="428"} 1
+  {__variant__="0", id="429"} 1
+  {__variant__="0", id="43"} 1
+  {__variant__="0", id="430"} 1
+  {__variant__="0", id="431"} 1
+  {__variant__="0", id="432"} 1
+  {__variant__="0", id="433"} 1
+  {__variant__="0", id="434"} 1
+  {__variant__="0", id="435"} 1
+  {__variant__="0", id="436"} 1
+  {__variant__="0", id="437"} 1
+  {__variant__="0", id="438"} 1
+  {__variant__="0", id="439"} 1
+  {__variant__="0", id="44"} 1
+  {__variant__="0", id="440"} 1
+  {__variant__="0", id="441"} 1
+  {__variant__="0", id="442"} 1
+  {__variant__="0", id="443"} 1
+  {__variant__="0", id="444"} 1
+  {__variant__="0", id="445"} 1
+  {__variant__="0", id="446"} 1
+  {__variant__="0", id="447"} 1
+  {__variant__="0", id="448"} 1
+  {__variant__="0", id="449"} 1
+  {__variant__="0", id="45"} 1
+  {__variant__="0", id="450"} 1
+  {__variant__="0", id="451"} 1
+  {__variant__="0", id="452"} 1
+  {__variant__="0", id="453"} 1
+  {__variant__="0", id="454"} 1
+  {__variant__="0", id="455"} 1
+  {__variant__="0", id="456"} 1
+  {__variant__="0", id="457"} 1
+  {__variant__="0", id="458"} 1
+  {__variant__="0", id="459"} 1
+  {__variant__="0", id="46"} 1
+  {__variant__="0", id="460"} 1
+  {__variant__="0", id="461"} 1
+  {__variant__="0", id="462"} 1
+  {__variant__="0", id="463"} 1
+  {__variant__="0", id="464"} 1
+  {__variant__="0", id="465"} 1
+  {__variant__="0", id="466"} 1
+  {__variant__="0", id="467"} 1
+  {__variant__="0", id="468"} 1
+  {__variant__="0", id="469"} 1
+  {__variant__="0", id="47"} 1
+  {__variant__="0", id="470"} 1
+  {__variant__="0", id="471"} 1
+  {__variant__="0", id="472"} 1
+  {__variant__="0", id="473"} 1
+  {__variant__="0", id="474"} 1
+  {__variant__="0", id="475"} 1
+  {__variant__="0", id="476"} 1
+  {__variant__="0", id="477"} 1
+  {__variant__="0", id="478"} 1
+  {__variant__="0", id="479"} 1
+  {__variant__="0", id="48"} 1
+  {__variant__="0", id="480"} 1
+  {__variant__="0", id="481"} 1
+  {__variant__="0", id="482"} 1
+  {__variant__="0", id="483"} 1
+  {__variant__="0", id="484"} 1
+  {__variant__="0", id="485"} 1
+  {__variant__="0", id="486"} 1
+  {__variant__="0", id="487"} 1
+  {__variant__="0", id="488"} 1
+  {__variant__="0", id="489"} 1
+  {__variant__="0", id="49"} 1
+  {__variant__="0", id="490"} 1
+  {__variant__="0", id="491"} 1
+  {__variant__="0", id="492"} 1
+  {__variant__="0", id="493"} 1
+  {__variant__="0", id="494"} 1
+  {__variant__="0", id="495"} 1
+  {__variant__="0", id="496"} 1
+  {__variant__="0", id="497"} 1
+  {__variant__="0", id="498"} 1
+  {__variant__="0", id="499"} 1
+  {__variant__="0", id="5"} 1
+  {__variant__="0", id="50"} 1
+  {__variant__="0", id="51"} 1
+  {__variant__="0", id="52"} 1
+  {__variant__="0", id="53"} 1
+  {__variant__="0", id="54"} 1
+  {__variant__="0", id="55"} 1
+  {__variant__="0", id="56"} 1
+  {__variant__="0", id="57"} 1
+  {__variant__="0", id="58"} 1
+  {__variant__="0", id="59"} 1
+  {__variant__="0", id="6"} 1
+  {__variant__="0", id="60"} 1
+  {__variant__="0", id="61"} 1
+  {__variant__="0", id="62"} 1
+  {__variant__="0", id="63"} 1
+  {__variant__="0", id="64"} 1
+  {__variant__="0", id="65"} 1
+  {__variant__="0", id="66"} 1
+  {__variant__="0", id="67"} 1
+  {__variant__="0", id="68"} 1
+  {__variant__="0", id="69"} 1
+  {__variant__="0", id="7"} 1
+  {__variant__="0", id="70"} 1
+  {__variant__="0", id="71"} 1
+  {__variant__="0", id="72"} 1
+  {__variant__="0", id="73"} 1
+  {__variant__="0", id="74"} 1
+  {__variant__="0", id="75"} 1
+  {__variant__="0", id="76"} 1
+  {__variant__="0", id="77"} 1
+  {__variant__="0", id="78"} 1
+  {__variant__="0", id="79"} 1
+  {__variant__="0", id="8"} 1
+  {__variant__="0", id="80"} 1
+  {__variant__="0", id="81"} 1
+  {__variant__="0", id="82"} 1
+  {__variant__="0", id="83"} 1
+  {__variant__="0", id="84"} 1
+  {__variant__="0", id="85"} 1
+  {__variant__="0", id="86"} 1
+  {__variant__="0", id="87"} 1
+  {__variant__="0", id="88"} 1
+  {__variant__="0", id="89"} 1
+  {__variant__="0", id="9"} 1
+  {__variant__="0", id="90"} 1
+  {__variant__="0", id="91"} 1
+  {__variant__="0", id="92"} 1
+  {__variant__="0", id="93"} 1
+  {__variant__="0", id="94"} 1
+  {__variant__="0", id="95"} 1
+  {__variant__="0", id="96"} 1
+  {__variant__="0", id="97"} 1
+  {__variant__="0", id="98"} 1
+  {__variant__="0", id="99"} 1
+  {__variant__="1"} 500
+
+# case 4 — instant, 501 common groups: variant 0 breaches and is
+# REMOVED ENTIRELY (never truncated); variant 1 is served. HTTP 200
+# on the reference, not a 4xx.
+eval instant at 60s variants(sum by (id) (count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m]))) of ({service_name="v277"} | logfmt | id < 501 [1m])
+  warning: maximum of series (500) reached for variant (0)
+  {__variant__="1"} 501
+
+# case 5 — every variant breaches: an EMPTY result and one warning
+# per skipped variant, still HTTP 200.
+eval instant at 60s variants(count_over_time({service_name="v277"} | logfmt | id < 501 [1m]), bytes_over_time({service_name="v277"} | logfmt | id < 501 [1m])) of ({service_name="v277"} | logfmt | id < 501 [1m])
+  warning: maximum of series (500) reached for variant (0)
+  warning: maximum of series (500) reached for variant (1)
+
+# case 6 — eleven variants, indices 2 and 10 breaching. The warning
+# order is BYTE-LEXICOGRAPHIC, not numeric: `variant (10)` comes
+# BEFORE `variant (2)` (the reference renders its warning set with
+# `slices.Sorted(maps.Keys(...))`,
+# pkg/logqlmodel/metadata/context.go:80-92 @ v3.7.4 b318f282).
+eval instant at 60s variants(sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), count_over_time({service_name="v277"} | logfmt | id < 501 [1m]), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), count_over_time({service_name="v277"} | logfmt | id < 501 [1m])) of ({service_name="v277"} | logfmt | id < 501 [1m])
+  warning: maximum of series (500) reached for variant (10)
+  warning: maximum of series (500) reached for variant (2)
+  {__variant__="0"} 501
+  {__variant__="1"} 501
+  {__variant__="3"} 501
+  {__variant__="4"} 501
+  {__variant__="5"} 501
+  {__variant__="6"} 501
+  {__variant__="7"} 501
+  {__variant__="8"} 501
+  {__variant__="9"} 501
+
+# case 7 — range grid {60s, 90s, 120s}, window (t-1m, t]. 499 common
+# groups: both variants served. At 90s only the ids at offsets in
+# (30s, 90s] remain; at 120s the window is empty.
+eval range from 60s to 120s step 30s variants(sum by (id) (count_over_time({service_name="v277"} | logfmt | id < 499 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 499 [1m]))) of ({service_name="v277"} | logfmt | id < 499 [1m])
+  {__variant__="0", id="0"} 60s 1
+  {__variant__="0", id="1"} 60s 1
+  {__variant__="0", id="10"} 60s 1
+  {__variant__="0", id="100"} 60s 1
+  {__variant__="0", id="101"} 60s 1
+  {__variant__="0", id="102"} 60s 1
+  {__variant__="0", id="103"} 60s 1
+  {__variant__="0", id="104"} 60s 1
+  {__variant__="0", id="105"} 60s 1
+  {__variant__="0", id="106"} 60s 1
+  {__variant__="0", id="107"} 60s 1
+  {__variant__="0", id="108"} 60s 1
+  {__variant__="0", id="109"} 60s 1
+  {__variant__="0", id="11"} 60s 1
+  {__variant__="0", id="110"} 60s 1
+  {__variant__="0", id="111"} 60s 1
+  {__variant__="0", id="112"} 60s 1
+  {__variant__="0", id="113"} 60s 1
+  {__variant__="0", id="114"} 60s 1
+  {__variant__="0", id="115"} 60s 1
+  {__variant__="0", id="116"} 60s 1
+  {__variant__="0", id="117"} 60s 1
+  {__variant__="0", id="118"} 60s 1
+  {__variant__="0", id="119"} 60s 1
+  {__variant__="0", id="12"} 60s 1
+  {__variant__="0", id="120"} 60s 1
+  {__variant__="0", id="121"} 60s 1
+  {__variant__="0", id="122"} 60s 1
+  {__variant__="0", id="123"} 60s 1
+  {__variant__="0", id="124"} 60s 1
+  {__variant__="0", id="125"} 60s 1
+  {__variant__="0", id="126"} 60s 1
+  {__variant__="0", id="127"} 60s 1
+  {__variant__="0", id="128"} 60s 1
+  {__variant__="0", id="129"} 60s 1
+  {__variant__="0", id="13"} 60s 1
+  {__variant__="0", id="130"} 60s 1
+  {__variant__="0", id="131"} 60s 1
+  {__variant__="0", id="132"} 60s 1
+  {__variant__="0", id="133"} 60s 1
+  {__variant__="0", id="134"} 60s 1
+  {__variant__="0", id="135"} 60s 1
+  {__variant__="0", id="136"} 60s 1
+  {__variant__="0", id="137"} 60s 1
+  {__variant__="0", id="138"} 60s 1
+  {__variant__="0", id="139"} 60s 1
+  {__variant__="0", id="14"} 60s 1
+  {__variant__="0", id="140"} 60s 1
+  {__variant__="0", id="141"} 60s 1
+  {__variant__="0", id="142"} 60s 1
+  {__variant__="0", id="143"} 60s 1
+  {__variant__="0", id="144"} 60s 1
+  {__variant__="0", id="145"} 60s 1
+  {__variant__="0", id="146"} 60s 1
+  {__variant__="0", id="147"} 60s 1
+  {__variant__="0", id="148"} 60s 1
+  {__variant__="0", id="149"} 60s 1
+  {__variant__="0", id="15"} 60s 1
+  {__variant__="0", id="150"} 60s 1
+  {__variant__="0", id="151"} 60s 1
+  {__variant__="0", id="152"} 60s 1
+  {__variant__="0", id="153"} 60s 1
+  {__variant__="0", id="154"} 60s 1
+  {__variant__="0", id="155"} 60s 1
+  {__variant__="0", id="156"} 60s 1
+  {__variant__="0", id="157"} 60s 1
+  {__variant__="0", id="158"} 60s 1
+  {__variant__="0", id="159"} 60s 1
+  {__variant__="0", id="16"} 60s 1
+  {__variant__="0", id="160"} 60s 1
+  {__variant__="0", id="161"} 60s 1
+  {__variant__="0", id="162"} 60s 1
+  {__variant__="0", id="163"} 60s 1
+  {__variant__="0", id="164"} 60s 1
+  {__variant__="0", id="165"} 60s 1
+  {__variant__="0", id="166"} 60s 1
+  {__variant__="0", id="167"} 60s 1
+  {__variant__="0", id="168"} 60s 1
+  {__variant__="0", id="169"} 60s 1
+  {__variant__="0", id="17"} 60s 1
+  {__variant__="0", id="170"} 60s 1
+  {__variant__="0", id="171"} 60s 1
+  {__variant__="0", id="172"} 60s 1
+  {__variant__="0", id="173"} 60s 1
+  {__variant__="0", id="174"} 60s 1
+  {__variant__="0", id="175"} 60s 1
+  {__variant__="0", id="176"} 60s 1
+  {__variant__="0", id="177"} 60s 1
+  {__variant__="0", id="178"} 60s 1
+  {__variant__="0", id="179"} 60s 1
+  {__variant__="0", id="18"} 60s 1
+  {__variant__="0", id="180"} 60s 1
+  {__variant__="0", id="181"} 60s 1
+  {__variant__="0", id="182"} 60s 1
+  {__variant__="0", id="183"} 60s 1
+  {__variant__="0", id="184"} 60s 1
+  {__variant__="0", id="185"} 60s 1
+  {__variant__="0", id="186"} 60s 1
+  {__variant__="0", id="187"} 60s 1
+  {__variant__="0", id="188"} 60s 1
+  {__variant__="0", id="189"} 60s 1
+  {__variant__="0", id="19"} 60s 1
+  {__variant__="0", id="190"} 60s 1
+  {__variant__="0", id="191"} 60s 1
+  {__variant__="0", id="192"} 60s 1
+  {__variant__="0", id="193"} 60s 1
+  {__variant__="0", id="194"} 60s 1
+  {__variant__="0", id="195"} 60s 1
+  {__variant__="0", id="196"} 60s 1
+  {__variant__="0", id="197"} 60s 1
+  {__variant__="0", id="198"} 60s 1
+  {__variant__="0", id="199"} 60s 1
+  {__variant__="0", id="2"} 60s 1
+  {__variant__="0", id="20"} 60s 1
+  {__variant__="0", id="200"} 60s 1
+  {__variant__="0", id="201"} 60s 1
+  {__variant__="0", id="202"} 60s 1
+  {__variant__="0", id="203"} 60s 1
+  {__variant__="0", id="204"} 60s 1
+  {__variant__="0", id="205"} 60s 1
+  {__variant__="0", id="206"} 60s 1
+  {__variant__="0", id="207"} 60s 1
+  {__variant__="0", id="208"} 60s 1
+  {__variant__="0", id="209"} 60s 1
+  {__variant__="0", id="21"} 60s 1
+  {__variant__="0", id="210"} 60s 1
+  {__variant__="0", id="211"} 60s 1
+  {__variant__="0", id="212"} 60s 1
+  {__variant__="0", id="213"} 60s 1
+  {__variant__="0", id="214"} 60s 1
+  {__variant__="0", id="215"} 60s 1
+  {__variant__="0", id="216"} 60s 1
+  {__variant__="0", id="217"} 60s 1
+  {__variant__="0", id="218"} 60s 1
+  {__variant__="0", id="219"} 60s 1
+  {__variant__="0", id="22"} 60s 1
+  {__variant__="0", id="220"} 60s 1
+  {__variant__="0", id="221"} 60s 1
+  {__variant__="0", id="222"} 60s 1
+  {__variant__="0", id="223"} 60s 1
+  {__variant__="0", id="224"} 60s 1
+  {__variant__="0", id="225"} 60s 1
+  {__variant__="0", id="226"} 60s 1
+  {__variant__="0", id="227"} 60s 1
+  {__variant__="0", id="228"} 60s 1
+  {__variant__="0", id="229"} 60s 1
+  {__variant__="0", id="23"} 60s 1
+  {__variant__="0", id="230"} 60s 1
+  {__variant__="0", id="231"} 60s 1
+  {__variant__="0", id="232"} 60s 1
+  {__variant__="0", id="233"} 60s 1
+  {__variant__="0", id="234"} 60s 1
+  {__variant__="0", id="235"} 60s 1
+  {__variant__="0", id="236"} 60s 1
+  {__variant__="0", id="237"} 60s 1
+  {__variant__="0", id="238"} 60s 1
+  {__variant__="0", id="239"} 60s 1
+  {__variant__="0", id="24"} 60s 1
+  {__variant__="0", id="240"} 60s 1
+  {__variant__="0", id="241"} 60s 1
+  {__variant__="0", id="242"} 60s 1
+  {__variant__="0", id="243"} 60s 1
+  {__variant__="0", id="244"} 60s 1
+  {__variant__="0", id="245"} 60s 1
+  {__variant__="0", id="246"} 60s 1
+  {__variant__="0", id="247"} 60s 1
+  {__variant__="0", id="248"} 60s 1
+  {__variant__="0", id="249"} 60s 1
+  {__variant__="0", id="25"} 60s 1
+  {__variant__="0", id="250"} 60s 1
+  {__variant__="0", id="251"} 60s 1
+  {__variant__="0", id="252"} 60s 1
+  {__variant__="0", id="253"} 60s 1
+  {__variant__="0", id="254"} 60s 1
+  {__variant__="0", id="255"} 60s 1
+  {__variant__="0", id="256"} 60s 1
+  {__variant__="0", id="257"} 60s 1
+  {__variant__="0", id="258"} 60s 1
+  {__variant__="0", id="259"} 60s 1
+  {__variant__="0", id="26"} 60s 1
+  {__variant__="0", id="260"} 60s 1
+  {__variant__="0", id="261"} 60s 1
+  {__variant__="0", id="262"} 60s 1
+  {__variant__="0", id="263"} 60s 1
+  {__variant__="0", id="264"} 60s 1
+  {__variant__="0", id="265"} 60s 1
+  {__variant__="0", id="266"} 60s 1
+  {__variant__="0", id="267"} 60s 1
+  {__variant__="0", id="268"} 60s 1
+  {__variant__="0", id="269"} 60s 1
+  {__variant__="0", id="27"} 60s 1
+  {__variant__="0", id="270"} 60s 1
+  {__variant__="0", id="271"} 60s 1
+  {__variant__="0", id="272"} 60s 1
+  {__variant__="0", id="273"} 60s 1
+  {__variant__="0", id="274"} 60s 1
+  {__variant__="0", id="275"} 60s 1
+  {__variant__="0", id="276"} 60s 1
+  {__variant__="0", id="277"} 60s 1
+  {__variant__="0", id="278"} 60s 1
+  {__variant__="0", id="279"} 60s 1
+  {__variant__="0", id="28"} 60s 1
+  {__variant__="0", id="280"} 60s 1
+  {__variant__="0", id="281"} 60s 1
+  {__variant__="0", id="282"} 60s 1
+  {__variant__="0", id="283"} 60s 1
+  {__variant__="0", id="284"} 60s 1
+  {__variant__="0", id="285"} 60s 1
+  {__variant__="0", id="286"} 60s 1
+  {__variant__="0", id="287"} 60s 1
+  {__variant__="0", id="288"} 60s 1
+  {__variant__="0", id="289"} 60s 1
+  {__variant__="0", id="29"} 60s 1
+  {__variant__="0", id="290"} 60s 1
+  {__variant__="0", id="291"} 60s 1
+  {__variant__="0", id="292"} 60s 1
+  {__variant__="0", id="293"} 60s 1
+  {__variant__="0", id="294"} 60s 1
+  {__variant__="0", id="295"} 60s 1
+  {__variant__="0", id="296"} 60s 1
+  {__variant__="0", id="297"} 60s 1
+  {__variant__="0", id="298"} 60s 1
+  {__variant__="0", id="299"} 60s 1
+  {__variant__="0", id="3"} 60s 1
+  {__variant__="0", id="30"} 60s 1
+  {__variant__="0", id="300"} 60s 1 90s 1
+  {__variant__="0", id="301"} 60s 1 90s 1
+  {__variant__="0", id="302"} 60s 1 90s 1
+  {__variant__="0", id="303"} 60s 1 90s 1
+  {__variant__="0", id="304"} 60s 1 90s 1
+  {__variant__="0", id="305"} 60s 1 90s 1
+  {__variant__="0", id="306"} 60s 1 90s 1
+  {__variant__="0", id="307"} 60s 1 90s 1
+  {__variant__="0", id="308"} 60s 1 90s 1
+  {__variant__="0", id="309"} 60s 1 90s 1
+  {__variant__="0", id="31"} 60s 1
+  {__variant__="0", id="310"} 60s 1 90s 1
+  {__variant__="0", id="311"} 60s 1 90s 1
+  {__variant__="0", id="312"} 60s 1 90s 1
+  {__variant__="0", id="313"} 60s 1 90s 1
+  {__variant__="0", id="314"} 60s 1 90s 1
+  {__variant__="0", id="315"} 60s 1 90s 1
+  {__variant__="0", id="316"} 60s 1 90s 1
+  {__variant__="0", id="317"} 60s 1 90s 1
+  {__variant__="0", id="318"} 60s 1 90s 1
+  {__variant__="0", id="319"} 60s 1 90s 1
+  {__variant__="0", id="32"} 60s 1
+  {__variant__="0", id="320"} 60s 1 90s 1
+  {__variant__="0", id="321"} 60s 1 90s 1
+  {__variant__="0", id="322"} 60s 1 90s 1
+  {__variant__="0", id="323"} 60s 1 90s 1
+  {__variant__="0", id="324"} 60s 1 90s 1
+  {__variant__="0", id="325"} 60s 1 90s 1
+  {__variant__="0", id="326"} 60s 1 90s 1
+  {__variant__="0", id="327"} 60s 1 90s 1
+  {__variant__="0", id="328"} 60s 1 90s 1
+  {__variant__="0", id="329"} 60s 1 90s 1
+  {__variant__="0", id="33"} 60s 1
+  {__variant__="0", id="330"} 60s 1 90s 1
+  {__variant__="0", id="331"} 60s 1 90s 1
+  {__variant__="0", id="332"} 60s 1 90s 1
+  {__variant__="0", id="333"} 60s 1 90s 1
+  {__variant__="0", id="334"} 60s 1 90s 1
+  {__variant__="0", id="335"} 60s 1 90s 1
+  {__variant__="0", id="336"} 60s 1 90s 1
+  {__variant__="0", id="337"} 60s 1 90s 1
+  {__variant__="0", id="338"} 60s 1 90s 1
+  {__variant__="0", id="339"} 60s 1 90s 1
+  {__variant__="0", id="34"} 60s 1
+  {__variant__="0", id="340"} 60s 1 90s 1
+  {__variant__="0", id="341"} 60s 1 90s 1
+  {__variant__="0", id="342"} 60s 1 90s 1
+  {__variant__="0", id="343"} 60s 1 90s 1
+  {__variant__="0", id="344"} 60s 1 90s 1
+  {__variant__="0", id="345"} 60s 1 90s 1
+  {__variant__="0", id="346"} 60s 1 90s 1
+  {__variant__="0", id="347"} 60s 1 90s 1
+  {__variant__="0", id="348"} 60s 1 90s 1
+  {__variant__="0", id="349"} 60s 1 90s 1
+  {__variant__="0", id="35"} 60s 1
+  {__variant__="0", id="350"} 60s 1 90s 1
+  {__variant__="0", id="351"} 60s 1 90s 1
+  {__variant__="0", id="352"} 60s 1 90s 1
+  {__variant__="0", id="353"} 60s 1 90s 1
+  {__variant__="0", id="354"} 60s 1 90s 1
+  {__variant__="0", id="355"} 60s 1 90s 1
+  {__variant__="0", id="356"} 60s 1 90s 1
+  {__variant__="0", id="357"} 60s 1 90s 1
+  {__variant__="0", id="358"} 60s 1 90s 1
+  {__variant__="0", id="359"} 60s 1 90s 1
+  {__variant__="0", id="36"} 60s 1
+  {__variant__="0", id="360"} 60s 1 90s 1
+  {__variant__="0", id="361"} 60s 1 90s 1
+  {__variant__="0", id="362"} 60s 1 90s 1
+  {__variant__="0", id="363"} 60s 1 90s 1
+  {__variant__="0", id="364"} 60s 1 90s 1
+  {__variant__="0", id="365"} 60s 1 90s 1
+  {__variant__="0", id="366"} 60s 1 90s 1
+  {__variant__="0", id="367"} 60s 1 90s 1
+  {__variant__="0", id="368"} 60s 1 90s 1
+  {__variant__="0", id="369"} 60s 1 90s 1
+  {__variant__="0", id="37"} 60s 1
+  {__variant__="0", id="370"} 60s 1 90s 1
+  {__variant__="0", id="371"} 60s 1 90s 1
+  {__variant__="0", id="372"} 60s 1 90s 1
+  {__variant__="0", id="373"} 60s 1 90s 1
+  {__variant__="0", id="374"} 60s 1 90s 1
+  {__variant__="0", id="375"} 60s 1 90s 1
+  {__variant__="0", id="376"} 60s 1 90s 1
+  {__variant__="0", id="377"} 60s 1 90s 1
+  {__variant__="0", id="378"} 60s 1 90s 1
+  {__variant__="0", id="379"} 60s 1 90s 1
+  {__variant__="0", id="38"} 60s 1
+  {__variant__="0", id="380"} 60s 1 90s 1
+  {__variant__="0", id="381"} 60s 1 90s 1
+  {__variant__="0", id="382"} 60s 1 90s 1
+  {__variant__="0", id="383"} 60s 1 90s 1
+  {__variant__="0", id="384"} 60s 1 90s 1
+  {__variant__="0", id="385"} 60s 1 90s 1
+  {__variant__="0", id="386"} 60s 1 90s 1
+  {__variant__="0", id="387"} 60s 1 90s 1
+  {__variant__="0", id="388"} 60s 1 90s 1
+  {__variant__="0", id="389"} 60s 1 90s 1
+  {__variant__="0", id="39"} 60s 1
+  {__variant__="0", id="390"} 60s 1 90s 1
+  {__variant__="0", id="391"} 60s 1 90s 1
+  {__variant__="0", id="392"} 60s 1 90s 1
+  {__variant__="0", id="393"} 60s 1 90s 1
+  {__variant__="0", id="394"} 60s 1 90s 1
+  {__variant__="0", id="395"} 60s 1 90s 1
+  {__variant__="0", id="396"} 60s 1 90s 1
+  {__variant__="0", id="397"} 60s 1 90s 1
+  {__variant__="0", id="398"} 60s 1 90s 1
+  {__variant__="0", id="399"} 60s 1 90s 1
+  {__variant__="0", id="4"} 60s 1
+  {__variant__="0", id="40"} 60s 1
+  {__variant__="0", id="400"} 60s 1 90s 1
+  {__variant__="0", id="401"} 60s 1 90s 1
+  {__variant__="0", id="402"} 60s 1 90s 1
+  {__variant__="0", id="403"} 60s 1 90s 1
+  {__variant__="0", id="404"} 60s 1 90s 1
+  {__variant__="0", id="405"} 60s 1 90s 1
+  {__variant__="0", id="406"} 60s 1 90s 1
+  {__variant__="0", id="407"} 60s 1 90s 1
+  {__variant__="0", id="408"} 60s 1 90s 1
+  {__variant__="0", id="409"} 60s 1 90s 1
+  {__variant__="0", id="41"} 60s 1
+  {__variant__="0", id="410"} 60s 1 90s 1
+  {__variant__="0", id="411"} 60s 1 90s 1
+  {__variant__="0", id="412"} 60s 1 90s 1
+  {__variant__="0", id="413"} 60s 1 90s 1
+  {__variant__="0", id="414"} 60s 1 90s 1
+  {__variant__="0", id="415"} 60s 1 90s 1
+  {__variant__="0", id="416"} 60s 1 90s 1
+  {__variant__="0", id="417"} 60s 1 90s 1
+  {__variant__="0", id="418"} 60s 1 90s 1
+  {__variant__="0", id="419"} 60s 1 90s 1
+  {__variant__="0", id="42"} 60s 1
+  {__variant__="0", id="420"} 60s 1 90s 1
+  {__variant__="0", id="421"} 60s 1 90s 1
+  {__variant__="0", id="422"} 60s 1 90s 1
+  {__variant__="0", id="423"} 60s 1 90s 1
+  {__variant__="0", id="424"} 60s 1 90s 1
+  {__variant__="0", id="425"} 60s 1 90s 1
+  {__variant__="0", id="426"} 60s 1 90s 1
+  {__variant__="0", id="427"} 60s 1 90s 1
+  {__variant__="0", id="428"} 60s 1 90s 1
+  {__variant__="0", id="429"} 60s 1 90s 1
+  {__variant__="0", id="43"} 60s 1
+  {__variant__="0", id="430"} 60s 1 90s 1
+  {__variant__="0", id="431"} 60s 1 90s 1
+  {__variant__="0", id="432"} 60s 1 90s 1
+  {__variant__="0", id="433"} 60s 1 90s 1
+  {__variant__="0", id="434"} 60s 1 90s 1
+  {__variant__="0", id="435"} 60s 1 90s 1
+  {__variant__="0", id="436"} 60s 1 90s 1
+  {__variant__="0", id="437"} 60s 1 90s 1
+  {__variant__="0", id="438"} 60s 1 90s 1
+  {__variant__="0", id="439"} 60s 1 90s 1
+  {__variant__="0", id="44"} 60s 1
+  {__variant__="0", id="440"} 60s 1 90s 1
+  {__variant__="0", id="441"} 60s 1 90s 1
+  {__variant__="0", id="442"} 60s 1 90s 1
+  {__variant__="0", id="443"} 60s 1 90s 1
+  {__variant__="0", id="444"} 60s 1 90s 1
+  {__variant__="0", id="445"} 60s 1 90s 1
+  {__variant__="0", id="446"} 60s 1 90s 1
+  {__variant__="0", id="447"} 60s 1 90s 1
+  {__variant__="0", id="448"} 60s 1 90s 1
+  {__variant__="0", id="449"} 60s 1 90s 1
+  {__variant__="0", id="45"} 60s 1
+  {__variant__="0", id="450"} 60s 1 90s 1
+  {__variant__="0", id="451"} 60s 1 90s 1
+  {__variant__="0", id="452"} 60s 1 90s 1
+  {__variant__="0", id="453"} 60s 1 90s 1
+  {__variant__="0", id="454"} 60s 1 90s 1
+  {__variant__="0", id="455"} 60s 1 90s 1
+  {__variant__="0", id="456"} 60s 1 90s 1
+  {__variant__="0", id="457"} 60s 1 90s 1
+  {__variant__="0", id="458"} 60s 1 90s 1
+  {__variant__="0", id="459"} 60s 1 90s 1
+  {__variant__="0", id="46"} 60s 1
+  {__variant__="0", id="460"} 60s 1 90s 1
+  {__variant__="0", id="461"} 60s 1 90s 1
+  {__variant__="0", id="462"} 60s 1 90s 1
+  {__variant__="0", id="463"} 60s 1 90s 1
+  {__variant__="0", id="464"} 60s 1 90s 1
+  {__variant__="0", id="465"} 60s 1 90s 1
+  {__variant__="0", id="466"} 60s 1 90s 1
+  {__variant__="0", id="467"} 60s 1 90s 1
+  {__variant__="0", id="468"} 60s 1 90s 1
+  {__variant__="0", id="469"} 60s 1 90s 1
+  {__variant__="0", id="47"} 60s 1
+  {__variant__="0", id="470"} 60s 1 90s 1
+  {__variant__="0", id="471"} 60s 1 90s 1
+  {__variant__="0", id="472"} 60s 1 90s 1
+  {__variant__="0", id="473"} 60s 1 90s 1
+  {__variant__="0", id="474"} 60s 1 90s 1
+  {__variant__="0", id="475"} 60s 1 90s 1
+  {__variant__="0", id="476"} 60s 1 90s 1
+  {__variant__="0", id="477"} 60s 1 90s 1
+  {__variant__="0", id="478"} 60s 1 90s 1
+  {__variant__="0", id="479"} 60s 1 90s 1
+  {__variant__="0", id="48"} 60s 1
+  {__variant__="0", id="480"} 60s 1 90s 1
+  {__variant__="0", id="481"} 60s 1 90s 1
+  {__variant__="0", id="482"} 60s 1 90s 1
+  {__variant__="0", id="483"} 60s 1 90s 1
+  {__variant__="0", id="484"} 60s 1 90s 1
+  {__variant__="0", id="485"} 60s 1 90s 1
+  {__variant__="0", id="486"} 60s 1 90s 1
+  {__variant__="0", id="487"} 60s 1 90s 1
+  {__variant__="0", id="488"} 60s 1 90s 1
+  {__variant__="0", id="489"} 60s 1 90s 1
+  {__variant__="0", id="49"} 60s 1
+  {__variant__="0", id="490"} 60s 1 90s 1
+  {__variant__="0", id="491"} 60s 1 90s 1
+  {__variant__="0", id="492"} 60s 1 90s 1
+  {__variant__="0", id="493"} 60s 1 90s 1
+  {__variant__="0", id="494"} 60s 1 90s 1
+  {__variant__="0", id="495"} 60s 1 90s 1
+  {__variant__="0", id="496"} 60s 1 90s 1
+  {__variant__="0", id="497"} 60s 1 90s 1
+  {__variant__="0", id="498"} 60s 1 90s 1
+  {__variant__="0", id="5"} 60s 1
+  {__variant__="0", id="50"} 60s 1
+  {__variant__="0", id="51"} 60s 1
+  {__variant__="0", id="52"} 60s 1
+  {__variant__="0", id="53"} 60s 1
+  {__variant__="0", id="54"} 60s 1
+  {__variant__="0", id="55"} 60s 1
+  {__variant__="0", id="56"} 60s 1
+  {__variant__="0", id="57"} 60s 1
+  {__variant__="0", id="58"} 60s 1
+  {__variant__="0", id="59"} 60s 1
+  {__variant__="0", id="6"} 60s 1
+  {__variant__="0", id="60"} 60s 1
+  {__variant__="0", id="61"} 60s 1
+  {__variant__="0", id="62"} 60s 1
+  {__variant__="0", id="63"} 60s 1
+  {__variant__="0", id="64"} 60s 1
+  {__variant__="0", id="65"} 60s 1
+  {__variant__="0", id="66"} 60s 1
+  {__variant__="0", id="67"} 60s 1
+  {__variant__="0", id="68"} 60s 1
+  {__variant__="0", id="69"} 60s 1
+  {__variant__="0", id="7"} 60s 1
+  {__variant__="0", id="70"} 60s 1
+  {__variant__="0", id="71"} 60s 1
+  {__variant__="0", id="72"} 60s 1
+  {__variant__="0", id="73"} 60s 1
+  {__variant__="0", id="74"} 60s 1
+  {__variant__="0", id="75"} 60s 1
+  {__variant__="0", id="76"} 60s 1
+  {__variant__="0", id="77"} 60s 1
+  {__variant__="0", id="78"} 60s 1
+  {__variant__="0", id="79"} 60s 1
+  {__variant__="0", id="8"} 60s 1
+  {__variant__="0", id="80"} 60s 1
+  {__variant__="0", id="81"} 60s 1
+  {__variant__="0", id="82"} 60s 1
+  {__variant__="0", id="83"} 60s 1
+  {__variant__="0", id="84"} 60s 1
+  {__variant__="0", id="85"} 60s 1
+  {__variant__="0", id="86"} 60s 1
+  {__variant__="0", id="87"} 60s 1
+  {__variant__="0", id="88"} 60s 1
+  {__variant__="0", id="89"} 60s 1
+  {__variant__="0", id="9"} 60s 1
+  {__variant__="0", id="90"} 60s 1
+  {__variant__="0", id="91"} 60s 1
+  {__variant__="0", id="92"} 60s 1
+  {__variant__="0", id="93"} 60s 1
+  {__variant__="0", id="94"} 60s 1
+  {__variant__="0", id="95"} 60s 1
+  {__variant__="0", id="96"} 60s 1
+  {__variant__="0", id="97"} 60s 1
+  {__variant__="0", id="98"} 60s 1
+  {__variant__="0", id="99"} 60s 1
+  {__variant__="1"} 60s 499 90s 199
+
+# case 8 — range at EXACTLY 500 series in variant 0: PulsusDB SERVES
+# it with no warning. THIS ROW IS A DELIBERATE DIVERGENCE, adjudicated
+# on issue #277 and recorded as ledger entry (d).
+#
+# reference: the pinned container SKIPS variant 0 here and returns
+# reference:   warnings = ['maximum of series (500) reached for variant (0)']
+# reference:   surviving series = 1
+# reference: because `multiVariantVectorsToSeries`
+# reference: (pkg/logql/engine.go:474-508 @ v3.7.4 b318f282) tests
+# reference: `len(sm[variantLabel]) >= maxSeries` BEFORE looking up
+# reference: whether the incoming point's series already exists, so a
+# reference: point belonging to an already-counted series deletes the
+# reference: whole variant on the second grid point. Its own sibling
+# reference: `vectorsToSeriesWithLimit` (:440-471) has exactly the
+# reference: `!ok` guard this function is missing. Its INSTANT path
+# reference: serves 500 (case 3), so the two disagree with each other.
+# reference:
+# reference: MEASURED REFINEMENT of the planned wording: the skip needs
+# reference: at least TWO grid points. On a single-step grid
+# reference: (`from 60s to 60s step 30s`) the same 500-series variant is
+# reference: SERVED by the reference with no warning — which is what the
+# reference: missing `!ok` guard predicts, since the delete can only
+# reference: fire on a revisit.
+#
+# The values below are the reference's own bytes for the same two
+# sub-queries run WITHOUT the variants wrapper, relabelled with the
+# `__variant__` index the wrapper injects; only the skip DECISION is
+# ours. DO NOT 'correct' this case toward the reference —
+# `range_variant_at_the_cap_is_served_where_the_reference_skips_it`
+# defends it.
+eval range from 60s to 120s step 30s variants(sum by (id) (count_over_time({service_name="v277"} | logfmt | id < 500 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 500 [1m]))) of ({service_name="v277"} | logfmt | id < 500 [1m])
+  {__variant__="0", id="0"} 60s 1
+  {__variant__="0", id="1"} 60s 1
+  {__variant__="0", id="10"} 60s 1
+  {__variant__="0", id="100"} 60s 1
+  {__variant__="0", id="101"} 60s 1
+  {__variant__="0", id="102"} 60s 1
+  {__variant__="0", id="103"} 60s 1
+  {__variant__="0", id="104"} 60s 1
+  {__variant__="0", id="105"} 60s 1
+  {__variant__="0", id="106"} 60s 1
+  {__variant__="0", id="107"} 60s 1
+  {__variant__="0", id="108"} 60s 1
+  {__variant__="0", id="109"} 60s 1
+  {__variant__="0", id="11"} 60s 1
+  {__variant__="0", id="110"} 60s 1
+  {__variant__="0", id="111"} 60s 1
+  {__variant__="0", id="112"} 60s 1
+  {__variant__="0", id="113"} 60s 1
+  {__variant__="0", id="114"} 60s 1
+  {__variant__="0", id="115"} 60s 1
+  {__variant__="0", id="116"} 60s 1
+  {__variant__="0", id="117"} 60s 1
+  {__variant__="0", id="118"} 60s 1
+  {__variant__="0", id="119"} 60s 1
+  {__variant__="0", id="12"} 60s 1
+  {__variant__="0", id="120"} 60s 1
+  {__variant__="0", id="121"} 60s 1
+  {__variant__="0", id="122"} 60s 1
+  {__variant__="0", id="123"} 60s 1
+  {__variant__="0", id="124"} 60s 1
+  {__variant__="0", id="125"} 60s 1
+  {__variant__="0", id="126"} 60s 1
+  {__variant__="0", id="127"} 60s 1
+  {__variant__="0", id="128"} 60s 1
+  {__variant__="0", id="129"} 60s 1
+  {__variant__="0", id="13"} 60s 1
+  {__variant__="0", id="130"} 60s 1
+  {__variant__="0", id="131"} 60s 1
+  {__variant__="0", id="132"} 60s 1
+  {__variant__="0", id="133"} 60s 1
+  {__variant__="0", id="134"} 60s 1
+  {__variant__="0", id="135"} 60s 1
+  {__variant__="0", id="136"} 60s 1
+  {__variant__="0", id="137"} 60s 1
+  {__variant__="0", id="138"} 60s 1
+  {__variant__="0", id="139"} 60s 1
+  {__variant__="0", id="14"} 60s 1
+  {__variant__="0", id="140"} 60s 1
+  {__variant__="0", id="141"} 60s 1
+  {__variant__="0", id="142"} 60s 1
+  {__variant__="0", id="143"} 60s 1
+  {__variant__="0", id="144"} 60s 1
+  {__variant__="0", id="145"} 60s 1
+  {__variant__="0", id="146"} 60s 1
+  {__variant__="0", id="147"} 60s 1
+  {__variant__="0", id="148"} 60s 1
+  {__variant__="0", id="149"} 60s 1
+  {__variant__="0", id="15"} 60s 1
+  {__variant__="0", id="150"} 60s 1
+  {__variant__="0", id="151"} 60s 1
+  {__variant__="0", id="152"} 60s 1
+  {__variant__="0", id="153"} 60s 1
+  {__variant__="0", id="154"} 60s 1
+  {__variant__="0", id="155"} 60s 1
+  {__variant__="0", id="156"} 60s 1
+  {__variant__="0", id="157"} 60s 1
+  {__variant__="0", id="158"} 60s 1
+  {__variant__="0", id="159"} 60s 1
+  {__variant__="0", id="16"} 60s 1
+  {__variant__="0", id="160"} 60s 1
+  {__variant__="0", id="161"} 60s 1
+  {__variant__="0", id="162"} 60s 1
+  {__variant__="0", id="163"} 60s 1
+  {__variant__="0", id="164"} 60s 1
+  {__variant__="0", id="165"} 60s 1
+  {__variant__="0", id="166"} 60s 1
+  {__variant__="0", id="167"} 60s 1
+  {__variant__="0", id="168"} 60s 1
+  {__variant__="0", id="169"} 60s 1
+  {__variant__="0", id="17"} 60s 1
+  {__variant__="0", id="170"} 60s 1
+  {__variant__="0", id="171"} 60s 1
+  {__variant__="0", id="172"} 60s 1
+  {__variant__="0", id="173"} 60s 1
+  {__variant__="0", id="174"} 60s 1
+  {__variant__="0", id="175"} 60s 1
+  {__variant__="0", id="176"} 60s 1
+  {__variant__="0", id="177"} 60s 1
+  {__variant__="0", id="178"} 60s 1
+  {__variant__="0", id="179"} 60s 1
+  {__variant__="0", id="18"} 60s 1
+  {__variant__="0", id="180"} 60s 1
+  {__variant__="0", id="181"} 60s 1
+  {__variant__="0", id="182"} 60s 1
+  {__variant__="0", id="183"} 60s 1
+  {__variant__="0", id="184"} 60s 1
+  {__variant__="0", id="185"} 60s 1
+  {__variant__="0", id="186"} 60s 1
+  {__variant__="0", id="187"} 60s 1
+  {__variant__="0", id="188"} 60s 1
+  {__variant__="0", id="189"} 60s 1
+  {__variant__="0", id="19"} 60s 1
+  {__variant__="0", id="190"} 60s 1
+  {__variant__="0", id="191"} 60s 1
+  {__variant__="0", id="192"} 60s 1
+  {__variant__="0", id="193"} 60s 1
+  {__variant__="0", id="194"} 60s 1
+  {__variant__="0", id="195"} 60s 1
+  {__variant__="0", id="196"} 60s 1
+  {__variant__="0", id="197"} 60s 1
+  {__variant__="0", id="198"} 60s 1
+  {__variant__="0", id="199"} 60s 1
+  {__variant__="0", id="2"} 60s 1
+  {__variant__="0", id="20"} 60s 1
+  {__variant__="0", id="200"} 60s 1
+  {__variant__="0", id="201"} 60s 1
+  {__variant__="0", id="202"} 60s 1
+  {__variant__="0", id="203"} 60s 1
+  {__variant__="0", id="204"} 60s 1
+  {__variant__="0", id="205"} 60s 1
+  {__variant__="0", id="206"} 60s 1
+  {__variant__="0", id="207"} 60s 1
+  {__variant__="0", id="208"} 60s 1
+  {__variant__="0", id="209"} 60s 1
+  {__variant__="0", id="21"} 60s 1
+  {__variant__="0", id="210"} 60s 1
+  {__variant__="0", id="211"} 60s 1
+  {__variant__="0", id="212"} 60s 1
+  {__variant__="0", id="213"} 60s 1
+  {__variant__="0", id="214"} 60s 1
+  {__variant__="0", id="215"} 60s 1
+  {__variant__="0", id="216"} 60s 1
+  {__variant__="0", id="217"} 60s 1
+  {__variant__="0", id="218"} 60s 1
+  {__variant__="0", id="219"} 60s 1
+  {__variant__="0", id="22"} 60s 1
+  {__variant__="0", id="220"} 60s 1
+  {__variant__="0", id="221"} 60s 1
+  {__variant__="0", id="222"} 60s 1
+  {__variant__="0", id="223"} 60s 1
+  {__variant__="0", id="224"} 60s 1
+  {__variant__="0", id="225"} 60s 1
+  {__variant__="0", id="226"} 60s 1
+  {__variant__="0", id="227"} 60s 1
+  {__variant__="0", id="228"} 60s 1
+  {__variant__="0", id="229"} 60s 1
+  {__variant__="0", id="23"} 60s 1
+  {__variant__="0", id="230"} 60s 1
+  {__variant__="0", id="231"} 60s 1
+  {__variant__="0", id="232"} 60s 1
+  {__variant__="0", id="233"} 60s 1
+  {__variant__="0", id="234"} 60s 1
+  {__variant__="0", id="235"} 60s 1
+  {__variant__="0", id="236"} 60s 1
+  {__variant__="0", id="237"} 60s 1
+  {__variant__="0", id="238"} 60s 1
+  {__variant__="0", id="239"} 60s 1
+  {__variant__="0", id="24"} 60s 1
+  {__variant__="0", id="240"} 60s 1
+  {__variant__="0", id="241"} 60s 1
+  {__variant__="0", id="242"} 60s 1
+  {__variant__="0", id="243"} 60s 1
+  {__variant__="0", id="244"} 60s 1
+  {__variant__="0", id="245"} 60s 1
+  {__variant__="0", id="246"} 60s 1
+  {__variant__="0", id="247"} 60s 1
+  {__variant__="0", id="248"} 60s 1
+  {__variant__="0", id="249"} 60s 1
+  {__variant__="0", id="25"} 60s 1
+  {__variant__="0", id="250"} 60s 1
+  {__variant__="0", id="251"} 60s 1
+  {__variant__="0", id="252"} 60s 1
+  {__variant__="0", id="253"} 60s 1
+  {__variant__="0", id="254"} 60s 1
+  {__variant__="0", id="255"} 60s 1
+  {__variant__="0", id="256"} 60s 1
+  {__variant__="0", id="257"} 60s 1
+  {__variant__="0", id="258"} 60s 1
+  {__variant__="0", id="259"} 60s 1
+  {__variant__="0", id="26"} 60s 1
+  {__variant__="0", id="260"} 60s 1
+  {__variant__="0", id="261"} 60s 1
+  {__variant__="0", id="262"} 60s 1
+  {__variant__="0", id="263"} 60s 1
+  {__variant__="0", id="264"} 60s 1
+  {__variant__="0", id="265"} 60s 1
+  {__variant__="0", id="266"} 60s 1
+  {__variant__="0", id="267"} 60s 1
+  {__variant__="0", id="268"} 60s 1
+  {__variant__="0", id="269"} 60s 1
+  {__variant__="0", id="27"} 60s 1
+  {__variant__="0", id="270"} 60s 1
+  {__variant__="0", id="271"} 60s 1
+  {__variant__="0", id="272"} 60s 1
+  {__variant__="0", id="273"} 60s 1
+  {__variant__="0", id="274"} 60s 1
+  {__variant__="0", id="275"} 60s 1
+  {__variant__="0", id="276"} 60s 1
+  {__variant__="0", id="277"} 60s 1
+  {__variant__="0", id="278"} 60s 1
+  {__variant__="0", id="279"} 60s 1
+  {__variant__="0", id="28"} 60s 1
+  {__variant__="0", id="280"} 60s 1
+  {__variant__="0", id="281"} 60s 1
+  {__variant__="0", id="282"} 60s 1
+  {__variant__="0", id="283"} 60s 1
+  {__variant__="0", id="284"} 60s 1
+  {__variant__="0", id="285"} 60s 1
+  {__variant__="0", id="286"} 60s 1
+  {__variant__="0", id="287"} 60s 1
+  {__variant__="0", id="288"} 60s 1
+  {__variant__="0", id="289"} 60s 1
+  {__variant__="0", id="29"} 60s 1
+  {__variant__="0", id="290"} 60s 1
+  {__variant__="0", id="291"} 60s 1
+  {__variant__="0", id="292"} 60s 1
+  {__variant__="0", id="293"} 60s 1
+  {__variant__="0", id="294"} 60s 1
+  {__variant__="0", id="295"} 60s 1
+  {__variant__="0", id="296"} 60s 1
+  {__variant__="0", id="297"} 60s 1
+  {__variant__="0", id="298"} 60s 1
+  {__variant__="0", id="299"} 60s 1
+  {__variant__="0", id="3"} 60s 1
+  {__variant__="0", id="30"} 60s 1
+  {__variant__="0", id="300"} 60s 1 90s 1
+  {__variant__="0", id="301"} 60s 1 90s 1
+  {__variant__="0", id="302"} 60s 1 90s 1
+  {__variant__="0", id="303"} 60s 1 90s 1
+  {__variant__="0", id="304"} 60s 1 90s 1
+  {__variant__="0", id="305"} 60s 1 90s 1
+  {__variant__="0", id="306"} 60s 1 90s 1
+  {__variant__="0", id="307"} 60s 1 90s 1
+  {__variant__="0", id="308"} 60s 1 90s 1
+  {__variant__="0", id="309"} 60s 1 90s 1
+  {__variant__="0", id="31"} 60s 1
+  {__variant__="0", id="310"} 60s 1 90s 1
+  {__variant__="0", id="311"} 60s 1 90s 1
+  {__variant__="0", id="312"} 60s 1 90s 1
+  {__variant__="0", id="313"} 60s 1 90s 1
+  {__variant__="0", id="314"} 60s 1 90s 1
+  {__variant__="0", id="315"} 60s 1 90s 1
+  {__variant__="0", id="316"} 60s 1 90s 1
+  {__variant__="0", id="317"} 60s 1 90s 1
+  {__variant__="0", id="318"} 60s 1 90s 1
+  {__variant__="0", id="319"} 60s 1 90s 1
+  {__variant__="0", id="32"} 60s 1
+  {__variant__="0", id="320"} 60s 1 90s 1
+  {__variant__="0", id="321"} 60s 1 90s 1
+  {__variant__="0", id="322"} 60s 1 90s 1
+  {__variant__="0", id="323"} 60s 1 90s 1
+  {__variant__="0", id="324"} 60s 1 90s 1
+  {__variant__="0", id="325"} 60s 1 90s 1
+  {__variant__="0", id="326"} 60s 1 90s 1
+  {__variant__="0", id="327"} 60s 1 90s 1
+  {__variant__="0", id="328"} 60s 1 90s 1
+  {__variant__="0", id="329"} 60s 1 90s 1
+  {__variant__="0", id="33"} 60s 1
+  {__variant__="0", id="330"} 60s 1 90s 1
+  {__variant__="0", id="331"} 60s 1 90s 1
+  {__variant__="0", id="332"} 60s 1 90s 1
+  {__variant__="0", id="333"} 60s 1 90s 1
+  {__variant__="0", id="334"} 60s 1 90s 1
+  {__variant__="0", id="335"} 60s 1 90s 1
+  {__variant__="0", id="336"} 60s 1 90s 1
+  {__variant__="0", id="337"} 60s 1 90s 1
+  {__variant__="0", id="338"} 60s 1 90s 1
+  {__variant__="0", id="339"} 60s 1 90s 1
+  {__variant__="0", id="34"} 60s 1
+  {__variant__="0", id="340"} 60s 1 90s 1
+  {__variant__="0", id="341"} 60s 1 90s 1
+  {__variant__="0", id="342"} 60s 1 90s 1
+  {__variant__="0", id="343"} 60s 1 90s 1
+  {__variant__="0", id="344"} 60s 1 90s 1
+  {__variant__="0", id="345"} 60s 1 90s 1
+  {__variant__="0", id="346"} 60s 1 90s 1
+  {__variant__="0", id="347"} 60s 1 90s 1
+  {__variant__="0", id="348"} 60s 1 90s 1
+  {__variant__="0", id="349"} 60s 1 90s 1
+  {__variant__="0", id="35"} 60s 1
+  {__variant__="0", id="350"} 60s 1 90s 1
+  {__variant__="0", id="351"} 60s 1 90s 1
+  {__variant__="0", id="352"} 60s 1 90s 1
+  {__variant__="0", id="353"} 60s 1 90s 1
+  {__variant__="0", id="354"} 60s 1 90s 1
+  {__variant__="0", id="355"} 60s 1 90s 1
+  {__variant__="0", id="356"} 60s 1 90s 1
+  {__variant__="0", id="357"} 60s 1 90s 1
+  {__variant__="0", id="358"} 60s 1 90s 1
+  {__variant__="0", id="359"} 60s 1 90s 1
+  {__variant__="0", id="36"} 60s 1
+  {__variant__="0", id="360"} 60s 1 90s 1
+  {__variant__="0", id="361"} 60s 1 90s 1
+  {__variant__="0", id="362"} 60s 1 90s 1
+  {__variant__="0", id="363"} 60s 1 90s 1
+  {__variant__="0", id="364"} 60s 1 90s 1
+  {__variant__="0", id="365"} 60s 1 90s 1
+  {__variant__="0", id="366"} 60s 1 90s 1
+  {__variant__="0", id="367"} 60s 1 90s 1
+  {__variant__="0", id="368"} 60s 1 90s 1
+  {__variant__="0", id="369"} 60s 1 90s 1
+  {__variant__="0", id="37"} 60s 1
+  {__variant__="0", id="370"} 60s 1 90s 1
+  {__variant__="0", id="371"} 60s 1 90s 1
+  {__variant__="0", id="372"} 60s 1 90s 1
+  {__variant__="0", id="373"} 60s 1 90s 1
+  {__variant__="0", id="374"} 60s 1 90s 1
+  {__variant__="0", id="375"} 60s 1 90s 1
+  {__variant__="0", id="376"} 60s 1 90s 1
+  {__variant__="0", id="377"} 60s 1 90s 1
+  {__variant__="0", id="378"} 60s 1 90s 1
+  {__variant__="0", id="379"} 60s 1 90s 1
+  {__variant__="0", id="38"} 60s 1
+  {__variant__="0", id="380"} 60s 1 90s 1
+  {__variant__="0", id="381"} 60s 1 90s 1
+  {__variant__="0", id="382"} 60s 1 90s 1
+  {__variant__="0", id="383"} 60s 1 90s 1
+  {__variant__="0", id="384"} 60s 1 90s 1
+  {__variant__="0", id="385"} 60s 1 90s 1
+  {__variant__="0", id="386"} 60s 1 90s 1
+  {__variant__="0", id="387"} 60s 1 90s 1
+  {__variant__="0", id="388"} 60s 1 90s 1
+  {__variant__="0", id="389"} 60s 1 90s 1
+  {__variant__="0", id="39"} 60s 1
+  {__variant__="0", id="390"} 60s 1 90s 1
+  {__variant__="0", id="391"} 60s 1 90s 1
+  {__variant__="0", id="392"} 60s 1 90s 1
+  {__variant__="0", id="393"} 60s 1 90s 1
+  {__variant__="0", id="394"} 60s 1 90s 1
+  {__variant__="0", id="395"} 60s 1 90s 1
+  {__variant__="0", id="396"} 60s 1 90s 1
+  {__variant__="0", id="397"} 60s 1 90s 1
+  {__variant__="0", id="398"} 60s 1 90s 1
+  {__variant__="0", id="399"} 60s 1 90s 1
+  {__variant__="0", id="4"} 60s 1
+  {__variant__="0", id="40"} 60s 1
+  {__variant__="0", id="400"} 60s 1 90s 1
+  {__variant__="0", id="401"} 60s 1 90s 1
+  {__variant__="0", id="402"} 60s 1 90s 1
+  {__variant__="0", id="403"} 60s 1 90s 1
+  {__variant__="0", id="404"} 60s 1 90s 1
+  {__variant__="0", id="405"} 60s 1 90s 1
+  {__variant__="0", id="406"} 60s 1 90s 1
+  {__variant__="0", id="407"} 60s 1 90s 1
+  {__variant__="0", id="408"} 60s 1 90s 1
+  {__variant__="0", id="409"} 60s 1 90s 1
+  {__variant__="0", id="41"} 60s 1
+  {__variant__="0", id="410"} 60s 1 90s 1
+  {__variant__="0", id="411"} 60s 1 90s 1
+  {__variant__="0", id="412"} 60s 1 90s 1
+  {__variant__="0", id="413"} 60s 1 90s 1
+  {__variant__="0", id="414"} 60s 1 90s 1
+  {__variant__="0", id="415"} 60s 1 90s 1
+  {__variant__="0", id="416"} 60s 1 90s 1
+  {__variant__="0", id="417"} 60s 1 90s 1
+  {__variant__="0", id="418"} 60s 1 90s 1
+  {__variant__="0", id="419"} 60s 1 90s 1
+  {__variant__="0", id="42"} 60s 1
+  {__variant__="0", id="420"} 60s 1 90s 1
+  {__variant__="0", id="421"} 60s 1 90s 1
+  {__variant__="0", id="422"} 60s 1 90s 1
+  {__variant__="0", id="423"} 60s 1 90s 1
+  {__variant__="0", id="424"} 60s 1 90s 1
+  {__variant__="0", id="425"} 60s 1 90s 1
+  {__variant__="0", id="426"} 60s 1 90s 1
+  {__variant__="0", id="427"} 60s 1 90s 1
+  {__variant__="0", id="428"} 60s 1 90s 1
+  {__variant__="0", id="429"} 60s 1 90s 1
+  {__variant__="0", id="43"} 60s 1
+  {__variant__="0", id="430"} 60s 1 90s 1
+  {__variant__="0", id="431"} 60s 1 90s 1
+  {__variant__="0", id="432"} 60s 1 90s 1
+  {__variant__="0", id="433"} 60s 1 90s 1
+  {__variant__="0", id="434"} 60s 1 90s 1
+  {__variant__="0", id="435"} 60s 1 90s 1
+  {__variant__="0", id="436"} 60s 1 90s 1
+  {__variant__="0", id="437"} 60s 1 90s 1
+  {__variant__="0", id="438"} 60s 1 90s 1
+  {__variant__="0", id="439"} 60s 1 90s 1
+  {__variant__="0", id="44"} 60s 1
+  {__variant__="0", id="440"} 60s 1 90s 1
+  {__variant__="0", id="441"} 60s 1 90s 1
+  {__variant__="0", id="442"} 60s 1 90s 1
+  {__variant__="0", id="443"} 60s 1 90s 1
+  {__variant__="0", id="444"} 60s 1 90s 1
+  {__variant__="0", id="445"} 60s 1 90s 1
+  {__variant__="0", id="446"} 60s 1 90s 1
+  {__variant__="0", id="447"} 60s 1 90s 1
+  {__variant__="0", id="448"} 60s 1 90s 1
+  {__variant__="0", id="449"} 60s 1 90s 1
+  {__variant__="0", id="45"} 60s 1
+  {__variant__="0", id="450"} 60s 1 90s 1
+  {__variant__="0", id="451"} 60s 1 90s 1
+  {__variant__="0", id="452"} 60s 1 90s 1
+  {__variant__="0", id="453"} 60s 1 90s 1
+  {__variant__="0", id="454"} 60s 1 90s 1
+  {__variant__="0", id="455"} 60s 1 90s 1
+  {__variant__="0", id="456"} 60s 1 90s 1
+  {__variant__="0", id="457"} 60s 1 90s 1
+  {__variant__="0", id="458"} 60s 1 90s 1
+  {__variant__="0", id="459"} 60s 1 90s 1
+  {__variant__="0", id="46"} 60s 1
+  {__variant__="0", id="460"} 60s 1 90s 1
+  {__variant__="0", id="461"} 60s 1 90s 1
+  {__variant__="0", id="462"} 60s 1 90s 1
+  {__variant__="0", id="463"} 60s 1 90s 1
+  {__variant__="0", id="464"} 60s 1 90s 1
+  {__variant__="0", id="465"} 60s 1 90s 1
+  {__variant__="0", id="466"} 60s 1 90s 1
+  {__variant__="0", id="467"} 60s 1 90s 1
+  {__variant__="0", id="468"} 60s 1 90s 1
+  {__variant__="0", id="469"} 60s 1 90s 1
+  {__variant__="0", id="47"} 60s 1
+  {__variant__="0", id="470"} 60s 1 90s 1
+  {__variant__="0", id="471"} 60s 1 90s 1
+  {__variant__="0", id="472"} 60s 1 90s 1
+  {__variant__="0", id="473"} 60s 1 90s 1
+  {__variant__="0", id="474"} 60s 1 90s 1
+  {__variant__="0", id="475"} 60s 1 90s 1
+  {__variant__="0", id="476"} 60s 1 90s 1
+  {__variant__="0", id="477"} 60s 1 90s 1
+  {__variant__="0", id="478"} 60s 1 90s 1
+  {__variant__="0", id="479"} 60s 1 90s 1
+  {__variant__="0", id="48"} 60s 1
+  {__variant__="0", id="480"} 60s 1 90s 1
+  {__variant__="0", id="481"} 60s 1 90s 1
+  {__variant__="0", id="482"} 60s 1 90s 1
+  {__variant__="0", id="483"} 60s 1 90s 1
+  {__variant__="0", id="484"} 60s 1 90s 1
+  {__variant__="0", id="485"} 60s 1 90s 1
+  {__variant__="0", id="486"} 60s 1 90s 1
+  {__variant__="0", id="487"} 60s 1 90s 1
+  {__variant__="0", id="488"} 60s 1 90s 1
+  {__variant__="0", id="489"} 60s 1 90s 1
+  {__variant__="0", id="49"} 60s 1
+  {__variant__="0", id="490"} 60s 1 90s 1
+  {__variant__="0", id="491"} 60s 1 90s 1
+  {__variant__="0", id="492"} 60s 1 90s 1
+  {__variant__="0", id="493"} 60s 1 90s 1
+  {__variant__="0", id="494"} 60s 1 90s 1
+  {__variant__="0", id="495"} 60s 1 90s 1
+  {__variant__="0", id="496"} 60s 1 90s 1
+  {__variant__="0", id="497"} 60s 1 90s 1
+  {__variant__="0", id="498"} 60s 1 90s 1
+  {__variant__="0", id="499"} 60s 1 90s 1
+  {__variant__="0", id="5"} 60s 1
+  {__variant__="0", id="50"} 60s 1
+  {__variant__="0", id="51"} 60s 1
+  {__variant__="0", id="52"} 60s 1
+  {__variant__="0", id="53"} 60s 1
+  {__variant__="0", id="54"} 60s 1
+  {__variant__="0", id="55"} 60s 1
+  {__variant__="0", id="56"} 60s 1
+  {__variant__="0", id="57"} 60s 1
+  {__variant__="0", id="58"} 60s 1
+  {__variant__="0", id="59"} 60s 1
+  {__variant__="0", id="6"} 60s 1
+  {__variant__="0", id="60"} 60s 1
+  {__variant__="0", id="61"} 60s 1
+  {__variant__="0", id="62"} 60s 1
+  {__variant__="0", id="63"} 60s 1
+  {__variant__="0", id="64"} 60s 1
+  {__variant__="0", id="65"} 60s 1
+  {__variant__="0", id="66"} 60s 1
+  {__variant__="0", id="67"} 60s 1
+  {__variant__="0", id="68"} 60s 1
+  {__variant__="0", id="69"} 60s 1
+  {__variant__="0", id="7"} 60s 1
+  {__variant__="0", id="70"} 60s 1
+  {__variant__="0", id="71"} 60s 1
+  {__variant__="0", id="72"} 60s 1
+  {__variant__="0", id="73"} 60s 1
+  {__variant__="0", id="74"} 60s 1
+  {__variant__="0", id="75"} 60s 1
+  {__variant__="0", id="76"} 60s 1
+  {__variant__="0", id="77"} 60s 1
+  {__variant__="0", id="78"} 60s 1
+  {__variant__="0", id="79"} 60s 1
+  {__variant__="0", id="8"} 60s 1
+  {__variant__="0", id="80"} 60s 1
+  {__variant__="0", id="81"} 60s 1
+  {__variant__="0", id="82"} 60s 1
+  {__variant__="0", id="83"} 60s 1
+  {__variant__="0", id="84"} 60s 1
+  {__variant__="0", id="85"} 60s 1
+  {__variant__="0", id="86"} 60s 1
+  {__variant__="0", id="87"} 60s 1
+  {__variant__="0", id="88"} 60s 1
+  {__variant__="0", id="89"} 60s 1
+  {__variant__="0", id="9"} 60s 1
+  {__variant__="0", id="90"} 60s 1
+  {__variant__="0", id="91"} 60s 1
+  {__variant__="0", id="92"} 60s 1
+  {__variant__="0", id="93"} 60s 1
+  {__variant__="0", id="94"} 60s 1
+  {__variant__="0", id="95"} 60s 1
+  {__variant__="0", id="96"} 60s 1
+  {__variant__="0", id="97"} 60s 1
+  {__variant__="0", id="98"} 60s 1
+  {__variant__="0", id="99"} 60s 1
+  {__variant__="1"} 60s 500 90s 200
+
+# case 9 — range, 501 common groups: variant 0 skipped, variant 1
+# served, one warning. Both sides agree here.
+eval range from 60s to 120s step 30s variants(sum by (id) (count_over_time({service_name="v277"} | logfmt | id < 501 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 501 [1m]))) of ({service_name="v277"} | logfmt | id < 501 [1m])
+  warning: maximum of series (500) reached for variant (0)
+  {__variant__="1"} 60s 501 90s 201
+
+# case 10 — THE ROOT-ONLY PROOF. Case 3 and this case differ only by
+# `+ 1` and must land on opposite verdicts: a root `variants(...)` is
+# gated per variant, any other root takes the plain concatenation cap
+# (`pkg/logql/engine.go:321-322` dispatches on the ROOT expression @
+# v3.7.4 b318f282). Captured status 400, body verbatim.
+eval_fail instant at 60s variants(sum by (id) (count_over_time({service_name="v277"} | logfmt | id < 500 [1m])), sum(count_over_time({service_name="v277"} | logfmt | id < 500 [1m]))) of ({service_name="v277"} | logfmt | id < 500 [1m]) + 1
+  msg: maximum number of series (500) reached for a single query; consider reducing query cardinality by adding more specific stream selectors, reducing the time range, or aggregating results with functions like sum(), count() or topk()
+
+clear

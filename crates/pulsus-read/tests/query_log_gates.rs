@@ -817,10 +817,11 @@ async fn fetch_until_limit_pages_issue_strictly_decrementing_positive_scan_caps(
     let params = full_window_params(ts_ns, 5_000);
     let expr = parse(&dropping_query()).expect("parse");
 
-    let result = engine
+    let (result, warnings) = engine
         .query(&expr, &params)
         .await
         .unwrap_or_else(|e| panic!("query err: {e:?}"));
+    assert!(warnings.is_empty(), "a log-stream query emits no warnings");
     let QueryResult::Streams { items, partial } = result else {
         panic!("a stream selector must return Streams");
     };
@@ -894,10 +895,11 @@ async fn fetch_until_limit_zero_budget_terminates_partial_without_unlimited_page
     let params = full_window_params(ts_ns, 5_000);
     let expr = parse(&dropping_query()).expect("parse");
 
-    let result = engine
+    let (result, warnings) = engine
         .query(&expr, &params)
         .await
         .unwrap_or_else(|e| panic!("query err: {e:?}"));
+    assert!(warnings.is_empty(), "a log-stream query emits no warnings");
     let QueryResult::Streams { items, partial } = result else {
         panic!("a stream selector must return Streams");
     };

@@ -39,6 +39,7 @@ use serde::Serialize;
 use pulsus_read::{
     DetectedFieldOut, DetectedFields, DetectedLabelOut, ExplainStage, LogStats, MatrixSeries,
     PatternSeries, PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample, VolumeEntry,
+    Warnings,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -602,8 +603,68 @@ fn explain_suffix(mut suffix: String, explain: Option<&PlanExplain>) -> String {
     suffix
 }
 
+/// Issue #277: the `warnings` envelope suffix — a TOP-LEVEL sibling of
+/// `data`, appended AFTER `data`'s own closing brace and never nested
+/// inside it (unlike [`explain_suffix`], whose `explain` key lives
+/// *inside* `data`).
+///
+/// **Warnings come LAST, after `data`** — captured from the pinned
+/// reference, not read off its encoder. `pkg/util/marshal/query.go:201-228`
+/// (`EncodeResult`) writes `status`, `warnings`, `data`, and that is NOT
+/// the encoder a user's query reaches: the query-frontend path serialises
+/// `queryrangebase.PrometheusResponse`
+/// (`pkg/querier/queryrange/queryrangebase/queryrange.proto:36-46` —
+/// `Status`=1, `Data`=2, … `Warnings`=6 `json:"warnings,omitempty"`), so
+/// the captured body puts `warnings` after `data`:
+///
+/// ```text
+/// {"status":"success","data":{…},"warnings":["maximum of series (500) reached for variant (0)"]}
+/// ```
+///
+/// Empty ⇒ zero bytes (`omitempty`), so every non-variants response stays
+/// byte-identical.
+fn warnings_suffix(warnings: &Warnings) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(",\"warnings\":[");
+    for (i, w) in warnings.as_strings().iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&json_string(w));
+    }
+    s.push(']');
+    s
+}
+
+/// [`query_response_warned`] with no warnings.
+///
+// Test-only since issue #277: the production caller
+// (`handlers::run_query`) passes the engine's accumulated warnings
+// through `query_response_warned`. Kept as a thin convenience so every
+// pre-existing byte-exact envelope test is untouched — an empty
+// `Warnings` renders zero extra bytes, which is exactly the property
+// `empty_warnings_leaves_every_query_response_arm_byte_identical` pins.
+#[cfg(test)]
+pub(crate) fn query_response(
+    result: QueryResult,
+    explain: Option<PlanExplain>,
+    at_ns: i64,
+    preserve_vector_order: bool,
+) -> Response {
+    query_response_warned(
+        result,
+        explain,
+        at_ns,
+        preserve_vector_order,
+        &Warnings::new(),
+    )
+}
+
 /// Encodes a `query`/`query_range` result: `data.resultType`/`result`/
-/// `stats`(/`explain`) per docs/api.md §2.1/§2.2. `at_ns` is the instant
+/// `stats`(/`explain`) per docs/api.md §2.1/§2.2, plus the top-level
+/// `warnings` array (issue #277) **after** `data`. `at_ns` is the instant
 /// evaluation time (`/query`'s `time` param) — only read when `result` is
 /// [`QueryResult::Vector`] (never produced by a `Range` spec, so
 /// `query_range` callers may pass any placeholder).
@@ -616,12 +677,17 @@ fn explain_suffix(mut suffix: String, explain: Option<&PlanExplain>) -> String {
 /// keep their deterministic label-sort (a range `sort(...)` yields a
 /// matrix with no per-series value order, so no HashMap nondeterminism
 /// reaches the wire).
-pub(crate) fn query_response(
+///
+/// `warnings` renders zero bytes when empty, so every non-variants
+/// response is byte-identical to the pre-#277 encoder.
+pub(crate) fn query_response_warned(
     result: QueryResult,
     explain: Option<PlanExplain>,
     at_ns: i64,
     preserve_vector_order: bool,
+    warnings: &Warnings,
 ) -> Response {
+    let warns = warnings_suffix(warnings);
     match result {
         QueryResult::Streams { mut items, partial } => {
             items.sort_by(|a, b| {
@@ -642,7 +708,7 @@ pub(crate) fn query_response(
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"streams\",\"result\":["
                     .to_vec();
             let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain.as_ref());
-            let suffix = format!("{suffix}}}}}").into_bytes();
+            let suffix = format!("{suffix}}}{warns}}}").into_bytes();
             json_response(stream_array(prefix, items, render_stream_item, suffix))
         }
         QueryResult::Matrix(mut items) => {
@@ -655,7 +721,7 @@ pub(crate) fn query_response(
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"matrix\",\"result\":["
                     .to_vec();
             let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain.as_ref());
-            let suffix = format!("{suffix}}}}}").into_bytes();
+            let suffix = format!("{suffix}}}{warns}}}").into_bytes();
             json_response(stream_array(prefix, items, render_matrix_item, suffix))
         }
         QueryResult::Vector(mut items) => {
@@ -672,7 +738,7 @@ pub(crate) fn query_response(
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":["
                     .to_vec();
             let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain.as_ref());
-            let suffix = format!("{suffix}}}}}").into_bytes();
+            let suffix = format!("{suffix}}}{warns}}}").into_bytes();
             json_response(stream_array(
                 prefix,
                 items,
@@ -696,7 +762,7 @@ pub(crate) fn query_response(
                 ),
                 explain.as_ref(),
             );
-            json_response(Body::from(format!("{body}}}")))
+            json_response(Body::from(format!("{body}{warns}}}")))
         }
         // Unreachable: `QueryResult::String` is a PromQL-only variant of
         // the shared enum (issue #86; a top-level string-literal metrics
@@ -1661,5 +1727,177 @@ mod tests {
             )
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #277: the `warnings` envelope key.
+    // -----------------------------------------------------------------
+
+    fn one_warning() -> Warnings {
+        let mut w = Warnings::new();
+        w.add("maximum of series (500) reached for variant (0)".to_string());
+        w
+    }
+
+    /// AC 1 — **position and content, byte for byte.** `warnings` is the
+    /// LAST top-level key, a sibling of `data` and appended AFTER its
+    /// closing brace.
+    ///
+    /// The position was CAPTURED from the pinned reference, not read off
+    /// its encoder: `pkg/util/marshal/query.go:201-228` (`EncodeResult`)
+    /// writes `status`, `warnings`, `data`, and that is not the encoder a
+    /// user's query reaches — the query-frontend path serialises
+    /// `queryrangebase.PrometheusResponse`
+    /// (`pkg/querier/queryrange/queryrangebase/queryrange.proto:36-46`,
+    /// `Warnings`=6 `json:"warnings,omitempty"`). Had this been derived
+    /// from `EncodeResult` the key would have shipped in the wrong place.
+    #[tokio::test]
+    async fn logs_query_envelope_places_warnings_after_data() {
+        let sample = VectorSample {
+            labels: vec![("__variant__".to_string(), "1".to_string())],
+            value: 501.0,
+        };
+        let body = body_string(query_response_warned(
+            QueryResult::Vector(vec![sample]),
+            None,
+            5_500_000_000,
+            false,
+            &one_warning(),
+        ))
+        .await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__variant__":"1"},"value":[5.500,"501"]}],"stats":{"series":1}},"warnings":["maximum of series (500) reached for variant (0)"]}"#
+        );
+        // Stated as a relation as well as a literal, so a future edit to
+        // the golden cannot quietly move the key inside `data`.
+        let warn_at = body.find(r#""warnings""#).expect("the key is present");
+        let data_end = body.rfind(r#"},"warnings""#).expect("data closes first");
+        assert!(warn_at > data_end, "warnings must follow data's brace");
+        assert!(
+            body.ends_with(r#"]}"#),
+            "warnings is the LAST top-level key"
+        );
+    }
+
+    /// The matrix arm's twin, and the multi-warning wire order — byte
+    /// lexicographic, so `variant (10)` precedes `variant (2)` (captured;
+    /// `pkg/logqlmodel/metadata/context.go:80-92 @ grafana/loki v3.7.4
+    /// b318f2829f0ae2094ab3a1e90780450e9e4b03be`).
+    #[tokio::test]
+    async fn logs_query_range_envelope_places_warnings_after_data() {
+        let series = MatrixSeries {
+            labels: vec![("__variant__".to_string(), "1".to_string())],
+            points: vec![(0, 501.0)],
+        };
+        let mut w = Warnings::new();
+        w.add("maximum of series (500) reached for variant (2)".to_string());
+        w.add("maximum of series (500) reached for variant (10)".to_string());
+        let body = body_string(query_response_warned(
+            QueryResult::Matrix(vec![series]),
+            None,
+            0,
+            false,
+            &w,
+        ))
+        .await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__variant__":"1"},"values":[[0.000,"501"]]}],"stats":{"series":1}},"warnings":["maximum of series (500) reached for variant (10)","maximum of series (500) reached for variant (2)"]}"#
+        );
+    }
+
+    /// `explain` lives INSIDE `data`; `warnings` lives outside it. The two
+    /// are not siblings, and appending the warnings to `explain_suffix`
+    /// would nest them under `data` — this is the assertion that catches
+    /// that.
+    #[tokio::test]
+    async fn explain_stays_inside_data_while_warnings_stay_outside_it() {
+        let mut explain = PlanExplain::new("vector");
+        explain.push("metric_read", "SELECT 1".to_string(), None);
+        let sample = VectorSample {
+            labels: vec![("__variant__".to_string(), "1".to_string())],
+            value: 1.0,
+        };
+        let body = body_string(query_response_warned(
+            QueryResult::Vector(vec![sample]),
+            Some(explain),
+            0,
+            false,
+            &one_warning(),
+        ))
+        .await;
+        let explain_at = body.find(r#""explain""#).expect("explain is present");
+        let warn_at = body.find(r#""warnings""#).expect("warnings are present");
+        let data_end = body.rfind(r#"},"warnings""#).expect("data closes");
+        assert!(explain_at < data_end, "explain must be inside data: {body}");
+        assert!(warn_at > data_end, "warnings must be outside data: {body}");
+    }
+
+    /// AC 12 — **the empty-`Warnings` path is byte-identical on every arm
+    /// of `query_response` as it exists today.** `warnings_suffix` of an
+    /// empty accumulator is the empty string, and each of the seven
+    /// `QueryResult` arms — `Streams`, `Matrix`, `Vector`, `Scalar`,
+    /// `String`, `VectorHist`, `MatrixHist` — produces the same bytes
+    /// with an empty accumulator as it does through the pre-change
+    /// `query_response` wrapper.
+    ///
+    /// **What is compiler-closed and what is not.** `query_response`'s
+    /// `match` is exhaustive with no `_` arm, so a new `QueryResult`
+    /// variant cannot be added without adding an ENCODER arm. It does
+    /// **not** force this test to gain a case: an implementer can add the
+    /// arm and leave the seven below untouched, and nothing reddens. The
+    /// encoder domain is compiler-closed; **this test's domain is a
+    /// hand-written list.** That residue is accepted and recorded rather
+    /// than policed by another test (issue #277 plan v3).
+    #[tokio::test]
+    async fn empty_warnings_leaves_every_query_response_arm_byte_identical() {
+        assert_eq!(warnings_suffix(&Warnings::new()), "");
+
+        let arms: Vec<(&str, QueryResult)> = vec![
+            (
+                "Streams",
+                QueryResult::Streams {
+                    items: vec![stream(1, r#"{"service_name":"a"}"#, vec![(1, "x")])],
+                    partial: false,
+                },
+            ),
+            (
+                "Matrix",
+                QueryResult::Matrix(vec![MatrixSeries {
+                    labels: vec![("service_name".to_string(), "a".to_string())],
+                    points: vec![(0, 1.0)],
+                }]),
+            ),
+            (
+                "Vector",
+                QueryResult::Vector(vec![VectorSample {
+                    labels: vec![("service_name".to_string(), "a".to_string())],
+                    value: 1.0,
+                }]),
+            ),
+            ("Scalar", QueryResult::Scalar(1.5)),
+            ("String", QueryResult::String("x".to_string())),
+            ("VectorHist", QueryResult::VectorHist(Vec::new())),
+            ("MatrixHist", QueryResult::MatrixHist(Vec::new())),
+        ];
+
+        for (name, result) in arms {
+            let with_empty =
+                query_response_warned(result.clone(), None, 5_500_000_000, false, &Warnings::new());
+            let plain = query_response(result, None, 5_500_000_000, false);
+            assert_eq!(
+                with_empty.status(),
+                plain.status(),
+                "{name}: status moved with an empty accumulator"
+            );
+            let a = body_string(with_empty).await;
+            let b = body_string(plain).await;
+            assert_eq!(a, b, "{name}: body moved with an empty accumulator");
+            assert!(
+                !a.contains("warnings"),
+                "{name}: an empty accumulator must emit no key at all: {a}"
+            );
+        }
     }
 }

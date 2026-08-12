@@ -83,7 +83,10 @@ pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
 /// direction that matters: PulsusDB rejects nothing the reference
 /// serves. Exactly 500 served, 501 rejected, on both sides.
 ///
-/// **Read by [`ensure_result_series`] and by nothing else** (issue #236).
+/// **Read by [`result_series_breach`] and by nothing else** (issue #236's
+/// normative property; the reader moved there from `ensure_result_series`
+/// in issue #277, which needs the breach as a VALUE on the per-variant
+/// skip path rather than as an error it would have to destructure).
 /// Applying it to an intermediate would reject on a *proxy* rather than
 /// on the resource consumed: an outer `sum` over an inner `sum by (id)`
 /// collapses 501+ inner groups to ONE final series, which the reference
@@ -92,7 +95,9 @@ pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
 /// ([`MAX_METRIC_RESULT_POINTS`]) — and by nothing else.
 pub const MAX_QUERY_SERIES: u64 = 500;
 
-/// Enforces [`MAX_QUERY_SERIES`] on a metric query's **final** result.
+/// `Some(cap)` when `result` breaches [`MAX_QUERY_SERIES`], `None`
+/// otherwise — **the single reader of that constant** (issue #236's
+/// normative property, moved here intact by issue #277).
 ///
 /// Counts TOP-LEVEL series: one per `Vector`/`VectorHist` sample and one
 /// per `Matrix`/`MatrixHist` series (the reference counts distinct series,
@@ -102,28 +107,44 @@ pub const MAX_QUERY_SERIES: u64 = 500;
 /// and `Scalar`/`String` carry no series, so all three pass.
 ///
 /// `> cap` is the reference's own test (`engine.go:538`), so exactly 500
-/// is served.
+/// is served. Issue #277 applies the SAME `>` on the per-variant path, at
+/// instant and at range alike — see
+/// [`variants`](super::variants)'s skip-and-warn body and ledger entry
+/// `(d)` for why the reference's own range path stops one earlier.
 ///
-/// `pub` so the conformance runner (`tests/logqltest/runner.rs`) applies
-/// the identical gate on its own `Expr::Metric` arm and corpus
-/// `eval_fail` cases can pin the reference's body. Exporting the FUNCTION
-/// keeps [`MAX_QUERY_SERIES`] read in exactly one place.
-pub fn ensure_result_series(result: &QueryResult) -> Result<(), ReadError> {
+/// Returning the breach as a value rather than an error is what lets the
+/// variants path skip-and-warn without destructuring a [`ReadError`].
+pub fn result_series_breach(result: &QueryResult) -> Option<u64> {
     let n = match result {
         QueryResult::Vector(v) => v.len() as u64,
         QueryResult::Matrix(m) => m.len() as u64,
         QueryResult::VectorHist(v) => v.len() as u64,
         QueryResult::MatrixHist(m) => m.len() as u64,
         QueryResult::Streams { .. } | QueryResult::Scalar(_) | QueryResult::String(_) => {
-            return Ok(());
+            return None;
         }
     };
     if n > MAX_QUERY_SERIES {
-        return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
-            cap: MAX_QUERY_SERIES,
-        }));
+        Some(MAX_QUERY_SERIES)
+    } else {
+        None
     }
-    Ok(())
+}
+
+/// Enforces [`MAX_QUERY_SERIES`] on a metric query's **final** result —
+/// [`result_series_breach`] as an error.
+///
+/// `pub` so the conformance runner (`tests/logqltest/runner.rs`) applies
+/// the identical gate on its own `Expr::Metric` arm and corpus
+/// `eval_fail` cases can pin the reference's body. Exporting the FUNCTIONS
+/// keeps [`MAX_QUERY_SERIES`] read in exactly one place.
+pub fn ensure_result_series(result: &QueryResult) -> Result<(), ReadError> {
+    match result_series_breach(result) {
+        Some(cap) => Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+            cap,
+        })),
+        None => Ok(()),
+    }
 }
 
 /// Every per-query retention cap in ONE place (issue #221), so the
@@ -1417,7 +1438,10 @@ mod tests {
 
     /// AC 11's static companion, as an executable check rather than a
     /// review-time grep: `MAX_QUERY_SERIES` is read by
-    /// `ensure_result_series` and by NOTHING else in production source.
+    /// `result_series_breach` and by NOTHING else in production source.
+    /// (Issue #277 split that predicate out of `ensure_result_series`, so
+    /// the per-variant skip path reads the breach as a value; both reads
+    /// moved with it and the census count is unchanged.)
     ///
     /// This is the property the plan calls normative — a constant that is
     /// *currently* read once and one that *can only* be read once are
@@ -1457,11 +1481,11 @@ mod tests {
             }
         }
         // Exactly two production lines mention it, both inside
-        // `ensure_result_series`: the `> cap` test and the error payload.
+        // `result_series_breach`: the `> cap` test and the returned cap.
         assert_eq!(
             reads.len(),
             2,
-            "MAX_QUERY_SERIES must be read only by ensure_result_series; found {reads:#?}"
+            "MAX_QUERY_SERIES must be read only by result_series_breach; found {reads:#?}"
         );
         for r in &reads {
             assert!(r.starts_with("charge.rs:"), "unexpected reader: {r}");
@@ -2289,6 +2313,8 @@ mod tests {
             ("post_agg.rs", include_str!("post_agg.rs")),
             ("variants.rs", include_str!("variants.rs")),
             ("walkbound.rs", include_str!("walkbound.rs")),
+            // Issue #277: the per-query response-warning accumulator.
+            ("warnings.rs", include_str!("warnings.rs")),
             ("window.rs", include_str!("window.rs")),
         ];
         assert_source_set_matches_the_directory(SOURCES);

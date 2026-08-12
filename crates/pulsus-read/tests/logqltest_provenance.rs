@@ -1903,7 +1903,17 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// container, with `discover_log_levels: false`. See `PROVENANCE.md`
 /// §"Issue #249" for the query strings, the push payload and the raw
 /// response bodies.
-const CAPTURED: usize = 1_417;
+///
+/// Issue #277 added `b21_variant_series_cap.test`, whose rows all sit
+/// under that file's `captured` default: every expectation was GENERATED
+/// from the pinned v3.7.4 container's own response bytes in a single
+/// session with `enable_multi_variant_queries: true`, never transcribed
+/// by hand.
+/// Its deliberate range divergence keeps the reference's captured
+/// behaviour beside it as a `# reference:` annotation rather than as a
+/// `divergence(...)` marker, because the row's own expectation is still a
+/// capture of the reference's values — only the skip DECISION is ours.
+const CAPTURED: usize = 1_427;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1923,6 +1933,7 @@ const DERIVED: usize = 31;
 /// ported reference order — the reference specifies none.
 const DIVERGENCE: usize = 30;
 const PORTED: usize = 30;
-/// Issue #249 grew this by `b25_structured_metadata.test`'s rows.
-const TOTAL: usize = 1_508;
+/// Issue #249 grew this by `b25_structured_metadata.test`'s rows, and
+/// issue #277 by `b21_variant_series_cap.test`'s.
+const TOTAL: usize = 1_518;
 // corpus-counts: end (provenance-corpus-constants)

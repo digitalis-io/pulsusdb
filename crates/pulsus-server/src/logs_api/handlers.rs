@@ -459,20 +459,26 @@ async fn run_query(
 ) -> Result<Response, ApiError> {
     let preserve_vector_order = preserve_vector_order(&query_params.spec, expr);
     if explain {
-        let (result, plan_explain) = engine.query_explained(expr, query_params).await?;
-        Ok(encode::query_response(
+        // Issue #277: `explain` lives INSIDE `data`, `warnings` outside
+        // it — the two are not siblings, so both must be threaded
+        // through and the encoder places each on its own side of
+        // `data`'s closing brace.
+        let (result, warnings, plan_explain) = engine.query_explained(expr, query_params).await?;
+        Ok(encode::query_response_warned(
             result,
             Some(plan_explain),
             at_ns,
             preserve_vector_order,
+            &warnings,
         ))
     } else {
-        let result = engine.query(expr, query_params).await?;
-        Ok(encode::query_response(
+        let (result, warnings) = engine.query(expr, query_params).await?;
+        Ok(encode::query_response_warned(
             result,
             None,
             at_ns,
             preserve_vector_order,
+            &warnings,
         ))
     }
 }

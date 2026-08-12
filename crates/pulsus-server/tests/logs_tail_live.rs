@@ -732,7 +732,11 @@ async fn tail_pages_and_range_query_deliver_identical_entry_sets() {
     };
 
     // (a) The ordinary query path.
-    let range_result = engine.query(&expr, &qp).await.expect("range query");
+    let (range_result, warnings) = engine.query(&expr, &qp).await.expect("range query");
+    assert!(
+        warnings.is_empty(),
+        "a log-stream query emits no warnings (issue #277)"
+    );
     let pulsus_read::QueryResult::Streams {
         items: range_streams,
         ..

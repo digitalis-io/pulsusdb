@@ -14,7 +14,7 @@ pub use logql::{
     LogStats, MatrixSeries, PatternSeries, PlanCtx, PlanExplain, QueryParams, QueryResult,
     QuerySpec, ReadError, RouteChoice, RoutingDecision, StreamResult, TAIL_REGISTRATION_GRACE_NS,
     TailCursor, TailLower, TailPage, TailSetup, TimeBounds, VectorSample, VolumeAggregateBy,
-    VolumeEntry, VolumeQuery,
+    VolumeEntry, VolumeQuery, Warnings,
 };
 pub use metrics::{
     CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, DiscoveryFilter,

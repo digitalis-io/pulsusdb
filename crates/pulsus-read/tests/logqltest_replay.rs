@@ -203,6 +203,11 @@ const CONFIG_DELTA_FILES: &[(&str, &str)] = &[
         "b25_structured_metadata.test",
         "discover_log_levels: false (NOT in ci/logql/config.yaml)",
     ),
+    // Issue #277: the per-variant series cap's skip-and-warn corpus.
+    (
+        "b21_variant_series_cap.test",
+        "enable_multi_variant_queries (in ci/logql/config.yaml)",
+    ),
 ];
 
 /// Sorts every corpus directive into replayable / not, by the rules in
@@ -753,7 +758,16 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// `detected_level` is itself structured metadata, so with level
 /// discovery on the answers — not merely a stripped label — change. So
 /// this figure moves and [`PROVENANCE_PERMITS`] does not.
-const TOTAL_DIRECTIVES: usize = 1_508;
+///
+/// Issue #277 adds `b21_variant_series_cap.test`, which is a CONFIG-DELTA
+/// file (`enable_multi_variant_queries`), so its captured `eval` rows
+/// enlarge the `config-delta file` exclusion. Its root-only `eval_fail`
+/// row carries PulsusDB's own error text and the classifier assigns each
+/// row a SINGLE reason, so it lands under `our-error-text` instead — the
+/// same split issue #397's `b13` section already has. This figure moves
+/// by the whole file; [`PROVENANCE_PERMITS`] and [`REACHABLE`] do not
+/// move at all.
+const TOTAL_DIRECTIVES: usize = 1_518;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
@@ -795,8 +809,8 @@ const REACHABLE: usize = 221;
 /// there. Its `eval_fail` row is counted under `config-delta file` and NOT
 /// under `our-error-text`, because the classifier assigns each row a
 /// single reason and no row lands in both buckets.
-const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=175, not a capture claim (derived)=29, \
-not a capture claim (ported)=27, our-error-text (eval_fail)=98, pinned-divergence=30";
+const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=184, not a capture claim (derived)=29, \
+not a capture claim (ported)=27, our-error-text (eval_fail)=99, pinned-divergence=30";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice

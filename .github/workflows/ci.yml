@@ -656,6 +656,33 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-logql --test logql_differential
 
+      # Issue #277: the `variants(...)` skip-and-warn leg. Spawns the real
+      # `pulsusdb` binary against this job's ClickHouse 26.3 on 19123,
+      # seeds a 501-group dataset into BOTH stores, and asserts at the
+      # HTTP surface that a breaching variant is skipped with a 200 and a
+      # `warnings` array rather than failing the query — plus that the
+      # top-level key sequence, the warnings array and the surviving
+      # `__variant__` set agree with the reference.
+      #
+      # It also pins the ONE place they disagree: a RANGE variant of
+      # exactly 500 series, which the reference drops (its
+      # `multiVariantVectorsToSeries` tests the length before the
+      # series-existence lookup its sibling guards with `!ok`) and
+      # PulsusDB serves. Both halves are asserted, so ledger entry (d)'s
+      # over-acceptance is measured on both sides rather than assumed.
+      #
+      # MUST STAY ABOVE "Stop LogQL differential oracle" — it needs the
+      # container that step removes. The suite's PulsusDB half is gated on
+      # PULSUS_TEST_CLICKHOUSE and its differential half additionally on
+      # PULSUSDB_LOGQL_DIFF_URL, so the hermetic `ci` job runs the same
+      # binary with both off and skips.
+      - name: LogQL differential leg (variants skip-and-warn, issue #277)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: ci/test-summary.sh run logs_variants_warnings_live -p pulsus-server --test logs_variants_warnings_live
+
       # Issue #392: the identifier rune set — general category `L`, plus
       # `Nd` in non-leading position, which is Go `text/scanner`'s default
       # `isIdentRune` and therefore the reference's rule

@@ -3079,7 +3079,13 @@ fn eval_node(
                     .client
                     .as_ref()
                     .expect("variants scan is client-aggregated");
-                run_variants_rows(rows, meta, &common.pipeline, variants)?
+                // Issue #277: no golden in this file breaches the
+                // per-variant series cap, so the accumulator stays empty
+                // and every expectation below is unchanged.
+                let mut warnings = pulsus_read::logql::Warnings::new();
+                let out = run_variants_rows(rows, meta, &common.pipeline, variants, &mut warnings)?;
+                assert!(warnings.is_empty(), "no golden here skips a variant");
+                out
             }
             // `label_replace(...)` (issue #276): the engine's exact
             // post-fetch transform.
