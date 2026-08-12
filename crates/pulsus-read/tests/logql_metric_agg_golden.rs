@@ -2843,7 +2843,7 @@ fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
     // closed interval would render `>=` and this assertion would fail.
     let sql = pulsus_read::logql::sql::metric_raw_samples(
         &mp.table,
-        &["checkout".to_string()],
+        &[pulsus_read::logql::predicate::literal("checkout")],
         &[1],
         pulsus_read::logql::sql::TimeWindow {
             start_ns: mp.start_ns,

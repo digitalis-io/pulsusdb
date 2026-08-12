@@ -1937,3 +1937,929 @@ const PORTED: usize = 30;
 /// issue #277 by `b21_variant_series_cap.test`'s.
 const TOTAL: usize = 1_518;
 // corpus-counts: end (provenance-corpus-constants)
+
+// ---------------------------------------------------------------------
+// Check G (issue #286) — the workspace `match(` render INVENTORY.
+// ---------------------------------------------------------------------
+
+/// Every `.rs` under `crates/*/src` (recursive) whose string literals spell
+/// a ClickHouse `match(` call, with its count. Committed verbatim; every
+/// other file must be `0`.
+///
+/// Pre-#286 this read `plan.rs 4`, `sql.rs 2` and no `predicate.rs`, for a
+/// total of 53 in 9 files. #286 moved the four LogQL production renderings
+/// into the leaf; `plan.rs`'s and `sql.rs`'s two each are now entirely in
+/// their own `mod tests` (one surviving pre-#286 expectation plus one
+/// `match(body, '(')` fixture proving `MetricShape`/`source_shape` refuse a
+/// foreign column pair).
+const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
+    ("pulsus-clickhouse/src/error.rs", 1),
+    ("pulsus-read/src/logql/exec.rs", 3),
+    ("pulsus-read/src/logql/plan.rs", 2),
+    ("pulsus-read/src/logql/predicate.rs", 8),
+    ("pulsus-read/src/logql/sql.rs", 2),
+    ("pulsus-read/src/metrics/dispatch.rs", 5),
+    ("pulsus-read/src/metrics/series_where.rs", 10),
+    ("pulsus-read/src/metrics/sql.rs", 14),
+    ("pulsus-read/src/traces/filter.rs", 12),
+    ("pulsus-read/src/traces/search_plan.rs", 2),
+];
+
+/// The separately-asserted total, so "a file appeared" reads differently
+/// from "a file grew".
+const MATCH_RENDER_TOTAL: usize = 59;
+
+/// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
+/// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
+///
+/// **File-level, not line-oriented, and that is load-bearing.** A
+/// line-oriented extractor loses `\`-continued multi-line SQL literals and
+/// measurably undercounts (`metrics/dispatch.rs` at 1 where the true figure
+/// is 5, `metrics/sql.rs` at 11 where it is 14).
+///
+/// Char literals are lexed and skipped, because `'"'` is a char literal and
+/// a scanner that treats its quote as a string opener swallows the code
+/// after it — measured: doing so reported a phantom hit in `pipeline.rs` and
+/// one in `template/eval.rs`, both from a Rust `match (a, b)` expression
+/// inside the phantom "literal". A lifetime (`'a`) has no closing quote and
+/// must not be lexed as a char.
+fn string_literal_contents(src: &str) -> Vec<String> {
+    let b: Vec<char> = src.chars().collect();
+    let n = b.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let c = b[i];
+        // `//` line comment
+        if c == '/' && i + 1 < n && b[i + 1] == '/' {
+            while i < n && b[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // `/* … */`, nesting
+        if c == '/' && i + 1 < n && b[i + 1] == '*' {
+            let mut depth = 1usize;
+            i += 2;
+            while i < n && depth > 0 {
+                if i + 1 < n && b[i] == '/' && b[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < n && b[i] == '*' && b[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // raw string: optional `b`, `r`, `#`*, `"`
+        let raw_at = if c == 'b' { i + 1 } else { i };
+        if raw_at < n
+            && b[raw_at] == 'r'
+            && (i == 0 || !(b[i - 1].is_alphanumeric() || b[i - 1] == '_'))
+        {
+            let mut k = raw_at + 1;
+            let hash_start = k;
+            while k < n && b[k] == '#' {
+                k += 1;
+            }
+            if k < n && b[k] == '"' {
+                let hashes = k - hash_start;
+                let start = k + 1;
+                let mut j = start;
+                let end = loop {
+                    if j >= n {
+                        break n;
+                    }
+                    if b[j] == '"' && (j + 1..=j + hashes).all(|h| h < n && b[h] == '#') {
+                        break j;
+                    }
+                    j += 1;
+                };
+                out.push(b[start..end.min(n)].iter().collect());
+                i = end + 1 + hashes;
+                continue;
+            }
+        }
+        // char / byte-char literal
+        let ch_at = if c == 'b' && i + 1 < n && b[i + 1] == '\'' {
+            i + 1
+        } else if c == '\'' {
+            i
+        } else {
+            usize::MAX
+        };
+        if ch_at != usize::MAX {
+            let j = ch_at + 1;
+            if j < n && b[j] == '\\' {
+                let mut k = j + 2;
+                while k < n && b[k] != '\'' {
+                    k += 1;
+                }
+                if k < n {
+                    i = k + 1;
+                    continue;
+                }
+            } else if j + 1 < n && b[j + 1] == '\'' {
+                i = j + 2;
+                continue;
+            }
+            // a lifetime — consume just the quote
+            i += 1;
+            continue;
+        }
+        // ordinary / byte string
+        let str_at = if c == 'b' && i + 1 < n && b[i + 1] == '"' {
+            i + 1
+        } else if c == '"' {
+            i
+        } else {
+            usize::MAX
+        };
+        if str_at != usize::MAX {
+            let mut j = str_at + 1;
+            let mut buf = String::new();
+            while j < n {
+                if b[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if b[j] == '"' {
+                    break;
+                }
+                buf.push(b[j]);
+                j += 1;
+            }
+            out.push(buf);
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `(?<![A-Za-z0-9_])match\s*\(` over one literal's content — whitespace
+/// normalised, so `match (` counts and `is_match(` does not.
+fn count_match_renders(text: &str) -> usize {
+    let b: Vec<char> = text.chars().collect();
+    let mut total = 0usize;
+    let mut i = 0usize;
+    while i + 5 <= b.len() {
+        if b[i..i + 5].iter().collect::<String>() == "match" {
+            let preceded = i > 0 && (b[i - 1].is_alphanumeric() || b[i - 1] == '_');
+            if !preceded {
+                let mut j = i + 5;
+                while j < b.len() && b[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == '(' {
+                    total += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    total
+}
+
+fn workspace_src_files() -> Vec<(String, String)> {
+    let crates_dir = manifest_path("..");
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut crates: Vec<PathBuf> = std::fs::read_dir(&crates_dir)
+        .expect("crates dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.is_dir())
+        .collect();
+    crates.sort();
+    for c in crates {
+        let src = c.join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .expect("src dir")
+                .map(|e| e.expect("entry").path())
+                .collect();
+            entries.sort();
+            for p in entries {
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let rel = p
+                        .strip_prefix(&crates_dir)
+                        .expect("under crates/")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, std::fs::read_to_string(&p).expect("read")));
+                }
+            }
+        }
+    }
+    out.sort();
+    assert!(out.len() > 100, "workspace source walk found {}", out.len());
+    out
+}
+
+/// **This is a location INVENTORY and drift detector, NOT a gate.** It
+/// records where `match(` text is rendered today. It cannot establish
+/// provenance: a lexical scan cannot see `format!("mat{}(", "ch")`, a
+/// spelling produced by macro expansion, or a fragment assembled from
+/// adjacent pieces. **The sealing mechanism is `CheckedFragment`'s type, not
+/// this census.** A new `match(` renderer failing this check is a review
+/// event, not a proof of anything; a new renderer that evades it is not
+/// thereby validated.
+///
+/// It also spans the two sibling languages, whose position is a MEASUREMENT
+/// with no mechanism behind it: TraceQL's renderings all route through
+/// `anchored_regex_sql` → `ch_regex_anchored_checked` and PromQL's sit
+/// inside #315's sealed leaf, but `ch_string` is `pub` and nothing keeps
+/// that true. This check detects the drift for spellings it can see.
+#[test]
+fn check_g_match_render_inventory() {
+    let pinned: BTreeMap<&str, usize> = MATCH_RENDER_INVENTORY.iter().copied().collect();
+    assert_eq!(
+        pinned.len(),
+        MATCH_RENDER_INVENTORY.len(),
+        "MATCH_RENDER_INVENTORY has a duplicate file"
+    );
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    for (rel, src) in workspace_src_files() {
+        let n: usize = string_literal_contents(&src)
+            .iter()
+            .map(|l| count_match_renders(l))
+            .sum();
+        if n > 0 {
+            found.insert(rel, n);
+        }
+    }
+    let found_pairs: Vec<(&str, usize)> = found.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    assert_eq!(
+        found_pairs, MATCH_RENDER_INVENTORY,
+        "the `match(` render inventory drifted. This is an INVENTORY, not a gate: a new \
+         renderer here is a review event, and one that evades this scan is not thereby \
+         validated. Re-derive and commit the table."
+    );
+    let total: usize = found.values().sum();
+    assert_eq!(
+        total, MATCH_RENDER_TOTAL,
+        "the `match(` render inventory TOTAL drifted (asserted separately from the per-file \
+         map, so 'a file appeared' reads differently from 'a file grew')"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Check H (issue #286) — `predicate.rs`'s construction surface.
+// ---------------------------------------------------------------------
+
+/// `predicate.rs`'s full path-qualified skeleton, committed verbatim. A diff
+/// to this array is the review event.
+///
+/// Every declaration that can name the private `sql` field is here, at every
+/// brace depth — impl members, struct fields, attributes and items declared
+/// inside function bodies included. A top-level-only census could not see a
+/// mint added to an existing `impl` block, which is exactly where a future
+/// contributor would reach first (issue #286 review round 1).
+const PREDICATE_ITEMS: &[&str] = &[
+    "use pulsus_logql::{LineFilter, LineFilterOp}",
+    "use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string}",
+    "use super::pipeline::PipelineError",
+    "const UUID_RE: &str = r_",
+    "#[derive(Debug, Clone, PartialEq, Eq)]",
+    "pub struct CheckedFragment",
+    "pub struct CheckedFragment :: sql: String,",
+    "impl CheckedFragment",
+    "impl CheckedFragment :: pub fn as_sql(&self) -> &str",
+    "#[derive(Debug, Clone, PartialEq, Eq)]",
+    "pub struct CheckedLiteral",
+    "pub struct CheckedLiteral :: sql: String,",
+    "impl CheckedLiteral",
+    "impl CheckedLiteral :: pub fn as_sql(&self) -> &str",
+    "#[derive(Debug, Clone, PartialEq, Eq)]",
+    "pub struct MonthLiteral",
+    "pub struct MonthLiteral :: sql: String,",
+    "impl MonthLiteral",
+    "impl MonthLiteral :: pub fn as_sql(&self) -> &str",
+    "pub fn literal(value: &str) -> CheckedLiteral",
+    "pub fn month_literal(year: i64, month: u32) -> MonthLiteral",
+    "pub fn index_positive_branch(key: &str, eq_value: Option<&str>, anchored_regexes: &[String]) -> Result<CheckedFragment, PipelineError>",
+    "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
+    "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
+    "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
+    "pub(super) fn non_id_values_expr() -> CheckedFragment",
+    "fn tokenize(literal: &str) -> Vec<String>",
+    "const REGEX_METACHARS: &[char] = &[ '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\\\', ]",
+    "fn is_plain_literal(pattern: &str) -> bool",
+    "fn contains_predicate(phrase: &str) -> String",
+    "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
+    "#[cfg(test)]",
+    "mod tests",
+    "mod tests :: use super::*",
+    "mod tests :: fn regex_filter(value: &str) -> LineFilter",
+    "mod tests :: #[test]",
+    "mod tests :: fn tokenize_splits_on_non_alphanumeric_boundaries()",
+    "mod tests :: #[test]",
+    "mod tests :: fn is_plain_literal_rejects_regex_metacharacters()",
+    "mod tests :: #[test]",
+    "mod tests :: fn an_uncompilable_pattern_is_refused_at_the_line_filter_mint()",
+    "mod tests :: #[test]",
+    "mod tests :: fn an_uncompilable_pattern_is_refused_at_the_index_regex_mints()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_literal_mint_is_exactly_the_escaper()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_month_mint_renders_the_committed_date_literal_shape()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_newtypes_are_the_size_and_alignment_of_the_string_they_wrap()",
+    "mod tests :: fn the_newtypes_are_the_size_and_alignment_of_the_string_they_wrap() :: use std::mem::{align_of, size_of}",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_positive_branch_renders_key_then_value_then_regexes_in_order()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_negative_branches_render_the_committed_shapes()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_non_id_values_aggregate_takes_no_caller_input()",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_regex_line_filter_pairs_the_token_prefilter_with_the_exact_predicate()",
+];
+
+/// The number of MINT-shaped entries: an `fn` whose OWN signature (the last
+/// path segment) names `CheckedFragment`, `CheckedLiteral` or `MonthLiteral`,
+/// or names `Self` while its path names one of them.
+///
+/// Judging the own segment rather than the qualified string matters:
+/// `impl CheckedFragment :: pub fn as_sql(&self) -> &str` must NOT count (it
+/// is the unwrap point, not a mint), and `-> Self` inside the impl must.
+const MINT_COUNT: usize = 7;
+
+/// Attributes permitted anywhere in `predicate.rs`.
+const PREDICATE_ATTRIBUTES: &[&str] = &[
+    "#[derive(Debug, Clone, PartialEq, Eq)]",
+    "#[cfg(test)]",
+    "#[test]",
+];
+
+/// The `impl` headers permitted, in order.
+const PREDICATE_IMPLS: &[&str] = &[
+    "impl CheckedFragment",
+    "impl CheckedLiteral",
+    "impl MonthLiteral",
+];
+
+const NEWTYPES: &[&str] = &["CheckedFragment", "CheckedLiteral", "MonthLiteral"];
+
+const ITEM_KEYWORDS: &[&str] = &[
+    "use",
+    "fn",
+    "mod",
+    "struct",
+    "enum",
+    "trait",
+    "impl",
+    "type",
+    "const",
+    "static",
+    "union",
+    "extern",
+    "macro_rules!",
+];
+
+/// One skeleton entry: the `" :: "`-joined path from the enclosing emitted
+/// items, and the kind of its own last segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkeletonEntry {
+    path: String,
+    own: String,
+    kind: &'static str,
+}
+
+fn strip_item_modifiers(mut head: &str) -> &str {
+    loop {
+        if let Some(rest) = head.strip_prefix("pub(") {
+            head = rest
+                .split_once(')')
+                .map(|(_, r)| r.trim_start())
+                .unwrap_or("");
+        } else if let Some(rest) = head.strip_prefix("pub ") {
+            head = rest.trim_start();
+        } else if let Some(rest) = head.strip_prefix("unsafe ") {
+            head = rest.trim_start();
+        } else if let Some(rest) = head.strip_prefix("async ") {
+            head = rest.trim_start();
+        } else if let Some(rest) = head.strip_prefix("default ") {
+            head = rest.trim_start();
+        } else {
+            return head;
+        }
+    }
+}
+
+fn item_kind(head: &str) -> Option<&'static str> {
+    for kw in ITEM_KEYWORDS {
+        if *kw == "macro_rules!" {
+            if head.starts_with("macro_rules!") {
+                return Some("macro_rules!");
+            }
+            continue;
+        }
+        if head == *kw
+            || head.starts_with(&format!("{kw} "))
+            || head.starts_with(&format!("{kw}<"))
+            || head.starts_with(&format!("{kw}!"))
+        {
+            return Some(kw);
+        }
+    }
+    None
+}
+
+fn normalize_signature(sig: &str) -> String {
+    let n = sig.trim_end_matches(['{', ';']).trim().to_string();
+    let n = n.split_whitespace().collect::<Vec<_>>().join(" ");
+    n.replace("( ", "(").replace(", )", ")").replace(" )", ")")
+}
+
+/// The skeleton census's scanner. Its domain, stated where the claim is:
+///
+/// > Over the comment/string-blanked text, at **every** brace depth, one
+/// > normalized, path-qualified entry for (a) every line whose leading token
+/// > — after stripping `pub`/`pub(...)`/`unsafe`/`async`/`default` — is an
+/// > item keyword; (b) every attribute line; (c) every line inside a
+/// > `struct`/`enum`/`union` body. Function bodies are NOT skipped: an item
+/// > declared inside one is still emitted, because `fn f() { impl X { … } }`
+/// > is legal Rust and adds a publicly callable method.
+///
+/// **Residual 1 — a sibling macro invoked here.** The census bans
+/// `macro_rules!` and `include!` *declared in this file*. It does **not**
+/// cover `foo!()`, an invocation of a macro defined elsewhere that expands to
+/// a mint inside this module: Rust's privacy is per-module and a macro
+/// invoked here expands here, so the expansion reaches the private field.
+/// **Compiled and confirmed** (issue #286 plan review round 2). This is a
+/// known limit of a text census, not an oversight, and it is the same
+/// residual `metrics/series_where.rs:34-42` records from #315's round 9.
+/// `check_h_self_test_detects_every_known_bypass_shape` holds that shape as a
+/// fixture and asserts it is NOT caught, so the blind spot cannot quietly
+/// change.
+///
+/// **Residual 2.** A mint whose signature spells none of the three newtype
+/// names and no `Self` still fails the TABLE (the entry is new) but not the
+/// count, so only the table half is load-bearing for that shape.
+///
+/// **Residual 3.** This is line/brace-oriented, not a Rust parser. A
+/// signature it mis-joins produces a mismatch — a loud failure, never a
+/// silent pass. `blank_comments_and_strings` already asserts on an
+/// unterminated `/*`.
+fn predicate_skeleton(file: &str, src: &str) -> Vec<SkeletonEntry> {
+    let blanked = blank_comments_and_strings(file, src);
+    let mut out: Vec<SkeletonEntry> = Vec::new();
+    // (depth after the item's body opened, normalized signature, is a
+    // field-bearing body)
+    let mut open: Vec<(i64, String, bool)> = Vec::new();
+    let mut depth: i64 = 0;
+    // (scope depth, accumulated signature)
+    let mut pending: Option<(i64, String)> = None;
+
+    for raw in blanked.lines() {
+        let t = raw.trim();
+        let depth_before = depth;
+        for c in raw.chars() {
+            match c {
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        let path_of = |open: &[(i64, String, bool)]| -> String {
+            open.iter()
+                .map(|(_, s, _)| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" :: ")
+        };
+
+        if let Some((scope, sig)) = &mut pending {
+            if !sig.is_empty() {
+                sig.push(' ');
+            }
+            sig.push_str(t);
+            let done =
+                t.ends_with('{') || t.ends_with(';') || (t.ends_with('}') && depth == *scope);
+            if done {
+                let scope = *scope;
+                let own = normalize_signature(sig);
+                let head = strip_item_modifiers(&own);
+                let kind = item_kind(head).unwrap_or("other");
+                out.push(SkeletonEntry {
+                    path: path_of(&open),
+                    own: own.clone(),
+                    kind,
+                });
+                if t.ends_with('{') && depth == scope + 1 {
+                    let fielded = matches!(kind, "struct" | "enum" | "union");
+                    open.push((depth, own, fielded));
+                }
+                pending = None;
+            }
+        } else if !t.is_empty() && !t.starts_with('}') && !t.starts_with(')') {
+            let inside_fielded = open.last().is_some_and(|(_, _, f)| *f);
+            if inside_fielded {
+                out.push(SkeletonEntry {
+                    path: path_of(&open),
+                    own: normalize_signature(t),
+                    kind: "field",
+                });
+            } else if t.starts_with("#[") || t.starts_with("#![") {
+                out.push(SkeletonEntry {
+                    path: path_of(&open),
+                    own: normalize_signature(t),
+                    kind: "attr",
+                });
+            } else if item_kind(strip_item_modifiers(t)).is_some() {
+                pending = Some((depth_before, String::new()));
+                // re-run the accumulation for THIS line
+                if let Some((scope, sig)) = &mut pending {
+                    sig.push_str(t);
+                    let done = t.ends_with('{')
+                        || t.ends_with(';')
+                        || (t.ends_with('}') && depth == *scope);
+                    if done {
+                        let scope = *scope;
+                        let own = normalize_signature(sig);
+                        let head = strip_item_modifiers(&own);
+                        let kind = item_kind(head).unwrap_or("other");
+                        out.push(SkeletonEntry {
+                            path: path_of(&open),
+                            own: own.clone(),
+                            kind,
+                        });
+                        if t.ends_with('{') && depth == scope + 1 {
+                            let fielded = matches!(kind, "struct" | "enum" | "union");
+                            open.push((depth, own, fielded));
+                        }
+                        pending = None;
+                    }
+                }
+            }
+        }
+
+        while open.last().is_some_and(|(d, _, _)| *d > depth) {
+            open.pop();
+        }
+    }
+    out
+}
+
+fn skeleton_lines(entries: &[SkeletonEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|e| {
+            if e.path.is_empty() {
+                e.own.clone()
+            } else {
+                format!("{} :: {}", e.path, e.own)
+            }
+        })
+        .collect()
+}
+
+/// The mint-shape predicate of `MINT_COUNT`'s doc, applied to one entry.
+fn is_mint(e: &SkeletonEntry) -> bool {
+    if e.kind != "fn" {
+        return false;
+    }
+    if NEWTYPES.iter().any(|t| e.own.contains(t)) {
+        return true;
+    }
+    e.own.contains("Self") && NEWTYPES.iter().any(|t| e.path.contains(t))
+}
+
+fn mint_count(entries: &[SkeletonEntry]) -> usize {
+    entries.iter().filter(|e| is_mint(e)).count()
+}
+
+#[test]
+fn check_h_predicate_rs_surface_is_allowlisted() {
+    let file = "predicate.rs";
+    let text = read("src/logql/predicate.rs");
+    let mut errors = String::new();
+
+    // (c) forbidden constructs, as delimited tokens over the blanked text.
+    let blanked = blank_comments_and_strings(file, &text);
+    for (i, line) in blanked.lines().enumerate() {
+        for token in ["macro_rules!", "include!"] {
+            if line.contains(token) {
+                let _ = writeln!(errors, "H {file}:{}: `{token}` is forbidden here", i + 1);
+            }
+        }
+        let head = strip_item_modifiers(line.trim());
+        for kw in ["extern", "trait", "union"] {
+            if head == kw || head.starts_with(&format!("{kw} ")) {
+                let _ = writeln!(errors, "H {file}:{}: `{kw}` is forbidden here", i + 1);
+            }
+        }
+        if line
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|w| w == "unsafe")
+        {
+            let _ = writeln!(
+                errors,
+                "H {file}:{}: `unsafe` is forbidden here — privacy is not checked by \
+                 unsafe conversions",
+                i + 1
+            );
+        }
+    }
+
+    let entries = predicate_skeleton(file, &text);
+
+    // (d) attribute allowlist.
+    for e in entries.iter().filter(|e| e.kind == "attr") {
+        assert!(
+            PREDICATE_ATTRIBUTES.contains(&e.own.as_str()),
+            "H {file}: attribute {:?} is not on PREDICATE_ATTRIBUTES",
+            e.own
+        );
+    }
+
+    // (e) exactly three impl blocks, headers exact.
+    let impls: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.kind == "impl")
+        .map(|e| e.own.as_str())
+        .collect();
+    assert_eq!(
+        impls, PREDICATE_IMPLS,
+        "H {file}: the permitted `impl` blocks are exactly PREDICATE_IMPLS"
+    );
+
+    // (b) the mint-shaped count.
+    let mints = mint_count(&entries);
+    if mints != MINT_COUNT {
+        let named: Vec<&str> = entries
+            .iter()
+            .filter(|e| is_mint(e))
+            .map(|e| e.own.as_str())
+            .collect();
+        let _ = writeln!(
+            errors,
+            "H {file}: {mints} mint-shaped items, pinned {MINT_COUNT} — found {named:?}"
+        );
+    }
+
+    // (a) the table, both directions.
+    let found = skeleton_lines(&entries);
+    let pinned: Vec<String> = PREDICATE_ITEMS.iter().map(|s| s.to_string()).collect();
+    if found != pinned {
+        let _ = writeln!(
+            errors,
+            "H {file}: the path-qualified skeleton does not match PREDICATE_ITEMS.\n  \
+             found:\n    {}\n  pinned:\n    {}",
+            found.join("\n    "),
+            pinned.join("\n    ")
+        );
+    }
+
+    assert!(errors.is_empty(), "{errors}");
+}
+
+// ---------------------------------------------------------------------
+// Check H self-test (issue #286 AC4b/AC23/AC26) — the finder is validated
+// in CI, not in scratch.
+// ---------------------------------------------------------------------
+
+/// A miniature of `predicate.rs`'s shape: three sealed newtypes, one impl
+/// each, one mint per type plus one more. Every mutation below is this
+/// source plus one edit.
+const FIXTURE_BASELINE: &str = r#"
+use super::escape::ch_string;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedFragment {
+    sql: String,
+}
+
+impl CheckedFragment {
+    pub fn as_sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedLiteral {
+    sql: String,
+}
+
+impl CheckedLiteral {
+    pub fn as_sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonthLiteral {
+    sql: String,
+}
+
+impl MonthLiteral {
+    pub fn as_sql(&self) -> &str {
+        &self.sql
+    }
+}
+
+pub fn literal(value: &str) -> CheckedLiteral {
+    CheckedLiteral { sql: ch_string(value) }
+}
+
+pub fn month_literal(year: i64, month: u32) -> MonthLiteral {
+    MonthLiteral { sql: format!("x") }
+}
+
+pub fn line_filter(v: &str) -> CheckedFragment {
+    CheckedFragment { sql: v.to_string() }
+}
+"#;
+
+/// Which pin a mutation must trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    /// The path-qualified table only.
+    Table,
+    /// The table AND the mint-shaped count.
+    TableAndMintCount,
+    /// NEITHER — a disclosed blind spot, pinned so it cannot quietly change.
+    NotDetected,
+}
+
+/// The bypass shapes, each as a whole source plus the pin it must trip.
+///
+/// M1–M3 and M6 are the four a top-level-only census misses (issue #286
+/// review round 1 compiled M1 and confirmed a depth-0 scan stays green);
+/// M7/M8 are the same shape on the two later newtypes; M9 is the disclosed
+/// residual.
+fn bypass_fixtures() -> Vec<(&'static str, String, Signal)> {
+    let b = FIXTURE_BASELINE;
+    vec![
+        (
+            "M1 — `from_unchecked_sql` added inside the permitted `impl CheckedFragment`",
+            b.replacen(
+                "impl CheckedFragment {\n    pub fn as_sql(&self) -> &str {\n        &self.sql\n    }\n}",
+                "impl CheckedFragment {\n    pub fn as_sql(&self) -> &str {\n        &self.sql\n    }\n\n    pub fn from_unchecked_sql(sql: String) -> Self {\n        Self { sql }\n    }\n}",
+                1,
+            ),
+            Signal::TableAndMintCount,
+        ),
+        (
+            "M2 — the sealed field made `pub`",
+            b.replacen(
+                "pub struct CheckedFragment {\n    sql: String,\n}",
+                "pub struct CheckedFragment {\n    pub sql: String,\n}",
+                1,
+            ),
+            Signal::Table,
+        ),
+        (
+            "M3 — `Default` added to the derive",
+            b.replacen(
+                "#[derive(Debug, Clone, PartialEq, Eq)]\npub struct CheckedFragment {",
+                "#[derive(Debug, Clone, PartialEq, Eq, Default)]\npub struct CheckedFragment {",
+                1,
+            ),
+            Signal::Table,
+        ),
+        (
+            "M4 — a nested `pub mod` minting from inside the leaf",
+            format!(
+                "{b}\npub mod escape_hatch {{\n    use super::CheckedFragment;\n    pub fn mint(sql: String) -> CheckedFragment {{\n        CheckedFragment {{ sql }}\n    }}\n}}\n"
+            ),
+            Signal::TableAndMintCount,
+        ),
+        (
+            "M5 — `impl From<String> for CheckedFragment`",
+            format!(
+                "{b}\nimpl From<String> for CheckedFragment {{\n    fn from(sql: String) -> Self {{\n        Self {{ sql }}\n    }}\n}}\n"
+            ),
+            Signal::TableAndMintCount,
+        ),
+        (
+            // Inside an EXISTING function, deliberately: a mutation that
+            // also adds a new top-level `fn` would be caught at depth 0 for
+            // the wrong reason, and the point of this row is that it is not.
+            "M6 — an `impl CheckedFragment` block nested inside an existing function body",
+            b.replacen(
+                "pub fn line_filter(v: &str) -> CheckedFragment {\n    CheckedFragment { sql: v.to_string() }\n}",
+                "pub fn line_filter(v: &str) -> CheckedFragment {\n    impl CheckedFragment {\n        pub fn forge(sql: String) -> Self {\n            Self { sql }\n        }\n    }\n    CheckedFragment { sql: v.to_string() }\n}",
+                1,
+            ),
+            Signal::TableAndMintCount,
+        ),
+        (
+            "M7 — `from_unchecked_literal` added inside `impl CheckedLiteral` (AC23)",
+            b.replacen(
+                "impl CheckedLiteral {\n    pub fn as_sql(&self) -> &str {\n        &self.sql\n    }\n}",
+                "impl CheckedLiteral {\n    pub fn as_sql(&self) -> &str {\n        &self.sql\n    }\n\n    pub fn from_unchecked_literal(sql: String) -> Self {\n        Self { sql }\n    }\n}",
+                1,
+            ),
+            Signal::TableAndMintCount,
+        ),
+        (
+            "M8 — `from_unchecked_month` added inside `impl MonthLiteral` (AC26)",
+            b.replacen(
+                "impl MonthLiteral {\n    pub fn as_sql(&self) -> &str {\n        &self.sql\n    }\n}",
+                "impl MonthLiteral {\n    pub fn as_sql(&self) -> &str {\n        &self.sql\n    }\n\n    pub fn from_unchecked_month(sql: String) -> Self {\n        Self { sql }\n    }\n}",
+                1,
+            ),
+            Signal::TableAndMintCount,
+        ),
+        (
+            "M9 — a SIBLING macro invoked here, expanding to a mint (Residual 1, \
+             DISCLOSED as not detected)",
+            format!("{b}\nsuper::forge_mint!(CheckedFragment);\n"),
+            Signal::NotDetected,
+        ),
+    ]
+}
+
+/// The pre-#286 census shape: top-level items only, exactly what check D's
+/// scanner does for `escape.rs`. Kept HERE, in the test that replays the
+/// mutations, so the "v1 would have passed" half is a committed measurement
+/// rather than a claim in an issue comment.
+fn top_level_only(entries: &[SkeletonEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.path.is_empty() && e.kind != "attr" && e.kind != "field")
+        .map(|e| e.own.clone())
+        .collect()
+}
+
+/// **[[validate-the-finder]]**: replay the finder against sources where the
+/// defect still exists, in CI, forever. A census whose blind spots were
+/// measured once, in scratch, decays the moment someone edits it.
+///
+/// Deleting the impl-descent from [`predicate_skeleton`] makes M1, M2, M3,
+/// M6, M7 and M8 equal their baseline and this test fails.
+#[test]
+fn check_h_self_test_detects_every_known_bypass_shape() {
+    let base = predicate_skeleton("fixture", FIXTURE_BASELINE);
+    let base_table = skeleton_lines(&base);
+    let base_mints = mint_count(&base);
+    assert_eq!(
+        base_mints, 3,
+        "the fixture baseline has three mints (literal, month_literal, line_filter)"
+    );
+    let base_top = top_level_only(&base);
+
+    let mut top_level_missed = 0usize;
+    for (name, src, signal) in bypass_fixtures() {
+        let got = predicate_skeleton("fixture", &src);
+        let table = skeleton_lines(&got);
+        let mints = mint_count(&got);
+        match signal {
+            Signal::Table => {
+                assert_ne!(table, base_table, "{name}: the TABLE must reject it");
+                assert_eq!(
+                    mints, base_mints,
+                    "{name}: the mint count is not the signal"
+                );
+            }
+            Signal::TableAndMintCount => {
+                assert_ne!(table, base_table, "{name}: the TABLE must reject it");
+                assert_eq!(
+                    mints,
+                    base_mints + 1,
+                    "{name}: the MINT COUNT must reject it too"
+                );
+            }
+            Signal::NotDetected => {
+                // Residual 1, and it is pinned rather than tolerated: the
+                // scanner reads the invocation line, never the expansion.
+                // The invocation itself IS a new line, so the table sees a
+                // change only if the line parses as an item — it does not.
+                assert_eq!(
+                    table, base_table,
+                    "{name}: this residual is DISCLOSED as undetected. If the census has \
+                     grown to catch it, that is good news — update the fixture's expected \
+                     signal and the residual note in `predicate.rs`'s module doc and check \
+                     H's doc, so the claim and its limit stay in step."
+                );
+                assert_eq!(
+                    mints, base_mints,
+                    "{name}: the mint count cannot see it either"
+                );
+            }
+        }
+        // The pre-#286 half: how many of these a depth-0 census misses.
+        if top_level_only(&got) == base_top {
+            top_level_missed += 1;
+        }
+    }
+
+    // Committed measurement, not prose: a top-level-only census misses M1,
+    // M2, M3, M6, M7 and M8 — plus M9, which nothing here catches — and
+    // sees only M4 (a new top-level `mod`) and M5 (a new top-level `impl`).
+    assert_eq!(
+        top_level_missed, 7,
+        "a depth-0 census misses seven of the nine shapes; the skeleton census misses only \
+         the disclosed sibling-macro residual"
+    );
+}

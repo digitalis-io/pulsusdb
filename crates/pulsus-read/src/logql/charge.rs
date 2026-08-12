@@ -2311,6 +2311,8 @@ mod tests {
             // Issue #406: the instant-vector wire-order predicate.
             ("order.rs", include_str!("order.rs")),
             ("post_agg.rs", include_str!("post_agg.rs")),
+            // Issue #286: the checked-fragment/literal leaf.
+            ("predicate.rs", include_str!("predicate.rs")),
             ("variants.rs", include_str!("variants.rs")),
             ("walkbound.rs", include_str!("walkbound.rs")),
             // Issue #277: the per-query response-warning accumulator.

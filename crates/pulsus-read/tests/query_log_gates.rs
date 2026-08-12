@@ -39,6 +39,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_logql::parse;
+use pulsus_read::logql::predicate::{literal, month_literal};
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 use pulsus_read::{EngineConfig, LogQlEngine, QueryResult, ReadError};
@@ -492,7 +493,7 @@ async fn stage3_narrow_window_read_rows_are_index_confined_not_a_full_scan() {
     let sp = streams_plan(&format!(r#"{{service_name="{SERVICE}"}}"#), &params, db);
     let sql = sql::stage3(
         &format!("{db}.log_samples"),
-        &[format!("'{SERVICE}'")],
+        &[literal(SERVICE)],
         &[FP_CORPUS],
         TimeWindow {
             start_ns: sp.start_ns,
@@ -552,7 +553,7 @@ async fn body_search_skip_index_prunes_most_granules() {
     );
     let sql = sql::stage3(
         &format!("{db}.log_samples"),
-        &[format!("'{SERVICE}'")],
+        &[literal(SERVICE)],
         &[FP_CORPUS],
         TimeWindow {
             start_ns: sp.start_ns,
@@ -1201,6 +1202,12 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
     // otherwise every case returns zero rows and the fan-in identity
     // below becomes vacuously true. The window per case is the month
     // itself, keeping the #261 property exactly as it was measured.
+    // Issue #286: `sql::detected_labels` takes `MonthLiteral`s, whose only
+    // mint takes integers — so the `'YYYY-MM-01'` case labels are split back
+    // into `(year, month)` here rather than passed as text.
+    let month_year = |month: &str| -> i64 { month.trim_matches('\'')[0..4].parse().expect("year") };
+    let month_month =
+        |month: &str| -> u32 { month.trim_matches('\'')[5..7].parse().expect("month") };
     let month_window = |month: &str| -> (i64, i64) {
         // `'YYYY-MM-01'` (quoted) → the month's [start, start + 28d] in ns.
         let date = month.trim_matches('\'');
@@ -1271,7 +1278,7 @@ async fn detected_labels_fan_in_is_one_row_per_key_at_any_cardinality() {
         let (start_ns, end_ns) = month_window(month);
         let sql = sql::detected_labels(
             &format!("{db}.log_streams_idx"),
-            &[month.to_string()],
+            &[month_literal(month_year(month), month_month(month))],
             None,
             &format!("{db}.log_metrics_5s"),
             sql::TimeWindow { start_ns, end_ns },

@@ -24,6 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use pulsus_read::logql::predicate::month_literal;
 use pulsus_read::logql::sql;
 
 /// The `/detected_labels` capture. Deliberately a NEW artifact rather
@@ -766,7 +767,7 @@ fn the_detected_labels_aggregate_is_still_an_exact_count() {
     for fingerprints in [None, Some(&[7u64, 9][..])] {
         let rendered = sql::detected_labels(
             "log_streams_idx",
-            &["'2026-08-01'".to_string()],
+            &[month_literal(2026, 8)],
             fingerprints,
             "log_metrics_5s",
             sql::TimeWindow {

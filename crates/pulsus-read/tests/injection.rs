@@ -8,6 +8,7 @@
 use pulsus_logql::{LineFilter, LineFilterOp, MatchOp, Matcher, StreamSelector};
 use pulsus_read::logql::escape::{ch_ident, ch_string};
 use pulsus_read::logql::plan;
+use pulsus_read::logql::predicate::{CheckedFragment, literal};
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec};
 
@@ -174,7 +175,11 @@ fn a_line_filter_payload_stays_inside_one_literal_in_the_exact_predicate() {
     })];
     let clauses = compile_line_filters(&filters);
     assert_eq!(clauses.len(), 1);
-    assert!(clauses[0].contains(&format!("position(body, {})", ch_string(PAYLOAD_PAREN))));
+    assert!(
+        clauses[0]
+            .as_sql()
+            .contains(&format!("position(body, {})", ch_string(PAYLOAD_PAREN)))
+    );
     assert_no_unescaped_quote_or_backslash(&ch_string(PAYLOAD_PAREN));
 }
 
@@ -227,7 +232,7 @@ fn stage3_with_an_injection_payload_in_the_line_filter_keeps_the_statement_well_
     let clauses = compile_line_filters(&filters);
     let sql = sql::stage3(
         "log_samples",
-        &["'checkout'".to_string()],
+        &[literal("checkout")],
         &[1],
         TimeWindow {
             start_ns: START_NS,
@@ -256,7 +261,7 @@ fn plan_streams(selector: StreamSelector) -> pulsus_read::logql::StreamsPlan {
     }
 }
 
-fn compile_line_filters(pipeline: &[pulsus_logql::Stage]) -> Vec<String> {
+fn compile_line_filters(pipeline: &[pulsus_logql::Stage]) -> Vec<CheckedFragment> {
     let selector = StreamSelector {
         matchers: vec![Matcher {
             name: "service_name".to_string(),
