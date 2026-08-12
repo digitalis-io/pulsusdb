@@ -17,6 +17,15 @@
 //! could refuse first, or the client is told the wrong thing about their
 //! own request. §5.6 carries the (P)/(A) classifying test that makes the
 //! second one applicable rather than aspirational.
+//!
+//! **Units (issue #312).** Every cap here is denominated in RETAINED
+//! bytes — the heap a structure occupies, priced through
+//! [`alloc_block_bytes`] — while the guarantee a streams client can
+//! observe reaches them as WIRE bytes (`stats.bytes`), and the ratio is
+//! about two because [`alloc_block_bytes`] doubles, so
+//! [`MAX_STREAMS_RESULT_BYTES`] = 1 GiB retained is a ~512 MiB wire
+//! ceiling and issue #312's "response bytes" wording and this constant
+//! are both correct in their own units.
 
 use super::error::{ReadError, TooBroadReason};
 use pulsus_logql::RangeAggOp;
@@ -919,24 +928,26 @@ const _: () = assert!(
 /// path, #285 for the chain); post-aggregation selection/grouping keys
 /// are charged, but against [`super::post_agg::MAX_POST_AGG_BYTES`]
 /// rather than into this sum (`post_agg.rs:3120-3163`), so they are
-/// outside this bound by SCOPE, not uncharged; a streams response
-/// accumulates one
-/// row's template output per entry across up to the entries limit
-/// (#312); and process RSS is still `N ×` this under concurrency, which
-/// #245's closure ruled an operational concern rather than a per-query
-/// bound.
+/// outside this bound by SCOPE, not uncharged; a streams response's
+/// accumulated entries are charged against
+/// [`MAX_STREAMS_RESULT_BYTES`], the second [`ResultBudgets`] term,
+/// rather than into this metric-leaf sum; and process RSS is still
+/// `N ×` this under concurrency, which #245's closure ruled an
+/// operational concern rather than a per-query bound.
 pub const MAX_LEAF_RETAINED_BYTES: u64 = leaf_retained_bytes();
 
-/// [`MAX_LEAF_RETAINED_BYTES`] plus ONE row's per-row output budgets —
-/// the whole per-query retained-byte figure (issue #260).
+/// Every per-query RESULT budget ([`ResultBudgets`] — the metric leaf
+/// plus, since issue #312, the streams result) plus ONE row's per-row
+/// output budgets: the whole per-query retained-byte figure (issue
+/// #260).
 ///
 /// Those budgets are per-ROW since #260 moved the template budget's
 /// lifetime off the individual render (whose output the caller RETAINS,
 /// so a per-render budget bounded one buffer while the number of live
 /// buffers was bounded only by the query-text cap). One row is live at a
-/// time on the metric path; the per-row OUTPUTS still accumulate into a
-/// streams result across up to the entries limit (#312), which this
-/// figure does not cover and #260 deliberately did not close.
+/// time on the metric path; the per-row OUTPUTS accumulate into a
+/// streams result across up to the entries limit, which #260 deliberately
+/// did not close and [`MAX_STREAMS_RESULT_BYTES`] now does.
 ///
 /// **The row term is a TABLE, and the enumeration behind it is a
 /// convention** (issue #287 review rounds 1 and 2, finding 2). #260
@@ -954,7 +965,7 @@ pub const MAX_LEAF_RETAINED_BYTES: u64 = leaf_retained_bytes();
 /// honest sentence is preferred to a fourth: see [`RowBudgets`] for the
 /// three routes around it that still compile, and for what closing them
 /// would actually take.
-pub const MAX_QUERY_RETAINED_BYTES: u64 = MAX_LEAF_RETAINED_BYTES + row_retained_bytes();
+pub const MAX_QUERY_RETAINED_BYTES: u64 = result_retained_bytes() + row_retained_bytes();
 
 /// Every PER-ROW output budget, one field each, in
 /// [`super::pipeline::RowBudget`] order.
@@ -1148,6 +1159,247 @@ const fn leaf_retained_bytes() -> u64 {
         + collision_members
         + collision_bytes
         + result_points
+}
+
+// =====================================================================
+// Issue #312 — the STREAMS retention ledger.
+//
+// Every other cap in this module bounds a METRIC evaluation. A streams
+// response reached none of them: `MAX_LIMIT` (5 000) bounds ENTRIES, and
+// bytes per entry are bounded only by the 64 MiB decompressed ingest cap
+// (`pulsus-write/src/ingest/decompress.rs:16`), so the enforceable
+// figures were 5 000 x 64 MiB = 320 GiB staged on the non-dropping path
+// and 50 000 x 64 MiB = 3.1 TiB for one page of the dropping path. This
+// ledger closes that, and the paths that used to stage a whole response
+// were rewritten to stream rather than merely priced.
+// =====================================================================
+
+/// The per-query ceiling on the bytes a STREAMS query retains at its
+/// peak — staged rows AND the assembled result (issue #312).
+///
+/// **Derived under PEAK accounting**, with `STREAM_ENTRY_SLOT` = 32,
+/// [`STREAM_GROUP_SLOT`] = 88, [`STAGED_ROW_SLOT`] = 64,
+/// [`map_entry_bytes`]`(88)` = 840 and
+/// [`super::exec::STREAM_FEED_CHUNK_BYTES`] = 8 388 608:
+///
+/// ```text
+/// #  shape                                            entries        groups   staging peak         total   vs 1 GiB
+/// A  5 000 entries, 64 KiB lines, 5 000 streams,
+///    1 KiB labels_json                            655 520 000    35 080 000      8 519 776   699 119 776   admitted (65.1%)
+/// B  5 000 entries, 100 KiB lines, 1 stream,
+///    64 B labels_json                           1 024 160 000         1 256      8 593 504 1 032 754 760   admitted (96.2%)
+/// C  ONE maximal ingestible line (64 MiB body)    134 217 760         1 256    134 217 824   268 436 840   admitted (25.0%)
+/// D  5 000 entries, 100 KiB lines, 5 000 streams,
+///    2 KiB labels_json                          1 024 160 000    65 800 000      8 593 504 1 098 553 504   REFUSED  (102.3%)
+/// ```
+///
+/// Row C is the property that matters most: no single stored row is ever
+/// unreturnable. Row B's wire size is 512 000 000 B — about 125x the
+/// largest streams response the reference could actually serve in the
+/// round-1 capture (4 102 651 B), so nothing the reference serves is
+/// refused here. Row D is included because a cap whose refusal boundary
+/// is not written down is a cap nobody can review; it is asserted as a
+/// refusal.
+///
+/// Wide-label results are charged up to **3x** their true retained
+/// footprint, because a group's `labels_json` is priced with
+/// [`grown_alloc_bytes`] (the `with_capacity` estimate in
+/// `render_labels_json_sorted` can under-reserve when `push_json_string`
+/// escapes, so the buffer may grow). Their effective ceiling is
+/// therefore roughly **357,913,941 B (~341 MiB)** rather than 1 GiB —
+/// still about 87x the largest streams response the reference could
+/// serve in the round-1 capture. Over-charging refuses a query;
+/// under-charging exhausts the server, which is the failure this cap
+/// exists to prevent.
+///
+/// **This cap does NOT bound the ENCODED body.** A rendered stream item
+/// is at most `3 x` its charged bytes — derived and pinned by
+/// `logs_api/encode.rs::the_encoder_body_factor_matches_what_the_renderer_produces`,
+/// recorded with its reproducing input in
+/// `docs/benchmarks/logs-differential-ledger.md`'s
+/// `streams-result-budget` entry. That factor is a property of the
+/// OUTPUT BYTES, not of the encoder's buffering; the peak HEAP beneath
+/// it is the ledger entry's separate, measured figure.
+///
+/// A constant, not a knob, following [`super::template::MAX_TEMPLATE_RENDER_BYTES`]
+/// / [`MAX_CLIENT_AGG_GROUP_BYTES`] / [`super::post_agg::MAX_POST_AGG_BYTES`];
+/// operator tuning routes to #25.
+pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// One retained streams entry's fixed slot: `(timestamp_ns, line)`.
+pub(in crate::logql) const STREAM_ENTRY_SLOT: usize = size_of::<(i64, String)>();
+
+/// The map-entry slot ONE output stream occupies. The transform path
+/// keys by fingerprint and the fan-out path by the rendered label set,
+/// so the LARGER of the two shapes is charged — the [`FOLD_GROUP_SLOT`]
+/// precedent (one constant, over-charge the smaller shape).
+pub(in crate::logql) const STREAM_GROUP_SLOT: usize = {
+    let by_fp = size_of::<(u64, super::exec::StreamResult)>();
+    let by_labels = size_of::<(String, super::detected_probe::FanOutGroup)>();
+    if by_fp > by_labels { by_fp } else { by_labels }
+};
+
+/// One STAGED [`super::rows::SampleRow`]'s fixed slot — the row struct
+/// itself, beside the body and structured-metadata blocks it owns.
+pub(in crate::logql) const STAGED_ROW_SLOT: usize = size_of::<super::rows::SampleRow>();
+
+/// EVERYTHING one staged [`super::rows::SampleRow`] retains: the body
+/// block, the structured-metadata block AND the slot.
+///
+/// Charging the body alone was measured to under-price a CONFORMING
+/// push by **65.4x** — 200 rows of 1 KiB bodies carrying 65 012 B of
+/// structured metadata each (inside the ingest ceiling
+/// `MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY` = 64 KiB) retain
+/// 27 188 850 B where a line-only charge prices 416 000 B, and the
+/// factor is set by the caller, not by anything we bound.
+pub(in crate::logql) fn staged_row_bytes(body_len: usize, sm_len: usize) -> u64 {
+    alloc_block_bytes(body_len as u64)
+        .saturating_add(alloc_block_bytes(sm_len as u64))
+        .saturating_add(STAGED_ROW_SLOT as u64)
+}
+
+/// One query's streams retention ledger (issue #312).
+///
+/// `charged` is the RESULT term and is never discharged — the retained
+/// bytes ARE the result (the [`super::exec::PushdownInstantGroups`]
+/// `charged` precedent). `staged` is the transient term: rows held
+/// between one feed and the next, released by [`Self::discharge_staged`]
+/// when their container is fed and dropped. Admission tests the SUM, so
+/// the ledger measures PEAK SIMULTANEOUS RETENTION rather than either
+/// half alone.
+#[derive(Debug)]
+pub struct StreamsResultBudget {
+    charged: u64,
+    staged: u64,
+    cap: u64,
+}
+
+impl StreamsResultBudget {
+    /// The shipped ceiling.
+    pub fn new() -> Self {
+        Self::with_cap(MAX_STREAMS_RESULT_BYTES)
+    }
+
+    /// A test-visible ceiling; production sites never call this.
+    pub fn with_cap(cap: u64) -> Self {
+        Self {
+            charged: 0,
+            staged: 0,
+            cap,
+        }
+    }
+
+    /// Result bytes charged so far — equal to the returned result's
+    /// footprint once every staged charge has been released.
+    pub fn charged(&self) -> u64 {
+        self.charged
+    }
+
+    /// Staged bytes outstanding right now.
+    pub fn staged(&self) -> u64 {
+        self.staged
+    }
+
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
+
+    /// The admission test both charge paths share: `saturating_add` then
+    /// `peak > cap` (the [`charge_group_bytes`] shape — saturation only
+    /// grows the sum, so it cannot mask a breach).
+    fn admit(&mut self, result_bytes: u64, staged_bytes: u64) -> Result<(), ReadError> {
+        let next_charged = self.charged.saturating_add(result_bytes);
+        let next_staged = self.staged.saturating_add(staged_bytes);
+        let peak = next_charged.saturating_add(next_staged);
+        if peak > self.cap {
+            return Err(ReadError::QueryTooBroad(
+                TooBroadReason::StreamsResultBytes {
+                    bytes: peak,
+                    cap: self.cap,
+                },
+            ));
+        }
+        self.charged = next_charged;
+        self.staged = next_staged;
+        Ok(())
+    }
+
+    /// Charges ONE retained entry: `alloc_block_bytes(line_len) +
+    /// STREAM_ENTRY_SLOT`. Called BEFORE the `String` holding `line_len`
+    /// bytes is allocated or moved in.
+    pub fn charge_entry(&mut self, line_len: usize) -> Result<(), ReadError> {
+        let bytes = alloc_block_bytes(line_len as u64).saturating_add(STREAM_ENTRY_SLOT as u64);
+        self.admit(bytes, 0)
+    }
+
+    /// Charges ONE new output stream: `map_entry_bytes(STREAM_GROUP_SLOT)`
+    /// plus `grown_alloc_bytes(labels_json)` plus
+    /// `alloc_block_bytes(service)`. Called BEFORE the map insertion and
+    /// before either string is cloned.
+    pub fn charge_group(&mut self, labels_json: &str, service: &str) -> Result<(), ReadError> {
+        let bytes = map_entry_bytes(STREAM_GROUP_SLOT)
+            .saturating_add(grown_alloc_bytes(labels_json.len() as u64))
+            .saturating_add(alloc_block_bytes(service.len() as u64));
+        self.admit(bytes, 0)
+    }
+
+    /// Charges EVERYTHING one staged row retains — see
+    /// [`staged_row_bytes`]. Called BEFORE the row is pushed.
+    pub fn charge_staged_row(&mut self, body_len: usize, sm_len: usize) -> Result<(), ReadError> {
+        self.admit(0, staged_row_bytes(body_len, sm_len))
+    }
+
+    /// Releases every outstanding staged charge — its container has been
+    /// fed and dropped.
+    pub fn discharge_staged(&mut self) {
+        self.staged = 0;
+    }
+}
+
+impl Default for StreamsResultBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Every per-query RESULT budget, one field each — the [`RowBudgets`]
+/// shape, for the same reason: a struct rather than a sum expression so
+/// [`result_retained_bytes`] can DESTRUCTURE it, and adding a field
+/// without adding its term is a build failure.
+#[derive(Debug)]
+pub struct ResultBudgets {
+    /// One metric leaf's enumerated retention (issue #260).
+    pub metric_leaf: u64,
+    /// One streams response's peak retention (issue #312).
+    pub streams_result: u64,
+}
+
+/// The shipped ceilings, read from the constants the ledgers are
+/// actually constructed with.
+pub const RESULT_BUDGETS: ResultBudgets = ResultBudgets {
+    metric_leaf: MAX_LEAF_RETAINED_BYTES,
+    streams_result: MAX_STREAMS_RESULT_BYTES,
+};
+
+/// The per-query RESULT budgets, summed over a DESTRUCTURED
+/// [`ResultBudgets`].
+///
+/// Deliberately LOOSE: `Plan::Streams` and `Plan::Metric` are mutually
+/// exclusive so no single query holds both terms, but proving that
+/// disjointness is a new claim and over-charging is the safe direction.
+///
+/// ```text
+/// metric leaf     1,953,259,520
+/// streams result  1,073,741,824
+///                 -------------
+///                 3,027,001,344
+/// ```
+const fn result_retained_bytes() -> u64 {
+    let ResultBudgets {
+        metric_leaf,
+        streams_result,
+    } = RESULT_BUDGETS;
+    metric_leaf + streams_result
 }
 
 #[cfg(test)]
@@ -1723,16 +1975,19 @@ mod tests {
         );
         assert_eq!(MAX_LEAF_RETAINED_BYTES, 1_953_259_520);
 
-        // The query bound adds exactly ONE row's per-row output budgets
-        // — BOTH of them (issue #287 review round 1, finding 2: #260's
-        // free-standing `+ template` addend lost the json key ledger).
+        // The query bound sums every RESULT budget (issue #312 added the
+        // streams term beside the metric leaf) plus exactly ONE row's
+        // per-row output budgets — BOTH of them (issue #287 review round
+        // 1, finding 2: #260's free-standing `+ template` addend lost the
+        // json key ledger).
         assert_eq!(
             MAX_QUERY_RETAINED_BYTES,
             MAX_LEAF_RETAINED_BYTES
+                + MAX_STREAMS_RESULT_BYTES
                 + crate::logql::template::MAX_TEMPLATE_RENDER_BYTES
                 + crate::logql::pipeline::MAX_JSON_FLATTEN_KEY_BYTES
         );
-        assert_eq!(MAX_QUERY_RETAINED_BYTES, 2_087_477_248);
+        assert_eq!(MAX_QUERY_RETAINED_BYTES, 3_161_219_072);
 
         // The variants leaf is strictly smaller, so the sum above really
         // is an upper bound for it too: its fan-out counter shares the
@@ -1838,11 +2093,71 @@ mod tests {
             crate::logql::pipeline::MAX_JSON_FLATTEN_KEY_BYTES
         );
         assert_eq!(
-            MAX_QUERY_RETAINED_BYTES - MAX_LEAF_RETAINED_BYTES,
+            MAX_QUERY_RETAINED_BYTES - result_retained_bytes(),
             template_render + json_flatten_keys,
             "the query bound's row term must be the sum of every per-row budget"
         );
         assert_eq!(template_render + json_flatten_keys, 134_217_728);
+    }
+
+    /// AC 11 (issue #312) — the derivation stays ENUMERATED across the
+    /// result term too. Both tables are DESTRUCTURED, so a new
+    /// [`ResultBudgets`] field without a term in [`result_retained_bytes`]
+    /// is a build failure rather than a silently missing summand — the
+    /// [`RowBudgets`] shape, adopted here for the reason #287 gave: a
+    /// free-standing addend is exactly what let a shipped ledger go
+    /// unpublished.
+    #[test]
+    fn every_result_budget_is_a_term_of_the_query_bound() {
+        let ResultBudgets {
+            metric_leaf,
+            streams_result,
+        } = RESULT_BUDGETS;
+        let RowBudgets {
+            template_render,
+            json_flatten_keys,
+        } = ROW_BUDGETS;
+        assert_eq!(metric_leaf, MAX_LEAF_RETAINED_BYTES);
+        assert_eq!(streams_result, MAX_STREAMS_RESULT_BYTES);
+        assert_eq!(
+            MAX_QUERY_RETAINED_BYTES,
+            metric_leaf + streams_result + template_render + json_flatten_keys,
+            "the query bound must be the sum of every result AND per-row budget"
+        );
+        assert_eq!(MAX_QUERY_RETAINED_BYTES, 3_161_219_072);
+    }
+
+    /// AC 12 (issue #312) — the owner-required module-doc sentence
+    /// exists, read back from the committed source so deleting it fails a
+    /// check rather than merely losing a comment. ONE sentence must carry
+    /// all three of `retained`, `stats.bytes` and
+    /// `MAX_STREAMS_RESULT_BYTES`: the divergence is only stated if the
+    /// three are stated together.
+    #[test]
+    fn the_module_doc_states_the_retained_vs_wire_divergence() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql/charge.rs"),
+        )
+        .expect("charge.rs readable");
+        // The `//!` header only — a `///` item doc would not be the
+        // module-level statement the ruling asked for.
+        let header: String = src
+            .lines()
+            .take_while(|l| l.starts_with("//!") || l.trim().is_empty())
+            .map(|l| l.trim_start_matches("//!").trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Split on a period followed by whitespace, so `stats.bytes`
+        // survives intact.
+        let sentences: Vec<&str> = header.split(". ").collect();
+        assert!(
+            sentences.iter().any(|s| s.contains("retained")
+                && s.contains("stats.bytes")
+                && s.contains("MAX_STREAMS_RESULT_BYTES")),
+            "charge.rs's module doc has no single sentence stating that the cap is RETAINED \
+             bytes while the observable guarantee is stats.bytes — issue #312's required \
+             unit-divergence statement"
+        );
     }
 
     /// AC 8 — the published bound is the SHIPPED one. `docs/features.md`
@@ -1871,7 +2186,11 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let features =
             std::fs::read_to_string(root.join("docs/features.md")).expect("features.md readable");
-        for c in [MAX_LEAF_RETAINED_BYTES, MAX_QUERY_RETAINED_BYTES] {
+        for c in [
+            MAX_LEAF_RETAINED_BYTES,
+            MAX_STREAMS_RESULT_BYTES,
+            MAX_QUERY_RETAINED_BYTES,
+        ] {
             let spelled = grouped(c);
             assert!(
                 features.contains(&spelled),
@@ -1879,6 +2198,19 @@ mod tests {
                  from the derived one"
             );
         }
+        // AC 13 (issue #312): the streams term is now a TERM of the
+        // published figure, so the residual list must stop naming it as
+        // something the figure does not cover.
+        let residuals = features
+            .split("Stated residuals, not covered by this figure:")
+            .nth(1)
+            .and_then(|s| s.split_once("\n\n").map(|(head, _)| head))
+            .expect("features.md still lists the retained-byte residuals");
+        assert!(
+            !residuals.contains("#312"),
+            "docs/features.md still lists #312 as a residual this bound does not cover, but \
+             MAX_STREAMS_RESULT_BYTES is now one of its terms"
+        );
         // The stale variants-fan-out figure, corrected here.
         assert!(
             !features.contains("one 64 MiB budget before each allocation"),
@@ -2354,9 +2686,24 @@ mod tests {
         );
     }
 
-    /// Everything above the file's `#[cfg(test)]` marker.
+    /// Everything above the file's `#[cfg(test)] mod tests` marker.
+    ///
+    /// Anchored on the test MODULE, not on any `#[cfg(test)]` attribute
+    /// (issue #312): a test-only ITEM in the middle of a file — this
+    /// issue left two, `exec::advance_tail_cursor` and
+    /// `detected_probe::fan_out_sm_fast_path`, whose production callers
+    /// it deleted — used to truncate the census at that item and hide
+    /// every charge site below it. Observed: with `advance_tail_cursor`
+    /// marked `#[cfg(test)]`, `every_charge_counter_is_enumerated`
+    /// reported `exec.rs: charge_group_bytes(&mut self.charged) occurs
+    /// 0×, expected 1×` — the `PushdownInstantGroups` counter 3 000
+    /// lines further down had silently left the scanned region.
+    /// `plan.rs`, which already carried three top-level `#[cfg(test)]`
+    /// items, was blind the same way. Over-including a test-only item is
+    /// the safe direction for a census: it can add a finding, never hide
+    /// one.
     fn production(src: &str) -> &str {
-        match src.find("\n#[cfg(test)]") {
+        match src.find("\n#[cfg(test)]\nmod tests") {
             Some(i) => &src[..i],
             None => src,
         }

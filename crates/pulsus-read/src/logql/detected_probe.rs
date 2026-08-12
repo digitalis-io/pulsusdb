@@ -16,7 +16,7 @@ use futures::StreamExt;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::charge::alloc_block_bytes;
+use super::charge::{StreamsResultBudget, alloc_block_bytes};
 use super::exec::{StreamResult, TailCursor};
 use super::labels::{
     EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
@@ -30,6 +30,7 @@ use super::pipeline::JsonPaths;
 /// into [`StreamResult`] when the map drains (review round 3: no
 /// per-new-group key clone, which under high-cardinality fan-out is
 /// effectively per-row).
+#[derive(Debug)]
 pub(in crate::logql) struct FanOutGroup {
     pub(in crate::logql) fingerprint: u64,
     pub(in crate::logql) service: String,
@@ -43,33 +44,53 @@ pub(in crate::logql) struct FanOutGroup {
 /// key (one owned copy, moved into [`StreamResult`] at drain — no per-new-group
 /// key clone); the group's `fingerprint` is a deterministic content hash of it;
 /// `service` is the merged set's `service_name` or `fallback_service`.
+///
+/// **Charged before it retains (issue #312).** The entry is charged
+/// before `line.into_owned()` — so on the `Cow::Borrowed` path the
+/// refusing charge precedes the only allocation it pays for, and on the
+/// `Cow::Owned` path `into_owned()` is a move — and a new group is
+/// charged before the vacant-arm `insert` and before `service` is
+/// cloned. ONE transient is deliberately NOT charged and is called out:
+/// the map key is rendered before this function can know whether the
+/// group is new. That `String` is exactly sized by
+/// `render_labels_json_sorted`'s estimate, is one label set, is
+/// pre-existing, and is dropped on the occupied arm; its RETAINED form
+/// is charged with `grown_alloc_bytes` because that `with_capacity`
+/// estimate can under-reserve when `push_json_string` escapes.
 pub(in crate::logql) fn push_fanout_entry(
     label_groups: &mut HashMap<String, FanOutGroup>,
+    budget: &mut StreamsResultBudget,
     sorted_scratch: &[(Cow<'_, str>, Cow<'_, str>)],
     timestamp_ns: i64,
-    line: String,
+    line: Cow<'_, str>,
     fallback_service: &str,
-) {
+) -> Result<(), ReadError> {
     let labels_json = render_labels_json_sorted(sorted_scratch);
-    let entry = (timestamp_ns, line);
     match label_groups.entry(labels_json) {
         std::collections::hash_map::Entry::Occupied(e) => {
-            e.into_mut().entries.push(entry);
+            budget.charge_entry(line.len())?;
+            e.into_mut().entries.push((timestamp_ns, line.into_owned()));
         }
         std::collections::hash_map::Entry::Vacant(e) => {
-            let service = sorted_scratch
+            // Borrowed, not owned, so the group charge precedes the
+            // `service` allocation it pays for.
+            let service: &str = sorted_scratch
                 .iter()
                 .find(|(k, _)| k == "service_name")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_else(|| fallback_service.to_string());
+                .map(|(_, v)| v.as_ref())
+                .unwrap_or(fallback_service);
+            budget.charge_group(e.key(), service)?;
+            budget.charge_entry(line.len())?;
+            let service = service.to_string();
             let fingerprint = fnv1a64(e.key().as_bytes());
             e.insert(FanOutGroup {
                 fingerprint,
                 service,
-                entries: vec![entry],
+                entries: vec![(timestamp_ns, line.into_owned())],
             });
         }
     }
+    Ok(())
 }
 
 /// A reusable label scratch whose `Cow` entries borrow from the row's merged
@@ -94,15 +115,23 @@ pub(in crate::logql) fn eval_structured_metadata_row<'a>(
     merged: &'a [(String, String)],
     sm: &'a StructuredMetadataCtx,
     label_groups: &mut HashMap<String, FanOutGroup>,
+    budget: &mut StreamsResultBudget,
     timestamp_ns: i64,
     service: &str,
     mut scratch: LabelScratch<'a>,
 ) -> (bool, Result<LabelScratch<'a>, ReadError>) {
     let survived = match compiled.run_into_with_sm(body, merged, timestamp_ns, sm, &mut scratch) {
         Ok(Some(line)) => {
-            let line = line.into_owned();
             scratch.sort_unstable();
-            push_fanout_entry(label_groups, &scratch, timestamp_ns, line, service);
+            // The result-budget breach (issue #312) is the same bounded
+            // 422 class; clear the scratch first so the recycling
+            // contract holds on the way out.
+            if let Err(e) =
+                push_fanout_entry(label_groups, budget, &scratch, timestamp_ns, line, service)
+            {
+                scratch.clear();
+                return (false, Err(e));
+            }
             true
         }
         Ok(None) => false,
@@ -482,15 +511,20 @@ fn observe_detected_row_legacy_shape<'a>(
 /// `line_limit` that are not fed; the cursor advances over the RAW page —
 /// and folds into the previous cursor at page end. Equivalence over
 /// randomized sequences is pinned by AC 17's tests below.
+///
+/// `pub(in crate::logql)` since issue #312: the streams paged loop and
+/// `tail_poll` stream their pages too, so the SAME incremental cursor
+/// serves all three — `advance_tail_cursor` has no production caller
+/// left and survives only as this tracker's independent oracle.
 #[derive(Debug)]
-struct TailCursorTracker {
+pub(in crate::logql) struct TailCursorTracker {
     tuple: Option<(i64, u64, u64)>,
     run: u32,
     rows: u32,
 }
 
 impl TailCursorTracker {
-    fn new() -> Self {
+    pub(in crate::logql) fn new() -> Self {
         Self {
             tuple: None,
             run: 0,
@@ -499,7 +533,12 @@ impl TailCursorTracker {
     }
 
     /// Called for EVERY drained row.
-    fn observe(&mut self, timestamp_ns: i64, fingerprint: u64, body_hash: u64) {
+    pub(in crate::logql) fn observe(
+        &mut self,
+        timestamp_ns: i64,
+        fingerprint: u64,
+        body_hash: u64,
+    ) {
         self.rows = self.rows.saturating_add(1);
         let bt = (timestamp_ns, fingerprint, body_hash);
         match self.tuple {
@@ -514,7 +553,7 @@ impl TailCursorTracker {
     /// `(next cursor, rows drained)` — an empty page keeps `prev`; a
     /// page ending on `prev`'s tuple carries its `seen` (the `OFFSET`
     /// already skipped those), exactly [`advance_tail_cursor`].
-    fn finish(self, prev: Option<TailCursor>) -> (Option<TailCursor>, u32) {
+    pub(in crate::logql) fn finish(self, prev: Option<TailCursor>) -> (Option<TailCursor>, u32) {
         match self.tuple {
             None => (prev, self.rows),
             Some(bt) => {
@@ -858,31 +897,47 @@ impl DetectedFieldsProbe {
 }
 
 /// Fan-out for structured-metadata-bearing rows on the line-filter-only fast
-/// path (issue #97). All filtering is already applied in SQL and no pipeline
-/// runs, so each SM row's response label set is its stream's base labels merged
-/// with its parsed structured metadata; each distinct merged set is its own
-/// stream (Loki's per-entry structured-metadata fan-out — see the #97 oracle
-/// probe). Grouping/fingerprinting matches the [`StreamAccumulator`] SM branch
-/// so fast- and transform-path results are byte-consistent. **No-SM rows never
-/// reach here** — they stay on the unchanged by-fingerprint fast path, so its
-/// zero-per-row profile and byte-identity hold (AC-8).
-pub(in crate::logql) fn fan_out_sm_fast_path(
-    sm_rows: &[SampleRow],
-    meta: &HashMap<u64, StreamMetaRow>,
-) -> Vec<StreamResult> {
-    let mut base_cache: HashMap<u64, Vec<(String, String)>> = HashMap::new();
-    let mut groups: HashMap<String, FanOutGroup> = HashMap::new();
+/// path (issue #97), accumulated PER ROW instead of per page (issue #312):
+/// the fast path no longer stages an `sm_rows` vector, so a row's body is
+/// live once — charged — rather than twice.
+///
+/// All filtering is already applied in SQL and no pipeline runs, so each SM
+/// row's response label set is its stream's base labels merged with its
+/// parsed structured metadata; each distinct merged set is its own stream
+/// (Loki's per-entry structured-metadata fan-out — see the #97 oracle
+/// probe). Grouping/fingerprinting matches the [`StreamAccumulator`] SM
+/// branch so fast- and transform-path results are byte-consistent. **No-SM
+/// rows never reach here** — they stay on the by-fingerprint fast path, so
+/// its zero-per-row profile and byte-identity hold (AC-8).
+///
+/// [`StreamAccumulator`]: super::exec::StreamAccumulator
+#[derive(Debug, Default)]
+pub(in crate::logql) struct SmFanOutAccumulator {
+    base_cache: HashMap<u64, Vec<(String, String)>>,
+    groups: HashMap<String, FanOutGroup>,
     // Reused across rows (clear + refill, capacity-amortized) — never a fresh
     // per-row allocation of the label vector itself. `sm_buf` is the SM-pair
     // parse scratch (see `merge_labels_with_structured_metadata`).
-    let mut merge_buf: Vec<(String, String)> = Vec::new();
-    let mut sm_buf: Vec<(String, String)> = Vec::new();
-    let mut sm_ctx = StructuredMetadataCtx::default();
-    for row in sm_rows {
+    merge_buf: Vec<(String, String)>,
+    sm_buf: Vec<(String, String)>,
+    sm_ctx: StructuredMetadataCtx,
+}
+
+impl SmFanOutAccumulator {
+    /// Absorbs ONE structured-metadata-bearing row. A row whose
+    /// fingerprint is absent from `meta` is skipped — exactly what the
+    /// pre-#312 drain's `filter_map` dropped.
+    pub(in crate::logql) fn push_row(
+        &mut self,
+        row: &SampleRow,
+        meta: &HashMap<u64, StreamMetaRow>,
+        budget: &mut StreamsResultBudget,
+    ) -> Result<(), ReadError> {
         let Some(m) = meta.get(&row.fingerprint) else {
-            continue;
+            return Ok(());
         };
-        let base = base_cache
+        let base = self
+            .base_cache
             .entry(row.fingerprint)
             .or_insert_with(|| parse_flat_labels(&m.labels));
         // Merge base + SM (colliding SM keys renamed `_extracted`, per the
@@ -895,33 +950,64 @@ pub(in crate::logql) fn fan_out_sm_fast_path(
         merge_labels_with_structured_metadata(
             base,
             &row.structured_metadata,
-            &mut merge_buf,
-            &mut sm_buf,
-            &mut sm_ctx,
+            &mut self.merge_buf,
+            &mut self.sm_buf,
+            &mut self.sm_ctx,
         );
-        sm_ctx.append_visible(&mut merge_buf);
-        merge_buf.sort_unstable();
-        let sorted: Vec<(Cow<'_, str>, Cow<'_, str>)> = merge_buf
+        self.sm_ctx.append_visible(&mut self.merge_buf);
+        self.merge_buf.sort_unstable();
+        let sorted: Vec<(Cow<'_, str>, Cow<'_, str>)> = self
+            .merge_buf
             .iter()
             .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
             .collect();
+        // BORROWED, so the refusing charge inside `push_fanout_entry`
+        // precedes the only body copy it pays for (issue #312 — this was
+        // an unconditional `row.body.clone()`).
         push_fanout_entry(
-            &mut groups,
+            &mut self.groups,
+            budget,
             &sorted,
             row.timestamp_ns,
-            row.body.clone(),
+            Cow::Borrowed(row.body.as_str()),
             &m.service,
-        );
+        )
     }
-    groups
-        .into_iter()
-        .map(|(labels_json, g)| StreamResult {
-            fingerprint: g.fingerprint,
-            service: g.service,
-            labels_json,
-            entries: g.entries,
-        })
-        .collect()
+
+    pub(in crate::logql) fn into_streams(self) -> Vec<StreamResult> {
+        self.groups
+            .into_iter()
+            .map(|(labels_json, g)| StreamResult {
+                fingerprint: g.fingerprint,
+                service: g.service,
+                labels_json,
+                entries: g.entries,
+            })
+            .collect()
+    }
+}
+
+/// The pre-#312 page-at-a-time shape, reimplemented over
+/// [`SmFanOutAccumulator`] so the shipped behaviour has exactly one
+/// implementation.
+///
+/// **No production caller since issue #312** — the fast path pushes rows
+/// into the accumulator as they arrive rather than staging `sm_rows` —
+/// so this is `#[cfg(test)]`, exactly like
+/// [`advance_tail_cursor`](super::exec::advance_tail_cursor). It keeps
+/// the pre-#312 tests driving the shipped fan-out code with one extra
+/// argument.
+#[cfg(test)]
+pub(in crate::logql) fn fan_out_sm_fast_path(
+    sm_rows: &[SampleRow],
+    meta: &HashMap<u64, StreamMetaRow>,
+    budget: &mut StreamsResultBudget,
+) -> Result<Vec<StreamResult>, ReadError> {
+    let mut acc = SmFanOutAccumulator::default();
+    for row in sm_rows {
+        acc.push_row(row, meta, budget)?;
+    }
+    Ok(acc.into_streams())
 }
 
 #[cfg(test)]
@@ -1655,7 +1741,9 @@ mod tests {
                 structured_metadata: r#"{"__error_details__":"bdet"}"#.to_string(),
             },
         ];
-        let mut got: Vec<String> = fan_out_sm_fast_path(&rows, &meta)
+        let mut budget = StreamsResultBudget::new();
+        let mut got: Vec<String> = fan_out_sm_fast_path(&rows, &meta, &mut budget)
+            .expect("well inside the shipped streams result budget")
             .into_iter()
             .map(|s| s.labels_json)
             .collect();

@@ -1092,8 +1092,10 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
             // query family is what let our own push responder omit it
             // unnoticed (#264 round 1); asserting only its PRESENCE would
             // now let the traces surface emit a header Tempo never emits
-            // (#384). So both are asserted, and "no rule at all" is a
-            // third value rather than a silent `false`.
+            // (#384). Issue #385 removed the third "no rule at all" value:
+            // the two writer-side receivers that carried it turned out to
+            // agree with each other and with Go's `http.Error`, so both
+            // now assert PRESENT.
             match writer.nosniff_rule() {
                 NosniffRule::Present => assert_eq!(
                     res.header("x-content-type-options"),
@@ -1107,7 +1109,6 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
                      (modules/frontend/handler.go:113-116 @ tempo v3.0.2) — nosniff \
                      must be absent"
                 ),
-                NosniffRule::Unasserted => {}
             }
             // The trailing byte, the second axis: `fmt.Fprint` vs
             // `fmt.Fprintln` vs a copied body. See
@@ -1138,9 +1139,34 @@ fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
                     "{ctx}: Tempo's frontend appends no terminator, got {:?}",
                     String::from_utf8_lossy(&res.body)
                 ),
-                // Two references, one responder, and they disagree on the
-                // terminator — see the variant's doc comment.
-                PlainTextWriter::WriterSideReceiver => {}
+                // Issue #385: `http.Error` -> `fmt.Fprintln` on BOTH
+                // writer-side receivers. Prometheus routes every status
+                // through one such call
+                // (`exp/api/remote/remote_api.go:611` @ client_golang/exp
+                // `3537b20ac86b`); Tempo's Zipkin receiver routes every
+                // PRE-admission rejection through one
+                // (`receiver/zipkinreceiver/trace_receiver.go:236` @ tempo
+                // v3.0.2), which is all these cells reach. Exactly one
+                // `\n`, so a doubled terminator fails too.
+                //
+                // Two arms, not one: the rules coincide today and the
+                // references do not, and the post-admission Zipkin writer
+                // — `nosniff` absent, no terminator — already disagrees.
+                // It is unreachable here (it needs a failing sink) and is
+                // pinned hermetically in `pulsus-write`.
+                PlainTextWriter::PromRemoteWriteHttpError => assert!(
+                    res.body.ends_with(b"\n") && !res.body.ends_with(b"\n\n"),
+                    "{ctx}: the reference writes every remote-write error through one \
+                     `http.Error` -> `fmt.Fprintln` — the body ends in exactly one \
+                     newline, got {:?}",
+                    String::from_utf8_lossy(&res.body)
+                ),
+                PlainTextWriter::ZipkinDecodeHttpError => assert!(
+                    res.body.ends_with(b"\n") && !res.body.ends_with(b"\n\n"),
+                    "{ctx}: the reference `http.Error`s every pre-admission Zipkin \
+                     rejection — the body ends in exactly one newline, got {:?}",
+                    String::from_utf8_lossy(&res.body)
+                ),
             }
         }
     }
