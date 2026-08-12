@@ -1436,9 +1436,12 @@ mod tests {
     /// The b21 corpus shape, in miniature: `n` distinct `| logfmt`
     /// groups on one stream, variant 0 = one series per group (so it is
     /// the variant that walks the cap), variant 1 = exactly one series.
-    fn cap_query(n: usize, range: bool) -> String {
-        let common = format!(r#"{{app="v277"}} | logfmt | id < {n} [1m]"#);
-        let _ = range;
+    fn common_range(n: usize) -> String {
+        format!(r#"{{app="v277"}} | logfmt | id < {n} [1m]"#)
+    }
+
+    fn cap_query(n: usize) -> String {
+        let common = common_range(n);
         format!(
             "variants(sum by (id) (count_over_time({common})), sum(count_over_time({common}))) of ({common})"
         )
@@ -1472,8 +1475,7 @@ mod tests {
     /// Runs the cap fixture over `n` groups and returns the result plus
     /// the accumulated warnings, in wire order.
     fn run_cap(n: usize, spec: QuerySpec) -> (QueryResult, Vec<String>) {
-        let range = matches!(spec, QuerySpec::Range { .. });
-        let (scan, variants, _) = variants_fixture(&cap_query(n, range), spec);
+        let (scan, variants, _) = variants_fixture(&cap_query(n), spec);
         let common = scan.client.expect("client scan").pipeline;
         let mut warnings = Warnings::new();
         let out = run_variants_rows(&cap_rows(n), &cap_meta(), &common, &variants, &mut warnings)
@@ -1599,12 +1601,31 @@ mod tests {
     /// Driven through `VariantsAggState` directly rather than through
     /// [`run_variants_rows`], so the post-condition is observed at
     /// `finish` with the charge counter still inspectable beforehand.
+    ///
+    /// **THE BREACHING VARIANT MUST NOT BE INDEX 0.** `VariantsAggState::new`
+    /// charges a sub-state only for `i > 0` — index 0 reuses the arena's
+    /// base entry, so `sub_charged[0]` is `0` and failing to discharge it
+    /// is a no-op the `debug_assert_eq!` can never see. The first cut of
+    /// this test breached index 0 and **passed with the discharge moved
+    /// back below the gate**: a gate weaker than its own claim. The
+    /// fixture is therefore RANGE (so the sub-state charge is non-zero at
+    /// all) with the wide variant at index 1, and the test asserts that
+    /// variant's own charge is non-zero BEFORE finishing — so it cannot
+    /// go vacuous again without saying so.
     #[test]
     fn a_skipped_variant_still_discharges_its_fanout_charge() {
-        let (scan, variants, spec_bytes) = variants_fixture(
-            &cap_query(501, false),
-            QuerySpec::Instant { at_ns: 60 * VSEC },
+        let c = common_range(501);
+        // Index 0 is the single-series variant; index 1 is the one that
+        // breaches, and the one that carries a fan-out charge.
+        let query = format!(
+            "variants(sum(count_over_time({c})), sum by (id) (count_over_time({c}))) of ({c})"
         );
+        let spec = QuerySpec::Range {
+            start_ns: 60 * VSEC,
+            end_ns: 120 * VSEC,
+            step_ns: 30 * VSEC as u64,
+        };
+        let (scan, variants, spec_bytes) = variants_fixture(&query, spec);
         let common = scan.client.expect("client scan").pipeline;
         let arena = VariantArena::build(
             &common,
@@ -1618,20 +1639,31 @@ mod tests {
             VariantsAggState::new(&arena, &variants, &meta, MAX_VARIANT_FANOUT_STATE_BYTES)
                 .expect("state");
         st.push_rows(&cap_rows(501)).expect("push");
+
         let base = st.base;
         assert!(
             st.charged > base,
             "the fan-out sub-states must be charged before finish"
         );
+        assert!(
+            st.sub_charged[1] > 0,
+            "the BREACHING variant must carry a charge of its own, or this \
+             test cannot observe the discharge it exists for (sub_charged = {:?})",
+            st.sub_charged
+        );
 
         let mut warnings = Warnings::new();
         // `finish` consumes the state and asserts `charged == base`. In a
         // debug build the assert is live, so reaching `Ok` here IS the
-        // proof; the explicit skip assertion below stops the test from
-        // passing because nothing breached.
+        // proof; the skip assertions below stop the test from passing
+        // because nothing breached.
         let out = st.finish(&mut warnings).expect("a skip is not an error");
-        assert_eq!(warnings.len(), 1, "exactly one variant was skipped");
-        assert!(!variant_indices(&out).iter().any(|i| i == "0"));
+        assert_eq!(
+            warnings.as_strings(),
+            vec!["maximum of series (500) reached for variant (1)".to_string()],
+            "variant 1 is the one that breached"
+        );
+        assert!(!variant_indices(&out).iter().any(|i| i == "1"));
     }
 
     /// The retention ceiling, at the seam that produces it: a query whose
