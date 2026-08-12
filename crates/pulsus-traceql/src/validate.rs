@@ -692,11 +692,20 @@ fn check_comparison(
 /// Rule 3's pattern half: reject exactly when [`re2_verdict`] proves an
 /// RE2-family engine rejects. `Unknown` is ACCEPTED — the residual
 /// where the reference still rejects spans the `Unknown` class families
-/// enumerated from `pulsus-re2`'s own return sites (measured per class:
-/// lookarounds, out-of-table `\p{…}` properties, `\u`/`\U` escapes,
-/// a trailing backslash, non-portable `(?…` heads, repetition beyond
-/// `kMaxRepeat` or applied to a repetition, over-budget compilations) —
-/// ledgered under `traceql-validate-re2-unknown-residual`, owner #336.
+/// enumerated from `pulsus-re2`'s own return sites, ledgered under
+/// `traceql-validate-re2-unknown-residual`, owner #336.
+///
+/// **Issue #400 Stage 2 shrank that residual without touching this
+/// function.** `re2_verdict` now consults
+/// `pulsus_re2::re2_definitely_rejects` first, so out-of-table `\p{…}`
+/// properties, `\u`/`\U` escapes, repetition beyond `kMaxRepeat` or
+/// applied to a repetition, and the `(?x`/`(?u`/`(?R` heads answer
+/// `Rejects` and reach the arm below. Ten `validate-vectors.json` rows
+/// moved `accept -> reject` with it, every one already recording
+/// `tempo: reject, tempo_status: 400`. What is LEFT undecided is
+/// lookarounds, in-table properties, a trailing backslash, the boundary
+/// escapes, `\Q…\E`, octal escapes, named groups and over-budget
+/// compilations.
 fn check_regex(pattern: &str) -> Result<(), ValidateError> {
     match re2_verdict(pattern) {
         Re2Verdict::Accepts | Re2Verdict::Unknown => Ok(()),
@@ -1043,28 +1052,58 @@ mod tests {
     /// Go accepts `\Q…\E`, octal, named groups, `\<`-as-literal,
     /// in-table `\p{L}`), the rest are reference 400s — the ledgered
     /// divergence (`traceql-validate-re2-unknown-residual`, owner #336).
+    ///
+    /// **Issue #400 Stage 2 shrank this list from seventeen to eight**,
+    /// and the members that left did so because they became DECIDABLE,
+    /// not because the accept-never-over-reject rule weakened. The nine
+    /// that moved — `\p{Alphabetic}` bare and in a class, `a{1001}`,
+    /// `a**`, `a*??`, `a{2}{3}`-shaped forms, `(?x)a b`, `\u{263A}` —
+    /// are `400` at Tempo, so they are asserted as REJECTIONS below
+    /// instead of dropped.
     #[test]
     fn unknown_verdicts_are_accepted_never_over_rejected() {
         for q in [
-            r#"{ .a =~ "\\p{Alphabetic}" }"#,
+            // In `unicodeTable`, so no rule reads it as an error.
             r#"{ .a =~ "\\p{L}" }"#,
-            r#"{ .a =~ "[\\p{Alphabetic}]" }"#,
-            r#"{ .a =~ "a{1001}" }"#,
-            r#"{ .a =~ "a**" }"#,
-            r#"{ .a =~ "a*??" }"#,
+            // A valid capture name and the group heads rule (c) does not
+            // claim: `P<`, `=`, `<!` are not `{u, x, R}` flags.
             r#"{ .a =~ "(?P<n>x)" }"#,
             r#"{ .a =~ "(?=x)" }"#,
             r#"{ .a =~ "(?<!x)" }"#,
-            r#"{ .a =~ "(?x)a b" }"#,
+            // A trailing backslash, the boundary escapes, `\Q…\E` (rule
+            // 0's bail-out) and octal — none of which any rule reads.
             r#"{ .a =~ "a\\" }"#,
-            r#"{ .a =~ "\\u{263A}" }"#,
             r#"{ .a =~ "\\<word\\>" }"#,
             r#"{ .a =~ "\\b{start}x" }"#,
             r#"{ .a =~ "\\Qa*\\E" }"#,
             r#"{ .a =~ "\\12" }"#,
+            // Our compile budget, which is not RE2's.
             r#"{ .a =~ "(?:(?:(?:(?:[0-9a-f]{32}){32}){32}){32})" }"#,
         ] {
             assert_eq!(v(q), Ok(()), "{q:?} carries an Unknown-verdict pattern");
+        }
+        // The other side of the same list: the nine that stopped being
+        // `Unknown`. Every one is a Tempo `400` (`validate-vectors.json`
+        // rows rx-u4, u5, u6, u12, u13, u16, u18, u19, u21, u22), so
+        // this is a move TOWARD parity — and asserting it here means the
+        // shrinking of the list above cannot be mistaken for members
+        // quietly dropped.
+        for q in [
+            r#"{ .a =~ "\\p{Alphabetic}" }"#,
+            r#"{ .a =~ "[\\p{Alphabetic}]" }"#,
+            r#"{ .a =~ "a{1001}" }"#,
+            r#"{ .a =~ "a**" }"#,
+            r#"{ .a =~ "a*??" }"#,
+            r#"{ .a =~ "a{2}{3}" }"#,
+            r#"{ .a =~ "(?x)a b" }"#,
+            r#"{ .a =~ "(?u:a)" }"#,
+            r#"{ .a =~ "\\u{263A}" }"#,
+            r#"{ .a =~ "\\U0001F600" }"#,
+        ] {
+            assert!(
+                matches!(v(q), Err(ValidateError::InvalidRegex { .. })),
+                "{q:?} is a `400` at Tempo and is now decided in-process"
+            );
         }
     }
 

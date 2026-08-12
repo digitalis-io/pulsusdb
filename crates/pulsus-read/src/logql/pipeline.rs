@@ -2406,6 +2406,37 @@ pub(super) fn validate_anchored_regex(p: &str) -> Result<(), PipelineError> {
     compile_anchored_regex(p).map(|_| ())
 }
 
+/// **Issue #400 Stage 2: the constructs RE2 decidably rejects, refused
+/// BEFORE the compile that would silently read them as something else.**
+///
+/// The Rust `regex` crate does not merely accept `a**`, `[[:foo:]]`,
+/// `\u{263A}`, `(?x)a` and their kin — it reads them as a DIFFERENT
+/// pattern (`a**` becomes `(a*)*`, which matches every line), while
+/// grafana/loki v3.7.4 answers `400`. So a compile is the wrong
+/// adjudicator here and the pre-check runs ahead of it.
+///
+/// `pulsus_re2::re2_definitely_rejects` is reject-only and conservative
+/// in one direction: it never claims a pattern the reference serves
+/// (asserted over the whole 4,315-pattern frozen corpus in
+/// `pulsus-re2/tests/re2_reject_classes.rs`, every flagged member probed
+/// at the container). A `false` changes nothing — the compile decides as
+/// it always did — so no query that worked before can stop working for a
+/// reason this function invented.
+///
+/// The message names the CONSTRUCT, not the engine's prose, and **no
+/// parity is claimed for its text**: #246's owner rulings (2026-07-26,
+/// 2026-08-08) pin the status and the accept/reject decision only. It
+/// does not route through [`bad_regex`] because there is no
+/// `regex::Error` to report — the pattern was never compiled.
+fn re2_reject_precheck(pattern: &str) -> Result<(), PipelineError> {
+    match pulsus_re2::re2_rejection_construct(pattern) {
+        None => Ok(()),
+        Some(construct) => Err(PipelineError::BadRegex(format!(
+            "error parsing regexp: {construct}: `{pattern}`"
+        ))),
+    }
+}
+
 /// Issue #291: every user pattern on this path compiles through
 /// `pulsus_re2::compile_user_regex`, which refuses it BEFORE the HIR
 /// translation when translating it could allocate more than
@@ -2413,6 +2444,7 @@ pub(super) fn validate_anchored_regex(p: &str) -> Result<(), PipelineError> {
 /// decision and wording are untouched — an `Engine` error still routes to
 /// [`bad_regex`], and only the new over-budget refusal is a new message.
 fn compile_regex(pattern: &str) -> Result<regex::Regex, PipelineError> {
+    re2_reject_precheck(pattern)?;
     pulsus_re2::compile_user_regex(pattern).map_err(|e| match e {
         pulsus_re2::RegexCompileError::Engine(e) => bad_regex(pattern, &e),
         e @ pulsus_re2::RegexCompileError::TooLarge { .. } => {
@@ -2457,6 +2489,7 @@ fn compile_drop_keep(elems: &[DropKeepElem]) -> Result<Vec<CompiledDropKeep>, Pi
 /// the same `^(?:...)$` wrapping shape `escape::ch_regex_anchored` uses
 /// for the SQL side, compiled locally for in-engine evaluation.
 fn compile_anchored_regex(pattern: &str) -> Result<regex::Regex, PipelineError> {
+    re2_reject_precheck(pattern)?;
     // Issue #291: the ANCHORED string is what gets compiled, so it is the
     // one the budget estimates.
     pulsus_re2::compile_user_regex_anchored(pattern).map_err(|e| match e {

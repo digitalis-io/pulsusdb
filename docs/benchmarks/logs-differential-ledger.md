@@ -3802,19 +3802,25 @@ this entry records is what the scouting run found while measuring the
 prose question — the two engines disagree about the **decision** far more
 often than they agree about it.
 
-- **Measurement conditions.** 16 query positions × 45 patterns = 720
-  points, plus 2 masked positions × 45 = 90, so 810 probed in all. (These
+- **Measurement conditions.** 16 query positions × 48 patterns = 768
+  points, plus 2 masked positions × 48 = 96, so 864 probed in all. (These
   read 704/88/792 until #400 Stage 1 and were stale by one pattern: the
   three assertions in `the_divergence_set_is_exactly_the_committed_enumeration`
   that say "the ledger says N" are recomputed from the table, so the
-  table had already moved while this sentence had not.) Reference: the digest-pinned
+  table had already moved while this sentence had not. #400 Stage 2 adds
+  three patterns — `\p{Cs}`, `(?P<1n>a)` and `\p{LC}` — which is where
+  45 → 48 comes from.) Reference: the digest-pinned
   `grafana/loki@sha256:87f0a067…` v3.7.4 oracle
   (`/loki/api/v1/status/buildinfo` = `{"version":"3.7.4","revision":"b318f282"}`)
   with `ci/logql/config.yaml`, probed at `/loki/api/v1/query_range` over a
   5-minute window **ending at `now`** — load-bearing, see
   `malformed-query-refused-in-every-window`. PulsusDB: `parse → plan →
   CompiledPipeline::compile`, the compile `exec` runs before any I/O.
-  **321 of the 720 unmasked points disagree**, in the classes below. Every
+  **226 of the 768 unmasked points disagree**, in the classes below —
+  down from 321 of 720 before #400 Stage 2, which both REMOVED
+  disagreements (nine patterns at fifteen positions each) and ADDED them
+  (two new Class E patterns at sixteen), so the figure is taken from the
+  test's own printed line and not from arithmetic on the old one. Every
   figure here is recomputed by
   `crates/pulsus-read/tests/logql_regex_accept_matrix.rs` rather than
   restated: the class enumeration is asserted equal to the matrix's own
@@ -3832,16 +3838,31 @@ often than they agree about it.
   | `variants_common_side_hides_the_build_error` | the 14 patterns both sides reject | 1 | **owned by #380**, not #400: the reference swallows a `variants(...)` common-pipeline build error in every window. Deliberate, and the direction the owner ruled for |
   | `engine_dir_a_non_utf8_string_literal` | `"\xff"` | 7 | **new in #400 Stage 1, and DELIBERATE** — see `logql-string-escape-non-utf8` below for the reachability argument, which is the part that makes it acceptable. With the reference's string grammar in the lexer, `"\xff"` decodes to the byte 0xFF here as it does there, and a decoded byte string that is not valid UTF-8 cannot be a Rust `String`, so it is a positioned `400` at every position. The nine positions that reach the reference's regex parser therefore now AGREE. What is left is the six `NewFastRegexMatcher` sites, which short-circuit a plain literal before `syntax.Parse` (`vendor/github.com/prometheus/prometheus/model/labels/regexp.go:56-72 @ v3.7.4`) and answer `200` with nothing, plus `variants_common_side`, whose `200` is #380's swallowed build error rather than the short-circuit |
 
-- **Direction B — PulsusDB serves, the reference rejects. Several of these
-  answer with a DIFFERENT PATTERN, which is a wrong answer and not
-  leniency.**
+- **Direction B — PulsusDB serves, the reference rejects. THIS DIRECTION
+  IS NOW EMPTY, and that is #400 Stage 2's result.** Every class below is
+  retired; the table is kept because it is the record of what was
+  divergent, why each member was a WRONG ANSWER rather than leniency, and
+  what closed it. `the_divergence_set_is_exactly_the_committed_enumeration`
+  asserts the emptiness — a new Direction-B row reddens it rather than
+  being merely reviewable.
+
+  | class | patterns | positions | fate |
+  |---|---|---|---|
+  | *(retired by #400 Stage 2)* `engine_dir_b_read_as_a_different_pattern` | `\U0001F600`, `(?R)a`, `(?x)a`, `a**`, `[[:foo:]]`, `\p{Alphabetic}`, `a{1001}` | was 15 | `a**` was read as `(a*)*`, which matches **every** subject tested (`""`, `a`, `b`, `:`, `101`, an emoji), so a line filter carrying it returned the whole stream; `[[:foo:]]` as a nested class matching `:`/`f`/`o`. In a `line_format` template `a**` renders **`zxz`** from the input `x` and `\p{Alphabetic}` renders **`z`** — see `template-error-wording-residuals`. **Correction (issue #400, measured 2026-08-10):** this cell said `(?R)` is read as the crate's line-terminator flag "and matches everything". It is not: `(?R)a` matches `"a"` and does not match `""`, `"b"` or `"x\r\ny"`. The false half was an inference from a category — a flag we do not have — sitting beside two measured facts. **Closed by `pulsus_re2::re2_definitely_rejects` at the LogQL compile seams**; the readings are pinned over eleven subjects by `crates/pulsus-re2/tests/re2_reject_classes.rs`'s `the_rust_crate_reads_these_as_a_different_pattern`, which lives in that file precisely so it outlives this row |
+  | *(retired by #400 Stage 2)* `engine_dir_b_class_forms` | `[a--b]`, `\u{263A}` | was 14 | `label_replace` was excluded — its rewrite made the Rust crate agree with the reference, so that one position was the only LogQL site where these were refused. **Owner ruling 2026-08-10: both are #400's to close with a decidable check, NOT the deferred `re2_pattern_to_rust` rewrite**, and that is exactly how they were closed. **The deferred #331/#336 pattern rewrite must not later be credited with either**: `[a--b]` is refused by rule (g), which reads `a--` as the RANGE `a`..`-` (`parse.go:1815 @ v3.7.4`), and `\u{263A}` by rule (d), which refuses every `\u`/`\U` spelling. Stage 1 closed neither — it is the string-literal LEXER, and both are REGEX bodies reaching the compiler with their backslashes doubled; the spelling `{app=~"\u{263A}"}` was Stage 1's and `{app=~"\\u{263A}"}` is Stage 2's, and both are `400` now |
+  | *(retired by #400 Stage 1)* `engine_dir_b_invalid_utf8_escape` | `"\xff"` | was 9 | **this row is gone and its successor points the other way** — see `engine_dir_a_non_utf8_string_literal` in Direction A above. It recorded the verdict half of a wrong-answer defect: Go's unquoting gives the reference one 0xFF byte, refused as invalid UTF-8 at the nine positions that reach its parser, while our lexer dropped the backslash and compiled the three ASCII characters `xff`. Stage 1 gave the lexer the reference's own grammar, so those nine positions now AGREE and the six that never parse a plain literal are what is left |
+  | *(retired by #400 Stage 2)* `variants_variant_side_skips_the_line_filter` | the patterns both sides reject | was 1 | found by this matrix. The reference refuses a malformed line filter inside a `variants(...)` variant; we served it — but only while the filter was PUSHABLE **and the variant was BARE** (issue #397: a variant wrapped in a vector aggregation runs its whole pipeline, so the filter was compiled and both sides refused). `compile_stage` returns `Ok(None)` for a pushable line filter before reaching `compile_regex`, so the discarded variant prefix `VariantSpec::try_new` compiles never saw the regex, and a discarded prefix renders no SQL either. **Closed by `build_variants_node`'s bare arm validating those regexes directly** (`plan.rs`'s `validate_pushable_line_filter_regexes`) — validation only, no pushdown decision moved — and `variants_variant_side`'s rule moved `AcceptsEverything → PerPattern` with it. The position that BOUNDED this row, `variants_variant_after_line_format`, is still in the matrix and still agrees at every pattern |
+
+- **Class E, added by #400 Stage 2's corpus sweep — PulsusDB rejects,
+  the reference serves, and neither member is in the eighteen classes
+  this issue was filed with.** Both are Direction A; they are recorded,
+  not fixed, because closing either needs pattern transformation at the
+  as-written seams, which the 2026-08-05 owner ruling refused. Both
+  produce an error, never a wrong row.
 
   | class | patterns | positions | note |
   |---|---|---|---|
-  | `engine_dir_b_read_as_a_different_pattern` | `\U0001F600`, `(?R)a`, `(?x)a`, `a**`, `[[:foo:]]`, `\p{Alphabetic}`, `a{1001}` | 15 | `a**` is read as `(a*)*`, which matches **every** subject tested (`""`, `a`, `b`, `:`, `101`, an emoji), so a line filter carrying it returns the whole stream; `[[:foo:]]` as a nested class matching `:`/`f`/`o`. In a `line_format` template `a**` renders **`zxz`** from the input `x` and `\p{Alphabetic}` renders **`z`** — see `template-error-wording-residuals`. **Correction (issue #400, measured 2026-08-10):** this cell said `(?R)` is read as the crate's line-terminator flag "and matches everything". It is not: `(?R)a` matches `"a"` and does not match `""`, `"b"` or `"x\r\ny"`. The false half was an inference from a category — a flag we do not have — sitting beside two measured facts, the same shape as `template-error-wording-residuals`' own correction. Three copies of the sentence shipped (here, `docs/api.md` §9.3, and the fixture's own row) and all three are now `the_wrong_pattern_row_says_what_each_member_actually_does`, which probes both members |
-  | `engine_dir_b_class_forms` | `[a--b]`, `\u{263A}` | 14 | `label_replace` excluded — its rewrite makes the Rust crate agree with the reference, so that one position is the only LogQL site where these are refused. **Owner ruling 2026-08-10: both are #400's to close with a decidable check, NOT the deferred `re2_pattern_to_rust` rewrite** ("What is NOT here", below) — `[a--b]` because it matches `a` where the reference sends `400`, and `\u{263A}` because it falls out of the same `\u` rule for free. #400 Stage 1 closes neither: it is the string-literal LEXER, and both of these are REGEX bodies that reach the compiler with their backslashes doubled. The spelling `{app=~"\u{263A}"}` — the escape in the string literal rather than in the pattern — *is* refused as of Stage 1, matching the reference; `{app=~"\\u{263A}"}` is the row here and is not |
-  | *(retired by #400 Stage 1)* `engine_dir_b_invalid_utf8_escape` | `"\xff"` | was 9 | **this row is gone and its successor points the other way** — see `engine_dir_a_non_utf8_string_literal` in Direction A above. It recorded the verdict half of a wrong-answer defect: Go's unquoting gives the reference one 0xFF byte, refused as invalid UTF-8 at the nine positions that reach its parser, while our lexer dropped the backslash and compiled the three ASCII characters `xff`. Stage 1 gave the lexer the reference's own grammar, so those nine positions now AGREE and the six that never parse a plain literal are what is left |
-  | `variants_variant_side_skips_the_line_filter` | the 14 patterns both sides reject | 1 | found by this matrix. The reference refuses a malformed line filter inside a `variants(...)` variant; we serve it — but only while the filter is PUSHABLE **and the variant is BARE** (issue #397: a variant wrapped in a vector aggregation runs its whole pipeline, so the filter is compiled and both sides refuse; that wrapped position is #400's to add, and corpus row W29 pins it meanwhile). `compile_stage` returns `Ok(None)` for a pushable line filter (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`, so the discarded variant prefix `VariantSpec::try_new` compiles (`plan.rs:2641`) never sees the regex, and a discarded prefix renders no SQL either. Put the same filter after a `line_format` and the pushdown is cleared, the filter is compiled, and both sides refuse it — that is the `variants_variant_after_line_format` position, which agrees at every pattern and is what bounds this row. `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused on both sides too |
+  | `engine_class_e_reference_serves_what_the_rust_crate_refuses` | `\p{Cs}`, `(?P<1n>a)` | 16 | `Cs` IS a `unicode.Categories` key, so `unicodeTable` resolves it and the reference serves `\p{Cs}` (measured `200`); the Rust crate answers `Unicode property value not found`. `(?P<1n>a)` is a valid capture name there — `isValidCaptureName` is `[A-Za-z0-9_]+` and its own comment says "Python rejects names starting with digits. We don't enforce either of those" (`vendor/github.com/grafana/regexp/syntax/parse.go:1261-1272 @ v3.7.4`) — while the Rust crate requires an XID start. **`re2_definitely_rejects` is asserted NOT to claim either**: rule (f)'s committed table CONTAINS `Cs`, and rule (h) fires only on a byte outside `[A-Za-z0-9_]`, so a digit-leading name reaches no rule. Its mirror image, `(?P<n.x>a)`, is a `400` on both sides |
 
 - **The LogQL string ESCAPE was one root cause with TWO divergences, and
   #400 Stage 1 closed both at the one line they shared.**
@@ -3982,6 +4003,53 @@ often than they agree about it.
   the already-running `pulsus-logql-diff` container. The per-route surface
   axis is `crates/pulsus-server/tests/logs_api_live.rs`'s
   `a_malformed_selector_regex_is_refused_on_every_mounted_logs_route`.
+
+### `logql-storage-re2-property-table` (issue #400 Stage 2 — measured, not fixed here)
+
+- **What differs.** `\p{LC}` is served by grafana/loki v3.7.4 and refused
+  by ClickHouse's RE2. One pattern, three engines, and the third answer
+  is not the second's:
+
+  | engine | verdict | how measured |
+  |---|---|---|
+  | grafana/loki v3.7.4 (`grafana/loki@sha256:87f0a067…`) | **`200`** at all sixteen matrix positions | `logql_regex_accept_matrix.rs`'s `live_matrix_against_the_reference`, `PATTERNS` row `unicode_prop_lc_category` |
+  | the Rust `regex` crate 1.13.0 | compiles it | `re2_screen_differential.rs`'s `the_property_table_the_storage_engine_carries_is_not_the_references` |
+  | ClickHouse 26.3.17.110's RE2 | **`Code: 427 CANNOT_COMPILE_REGEXP`** — `cannot compile re2: ^(?:\p{LC})$, error: invalid character class range: \p{LC}` | the same test, live |
+
+- **Cause, at its measured strength.** The reference's property table is
+  Go's `unicode` package, **read**: `unicodeTable` is `"Any"`, then
+  `unicode.Categories[name]`, then `unicode.Scripts[name]`, then `nil`
+  (`vendor/github.com/grafana/regexp/syntax/parse.go:1646-1658 @ v3.7.4`),
+  and `LC` is a `Categories` key. ClickHouse's is upstream RE2's own
+  generated table, **not read**. That the two differ on this name is the
+  measurement above; *why* they differ is not claimed here.
+
+- **What PulsusDB does, and why.** `pulsus_re2::re2_definitely_rejects`'s
+  rule (f) reads the REFERENCE's table, so it answers `false` for
+  `\p{LC}` and the pattern is not refused at plan time. Refusing it would
+  be an over-rejection against the accept-surface authority, which is the
+  Loki container and not the storage engine.
+
+- **The consequence, probed end to end and NOT fixed here.**
+  `{app=~"\\p{LC}"}` through the real `pulsusdb` binary against ClickHouse
+  26.3.17.110 answers **`500`** with
+  `clickhouse: server [427]: Code: 427. DB::Exception:
+  OptimizedRegularExpression: cannot compile re2: ^(?:\p{LC})$` — **but
+  only when the query actually scans a row**. Measured 2026-08-12 on the
+  same server process: with `log_streams_idx` holding no row for the
+  matched key it is a `200` with an empty result, because ClickHouse
+  never evaluates the `match()`; after seeding one stream row it is the
+  `500` above. `{app=~"\\p{L}"}` is a `200` in both states, which is the
+  discriminator that makes this about the NAME rather than about
+  `\p{…}` support.
+
+  This path is **pre-existing** — every pattern ClickHouse's RE2 refuses
+  and the Rust crate accepts reaches it the same way — and #400 Stage 2
+  neither creates nor closes it. It is recorded here so the next reader
+  meets the measurement rather than rediscovering it. `\p{Lc}` (lowercase
+  `c`) is a `400` at plan time on both sides, because `unicodeTable` does
+  no case folding of the NAME; that is the pair that separates "the
+  storage engine has a different table" from "the pre-check is wrong".
 
 ### `logql-string-escape-non-utf8` (issue #400 Stage 1 — DELIBERATE narrowing, owner ruling 2026-08-10)
 

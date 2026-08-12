@@ -14,3 +14,7 @@ regex-syntax.workspace = true
 # (`[\p{L}&&\p{Nd}]` translates to an EMPTY class) against the same
 # parser the estimator uses, rather than restating it.
 regex-syntax.workspace = true
+# Issue #400 Stage 2: the frozen-corpus flagged-set digest in
+# `re2_reject_classes.rs`. SHA-256 so the committed value is
+# reproducible with `sort | sha256sum` and not only by this test.
+sha2.workspace = true
