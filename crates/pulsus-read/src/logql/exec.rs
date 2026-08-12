@@ -18,11 +18,15 @@ use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow,
     MetricScanRow, PatternFetchRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
 };
+use futures::Stream;
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
 use pulsus_logql::{Expr, LogExpr, MatchOp, Matcher, RangeAggOp, Stage, StreamSelector};
 
-use super::charge::{PUSHDOWN_INSTANT_SLOT, charge_group_bytes, group_entry_bytes};
+use super::charge::{
+    MAX_STREAMS_RESULT_BYTES, PUSHDOWN_INSTANT_SLOT, StreamsResultBudget, charge_group_bytes,
+    group_entry_bytes,
+};
 use super::client_agg::check_surviving_error;
 use super::labels::render_series_labels;
 use super::sql::ScanProjection;
@@ -35,9 +39,11 @@ use super::client_agg::{
     CLIENT_AGG_CHUNK_ROWS, ClientAggState, MetricAggState, RangeSlideState, run_client_agg_rows,
 };
 use super::detected_probe::{
-    DetectedPagedState, DetectedRowFeeder, FanOutGroup, LabelScratch, classify_page_error,
-    eval_structured_metadata_row, fan_out_sm_fast_path, push_fanout_entry, recycle_label_scratch,
+    DetectedPagedState, DetectedRowFeeder, FanOutGroup, LabelScratch, SmFanOutAccumulator,
+    TailCursorTracker, classify_page_error, eval_structured_metadata_row, push_fanout_entry,
+    recycle_label_scratch,
 };
+
 use super::labels::{
     StructuredMetadataCtx, merge_labels_with_structured_metadata, parse_flat_labels, series_labels,
 };
@@ -959,11 +965,20 @@ impl LogQlEngine {
         if compiled.is_line_filter_only() {
             // Fast path: today's per-fingerprint shape, `labels_json`
             // verbatim (`scan_limit == result_limit` by construction).
-            // Zero-structured-metadata rows stay on this UNCHANGED path (AC-8
-            // byte-identity); rows carrying structured metadata (issue #97)
-            // fan out into their own merged-label-set streams below.
-            let mut by_fp: HashMap<u64, Vec<(i64, String)>> = HashMap::new();
-            let mut sm_rows: Vec<SampleRow> = Vec::new();
+            // Zero-structured-metadata rows stay on the by-fingerprint
+            // path (AC-8 byte-identity); rows carrying structured
+            // metadata (issue #97) fan out into their own
+            // merged-label-set streams.
+            //
+            // **Streamed, not staged (issue #312).** There is no
+            // `sm_rows` vector: an SM row fans out as it arrives, so its
+            // body is live once — charged — rather than twice. A row
+            // whose fingerprint is absent from `meta` is skipped here
+            // rather than at drain, which is byte-identical (the
+            // pre-#312 `filter_map` dropped exactly those) and is what
+            // makes the charge equal the returned footprint exactly.
+            let mut budget = StreamsResultBudget::new();
+            let mut groups = FastPathGroups::new();
             let mut stream = self
                 .query_stream::<SampleRow>(&sql, &self.budget_settings())
                 .await?;
@@ -975,31 +990,9 @@ impl LogQlEngine {
                         self.config.read_max_memory_bytes,
                     )
                 })?;
-                if row.structured_metadata.is_empty() {
-                    by_fp
-                        .entry(row.fingerprint)
-                        .or_default()
-                        .push((row.timestamp_ns, row.body));
-                } else {
-                    sm_rows.push(row);
-                }
+                groups.push_row(row, &meta, &mut budget)?;
             }
-
-            let mut streams: Vec<StreamResult> = by_fp
-                .into_iter()
-                .filter_map(|(fp, entries)| {
-                    meta.get(&fp).map(|m| StreamResult {
-                        fingerprint: fp,
-                        service: m.service.clone(),
-                        labels_json: m.labels.clone(),
-                        entries,
-                    })
-                })
-                .collect();
-            if !sm_rows.is_empty() {
-                streams.extend(fan_out_sm_fast_path(&sm_rows, &meta));
-            }
-            return Ok((streams, false));
+            return Ok((groups.into_streams(), false));
         }
 
         // Dropping sub-case (issue #90): a label filter, or a line filter
@@ -1012,29 +1005,38 @@ impl LogQlEngine {
                 .await;
         }
 
-        // Non-dropping transform/fan-out path: collect rows in arrival
-        // order (stage 3 orders globally by timestamp in the requested
-        // direction, so arrival order IS the response order — the global
-        // `result_limit` truncation below depends on it). A single
+        // Non-dropping transform/fan-out path: rows are consumed in
+        // arrival order (stage 3 orders globally by timestamp in the
+        // requested direction, so arrival order IS the response order —
+        // the global `result_limit` truncation depends on it). A single
         // `stage3` `LIMIT = result_limit` scan, byte-identical to today.
-        let mut rows: Vec<SampleRow> = Vec::new();
-        let mut stream = self
-            .query_stream::<SampleRow>(&sql, &self.budget_settings())
-            .await?;
-        while let Some(row) = stream.next().await {
-            rows.push(row.map_err(|e| {
-                map_read_error(
-                    e,
-                    self.config.scan_budget_bytes,
-                    self.config.read_max_memory_bytes,
-                )
-            })?);
+        //
+        // **Chunked, not staged (issue #312).** The whole-response
+        // `Vec<SampleRow>` this used to build was bounded only by the SQL
+        // LIMIT — 5 000 rows x the 64 MiB ingest cap = 320 GiB. Rows now
+        // flow through the accumulator's byte-denominated chunk, charged
+        // on push and released on flush.
+        let mut acc = StreamAccumulator::new(&meta, sp.result_limit);
+        {
+            // Scoped: the row stream holds its pooled connection until
+            // dropped (the `ChRowStream` lease rule).
+            let mut stream = self
+                .query_stream::<SampleRow>(&sql, &self.budget_settings())
+                .await?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
+                acc.push_row(row, &compiled)?;
+            }
         }
+        acc.flush_chunk(&compiled)?;
 
-        Ok((
-            run_pipeline_rows(rows, &compiled, &meta, sp.result_limit)?,
-            false,
-        ))
+        Ok((acc.into_streams(), false))
     }
 
     /// The fetch-until-limit paging loop (issue #90 — the dropping
@@ -1067,7 +1069,7 @@ impl LogQlEngine {
     /// the full cap (conservative).
     ///
     /// **Termination.** The cursor advances past every *fetched* row
-    /// (`advance_tail_cursor` over the raw page, not survivors — so a page
+    /// ([`TailCursorTracker`] over the raw page, not survivors — so a page
     /// entirely filtered out by the pipeline never stalls the loop), with
     /// occurrence-count `OFFSET` handling tie-runs larger than a page
     /// (carried from #74). Over a finite window the cursor advances
@@ -1080,6 +1082,22 @@ impl LogQlEngine {
     /// propagate `QueryTooBroad` (a genuinely too-broad query, preserving
     /// today's error); a later page (`spent > 0`) tripping its positive cap
     /// → signaled partial.
+    ///
+    /// **Streaming (issue #312), and refusal versus partial.** Each page's
+    /// rows are charged and chunked through the accumulator as they
+    /// arrive — no page-sized `Vec<TailSampleRow>` and no `SampleRow`
+    /// re-materialisation into a second page-sized vector; the two used to
+    /// hold 50 000 rows x the 64 MiB ingest cap = 3.1 TiB. A
+    /// `ScanBudgetBytes` breach mid-page therefore returns the survivors
+    /// INCLUDING that page's prefix, which is #244's ruled precedent (the
+    /// prefix boundary is not required to align with a page boundary) and
+    /// is more complete, never less. The scan-budget partial is decided at
+    /// the top of the loop and inside `absorb_page`; the RESULT-budget
+    /// refusal is decided inside `push_row`. A query near both boundaries
+    /// resolves to whichever trips first, which is page-timing dependent —
+    /// but complete-or-error wins where the ledger trips: a
+    /// [`TooBroadReason::StreamsResultBytes`] refusal is never downgraded
+    /// to a partial.
     async fn run_streams_paged(
         &self,
         sp: &StreamsPlan,
@@ -1093,11 +1111,15 @@ impl LogQlEngine {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
         };
-        // First-page size = the oversample hint; subsequent pages reuse it.
-        let page_size = sp.scan_limit.max(1);
         let mut acc = StreamAccumulator::new(meta, sp.result_limit);
-        let mut cursor: Option<TailCursor> = None;
-        let mut spent: u64 = 0;
+        let mut st = StreamsPagedState {
+            cursor: None,
+            spent: 0,
+            // First-page size = the oversample hint; subsequent pages
+            // reuse it.
+            page_size: sp.scan_limit.max(1),
+            budget,
+        };
 
         loop {
             // Terminate before issuing: `max_bytes_to_read = 0` is
@@ -1106,11 +1128,11 @@ impl LogQlEngine {
             // as a partial result (a later page's positive-cap overflow is
             // handled below; the first-page `spent == 0` case never reaches
             // here). This makes `page_cap` always > 0.
-            if scan_budget_spent(spent, budget) {
+            if scan_budget_spent(st.spent, budget) {
                 return Ok((acc.into_streams(), true));
             }
-            let page_cap = budget.saturating_sub(spent); // now always > 0
-            let ks_lower = match cursor {
+            let page_cap = budget.saturating_sub(st.spent); // now always > 0
+            let ks_lower = match st.cursor {
                 None => super::sql::KeysetLower::First,
                 Some(c) => super::sql::KeysetLower::After {
                     tuple: c.tuple,
@@ -1125,86 +1147,45 @@ impl LogQlEngine {
                 ks_lower,
                 sp.direction,
                 &sp.line_filters,
-                page_size,
+                st.page_size,
             );
 
-            // Fetch and fully drain one page; `read_bytes` is meaningful
+            // Open, then stream-drain one page; `read_bytes` is meaningful
             // only after the drain (wait_end_of_query=1). Scoped so the
             // stream's pooled-connection lease releases before the next
             // page.
-            let mut rows: Vec<TailSampleRow> = Vec::new();
-            // Issue #35: `query_stream` now returns `Result<_, ReadError>`
+            //
+            // Issue #35: `query_stream` returns `Result<_, ReadError>`
             // directly (already mapped through `map_read_error` for a
-            // dispatch-time failure); per-row errors are still raw
-            // `ChError` from `ChRowStream::next()`, mapped explicitly below
-            // with the SAME `map_read_error(_, budget)` the dispatch-time
-            // path uses internally — so `page_result`'s `Err` is uniformly
-            // an already-mapped `ReadError` either way, preserving the
-            // first-page-vs-later-page branching below unchanged.
-            let page_result: Result<Option<u64>, ReadError> = async {
-                let mut stream = self
+            // dispatch-time failure); per-row errors are raw `ChError`
+            // from `ChRowStream::next()` and are mapped inside
+            // `absorb_page` with the SAME `map_read_error(_, budget)` —
+            // so both routes reach `classify_page_error` as an
+            // already-mapped `ReadError`, preserving the
+            // first-page-vs-later-page branch split unchanged.
+            let decision = {
+                let mut stream = match self
                     .query_stream::<TailSampleRow>(&sql, &self.paging_settings(page_cap))
-                    .await?;
-                while let Some(row) = stream.next().await {
-                    rows.push(row.map_err(|e| {
-                        map_read_error(e, budget, self.config.read_max_memory_bytes)
-                    })?);
-                }
-                Ok(stream.read_bytes())
-            }
-            .await;
-
-            let read = match page_result {
-                Ok(rb) => rb.unwrap_or(page_cap),
-                Err(mapped) => {
-                    if matches!(
-                        mapped,
-                        ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })
-                    ) {
-                        // Branch split on this positive-cap overflow:
-                        // `spent == 0` (first page) overflows the FULL budget
-                        // ⇒ propagate `QueryTooBroad` (a genuinely too-broad
-                        // query) — preserve the error the old single-scan
-                        // path raised; `spent > 0` (a
-                        // later page) ⇒ keep the survivors and signal partial
-                        // (best-effort, not a hard byte ceiling). The
-                        // budget-already-spent-before-issuing case is covered
-                        // by the top-of-loop guard, which never issues a zero
-                        // cap.
-                        if spent == 0 {
-                            return Err(mapped);
-                        }
-                        return Ok((acc.into_streams(), true));
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(mapped) => {
+                        let partial = classify_page_error(mapped, st.spent)?;
+                        return Ok((acc.into_streams(), partial));
                     }
-                    return Err(mapped);
-                }
+                };
+                st.absorb_page(
+                    &mut stream,
+                    |s| s.read_bytes(),
+                    |e| map_read_error(e, budget, self.config.read_max_memory_bytes),
+                    &mut acc,
+                    compiled,
+                )
+                .await
             };
-            spent = spent.saturating_add(read);
-
-            let fetched = u32::try_from(rows.len()).unwrap_or(u32::MAX);
-            cursor = advance_tail_cursor(cursor, &rows);
-            let sample_rows: Vec<SampleRow> = rows
-                .into_iter()
-                .map(|r| SampleRow {
-                    fingerprint: r.fingerprint,
-                    timestamp_ns: r.timestamp_ns,
-                    body: r.body,
-                    structured_metadata: r.structured_metadata,
-                })
-                .collect();
-            let filled = acc.feed(&sample_rows, compiled)?;
-
-            if filled {
-                // Result limit filled — a complete result, never partial.
-                return Ok((acc.into_streams(), false));
+            if let Some(terminal) = decision? {
+                return Ok((acc.into_streams(), terminal));
             }
-            if fetched < page_size {
-                // Fewer rows than asked ⇒ the window is exhausted — a
-                // complete result over the whole window, never partial.
-                return Ok((acc.into_streams(), false));
-            }
-            // Budget-spent-before-issuing is handled by the top-of-loop guard
-            // (which never issues a zero/unlimited cap); loop back to it.
         }
     }
 
@@ -3099,7 +3080,15 @@ impl LogQlEngine {
             fetch_limit,
         );
 
-        let mut rows: Vec<TailSampleRow> = Vec::new();
+        // Streamed, not staged (issue #312): a poll used to build a
+        // page-sized `Vec<TailSampleRow>` and re-materialise it into a
+        // second `Vec<SampleRow>`, both bounded only by
+        // `tail_max_fetch_limit` rows x the 64 MiB ingest cap. Rows are
+        // now charged and chunked as they arrive, and the cursor walks
+        // the raw page incrementally through the same
+        // [`TailCursorTracker`] the paged loops use.
+        let mut acc = StreamAccumulator::new(&meta, fetch_limit);
+        let mut tracker = TailCursorTracker::new();
         {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule).
@@ -3107,28 +3096,28 @@ impl LogQlEngine {
                 .query_stream::<TailSampleRow>(&sql, &self.budget_settings())
                 .await?;
             while let Some(row) = stream.next().await {
-                rows.push(row.map_err(|e| {
+                let row = row.map_err(|e| {
                     map_read_error(
                         e,
                         self.config.scan_budget_bytes,
                         self.config.read_max_memory_bytes,
                     )
-                })?);
+                })?;
+                tracker.observe(row.timestamp_ns, row.fingerprint, row.body_hash);
+                acc.push_row(
+                    SampleRow {
+                        fingerprint: row.fingerprint,
+                        timestamp_ns: row.timestamp_ns,
+                        body: row.body,
+                        structured_metadata: row.structured_metadata,
+                    },
+                    &setup.compiled,
+                )?;
             }
         }
-        let fetched = u32::try_from(rows.len()).unwrap_or(u32::MAX);
-        let next = advance_tail_cursor(prev, &rows);
-
-        let sample_rows: Vec<SampleRow> = rows
-            .into_iter()
-            .map(|r| SampleRow {
-                fingerprint: r.fingerprint,
-                timestamp_ns: r.timestamp_ns,
-                body: r.body,
-                structured_metadata: r.structured_metadata,
-            })
-            .collect();
-        let streams = run_pipeline_rows(sample_rows, &setup.compiled, &meta, fetch_limit)?;
+        acc.flush_chunk(&setup.compiled)?;
+        let (next, fetched) = tracker.finish(prev);
+        let streams = acc.into_streams();
         Ok(TailPage {
             streams,
             next,
@@ -3237,6 +3226,16 @@ fn merge_resolved(cache: &mut Vec<u64>, new: &[u64]) {
 /// adjacent under the total `ORDER BY` (raw `body` tiebreaker), so the
 /// trailing-run count is deterministic even under hash collisions. An
 /// empty page leaves the cursor unchanged.
+///
+/// **No production caller since issue #312** — every paged drain now
+/// walks its page incrementally through
+/// [`TailCursorTracker`](super::detected_probe::TailCursorTracker). This
+/// survives as that tracker's INDEPENDENT ORACLE: the already-committed
+/// `tail_cursor_tracker_matches_advance_tail_cursor_over_randomized_sequences`
+/// (`detected_probe.rs`) is what proves the tracker computes the same
+/// function, so deleting this as "dead code" would take the tracker's
+/// only independent check with it.
+#[cfg(test)]
 pub(in crate::logql) fn advance_tail_cursor(
     prev: Option<TailCursor>,
     rows: &[TailSampleRow],
@@ -3387,6 +3386,261 @@ impl From<super::pipeline::RowBudgetExceeded> for ReadError {
     }
 }
 
+/// The streams paging loop's per-page state (issue #312) — a structural
+/// sibling of [`DetectedPagedState`] (issue #244), so the two loops share
+/// one drain discipline instead of carrying two hand-written twins.
+#[derive(Debug)]
+pub(in crate::logql) struct StreamsPagedState {
+    pub(in crate::logql) cursor: Option<TailCursor>,
+    pub(in crate::logql) spent: u64,
+    pub(in crate::logql) page_size: u32,
+    pub(in crate::logql) budget: u64,
+}
+
+impl StreamsPagedState {
+    /// Drains ONE already-opened page to completion, charging and
+    /// chunking each row through `acc` as it arrives, then returns the
+    /// loop's decision: `Ok(None)` continue / `Ok(Some(false))`
+    /// terminate-COMPLETE / `Ok(Some(true))` terminate-PARTIAL / `Err`
+    /// propagate. The drain stops at the FIRST error — exactly what the
+    /// pre-#312 per-row `?` did. Generic over the stream AND its error so
+    /// the seam never names `ChError`.
+    ///
+    /// The staged chunk is flushed BEFORE the page's fate is decided, so
+    /// a mid-page `ScanBudgetBytes` breach keeps the rows that already
+    /// arrived; a result-budget breach raised by that flush propagates
+    /// rather than being downgraded to a partial.
+    pub(in crate::logql) async fn absorb_page<S, E>(
+        &mut self,
+        stream: &mut S,
+        read_bytes: impl FnOnce(&S) -> Option<u64>,
+        map_err: impl Fn(E) -> ReadError,
+        acc: &mut StreamAccumulator<'_>,
+        compiled: &super::pipeline::CompiledPipeline,
+    ) -> Result<Option<bool>, ReadError>
+    where
+        S: Stream<Item = Result<TailSampleRow, E>> + Unpin,
+    {
+        let mut tracker = TailCursorTracker::new();
+        let mut page_err: Option<ReadError> = None;
+        let mut filled = false;
+        while let Some(item) = stream.next().await {
+            let row = match item {
+                Ok(row) => row,
+                Err(e) => {
+                    page_err = Some(map_err(e));
+                    break;
+                }
+            };
+            // Advance over the RAW page, not survivors — a page entirely
+            // dropped by the pipeline must never stall the walk.
+            tracker.observe(row.timestamp_ns, row.fingerprint, row.body_hash);
+            match acc.push_row(
+                SampleRow {
+                    fingerprint: row.fingerprint,
+                    timestamp_ns: row.timestamp_ns,
+                    body: row.body,
+                    structured_metadata: row.structured_metadata,
+                },
+                compiled,
+            ) {
+                Ok(true) => filled = true,
+                Ok(false) => {}
+                Err(e) => {
+                    page_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let (cursor, fetched) = tracker.finish(self.cursor.take());
+        self.cursor = cursor;
+        // Feed and RELEASE whatever the drain staged before the page's
+        // fate is decided: a mid-page error keeps its prefix, and a
+        // result-budget refusal raised here is a hard 422 that
+        // `classify_page_error` must never see.
+        filled |= acc.flush_chunk(compiled)?;
+        if let Some(mapped) = page_err {
+            return classify_page_error(mapped, self.spent).map(Some);
+        }
+        let read = read_bytes(stream).unwrap_or_else(|| self.budget.saturating_sub(self.spent));
+        self.spent = self.spent.saturating_add(read);
+        if filled {
+            // Result limit filled — a complete result, never partial.
+            return Ok(Some(false));
+        }
+        if fetched < self.page_size {
+            // Fewer rows than asked ⇒ the window is exhausted — a
+            // complete result over the whole window, never partial.
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+}
+
+/// The line-filter-only fast path's RETENTION, factored out of
+/// [`LogQlEngine::run_streams_inner`] (issue #312) so its hermetic probe
+/// drives the shipped body rather than a transcription of it.
+///
+/// Zero-structured-metadata rows group by source fingerprint with
+/// `labels_json` verbatim; structured-metadata-bearing rows (issue #97)
+/// fan out through [`SmFanOutAccumulator`]. Rows are absorbed as they
+/// arrive — there is no staging on this path at all — and a row whose
+/// fingerprint is absent from `meta` is skipped, which is what the
+/// pre-#312 drain's `filter_map` did at the other end.
+#[derive(Debug, Default)]
+pub(in crate::logql) struct FastPathGroups {
+    by_fp: HashMap<u64, StreamResult>,
+    sm: SmFanOutAccumulator,
+}
+
+impl FastPathGroups {
+    pub(in crate::logql) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Charges the group on FIRST SIGHT of the fingerprint and the entry
+    /// before the body is retained, so neither the map entry nor the
+    /// entry exists when the cap refuses.
+    pub(in crate::logql) fn push_row(
+        &mut self,
+        row: SampleRow,
+        meta: &HashMap<u64, StreamMetaRow>,
+        budget: &mut StreamsResultBudget,
+    ) -> Result<(), ReadError> {
+        let Some(m) = meta.get(&row.fingerprint) else {
+            return Ok(());
+        };
+        if !row.structured_metadata.is_empty() {
+            return self.sm.push_row(&row, meta, budget);
+        }
+        match self.by_fp.entry(row.fingerprint) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                budget.charge_entry(row.body.len())?;
+                e.into_mut().entries.push((row.timestamp_ns, row.body));
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                budget.charge_group(&m.labels, &m.service)?;
+                budget.charge_entry(row.body.len())?;
+                e.insert(StreamResult {
+                    fingerprint: row.fingerprint,
+                    service: m.service.clone(),
+                    labels_json: m.labels.clone(),
+                    entries: vec![(row.timestamp_ns, row.body)],
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::logql) fn into_streams(self) -> Vec<StreamResult> {
+        let mut streams: Vec<StreamResult> = self.by_fp.into_values().collect();
+        streams.extend(self.sm.into_streams());
+        streams
+    }
+}
+
+/// The hermetic test seam for the issue #312 line-filter-only fast path —
+/// the [`DetectedFieldsProbe`](super::detected_probe::DetectedFieldsProbe)
+/// pattern. `#[doc(hidden)]`: consumed only by
+/// `tests/logql_streams_result_budget.rs`, never by callers.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StreamsFastPathProbe {
+    groups: FastPathGroups,
+    budget: StreamsResultBudget,
+}
+
+impl StreamsFastPathProbe {
+    pub fn with_cap(cap: u64) -> Self {
+        Self {
+            groups: FastPathGroups::new(),
+            budget: StreamsResultBudget::with_cap(cap),
+        }
+    }
+
+    /// One row through the REAL fast-path body.
+    pub fn push_row(
+        &mut self,
+        row: SampleRow,
+        meta: &HashMap<u64, StreamMetaRow>,
+    ) -> Result<(), ReadError> {
+        self.groups.push_row(row, meta, &mut self.budget)
+    }
+
+    pub fn charged(&self) -> u64 {
+        self.budget.charged()
+    }
+
+    pub fn staged(&self) -> u64 {
+        self.budget.staged()
+    }
+
+    pub fn into_streams(self) -> Vec<StreamResult> {
+        self.groups.into_streams()
+    }
+}
+
+/// The hermetic test seam for the issue #312 streaming paged loop — the
+/// [`DetectedFieldsProbe`](super::detected_probe::DetectedFieldsProbe)
+/// pattern, so the loop body under test is the SHIPPED one rather than a
+/// transcription of it. `#[doc(hidden)]`: consumed only by
+/// `tests/logql_streams_result_budget.rs`, never by callers.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StreamsPagedProbe {
+    state: StreamsPagedState,
+}
+
+impl StreamsPagedProbe {
+    pub fn new(page_size: u32, budget: u64) -> Self {
+        Self {
+            state: StreamsPagedState {
+                cursor: None,
+                spent: 0,
+                page_size,
+                budget,
+            },
+        }
+    }
+
+    /// Pretends `spent` bytes were already scanned — the "later page"
+    /// half of the #90 branch split.
+    pub fn with_spent(mut self, spent: u64) -> Self {
+        self.state.spent = spent;
+        self
+    }
+
+    pub fn spent(&self) -> u64 {
+        self.state.spent
+    }
+
+    pub fn cursor(&self) -> Option<TailCursor> {
+        self.state.cursor
+    }
+
+    /// One injected page through the REAL paged-loop body.
+    pub async fn absorb_page<S>(
+        &mut self,
+        stream: &mut S,
+        read_bytes: u64,
+        acc: &mut StreamAccumulator<'_>,
+        compiled: &super::pipeline::CompiledPipeline,
+    ) -> Result<Option<bool>, ReadError>
+    where
+        S: Stream<Item = Result<TailSampleRow, ReadError>> + Unpin,
+    {
+        self.state
+            .absorb_page(stream, |_| Some(read_bytes), |e| e, acc, compiled)
+            .await
+    }
+}
+
+/// The BYTES staged before one [`StreamAccumulator::feed`] — byte-
+/// denominated on purpose: a row count is exactly the proxy issue #312
+/// exists to reject. Peak staged retention is this plus at most one row,
+/// whatever the stream's length or the rows' size.
+pub const STREAM_FEED_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
 /// The stateful grouping/counting core of [`run_pipeline_rows`], extracted
 /// (issue #90) so the fetch-until-limit paging loop can stream multiple
 /// keyset pages through ONE accumulator: fan-out/transform grouping and
@@ -3414,10 +3668,22 @@ pub struct StreamAccumulator<'m> {
     fp_groups: HashMap<u64, StreamResult>,
     label_groups: HashMap<String, FanOutGroup>,
     survivors: u32,
+    /// The issue #312 peak-retention ledger — result charges plus the
+    /// outstanding staged chunk.
+    budget: StreamsResultBudget,
+    /// Rows staged between `feed` calls, bounded in BYTES by
+    /// [`STREAM_FEED_CHUNK_BYTES`] rather than by a row count — a row
+    /// count is exactly the proxy issue #312 exists to reject.
+    chunk: Vec<SampleRow>,
 }
 
 impl<'m> StreamAccumulator<'m> {
     pub fn new(meta: &'m HashMap<u64, StreamMetaRow>, result_limit: u32) -> Self {
+        Self::with_cap(meta, result_limit, MAX_STREAMS_RESULT_BYTES)
+    }
+
+    /// A test-visible ceiling; production sites call [`Self::new`].
+    pub fn with_cap(meta: &'m HashMap<u64, StreamMetaRow>, result_limit: u32, cap: u64) -> Self {
         let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
         for (fp, m) in meta {
             base_labels.insert(*fp, parse_flat_labels(&m.labels));
@@ -3429,7 +3695,67 @@ impl<'m> StreamAccumulator<'m> {
             fp_groups: HashMap::new(),
             label_groups: HashMap::new(),
             survivors: 0,
+            budget: StreamsResultBudget::with_cap(cap),
+            chunk: Vec::new(),
         }
+    }
+
+    /// Result bytes charged so far (issue #312).
+    pub fn charged(&self) -> u64 {
+        self.budget.charged()
+    }
+
+    /// Staged bytes outstanding right now (issue #312).
+    pub fn staged(&self) -> u64 {
+        self.budget.staged()
+    }
+
+    /// The shipped ceiling this accumulator was built with.
+    pub fn cap(&self) -> u64 {
+        self.budget.cap()
+    }
+
+    /// Stages ONE streamed row — charged IN FULL (body, structured
+    /// metadata and slot) before it is pushed — and feeds the chunk once
+    /// its staged bytes reach [`STREAM_FEED_CHUNK_BYTES`]. `true` ==
+    /// the result limit filled, so the caller can stop paging.
+    ///
+    /// This replaces the response-sized `Vec<SampleRow>` the streams
+    /// paths used to build (issue #312): peak staged bytes are bounded by
+    /// the chunk plus at most one row, never by the stream.
+    pub fn push_row(
+        &mut self,
+        row: SampleRow,
+        compiled: &super::pipeline::CompiledPipeline,
+    ) -> Result<bool, ReadError> {
+        self.budget
+            .charge_staged_row(row.body.len(), row.structured_metadata.len())?;
+        self.chunk.push(row);
+        if self.budget.staged() >= STREAM_FEED_CHUNK_BYTES {
+            return self.flush_chunk(compiled);
+        }
+        Ok(self.survivors >= self.result_limit)
+    }
+
+    /// Feeds and RELEASES the staged chunk. Must be called after the
+    /// drain — the staged charge is only sound if it is discharged when
+    /// the rows it paid for are dropped.
+    pub fn flush_chunk(
+        &mut self,
+        compiled: &super::pipeline::CompiledPipeline,
+    ) -> Result<bool, ReadError> {
+        if self.chunk.is_empty() {
+            self.budget.discharge_staged();
+            return Ok(self.survivors >= self.result_limit);
+        }
+        // Taken out so `feed`'s `&[SampleRow]` does not alias `self`;
+        // the buffer's capacity is handed back afterwards.
+        let mut chunk = std::mem::take(&mut self.chunk);
+        let filled = self.feed(&chunk, compiled);
+        chunk.clear();
+        self.chunk = chunk;
+        self.budget.discharge_staged();
+        filled
     }
 
     /// Feeds one page of rows in arrival (direction) order — arrival order
@@ -3448,6 +3774,11 @@ impl<'m> StreamAccumulator<'m> {
             fp_groups,
             label_groups,
             survivors,
+            budget,
+            // The staged chunk is `take`n by `flush_chunk` before it calls
+            // here, so `feed` never sees it. Named rather than elided so a
+            // future field is a build failure, not a silent omission.
+            chunk: _,
         } = self;
         let fan_out = compiled.mutates_labels();
         // One label scratch reused across every row of this page (issue
@@ -3503,22 +3834,35 @@ impl<'m> StreamAccumulator<'m> {
                     scratch.sort_unstable();
                     push_fanout_entry(
                         label_groups,
+                        budget,
                         &scratch,
                         row.timestamp_ns,
-                        line.into_owned(),
+                        line,
                         &m.service,
-                    );
+                    )?;
                 } else {
-                    fp_groups
-                        .entry(row.fingerprint)
-                        .or_insert_with(|| StreamResult {
-                            fingerprint: row.fingerprint,
-                            service: m.service.clone(),
-                            labels_json: m.labels.clone(),
-                            entries: Vec::new(),
-                        })
-                        .entries
-                        .push((row.timestamp_ns, line.into_owned()));
+                    // Issue #312: the group is charged on FIRST SIGHT of
+                    // the fingerprint and the entry before
+                    // `line.into_owned()`, so neither the map entry nor
+                    // the owned line exists when the cap refuses.
+                    match fp_groups.entry(row.fingerprint) {
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            budget.charge_entry(line.len())?;
+                            e.into_mut()
+                                .entries
+                                .push((row.timestamp_ns, line.into_owned()));
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            budget.charge_group(&m.labels, &m.service)?;
+                            budget.charge_entry(line.len())?;
+                            e.insert(StreamResult {
+                                fingerprint: row.fingerprint,
+                                service: m.service.clone(),
+                                labels_json: m.labels.clone(),
+                                entries: vec![(row.timestamp_ns, line.into_owned())],
+                            });
+                        }
+                    }
                 }
             } else {
                 // Structured-metadata-bearing row (issue #97): merge the
@@ -3543,6 +3887,7 @@ impl<'m> StreamAccumulator<'m> {
                     &merge_buf,
                     &sm_ctx,
                     label_groups,
+                    budget,
                     row.timestamp_ns,
                     &m.service,
                     sm_scratch,

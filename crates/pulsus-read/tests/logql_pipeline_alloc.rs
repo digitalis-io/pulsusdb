@@ -44,7 +44,7 @@ static ALLOCATOR: CountingAlloc = CountingAlloc;
 
 use std::borrow::Cow;
 
-use pulsus_read::logql::exec::run_pipeline_rows;
+use pulsus_read::logql::exec::{StreamAccumulator, run_pipeline_rows};
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::rows::{MetricScanRow, SampleRow, StreamMetaRow};
 use pulsus_read::logql::run_client_agg_rows;
@@ -99,6 +99,35 @@ fn count_assembly(
     let rows_clone = rows.to_vec(); // clone outside the window too
     let start = ALLOCS.load(Ordering::Relaxed);
     let out = run_pipeline_rows(rows_clone, &pipeline, meta, u32::MAX).expect("no budget breach");
+    let total = ALLOCS.load(Ordering::Relaxed) - start;
+    std::hint::black_box(&out);
+    total
+}
+
+/// Counts allocations across one full assembly over `rows` driven the way
+/// PRODUCTION drives it since issue #312 — `push_row` per streamed row,
+/// then one `flush_chunk` after the drain. Same accounting window shape
+/// as [`count_assembly`], so the two are directly comparable.
+fn count_streamed_assembly(
+    query: &str,
+    rows: &[SampleRow],
+    meta: &std::collections::HashMap<u64, StreamMetaRow>,
+) -> u64 {
+    let pipeline = compiled(query);
+    let drive = |rows: Vec<SampleRow>| -> Vec<pulsus_read::logql::StreamResult> {
+        let mut acc = StreamAccumulator::new(meta, u32::MAX);
+        for row in rows {
+            acc.push_row(row, &pipeline).expect("no budget breach");
+        }
+        acc.flush_chunk(&pipeline).expect("no budget breach");
+        acc.into_streams()
+    };
+    // Warm-up run (also proves the path is exercised).
+    let warm = drive(rows.to_vec());
+    assert!(!warm.is_empty(), "assembly fixture must produce output");
+    let rows_clone = rows.to_vec(); // clone outside the window too
+    let start = ALLOCS.load(Ordering::Relaxed);
+    let out = drive(rows_clone);
     let total = ALLOCS.load(Ordering::Relaxed) - start;
     std::hint::black_box(&out);
     total
@@ -417,6 +446,34 @@ fn per_row_allocation_bounds_hold() {
         "high-cardinality fan-out assembly: {total} allocations over {n} rows — must stay \
          <= 4.5 per row (a per-new-group key clone would push this past 5)"
     );
+
+    // --- Issue #312: the STREAMED shape must cost no more per row than
+    // --- the one-shot `run_pipeline_rows` it replaced. Production drains
+    // --- into `push_row` and calls `flush_chunk` once after the drain;
+    // --- the ledger arithmetic is allocation-free (a widen, a shift, a
+    // --- max, two saturating adds, a compare), and the chunk's own
+    // --- buffer is reused across flushes, so the only additional cost is
+    // --- `feed`'s five scratch buffers once per 8 MiB chunk.
+    //
+    // Stated as a DIFFERENCE against the same corpus through
+    // `run_pipeline_rows`, so the assembly's own inherent cost cancels
+    // and the gate is about the streaming restructure alone.
+    {
+        let n = assembly_rows.len() as u64;
+        for query in [
+            r#"{a="b"} | line_format "L={{.env}} {{.service_name}}" |= "L=prod""#,
+            r#"{a="b"} | logfmt"#,
+        ] {
+            let one_shot = count_assembly(query, &assembly_rows, &meta);
+            let streamed = count_streamed_assembly(query, &assembly_rows, &meta);
+            assert!(
+                streamed <= one_shot + ZERO_RESIDUE,
+                "{query}: the streamed push_row/flush_chunk path made {streamed} allocations \
+                 over {n} rows against {one_shot} for the one-shot feed over the SAME rows — \
+                 the issue #312 restructure must not add a per-row cost"
+            );
+        }
+    }
 
     // --- Issue #230: template-engine bounds. The pre-#230 `{{.label}}`
     // --- shapes keep their fast paths (`Simple`/`Parts` — asserted at

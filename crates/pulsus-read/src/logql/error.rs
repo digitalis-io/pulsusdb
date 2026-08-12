@@ -253,6 +253,13 @@ pub enum TooBroadReason {
     /// [`crate::querytext::ensure_query_text_fits`], never by a ClickHouse
     /// server error code.
     QueryTextBytes { rendered_bytes: u64, cap: u64 },
+    /// Issue #312: a streams query's PEAK retention — staged rows plus
+    /// the assembled result — exceeded
+    /// [`crate::logql::charge::MAX_STREAMS_RESULT_BYTES`]. Charged before
+    /// each retention, so the refused bytes are never allocated;
+    /// complete-or-error, never a truncated or partial streams response.
+    /// A Rust-side structural limit, never from a ClickHouse error code.
+    StreamsResultBytes { bytes: u64, cap: u64 },
     /// Issue #272: the iterative LogQL walkers' transient heap for this
     /// query would exceed
     /// [`crate::logql::MAX_LOGQL_WALK_TRANSIENT_BYTES`] — a Rust-side
@@ -578,6 +585,14 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "query would need up to {estimate} bytes of transient walker state, \
                      exceeding the {cap}-byte cap — shorten the query"
+                )
+            }
+            TooBroadReason::StreamsResultBytes { bytes, cap } => {
+                write!(
+                    f,
+                    "a streams result retained {bytes} bytes, exceeding the {cap}-byte result \
+                     budget — lower `limit`, narrow the time range, or shrink the line_format \
+                     output"
                 )
             }
             TooBroadReason::QueryTextBytes {

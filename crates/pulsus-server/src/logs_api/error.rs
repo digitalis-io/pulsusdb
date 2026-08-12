@@ -494,6 +494,26 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// Issue #312 AC-14: the streams result-budget reason rides the same
+    /// `QueryTooBroad(_)` wildcard arm — no mapper change was needed, and
+    /// this proves it, body included.
+    #[tokio::test]
+    async fn read_error_streams_result_bytes_maps_to_422() {
+        let err =
+            ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::StreamsResultBytes {
+                bytes: 1_073_741_825,
+                cap: pulsus_read::logql::MAX_STREAMS_RESULT_BYTES,
+            });
+        let expected = err.to_string();
+        let (status, body) = rendered(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, expected);
+        assert!(
+            body.contains("streams result retained 1073741825 bytes"),
+            "the 422 body must name the counter that refused: {body}"
+        );
+    }
+
     /// Issue #272: the walk-admission reason rides the same
     /// `QueryTooBroad(_)` wildcard — no mapper arm changes, and this
     /// proves it.

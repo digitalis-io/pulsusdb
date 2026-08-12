@@ -122,7 +122,8 @@ pub(crate) mod window;
 
 pub use charge::{
     MAX_CLIENT_AGG_GROUP_BYTES, MAX_LEAF_RETAINED_BYTES, MAX_METRIC_RESULT_POINTS,
-    MAX_QUERY_RETAINED_BYTES, ensure_result_series, result_series_breach,
+    MAX_QUERY_RETAINED_BYTES, MAX_STREAMS_RESULT_BYTES, RESULT_BUDGETS, ResultBudgets,
+    StreamsResultBudget, ensure_result_series, result_series_breach,
 };
 pub use client_agg::{run_client_agg_rows, run_client_agg_rows_folded};
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETECTED_FIELD_BYTES};
@@ -130,7 +131,8 @@ pub use detected_probe::{DetectedFieldsProbe, MAX_FEEDER_SCRATCH_BYTES};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
     EngineConfig, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine, LogStats,
-    MatrixSeries, PatternSeries, QueryResult, StreamResult, TAIL_REGISTRATION_GRACE_NS, TailCursor,
+    MatrixSeries, PatternSeries, QueryResult, STREAM_FEED_CHUNK_BYTES, StreamAccumulator,
+    StreamResult, StreamsFastPathProbe, StreamsPagedProbe, TAIL_REGISTRATION_GRACE_NS, TailCursor,
     TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
     final_series_gate_applies, read_query_settings, run_pipeline_rows,
 };
