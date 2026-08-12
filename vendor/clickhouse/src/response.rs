@@ -227,9 +227,20 @@ impl Chunks {
     fn new(stream: Incoming, compression: Compression, exception_tag: Option<Box<[u8]>>) -> Self {
         let stream = IncomingStream(stream);
         let stream = Decompress::new(stream, compression);
+        // PULSUSDB PATCH (issue #412): the anchor is built once per response,
+        // never per chunk.
+        let anchor = exception_tag.as_deref().map(|tag| {
+            let mut anchor = Vec::with_capacity(EXC_OPEN.len() + tag.len());
+            anchor.extend_from_slice(EXC_OPEN);
+            anchor.extend_from_slice(tag);
+            anchor.into_boxed_slice()
+        });
         let stream = DetectDbException {
             stream,
             exception_tag,
+            anchor,
+            pos: FramePos::default(),
+            eos: false,
         };
         Self {
             inner: Some(Box::new(stream)),
@@ -342,9 +353,72 @@ where
 
 // === DetectDbException ===
 
+// PULSUSDB PATCH (issue #412) -- see ../PATCHES.md §2.
+//
+// The opening of a tagged exception frame, without the tag. ClickHouse writes
+// the frame with its two ends in OPPOSITE field orders -- captured from a live
+// 26.3.17.110 HTTP-200 stream (body 15,960,999 bytes, tag `zgnglmkjouifsqby`):
+//
+// ```text
+// opening   \r\n__exception__\r\nzgnglmkjouifsqby\r\nCode: 395. DB::Exception: ...
+// closing   ...0 (official build))\n288 zgnglmkjouifsqby\r\n__exception__\r\n
+// ```
+//
+// `extract_exception_new`'s `strip_suffix` chain parses the CLOSING sequence
+// only, so it says nothing about the opening; reassembly has to detect where a
+// frame STARTS, which is `EXC_OPEN ++ tag`.
+const EXC_OPEN: &[u8] = b"\r\n__exception__\r\n";
+
+// The closing marker, which is also what upstream's `ends_with` arm keys on.
+const EXC_CLOSE: &[u8] = b"__exception__\r\n";
+
+// A memory bound on a frame that never terminates -- NOT a claim about any
+// size ClickHouse guarantees. The largest exception body measured on
+// 26.3.17.110 was 100,334 bytes (`SELECT throwIf(1, repeat('x', 100000))`), so
+// this is roughly 167x that. Crossing it fails the stream with `Error::Other`
+// and drops the buffered bytes; that path was not reproducible against a real
+// server.
+const EXC_FRAME_CAP: usize = 16 * 1024 * 1024;
+
+/// Where the reassembler is inside a tagged exception frame.
+///
+/// Only reachable when the server declared `X-ClickHouse-Exception-Tag`; an
+/// untagged response never leaves `Idle`.
+#[derive(Default)]
+enum FramePos {
+    /// No frame open. Chunks are result data unless they carry the anchor.
+    #[default]
+    Idle,
+    /// The tail of the previous chunk is a proper prefix of the anchor and
+    /// nothing else yet, so the anchor may be straddling the boundary. At most
+    /// `anchor.len() - 1` bytes.
+    Maybe(Vec<u8>),
+    /// The anchor matched; accumulating until the closing marker.
+    Frame(Vec<u8>),
+}
+
+/// What `poll_next` should do with the chunk it was just handed.
+enum Action {
+    /// Deliver these bytes to the caller as result data.
+    Data(Chunk),
+    /// The bytes were withheld (buffered); poll the inner stream again.
+    Buffer,
+    /// Fail the stream.
+    Fail(Error),
+}
+
 struct DetectDbException<S> {
     stream: S,
     exception_tag: Option<Box<[u8]>>,
+    // PULSUSDB PATCH (issue #412): `EXC_OPEN ++ tag`, built ONCE in
+    // `Chunks::new` -- never per chunk, which would be a 33-byte allocation on
+    // the hot read path. `None` exactly when `exception_tag` is `None`.
+    anchor: Option<Box<[u8]>>,
+    pos: FramePos,
+    // Set when the inner stream has ended, so a final `Maybe` flush can be
+    // delivered as one more `Ready(Some(Ok(_)))` without re-polling an
+    // exhausted stream on the following call.
+    eos: bool,
 }
 
 impl<S> Stream for DetectDbException<S>
@@ -354,32 +428,257 @@ where
     type Item = Result<Chunk>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let res = Pin::new(&mut self.stream).poll_next(cx);
+        loop {
+            if self.eos {
+                return Poll::Ready(None);
+            }
 
-        if let Poll::Ready(Some(Ok(chunk))) = &res
-            && let Some(err) = extract_exception(&chunk.data, self.exception_tag.as_deref())
-        {
-            err.record_in_current_span("response error");
-            return Poll::Ready(Some(Err(err)));
+            let res = Pin::new(&mut self.stream).poll_next(cx);
+
+            let chunk = match res {
+                Poll::Ready(Some(Ok(chunk))) => chunk,
+                Poll::Ready(None) => {
+                    // PULSUSDB PATCH (issue #412): settle whatever was withheld.
+                    self.eos = true;
+                    let this = &mut *self;
+                    let Some(action) = on_end_of_stream(&mut this.pos, this.anchor.as_deref())
+                    else {
+                        return Poll::Ready(None);
+                    };
+                    return match action {
+                        Action::Data(chunk) => Poll::Ready(Some(Ok(chunk))),
+                        Action::Fail(err) => {
+                            err.record_in_current_span("response error");
+                            Poll::Ready(Some(Err(err)))
+                        }
+                        Action::Buffer => Poll::Ready(None),
+                    };
+                }
+                other => return other,
+            };
+
+            let this = &mut *self;
+            // PULSUSDB PATCH (issue #412): the untagged path is upstream's,
+            // byte for byte. It is the only signal a pre-25.11 server (or a
+            // header-stripping proxy) gives, and it is reachable on `main` --
+            // `PULSUS_SKIP_DDL` skips the version gate in `run_init`
+            // (`crates/pulsus-server/src/serve.rs:645-685`,
+            // `crates/pulsus-schema/src/controller.rs:84-100`).
+            let (Some(tag), Some(anchor)) = (this.exception_tag.as_deref(), this.anchor.as_deref())
+            else {
+                if let Some(err) = extract_exception(&chunk.data, None) {
+                    err.record_in_current_span("response error");
+                    return Poll::Ready(Some(Err(err)));
+                }
+                return Poll::Ready(Some(Ok(chunk)));
+            };
+
+            match consume(&mut this.pos, chunk, anchor, tag) {
+                Action::Data(chunk) => return Poll::Ready(Some(Ok(chunk))),
+                Action::Buffer => continue,
+                Action::Fail(err) => {
+                    err.record_in_current_span("response error");
+                    return Poll::Ready(Some(Err(err)));
+                }
+            }
         }
+    }
+}
 
-        res
+// PULSUSDB PATCH (issue #412) -- see ../PATCHES.md §2.
+//
+// Decides what to do with one decompressed chunk on a TAGGED response.
+//
+// A free function, not a method: `self.exception_tag` / `self.anchor` and
+// `&mut self.pos` cannot be borrowed together through a `Pin<&mut Self>`.
+fn consume(pos: &mut FramePos, chunk: Chunk, anchor: &[u8], tag: &[u8]) -> Action {
+    match pos {
+        FramePos::Frame(buf) => {
+            buf.extend_from_slice(&chunk.data);
+            close_or_buffer(pos, tag)
+        }
+        FramePos::Maybe(prev) => {
+            // The withheld tail is at most `anchor.len() - 1` bytes and is a
+            // proper prefix of the anchor, so joining is the only way to see
+            // an anchor that straddles the boundary. The copy costs one
+            // chunk-sized memcpy and happens only when the previous chunk
+            // ended with `\r`, `\r\n`, `\r\n_`, ... -- rare, and bounded.
+            let mut joined = std::mem::take(prev);
+            joined.extend_from_slice(&chunk.data);
+            *pos = FramePos::Idle;
+            scan(pos, Bytes::from(joined), chunk.net_size, anchor, tag)
+        }
+        FramePos::Idle => {
+            // Upstream's arm, unchanged and still first: a chunk that ENDS
+            // with the closing marker carries the whole frame (or its tail),
+            // and `extract_exception_new` slices it by the server-declared
+            // length. Only when that finds nothing do we look for an opening.
+            if chunk.data.ends_with(EXC_CLOSE)
+                && let Some(err) = extract_exception_new(&chunk.data, tag)
+            {
+                return Action::Fail(err);
+            }
+            scan(pos, chunk.data, chunk.net_size, anchor, tag)
+        }
+    }
+}
+
+// PULSUSDB PATCH (issue #412): the anchor may begin at ANY offset in `data`.
+//
+// Checking only offset 0 carries the same shape as the defect being fixed -- a
+// check that inspects one position -- and measured on the hermetic mock, a
+// frame opening appended after result data in one chunk then closing in the
+// next was NOT recognised by a `starts_with` design (4 garbage rows, then
+// `not enough data...`).
+//
+// `net_size` is the SOURCE block's compressed size, so when a chunk is split
+// the whole of it is attributed to the emitted prefix; a chunk withheld in
+// full contributes nothing. It feeds `RawCursor::received_bytes`, which is
+// tracing only and has no caller in this workspace.
+fn scan(pos: &mut FramePos, data: Bytes, net_size: usize, anchor: &[u8], tag: &[u8]) -> Action {
+    if let Some(i) = data.find(anchor) {
+        *pos = FramePos::Frame(data[i..].to_vec());
+        let act = close_or_buffer(pos, tag);
+        // Rows that arrived ahead of the frame are delivered, not discarded.
+        // (The `ends_with` arm above does discard its whole chunk; that
+        // asymmetry is upstream's and is left alone.)
+        if i > 0 && matches!(act, Action::Buffer) {
+            return Action::Data(Chunk {
+                data: data.slice(..i),
+                net_size,
+            });
+        }
+        return act;
+    }
+
+    // Longest suffix of `data` that is a proper prefix of `anchor`: at most
+    // `anchor.len() - 1` comparisons, so the anchor cannot hide in a straddle.
+    let k = straddle_len(&data, anchor);
+    if k > 0 {
+        let split = data.len() - k;
+        *pos = FramePos::Maybe(data[split..].to_vec());
+        return if split > 0 {
+            Action::Data(Chunk {
+                data: data.slice(..split),
+                net_size,
+            })
+        } else {
+            Action::Buffer
+        };
+    }
+
+    Action::Data(Chunk { data, net_size })
+}
+
+// PULSUSDB PATCH (issue #412): close the buffered frame, or keep buffering.
+fn close_or_buffer(pos: &mut FramePos, tag: &[u8]) -> Action {
+    let FramePos::Frame(buf) = pos else {
+        // Unreachable: every caller sets `Frame` first. Treated as "keep
+        // going" rather than panicking inside a stream poll.
+        return Action::Buffer;
+    };
+
+    if buf.ends_with(EXC_CLOSE) {
+        let err = extract_exception_new(buf, tag).unwrap_or_else(|| {
+            Error::Other(
+                format!(
+                    "found a tagged exception frame in response but could not parse it (frame len: {})",
+                    buf.len()
+                )
+                .into(),
+            )
+        });
+        *pos = FramePos::Idle;
+        return Action::Fail(err);
+    }
+
+    if buf.len() > EXC_FRAME_CAP {
+        let len = buf.len();
+        *pos = FramePos::Idle;
+        return Action::Fail(Error::Other(
+            format!(
+                "a tagged exception frame exceeded {EXC_FRAME_CAP} bytes without terminating \
+                 (buffered: {len})"
+            )
+            .into(),
+        ));
+    }
+
+    Action::Buffer
+}
+
+// PULSUSDB PATCH (issue #412): the longest `k` in `1..anchor.len()` with
+// `data` ending in `anchor[..k]`. `0` when no suffix of `data` is a proper
+// prefix of `anchor`.
+fn straddle_len(data: &[u8], anchor: &[u8]) -> usize {
+    let max = anchor.len().saturating_sub(1).min(data.len());
+    (1..=max)
+        .rev()
+        .find(|&k| data.ends_with(&anchor[..k]))
+        .unwrap_or(0)
+}
+
+// PULSUSDB PATCH (issue #412): what happens to bytes still withheld when the
+// stream ends. Three outcomes, all deliberate -- see ../PATCHES.md §2.
+fn on_end_of_stream(pos: &mut FramePos, anchor: Option<&[u8]>) -> Option<Action> {
+    match std::mem::take(pos) {
+        FramePos::Idle => None,
+        // A straddle that never became an anchor is result data.
+        FramePos::Maybe(buf) => {
+            let net_size = buf.len();
+            Some(Action::Data(Chunk {
+                data: Bytes::from(buf),
+                net_size,
+            }))
+        }
+        // A started frame NEVER ends as `Ok`: the anchor matched, so the tag
+        // matched, and a truncated exception is the only shape that produces
+        // one on a healthy server. The anchor and the `\r\n` after it are
+        // stripped so byte 0 is the server's own `Code: N` and the caller's
+        // code parse classifies it correctly. The tail of a partial trailer
+        // may still be attached to the description -- lossy there, exact in
+        // the code, and preferable to dropping the error.
+        FramePos::Frame(buf) => {
+            let msg = match anchor {
+                Some(anchor) => buf
+                    .strip_prefix(anchor)
+                    .map(|rest| rest.strip_prefix(b"\r\n".as_slice()).unwrap_or(rest))
+                    .unwrap_or(&buf),
+                None => &buf,
+            };
+            Some(Action::Fail(Error::BadResponse(
+                String::from_utf8_lossy(msg).trim().into(),
+            )))
+        }
     }
 }
 
 fn extract_exception(chunk: &[u8], tag: Option<&[u8]>) -> Option<Error> {
     // 25.11 introduced a new exception tagging format that's incompatible with the previous
     // https://github.com/ClickHouse/clickhouse-rs/issues/359
-    if let Some(tag) = tag
-        && chunk.ends_with(b"__exception__\r\n")
-    {
-        extract_exception_new(chunk, tag)
-    } else if chunk.ends_with(b"))\n") {
-        // `))\n` is very rare in real data, so it's fast dirty check.
-        // In random data, it occurs with a probability of ~6*10^-8 only.
-        extract_exception_old(chunk)
-    } else {
-        None
+    //
+    // PULSUSDB PATCH (issue #412): the tag, not the shape of the current
+    // chunk, decides which channel is believed. Upstream falls through to
+    // `extract_exception_old` on ANY chunk ending `))\n`, including on a
+    // tagged response -- and result bytes are tenant data, so a stored
+    // ClickHouse error message ending `))\n` fabricates a `Code: 210` on a
+    // query that SUCCEEDED (measured: `rows=0` where the server returned
+    // 200 000 rows). 210 is retryable, so the fabricated failure is retried
+    // and demotes a healthy endpoint via `report_transport_failure`.
+    match tag {
+        // The server declared an exception tag, so every exception it raises
+        // arrives inside `<open><tag>\r\n<msg>\n<len> <tag><close>`, sliced by
+        // declared length. Result bytes are never searched.
+        Some(tag) if chunk.ends_with(EXC_CLOSE) => extract_exception_new(chunk, tag),
+        Some(_) => None,
+        // No tag: pre-25.11 server, or a proxy that dropped the header. The
+        // text search is then the only signal there is -- see ../PATCHES.md.
+        None if chunk.ends_with(b"))\n") => {
+            // `))\n` is very rare in real data, so it's fast dirty check.
+            // In random data, it occurs with a probability of ~6*10^-8 only.
+            extract_exception_old(chunk)
+        }
+        None => None,
     }
 }
 

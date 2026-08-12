@@ -3814,14 +3814,17 @@ fn scan_budget_spent(spent: u64, budget: u64) -> bool {
 /// [`ReadError::Clickhouse`] passthrough — never reinterpreted as a
 /// timeout or vice versa.
 ///
-/// **The #412 rule.** `ChError::Server.code` is parsed out of the
-/// exception TEXT, and a user-supplied regex can reach that text, so the
-/// code is spoofable (issue #412). **#376's move to 26.3 narrows this and
-/// does NOT close it** — the final-chunk path is sound there, but
-/// `extract_exception` runs per chunk and a non-final chunk ending `))\n`
-/// still reaches the forgeable search, so #412 stays open on the version we
-/// run. The classification here is designed
-/// so a wrong code can never make anything worse:
+/// **The #412 rule.** `ChError::Server.code` used to be parsed out of the
+/// exception TEXT on the streaming path, and tenant bytes reach that text, so
+/// the code was spoofable. Issue #412 closed that on any server that declares
+/// `X-ClickHouse-Exception-Tag` — 26.3, our floor — by never searching result
+/// bytes there and slicing the exception out of its tagged frame by declared
+/// length (`vendor/clickhouse/PATCHES.md` §2). The search survives only for an
+/// **untagged** server (pre-25.11, or a header-stripping proxy), where it is
+/// the only signal there is; that arm is documented as forgeable.
+///
+/// This mapper needed no edit for that, and the reasoning below is why — it is
+/// designed so a wrong code can never make anything worse:
 ///
 /// 1. The BOUND is not the parse — `max_memory_usage` is enforced by
 ///    ClickHouse whether or not we read the code correctly, so a spoofed
@@ -3835,7 +3838,8 @@ fn scan_budget_spent(spent: u64, budget: u64) -> bool {
 ///    `execute` retries, and only for idempotent DDL), so a spoofed
 ///    *retryable* code cannot re-execute a memory-exhausting read.
 /// 5. This function is a pure function of the already-parsed `code` field
-///    and never re-inspects `message`, so it inherits #412's fix for free.
+///    and never re-inspects `message`, so it inherited #412's fix with no
+///    edit here.
 fn map_read_error(e: ChError, budget_bytes: u64, read_max_memory_bytes: u64) -> ReadError {
     if let ChError::Server { code, .. } = &e {
         if *code == CODE_TOO_MANY_BYTES {
@@ -4244,8 +4248,9 @@ mod tests {
     ///   forged `Code: 241` — the exact #412 spoof shape, measured live on
     ///   24.8.14.39 — does NOT become a memory refusal.
     ///
-    /// Together these pin that when #412 replaces the exception-code parse
-    /// the classification here becomes sound with no edit to this file.
+    /// Together these pinned that when #412 replaced the exception-code parse
+    /// the classification here would become sound with no edit to this file.
+    /// It did, and there was none.
     #[test]
     fn logql_read_memory_classification_reads_only_the_server_code() {
         let bare = ChError::Server {

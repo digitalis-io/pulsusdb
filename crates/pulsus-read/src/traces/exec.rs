@@ -537,7 +537,9 @@ fn map_trace_metrics_error(e: ChError, config: &TraceReadConfig) -> ReadError {
 /// BOUND is enforced by ClickHouse regardless of how the code was parsed,
 /// a missed 241 falls open to the pre-#398 `500`, a false 241 only
 /// relabels an already-failing query, and this mapper reads only the
-/// already-parsed `code` field so it inherits #412's fix for free.
+/// already-parsed `code` field — so it inherited #412's fix with no edit
+/// here when the streaming path stopped searching result bytes on a tagged
+/// response (`vendor/clickhouse/PATCHES.md` §2).
 fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     if let ChError::Server { code, .. } = &e {
         match *code {
