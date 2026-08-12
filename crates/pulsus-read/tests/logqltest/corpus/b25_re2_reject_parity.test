@@ -1,0 +1,158 @@
+# b25_re2_reject_parity.test — issue #400 Stage 2: the patterns the
+# reference REFUSES and PulsusDB served. Stage 1 closed the half where a
+# string escape made us read a different pattern; this file pins the half
+# where a REGEX construct did — `a**` read as `(a*)*` (matches every
+# line), `[[:foo:]]` read as a class of `:`/`f`/`o`.
+#
+# Every status below was measured on the pinned reference,
+# grafana/loki:3.7.4, image digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc,
+# booted on `ci/logql/config.yaml` with no delta of its own, as container
+# `pulsus-c400-loki` on port 13400, 2026-08-12. Captured over
+# `/loki/api/v1/query_range` with a window ending at `now`, from exactly
+# the query text committed below; `detected_level` stripped per
+# PROVENANCE.md.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.)
+#
+# THE RULE, read from the reference rather than inferred from these rows
+# (grafana/loki @ v3.7.4, b318f2829f0ae2094ab3a1e90780450e9e4b03be, whose
+# `go.mod` names go1.26.5). Each row's construct, with the error the
+# reference's vendored parser raises and where:
+#
+#   a**            ErrInvalidRepeatOp    vendor/github.com/grafana/regexp/syntax/parse.go:414
+#   a{1001}        ErrInvalidRepeatSize  parse.go:436 (maxRepeat = 1000)
+#   (?x)a (?R)a    ErrInvalidPerlOp      parse.go:1253 — `parsePerlFlags` takes
+#                                        `i m s U - : )` and nothing else
+#   \u{263A}       ErrInvalidEscape      parse.go:1559 — RE2 has no `\u`/`\U`
+#   \U0001F600
+#   [[:foo:]]      ErrInvalidCharRange   parse.go:1610 — `posixGroup` is the fixed
+#   [a[:zzz:]]                           fourteen names of perl_groups.go:105-134,
+#   [[:^foo:]]                           each with a `^` form
+#   \p{Alphabetic}  ErrInvalidCharRange   parse.go:1707 — `unicodeTable` is `"Any"`
+#                                        plus `unicode.Categories` plus
+#                                        `unicode.Scripts`, 202 names, and
+#                                        nothing else
+#   [a--b]         ErrInvalidCharRange   parse.go:1815 — `a--` is the RANGE
+#                                        `a`..`-`, whose end is below its start
+#   (?P<n.x>a)     ErrInvalidNamedCapture parse.go:1185 — `isValidCaptureName`
+#                                        is `[A-Za-z0-9_]+`
+#
+# The Rust `regex` crate compiles every one of them, which is why they
+# were served here. What it compiles them AS is pinned over eleven
+# subjects by `crates/pulsus-re2/tests/re2_reject_classes.rs`'s
+# `the_rust_crate_reads_these_as_a_different_pattern`.
+#
+# THE `msg:` TEXT IS PULSUSDB'S OWN. Only the STATUS is claimed against
+# the reference (owner ruling on #246, 2026-07-26 and 2026-08-08): every
+# row below is a 400 on both sides, and neither the wording nor the
+# quoted sub-expression is matched. Ours names the CONSTRUCT because a
+# `bool` pre-check has no engine error to quote.
+#
+# `| decolorize` IS LOAD-BEARING ON EVERY ROW and not decoration. A line
+# filter sitting directly on the selector is PUSHED DOWN to SQL, so
+# `CompiledPipeline::compile` skips it (`pipeline.rs`'s `compile_stage`
+# returns `Ok(None)` for a pushable filter) and this runner — which
+# executes the pipeline and no SQL — would return every loaded line
+# whatever the pattern says. Written without it, the `eval_fail` rows
+# below would not fail before this change either, and the file would
+# measure nothing. That is Stage 1's finding, applied here. `| decolorize`
+# is a no-op on these bodies (no ANSI escapes) and clears the pushdown.
+#
+# WHY TWO `eval` ROWS AND NOT MORE. This file's slot budget is two
+# permanent reachable rows (`logqltest_replay.rs`'s `REACHABLE` /
+# `SLOT_SECS` / `FIRST_SLOT_AGE`); `eval_fail` rows are not reachable and
+# cost none. The two are chosen as the BOUNDARY of two rules rather than
+# as examples: `[[:alnum:]]` is a POSIX name that IS in `posixGroup` and
+# `a{999}` a bound that IS under `maxRepeat`, so a rule that over-reached
+# by one — the whole `[[:` prefix, or `>= 999` — turns each into an
+# `eval_fail` and this file goes red.
+
+load
+  {app="rj", service_name="rj400"}
+  0s   alnum123
+  5s   ---
+  10s  aaa
+
+# CONTROL 1 — an accepted POSIX class name. Also the row that proves the
+# runner SELECTS: `---` carries no alphanumeric and is absent.
+eval instant at 60s {service_name="rj400"} | decolorize |~ "[[:alnum:]]"
+  {app="rj", service_name="rj400"} 0s alnum123
+  {app="rj", service_name="rj400"} 10s aaa
+
+# CONTROL 2 — a repetition bound at the limit. `maxRepeat` is 1000 and
+# the bound is 999, so the reference SERVES it: measured `200` with an
+# empty result on the capture container, which is the point (a rejection
+# would be an `eval_fail` row, and `a{1001}` below is one). No line here
+# carries 999 consecutive `a`s, so an empty answer is the correct one.
+eval instant at 60s {service_name="rj400"} | decolorize |~ "a{999}"
+
+# --- The nine that moved. Each is `400` at the reference and was `200`
+#     here before this change, returning the lines its MISREADING
+#     selected.
+
+# A repetition applied to a repetition. The Rust crate reads `a**` as
+# `(a*)*`, which matches every subject including the empty string — so
+# this row used to return all three loaded lines.
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "a**"
+  msg: a repetition applied to a repetition
+
+# A bound above `maxRepeat`.
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "a{1001}"
+  msg: a repetition bound above RE2's limit of 1000
+
+# Group flags RE2 does not have. `{u, x, R}` is exactly the Rust-valid
+# minus RE2-valid flag set; `(?i)`, `(?U)` and `(?ms)` are RE2's own and
+# are untouched.
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "(?x)a"
+  msg: a `(?x`/`(?u`/`(?R` group flag RE2 does not have
+
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "(?R)a"
+  msg: a `(?x`/`(?u`/`(?R` group flag RE2 does not have
+
+# `\u`/`\U` escapes. **The doubled backslash is the whole point of these
+# two rows**: `"\\u{263A}"` decodes to the six-character REGEX BODY
+# `\u{263A}`, which reaches the regex parser — where b24's `"\u{263A}"`
+# is refused by the LEXER before any parser sees it. Same text, two
+# different rules, and only this spelling exercises rule (d).
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "\\u{263A}"
+  msg: a `\u`/`\U` escape RE2 does not have
+
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "\\U0001F600"
+  msg: a `\u`/`\U` escape RE2 does not have
+
+# POSIX class names outside `posixGroup`. The Rust crate reads
+# `[[:foo:]]` as a nested class of the literal members `:`, `f`, `o`.
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "[[:foo:]]"
+  msg: an unrecognised POSIX character class name
+
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "[a[:zzz:]]"
+  msg: an unrecognised POSIX character class name
+
+# The `^` form of an unknown name. `[[:^alpha:]]` IS in `posixGroup` and
+# is served (asserted in `re2_reject_classes.rs`'s control set), so this
+# row separates "the name is unknown" from "the `^` form is unknown".
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "[[:^foo:]]"
+  msg: an unrecognised POSIX character class name
+
+# A Unicode property name outside `unicodeTable`'s 202. `\p{L}` and
+# `\p{LC}` are IN it and are served.
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "\\p{Alphabetic}"
+  msg: an unrecognised Unicode property name
+
+# `a--` is the RANGE `a`..`-`, not a literal double dash. `[!--b]`,
+# `[--a]` and `[\w--a]` are all `200` at the reference and reach no rule —
+# eleven such shapes are asserted in
+# `re2_reject_classes.rs::rule_g_is_the_range_rule_and_not_a_double_dash_rule`.
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "[a--b]"
+  msg: a character-class range whose end is below its start
+
+# A capture name outside `[A-Za-z0-9_]`. NOT one of the eighteen classes
+# #400 was filed with — found by sweeping the frozen corpus. Its
+# Direction-A twin `(?P<1n>a)` is `200` at the reference (Go's own
+# comment: "Python rejects names starting with digits. We don't enforce
+# either of those") and must NOT be refused here; that is Class E, and it
+# is a `PATTERNS` row in `logql_regex_accept_matrix.rs`.
+eval_fail instant at 60s {service_name="rj400"} | decolorize |~ "(?P<n.x>a)"
+  msg: a capture name outside [A-Za-z0-9_]

@@ -291,9 +291,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "unicode-property",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u5",
@@ -302,9 +301,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "over-max-repeat",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u6",
@@ -313,9 +311,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "repetition-of-repetition",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "nil-r1",
@@ -910,9 +907,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "rust-only-escape",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u13",
@@ -921,9 +917,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "rust-only-escape",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u14",
@@ -952,9 +947,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "unicode-property",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u17",
@@ -973,9 +967,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "nonportable-group-head",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u19",
@@ -984,9 +977,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "nonportable-group-head",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u20",
@@ -1006,9 +998,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "repetition-of-repetition",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u22",
@@ -1017,9 +1008,8 @@
    "route": "search-query",
    "tempo_status": 400,
    "tempo": "reject",
-   "pulsus": "accept",
-   "unknown_class": "repetition-of-repetition",
-   "divergence": "traceql-validate-re2-unknown-residual"
+   "pulsus": "reject",
+   "error_variant": "invalid-regex"
   },
   {
    "id": "rx-u23",

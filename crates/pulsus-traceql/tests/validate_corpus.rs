@@ -103,22 +103,45 @@ fn implemented_checks() -> Vec<&'static str> {
 /// class into the vectors and ledgered
 /// (`traceql-validate-re2-unknown-residual`, owner #336).
 const UNKNOWN_CLASSES: &[&str] = &[
-    // scan: the escape check, bare or inside a class
+    // scan: the escape check, bare or inside a class. **`rust-only-escape`
+    // retired with #400 Stage 2** — rule (d) refuses every `\u`/`\U`
+    // spelling, so the class has no `Unknown` member left.
+    // `unicode-property` survives on the half of it that is IN
+    // `unicodeTable`.
     "unicode-property",
-    "rust-only-escape",
     "boundary-escape",
     "trailing-backslash",
     // scan: non-portable `(?…` group heads
     "lookaround",
     "named-group",
     "nonportable-group-head",
-    // scan: repetition shape/bounds
-    "repetition-of-repetition",
-    "over-max-repeat",
     // compile: Rust rejects inside RE2's accept set, or its own budget
     "literal-quoting",
     "octal-escape",
     "compiled-too-big",
+];
+
+/// **The ten vectors #400 Stage 2 moved `pulsus: accept -> reject`**, and
+/// the direction assertion that makes a move the OTHER way red rather
+/// than merely reviewable.
+///
+/// `pulsus_traceql::validate`'s `check_regex` consumes
+/// `pulsus_re2::re2_verdict`, which now consults
+/// `re2_definitely_rejects` first. Every vector below already recorded
+/// `tempo: reject, tempo_status: 400`, so every move is toward parity —
+/// provable from committed data, with no container. A row that moved
+/// while Tempo SERVES it would be a regression, and this list plus the
+/// assertion in [`every_vector_reproduces_its_recorded_pulsus_verdict`]
+/// is what says so.
+///
+/// Three `UNKNOWN_CLASSES` retired with them, because every member moved:
+/// `repetition-of-repetition` (rx-u6, rx-u21, rx-u22), `over-max-repeat`
+/// (rx-u5) and `rust-only-escape` (rx-u12, rx-u13). `unicode-property`
+/// survives on rx-u17 (`\p{L}` — the name IS in `unicodeTable`, so both
+/// engines serve it) and `nonportable-group-head` on rx-u20 (`(?#c)a` —
+/// `#` is not one of the `{u, x, R}` flags rule (c) claims).
+const MOVED_BY_400_STAGE2: &[&str] = &[
+    "rx-u4", "rx-u5", "rx-u6", "rx-u12", "rx-u13", "rx-u16", "rx-u18", "rx-u19", "rx-u21", "rx-u22",
 ];
 
 #[test]
@@ -167,6 +190,32 @@ fn every_vector_reproduces_its_recorded_pulsus_verdict() {
             ("accept", 200..=299) | ("reject", 400) => {}
             (t, s) => panic!("{}: tempo={t:?} disagrees with tempo_status={s}", v.id),
         }
+    }
+    // Issue #400 Stage 2, criterion 17: the DIRECTION of the ten moved
+    // rows. Every one must be a rejection that Tempo also rejects — a
+    // vector that moved to `reject` while Tempo serves it is a
+    // regression wearing the same shape as a fix.
+    for id in MOVED_BY_400_STAGE2 {
+        let v = doc
+            .vectors
+            .iter()
+            .find(|v| v.id == *id)
+            .unwrap_or_else(|| panic!("{id}: moved vector is gone from the corpus"));
+        assert_eq!(v.pulsus, "reject", "{id}: must be a rejection here");
+        assert_eq!(
+            v.tempo, "reject",
+            "{id}: PulsusDB refuses this and Tempo SERVES it — the move was away from parity"
+        );
+        assert_eq!(v.tempo_status, 400, "{id}");
+        assert_eq!(
+            v.error_variant.as_deref(),
+            Some("invalid-regex"),
+            "{id}: the rejection must come from the regex check, not another rule"
+        );
+        assert!(
+            v.divergence.is_none() && v.unknown_class.is_none(),
+            "{id}: both sides reject it now, so it is neither a divergence nor an `Unknown`              residual — leaving either field would keep a retired class alive"
+        );
     }
 }
 

@@ -153,6 +153,21 @@ impl LabelReplaceSpec {
         src: &str,
         regex: &str,
     ) -> Result<Self, ReadError> {
+        // Issue #400 Stage 2: the pre-check takes the UNREWRITTEN
+        // argument, and takes it BEFORE the rewrite. `re2_pattern_to_rust`
+        // exists to give the Rust crate RE2's reading of a pattern both
+        // engines accept; asking it about a pattern RE2 REFUSES would
+        // decide the question against a string the user never wrote.
+        // (Two of the rewrite's own outputs make the point: it escapes
+        // `\u` and gives `[a--b]` RE2's meaning, so the compile below
+        // already refuses those two at this one site — but `(?x)a`,
+        // `a{1001}` and `[[:foo:]]` pass through it unchanged and would
+        // compile.)
+        if let Some(construct) = pulsus_re2::re2_rejection_construct(regex) {
+            return Err(ReadError::PipelineInvalid {
+                reason: format!("invalid regex in label_replace: {construct}: `{regex}`"),
+            });
+        }
         let translated = pulsus_promql::re2_pattern_to_rust(regex);
         // Issue #291: routed through the shared compile budget. The
         // message prefix and the WRAPPED-form reporting are unchanged —
@@ -2705,6 +2720,22 @@ fn build_variants_node(
             // BARE range aggregation: the prefix is dead. Validate it
             // and throw it away (issue #247, above).
             CompiledPipeline::compile(common_stages(pipeline))?;
+            // **Issue #400 Stage 2 — and the compile above does NOT cover
+            // it.** `compile_stage` answers `Ok(None)` for a PUSHABLE line
+            // filter before it reaches `compile_regex` (`pipeline.rs`'s
+            // `st.pushdown_active && !st.seen_line_format &&
+            // is_pushable_line_filter` arm): such a filter's regex is
+            // validated on the SQL-rendering path instead, and a
+            // DISCARDED prefix renders no SQL. So the one construct the
+            // reference refuses here — a malformed line filter in a bare
+            // variant — was the one construct nothing validated.
+            //
+            // **Validation only.** Nothing here decides pushdown, reads
+            // `CompileState`, or is reachable from the wrapped arm; it
+            // compiles a regex, drops it, and reports the error.
+            // Filters the compile above DID reach are re-validated, which
+            // is idempotent and costs one plan-time compile.
+            validate_pushable_line_filter_regexes(common_stages(pipeline))?;
             variant_tail(pipeline)
         } else {
             // WRAPPED in one vector aggregation: the whole pipeline is
@@ -3029,6 +3060,43 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFrag
 /// token prefilter.
 pub(crate) fn is_pushable_line_filter(lf: &LineFilter) -> bool {
     !lf.value_is_ip && lf.or_matches.iter().all(|m| !m.is_ip)
+}
+
+/// Compiles every `|~`/`!~` alternative of every line filter in `stages`,
+/// purely to raise its error (issue #400 Stage 2).
+///
+/// The gap this closes is narrow and was measured, not reasoned: in a
+/// BARE `variants(...)` variant the prefix is discarded, so a pushable
+/// line filter is neither compiled by `compile_stage` nor rendered into
+/// SQL, and `{app="x"} |~ "("` inside one was served here while the
+/// reference answers `400` (`stage '|~ "("'`).
+///
+/// Unanchored, because a LogQL line filter is an RE2 substring search —
+/// the same `validate_unanchored_regex` the SQL-rendering seam uses, so
+/// the two cannot disagree about which patterns are legal.
+///
+/// An `ip("…")` alternative is not a regex and is skipped; a malformed
+/// one is `PipelineError::BadIpFilter` from the compile above, which
+/// reaches this prefix because such a filter is not pushable.
+fn validate_pushable_line_filter_regexes(stages: &[Stage]) -> Result<(), ReadError> {
+    for stage in stages {
+        let Stage::LineFilter(lf) = stage else {
+            continue;
+        };
+        if !matches!(
+            lf.op,
+            pulsus_logql::LineFilterOp::Regex | pulsus_logql::LineFilterOp::NotRegex
+        ) {
+            continue;
+        }
+        for (value, is_ip) in lf.alternatives() {
+            if is_ip {
+                continue;
+            }
+            super::pipeline::validate_unanchored_regex(value)?;
+        }
+    }
+    Ok(())
 }
 
 /// Days since the Unix epoch, per nanosecond. Local to this module rather

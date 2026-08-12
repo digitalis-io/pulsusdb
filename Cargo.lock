@@ -1765,6 +1765,7 @@ version = "0.0.0"
 dependencies = [
  "regex",
  "regex-syntax",
+ "sha2",
 ]
 
 [[package]]

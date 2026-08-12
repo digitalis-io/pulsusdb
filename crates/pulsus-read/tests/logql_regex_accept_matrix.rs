@@ -420,9 +420,14 @@ const POSITIONS: &[Position] = &[
               cleared, and it agrees; a variant WRAPPED in a vector aggregation runs its whole \
               pipeline (issue #397), so the same filter is compiled there and agrees too — \
               that wrapped position belongs to #400 with the rest of this surface, and is \
-              pinned meanwhile by corpus row W29 in `b13_variants.test`.",
+              pinned meanwhile by corpus row W29 in `b13_variants.test`. **#400 Stage 2 closed \
+              it**: `build_variants_node`'s bare arm now validates the regex of every line \
+              filter in the discarded prefix, which is the one thing `CompiledPipeline::compile` \
+              could not reach, so this position is `PerPattern` like the rest and \
+              `variants_variant_side_skips_the_line_filter` is retired. The pushdown DECISION is \
+              untouched — the added call compiles a regex and drops it.",
         reference: Rule::PerPattern,
-        pulsus: Rule::AcceptsEverything,
+        pulsus: Rule::PerPattern,
     },
     Position {
         id: "variants_variant_after_line_format",
@@ -470,8 +475,14 @@ const MASKED: &[Position] = &[
         template: r#"{app="x"} | regexp "{P}""#,
         why: "`| regexp` without a named capture is refused on both sides for that reason \
               alone (`errMissingCapture`, `pkg/logql/log/parser.go:299-301,317-319 @ v3.7.4`). \
-              Measured: 0 of 42 disagree — 41 reject-on-both, and the single pattern that \
-              carries a named capture of its own (`ok_named`) accepts on both.",
+              Measured: 0 of 42 disagreed when this was written — 41 reject-on-both, and the \
+              single pattern that carried a named capture of its own (`ok_named`) accepting \
+              on both. **#400 Stage 2 added a second such pattern**, \
+              `digit_leading_capture_name`, which is Class E: the reference serves it here \
+              (measured `200`, with a result body) and PulsusDB refuses it. The mask is \
+              unchanged — a pattern carrying its own capture was never one it masks — and the \
+              disagreement is shared with all sixteen unmasked positions, which is the \
+              property the test now asserts.",
         reference: Rule::RejectsEverything,
         pulsus: Rule::RejectsEverything,
     },
@@ -821,68 +832,113 @@ const PATTERNS: &[Pattern] = &[
         reference: Verdict::Reject,
         pulsus: Verdict::Reject,
     },
-    // --- Direction B: PulsusDB serves, the reference rejects.
+    // --- Direction B: PulsusDB served these and the reference refuses
+    //     them, reading each as a DIFFERENT pattern. **Closed by #400
+    //     Stage 2** — `pulsus_re2::re2_definitely_rejects` decides all
+    //     nine at the compile seams, so every column below now says
+    //     `Reject`/`Reject` and the two `engine_dir_b_*` divergence rows
+    //     are retired. The READINGS the crate gave them are pinned by
+    //     `pulsus-re2/tests/re2_reject_classes.rs`'s
+    //     `the_rust_crate_reads_these_as_a_different_pattern`, which is
+    //     in that file precisely so it outlives these rows.
     p(
         "big_u_escape",
         r"\U0001F600",
         Some("ErrInvalidEscape"),
         Verdict::Reject,
-        Verdict::Accept,
+        Verdict::Reject,
     ),
     p(
         "perl_R",
         "(?R)a",
         Some("ErrInvalidPerlOp"),
         Verdict::Reject,
-        Verdict::Accept,
+        Verdict::Reject,
     ),
     p(
         "flag_x",
         "(?x)a",
         Some("ErrInvalidPerlOp"),
         Verdict::Reject,
-        Verdict::Accept,
+        Verdict::Reject,
     ),
     p(
         "nested_star",
         "a**",
         Some("ErrInvalidRepeatOp"),
         Verdict::Reject,
-        Verdict::Accept,
+        Verdict::Reject,
     ),
     p(
         "bad_posix_class",
         "[[:foo:]]",
         Some("ErrInvalidCharRange"),
         Verdict::Reject,
-        Verdict::Accept,
+        Verdict::Reject,
     ),
     p(
         "unicode_prop_long",
         r"\p{Alphabetic}",
         Some("ErrInvalidCharRange"),
         Verdict::Reject,
-        Verdict::Accept,
+        Verdict::Reject,
     ),
     p(
         "repeat_1001",
         "a{1001}",
         Some("ErrInvalidRepeatSize"),
         Verdict::Reject,
-        Verdict::Accept,
+        Verdict::Reject,
     ),
     p(
         "class_double_dash",
         "[a--b]",
         Some("ErrInvalidCharRange"),
         Verdict::Reject,
-        Verdict::Accept,
+        Verdict::Reject,
     ),
     p(
         "brace_unicode",
         r"\u{263A}",
         Some("ErrInvalidEscape"),
         Verdict::Reject,
+        Verdict::Reject,
+    ),
+    // --- Class E, found by #400 Stage 2's corpus sweep and in none of
+    //     the eighteen classes this issue was filed with. Both are
+    //     Direction A — the reference SERVES them and PulsusDB refuses —
+    //     and both are RECORDED, not fixed: the fix is pattern
+    //     transformation, which the 2026-08-05 ruling refused. They are
+    //     here so they cannot be lost, and `re2_definitely_rejects` is
+    //     asserted NOT to claim either (`re2_reject_classes.rs`'s
+    //     control set).
+    p(
+        "unicode_prop_surrogate",
+        r"\p{Cs}",
+        None,
+        Verdict::Accept,
+        Verdict::Reject,
+    ),
+    p(
+        "digit_leading_capture_name",
+        "(?P<1n>a)",
+        None,
+        Verdict::Accept,
+        Verdict::Reject,
+    ),
+    // --- The property-table DISCRIMINATOR, and a both-accept row.
+    //     `LC` is a `unicode.Categories` key, so the reference serves
+    //     `\p{LC}` while refusing `\p{Lc}`; the Rust crate compiles it
+    //     too. It is here so rule (f)'s table cannot narrow without a
+    //     live cell moving — and its STORAGE half (ClickHouse 26.3
+    //     answers `Code: 427` for it) is pinned separately in
+    //     `re2_screen_differential.rs` and ledgered as
+    //     `logql-storage-re2-property-table`.
+    p(
+        "unicode_prop_lc_category",
+        r"\p{LC}",
+        None,
+        Verdict::Accept,
         Verdict::Accept,
     ),
 ];
@@ -987,20 +1043,16 @@ const EXCEPTIONS: &[Exception] = &[
         "`mustNewLabelReplaceExpr` compiles `^(?:…)$` directly (`syntax/ast.go:2225-2233 @ \
          v3.7.4`), and the body quotes that WRAPPED form",
     ),
-    Exception {
-        position: "variants_variant_side",
-        pattern: "invalid_utf8",
-        reference: Some(Verdict::Reject),
-        pulsus: Some(Verdict::Reject),
-        why: "the reference half is `as line_re`. The PulsusDB half is the exception: this \
-              position's `AcceptsEverything` rule is about the PUSHDOWN skipping the regex \
-              COMPILE, and since #400 Stage 1 this pattern is refused at the LEXER, above the \
-              planner entirely — nothing about the variant's discarded prefix can reach it. \
-              **The one point where Stage 1 narrows \
-              `variants_variant_side_skips_the_line_filter`**, and why that row keeps \
-              `BOTH_REJECT` rather than gaining this pattern: every other member of it is a \
-              regex-GRAMMAR rejection, which still slips through here.",
-    },
+    ex_ref(
+        "variants_variant_side",
+        "invalid_utf8",
+        Verdict::Reject,
+        "as `line_re`. **The PulsusDB half of this row was deleted by #400 Stage 2**: it used \
+         to override this position's `AcceptsEverything` rule, which existed because a pushable \
+         line filter's regex was never compiled here. The position is `PerPattern` now, so the \
+         pattern's own `Reject` column is what applies and an override restating it would fail \
+         `every_committed_exception_is_a_real_exception`.",
+    ),
     ex_ref(
         "variants_variant_after_line_format",
         "invalid_utf8",
@@ -1027,6 +1079,18 @@ const EXCEPTIONS: &[Exception] = &[
         why: "the one pattern in the set that carries a named capture of its own, so the \
               missing-capture refusal that masks this position does not apply to it.",
     },
+    ex_ref(
+        "MASKED_regexp_bare",
+        "digit_leading_capture_name",
+        Verdict::Accept,
+        "the SECOND pattern carrying a named capture of its own (#400 Stage 2 added it), so \
+         the missing-capture refusal does not apply here either and the reference serves it — \
+         measured `200` on the pinned container, with a result body. Unlike `ok_named` this \
+         one is Class E, so PulsusDB still refuses it (the Rust crate requires an XID start in \
+         a capture name) and this position disagrees on it. That is why \
+         `the_masked_positions_pin_nothing_and_this_is_measured` asks whether a masked \
+         position hides anything NEW rather than whether it disagrees at all.",
+    ),
     // `label_replace` is the single LogQL site that translates the
     // pattern before compiling it (`re2_pattern_to_rust`), so it answers
     // differently from every other position in BOTH directions.
@@ -1048,20 +1112,15 @@ const EXCEPTIONS: &[Exception] = &[
         Verdict::Accept,
         "the rewrite escapes the braces",
     ),
-    ex_pulsus(
-        "label_replace",
-        "class_double_dash",
-        Verdict::Reject,
-        "the rewrite gives `[a--b]` RE2's meaning, which the Rust crate then refuses — so this \
-         is the one LogQL position that AGREES with the reference on it",
-    ),
-    ex_pulsus(
-        "label_replace",
-        "brace_unicode",
-        Verdict::Reject,
-        "the rewrite escapes `\\u`, which the Rust crate then refuses — agreement here, \
-         divergence everywhere else",
-    ),
+    // **The two `label_replace` rows for `class_double_dash` and
+    // `brace_unicode` were DELETED by #400 Stage 2, not lost.** They
+    // recorded that `re2_pattern_to_rust`'s rewrite made this one site
+    // agree with the reference where the other thirteen diverged. The
+    // pre-check now refuses both patterns at every position, so the
+    // agreement is universal and the rows stopped being exceptions —
+    // `every_committed_exception_is_a_real_exception` fails on a row
+    // that merely restates its pattern's column, which is what made
+    // deleting them mandatory rather than optional.
 ];
 
 const fn ex_ref(
@@ -1115,6 +1174,20 @@ const BOTH_REJECT: &[&str] = &[
     "repeat_product",
     "class_escape_range",
     "too_large",
+    // Issue #400 Stage 2: the nine that used to be Direction B. Their
+    // `pulsus` column moved `Accept -> Reject`, so they joined this
+    // list — which is what makes `variants_common_side`'s row (the
+    // reference's querier swallowing a common-pipeline build error and
+    // answering an empty 200 in every window) claim them.
+    "big_u_escape",
+    "perl_R",
+    "flag_x",
+    "nested_star",
+    "bad_posix_class",
+    "unicode_prop_long",
+    "repeat_1001",
+    "class_double_dash",
+    "brace_unicode",
 ];
 
 const DIVERGENCES: &[Divergence] = &[
@@ -1139,6 +1212,7 @@ const DIVERGENCES: &[Divergence] = &[
             "metric_line",
             "metric_binary",
             "label_replace",
+            "variants_variant_side",
             "variants_variant_after_line_format",
             "variants_common_side",
         ],
@@ -1150,9 +1224,12 @@ const DIVERGENCES: &[Divergence] = &[
               bisected one atom at a time rather than projected. Matching its \
               boundary would mean porting Go's `maxRunes`/`maxSize`/`maxHeight`, which admit \
               128 MB parse trees — the unboundedness the cap exists to remove. Ledgered as \
-              `regex-compile-budget`; docs/api.md \u{a7}9.4. `variants_variant_side` is \
-              absent for the reason every other row omits it: a PUSHABLE line filter is not \
-              compiled at all there, so both sides serve it and the budget never runs.",
+              `regex-compile-budget`; docs/api.md \u{a7}9.4. **`variants_variant_side` was \
+              absent from this list until #400 Stage 2** and the reason is worth keeping: a \
+              PUSHABLE line filter was not compiled at all there, so both sides served it and \
+              the budget never ran. `build_variants_node`'s bare arm now validates that \
+              regex, so the budget runs and the position joins every other Direction-A row \
+              here as well as this one.",
     },
     Divergence {
         id: "engine_dir_a_perl_and_flag_forms",
@@ -1178,6 +1255,7 @@ const DIVERGENCES: &[Divergence] = &[
             "metric_line",
             "metric_binary",
             "label_replace",
+            "variants_variant_side",
             "variants_variant_after_line_format",
             "variants_common_side",
         ],
@@ -1203,6 +1281,7 @@ const DIVERGENCES: &[Divergence] = &[
             "keep",
             "metric_line",
             "metric_binary",
+            "variants_variant_side",
             "variants_variant_after_line_format",
             "variants_common_side",
         ],
@@ -1227,6 +1306,7 @@ const DIVERGENCES: &[Divergence] = &[
             "metric_line",
             "metric_binary",
             "label_replace",
+            "variants_variant_side",
             "variants_variant_after_line_format",
             "variants_common_side",
         ],
@@ -1246,6 +1326,7 @@ const DIVERGENCES: &[Divergence] = &[
             "line_after_line_format",
             "metric_line",
             "metric_binary",
+            "variants_variant_side",
             "variants_variant_after_line_format",
             "variants_common_side",
         ],
@@ -1254,72 +1335,33 @@ const DIVERGENCES: &[Divergence] = &[
               positions where the reference does NOT wrap the pattern are affected; everywhere \
               else both reject.",
     },
-    Divergence {
-        id: "engine_dir_b_read_as_a_different_pattern",
-        pulsus: Verdict::Accept,
-        patterns: &[
-            "big_u_escape",
-            "perl_R",
-            "flag_x",
-            "nested_star",
-            "bad_posix_class",
-            "unicode_prop_long",
-            "repeat_1001",
-        ],
-        positions: &[
-            "sel_re",
-            "sel_nre",
-            "line_re",
-            "line_nre",
-            "line_after_line_format",
-            "regexp_named",
-            "labelfilter_re",
-            "labelfilter_nre",
-            "drop",
-            "keep",
-            "metric_line",
-            "metric_binary",
-            "label_replace",
-            "variants_variant_after_line_format",
-            "variants_variant_side",
-        ],
-        owner: "#400",
-        why: "not merely lenient. `a**` is read as `(a*)*`, which matches EVERY subject tested \
-              (`\"\"`, `a`, `b`, `:`, `101`, an emoji), so a line filter carrying it returns \
-              the whole stream, and in a template it renders `zxz` from the input `x` — see \
-              `the_template_regex_boundary_does_not_match_the_reference`. `[[:foo:]]` is read \
-              as a nested class (matches `:`/`f`/`o`). **`(?R)` is NOT one of the \
-              match-everything members** — this row said for three releases that the crate \
-              reads it as a line-terminator flag \"so the pattern silently matches \
-              everything\"; measured, `(?R)a` matches `\"a\"` and not `\"\"`, `\"b\"` or \
-              `\"x\\r\\ny\"`. That was an inference from a category, not a measurement, and it \
-              is now `the_wrong_pattern_row_says_what_each_member_actually_does`. A wrong \
-              answer, not a permissive one. docs/api.md \u{a7}9.2/\u{a7}9.3.",
-    },
-    Divergence {
-        id: "engine_dir_b_class_forms",
-        pulsus: Verdict::Accept,
-        patterns: &["class_double_dash", "brace_unicode"],
-        positions: &[
-            "sel_re",
-            "sel_nre",
-            "line_re",
-            "line_nre",
-            "line_after_line_format",
-            "regexp_named",
-            "labelfilter_re",
-            "labelfilter_nre",
-            "drop",
-            "keep",
-            "metric_line",
-            "metric_binary",
-            "variants_variant_after_line_format",
-            "variants_variant_side",
-        ],
-        owner: "#400",
-        why: "`label_replace` is absent because its rewrite makes the Rust crate agree with the \
-              reference — the same one-site partial fix as the brace forms.",
-    },
+    // **`engine_dir_b_read_as_a_different_pattern` and
+    // `engine_dir_b_class_forms` were RETIRED by #400 Stage 2.** Between
+    // them they owned the nine patterns PulsusDB served while the
+    // reference answered `400` — `big_u_escape`, `perl_R`, `flag_x`,
+    // `nested_star`, `bad_posix_class`, `unicode_prop_long`,
+    // `repeat_1001`, `class_double_dash`, `brace_unicode` — and every one
+    // of the nine is now refused at the compile seams by
+    // `pulsus_re2::re2_definitely_rejects`. They are gone rather than
+    // emptied because a `Divergence` row claiming no disagreeing point
+    // fails the dead-row check above.
+    //
+    // What they carried besides the verdicts, and where it went:
+    //
+    // * the READINGS (`a**` as `(a*)*` matching every subject,
+    //   `[[:foo:]]` as a class of `:`/`f`/`o`, and the corrected note
+    //   that `(?R)a` does NOT match everything) are pinned by
+    //   `pulsus-re2/tests/re2_reject_classes.rs`'s
+    //   `the_rust_crate_reads_these_as_a_different_pattern`, over all
+    //   eleven subjects. That test lives in the new file for exactly this
+    //   reason: a pin hanging off a divergence row would vanish in the
+    //   same commit as the row.
+    // * `class_double_dash` and `brace_unicode` were `engine_dir_b_class_forms`'s
+    //   two members, and its `why` said `label_replace` was absent
+    //   because the rewrite made that one site agree. That deferred-fix
+    //   note is now recorded in the logs ledger's
+    //   `logql-regex-accept-surface-divergence` row, so #331/#336's
+    //   pattern rewrite is not later credited with closing them.
     Divergence {
         id: "engine_dir_a_non_utf8_string_literal",
         pulsus: Verdict::Reject,
@@ -1367,23 +1409,57 @@ const DIVERGENCES: &[Divergence] = &[
               the owner ruled for. Measured here for a LINE FILTER; #247 measured it for \
               `| logfmt`.",
     },
+    // **`variants_variant_side_skips_the_line_filter` was RETIRED by
+    // #400 Stage 2.** It owned every `BOTH_REJECT` pattern at
+    // `variants_variant_side`: the reference refuses a malformed line
+    // filter in a bare variant and PulsusDB served it, because
+    // `compile_stage` returns `Ok(None)` for a PUSHABLE line filter
+    // before reaching `compile_regex` and a discarded prefix renders no
+    // SQL. `build_variants_node`'s bare arm now validates those regexes
+    // directly (`plan.rs`'s `validate_pushable_line_filter_regexes`),
+    // the position's rule moved `AcceptsEverything → PerPattern`, and
+    // the row claims nothing.
+    //
+    // **The escape was the pushdown, not the construct**, and the
+    // position that proves it is still here:
+    // `variants_variant_after_line_format` is the same filter with the
+    // pushdown cleared, and it agreed at every pattern before this
+    // change as well as after.
     Divergence {
-        id: "variants_variant_side_skips_the_line_filter",
-        pulsus: Verdict::Accept,
-        patterns: BOTH_REJECT,
-        positions: &["variants_variant_side"],
+        id: "engine_class_e_reference_serves_what_the_rust_crate_refuses",
+        pulsus: Verdict::Reject,
+        patterns: &["unicode_prop_surrogate", "digit_leading_capture_name"],
+        positions: &[
+            "sel_re",
+            "sel_nre",
+            "line_re",
+            "line_nre",
+            "line_after_line_format",
+            "regexp_named",
+            "labelfilter_re",
+            "labelfilter_nre",
+            "drop",
+            "keep",
+            "metric_line",
+            "metric_binary",
+            "label_replace",
+            "variants_variant_side",
+            "variants_variant_after_line_format",
+            "variants_common_side",
+        ],
         owner: "#400",
-        why: "found by this matrix, and the direction that matters: the reference REFUSES a \
-              malformed line filter in a variant (`stage '|~ \"(\"'`) and PulsusDB serves it. \
-              `VariantSpec::try_new` (`plan.rs:2641`) does compile the variant's discarded \
-              prefix, but `compile_stage` returns `Ok(None)` for a PUSHABLE line filter \
-              (`pipeline.rs:986-996`) before reaching `compile_regex` at `:1013`; a pushable \
-              filter's regex is validated on the SQL-rendering path instead, and a discarded \
-              prefix renders no SQL. **The escape is the pushdown, not the construct**: the \
-              same filter after a `line_format` clears the pushdown and IS refused — that is \
-              the `variants_variant_after_line_format` position, which agrees at every pattern. \
-              `| regexp`, `| drop`, `| logfmt` and `| line_format` in this position are refused \
-              on both sides too.",
+        why: "**Class E, found by #400 Stage 2's corpus sweep and in none of the eighteen \
+              classes this issue was filed with.** `\u{5c}p{Cs}` is a `unicode.Categories` key, so \
+              `unicodeTable` resolves it and the reference serves it, while the Rust crate \
+              refuses a surrogate class outright; `(?P<1n>a)` is a valid capture name there \
+              (`isValidCaptureName` is `[A-Za-z0-9_]+` and its own comment says \"Python rejects \
+              names starting with digits. We don't enforce either of those\", \
+              `parse.go:1261-1272 @ v3.7.4`) while the Rust crate requires an XID start. \
+              RECORDED, NOT FIXED: closing either needs pattern transformation at the \
+              as-written seams, which the 2026-08-05 owner ruling refused. Both produce an \
+              error, never a wrong row. `re2_definitely_rejects` is asserted NOT to claim \
+              either — rule (f)'s table CONTAINS `Cs` and rule (h) fires only on a byte outside \
+              `[A-Za-z0-9_]`, so a digit-leading name reaches no rule. docs/api.md \u{a7}9.4.",
     },
 ];
 
@@ -1959,6 +2035,15 @@ fn pulsus_verdicts_match_the_committed_table() {
     );
 }
 
+/// How many of the 768 unmasked points disagree.
+///
+/// **Recomputed, never adjusted.** #400 Stage 2 moves this in BOTH
+/// directions at once — nine patterns stop disagreeing at fifteen
+/// positions each, three new ones start — so it is taken from this
+/// test's own printed value and pasted into
+/// `docs/benchmarks/logs-differential-ledger.md`, not carried over.
+const DISAGREEING_POINTS: usize = 226;
+
 /// **The divergence set is exactly the committed enumeration.**
 #[test]
 fn the_divergence_set_is_exactly_the_committed_enumeration() {
@@ -1971,20 +2056,23 @@ fn the_divergence_set_is_exactly_the_committed_enumeration() {
     // `logql-regex-accept-surface-divergence` quotes. Asserted here so
     // that a prose number in the ledger cannot outlive the table it
     // describes.
+    // Issue #400 Stage 2 added three patterns (`\p{Cs}`, `(?P<1n>a)`,
+    // `\p{LC}`), so 45 -> 48 and the two products move with it. Derived
+    // from the dimensions rather than copied: `16 * 48` and `18 * 48`.
     assert_eq!(
         POSITIONS.len() * PATTERNS.len(),
-        720,
-        "the ledger says 720 unmasked points"
+        768,
+        "the ledger says 768 unmasked points"
     );
     assert_eq!(
         measured.len(),
-        321,
-        "the ledger says 321 of the 720 unmasked points disagree"
+        DISAGREEING_POINTS,
+        "the ledger says {DISAGREEING_POINTS} of the 768 unmasked points disagree"
     );
     assert_eq!(
         POSITIONS.len() * PATTERNS.len() + MASKED.len() * PATTERNS.len(),
-        810,
-        "the ledger says 810 probed points, masked positions included"
+        864,
+        "the ledger says 864 probed points, masked positions included"
     );
 
     let claimed = |skip: Option<usize>| -> Vec<(String, String)> {
@@ -2057,11 +2145,36 @@ fn the_divergence_set_is_exactly_the_committed_enumeration() {
             }
         }
     }
+    // **The table is one-directional now, and that is the result rather
+    // than a gap.** This assertion used to demand BOTH directions,
+    // because a table with only `pulsus: Reject` rows would have hidden
+    // the half that serves a query the reference refuses. #400 Stage 2
+    // removed that half: `re2_definitely_rejects` closes all nine of it
+    // at the compile seams and `build_variants_node` closes the tenth
+    // (a pushable line filter in a discarded variant prefix), so no
+    // `Divergence` row says PulsusDB accepts where the reference
+    // rejects.
+    //
+    // Inverting it keeps the check breakable in the direction that
+    // matters: the `missing` assertion above forces any new
+    // disagreement into a row, and this then fails the moment such a row
+    // is Direction B. A row added the other way passes here and is
+    // scrutinised by its own `why`.
+    let direction_b: Vec<&str> = DIVERGENCES
+        .iter()
+        .filter(|d| d.pulsus == Verdict::Accept)
+        .map(|d| d.id)
+        .collect();
     assert!(
-        DIVERGENCES.iter().any(|d| d.pulsus == Verdict::Accept)
-            && DIVERGENCES.iter().any(|d| d.pulsus == Verdict::Reject),
-        "both directions must be represented; a one-directional table would hide the half that \
-         serves a query the reference refuses"
+        direction_b.is_empty(),
+        "PulsusDB serves a LogQL regex the reference refuses again, in {direction_b:?}. That \
+         half of this table was closed by #400 Stage 2 and re-opening it is a finding, not a \
+         number to update: a served pattern the reference rejects is read as a DIFFERENT \
+         pattern here and returns wrong rows"
+    );
+    assert!(
+        DIVERGENCES.iter().any(|d| d.pulsus == Verdict::Reject),
+        "the table cannot be empty in both directions"
     );
     eprintln!(
         "{} of {} matrix points disagree, in {} classes",
@@ -2276,20 +2389,22 @@ fn the_wrong_pattern_row_says_what_each_member_actually_does() {
             "`a**` must match {subject:?} — it is the member that returns the whole stream"
         );
     }
-    // And the sentence itself, so a re-worded copy cannot drift back.
-    let row = DIVERGENCES
-        .iter()
-        .find(|d| d.id == "engine_dir_b_read_as_a_different_pattern")
-        .expect("the row exists");
-    let flat = row.why.to_lowercase();
+    // The sentence-drift half of this test used to read
+    // `engine_dir_b_read_as_a_different_pattern`'s `why` field. **#400
+    // Stage 2 retired that row**, and the guard did not go with it: the
+    // patterns are now REFUSED at the compile seams, so the wrong
+    // reading is unreachable rather than merely documented, and the
+    // reading itself is pinned over eleven subjects by
+    // `pulsus-re2/tests/re2_reject_classes.rs`'s
+    // `the_rust_crate_reads_these_as_a_different_pattern`. What stays
+    // here is the BEHAVIOUR above, because it is what the false sentence
+    // contradicted, plus the file-scope needle in
+    // `the_corrected_sentences_are_not_in_the_tree`.
     assert!(
-        !flat.contains("crlf"),
-        "this row named the CRLF flag as the reason a pattern matches everything; it is not — \
-         see this test's own probes"
-    );
-    assert!(
-        row.why.contains("a**"),
-        "the row must name `a**`, which is the member that matches everything"
+        !DIVERGENCES
+            .iter()
+            .any(|d| d.id == "engine_dir_b_read_as_a_different_pattern"),
+        "the row is retired; if it comes back, its `why` needs the CRLF guard back with it"
     );
 }
 
@@ -2335,29 +2450,58 @@ fn every_committed_exception_is_a_real_exception() {
     }
 }
 
-/// **The masked positions pin nothing, and that is measured rather than
-/// asserted from the shape of the query.**
+/// **The masked positions pin nothing NEW, and that is measured rather
+/// than asserted from the shape of the query.**
 ///
-/// If either stops masking — because a rule changed on one side — this
-/// fails, and the position should be promoted into [`POSITIONS`] rather
-/// than have its expectation edited.
+/// The property asserted is: a masked position may only disagree on a
+/// pattern that ALREADY disagrees somewhere in [`POSITIONS`]. A
+/// disagreement it does not share with any unmasked position would be a
+/// divergence class visible only here, which is exactly what keeping
+/// these positions out of the matrix would hide — and it is what should
+/// promote the position into [`POSITIONS`] rather than have its
+/// expectation edited.
+///
+/// **This used to demand ZERO disagreements, and #400 Stage 2 made that
+/// claim false for a reason that is not a rule change.** The mask on
+/// `MASKED_regexp_bare` is `| regexp` refusing a pattern with no named
+/// capture; a pattern that HAS one escapes it, which `ok_named` already
+/// showed (both sides accept). Stage 2 added a second such pattern,
+/// `digit_leading_capture_name` — and that one is Class E, so the
+/// reference serves it and PulsusDB does not. The mask still works; the
+/// pattern is simply not one it masks, and it disagrees at all sixteen
+/// unmasked positions too. Asserting zero here would have forced either
+/// a promotion this plan does not call for or an expectation edited to
+/// hide a real divergence.
 #[test]
 fn the_masked_positions_pin_nothing_and_this_is_measured() {
+    let unmasked: Vec<String> = measured_disagreements()
+        .into_iter()
+        .map(|(_, pattern)| pattern)
+        .collect();
     for position in MASKED {
-        let mut disagree = Vec::new();
+        let mut only_here = Vec::new();
+        let mut shared = 0usize;
         for pattern in PATTERNS {
             let r = committed(position, pattern, Side::Reference);
             let u = committed(position, pattern, Side::Pulsus);
-            if r != u {
-                disagree.push(pattern.id);
+            if r == u {
+                continue;
+            }
+            if unmasked.iter().any(|p| p == pattern.id) {
+                shared += 1;
+            } else {
+                only_here.push(pattern.id);
             }
         }
         assert!(
-            disagree.is_empty(),
-            "`{}` is no longer masked ({} of {} patterns disagree: {disagree:?}) — promote it \
-             into POSITIONS",
+            only_here.is_empty(),
+            "`{}` disagrees on {} of {} patterns that agree at every unmasked position \
+             ({only_here:?}) — that is a divergence class visible ONLY at a position the \
+             matrix does not score, so promote it into POSITIONS rather than editing its \
+             expectation. ({shared} of its disagreements are shared with the unmasked \
+             positions and are fine.)",
             position.id,
-            disagree.len(),
+            only_here.len(),
             PATTERNS.len()
         );
     }
@@ -2487,6 +2631,169 @@ fn every_go_regexp_error_code_is_accounted_for() {
     }
 }
 
+/// What a [`pulsus_logql::Stage`] can carry that a user controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carries {
+    /// A regular expression the user wrote, which some engine compiles.
+    UserRegex,
+    /// A Go-template body — validated, but not by a regex compiler, and
+    /// a bad one is a `200` carrying `__error__` rather than a status.
+    Template,
+    /// Nothing a user can make malformed at this layer.
+    Nothing,
+}
+
+/// What each `Stage` variant carries, as an EXHAUSTIVE match with **no
+/// wildcard arm** — so an eleventh variant added to `pulsus_logql` fails
+/// to COMPILE here rather than being silently classified.
+///
+/// That is the difference between this and a marker census: a census
+/// counts calls that exist, and the defect #400 Stage 2 closed was a
+/// call that did NOT exist (`compile_stage` returning `Ok(None)` for a
+/// pushable line filter, so nothing ever compiled its regex). Absence is
+/// invisible to a grep and visible to an exhaustive match over the
+/// reference's own construct list.
+fn stage_carries(stage: &pulsus_logql::Stage) -> (Carries, &'static str) {
+    use pulsus_logql::Stage;
+    match stage {
+        Stage::LineFilter(_) => (
+            Carries::UserRegex,
+            "`|~`/`!~` take a user pattern; `|=`/`!=` take a literal and `ip(…)` an address, \
+             all three on the same variant",
+        ),
+        Stage::Parser(_) => (
+            Carries::UserRegex,
+            "`| regexp \"…\"` compiles the user's pattern (`| json`/`| logfmt`/`| pattern` do \
+             not, but they share this variant, so the variant carries one)",
+        ),
+        Stage::LabelFilter(_) => (
+            Carries::UserRegex,
+            "`=~`/`!~` over a label value, anchored-compiled",
+        ),
+        Stage::LineFormat(_) => (
+            Carries::Template,
+            "a Go template. Its `regexReplaceAll`/`count` functions DO compile user patterns, \
+             but a failure there is a `200` carrying `__error__: TemplateFormatErr`, not a \
+             status — the template axis measures it, not this matrix",
+        ),
+        Stage::LabelFormat(_) => (
+            Carries::Template,
+            "`dst=src` renames and `dst=\"template\"` renders; no regex either way",
+        ),
+        Stage::Unwrap(_) => (
+            Carries::Nothing,
+            "a label name plus an optional conversion (`bytes`/`duration`/…). It is also where \
+             `common_stages` TRUNCATES the discarded prefix, so nothing after it is in scope \
+             here at all",
+        ),
+        Stage::Unpack => (
+            Carries::Nothing,
+            "`| unpack` takes no arguments — the packed-JSON field names come from the LINE, \
+             not from the query",
+        ),
+        Stage::Decolorize => (
+            Carries::Nothing,
+            "`| decolorize` takes no arguments; its ANSI SGR pattern is a `const` in \
+             `pipeline.rs`, which the site census lists as EXCLUDED for that reason",
+        ),
+        Stage::Drop(_) => (
+            Carries::UserRegex,
+            "`| drop a=~\"…\"` — its own compile site (`compile_drop_keep`)",
+        ),
+        Stage::Keep(_) => (
+            Carries::UserRegex,
+            "`| keep a=~\"…\"` — the second `compile_drop_keep` caller",
+        ),
+    }
+}
+
+/// **Every regex-carrying stage is validated in a BARE variant's
+/// discarded prefix** (issue #400 Stage 2, criterion 18).
+///
+/// A bare `variants(...)` variant's prefix is dead syntax at evaluation
+/// and the reference still BUILDS it, so a malformed stage there is a
+/// `400` there. PulsusDB validated the prefix through
+/// `CompiledPipeline::compile`, whose `compile_stage` answers `Ok(None)`
+/// for a PUSHABLE line filter before reaching any compiler — and since a
+/// discarded prefix renders no SQL, that filter's regex was compiled
+/// nowhere. Every OTHER regex-carrying stage was already covered, which
+/// is why the gap survived: it was one arm of one variant.
+///
+/// The classification is exhaustive over `Stage` and the probe is built
+/// from it, so a new regex-carrying variant cannot be added without
+/// either a row here or a compile error.
+#[test]
+fn every_regex_carrying_stage_is_validated_in_a_bare_variant_prefix() {
+    /// `(the fragment appended to `{app="x"}`, the classification it
+    /// must produce)`. The fragment's pattern is the malformed `(` for
+    /// every regex-carrying row, so the probe below is a real rejection
+    /// and not a shape check.
+    const FRAGMENTS: &[(&str, Carries)] = &[
+        (r#" |~ "(""#, Carries::UserRegex),
+        (r#" | regexp "(?P<c>a)(""#, Carries::UserRegex),
+        (r#" | a=~"(""#, Carries::UserRegex),
+        (r#" | drop a=~"(""#, Carries::UserRegex),
+        (r#" | keep a=~"(""#, Carries::UserRegex),
+        (r#" | line_format "{{.x}}""#, Carries::Template),
+        (" | label_format a=b", Carries::Template),
+        (" | unwrap b", Carries::Nothing),
+        (" | unpack", Carries::Nothing),
+        (" | decolorize", Carries::Nothing),
+    ];
+
+    let mut seen: Vec<&'static str> = Vec::new();
+    for (fragment, want) in FRAGMENTS {
+        let expr = parse(&format!(r#"{{app="x"}}{fragment}"#))
+            .unwrap_or_else(|e| panic!("{fragment:?} must parse: {e}"));
+        let stages = match &expr {
+            pulsus_logql::Expr::Log(e) => e.pipeline.clone(),
+            other => panic!("{fragment:?} parsed to {other:?}, not a log selector"),
+        };
+        let last = stages.last().expect("the fragment adds a stage");
+        let (got, why) = stage_carries(last);
+        assert_eq!(got, *want, "{fragment:?}: {why}");
+        assert!(why.len() > 30, "{fragment:?}: the reason must be checkable");
+        let name = std::mem::discriminant(last);
+        let label: &'static str = match last {
+            pulsus_logql::Stage::LineFilter(_) => "LineFilter",
+            pulsus_logql::Stage::Parser(_) => "Parser",
+            pulsus_logql::Stage::LabelFilter(_) => "LabelFilter",
+            pulsus_logql::Stage::LineFormat(_) => "LineFormat",
+            pulsus_logql::Stage::LabelFormat(_) => "LabelFormat",
+            pulsus_logql::Stage::Unwrap(_) => "Unwrap",
+            pulsus_logql::Stage::Unpack => "Unpack",
+            pulsus_logql::Stage::Decolorize => "Decolorize",
+            pulsus_logql::Stage::Drop(_) => "Drop",
+            pulsus_logql::Stage::Keep(_) => "Keep",
+        };
+        let _ = name;
+        assert!(!seen.contains(&label), "{label} is probed twice");
+        seen.push(label);
+
+        // The behavioural half: a regex-carrying stage carrying `(`
+        // inside a BARE variant must be a rejection.
+        if *want != Carries::UserRegex {
+            continue;
+        }
+        let query = format!(
+            r#"variants(count_over_time({{app="x"}}{fragment} [5m])) of ({{app="x"}}[5m])"#
+        );
+        let (verdict, why) = pulsus_verdict(&query);
+        assert_eq!(
+            verdict,
+            Verdict::Reject,
+            "{query}\n  the reference refuses a malformed stage in a bare variant's discarded \
+             prefix (it builds the prefix purely to count extractors, \
+             `pkg/logql/evaluator.go:1417,1422 @ v3.7.4`); this served it. {why}"
+        );
+    }
+    assert_eq!(
+        seen.len(),
+        10,
+        "`Stage` has ten variants and every one must be probed: {seen:?}"
+    );
+}
+
 /// **The compile-site enumeration is derived from the source,
 /// recursively.**
 ///
@@ -2530,6 +2837,8 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
                 ("compile_drop_keep(", 3),
                 ("compile_user_regex(", 1),
                 ("compile_user_regex_anchored(", 1),
+                ("re2_rejection_construct(", 1),
+                ("re2_reject_precheck(", 3),
             ],
             "the in-process seam and its callers: the line filter compiled after a \
              `line_format` (`line_after_line_format`), `DECOLORIZE_PATTERN` (EXCLUDED, a \
@@ -2541,17 +2850,34 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              `Regex::new(` is now one: the survivor is inside `bad_regex`, which \
              re-compiles the user's own pattern only to choose which error text to \
              report — it decides no verdict, is reached only AFTER the budget estimate \
-             passed, and issue #240 pins its rule.",
+             passed, and issue #240 pins its rule. **Issue #400 Stage 2 added \
+             `re2_reject_precheck`** — one definition plus its two calls, from \
+             `compile_regex` and `compile_anchored_regex`, which is the whole LogQL seam — \
+             and the single `re2_rejection_construct(` inside it. It runs BEFORE the compile, \
+             on purpose: for the constructs RE2 rejects, a successful compile is the wrong \
+             answer rather than a slow one.",
         ),
         (
             "plan.rs",
-            &[("compile_user_regex_anchored(", 1)],
+            &[
+                ("validate_unanchored_regex(", 1),
+                ("compile_user_regex_anchored(", 1),
+                ("re2_rejection_construct(", 1),
+            ],
             "`LabelReplaceSpec::compile` — the one LogQL site that translates the pattern \
              through `re2_pattern_to_rust` before compiling it, and the one that reports the \
              WRAPPED form (issue #276). Covered by `label_replace`. Issue #291 routed it \
              through the shared budgeted entry point; the marker changed with it, which is \
              the whole reason the four #291 markers are in `MARKERS` — without them this \
-             site would have vanished from the census instead of moving in it.",
+             site would have vanished from the census instead of moving in it. **Issue #400 \
+             Stage 2 added two.** `re2_rejection_construct(` is `LabelReplaceSpec::compile`'s \
+             pre-check, taken on the UNREWRITTEN argument before `re2_pattern_to_rust` runs. \
+             `validate_unanchored_regex(` is a different site entirely — \
+             `validate_pushable_line_filter_regexes`, called from `build_variants_node`'s BARE \
+             arm, which validates the regex of a pushable line filter in a discarded variant \
+             prefix. `compile_stage` skips exactly those, and a discarded prefix renders no \
+             SQL, so before this nothing in the workspace compiled them: it is the position \
+             `variants_variant_side` measures, and the reason its rule moved to `PerPattern`.",
         ),
         (
             "template/funcs.rs",
@@ -2600,6 +2926,12 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         "compile_user_regex_anchored(",
         "compile_user_regex_with(",
         "regex_compile_transient_bound_with(",
+        // Issue #400 Stage 2: the reject-only pre-check. A construction
+        // site is any place a user pattern's fate is decided, and these
+        // decide it BEFORE the compile — so without them the census
+        // would not see the change at all.
+        "re2_rejection_construct(",
+        "re2_reject_precheck(",
     ];
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");

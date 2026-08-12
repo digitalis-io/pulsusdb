@@ -91,6 +91,7 @@
 //! | P-d | grouping created / by-cloned / without-cloned | ::build_variants_node | plan.rs VariantSpec::try_new injection | BAND | G1a / G1c / G1g |
 //! | P-e1 | BARE variant: unwrap tail empty vs non-empty | ::build_variants_node | plan.rs variant_tail + try_new clone | BAND | G1a/G1d/G1e vs G1c |
 //! | P-e2 | WRAPPED variant: whole pipeline as the tail (no prefix compile) | ::build_variants_node | plan.rs build_variants_node bare/wrapped arm | BAND | G1i (F_wrap) |
+//! | P-e3 | BARE variant: the discarded prefix's PUSHABLE line-filter regexes | ::build_variants_node | plan.rs validate_pushable_line_filter_regexes | BAND | G1a/G1c/G1d/G1e (bare); F_wrap pins the wrapped arm, which never calls it |
 //! | P-f | arity class success side (forbids vs requires unwrap) | ::build_variants_node | plan.rs build_variants_node arity gates | BAND | G1a vs G1c |
 //! | P-g | ClientValue Count / Bytes / Unwrap | ::build_variants_node | plan.rs build_variants_node value arm | BAND | G1a / G1f / G1c |
 //! | P-h | quantile parameter parse | ::build_variants_node | plan.rs build_variants_node quantile arm | BAND | G1h |
@@ -1629,7 +1630,19 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // tail BY SLICE, so a longer tail is charged more with no
         // formula change. F_wrap puts a band on the wrapped arm;
         // G1a/G1c/G1d/G1e keep the bare one.
-        branches: 30,
+        //
+        // **Issue #400 Stage 2 adds one callee and one branch** to the
+        // BARE arm: `validate_pushable_line_filter_regexes`, which
+        // compiles the regex of any `|~`/`!~` line filter in the
+        // discarded prefix and drops it. `CompiledPipeline::compile`
+        // above cannot reach those — `compile_stage` answers `Ok(None)`
+        // for a PUSHABLE filter — and a discarded prefix renders no SQL,
+        // so nothing compiled them. W-MEM disposition: **BAND**, the
+        // same band `compile` is in and for the same reason (one
+        // per-stage regex compile, dropped immediately); inventory row
+        // P-e3. It cannot move the WRAPPED arm at all, which is why it
+        // sits inside the bare branch rather than before the split.
+        branches: 31,
         callees: &[
             ".any",
             ".as_nanos",
@@ -1677,6 +1690,9 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "try_new",
             "unwrap_vector_aggs_into",
             "validate_duration_ns",
+            // Issue #400 Stage 2: the discarded prefix's PUSHABLE line
+            // filters, which `compile` above skips. BAND, row P-e3.
+            "validate_pushable_line_filter_regexes",
             "variant_tail",
             "vec_buffer_bytes",
             "widen_scan_start",
@@ -2782,8 +2798,8 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
 /// W_ctor + 23 W_fin = 46 rows, each with exactly ONE disposition. The
 /// module-doc tables are a RENDERING of this const (assertion 7), never
 /// the source.
-static INVENTORY: [Row; 50] = [
-    // --- W_plan (13) ---
+static INVENTORY: [Row; 51] = [
+    // --- W_plan (14) ---
     Row {
         id: "P-a",
         window: Win::Plan,
@@ -2841,6 +2857,15 @@ static INVENTORY: [Row; 50] = [
         site: "plan.rs build_variants_node bare/wrapped arm",
         disp: Disp::Band,
         covered_by: "G1i (F_wrap)",
+    },
+    Row {
+        id: "P-e3",
+        window: Win::Plan,
+        what: "BARE variant: the discarded prefix's PUSHABLE line-filter regexes",
+        frames: &["::build_variants_node"],
+        site: "plan.rs validate_pushable_line_filter_regexes",
+        disp: Disp::Band,
+        covered_by: "G1a/G1c/G1d/G1e (bare); F_wrap pins the wrapped arm, which never calls it",
     },
     Row {
         id: "P-f",
@@ -3422,11 +3447,11 @@ fn g4_frame_census_and_inventory_closure() {
         );
     }
     // (3) inventory size and per-window counts; unique ids.
-    assert_eq!(INVENTORY.len(), 50);
+    assert_eq!(INVENTORY.len(), 51);
     let count = |w: Win| INVENTORY.iter().filter(|r| r.window == w).count();
     assert_eq!(
         (count(Win::Plan), count(Win::Ctor), count(Win::Fin)),
-        (13, 12, 25)
+        (14, 12, 25)
     );
     let mut ids = BTreeSet::new();
     for r in &INVENTORY {

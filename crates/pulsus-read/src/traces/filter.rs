@@ -3561,13 +3561,26 @@ mod tests {
         );
     }
 
-    /// A pattern the checked escaper accepts renders SQL; the acceptance
-    /// SET is unchanged from the `compile_anchored` validator this
-    /// replaced (both compile `^(?:pat)$` with the same crate), so the
-    /// migration rejects nothing new. Spot-checked on the constructs most
-    /// likely to differ between a bare and an anchored compile.
+    /// A pattern the checked escaper accepts renders SQL. The acceptance
+    /// SET was unchanged from the `compile_anchored` validator this
+    /// replaced (both compile `^(?:pat)$` with the same crate) — **until
+    /// issue #400 Stage 2**, which put `pulsus_re2::re2_definitely_rejects`
+    /// ahead of that compile at `escape::ch_regex_anchored_checked`. So
+    /// the relation is now the compile MINUS the pre-check, and it is
+    /// asserted as that rather than as equality, which would have to be
+    /// weakened to a subset and stop detecting a rejection the pre-check
+    /// did NOT cause.
+    ///
+    /// **The narrowing is toward parity and is redundant here.** Every
+    /// construct the pre-check claims is a Tempo `400`
+    /// (`tests/conformance/validate-vectors.json`, rows rx-u4/u5/u6/u12/
+    /// u13/u16/u18/u19/u21/u22), and `pulsus_traceql::validate` already
+    /// refuses them one layer above this on every route that validates.
+    /// This site is the second gate on the same decision, in the same
+    /// direction.
     #[test]
-    fn the_checked_escaper_accepts_exactly_what_the_previous_validator_did() {
+    fn the_checked_escaper_accepts_the_compile_minus_the_re2_precheck() {
+        let mut precheck_refused = Vec::new();
         for pat in [
             "che.*",
             "^a$",
@@ -3586,13 +3599,37 @@ mod tests {
             "[",
             "*",
             r"(?P<n>a)",
+            // Added with the pre-check, so the list carries a member of
+            // each rule family it decides rather than only the property
+            // one that happened to be here.
+            "a**",
+            "a{1001}",
+            "(?x)a",
+            "[[:foo:]]",
+            r"\u{263A}",
+            // ...and the CONTROL that keeps this from passing under a
+            // pre-check that claimed everything: an in-table property
+            // name, which both the crate and Tempo accept.
+            r"\p{L}",
         ] {
             let via_escaper = anchored_regex_sql(pat).is_ok();
-            let via_previous_validator = regex::Regex::new(&format!("^(?:{pat})$")).is_ok();
+            let compiles = regex::Regex::new(&format!("^(?:{pat})$")).is_ok();
+            let refused = pulsus_re2::re2_definitely_rejects(pat);
+            if refused {
+                precheck_refused.push(pat);
+            }
             assert_eq!(
-                via_escaper, via_previous_validator,
-                "{pat:?}: the two validations disagree"
+                via_escaper,
+                compiles && !refused,
+                "{pat:?}: the escaper is the anchored compile minus the RE2 pre-check \
+                 (compiles={compiles}, pre-check refuses={refused})"
             );
         }
+        assert_eq!(
+            precheck_refused.len(),
+            7,
+            "the pre-check must actually fire on this list, or the relation above is the old \
+             equality wearing a new name: {precheck_refused:?}"
+        );
     }
 }

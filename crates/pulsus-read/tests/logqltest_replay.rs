@@ -767,12 +767,18 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// same split issue #397's `b13` section already has. This figure moves
 /// by the whole file; [`PROVENANCE_PERMITS`] and [`REACHABLE`] do not
 /// move at all.
-const TOTAL_DIRECTIVES: usize = 1_518;
+///
+/// Issue #400's second stage adds `b25_re2_reject_parity.test`, which
+/// needs no config delta: its `eval` control rows are permitted AND
+/// reachable, so this figure, [`PROVENANCE_PERMITS`] and [`REACHABLE`]
+/// all move together by that share, while its `eval_fail` rows carry
+/// PulsusDB's own error text and land under `our-error-text`.
+const TOTAL_DIRECTIVES: usize = 1_532;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_149;
+const PROVENANCE_PERMITS: usize = 1_151;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -794,7 +800,11 @@ const PROVENANCE_PERMITS: usize = 1_149;
 /// that shape too: every `eval` row is a streams query at a single
 /// instant over a relative-offset load set, so its whole permitted share
 /// lands here and its `eval_fail` rows never enter the question.
-const REACHABLE: usize = 221;
+/// `b25_re2_reject_parity.test` (issue #400's second stage) is that
+/// shape as well, and it was authored to be: its load spans well inside
+/// [`SLOT_SECS`]'s half, which the widest-case assertion below checks
+/// rather than takes on trust.
+const REACHABLE: usize = 223;
 
 /// Issue #406 moved `differential_metric_reducers.test`'s `eval_ordered`
 /// rows off that file's `ported(...)` default onto
@@ -810,7 +820,7 @@ const REACHABLE: usize = 221;
 /// under `our-error-text`, because the classifier assigns each row a
 /// single reason and no row lands in both buckets.
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=184, not a capture claim (derived)=29, \
-not a capture claim (ported)=27, our-error-text (eval_fail)=99, pinned-divergence=30";
+not a capture claim (ported)=27, our-error-text (eval_fail)=111, pinned-divergence=30";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice
