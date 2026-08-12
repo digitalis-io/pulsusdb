@@ -198,7 +198,8 @@ use pulsus_logql::{Grouping, GroupingKind, VectorAggOp, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
     Direction, MAX_VARIANT_FANOUT_STATE_BYTES, MetricNode, MetricPlan, Plan, PlanCtx, QueryParams,
-    QueryResult, QuerySpec, VariantArena, VariantSpec, VariantsAggState, plan, run_variants_rows,
+    QueryResult, QuerySpec, VariantArena, VariantSpec, VariantsAggState, Warnings, plan,
+    run_variants_rows,
 };
 
 static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -651,9 +652,13 @@ fn count_fin(f: &ExecFixture) -> (u64, u64, u64) {
     let mut st =
         VariantsAggState::new(&arena, &f.variants, &f.meta, MAX_VARIANT_FANOUT_STATE_BYTES)
             .expect("state");
+    // Issue #277: the accumulator is built OUTSIDE the measured region —
+    // a `BTreeSet::new()` allocates nothing, and no variant here breaches,
+    // so every census figure below is unchanged by its presence.
+    let mut warnings = Warnings::new();
     let (calls, bytes, peak, out) = measured(|| {
         st.push_rows(&[]).expect("empty push");
-        st.finish().expect("finish")
+        st.finish(&mut warnings).expect("finish")
     });
     drop(out);
     (calls, bytes, peak)
@@ -989,6 +994,7 @@ fn variants_allocation_gates() {
         let charged_and_bytes = |q: &str| {
             let f = exec_fixture(q, &range_params(), 0);
             let common = &f.scan.client.as_ref().expect("client scan").pipeline;
+            let mut warnings = Warnings::new();
             let (_, bytes, _, charged) = measured(|| {
                 let arena = VariantArena::build(
                     common,
@@ -1006,7 +1012,7 @@ fn variants_allocation_gates() {
                 .expect("state");
                 st.push_rows(&[]).expect("push");
                 let charged = st.charged_bytes();
-                let out = st.finish().expect("finish");
+                let out = st.finish(&mut warnings).expect("finish");
                 drop(out);
                 charged
             });
@@ -1098,6 +1104,7 @@ fn variants_allocation_gates() {
         let peak_and_charged = |q: &str| {
             let f = exec_fixture(q, &range_params(), 8);
             let common = &f.scan.client.as_ref().expect("client scan").pipeline;
+            let mut warnings = Warnings::new();
             let (_, _, peak, charged) = measured(|| {
                 let arena = VariantArena::build(
                     common,
@@ -1115,7 +1122,7 @@ fn variants_allocation_gates() {
                 .expect("state");
                 st.push_rows(&[]).expect("push");
                 let charged = st.charged_bytes();
-                let out = st.finish().expect("finish");
+                let out = st.finish(&mut warnings).expect("finish");
                 drop(out);
                 charged
             });
@@ -1154,10 +1161,13 @@ fn variants_allocation_gates() {
         let common2 = f2.scan.client.as_ref().expect("client").pipeline.clone();
         let common8 = f8.scan.client.as_ref().expect("client").pipeline.clone();
         let rows = mk_rows(true);
-        let (_, bytes2, _, out2) =
-            measured(|| run_variants_rows(&rows, &f2.meta, &common2, &f2.variants).expect("run"));
-        let (_, bytes8, _, out8) =
-            measured(|| run_variants_rows(&rows, &f8.meta, &common8, &f8.variants).expect("run"));
+        let mut warnings = Warnings::new();
+        let (_, bytes2, _, out2) = measured(|| {
+            run_variants_rows(&rows, &f2.meta, &common2, &f2.variants, &mut warnings).expect("run")
+        });
+        let (_, bytes8, _, out8) = measured(|| {
+            run_variants_rows(&rows, &f8.meta, &common8, &f8.variants, &mut warnings).expect("run")
+        });
         let body_bytes = 32 * fat.len() as u64;
         assert!(
             bytes8.saturating_sub(bytes2) < body_bytes,
@@ -1165,8 +1175,14 @@ fn variants_allocation_gates() {
              grow by a body-clone per extra sub-state (bodies = {body_bytes})",
             bytes8.saturating_sub(bytes2)
         );
-        let sorted_out =
-            run_variants_rows(&mk_rows(false), &f8.meta, &common8, &f8.variants).expect("run");
+        let sorted_out = run_variants_rows(
+            &mk_rows(false),
+            &f8.meta,
+            &common8,
+            &f8.variants,
+            &mut warnings,
+        )
+        .expect("run");
         // Series order inside a fan-out result is map-iteration order
         // (the server encoder label-sorts on the wire) — canonicalize
         // before comparing.
@@ -2050,8 +2066,27 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
         // `StageInput` and the refusal arm builds one fixed-size
         // `TooBroadReason`, so the per-variant allocation count does not
         // move.
+        //
+        // Issue #277: the per-variant gate becomes SKIP-AND-WARN.
+        // `ensure_result_series` (a `syn::ExprTry`) is replaced by
+        // `result_series_breach` + a `match`, so the branch count is
+        // UNCHANGED at 18 (one `ExprTry` out, one `match` arm-pair in)
+        // while the callee set gains `.add`, `result_series_breach` and
+        // `variant_series_warning` and loses `ensure_result_series`.
+        // Regenerated with `zz_print_frame_censuses`, not hand-edited.
+        // W-MEM inventory disposition: **NOT NIL** —
+        // `Warnings::add(variant_series_warning(..))` allocates one
+        // `String` (and one `BTreeSet` node) per SKIPPED variant. It is
+        // bounded by the variant count, which `MAX_VARIANT_SUB_STATES`
+        // already gates at plan time, times a fixed-format message over a
+        // decimal index, so it adds no scan-proportional retention — the
+        // executable form of that sentence is
+        // `warnings_retention_is_bounded_by_the_variant_count`
+        // (`src/logql/warnings.rs`). The G-gates below drive no breaching
+        // fixture, so every figure they pin is unmoved.
         branches: 18,
         callees: &[
+            ".add",
             ".any",
             ".client",
             ".enumerate",
@@ -2076,9 +2111,10 @@ static PER_VARIANT_FRAMES: [Frame; 34] = [
             "append_variant_label",
             "apply_vector_aggs",
             "discharge_fanout_bytes",
-            "ensure_result_series",
             "matches!",
+            "result_series_breach",
             "take",
+            "variant_series_warning",
             "with_capacity",
         ],
     },

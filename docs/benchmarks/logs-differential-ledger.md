@@ -1213,15 +1213,104 @@ not "fix" us toward the panic.
   therefore registered as *unreachable* rather than live —
   `variants_past_the_derived_backstop_reject_at_plan_time` computes the
   verdict from the two constants and fails if it ever becomes reachable.
-- **(c) Per-variant series cap.** *Reference:* applies `maxSeries` PER
-  VARIANT and SKIPS the breaching variant with a warning. *PulsusDB:*
-  applies the result-series cap per variant too (#236 — matching the
-  reference's GRANULARITY, a strict acceptance win: a 3-variant query
-  returning 3×400 series is served), but **422s** on breach where the
-  reference skips-and-warns. The remaining divergence is the
-  skip-and-warn behaviour, which needs a `warnings` response-envelope
-  field that exists nowhere in the tree: owned by **#277**, a real
-  parity bug deferred for sequencing, not an accepted shape.
+- **(c) Per-variant series cap — CLOSED by #277, no divergence remains
+  at instant.** *Reference:* applies `maxSeries` PER VARIANT and SKIPS
+  the breaching variant with a warning, at HTTP 200. *PulsusDB:* the
+  same. #236 landed the GRANULARITY and #277 landed the skip-and-warn
+  plus the `warnings` response-envelope field, so a breaching variant is
+  removed entirely, the rest of the query is served, and the response
+  carries `"warnings":["maximum of series (500) reached for variant
+  (0)"]` as its LAST top-level key.
+
+  **A correction to what this entry used to claim.** It said "a
+  3-variant query returning 3×400 series is served". That was **false at
+  the API** until #277: a variants query plans to
+  `Plan::MetricBinary(MetricNode::Variants{…})` and `exec.rs` then capped
+  the CONCATENATION unconditionally, so #236's per-variant gate was
+  shadowed and 1 200 result series were a 422. #277's
+  `final_series_gate_applies` exempts a root `MetricNode::Variants` — the
+  reference's own rule, which dispatches on the ROOT expression
+  (`pkg/logql/engine.go:321-322 @ grafana/loki v3.7.4 b318f282`) — and
+  `three_variants_of_four_hundred_series_each_are_served`
+  (`crates/pulsus-server/tests/logs_variants_warnings_live.rs`) is the
+  behavioural proof at the HTTP surface.
+
+  The residual range boundary is entry **(d)**.
+- **(d) The range boundary, and the two warnings we deliberately do not
+  emit** (issue #277, adjudicated).
+
+  **The divergence.** `multiVariantVectorsToSeries`
+  (`pkg/logql/engine.go:473-508 @ grafana/loki v3.7.4
+  b318f2829f0ae2094ab3a1e90780450e9e4b03be`) tests
+  `len(sm[variantLabel]) >= maxSeries` **before** looking up whether the
+  incoming point's series already exists, so a point belonging to an
+  ALREADY-COUNTED series deletes the entire variant. Its own sibling
+  `vectorsToSeriesWithLimit` (`:440-471`) has exactly the `!ok` guard
+  this function is missing. Measured on the pinned container
+  (`grafana/loki:3.7.4`, digest `sha256:87f0a067…`, buildinfo
+  `3.7.4`/`b318f282`) over 501 `| logfmt` groups:
+
+  | grid | 498 | 499 | 500 | 501 |
+  |---|---|---|---|---|
+  | instant | served | served | served | skipped + warning |
+  | range, `60s→120s step 30s` | served | served | **skipped + warning** | skipped + warning |
+  | range, `60s→60s step 30s` (one point) | — | served | served | skipped + warning |
+
+  The single-point row is a **measured refinement** of the wording the
+  #277 plan carried ("at a single step as well as many"): the skip needs
+  at least TWO grid points, which is exactly what the missing `!ok` guard
+  predicts, since the delete can only fire when a later point revisits an
+  already-counted series. The reference's instant path serves 500, so its
+  two paths disagree with each other.
+
+  **PulsusDB applies `> 500` uniformly**, instant and range alike. The
+  divergence is an **over-acceptance in the safe direction**: every query
+  the reference serves, PulsusDB serves; PulsusDB additionally serves a
+  range variant of exactly 500 series. Same class as `#236 (f)`.
+  Corpus case 8 of `b21_variant_series_cap.test` asserts our verdict and
+  keeps the reference's captured skip beside it as a `# reference:`
+  annotation, so a later "parity fix" toward the off-by-one has to delete
+  the evidence rather than overlook it;
+  `range_variant_at_the_cap_is_served_where_the_reference_skips_it`
+  (`crates/pulsus-read/src/logql/variants.rs`) reddens if our gate moves
+  to `>= 500`.
+
+  **The warnings PulsusDB does not emit — measured non-emissions, not
+  omissions.** The reference's whole emission inventory is three message
+  families (every `AddWarning`/`AddWarnings` call site under `pkg/`,
+  tests and generated files excluded, is one of them; the wire array has
+  no other source, because `metadata.Context`'s `warnings
+  map[string]struct{}` is unexported and its package is a single
+  non-test file with exactly two insertion statements, `context.go:84`
+  and `:140`):
+
+  1. `maximum of series (%d) reached for variant (%s)` — **implemented**,
+     above.
+  2. `maximum number of series (%d) reached for a single query;
+     returning partial results` (`engine.go:542`, `:582`,
+     `limits.go:512`) — **NOT emitted, and not implementable.** It is
+     gated on the request header `X-Query-Tags:
+     source=grafana-lokiexplore-app` (`pkg/util/httpreq/tags.go:108-128`,
+     `constants.LogsDrilldownAppName`). Measured five times with that
+     header over the 501-group dataset, it returned a DIFFERENT
+     500-series subset each run — the dropped `id` was 184, 396, 370, 42
+     and 303 — because `engine.go:541` truncates `vec[:maxSeries]`
+     before any sort. (The #277 plan's own five runs, on a separate
+     container from the same digest, dropped 461, 265, 387, 450 and 486:
+     ten runs, ten different ids.) There is no stable rule there to
+     match, only an unstable one to imitate. PulsusDB rejects that case
+     with its existing `maximum number of series (500) …` error instead.
+  3. `Query was executed using the new experimental query engine[ and
+     dataobj storage.]` (`pkg/engine/basic_engine.go:265`,
+     `pkg/engine/engine.go:298`, `pkg/engine/handler.go:532`) — **NOT
+     emitted.** It is an announcement about the reference's own
+     experimental dataobj engine; emitting it from PulsusDB would be a
+     false statement about our implementation.
+
+  `the_reference_warning_inventory_is_three_families`
+  (`crates/pulsus-read/tests/warning_inventory.rs`) pins this decision
+  and parses these two non-emission records out of this entry, so
+  deleting them reddens.
 
 ### `label-replace-scalar-operand-status` (issue #276)
 

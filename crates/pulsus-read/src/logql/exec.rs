@@ -45,6 +45,7 @@ use super::post_agg::{
     charged_range_chain, combine_binary,
 };
 use super::variants::{MAX_VARIANT_FANOUT_STATE_BYTES, VariantArena, VariantsAggState};
+use super::warnings::Warnings;
 use super::window::{ClientWindow, materialize_vector_lit};
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
@@ -236,13 +237,22 @@ impl LogQlEngine {
         Self { client, config }
     }
 
-    pub async fn query(&self, expr: &Expr, params: &QueryParams) -> Result<QueryResult, ReadError> {
+    /// Returns the result alongside the [`Warnings`] the evaluation
+    /// accumulated (issue #277) — empty for every query but a
+    /// `variants(...)` one that skipped a variant, and an empty
+    /// accumulator renders zero bytes on the wire.
+    pub async fn query(
+        &self,
+        expr: &Expr,
+        params: &QueryParams,
+    ) -> Result<(QueryResult, Warnings), ReadError> {
         let ctx = self.config.plan_ctx();
+        let mut warnings = Warnings::new();
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => self
                 .run_streams_inner(&sp, None)
                 .await
-                .map(|(items, partial)| QueryResult::Streams { items, partial }),
+                .map(|(items, partial)| (QueryResult::Streams { items, partial }, warnings)),
             // Issue #236: [`MAX_QUERY_SERIES`] is a FINAL-RESULT cap, so it
             // is applied here — on the whole expression's output — and
             // never inside `run_metric_inner`/`run_metric_node`/
@@ -251,12 +261,14 @@ impl LogQlEngine {
             Plan::Metric(mp) => {
                 let result = self.run_metric_inner(&mp, None).await?;
                 ensure_result_series(&result)?;
-                Ok(result)
+                Ok((result, warnings))
             }
             Plan::MetricBinary(node) => {
-                let result = self.run_metric_node(&node, None).await?;
-                ensure_result_series(&result)?;
-                Ok(result)
+                let result = self.run_metric_node(&node, None, &mut warnings).await?;
+                if final_series_gate_applies(&node) {
+                    ensure_result_series(&result)?;
+                }
+                Ok((result, warnings))
             }
         }
     }
@@ -272,13 +284,14 @@ impl LogQlEngine {
         &self,
         expr: &Expr,
         params: &QueryParams,
-    ) -> Result<(QueryResult, PlanExplain), ReadError> {
+    ) -> Result<(QueryResult, Warnings, PlanExplain), ReadError> {
         let ctx = self.config.plan_ctx();
+        let mut warnings = Warnings::new();
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => {
                 let mut explain = PlanExplain::new("streams");
                 let (items, partial) = self.run_streams_inner(&sp, Some(&mut explain)).await?;
-                Ok((QueryResult::Streams { items, partial }, explain))
+                Ok((QueryResult::Streams { items, partial }, warnings, explain))
             }
             Plan::Metric(mp) => {
                 let result_type = if mp.step_ns.is_none() {
@@ -289,13 +302,17 @@ impl LogQlEngine {
                 let mut explain = PlanExplain::new(result_type);
                 let result = self.run_metric_inner(&mp, Some(&mut explain)).await?;
                 ensure_result_series(&result)?;
-                Ok((result, explain))
+                Ok((result, warnings, explain))
             }
             Plan::MetricBinary(node) => {
                 let mut explain = PlanExplain::new(binary_result_type(&node, params));
-                let result = self.run_metric_node(&node, Some(&mut explain)).await?;
-                ensure_result_series(&result)?;
-                Ok((result, explain))
+                let result = self
+                    .run_metric_node(&node, Some(&mut explain), &mut warnings)
+                    .await?;
+                if final_series_gate_applies(&node) {
+                    ensure_result_series(&result)?;
+                }
+                Ok((result, warnings, explain))
             }
         }
     }
@@ -1538,6 +1555,7 @@ impl LogQlEngine {
         variants: &[plan::VariantSpec],
         spec_bytes: u64,
         mut explain: Option<&mut PlanExplain>,
+        warnings: &mut Warnings,
     ) -> Result<QueryResult, ReadError> {
         let common = scan.client.as_ref().ok_or_else(|| {
             // Defense in depth: `build_variants_node` plans the scan with
@@ -1577,7 +1595,7 @@ impl LogQlEngine {
                 MAX_VARIANT_FANOUT_STATE_BYTES,
             )?;
             state.push_rows(&[])?;
-            return state.finish();
+            return state.finish(warnings);
         }
         if let Some(e) = explain.as_mut() {
             e.push(
@@ -1635,7 +1653,7 @@ impl LogQlEngine {
             }
         }
         state.push_rows(&chunk)?;
-        state.finish()
+        state.finish(warnings)
     }
 
     /// Evaluates a [`MetricNode`] tree (issue M6-10): leaves execute the
@@ -1656,6 +1674,7 @@ impl LogQlEngine {
         &self,
         node: &MetricNode,
         explain: Option<&mut PlanExplain>,
+        warnings: &mut Warnings,
     ) -> Result<QueryResult, ReadError> {
         // Issue #272, memory L5 Leg B: EVERY allocating step is charged
         // BEFORE it happens, against the same derived cap Leg A uses —
@@ -1687,8 +1706,14 @@ impl LogQlEngine {
                     variants,
                     spec_bytes,
                 } => {
-                    self.run_variants(scan, variants, *spec_bytes, explain.as_deref_mut())
-                        .await?
+                    self.run_variants(
+                        scan,
+                        variants,
+                        *spec_bytes,
+                        explain.as_deref_mut(),
+                        warnings,
+                    )
+                    .await?
                 }
                 MetricNode::Binary {
                     op,
@@ -3241,6 +3266,36 @@ pub(in crate::logql) fn advance_tail_cursor(
         tuple: bt,
         seen: run.saturating_add(carry),
     })
+}
+
+/// Issue #277: does the FINAL-result series cap apply to this root?
+///
+/// **No, for a root `variants(...)`, and only there.** Measured against
+/// the pinned reference: it dispatches on the ROOT expression
+/// (`pkg/logql/engine.go:321-322 @ grafana/loki v3.7.4
+/// b318f2829f0ae2094ab3a1e90780450e9e4b03be` — "A VariantsExpr is a
+/// specific type of SampleExpr, so make sure this case is evaluated
+/// first") into `evalVariants` → `JoinMultiVariantSampleVector`
+/// (`:608-660`), which caps PER VARIANT and never the concatenation. Every
+/// other root — including `variants(...) + 1` — goes to `JoinSampleVector`
+/// (`:520-607`) and its plain cap at `:538`/`:588`.
+///
+/// Captured 2026-08-12 on that container: a root variants query returning
+/// **501 total** series across two variants is `200` with no warning,
+/// while the identical expression `+ 1` is `400` with
+/// `maximum number of series (500) reached for a single query; …`.
+///
+/// Without this exemption the per-variant gate #236 landed is SHADOWED:
+/// `exec.rs` capped the concatenation unconditionally, so a three-variant
+/// query returning 400 series each — every variant under the cap — was a
+/// 422.
+/// `pub` so the conformance runner (`tests/logqltest/runner.rs`) applies
+/// the IDENTICAL root test on its own `Plan::MetricBinary` arm rather
+/// than a hand-copied twin of it — the same reason
+/// [`ensure_result_series`](super::charge::ensure_result_series) is
+/// exported.
+pub fn final_series_gate_applies(node: &MetricNode) -> bool {
+    !matches!(node, MetricNode::Variants { .. })
 }
 
 /// The `resultType` a binary metric plan produces: `scalar` for a tree

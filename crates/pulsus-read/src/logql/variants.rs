@@ -18,12 +18,13 @@ use std::ops::ControlFlow;
 
 use super::agg::LabelSet;
 use super::charge::{
-    AggCaps, alloc_block_bytes, ensure_result_series, grown_alloc_bytes, label_set_bytes,
-    map_entry_bytes,
+    AggCaps, alloc_block_bytes, grown_alloc_bytes, label_set_bytes, map_entry_bytes,
+    result_series_breach,
 };
 use super::client_agg::{ClientAggState, MetricAggState, RangeSlideState};
 use super::exec::{MatrixSeries, QueryResult, VectorSample};
 use super::post_agg::apply_vector_aggs;
+use super::warnings::{Warnings, variant_series_warning};
 use super::window::{ClientWindow, grid_point_count};
 
 /// The reference's variant-index label (`__variant__`), set to the plain
@@ -742,7 +743,7 @@ impl<'q> VariantsAggState<'q> {
     /// no `__variant__` (reference `engine.go:485-487`); instant keeps
     /// them (`engine.go:620-634`) — the reference's instant/range
     /// asymmetry.
-    fn finish_in_place(&mut self) -> Result<QueryResult, ReadError> {
+    fn finish_in_place(&mut self, warnings: &mut Warnings) -> Result<QueryResult, ReadError> {
         let is_range = matches!(
             self.variants.first().map(plan::VariantSpec::window),
             Some(ClientWindow::Range { .. })
@@ -786,12 +787,25 @@ impl<'q> VariantsAggState<'q> {
             // variant, not to the concatenated whole). Strictly more
             // permissive than capping the concat: a 3-variant query
             // returning 400 series each is served (1 200 result series).
-            // The remaining divergence is that the reference SKIPS the
-            // breaching variant with a warning where PulsusDB 422s —
-            // that needs a `warnings` response envelope and is #277.
-            ensure_result_series(&out)?;
+            //
+            // Issue #277: a breach SKIPS the variant and records a
+            // warning; it is not an error. The reference removes the
+            // whole variant — never truncates it — and serves the rest at
+            // 200 (`pkg/logql/engine.go:500-508 @ grafana/loki v3.7.4
+            // b318f2829f0ae2094ab3a1e90780450e9e4b03be`).
+            //
+            // THE DISCHARGE RUNS ON BOTH ARMS, and above the decision.
+            // Before #277 the `?` on the gate returned before it, which
+            // was invisible only because the error propagated past
+            // `finish`'s `debug_assert_eq!(self.charged, self.base)`.
+            // Now that a breach continues, leaving it below would fire
+            // that assert on the first skip in any debug build.
+            let breach = result_series_breach(&out);
             discharge_fanout_bytes(&mut self.charged, self.sub_charged[i]);
-            per_variant.push(out);
+            match breach {
+                Some(cap) => warnings.add(variant_series_warning(cap, spec.index())),
+                None => per_variant.push(out),
+            }
         }
         if is_range {
             let total: usize = per_variant
@@ -831,8 +845,9 @@ impl<'q> VariantsAggState<'q> {
     }
 
     /// Finalizes, asserting every per-sub-state charge was released.
-    pub fn finish(mut self) -> Result<QueryResult, ReadError> {
-        let out = self.finish_in_place()?;
+    /// `warnings` collects one message per SKIPPED variant (issue #277).
+    pub fn finish(mut self, warnings: &mut Warnings) -> Result<QueryResult, ReadError> {
+        let out = self.finish_in_place(warnings)?;
         debug_assert_eq!(
             self.charged, self.base,
             "every variants fan-out charge must be discharged at finish"
@@ -871,6 +886,7 @@ pub fn run_variants_rows(
     meta: &HashMap<u64, StreamMetaRow>,
     common: &[Stage],
     variants: &[plan::VariantSpec],
+    warnings: &mut Warnings,
 ) -> Result<QueryResult, ReadError> {
     let arena = VariantArena::build(common, variants, MAX_VARIANT_FANOUT_STATE_BYTES, 0)?;
     let mut state = VariantsAggState::new(&arena, variants, meta, MAX_VARIANT_FANOUT_STATE_BYTES)?;
@@ -896,7 +912,7 @@ pub fn run_variants_rows(
     } else {
         state.push_rows(rows)?;
     }
-    state.finish()
+    state.finish(warnings)
 }
 
 #[cfg(test)]
@@ -1411,5 +1427,279 @@ mod tests {
         let charges = compact.matches("charge_fanout_bytes(&mut").count()
             - compact.matches("discharge_fanout_bytes(&mut").count();
         assert_eq!(charges, 3, "exec charge-site census");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #277: the per-variant cap SKIPS and WARNS.
+    // -----------------------------------------------------------------
+
+    /// The b21 corpus shape, in miniature: `n` distinct `| logfmt`
+    /// groups on one stream, variant 0 = one series per group (so it is
+    /// the variant that walks the cap), variant 1 = exactly one series.
+    fn common_range(n: usize) -> String {
+        format!(r#"{{app="v277"}} | logfmt | id < {n} [1m]"#)
+    }
+
+    fn cap_query(n: usize) -> String {
+        let common = common_range(n);
+        format!(
+            "variants(sum by (id) (count_over_time({common})), sum(count_over_time({common}))) of ({common})"
+        )
+    }
+
+    fn cap_rows(n: usize) -> Vec<MetricScanRow> {
+        (0..n)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                // 100 ms apart inside the (0, 60s] window, like b21.
+                timestamp_ns: (i as i64 + 1) * 100 * 1_000_000,
+                body: format!("id={i}"),
+                structured_metadata: String::new(),
+            })
+            .collect()
+    }
+
+    fn cap_meta() -> HashMap<u64, StreamMetaRow> {
+        let mut m = HashMap::new();
+        m.insert(
+            1,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "v277".to_string(),
+                labels: r#"{"app":"v277"}"#.to_string(),
+            },
+        );
+        m
+    }
+
+    /// Runs the cap fixture over `n` groups and returns the result plus
+    /// the accumulated warnings, in wire order.
+    fn run_cap(n: usize, spec: QuerySpec) -> (QueryResult, Vec<String>) {
+        let (scan, variants, _) = variants_fixture(&cap_query(n), spec);
+        let common = scan.client.expect("client scan").pipeline;
+        let mut warnings = Warnings::new();
+        let out = run_variants_rows(&cap_rows(n), &cap_meta(), &common, &variants, &mut warnings)
+            .expect("a breaching variant is skipped, never an error");
+        (out, warnings.as_strings())
+    }
+
+    fn variant_indices(result: &QueryResult) -> Vec<String> {
+        let pick = |labels: &Vec<(String, String)>| {
+            labels
+                .iter()
+                .find(|(k, _)| k == VARIANT_LABEL)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "<none>".to_string())
+        };
+        let mut out: Vec<String> = match result {
+            QueryResult::Vector(items) => items.iter().map(|s| pick(&s.labels)).collect(),
+            QueryResult::Matrix(items) => items.iter().map(|s| pick(&s.labels)).collect(),
+            other => panic!("expected a series result, got {other:?}"),
+        };
+        out.sort();
+        out
+    }
+
+    /// AC 2 — engine-level skip and message. The breaching variant
+    /// contributes ZERO series (removed entirely, never truncated), the
+    /// call returns `Ok`, and the message is byte-equal to the string
+    /// captured from the pinned container.
+    #[test]
+    fn variants_breaching_variant_is_skipped_with_a_warning() {
+        let (out, warnings) = run_cap(501, QuerySpec::Instant { at_ns: 60 * VSEC });
+
+        assert_eq!(
+            warnings,
+            vec!["maximum of series (500) reached for variant (0)".to_string()],
+            "the captured message, byte for byte"
+        );
+        let indices = variant_indices(&out);
+        assert!(
+            !indices.iter().any(|i| i == "0"),
+            "the breaching variant contributes zero series, got {indices:?}"
+        );
+        assert_eq!(
+            indices,
+            vec!["1".to_string()],
+            "the surviving variant is served in full"
+        );
+    }
+
+    /// AC 2's companion boundary, both sides: exactly the cap is SERVED
+    /// with no warning, and `cap + 1` skips. Captured on the pinned
+    /// container at 498/499/500 served and 501 skipped
+    /// (`b21_variant_series_cap.test` cases 1-4); this pins the two rows
+    /// either side of the edge at the unit level, where the corpus pins
+    /// all four end to end.
+    #[test]
+    fn the_per_variant_boundary_serves_exactly_the_cap_and_skips_one_more() {
+        let (at_cap, none) = run_cap(500, QuerySpec::Instant { at_ns: 60 * VSEC });
+        assert!(none.is_empty(), "exactly the cap emits no warning");
+        // 500 + 1 = 501 RESULT series across two variants, served: the
+        // cap is PER VARIANT, never on the concatenation.
+        match &at_cap {
+            QueryResult::Vector(items) => assert_eq!(items.len(), 501),
+            other => panic!("expected a vector, got {other:?}"),
+        }
+
+        let (_, over) = run_cap(501, QuerySpec::Instant { at_ns: 60 * VSEC });
+        assert_eq!(over.len(), 1, "one more than the cap skips");
+    }
+
+    /// AC 14 — **a deliberate over-acceptance, defended.** A RANGE
+    /// variants query whose variant yields exactly 500 series is served
+    /// with no warning. The pinned reference SKIPS it there:
+    /// `multiVariantVectorsToSeries` (`pkg/logql/engine.go:473-508 @
+    /// grafana/loki v3.7.4 b318f2829f0ae2094ab3a1e90780450e9e4b03be`)
+    /// tests `len(sm[variantLabel]) >= maxSeries` **before** looking up
+    /// whether the incoming point's series already exists, so on the
+    /// second grid point a point belonging to an already-counted series
+    /// deletes the whole variant. Its own sibling
+    /// `vectorsToSeriesWithLimit` (`:440-471`) has exactly the `!ok`
+    /// guard this function is missing, and the reference's own INSTANT
+    /// path serves 500 — the two disagree with each other.
+    ///
+    /// PulsusDB applies `> 500` uniformly, which is a strict
+    /// over-acceptance: everything the reference serves, PulsusDB
+    /// serves. Adjudicated on issue #277 and recorded as ledger entry
+    /// `(d)` in `docs/benchmarks/logs-differential-ledger.md`.
+    ///
+    /// **Changing our gate to `>= 500` to "match the reference" reddens
+    /// this test.** That is the whole point of it.
+    #[test]
+    fn range_variant_at_the_cap_is_served_where_the_reference_skips_it() {
+        let (out, warnings) = run_cap(
+            500,
+            QuerySpec::Range {
+                start_ns: 60 * VSEC,
+                end_ns: 120 * VSEC,
+                step_ns: 30 * VSEC as u64,
+            },
+        );
+        assert!(
+            warnings.is_empty(),
+            "PulsusDB serves the range case the reference drops; got {warnings:?}"
+        );
+        let indices = variant_indices(&out);
+        assert_eq!(
+            indices.iter().filter(|i| *i == "0").count(),
+            500,
+            "the 500-series variant survives in full"
+        );
+        assert_eq!(indices.iter().filter(|i| *i == "1").count(), 1);
+    }
+
+    /// AC 9 — **the charge invariant survives a skip.** A breaching
+    /// variant's fan-out bytes were charged and must be discharged.
+    /// Before issue #277 the gate's `?` returned before
+    /// `discharge_fanout_bytes`, which was invisible only because the
+    /// error propagated past `finish`'s
+    /// `debug_assert_eq!(self.charged, self.base)`. Now that a breach
+    /// CONTINUES, that assert is reachable: moving the discharge back
+    /// below the gate panics this test in any debug build.
+    ///
+    /// Driven through `VariantsAggState` directly rather than through
+    /// [`run_variants_rows`], so the post-condition is observed at
+    /// `finish` with the charge counter still inspectable beforehand.
+    ///
+    /// **THE BREACHING VARIANT MUST NOT BE INDEX 0.** `VariantsAggState::new`
+    /// charges a sub-state only for `i > 0` — index 0 reuses the arena's
+    /// base entry, so `sub_charged[0]` is `0` and failing to discharge it
+    /// is a no-op the `debug_assert_eq!` can never see. The first cut of
+    /// this test breached index 0 and **passed with the discharge moved
+    /// back below the gate**: a gate weaker than its own claim. The
+    /// fixture is therefore RANGE (so the sub-state charge is non-zero at
+    /// all) with the wide variant at index 1, and the test asserts that
+    /// variant's own charge is non-zero BEFORE finishing — so it cannot
+    /// go vacuous again without saying so.
+    #[test]
+    fn a_skipped_variant_still_discharges_its_fanout_charge() {
+        let c = common_range(501);
+        // Index 0 is the single-series variant; index 1 is the one that
+        // breaches, and the one that carries a fan-out charge.
+        let query = format!(
+            "variants(sum(count_over_time({c})), sum by (id) (count_over_time({c}))) of ({c})"
+        );
+        let spec = QuerySpec::Range {
+            start_ns: 60 * VSEC,
+            end_ns: 120 * VSEC,
+            step_ns: 30 * VSEC as u64,
+        };
+        let (scan, variants, spec_bytes) = variants_fixture(&query, spec);
+        let common = scan.client.expect("client scan").pipeline;
+        let arena = VariantArena::build(
+            &common,
+            &variants,
+            MAX_VARIANT_FANOUT_STATE_BYTES,
+            spec_bytes,
+        )
+        .expect("arena");
+        let meta = cap_meta();
+        let mut st =
+            VariantsAggState::new(&arena, &variants, &meta, MAX_VARIANT_FANOUT_STATE_BYTES)
+                .expect("state");
+        st.push_rows(&cap_rows(501)).expect("push");
+
+        let base = st.base;
+        assert!(
+            st.charged > base,
+            "the fan-out sub-states must be charged before finish"
+        );
+        assert!(
+            st.sub_charged[1] > 0,
+            "the BREACHING variant must carry a charge of its own, or this \
+             test cannot observe the discharge it exists for (sub_charged = {:?})",
+            st.sub_charged
+        );
+
+        let mut warnings = Warnings::new();
+        // `finish` consumes the state and asserts `charged == base`. In a
+        // debug build the assert is live, so reaching `Ok` here IS the
+        // proof; the skip assertions below stop the test from passing
+        // because nothing breached.
+        let out = st.finish(&mut warnings).expect("a skip is not an error");
+        assert_eq!(
+            warnings.as_strings(),
+            vec!["maximum of series (500) reached for variant (1)".to_string()],
+            "variant 1 is the one that breached"
+        );
+        assert!(!variant_indices(&out).iter().any(|i| i == "1"));
+    }
+
+    /// The retention ceiling, at the seam that produces it: a query whose
+    /// variants ALL breach accumulates exactly one message per variant
+    /// and no more, whatever the row volume. The pure-value form of the
+    /// same property is
+    /// `warnings_retention_is_bounded_by_the_variant_count`
+    /// (`src/logql/warnings.rs`).
+    #[test]
+    fn every_breaching_variant_contributes_exactly_one_warning() {
+        let common = r#"{app="v277"} | logfmt | id < 501 [1m]"#;
+        let query =
+            format!("variants(count_over_time({common}), bytes_over_time({common})) of ({common})");
+        let (scan, variants, _) = variants_fixture(&query, QuerySpec::Instant { at_ns: 60 * VSEC });
+        let common_pipeline = scan.client.expect("client scan").pipeline;
+        let mut warnings = Warnings::new();
+        let out = run_variants_rows(
+            &cap_rows(501),
+            &cap_meta(),
+            &common_pipeline,
+            &variants,
+            &mut warnings,
+        )
+        .expect("every variant skipping is still a success");
+
+        assert_eq!(
+            warnings.as_strings(),
+            vec![
+                "maximum of series (500) reached for variant (0)".to_string(),
+                "maximum of series (500) reached for variant (1)".to_string(),
+            ]
+        );
+        assert!(warnings.len() <= variants.len());
+        match out {
+            QueryResult::Vector(items) => assert!(items.is_empty(), "every variant was removed"),
+            other => panic!("expected an empty vector, got {other:?}"),
+        }
     }
 }

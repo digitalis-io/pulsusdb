@@ -108,11 +108,15 @@ pub mod template;
 mod testkit;
 pub(crate) mod variants;
 pub(crate) mod walkbound;
+/// Issue #277: the per-query response-warning accumulator. Its own module
+/// rather than a corner of [`charge`], because it is a WIRE contract (the
+/// reference's dedup-and-sort set) and not a resource bound.
+pub mod warnings;
 pub(crate) mod window;
 
 pub use charge::{
     MAX_CLIENT_AGG_GROUP_BYTES, MAX_LEAF_RETAINED_BYTES, MAX_METRIC_RESULT_POINTS,
-    MAX_QUERY_RETAINED_BYTES, ensure_result_series,
+    MAX_QUERY_RETAINED_BYTES, ensure_result_series, result_series_breach,
 };
 pub use client_agg::{run_client_agg_rows, run_client_agg_rows_folded};
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETECTED_FIELD_BYTES};
@@ -122,7 +126,7 @@ pub use exec::{
     EngineConfig, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine, LogStats,
     MatrixSeries, PatternSeries, QueryResult, StreamResult, TAIL_REGISTRATION_GRACE_NS, TailCursor,
     TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
-    read_query_settings, run_pipeline_rows,
+    final_series_gate_applies, read_query_settings, run_pipeline_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 /// The structured-metadata context [`pipeline::CompiledPipeline::run_into_with_sm`]
@@ -179,5 +183,6 @@ pub use variants::{
     MAX_VARIANT_FANOUT_STATE_BYTES, VARIANT_LABEL, VariantArena, VariantsAggState,
     append_variant_label, run_variants_rows,
 };
+pub use warnings::{Warnings, variant_series_warning};
 pub use window::MAX_ADMITTED_GRID_POINTS;
 pub use window::{ClientWindow, GridWindow, MAX_CLIENT_AGG_BUCKETS, materialize_vector_lit};
