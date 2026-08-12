@@ -4271,6 +4271,53 @@ mod tests {
         );
     }
 
+    /// Issue #425: changing the DERIVED `step` selects no storage path.
+    ///
+    /// `metric_plan` forces `client = Some(..)` for every `QuerySpec::Range`
+    /// (`|| is_range`), and the `client.is_some()` arm of the routing match
+    /// is taken before `p.spec` is inspected — so the one place `step_ns`
+    /// could influence a route (`step_ns.is_multiple_of(ctx.rollup_res_ns)`)
+    /// is unreachable for a range query. This is the mechanical form of
+    /// that claim: two plans differing ONLY in the step agree on the route,
+    /// the reason string and the table. It fails if that rollup arm ever
+    /// becomes reachable for a range.
+    ///
+    /// The two steps are the old derived value for a 501 s window
+    /// (`2.004 s`, not a multiple of the 5 s rollup resolution) and the new
+    /// one (`2 s`, also not) alongside `1 s`; `5 s` is included precisely
+    /// because it DOES divide the resolution and would take the rollup arm
+    /// if that arm were live.
+    #[test]
+    fn derived_step_does_not_move_the_range_route() {
+        let route = |step_ns: u64| {
+            let mp = metric_mp(
+                r#"count_over_time({env="prod"}[5m])"#,
+                QuerySpec::Range {
+                    start_ns: 0,
+                    end_ns: 501_000_000_000,
+                    step_ns,
+                },
+            )
+            .unwrap();
+            (
+                mp.routing.chosen,
+                mp.routing.reason.clone(),
+                mp.table.clone(),
+                mp.rollup,
+            )
+        };
+        let baseline = route(1_000_000_000);
+        assert_eq!(baseline.0, RouteChoice::Raw);
+        assert!(!baseline.3);
+        for step_ns in [2_000_000_000u64, 2_004_000_000, 5_000_000_000] {
+            assert_eq!(
+                route(step_ns),
+                baseline,
+                "step {step_ns} ns moved the route"
+            );
+        }
+    }
+
     /// Issue #227: a range query WITH a line filter is the pipeline/unwrap
     /// client path (a beyond-plain aggregation), still raw and sliding.
     #[test]
