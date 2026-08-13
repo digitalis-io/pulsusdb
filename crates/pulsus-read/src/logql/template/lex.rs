@@ -113,7 +113,11 @@ const LEFT_COMMENT: &str = "/*";
 const RIGHT_COMMENT: &str = "*/";
 const SPACE_CHARS: &[char] = &[' ', '\t', '\r', '\n'];
 
-fn is_space(r: char) -> bool {
+/// Named apart from `logfmt_expr.rs`'s `is_space` (issue #302 — the
+/// census keys free functions by bare name). This one classifies a
+/// `char` against the template lexer's space set; that one classifies a
+/// logfmt byte.
+fn is_template_space(r: char) -> bool {
     SPACE_CHARS.contains(&r)
 }
 
@@ -236,7 +240,7 @@ impl<'t> Lexer<'t> {
     fn at_terminator(&self) -> bool {
         match self.peek() {
             None => true,
-            Some(r) if is_space(r) => true,
+            Some(r) if is_template_space(r) => true,
             Some('.') | Some(',') | Some('|') | Some(':') | Some(')') | Some('(') => true,
             _ => self.rest().starts_with(RIGHT_DELIM),
         }
@@ -361,7 +365,7 @@ impl<'t> Lexer<'t> {
             return self.errorf("unclosed action".to_string());
         };
         match r {
-            r if is_space(r) => {
+            r if is_template_space(r) => {
                 self.backup(r);
                 self.lex_space()
             }
@@ -417,7 +421,7 @@ impl<'t> Lexer<'t> {
     fn lex_space(&mut self) -> Item {
         let mut num_spaces = 0;
         while let Some(r) = self.peek() {
-            if !is_space(r) {
+            if !is_template_space(r) {
                 break;
             }
             self.next();

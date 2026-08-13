@@ -5437,25 +5437,83 @@ mod region_census {
         }
     }
 
+    /// The SUBDIRECTORY modules `dir`'s own `mod.rs` declares
+    /// `#[cfg(test)]` — derived from that file, never a name list
+    /// (issue #302).
+    ///
+    /// A list would be the thing that rots: the first subdirectory
+    /// someone adds without editing the list would be silently excluded
+    /// from a census that reports full coverage of the region. Deriving
+    /// it means a new subdirectory is SCANNED unless it is declared
+    /// test-only, so the failure direction is a loud extra finding
+    /// rather than a quiet gap.
+    fn test_only_subdirs(dir: &std::path::Path) -> BTreeSet<String> {
+        let path = dir.join("mod.rs");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return BTreeSet::new();
+        };
+        let parsed = syn::parse_file(&text)
+            .unwrap_or_else(|e| panic!("{} does not parse as Rust: {e}", path.display()));
+        parsed
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                // `content.is_none()` = `mod foo;`, i.e. a file or
+                // directory module. An inline `mod tests { … }` is not a
+                // subdirectory and is excluded by the walk anyway.
+                syn::Item::Mod(m) if m.content.is_none() && is_cfg_test(&m.attrs) => {
+                    Some(m.ident.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `.rs` under `dir`, recursively, skipping the subdirectories
+    /// that directory's own `mod.rs` declares `#[cfg(test)]`.
+    fn walk_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let skip = test_only_subdirs(dir);
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+        for e in entries {
+            let path = e.expect("dir entry").path();
+            if path.is_dir() {
+                let name = path
+                    .file_name()
+                    .expect("dir name")
+                    .to_string_lossy()
+                    .into_owned();
+                if !skip.contains(&name) {
+                    walk_sources(&path, out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
     /// Parses every production function in `src/logql`.
     ///
     /// **Scope, stated because an unscoped conclusion from a scoped
-    /// census is worthless:** every `.rs` file **directly in**
-    /// `crates/pulsus-read/src/logql/` — the flat level only, with
-    /// `#[cfg(test)]` modules excluded. The walk is NON-RECURSIVE, so
-    /// subdirectory modules such as `template/` are not scanned; making
-    /// it recursive is #302. The directory is read at RUN TIME rather
-    /// than a file list being written out, which is why issue #299's
-    /// `exec.rs` split did not narrow this census — the region simply
-    /// moved to other files the walk already covers. The unit is a
-    /// function ITEM.
+    /// census is worthless:** every `.rs` file under
+    /// `crates/pulsus-read/src/logql/`, RECURSIVELY, with `#[cfg(test)]`
+    /// modules excluded. The unit is a function ITEM, named by its path
+    /// relative to the region root (`exec.rs`, `template/funcs.rs`).
+    ///
+    /// It was flat until issue #302, and `src/logql/template/` — twelve
+    /// files of production source — sat outside it. The directory is
+    /// read at RUN TIME rather than a file list being written out, which
+    /// is why issue #299's `exec.rs` split did not narrow this census.
+    ///
+    /// **The test-only subdirectory is excluded by a DERIVED rule, never
+    /// a name list** ([`test_only_subdirs`]): a subdirectory whose `mod`
+    /// declaration in `src/logql/mod.rs` carries `#[cfg(test)]` is
+    /// skipped. A new subdirectory that is not so declared is scanned,
+    /// so a hand list cannot go stale and fail-open is not available.
     pub fn collect() -> (Vec<String>, Vec<FnInfo>) {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .expect("the logql source directory")
-            .map(|e| e.expect("dir entry").path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        walk_sources(&dir, &mut files);
         files.sort();
         assert!(
             files.len() >= 10,
@@ -5466,8 +5524,8 @@ mod region_census {
         let mut names = Vec::new();
         for path in &files {
             let name = path
-                .file_name()
-                .expect("file name")
+                .strip_prefix(&dir)
+                .expect("a walked file is under the region root")
                 .to_string_lossy()
                 .into_owned();
             let text = std::fs::read_to_string(path).expect("read source");
@@ -5559,9 +5617,9 @@ mod region_census {
     /// token exists whose type the census's predicates do not know
     /// about", for a token minted by an `acquire*` constructor in any
     /// file `collect()` parses. It does NOT close a token minted by a
-    /// constructor named something else, nor one declared in a
-    /// subdirectory module the non-recursive walk never reads (#302);
-    /// both are accepted open, and both are empty at this commit —
+    /// constructor named something else. Issue #302 made the walk
+    /// RECURSIVE, so a subdirectory module is no longer outside it — the
+    /// remaining gap is the naming one, and it is empty at this commit —
     /// `git grep -n "fn acquire" -- crates/pulsus-read/src/logql/`
     /// returns four hits, all inherent methods of `Ledger` or
     /// `PreflightCharge` in `post_agg.rs`.
@@ -6168,10 +6226,13 @@ fn the_external_caller_map_of_the_funnel_closure_is_pinned() {
 /// whose type the predicates do not know about" for a token minted by an
 /// `acquire*` constructor in any file `collect()` parses, and it turns a
 /// FREE such constructor into a named panic. It does NOT close a token
-/// minted by a constructor named something else, nor one declared in
-/// `src/logql/template/` or `src/logql/testkit/`, which the
-/// non-recursive walk never reads (#302). Both are accepted open by
-/// ruling, and both are empty at this commit.
+/// minted by a constructor named something else. It DOES now cover
+/// `src/logql/template/`, which the walk could not read until issue #302
+/// made it recursive — so "that directory mints no token" is a measured
+/// result rather than an accepted gap. `src/logql/testkit/` stays out as
+/// test-only, excluded by its own `#[cfg(test)] mod` declaration rather
+/// than by name. The naming gap is accepted open by ruling and is empty
+/// at this commit.
 #[test]
 fn the_proof_token_list_is_derived_from_the_acquire_constructors() {
     let (_, all) = region_census::collect();
