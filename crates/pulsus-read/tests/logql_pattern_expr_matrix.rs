@@ -69,6 +69,11 @@ use pulsus_read::logql::{Direction, PlanCtx, QueryParams, QuerySpec, plan};
 enum Verdict {
     Accept,
     Reject,
+    /// Only [`pre_388`] can produce this: at `5d91ef1` `compile_pattern`
+    /// sliced `rest[1..]` and PANICKED on a pattern beginning with a
+    /// multi-byte character. Recorded as its own outcome so the replay
+    /// does not invent a verdict the shipped code never gave.
+    Panicked,
 }
 
 impl Verdict {
@@ -76,6 +81,7 @@ impl Verdict {
         match self {
             Verdict::Accept => "accept",
             Verdict::Reject => "reject",
+            Verdict::Panicked => "panicked",
         }
     }
 }
@@ -574,13 +580,12 @@ impl Point {
         self.rule.reference()
     }
 
-    /// What PulsusDB answers.
-    ///
-    /// **BASELINE COMMIT: this is the `5d91ef1` column.** The next commit
-    /// lands `pattern_expr.rs` and moves it to `self.rule.reference()`,
-    /// so the reviewer sees every verdict that moved in one diff.
+    /// What PulsusDB answers. Equal to the reference at every point —
+    /// [`pulsus_agrees_with_the_captured_reference_verdicts`] is what
+    /// makes that a measurement rather than a definition, and the
+    /// previous commit's diff shows every verdict this line moved.
     fn pulsus(&self) -> Verdict {
-        self.pre
+        self.rule.reference()
     }
 }
 
@@ -695,6 +700,18 @@ fn collect_variant_pipelines(node: &MetricNode, out: &mut Vec<Vec<pulsus_logql::
 /// It is tied to reality by the branch's FIRST commit, which asserted the
 /// real `parse → plan → compile` chain against the `pre` column with
 /// production code untouched.
+///
+/// **It has THREE outcomes, because the shipped rule had three.**
+/// `compile_pattern` sliced `rest[1..]` to look for the next `<`, which
+/// **panics** when the remaining pattern begins with a multi-byte
+/// character — so at `5d91ef1` a `| pattern "é x"` panicked the pipeline
+/// compile rather than answering. Measured, not reasoned: the function's
+/// bytes were extracted with `git show 2b32cf9:…/pipeline.rs`, compiled
+/// standalone against stub types and run under `catch_unwind` —
+/// `"…"`, `"é x"` and `"日本 <a>"` all PANIC, `"<a> <a>"` returns
+/// `Ok(3 tokens)`. `Pre::Panicked` records that instead of inventing a
+/// verdict for it. [`parse_pattern`] iterates chars and has no such
+/// edge, so every one of those is now an ordinary refusal.
 fn pre_388(pattern: &str) -> Verdict {
     let mut tokens: Vec<(u8, String)> = Vec::new(); // (0 literal, 1 capture, 2 discard)
     let mut rest = pattern;
@@ -722,6 +739,12 @@ fn pre_388(pattern: &str) -> Verdict {
             } else {
                 return Verdict::Reject; // unclosed '<'
             }
+        }
+        // `rest[1..]` PANICS here when `rest` starts with a multi-byte
+        // character — the shipped defect, reproduced as an outcome
+        // rather than as an unwind.
+        if !rest.is_char_boundary(1) {
+            return Verdict::Panicked;
         }
         let next = rest[1..].find('<').map(|off| off + 1).unwrap_or(rest.len());
         let (lit, tail) = rest.split_at(next);
@@ -816,29 +839,60 @@ fn the_pre_388_column_is_reproduced_by_the_replayed_rule() {
     }
 }
 
-/// **The gap this issue closes, enumerated at the baseline.** With
-/// `Point::pulsus` still on the `5d91ef1` column, every point where we
-/// and the reference disagree is listed by name. The next commit turns
-/// this into the direction gate: the same three verdicts, classified into
-/// buckets that must partition the matrix, with INTRODUCED asserted
-/// empty.
+/// **The direction gate, per point and re-derived.** Each point is
+/// classified by comparing three verdicts — the rule at `5d91ef1`, the
+/// rule now, and the reference's — into four disjoint buckets that must
+/// partition the matrix:
+///
+/// - **CLOSED** — `5d91ef1` disagreed with the reference and we now
+///   agree. What the issue is for.
+/// - **INTRODUCED** — `5d91ef1` agreed and we now do not. Asserted
+///   EMPTY, by name and not by a count: this change may only move points
+///   toward the reference.
+/// - **STILL OPEN** — both disagree. Also empty here.
+/// - **UNMOVED** — the two trees give the same verdict, split into the
+///   points already refused at `5d91ef1` (which pin a rule and
+///   discriminate nothing) and the accept-side controls (which show the
+///   new rule does not over-refuse).
 #[test]
-fn the_baseline_disagrees_with_the_reference_exactly_where_the_issue_says() {
+fn the_pre_388_rule_disagrees_wherever_the_reference_refuses_a_pattern() {
     let points = matrix();
-    let open: Vec<&str> = points
-        .iter()
-        .filter(|p| p.pulsus() != p.reference())
-        .map(|p| p.label.as_str())
-        .collect();
-    let expected: Vec<&str> = points
-        .iter()
-        .filter(|p| p.pre != p.rule.reference())
-        .map(|p| p.label.as_str())
-        .collect();
-    assert_eq!(open, expected);
+    let (mut closed, mut introduced, mut still_open) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut already_rejecting, mut controls) = (Vec::new(), 0usize);
+    for p in &points {
+        let (before, now, theirs) = (p.pre, p.pulsus(), p.reference());
+        match (before == theirs, now == theirs) {
+            (false, true) => closed.push(p.label.as_str()),
+            (false, false) => still_open.push(p.label.as_str()),
+            (true, false) => introduced.push(p.label.as_str()),
+            (true, true) => {
+                if theirs == Verdict::Reject {
+                    already_rejecting.push(p.label.as_str());
+                } else {
+                    controls += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        closed.len() + introduced.len() + still_open.len() + already_rejecting.len() + controls,
+        points.len(),
+        "the four buckets must partition the matrix"
+    );
+    assert!(
+        introduced.is_empty(),
+        "a point that agreed with the reference at `5d91ef1` and does not now: {introduced:?}"
+    );
+    assert!(
+        still_open.is_empty(),
+        "a point where neither tree agrees with the reference: {still_open:?}"
+    );
+    // CLOSED is computed from the table, never restated as a literal.
+    let expected_closed = points.iter().filter(|p| p.pre != p.reference()).count();
+    assert_eq!(closed.len(), expected_closed, "CLOSED: {closed:?}");
     // Five patterns move, at every position: the three duplicate-capture
-    // shapes and the two the identifier charset lets us invent a label
-    // for. Computed from the table, never restated as a literal.
+    // shapes and the two the identifier charset let us invent a label
+    // for. Named rather than counted.
     let names: std::collections::BTreeSet<&str> = PATTERNS
         .iter()
         .filter(|p| p.pre != p.rule.reference())
@@ -855,9 +909,13 @@ fn the_baseline_disagrees_with_the_reference_exactly_where_the_issue_says() {
         ]
     );
     eprintln!(
-        "baseline: {} of {} matrix points disagree with the pinned container",
-        open.len(),
-        points.len()
+        "of {} matrix points: {} CLOSED by #388; {} INTRODUCED; {} already refused at 5d91ef1 \
+         (they pin a rule and discriminate nothing); {} accept-side controls.",
+        points.len(),
+        closed.len(),
+        introduced.len(),
+        already_rejecting.len(),
+        controls,
     );
 }
 
@@ -994,224 +1052,91 @@ fn the_line_filter_rule_set_is_out_of_reach() {
 // The ALL dataset (`logql_pattern_expr_sites.tsv`).
 // ---------------------------------------------------------------------
 
-/// One tracked-tree site holding a `| pattern "…"` argument.
-struct Site {
-    /// Which sweep reaches it: `A` a literal argument, `B` one built by
-    /// `format!`/`replace`, `C` a built stage KEYWORD.
-    sweep: &'static str,
-    /// `Literal` a real query argument; `DocProse` a hit inside a doc
-    /// comment that never reaches a parser — kept in the dataset with its
-    /// verdicts rather than filtered out, so the sweep's output and this
-    /// file agree line for line.
-    form: &'static str,
-    site: &'static str,
-    /// The literal argument, or each element of a generator's domain.
-    pattern: &'static str,
-    /// The verdict at `5d91ef1` and the verdict now. **They are equal on
-    /// every row**, which is the "0 of 15 flips" claim in a form that can
-    /// go red.
-    pre: Verdict,
-    post: Verdict,
-    note: &'static str,
-}
-
-/// **The tracked-tree inventory, from three sweeps with disjoint
-/// construction forms.** Committed so a flip cannot be silent, and
-/// re-derived by [`sweep_a_still_finds_exactly_the_committed_sites`].
+/// **The tracked-tree inventory is GENERATED from the sweep, not typed.**
 ///
-/// Today: sweep A finds 15 `| pattern "…"` arguments (`git grep`-style
-/// scan over `git ls-files`, keyword case-insensitive because LogQL
-/// keywords fold); **sweep B** — `git grep -n -E '(format!|replace)\(.*(\|
-/// *json|\| *pattern)' -- crates e2e xtask test` — finds 7 sites, all
-/// seven in the `| json` domain and none in this one; **sweep C** —
-/// `git grep -n -E 'format!\([^)]*\|\s*\{\}' -- crates e2e xtask test` —
-/// finds 2 hits, `ast_walk_characterization.rs:887` (which renders a
-/// `LabelFilterExpr`, a TYPE fact, so it cannot be a parser stage) and
-/// one in `pulsus-traceql`. **0 of 15 flips.**
-const SITES: &[Site] = &[
-    Site {
-        sweep: "A",
-        form: "DocProse",
-        site: "crates/pulsus-logql/src/ast.rs:249",
-        pattern: "<p>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "`ParserStage::Pattern`'s own doc comment",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-logql/tests/case_folding.rs:277",
-        pattern: "<a>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "the `| PATTERN` spelling -- why the scan folds the keyword",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-logql/tests/case_folding.rs:278",
-        pattern: "<a>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-logql/tests/snapshots.rs:946",
-        pattern: "<method> <path> <_> <status>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "",
-    },
-    Site {
-        sweep: "A",
-        form: "DocProse",
-        site: "crates/pulsus-read/src/logql/charge.rs:548",
-        pattern: ", ",
-        pre: Verdict::Reject,
-        post: Verdict::Reject,
-        note: "prose listing the parser stages; the scan reads the text after the closing \
-               backtick as an argument. Not a query -- kept so the sweep's output and this \
-               table agree line for line",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/src/logql/plan.rs:4710",
-        pattern: "<x> y",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logql_pipeline_alloc.rs:198",
-        pattern: "<method> <path> <status> <took>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "the allocation band's pattern -- its constants must not move",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logql_pipeline_golden.rs:991",
-        pattern: "<method> <_> <status> took <took>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "an UNNAMED capture beside named ones",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logql_pipeline_golden.rs:1010",
-        pattern: "level=<level> msg",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "a literal `=` inside the pattern text",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:253",
-        pattern: "<_> <method> <path> <status>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "a LEADING unnamed capture",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:264",
-        pattern: "<level> <subsys> <event>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:437",
-        pattern: "<a><b>",
-        pre: Verdict::Reject,
-        post: Verdict::Reject,
-        note: "already refused on both sides (consecutive captures)",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logqltest/corpus/b21_key_collisions.test:190",
-        pattern: "<a>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logqltest/corpus/b2_formatters.test:198",
-        pattern: "<method> <path> <status>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "",
-    },
-    Site {
-        sweep: "A",
-        form: "Literal",
-        site: "crates/pulsus-read/tests/logqltest/corpus/differential_parsers_filters.test:65",
-        pattern: "<method> <path> <status> <took>",
-        pre: Verdict::Accept,
-        post: Verdict::Accept,
-        note: "",
-    },
-];
-
-/// **Every committed site's argument still gets the verdict the dataset
-/// records**, replayed through the real `parse → plan → compile` chain
-/// rather than through the parser alone — and its `pre` verdict is
-/// reproduced by the replayed `5d91ef1` rule, so "nothing flips" is a
-/// per-row identity rather than a count.
-#[test]
-fn every_tracked_pattern_argument_keeps_its_verdict() {
-    for s in SITES {
-        let query = format!(r#"{{service_name="m"}} | pattern "{}""#, s.pattern);
-        let (ours, detail) = pulsus_verdict(&query);
-        assert_eq!(ours, s.post, "{}: {:?}: {detail}", s.site, s.pattern);
-        assert_eq!(
-            pre_388(s.pattern),
-            s.pre,
-            "{}: the replayed `5d91ef1` rule disagrees with the recorded `pre`",
-            s.site
-        );
-        assert_eq!(
-            s.pre, s.post,
-            "{}: {:?} FLIPS under #388 -- a committed artefact may not change verdict silently",
-            s.site, s.pattern
-        );
-    }
-}
-
-/// **The committed inventory is what the sweep finds today.** A hit the
-/// file does not carry reddens, and a file row no sweep produces reddens.
+/// The first revision of this file carried a hand list of the fifteen
+/// sites sweep A found, cross-checked against the sweep. Adding this
+/// issue's own corpus file and its ledger rows took that to forty-five,
+/// most of them prose whose line numbers move whenever a doc comment is
+/// reflowed — a list that has to be re-typed on every edit stops being
+/// evidence. So the dataset's Site rows are rendered from the sweep with
+/// their verdicts COMPUTED (`pre` by the replayed `5d91ef1` rule, `post`
+/// by the real `parse → plan → compile` chain) and the committed file is
+/// compared byte for byte. A new site, a moved site or a moved verdict
+/// is a diff in `logql_pattern_expr_sites.tsv`; there is nowhere for one
+/// to hide.
 ///
-/// **What this cannot see, stated:** a pattern argument that is neither a
-/// literal, nor built by `format!`/`replace`, nor stored in one of the
-/// corpus or fixture files
+/// This is the same shape `logql_json_expr_matrix.rs` uses, for the same
+/// reason.
+///
+/// **Sweeps B and C reach nothing in this domain, today.** Sweep B —
+/// `git grep -n -E '(format!|replace)\(.*(\| *json|\| *pattern)' -- crates
+/// e2e xtask test` — finds 7 sites, all seven in the `| json` domain.
+/// Sweep C — `git grep -n -E 'format!\([^)]*\|\s*\{\}' -- crates e2e
+/// xtask test` — finds 2 hits: `ast_walk_characterization.rs:887`, which
+/// renders a `LabelFilterExpr` and so cannot be a parser stage (a TYPE
+/// fact, read from `build_lf`'s return type), and one in
+/// `pulsus-traceql`.
+///
+/// **What no sweep here reaches, stated:** a pattern argument that is
+/// neither a literal, nor built by `format!`/`replace`, nor stored in one
+/// of the corpus or fixture files
 /// [`every_corpus_pattern_argument_keeps_its_verdict`] walks — one
 /// arriving over the network in a suite this file does not touch, for
 /// instance. That set is not reachable by any command here and is not
 /// claimed empty.
-#[test]
-fn sweep_a_still_finds_exactly_the_committed_sites() {
+struct Flip {
+    argument: &'static str,
+    resolution: &'static str,
+}
+
+/// **Nothing that PRE-DATES this issue moves.** The sweep found no
+/// duplicate capture name and no digit-leading capture anywhere in the
+/// tree as it stood at `5d91ef1`; every entry below is either an elision
+/// that is not an argument, or a row this issue's own corpus file adds
+/// precisely to pin the move.
+/// [`every_flipped_site_is_resolved_and_every_resolution_flips`] turns
+/// that into a check: a flip with no entry here reddens, and an entry
+/// that no longer flips reddens too.
+const FLIPS: &[Flip] = &[
+    Flip {
+        argument: "\u{2026}",
+        resolution: "a doc-comment/CI-comment ELISION, not an argument. It is listed because                  `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any                  pattern beginning with a multi-byte character was an unwind, measured by                  running the shipped bytes under catch_unwind -- and this change refuses it                  cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT",
+    },
+    Flip {
+        argument: "<a> <a>",
+        resolution: "b25_pattern_expr_reject.test's eval_fail rows and the ledger's                      window-independence table -- THE ISSUE. Added by this change to pin the                      move, not moved by it",
+    },
+    Flip {
+        argument: "<a> x <a>",
+        resolution: "the same, with the two captures further apart",
+    },
+    Flip {
+        argument: "<__> x <__>",
+        resolution: "the same: `<__>` is a NAMED capture, since isUnnamed tests length 1",
+    },
+    Flip {
+        argument: "<1a> x",
+        resolution: "b25_pattern_expr_reject.test's eval_fail row and the ledger's table -- the                      identifier-charset half, where `5d91ef1` invented the label `_1a`. Added                      by this change to pin the move",
+    },
+    Flip {
+        argument: "<1> x",
+        resolution: "the same charset rule with a digit-only name",
+    },
+];
+
+/// `(site, argument-as-written)` for every tracked-tree hit of sweep A.
+fn sweep_a() -> Vec<(String, String)> {
     let root = repo_root();
-    let mut found: Vec<(String, String)> = Vec::new();
+    let mut found = Vec::new();
     for file in tracked_files(&root) {
-        // The matrix's own tables are the fixture, not a site.
-        if file.ends_with("logql_pattern_expr_matrix.rs")
-            || file.ends_with("logql_pattern_expr_sites.tsv")
-        {
+        // **The files that DEFINE this rule and measure it are not
+        // consumers of it**, so they are out of the sweep's scope: the
+        // two sub-grammar modules, the two matrices, the two datasets
+        // and the two committed reference enumerations. Every
+        // `| pattern` in them is either prose citing the rule or a probe
+        // this file already puts to the real chain.
+        if EXCLUDED.iter().any(|x| file.ends_with(x)) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(root.join(&file)) else {
@@ -1224,16 +1149,69 @@ fn sweep_a_still_finds_exactly_the_committed_sites() {
         }
     }
     found.sort();
-    let mut want: Vec<(String, String)> = SITES
-        .iter()
-        .filter(|s| s.sweep == "A")
-        .map(|s| (s.site.to_string(), s.pattern.to_string()))
-        .collect();
-    want.sort();
-    assert_eq!(
-        found, want,
-        "the tracked-tree inventory of `| pattern \"…\"` arguments has moved: add the site to \
-         `SITES` and state its verdict"
+    found
+}
+
+/// A sweep hit's `(decoded argument, verdict at 5d91ef1, verdict now)`,
+/// or `None` when the written text is not a valid LogQL string body.
+///
+/// The sweep yields the argument AS WRITTEN, so an escaped `\"` arrives
+/// with its backslash on; decoding is the LogQL parser's job and this
+/// asks it to do it, which also separates out a text that cannot be a
+/// LogQL string at all instead of scoring it against a rule it never
+/// reaches.
+fn resolve_site(written: &str) -> Option<(String, Verdict, Verdict)> {
+    let query = format!(r#"{{service_name="m"}} | pattern "{written}""#);
+    let expr = parse(&query).ok()?;
+    let pulsus_logql::Expr::Log(log) = &expr else {
+        return None;
+    };
+    let mut decoded = None;
+    for stage in &log.pipeline {
+        if let pulsus_logql::Stage::Parser(pulsus_logql::ParserStage::Pattern(p)) = stage {
+            decoded = Some(p.clone());
+        }
+    }
+    let decoded = decoded?;
+    let (post, _) = pulsus_verdict(&query);
+    Some((decoded.clone(), pre_388(&decoded), post))
+}
+
+/// **Every flip is hand-resolved, and every resolution names a real
+/// flip.** Both directions, so neither list can rot.
+#[test]
+fn every_flipped_site_is_resolved_and_every_resolution_flips() {
+    let mut flipped: Vec<String> = Vec::new();
+    for (site, written) in sweep_a() {
+        let Some((decoded, pre, post)) = resolve_site(&written) else {
+            continue;
+        };
+        if pre != post {
+            flipped.push(format!("{site}\t{decoded}"));
+        }
+    }
+    for f in &flipped {
+        let decoded = f.split('\t').nth(1).expect("argument");
+        assert!(
+            FLIPS.iter().any(|x| x.argument == decoded),
+            "{f}: a tracked-tree pattern argument whose verdict MOVES with no recorded resolution"
+        );
+    }
+    for f in FLIPS {
+        assert!(
+            flipped
+                .iter()
+                .any(|x| x.split('\t').nth(1) == Some(f.argument)),
+            "{}: a recorded flip that no longer flips ({}) -- delete the entry rather than \
+             leaving it",
+            f.argument,
+            f.resolution
+        );
+    }
+    eprintln!(
+        "{} of {} tracked-tree pattern arguments flip",
+        flipped.len(),
+        sweep_a().len()
     );
 }
 
@@ -1289,6 +1267,19 @@ fn pattern_arguments(line: &str) -> Vec<String> {
     out
 }
 
+/// Out of the sweep's scope — see
+/// [`sweep_a_still_finds_exactly_the_committed_sites`].
+const EXCLUDED: &[&str] = &[
+    "src/logql/pattern_expr.rs",
+    "src/logql/json_expr.rs",
+    "tests/logql_pattern_expr_matrix.rs",
+    "tests/logql_json_expr_matrix.rs",
+    "tests/logql_pattern_expr_sites.tsv",
+    "tests/logql_json_expr_sites.tsv",
+    "tests/logql_pattern_expr_reference_error_sites.txt",
+    "tests/logql_json_expr_reference_error_sites.txt",
+];
+
 fn repo_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1312,8 +1303,16 @@ fn tracked_files(root: &std::path::Path) -> Vec<String> {
 
 /// **Sweep D — the queries that live in DATA, not source.** Walks the
 /// `logqltest` corpus and the logs fixtures at run time and compiles
-/// every `| pattern` argument it finds, because a grep cannot see a query
-/// a harness reads from a file.
+/// every `| pattern` argument it finds, because a grep over source
+/// cannot see a query a harness reads from a file.
+///
+/// **The property is per-argument, not per-row.** An earlier revision
+/// asserted "an `eval_fail` row's argument must be refused", which is
+/// wrong twice over: a row can fail for a reason that is not its
+/// pattern, and a corpus file's HEADER prose is not a row at all. What
+/// this checks instead is that no corpus argument's verdict MOVES, which
+/// is the property the corpus depends on and needs no reading of why a
+/// row fails.
 #[test]
 fn every_corpus_pattern_argument_keeps_its_verdict() {
     let root = repo_root();
@@ -1328,15 +1327,16 @@ fn every_corpus_pattern_argument_keeps_its_verdict() {
         for (i, line) in text.lines().enumerate() {
             for arg in pattern_arguments(line) {
                 let query = format!(r#"{{service_name="m"}} | pattern "{arg}""#);
-                let (ours, detail) = pulsus_verdict(&query);
-                // `b1_parsers_filters.test`'s row is an `eval_fail`; every
-                // other corpus argument is an `eval`.
-                let want = if line.starts_with("eval_fail") {
-                    Verdict::Reject
-                } else {
-                    Verdict::Accept
-                };
-                assert_eq!(ours, want, "{rel}:{}: {arg:?}: {detail}", i + 1);
+                let (post, detail) = pulsus_verdict(&query);
+                let pre = pre_388(&arg);
+                if pre != post {
+                    assert!(
+                        FLIPS.iter().any(|f| f.argument == arg),
+                        "{rel}:{}: {arg:?} moves from {pre:?} to {post:?} with no recorded \
+                         resolution: {detail}",
+                        i + 1
+                    );
+                }
                 checked += 1;
             }
         }
@@ -1359,26 +1359,26 @@ fn render_sites_tsv() -> String {
          served.\n\
          #   reference_status/reference_text are CAPTURED constants, re-derived only when the \
          live leg runs.\n\
-         # row=Site:    one per tracked-tree site holding a `| pattern` argument (sweeps A/B/C).\n\
-         row\tid\terr_class\twhy_not\tform\texpression\tpre\tpost\tref_status\tref_text\tnote\n",
+         # row=Site:    one per tracked-tree hit of sweep A; `pre`/`post` are computed, not \
+         typed. form=LogqlUnparseable marks a hit whose text cannot be a LogQL string body.\n\
+         row\tform\tid\terr_class\twhy_not\texpression\tpre\tpost\tref_status\tref_text\tnote\n",
     );
     for r in REF_RULES {
         out.push_str(&format!(
-            "RefRule\t{}\t{:?}\t{}\t-\t-\t-\t-\t-\t-\t{}\n",
+            "RefRule\t-\t{}\t{:?}\t{}\t-\t-\t-\t-\t-\t{}\n",
             r.site,
             r.class,
             match r.why_not {
                 Some(w) => format!("{w:?}"),
                 None => "-".to_string(),
             },
-            r.note
+            one_line(r.note)
         ));
     }
     for p in PATTERNS {
         out.push_str(&format!(
-            "Probe\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "Probe\t-\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\n",
             p.rule.site(),
-            p.name,
             p.decoded,
             p.pre.tsv(),
             p.rule.reference().tsv(),
@@ -1391,21 +1391,41 @@ fn render_sites_tsv() -> String {
             } else {
                 p.reference_text
             },
-            format_args!("{:?}", p.rule),
+            p.name,
         ));
     }
-    for s in SITES {
-        out.push_str(&format!(
-            "Site\t{}\t-\t-\t{}\t{}\t{}\t{}\t-\t-\t{}\n",
-            s.site,
-            s.form,
-            s.pattern,
-            s.pre.tsv(),
-            s.post.tsv(),
-            format_args!("sweep {} -- {}", s.sweep, s.note),
-        ));
+    for (site, written) in sweep_a() {
+        match resolve_site(&written) {
+            Some((decoded, pre, post)) => {
+                let note = FLIPS
+                    .iter()
+                    .find(|f| f.argument == decoded)
+                    .map(|f| f.resolution)
+                    .unwrap_or("");
+                out.push_str(&format!(
+                    "Site\tLiteral\t{site}\t-\t-\t{decoded}\t{}\t{}\t-\t-\t{}\n",
+                    pre.tsv(),
+                    post.tsv(),
+                    one_line(note),
+                ));
+            }
+            None => out.push_str(&format!(
+                "Site\tLogqlUnparseable\t{site}\t-\t-\t{written}\t-\t-\t-\t-\t{}\n",
+                one_line(
+                    "the sweep's text is not a valid LogQL string body, so no argument reaches \
+                     the sub-grammar from this site. Outside the compile domain; no verdict is \
+                     recorded rather than a made-up one"
+                ),
+            )),
+        }
     }
     out
+}
+
+/// Rust's string continuation leaves runs of indentation inside a
+/// multi-line literal; a TSV cell must not carry them.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn sites_tsv_path() -> std::path::PathBuf {
@@ -1550,6 +1570,9 @@ fn live_the_pattern_rule_is_window_independent() {
         let want = match p.rule.reference() {
             Verdict::Accept => 200,
             Verdict::Reject => 400,
+            // Only `pre_388` produces `Panicked`; `Rule::reference` is
+            // Accept or Reject by construction.
+            Verdict::Panicked => unreachable!("the reference does not panic"),
         };
         assert_eq!(
             code,

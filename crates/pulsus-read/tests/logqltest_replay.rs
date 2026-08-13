@@ -773,12 +773,19 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// reachable, so this figure, [`PROVENANCE_PERMITS`] and [`REACHABLE`]
 /// all move together by that share, while its `eval_fail` rows carry
 /// PulsusDB's own error text and land under `our-error-text`.
-const TOTAL_DIRECTIVES: usize = 1_532;
+/// Issue #388 adds `b25_pattern_expr_reject.test` and
+/// `b26_json_expr.test`, neither of which needs a config delta. Their
+/// `eval` rows are streams queries at a single instant over a
+/// relative-offset load set, so they move this figure,
+/// [`PROVENANCE_PERMITS`] and [`REACHABLE`] together; their `eval_fail`
+/// rows carry PulsusDB's own error text and land under `our-error-text`,
+/// which the markers never permitted in the first place.
+const TOTAL_DIRECTIVES: usize = 1_585;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_151;
+const PROVENANCE_PERMITS: usize = 1_167;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -804,7 +811,13 @@ const PROVENANCE_PERMITS: usize = 1_151;
 /// shape as well, and it was authored to be: its load spans well inside
 /// [`SLOT_SECS`]'s half, which the widest-case assertion below checks
 /// rather than takes on trust.
-const REACHABLE: usize = 223;
+///
+/// Issue #388's `b25_pattern_expr_reject.test` and `b26_json_expr.test`
+/// are that shape too, and were authored to be: every `eval` row is a
+/// streams query at a single instant over a relative-offset load set, so
+/// their whole permitted share lands here and their `eval_fail` rows
+/// never enter the question.
+const REACHABLE: usize = 239;
 
 /// Issue #406 moved `differential_metric_reducers.test`'s `eval_ordered`
 /// rows off that file's `ported(...)` default onto
@@ -819,8 +832,12 @@ const REACHABLE: usize = 223;
 /// there. Its `eval_fail` row is counted under `config-delta file` and NOT
 /// under `our-error-text`, because the classifier assigns each row a
 /// single reason and no row lands in both buckets.
+///
+/// `b25_pattern_expr_reject.test` and `b26_json_expr.test` (issue #388)
+/// need no config delta, so their `eval_fail` rows enlarge
+/// `our-error-text` alone and their `eval` rows are permitted.
 const EXCLUDED_BY_PROVENANCE: &str = "config-delta file=184, not a capture claim (derived)=29, \
-not a capture claim (ported)=27, our-error-text (eval_fail)=111, pinned-divergence=30";
+not a capture claim (ported)=27, our-error-text (eval_fail)=148, pinned-divergence=30";
 
 /// Issue #344: all of `b18_range_agg_grouping.test`'s newly-permitted
 /// rows are metric queries, some of them on a step grid, and this slice
@@ -834,7 +851,20 @@ metric query (slice: streams only)=240, range/matrix eval (slice: instant only)=
 /// How far back the first slot sits. Bounded above by
 /// [`INGESTION_WINDOW`] and below by the total slot span; both are
 /// asserted by [`slots_fit_inside_the_measured_ingestion_window`].
-const FIRST_SLOT_AGE: Duration = Duration::from_secs(150 * 60);
+///
+/// **Issue #388 moved this from 150 min to 160 min, which is the
+/// DANGEROUS lever, and it was moved only because the other one is
+/// spent.** [`SLOT_SECS`] cannot shrink below 40s — the widest reachable
+/// case spans 20s and the separation rule is `2 * widest <= SLOT_SECS` —
+/// so `SLOT_SECS * REACHABLE` outgrowing 150 min left nothing else to
+/// give. What is spent by the move is the margin between the OLDEST slot
+/// and the window's edge: `FIRST_SLOT_AGE + SLOT_SECS` is now 9640s
+/// against [`INGESTION_WINDOW`]'s 10800s, i.e. 1160s of headroom where
+/// it was 1760s. That headroom is what absorbs the wall-clock the leg
+/// spends between planning the slots and querying them; at ~19 minutes
+/// it is still comfortably more than a run takes, but the next corpus
+/// addition should narrow a case rather than spend more of it.
+const FIRST_SLOT_AGE: Duration = Duration::from_secs(160 * 60);
 
 /// One case's exclusive time slot: the corpus reuses stream labels
 /// constantly (`clear` scopes them and the reference has no

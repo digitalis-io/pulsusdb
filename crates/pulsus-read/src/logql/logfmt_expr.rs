@@ -153,10 +153,20 @@
 //! reason. It is a whole-lexer question touching every identifier
 //! position, hence its own issue.
 //!
-//! **`| json`'s expression grammar — issue #394.** The reference uses a
-//! DIFFERENT sub-grammar there (`pkg/logql/log/jsonexpr/`, which accepts
-//! `.` and `[N]`), so this module must not be reused for it and
-//! `parse_json_path` is untouched.
+//! **`| json`'s expression grammar — issue #394, CLOSED by #388.** The
+//! reference uses a DIFFERENT sub-grammar there
+//! (`pkg/logql/log/jsonexpr/`, which accepts `.` and `[N]`), so this
+//! module is not reused for it: [`super::json_expr`] is that grammar,
+//! physically independent of this one. Until #388 the `| json` arm used
+//! a hand-rolled `parse_json_path` and this note said the two shapes
+//! below were "accepted here"; both are now 400 on both sides, and the
+//! rule is enumerated from `jsonexpr/`'s own error sites rather than
+//! borrowed from this file's.
+//!
+//! | probe | here, before #388 | here, now | reference `v3.7.4` |
+//! |---|---|---|---|
+//! | `\| json a="b c"` | 200 | 400 | 400 |
+//! | `\| json a="b-c"` | 200 | 400 | 400 |
 
 /// The reference's yacc message when no token was shifted at all
 /// (`logfmtexpr.y:26-27 @ v3.7.4` — `logfmt: expressions`, and

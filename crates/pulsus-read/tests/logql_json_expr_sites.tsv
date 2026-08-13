@@ -80,30 +80,32 @@ Probe	-	-	-	-	-	b[9223372036854775807]	accept	accept	200	-	e_b_lsb_9223372036854
 Probe	-	lexer.go:26	-	-	-	b[9223372036854775808]	accept	reject	400	syntax error: unexpected $end, expecting STRING or INDEX	e_b_lsb_9223372036854775808_rsb
 Site	Literal	crates/pulsus-logql/src/ast.rs:235	-	-	a.b	accept	accept	-	-	
 Site	Literal	crates/pulsus-logql/src/parser.rs:769	-	-	b	accept	accept	-	-	
-Site	Literal	crates/pulsus-logql/tests/snapshots.rs:940	-	-	request.headers.User-Agent	accept	accept	-	-	
+Site	Literal	crates/pulsus-logql/tests/snapshots.rs:940	-	-	request.headers.User-Agent	accept	reject	-	-	a PARSER-level snapshot (crates/pulsus-logql/tests/snapshots.rs). The reference accepts it in ParseExpr too -- a json expression is refused at Stage(), one layer later -- and that test never compiles a pipeline, so it is unaffected. The expression itself is now correctly refused: `-` is not an identifier character (jsonexpr/lexer.go:80)
 Site	Literal	crates/pulsus-logql/tests/snapshots.rs:940	-	-	servers[0]	accept	accept	-	-	
 Site	LogqlUnparseable	crates/pulsus-logql/tests/string_escapes.rs:365	-	-	\d	-	-	-	-	the sweep's text is not a valid LogQL string body, so no expression reaches the sub-grammar from this site (an invalid escape, or a `format!` placeholder). Outside the compile domain; no verdict is recorded rather than a made-up one
 Site	Literal	crates/pulsus-read/src/logql/error.rs:420	-	-	b.c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3504	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3504	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3987	-	-	b.c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4300	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4300	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4554	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4554	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4560	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4564	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4564	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4570	-	-	nosuch	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4570	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4571	-	-	nosuch	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5104	-	-	a.a.a…	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_json_flatten_budget.rs:268	-	-	{key}.k00000	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/logfmt_expr.rs:168	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/src/logql/logfmt_expr.rs:169	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3433	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3433	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3916	-	-	b.c	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4229	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4229	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4483	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4483	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4489	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4493	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4493	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4499	-	-	nosuch	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4499	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4500	-	-	nosuch	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5033	-	-	a.a.a…	accept	reject	-	-	a doc-comment ELISION, not an expression
+Site	Literal	crates/pulsus-read/tests/logql_json_flatten_budget.rs:268	-	-	{key}.k00000	accept	reject	-	-	a `format!` PLACEHOLDER (logql_json_flatten_budget.rs). Its real domain is `a`*32761 `.k00000`, FIELD DOT FIELD, which the reference accepts; that the generator produces only that is read out of the generator, not run (reading R4)
 Site	Literal	crates/pulsus-read/tests/logql_json_flatten_budget.rs:30	-	-	b.c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:156	-	-	b c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:157	-	-	b-c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:623	-	-	b	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:741	-	-	b	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:157	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:157	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:625	-	-	b	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:743	-	-	b	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:314	-	-	status	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:315	-	-	request	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:316	-	-	big	accept	accept	-	-	
@@ -111,7 +113,7 @@ Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:132	-	-	nope.deep
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:132	-	-	req.hdr["User-Agent"]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:132	-	-	servers[0]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:155	-	-	req.hdr	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:175	-	-	…	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:175	-	-	…	accept	reject	-	-	a doc-comment elision, not an expression
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:205	-	-	a	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:239	-	-	a	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:251	-	-	a	accept	accept	-	-	
@@ -121,11 +123,11 @@ Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:330	-	-	o	accept	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:351	-	-	o	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:361	-	-	o	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:371	-	-	a	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:392	-	-	{expr}	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:392	-	-	{expr}	accept	reject	-	-	`format!` placeholders (logql_pipeline_golden.rs). One loop's domain is `o`, `o.z`, `o[0]`, all valid; the other two are the malformed/valid lists this change updates in place
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:410	-	-	a	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:421	-	-	o	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:434	-	-	{expr}	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:443	-	-	{expr}	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:450	-	-	{expr}	accept	reject	-	-	`format!` placeholders (logql_pipeline_golden.rs). One loop's domain is `o`, `o.z`, `o[0]`, all valid; the other two are the malformed/valid lists this change updates in place
+Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:465	-	-	{expr}	accept	reject	-	-	`format!` placeholders (logql_pipeline_golden.rs). One loop's domain is `o`, `o.z`, `o[0]`, all valid; the other two are the malformed/valid lists this change updates in place
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:42	-	-	a.b	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b21_key_collisions.test:277	-	-	p	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b21_key_collisions.test:277	-	-	q	accept	accept	-	-	
@@ -187,9 +189,50 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b23_json_raw_read.test:38
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b23_json_raw_read.test:394	-	-	o	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b23_json_raw_read.test:406	-	-	a	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b23_json_raw_read.test:419	-	-	o	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:43	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:100	-	-	b.c	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:106	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:109	-	-	b/c	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:112	-	-	b!	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:119	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:122	-	-		reject	reject	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:125	-	-	 	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:130	-	-	0b	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:133	-	-	b[0	reject	reject	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:136	-	-	b[c]	reject	reject	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:139	-	-	b..c	reject	reject	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:142	-	-	b.0	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:145	-	-	.b	reject	reject	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:152	-	-	b 1.5	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:155	-	-	b.c 1.5	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:161	-	-	b 1x	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:169	-	-	b[9223372036854775808]	accept	reject	-	-	the same bound, one bracket in, where the syntax error overwrites the range error
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:172	-	-	b 9223372036854775808]	accept	reject	-	-	b26_json_expr.test's eval_fail row for the index bound, which is Go's `int`
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:182	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:185	-	-	["b]"]	reject	reject	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:19	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:190	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:60	-	-	arr[ 0 ]	reject	accept	-	-	b26_json_expr.test's eval row -- one of the FOUR the reference serves and `5d91ef1` refused. It flips toward the reference, which is the direction this half of the issue exists for
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:63	-	-	arr[0 ]	reject	accept	-	-	the same, second of four
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:66	-	-	b[ "c" ]	reject	accept	-	-	the same, third of four
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:71	-	-	[ "b-c" ]	reject	accept	-	-	the same, fourth of four
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:74	-	-	[ "b c" ]	reject	accept	-	-	the same widening, with a space inside the quoted key
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:82	-	-	b . c	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:85	-	-	b.c 	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:91	-	-	b["0"]	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:94	-	-	b[0]	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:97	-	-	arr["0"]	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2208	-	-	a	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2209	-	-	o	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2211	-	-	a	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2212	-	-	o	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2230	-	-	o	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2338	-	-	a.b	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3672	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3673	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3674	-	-	b 1.5	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3694	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:5616	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:5616	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:5617	-	-	["b]"]	reject	reject	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:5617	-	-	["b]"]	reject	reject	-	-	

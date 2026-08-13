@@ -922,13 +922,13 @@ impl Point {
         }
     }
 
-    /// What PulsusDB answers.
-    ///
-    /// **BASELINE COMMIT: this is the `5d91ef1` column.** The next commit
-    /// lands `json_expr.rs` and moves it to `self.rule.reference()`, so
-    /// the reviewer sees every verdict that moved in one diff.
+    /// What PulsusDB answers: the reference's verdict at every point,
+    /// INCLUDING the one position where the reference itself answers
+    /// 200 — see [`Outcome::CommonSideRefusedHere`], which is the single
+    /// recorded divergence and is inherited from #247 rather than
+    /// introduced here.
     fn pulsus(&self) -> Verdict {
-        self.pre
+        self.rule.reference()
     }
 }
 
@@ -1164,42 +1164,114 @@ fn the_pre_388_column_is_reproduced_by_the_replayed_rule() {
     }
 }
 
-/// **The gap this issue closes, enumerated at the baseline — IN BOTH
-/// DIRECTIONS.** With `Point::pulsus` still on the `5d91ef1` column, the
-/// disagreements are split by direction, because "we over-accept" and
-/// "we refuse what they serve" are different bugs and the second is the
-/// one #226 calls the real one. The next commit turns this into the
-/// direction gate.
+/// **The direction gate, per point and re-derived — and it must account
+/// for BOTH directions**, because "we over-accept" and "we refuse what
+/// they serve" are different bugs and the second is the one #226 calls
+/// the real one.
+///
+/// Four disjoint buckets that must partition the matrix:
+///
+/// - **CLOSED** — `5d91ef1` disagreed with the reference and we now
+///   agree, split by which direction it was.
+/// - **INTRODUCED** — `5d91ef1` agreed and we now do not.
+/// - **STILL OPEN** — both disagree.
+///
+/// The last two are the SAME divergence seen from two sides, they live
+/// only at `variants_common_side`, and #247 recorded and ledgered it:
+/// the reference swallows a `Stage()` build error there and answers
+/// 200-empty where we answer 400. Their union is asserted to be exactly
+/// the common-side points with a malformed expression, so no OTHER point
+/// can move away from the reference.
+/// - **UNMOVED** — the two trees agree.
 #[test]
-fn the_baseline_disagrees_with_the_reference_in_both_directions() {
+fn the_pre_388_rule_disagrees_wherever_the_reference_refuses_an_expression() {
     let points = matrix();
-    let mut over_accept = Vec::new();
-    let mut under_accept = Vec::new();
+    let (mut closed_over, mut closed_under) = (Vec::new(), Vec::new());
+    let (mut introduced, mut still_open) = (Vec::new(), Vec::new());
+    let (mut already_rejecting, mut controls) = (Vec::new(), 0usize);
     for p in &points {
-        match (p.pulsus(), p.reference()) {
-            (Verdict::Accept, Verdict::Reject) => over_accept.push(p.label.as_str()),
-            (Verdict::Reject, Verdict::Accept) => under_accept.push(p.label.as_str()),
-            _ => {}
+        let (before, now, theirs) = (p.pre, p.pulsus(), p.reference());
+        match (before == theirs, now == theirs) {
+            (false, true) if before == Verdict::Accept => closed_over.push(p.label.as_str()),
+            (false, true) => closed_under.push(p.label.as_str()),
+            (false, false) => still_open.push(p.label.as_str()),
+            (true, false) => introduced.push(p.label.as_str()),
+            (true, true) => {
+                if theirs == Verdict::Reject {
+                    already_rejecting.push(p.label.as_str());
+                } else {
+                    controls += 1;
+                }
+            }
         }
     }
-    // THE HARMFUL DIRECTION: expressions the reference serves and we
-    // refuse. Named, not counted.
-    let refused_here: std::collections::BTreeSet<&str> = EXPRESSIONS
+    assert_eq!(
+        closed_over.len()
+            + closed_under.len()
+            + still_open.len()
+            + introduced.len()
+            + already_rejecting.len()
+            + controls,
+        points.len(),
+        "the buckets must partition the matrix"
+    );
+    // **INTRODUCED and STILL OPEN are the SAME ledgered divergence seen
+    // from two sides, and both live only at `variants_common_side`.**
+    // There the reference swallows a `Stage()` build error behind
+    // `SelectSamples` and hands the user a 200 with an empty result; we
+    // answer 400 wherever the expression is malformed. Whether a point
+    // lands in INTRODUCED or in STILL OPEN depends only on whether
+    // `5d91ef1` happened to accept the expression, which is not a
+    // property of this change. So the assertion is that their UNION is
+    // exactly the common-side points with a malformed expression —
+    // computed from the table, never restated as a literal — and that
+    // neither reaches any other position.
+    let mut diverging: Vec<&str> = introduced
+        .iter()
+        .chain(still_open.iter())
+        .copied()
+        .collect();
+    diverging.sort_unstable();
+    let mut expected: Vec<&str> = points
+        .iter()
+        .filter(|p| p.outcome == Outcome::CommonSideRefusedHere && p.rule != Rule::Accepted)
+        .map(|p| p.label.as_str())
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(
+        diverging, expected,
+        "a divergence outside the ledgered common-side one: this change may not move any other \
+         point away from the reference"
+    );
+    assert!(
+        !introduced.is_empty() && !still_open.is_empty(),
+        "the two halves of the common-side divergence are both expected to be non-empty; if one \
+         has emptied, the reason is worth knowing before this assertion is relaxed"
+    );
+    // THE HARMFUL DIRECTION, named rather than counted: the expressions
+    // the reference serves and `5d91ef1` refused.
+    let served_there_refused_here: std::collections::BTreeSet<&str> = EXPRESSIONS
         .iter()
         .filter(|e| e.pre == Verdict::Reject && e.rule == Rule::Accepted)
         .map(|e| e.decoded)
         .collect();
     assert_eq!(
-        refused_here.into_iter().collect::<Vec<_>>(),
+        served_there_refused_here.into_iter().collect::<Vec<_>>(),
         vec![r#"[ "b-c" ]"#, r#"arr[ 0 ]"#, r#"arr[0 ]"#, r#"b[ "c" ]"#],
-        "the set of expressions the reference serves and `5d91ef1` refuses has moved"
+        "the set of expressions the reference serves and `5d91ef1` refused has moved"
     );
-    assert!(!over_accept.is_empty() && !under_accept.is_empty());
+    assert!(!closed_over.is_empty() && !closed_under.is_empty());
     eprintln!(
-        "baseline: {} points over-accepted, {} points refused here and served there, of {}",
-        over_accept.len(),
-        under_accept.len(),
-        points.len()
+        "of {} matrix points: {} CLOSED where we over-accepted, {} CLOSED where we refused what \
+         the reference serves, {} INTRODUCED, {} STILL OPEN (the ledgered common-side \
+         divergence), {} already refused at 5d91ef1, {} accept-side controls.",
+        points.len(),
+        closed_over.len(),
+        closed_under.len(),
+        introduced.len(),
+        still_open.len(),
+        already_rejecting.len(),
+        controls,
     );
 }
 
@@ -1336,10 +1408,106 @@ struct Flip {
     resolution: &'static str,
 }
 
-/// **The eleven flagged expressions, hand-resolved.** Populated in the
-/// commit that lands `json_expr.rs`; empty at the baseline, where nothing
-/// has moved yet.
-const FLIPS: &[Flip] = &[];
+/// **Every tracked-tree expression whose verdict moves, hand-resolved.**
+///
+/// Keyed by the DECODED expression, so one entry covers every site that
+/// spells it; [`every_flipped_site_is_resolved_and_every_resolution_flips`]
+/// asserts both directions, so neither list can rot. None of these is a
+/// query a user or a suite actually runs against the sub-grammar.
+const FLIPS: &[Flip] = &[
+    Flip {
+        expression: "request.headers.User-Agent",
+        resolution: "a PARSER-level snapshot (crates/pulsus-logql/tests/snapshots.rs). The                      reference accepts it in ParseExpr too -- a json expression is refused at                      Stage(), one layer later -- and that test never compiles a pipeline, so it                      is unaffected. The expression itself is now correctly refused: `-` is not                      an identifier character (jsonexpr/lexer.go:80)",
+    },
+    Flip {
+        expression: "a.a.a\u{2026}",
+        resolution: "a doc-comment ELISION, not an expression",
+    },
+    Flip {
+        expression: "\u{2026}",
+        resolution: "a doc-comment elision, not an expression",
+    },
+    Flip {
+        expression: "{key}.k00000",
+        resolution: "a `format!` PLACEHOLDER (logql_json_flatten_budget.rs). Its real domain is                      `a`*32761 `.k00000`, FIELD DOT FIELD, which the reference accepts; that                      the generator produces only that is read out of the generator, not run                      (reading R4)",
+    },
+    Flip {
+        expression: "{expr}",
+        resolution: "`format!` placeholders (logql_pipeline_golden.rs). One loop's domain is                      `o`, `o.z`, `o[0]`, all valid; the other two are the malformed/valid lists                      this change updates in place",
+    },
+    Flip {
+        expression: "b c",
+        resolution: "PROSE and FIXTURE about this expression, never a query that must keep                      working: one of the two #394 glosses that said it was `accepted here`                      (which this change makes false and rewrites), and b26_json_expr.test's own                      eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: "b-c",
+        resolution: "the same: the second #394 gloss, this issue's two corpus-file headers, and                      b26_json_expr.test's eval_fail row pinning the new verdict",
+    },
+    Flip {
+        expression: "b/c",
+        resolution: "b26_json_expr.test's eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: "b!",
+        resolution: "b26_json_expr.test's eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: " ",
+        resolution: "b26_json_expr.test's eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: "0b",
+        resolution: "b26_json_expr.test's eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: "b.0",
+        resolution: "b26_json_expr.test's eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: "b 1.5",
+        resolution: "b26_json_expr.test's eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: "b.c 1.5",
+        resolution: "b26_json_expr.test's eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: "b 1x",
+        resolution: "b26_json_expr.test's eval_fail row, which pins the new verdict",
+    },
+    Flip {
+        expression: "b]",
+        resolution: "b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as                      `json-expression-bracket-key-unreachable`",
+    },
+    Flip {
+        expression: "b 9223372036854775808]",
+        resolution: "b26_json_expr.test's eval_fail row for the index bound, which is Go's                      `int`",
+    },
+    Flip {
+        expression: "b[9223372036854775808]",
+        resolution: "the same bound, one bracket in, where the syntax error overwrites the                      range error",
+    },
+    Flip {
+        expression: "arr[ 0 ]",
+        resolution: "b26_json_expr.test's eval row -- one of the FOUR the reference serves and                      `5d91ef1` refused. It flips toward the reference, which is the direction                      this half of the issue exists for",
+    },
+    Flip {
+        expression: "arr[0 ]",
+        resolution: "the same, second of four",
+    },
+    Flip {
+        expression: "b[ \"c\" ]",
+        resolution: "the same, third of four",
+    },
+    Flip {
+        expression: "[ \"b-c\" ]",
+        resolution: "the same, fourth of four",
+    },
+    Flip {
+        expression: "[ \"b c\" ]",
+        resolution: "the same widening, with a space inside the quoted key",
+    },
+];
 
 /// Every `| json <id>="…"` extraction expression on one line, as
 /// `(identifier, expression)`. The keyword is matched
@@ -1411,6 +1579,18 @@ fn json_expressions(line: &str) -> Vec<String> {
     out
 }
 
+/// Out of the sweep's scope — see [`sweep_a`].
+const EXCLUDED: &[&str] = &[
+    "src/logql/pattern_expr.rs",
+    "src/logql/json_expr.rs",
+    "tests/logql_pattern_expr_matrix.rs",
+    "tests/logql_json_expr_matrix.rs",
+    "tests/logql_pattern_expr_sites.tsv",
+    "tests/logql_json_expr_sites.tsv",
+    "tests/logql_pattern_expr_reference_error_sites.txt",
+    "tests/logql_json_expr_reference_error_sites.txt",
+];
+
 fn repo_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1437,9 +1617,13 @@ fn sweep_a() -> Vec<(String, String)> {
     let root = repo_root();
     let mut found = Vec::new();
     for file in tracked_files(&root) {
-        if file.ends_with("logql_json_expr_matrix.rs")
-            || file.ends_with("logql_json_expr_sites.tsv")
-        {
+        // The files that DEFINE this rule and measure it are not
+        // consumers of it — the two sub-grammar modules, the two
+        // matrices, the two datasets and the two committed reference
+        // enumerations. See the pattern matrix's
+        // `sweep_a_still_finds_exactly_the_committed_sites` for the same
+        // boundary, stated once.
+        if EXCLUDED.iter().any(|x| file.ends_with(x)) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(root.join(&file)) else {
@@ -1487,7 +1671,7 @@ fn render_sites_tsv() -> String {
                 Some(w) => format!("{w:?}"),
                 None => "-".to_string(),
             },
-            r.note
+            one_line(r.note)
         ));
     }
     for e in EXPRESSIONS {
@@ -1518,16 +1702,20 @@ fn render_sites_tsv() -> String {
                     .map(|f| f.resolution)
                     .unwrap_or("");
                 out.push_str(&format!(
-                    "Site\tLiteral\t{site}\t-\t-\t{decoded}\t{}\t{}\t-\t-\t{note}\n",
+                    "Site\tLiteral\t{site}\t-\t-\t{decoded}\t{}\t{}\t-\t-\t{}\n",
                     pre.tsv(),
                     post.tsv(),
+                    one_line(note),
                 ));
             }
             None => out.push_str(&format!(
                 "Site\tLogqlUnparseable\t{site}\t-\t-\t{expr}\t-\t-\t-\t-\t{}\n",
-                "the sweep's text is not a valid LogQL string body, so no expression reaches the \
-                 sub-grammar from this site (an invalid escape, or a `format!` placeholder). \
-                 Outside the compile domain; no verdict is recorded rather than a made-up one",
+                one_line(
+                    "the sweep's text is not a valid LogQL string body, so no expression reaches \
+                     the sub-grammar from this site (an invalid escape, or a `format!` \
+                     placeholder). Outside the compile domain; no verdict is recorded rather \
+                     than a made-up one"
+                ),
             )),
         }
     }
@@ -1561,6 +1749,12 @@ fn first_json_expression(expr: pulsus_logql::Expr) -> Option<String> {
         }
     }
     None
+}
+
+/// Rust's string continuation leaves runs of indentation inside a
+/// multi-line literal; a TSV cell must not carry them.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn sites_tsv_path() -> std::path::PathBuf {
@@ -1604,7 +1798,9 @@ fn every_flipped_site_is_resolved_and_every_resolution_flips() {
     }
     for f in FLIPS {
         assert!(
-            flipped.iter().any(|x| x.ends_with(f.expression)),
+            flipped
+                .iter()
+                .any(|x| x.split('\t').nth(1) == Some(f.expression)),
             "{}: a recorded flip that no longer flips -- delete the entry rather than leaving it",
             f.expression
         );
