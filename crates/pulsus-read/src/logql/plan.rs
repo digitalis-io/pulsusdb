@@ -406,12 +406,37 @@ pub struct ClientAgg {
     pub grouping: Option<Box<RangeGrouping>>,
 }
 
-/// Where a client-aggregated sample's value comes from. `Unwrap` carries
-/// no fields (plan v2 D1): the label/conversion live in the compiled
-/// unwrap stage inside the pipeline; this is just the marker telling
-/// exec to read the pipeline's extracted value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientValue {
+/// Declares [`ClientValue`] and its COMPLETE variant list from one
+/// source — the `bin_ops!`/`vector_agg_ops!` precedent in
+/// `pulsus-logql`'s `ast.rs`, adopted here by issue #241 for the same
+/// reason: a hand-maintained `ALL` slice beside a hand-written enum is
+/// two sources, and a census that enumerates the value space through the
+/// slice would silently cover less than the enum has.
+macro_rules! client_values {
+    ($($(#[$meta:meta])* $variant:ident,)+) => {
+        /// Where a client-aggregated sample's value comes from. `Unwrap`
+        /// carries no fields (plan v2 D1): the label/conversion live in
+        /// the compiled unwrap stage inside the pipeline; this is just the
+        /// marker telling exec to read the pipeline's extracted value.
+        ///
+        /// **Derived, never free** (`metric_plan`'s ladder): `has_unwrap`
+        /// ⇒ `Unwrap`; else `bytes_rate`/`bytes_over_time` ⇒ `Bytes`; else
+        /// `Count`. Query text carries the op and the presence of
+        /// `unwrap` and nothing else, so `Count` versus `Bytes` is
+        /// unrepresentable in the text a client sends.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ClientValue { $($(#[$meta])* $variant),+ }
+
+        impl ClientValue {
+            /// Every variant, in declaration order — emitted by the same
+            /// invocation that declares them, so no enumeration driven by
+            /// this slice can miss a value the enum has.
+            pub const ALL: &'static [ClientValue] = &[$(ClientValue::$variant),+];
+        }
+    };
+}
+
+client_values! {
     Count,
     Bytes,
     Unwrap,

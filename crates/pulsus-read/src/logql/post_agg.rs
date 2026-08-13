@@ -1795,23 +1795,6 @@ pub fn binary_peak_bytes_without(
     total
 }
 
-/// Measures a range stage input — the chain's shape once the
-/// `QueryResult` has been converted. `points.len()` on a `BTreeMap` is
-/// `O(1)`, so the pass stays `O(series + label pairs)`.
-fn measure_range(series: &[RangeSeries]) -> StageInput {
-    let mut m = StageInput {
-        series: series.len() as u64,
-        ..StageInput::default()
-    };
-    for s in series {
-        measure_labels(&mut m, &s.labels);
-        let pts = s.points.len() as u64;
-        m.points = m.points.saturating_add(pts);
-        m.max_series_points = m.max_series_points.max(pts);
-    }
-    m
-}
-
 /// Measures an instant stage input — one point per series.
 fn measure_instant(series: &[InstantSeries]) -> StageInput {
     let mut m = StageInput {
@@ -3052,29 +3035,19 @@ fn run_instant_chain(
     Ok(series)
 }
 
-/// Charges, then runs the chain over an already-converted range vector.
+/// Charges, then runs the chain over an already-converted instant vector.
 ///
-/// The SQL metric path holds `Vec<RangeSeries>` directly and reaching
-/// [`apply_vector_aggs`] from there would cost a `BTreeMap -> Vec ->
-/// BTreeMap` round trip per point on the commonest metric shape. This is
-/// the same funnel — measure, charge, run — entered one conversion
-/// earlier.
-pub(in crate::logql) fn charged_range_chain(
-    series: Vec<RangeSeries>,
-    aggs: &[plan::VectorAggSpec],
-    cap: u64,
-) -> Result<Vec<RangeSeries>, ReadError> {
-    if aggs.is_empty() {
-        return Ok(series);
-    }
-    let m = measure_range(&series);
-    let bytes = post_agg_peak_bytes(&m, aggs);
-    let mut charged = 0u64;
-    let l = Ledger::acquire(&mut charged, &m, bytes, cap)?;
-    run_range_chain(series, aggs, &l)
-}
-
-/// [`charged_range_chain`] for an instant vector.
+/// The SQL-pushdown instant path holds `Vec<InstantSeries>` directly and
+/// reaching [`apply_vector_aggs`] from there would cost a `Vec ->
+/// QueryResult -> Vec` round trip per point. This is the same funnel —
+/// measure, charge, run — entered one conversion earlier.
+///
+/// **There is no range twin.** `charged_range_chain` stood beside this
+/// until issue #241 removed the SQL-aggregated RANGE arm it served as
+/// unreachable (`exec.rs`'s `run_metric_inner`): `metric_plan` forces
+/// client aggregation for every `QuerySpec::Range`, so no range result
+/// ever reaches post-aggregation through a `Vec<RangeSeries>` — the
+/// client path hands `apply_vector_aggs` a `QueryResult::Matrix`.
 pub(in crate::logql) fn charged_instant_chain(
     series: Vec<InstantSeries>,
     aggs: &[plan::VectorAggSpec],

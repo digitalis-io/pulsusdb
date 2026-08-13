@@ -239,9 +239,21 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
     // rejection in `fold_plan_ops`).
     //
     // Issue #299 split `exec.rs` into ten flat modules, so `exec.rs`'s 20
-    // are now spread over five of them. The TOTAL is unchanged at 20, and
-    // #240's sweep numbers stand: this is a redistribution, not a new
-    // construction site.
+    // are now spread over five of them. That redistribution left the
+    // TOTAL at 20, and #240's sweep numbers stood: it moved sites, it did
+    // not create them.
+    //
+    // Issue #241 adds TWO, both in `exec.rs`, and they are the first
+    // additions to the exec family since the split: `run_metric_inner`'s
+    // SQL-aggregated RANGE arm and its `explain_metric_into` twin were
+    // structurally unreachable (`metric_plan` forces `client = Some(..)`
+    // for every `QuerySpec::Range`) and are replaced by an internal
+    // refusal rather than deleted outright, so a planner change that
+    // reintroduces the state is a named 4xx instead of a wrong answer.
+    // The exec family is therefore 22. #240's sweep numbers stand: both
+    // refusals are internal-invariant messages carrying no regex and no
+    // reference-verbatim text, which is the property #240's sweep is
+    // about.
     let expected: BTreeMap<&str, usize> = BTreeMap::from([
         // Issue #272 moved `build_metric_node` — and with it ONE
         // `PipelineInvalid` construction, the `Vector`-over-`Literal`
@@ -274,7 +286,7 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // and the WRAPPED-form reporting (#276) is on the other branch,
         // untouched.
         ("plan.rs", 17),
-        ("exec.rs", 12),
+        ("exec.rs", 14),
         ("client_agg.rs", 1),
         ("fold.rs", 1),
         ("post_agg.rs", 5),

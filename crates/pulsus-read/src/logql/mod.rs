@@ -125,7 +125,17 @@ pub use charge::{
     MAX_QUERY_RETAINED_BYTES, MAX_STREAMS_RESULT_BYTES, RESULT_BUDGETS, ResultBudgets,
     StreamsResultBudget, ensure_result_series, result_series_breach,
 };
-pub use client_agg::{run_client_agg_rows, run_client_agg_rows_folded};
+/// Issue #241 wave 2: the instant leaf's retained-byte seam, exported so
+/// `tests/logql_leaf_retention_witness.rs` measures the shipped path
+/// rather than a copy — the same reason `post_agg`'s byte model is
+/// exported for its own witness below. `ReducerClass`/`reducer_class`
+/// travel with them so the witness's coverage table COMPUTES each row's
+/// class instead of restating it.
+pub use client_agg::{
+    LeafBoundedInput, LeafBoundedTerm, ReducerClass, instant_leaf_bounded_bytes,
+    instant_leaf_bounded_bytes_without, reducer_class, run_client_agg_rows,
+    run_client_agg_rows_folded, run_client_agg_rows_folded_measured,
+};
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETECTED_FIELD_BYTES};
 pub use detected_probe::{DetectedFieldsProbe, MAX_FEEDER_SCRATCH_BYTES};
 pub use error::{ReadError, TooBroadReason};

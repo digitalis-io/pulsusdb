@@ -518,8 +518,9 @@ pub(in crate::logql) fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// | variants: each extra sub-state's boxed slot / `base_labels`(+`hashes`) snapshot (C table share + H payload) / range `absent_labels` clone / absent `present_cover` | **charged** ([`variant_state_bytes`]) before construction; sub-state 0 charges 0 (a 1-variant query is admitted exactly when the plain query is) |
 /// | variants: `MetricNode::Variants::variants` vec + each `VariantSpec`'s tail/absent/grouping clones (incl. the CREATED `by (__variant__)` grouping and the pushed-into `Grouping::labels` realloc) | **charged at PLAN time** ([`variant_spec_bytes`] + the spec-vector buffer) into the SAME counter the arena continues (`spec_bytes`) — one budget, never two |
 /// | variants: per-sub-state growing state (`groups`/retention/collision/quantile/counter) | [`AggCaps::divided`]`(n)` — the per-field SUM over sub-states is exactly the single-query bound above |
-/// | post-aggregation selection/grouping keys (`select_k_*`/`group_*`'s `HashMap<LabelSet, _>` owned `group_key` copies) | **charged against [`super::post_agg::MAX_POST_AGG_BYTES`]**, not this cap: `apply_vector_aggs_capped` measures the stage input and `Ledger::acquire`s BEFORE converting or grouping (`post_agg.rs:3120-3163`), so a refused chain builds no map; the four maps are `select_k_range`/`select_k_instant`/`group_range`/`group_instant` (`post_agg.rs:820`/`:871`/`:1064`/`:1122`). Measured-and-margined, not a worst-case proof — see that constant's own doc (`post_agg.rs:1357-1362`). `approx_topk` is exempt structurally (`grouping == None` ⇒ a single empty key) |
+/// | post-aggregation selection/grouping keys (`select_k_*`/`group_*`'s `HashMap<LabelSet, _>` owned `group_key` copies) | **charged against [`super::post_agg::MAX_POST_AGG_BYTES`]**, not this cap: `apply_vector_aggs_capped` measures the stage input and `Ledger::acquire`s BEFORE converting or grouping (`post_agg.rs:3093-3136`), so a refused chain builds no map; the four maps are `select_k_range`/`select_k_instant`/`group_range`/`group_instant` (`post_agg.rs:820`/`:871`/`:1064`/`:1122`). Measured-and-margined, not a worst-case proof — see that constant's own doc (`post_agg.rs:1357-1362`). `approx_topk` is exempt structurally (`grouping == None` ⇒ a single empty key). **Gate:** `a_flat_or_accumulation_is_refused_rather_than_grown` (`crates/pulsus-read/tests/logql_post_agg_witness.rs`) drives the widest composed operand this cap has to refuse and asserts the refusal happens DURING accumulation, not after it |
 /// | the SQL-pushdown instant path's re-grouping map + its output `Vec<InstantSeries>` (issue #249) | **charged** ([`group_entry_bytes`] with [`PUSHDOWN_INSTANT_SLOT`]) before the map retains a group, against THIS cap — the same counter and the same named 422 the client paths use, so a query's refusal surface does not depend on how it routed |
+/// | the SQL-aggregated RANGE path's `by_fp` bucket map + its `Vec<RangeSeries>` (issue #257) | **REMOVED, not bounded** (issue #241): `run_metric_inner`'s `client.is_none() && step_ns.is_some()` arm was structurally unreachable — `metric_plan` forces `client = Some(..)` for every `QuerySpec::Range` (`plan.rs`, the `|| is_range` disjunct) — so it is refused as an internal error instead of charged. Recorded as a row so a later reader finds the disposition rather than re-deriving it as an uncharged container |
 ///
 /// **Value: 256 MiB, raised from 64 MiB by issue #236 (owner ruling O1).**
 /// With the group-COUNT cap deleted this became the only bound on the
@@ -532,6 +533,22 @@ pub(in crate::logql) fn retention_points_per_sample(op: RangeAggOp) -> u64 {
 /// fix is a step-ordered evaluator (#250). O2 (1 GiB) was rejected
 /// because per-query ceilings do not compose across concurrent queries;
 /// O4 (operator-configurable) routes to #25.
+///
+/// **Issue #374's write-time label bounds DO NOT REACH the query-time
+/// label set** — recorded here, beside the caps that do bound it, because
+/// it was an open question in both directions and the answer is *no*.
+/// `MAX_LABEL_NAMES_PER_STREAM` / `MAX_LABEL_NAME_BYTES` /
+/// `MAX_LABEL_VALUE_BYTES`
+/// (`crates/pulsus-write/src/protocols/log_label_limits.rs:206`, `:213`,
+/// `:220`) are charged on a pushed stream's labels at ingest. That
+/// module's own *"What these bounds do not cover: a stored label can
+/// exceed them"* section (`:130` onwards) states that a STORED, indexed
+/// label can already exceed all three on the OTLP path; and a query-time
+/// label set additionally comes from pipeline extraction (`| json`,
+/// `| logfmt`, `| pattern`, `line_format`/`label_format`) and from
+/// `label_replace`, none of which those bounds ever see. So the query
+/// path's label bytes are bounded by the caps in this module and by
+/// nothing upstream of them.
 pub const MAX_CLIENT_AGG_GROUP_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The cap on emitted points, fold cells and fold slots — one counter
@@ -924,16 +941,42 @@ const _: () = assert!(
 /// outside it by construction.
 ///
 /// **Known residuals, stated rather than hidden:** accumulated leaf
-/// RESULTS across a binary chain are charged by nothing (#257 on the SQL
-/// path, #285 for the chain); post-aggregation selection/grouping keys
+/// RESULTS across a binary chain are charged by nothing (#285);
+/// post-aggregation selection/grouping keys
 /// are charged, but against [`super::post_agg::MAX_POST_AGG_BYTES`]
-/// rather than into this sum (`post_agg.rs:3120-3163`), so they are
+/// rather than into this sum (`post_agg.rs:3093-3136`), so they are
 /// outside this bound by SCOPE, not uncharged; a streams response's
 /// accumulated entries are charged against
 /// [`MAX_STREAMS_RESULT_BYTES`], the second [`ResultBudgets`] term,
 /// rather than into this metric-leaf sum; and process RSS is still
 /// `N ×` this under concurrency, which #245's closure ruled an
 /// operational concern rather than a per-query bound.
+///
+/// **The SQL path is no longer one of those residuals (issue #241).**
+/// #257 named `run_metric_inner`'s SQL-aggregated RANGE arm as an
+/// uncharged accumulation. That arm could not run — `metric_plan` forces
+/// `client = Some(..)` for every `QuerySpec::Range` (`plan.rs`'s
+/// `metric_plan`, the `|| is_range` disjunct), and
+/// it already did on the day #257 was filed — so it is REMOVED rather
+/// than charged, which is #257's discharge and the audit row above
+/// records it. The SQL-pushdown INSTANT arm that remains IS charged
+/// ([`PUSHDOWN_INSTANT_SLOT`]).
+///
+/// **How the post-aggregation cap bounds, stated exactly, because an
+/// earlier revision of this paragraph implied a global admission
+/// ceiling.** [`super::post_agg::MAX_POST_AGG_BYTES`] is charged **per
+/// binary/aggregation NODE** — `combine_binary` and `apply_vector_aggs`
+/// each open their own counter — and what it bounds is **bytes, not
+/// series count**. There is **no term-count bound** on a flat
+/// `a or b or …` chain: the query-text cap (`MAX_QUERY_BYTES`,
+/// `crates/pulsus-logql/src/limits.rs`) is the only structural limit, and the
+/// per-node byte cap is the only memory one — it refuses DURING the
+/// accumulation rather than after it, which is what the gate named in the
+/// post-aggregation audit row above drives. A figure describing one
+/// leaf's output ceiling is exactly that, one leaf's; it is not a bound
+/// on what an enclosing aggregation can be presented with, and the
+/// per-query multiplication ACROSS nodes is #245's disclosed residual,
+/// which no mechanism here closes.
 pub const MAX_LEAF_RETAINED_BYTES: u64 = leaf_retained_bytes();
 
 /// Every per-query RESULT budget ([`ResultBudgets`] — the metric leaf
@@ -2226,6 +2269,120 @@ mod tests {
         assert!(
             !ledger.contains("cumulative per-render budget"),
             "the ledger still describes the pre-#260 per-render lifetime"
+        );
+    }
+
+    /// The [`MAX_LEAF_RETAINED_BYTES`] doc block, read back out of the
+    /// committed source. Everything from the first `///` line above the
+    /// `pub const` to the `pub const` itself — an unambiguous region, so
+    /// the assertions below name one artifact rather than "the paragraph".
+    fn leaf_retained_doc_block() -> String {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql/charge.rs"),
+        )
+        .expect("charge.rs readable");
+        let lines: Vec<&str> = src.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("pub const MAX_LEAF_RETAINED_BYTES"))
+            .expect("MAX_LEAF_RETAINED_BYTES is declared");
+        let mut start = at;
+        while start > 0 && lines[start - 1].trim_start().starts_with("///") {
+            start -= 1;
+        }
+        assert!(start < at, "MAX_LEAF_RETAINED_BYTES has no doc block");
+        lines[start..at]
+            .iter()
+            .map(|l| l.trim().trim_start_matches("///").trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Issue #241 AC 13, first half — the CORRECTED residual paragraph.
+    ///
+    /// Two things this pins, both of which an earlier revision got wrong:
+    /// the SQL-path clause #257 was cited under is gone (that arm is
+    /// removed as unreachable, not charged), and the post-aggregation cap
+    /// is described as a per-NODE bound on BYTES with no term-count bound
+    /// — the shape the round-14 retraction settled on after two quoted
+    /// term counts both turned out to be stale.
+    ///
+    /// A MISSING phrase is a definite failure, which is why this half is a
+    /// phrase check. It is **not** a truth check: no mechanism here gates
+    /// whether the prose beside these phrases is correct, and the
+    /// substring census that tried to (a "must not contain 435" negative)
+    /// was withdrawn precisely because a restatement passes it.
+    #[test]
+    fn the_leaf_retained_residual_states_the_per_node_byte_bound() {
+        let doc = leaf_retained_doc_block();
+        for phrase in [
+            "per binary/aggregation NODE",
+            "bytes, not series count",
+            "no term-count bound",
+        ] {
+            assert!(
+                doc.contains(phrase),
+                "MAX_LEAF_RETAINED_BYTES' doc block no longer states {phrase:?} — the \
+                 post-aggregation bound is being described as something other than a per-node \
+                 byte cap"
+            );
+        }
+        assert!(
+            !doc.contains("#257 on the SQL path"),
+            "the residual paragraph still charges #257 to the SQL path, but that arm is \
+             removed as unreachable — there is nothing there to be uncharged"
+        );
+    }
+
+    /// Issue #241 AC 13, second half — **the load-bearing one: a RELATION
+    /// between two artifacts.**
+    ///
+    /// The post-aggregation audit row NAMES the shipped gate that
+    /// establishes its property, and this test asserts a function of that
+    /// exact name exists in the witness file. The row's claim is thereby
+    /// pinned to a live gate rather than to its own wording: renaming or
+    /// deleting the gate reddens the audit table.
+    ///
+    /// **The gate name is read out of the row, never restated here** — a
+    /// literal in this test would be a second declaration that could
+    /// disagree with the row and still compile.
+    ///
+    /// **What this does NOT do.** It guarantees the audit row points at a
+    /// gate that exists. It does not guarantee the prose beside it is
+    /// true. No mechanism in this module gates prose truth and none is
+    /// implied by this test's presence.
+    #[test]
+    fn the_post_aggregation_audit_row_names_a_gate_that_exists() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql/charge.rs"),
+        )
+        .expect("charge.rs readable");
+        let row = src
+            .lines()
+            .find(|l| l.contains("| post-aggregation selection/grouping keys"))
+            .expect("the audit table still carries the post-aggregation row");
+        let marker = "**Gate:** `";
+        let rest = row
+            .split_once(marker)
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| panic!("the post-aggregation audit row names no gate: {row}"));
+        let gate = rest
+            .split_once('`')
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| panic!("the audit row's gate name is unterminated: {row}"));
+        assert!(
+            !gate.is_empty() && gate.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "the audit row's gate name is not an identifier: {gate:?}"
+        );
+        let witness = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/logql_post_agg_witness.rs"),
+        )
+        .expect("the post-aggregation witness is readable");
+        assert!(
+            witness.contains(&format!("fn {gate}(")),
+            "the post-aggregation audit row names `{gate}` as the gate establishing its \
+             property, and no such function exists in tests/logql_post_agg_witness.rs"
         );
     }
 

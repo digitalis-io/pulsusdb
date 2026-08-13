@@ -2339,30 +2339,62 @@ pub struct Unwrap {
     pub conversion: Option<String>,
 }
 
-/// Range aggregation functions. M1 implemented the four count/bytes-only
-/// operations that the log rollup table can serve (docs/architecture.md
-/// §5.3, §3.2); issue M6-10 added the full over-time set as new variants
-/// only (the designated growth-point contract).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RangeAggOp {
-    Rate,
-    CountOverTime,
-    BytesRate,
-    BytesOverTime,
-    SumOverTime,
-    AvgOverTime,
-    MinOverTime,
-    MaxOverTime,
-    StddevOverTime,
-    StdvarOverTime,
-    QuantileOverTime,
-    FirstOverTime,
-    LastOverTime,
-    AbsentOverTime,
+/// Declares [`RangeAggOp`], its keyword rendering and its COMPLETE
+/// variant list from one source — the [`bin_ops!`]/[`vector_agg_ops!`]
+/// precedent, adopted here by issue #241 for the same reason: a
+/// hand-maintained `ALL` slice beside a hand-written enum is two sources,
+/// and a census that enumerates the operator space through the slice
+/// would silently cover less than the enum has.
+///
+/// Per-variant docs travel through `$(#[$meta:meta])*`, so a documented
+/// variant keeps its documentation.
+///
+/// [`RangeAggOp::from_ident`] is deliberately NOT emitted here, matching
+/// [`vector_agg_ops!`]: it folds case before matching. Its keyword list
+/// is checked for completeness against `RangeAggOp::ALL` by
+/// `range_agg_op_round_trips_through_from_ident_and_display`.
+macro_rules! range_agg_ops {
+    ($($(#[$meta:meta])* $variant:ident => $keyword:literal,)+) => {
+        /// Range aggregation functions. M1 implemented the four
+        /// count/bytes-only operations that the log rollup table can serve
+        /// (docs/architecture.md §5.3, §3.2); issue M6-10 added the full
+        /// over-time set as new variants only (the designated growth-point
+        /// contract).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum RangeAggOp { $($(#[$meta])* $variant),+ }
+
+        impl RangeAggOp {
+            /// Every variant, in declaration order — emitted by the same
+            /// invocation that declares them, so no enumeration driven by
+            /// this slice can miss an operator the enum has.
+            pub const ALL: &'static [RangeAggOp] = &[$(RangeAggOp::$variant),+];
+
+            fn as_str(self) -> &'static str {
+                match self { $(RangeAggOp::$variant => $keyword),+ }
+            }
+        }
+    };
+}
+
+range_agg_ops! {
+    Rate => "rate",
+    CountOverTime => "count_over_time",
+    BytesRate => "bytes_rate",
+    BytesOverTime => "bytes_over_time",
+    SumOverTime => "sum_over_time",
+    AvgOverTime => "avg_over_time",
+    MinOverTime => "min_over_time",
+    MaxOverTime => "max_over_time",
+    StddevOverTime => "stddev_over_time",
+    StdvarOverTime => "stdvar_over_time",
+    QuantileOverTime => "quantile_over_time",
+    FirstOverTime => "first_over_time",
+    LastOverTime => "last_over_time",
+    AbsentOverTime => "absent_over_time",
     /// `rate_counter({...} | unwrap x [5m])` — the reset-aware per-second
     /// increase over unwrapped counter values (issue M8-LQ3). Requires
     /// `unwrap`; client-aggregated like the other over-time reducers.
-    RateCounter,
+    RateCounter => "rate_counter",
 }
 
 impl RangeAggOp {
@@ -2418,26 +2450,6 @@ impl RangeAggOp {
             | RangeAggOp::BytesOverTime
             | RangeAggOp::SumOverTime
             | RangeAggOp::AbsentOverTime => false,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            RangeAggOp::Rate => "rate",
-            RangeAggOp::CountOverTime => "count_over_time",
-            RangeAggOp::BytesRate => "bytes_rate",
-            RangeAggOp::BytesOverTime => "bytes_over_time",
-            RangeAggOp::SumOverTime => "sum_over_time",
-            RangeAggOp::AvgOverTime => "avg_over_time",
-            RangeAggOp::MinOverTime => "min_over_time",
-            RangeAggOp::MaxOverTime => "max_over_time",
-            RangeAggOp::StddevOverTime => "stddev_over_time",
-            RangeAggOp::StdvarOverTime => "stdvar_over_time",
-            RangeAggOp::QuantileOverTime => "quantile_over_time",
-            RangeAggOp::FirstOverTime => "first_over_time",
-            RangeAggOp::LastOverTime => "last_over_time",
-            RangeAggOp::AbsentOverTime => "absent_over_time",
-            RangeAggOp::RateCounter => "rate_counter",
         }
     }
 }
@@ -2731,9 +2743,15 @@ mod tests {
         assert_eq!(m.to_string(), r#"app="a\"b\\c""#);
     }
 
+    /// The keyword spellings are INPUT DATA — the reference's own
+    /// identifiers — but the claim "every variant is covered" is a set
+    /// claim, so it is answered from [`RangeAggOp::ALL`] rather than by
+    /// the length of the list below (issue #241). A variant added to the
+    /// declaring macro without a row here fails on the coverage
+    /// assertion, naming itself.
     #[test]
     fn range_agg_op_round_trips_through_from_ident_and_display() {
-        for (name, op) in [
+        const KEYWORDS: [(&str, RangeAggOp); 15] = [
             ("rate", RangeAggOp::Rate),
             ("count_over_time", RangeAggOp::CountOverTime),
             ("bytes_rate", RangeAggOp::BytesRate),
@@ -2749,9 +2767,22 @@ mod tests {
             ("last_over_time", RangeAggOp::LastOverTime),
             ("absent_over_time", RangeAggOp::AbsentOverTime),
             ("rate_counter", RangeAggOp::RateCounter),
-        ] {
+        ];
+        for (name, op) in KEYWORDS {
             assert_eq!(RangeAggOp::from_ident(name), Some(op));
             assert_eq!(op.to_string(), name);
+        }
+        assert_eq!(
+            KEYWORDS.len(),
+            RangeAggOp::ALL.len(),
+            "the keyword table and `RangeAggOp::ALL` disagree on the variant count"
+        );
+        for op in RangeAggOp::ALL {
+            assert!(
+                KEYWORDS.iter().filter(|(_, o)| o == op).count() == 1,
+                "`RangeAggOp::{op:?}` has no keyword row (or more than one) — \
+                 `from_ident` and `Display` are unchecked for it"
+            );
         }
     }
 

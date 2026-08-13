@@ -19,10 +19,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::agg::{EMPTY_LABEL_SET, LabelSet, pin_reduction_order, range_payload_cmp};
 use super::charge::{
-    AggCaps, FP_GROUP_SLOT, INSTANT_GROUP_SLOT, MUT_GROUP_SLOT, SERIES_OUT_SLOT, alloc_block_bytes,
-    charge_group_bytes, charge_result_points, charge_retention, discharge_group_bytes,
-    discharge_retention, group_entry_bytes, grown_alloc_bytes, rendered_labels_json_len,
-    retention_points_per_sample,
+    AggCaps, COUNTER_VALUE_BYTES, FP_GROUP_SLOT, INSTANT_GROUP_SLOT, MAX_TS_COLLISION_GROUP_BYTES,
+    MUT_GROUP_SLOT, QUANTILE_VALUE_BYTES, SERIES_OUT_SLOT, alloc_block_bytes, charge_group_bytes,
+    charge_result_points, charge_retention, discharge_group_bytes, discharge_retention,
+    group_entry_bytes, grown_alloc_bytes, label_set_bytes, map_entry_bytes,
+    rendered_labels_json_len, retention_points_per_sample,
 };
 use super::detected_probe::{LabelScratch, recycle_label_scratch};
 use super::exec::{MatrixSeries, QueryResult, VectorSample, apply_rate, range_seconds};
@@ -1380,7 +1381,7 @@ fn accumulate_into(
 /// The three sliding-window reducer classes (issue #227 finding-4 table,
 /// cited to Loki v3.7.4 `range_vector.go` / `syntax/ast.go:1449-1458`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::logql) enum ReducerClass {
+pub enum ReducerClass {
     /// `count`/`bytes`/`bytes_rate`/`rate`(no-unwrap): a running INTEGER,
     /// add-on-load / subtract-on-evict. Integer ± is exact-invertible, so
     /// the running value is bit-identical to a fresh reduction (finding 1);
@@ -1403,7 +1404,7 @@ pub(in crate::logql) enum ReducerClass {
 /// count); with unwrap it is a float sum ⇒ canonical fold. `stdvar` is
 /// canonical fold. `absent` is handled specially (a sliding presence set)
 /// and nominally classed order-independent.
-pub(in crate::logql) fn reducer_class(op: RangeAggOp, value: ClientValue) -> ReducerClass {
+pub fn reducer_class(op: RangeAggOp, value: ClientValue) -> ReducerClass {
     match op {
         RangeAggOp::CountOverTime | RangeAggOp::BytesOverTime | RangeAggOp::BytesRate => {
             ReducerClass::InvertInteger
@@ -3313,6 +3314,39 @@ pub fn run_client_agg_rows_folded(
     rate_window_ns: Option<u64>,
     aggs: &[plan::VectorAggSpec],
 ) -> Result<QueryResult, ReadError> {
+    run_client_agg_rows_folded_measured(rows, compiled, meta, client, window, rate_window_ns, aggs)
+        .map(|(result, _charged)| result)
+}
+
+/// [`run_client_agg_rows_folded`] with the instant leaf's CHARGED bytes
+/// reported alongside its result (issue #241 wave 2).
+///
+/// The shipped seam above delegates here and drops the second member, so
+/// the witness measures the code the engine's pure-slice entry point
+/// actually runs rather than a copy of it.
+///
+/// **The second member is `None` for a RANGE window, and that is not a
+/// missing value — it is the absence of a defined one.**
+/// [`RangeSlideState`] discharges its retention counters AS the window
+/// slides, so any snapshot taken at finish is below its own peak and
+/// would be unsound as the priced side of a `peak <= priced + bounded`
+/// identity. Wave 2 claims the INSTANT leaf and nothing else; reporting
+/// `0` there would be a measurement that reads as a fact.
+///
+/// `Some(bytes)` is the sum over [`ClientAggState`]'s CHARGED fields,
+/// taken after the last equal-timestamp run has been folded (so no charge
+/// is still pending) and before `finish_folded` releases anything — i.e.
+/// at the state's charged peak. The vector-aggregation chain runs AFTER
+/// that snapshot and is not in it.
+pub fn run_client_agg_rows_folded_measured(
+    rows: &[MetricScanRow],
+    compiled: &super::pipeline::CompiledPipeline,
+    meta: &HashMap<u64, StreamMetaRow>,
+    client: &ClientAgg,
+    window: ClientWindow,
+    rate_window_ns: Option<u64>,
+    aggs: &[plan::VectorAggSpec],
+) -> Result<(QueryResult, Option<u64>), ReadError> {
     if matches!(window, ClientWindow::Range { .. }) {
         // Issue #227: a range query evaluates Loki's sliding windows, which
         // assume fingerprint-contiguous, ascending-ts input (the live
@@ -3347,7 +3381,7 @@ pub fn run_client_agg_rows_folded(
             state.push_rows(&sorted)?;
         }
         let result = state.finish()?;
-        return apply_vector_aggs(result, &aggs[..aggs.len() - folded]);
+        return apply_vector_aggs(result, &aggs[..aggs.len() - folded]).map(|r| (r, None));
     }
     // The `Range` arm returned above, so this narrowing cannot fail; it
     // is a narrowing rather than an assertion so the instant state cannot
@@ -3366,7 +3400,247 @@ pub fn run_client_agg_rows_folded(
         AggCaps::DEFAULT,
     )?;
     state.push_rows(rows)?;
-    apply_vector_aggs(state.finish()?, aggs)
+    // `finish()` is `flush_pending` then `finish_folded`; the two halves
+    // are spelled out here ONLY so the charge snapshot can sit between
+    // them — after the last equal-timestamp run has charged its groups,
+    // before the first entry is discharged. The sequence the engine runs
+    // is byte-identical.
+    state.flush_pending(state.client.range_op)?;
+    let charged = instant_leaf_charged_bytes(&state);
+    let result = state.finish_folded();
+    apply_vector_aggs(result, aggs).map(|r| (r, Some(charged)))
+}
+
+/// The instant leaf's CHARGED bytes, priced by the same helpers the
+/// charge sites use.
+///
+/// **One exhaustive destructure of [`ClientAggState`], and no second
+/// field list.** Every field is given a disposition here; a field added
+/// to the state does not compile until it is given one
+/// (`error[E0027]: pattern does not mention field …`). An earlier
+/// revision of this work carried a separate `LeafCharges` struct whose
+/// CHARGED arm constructed it — that was a parallel list in a new
+/// spelling, since the two declarations could disagree and still compile.
+/// It is deleted rather than synchronised: the identity consumes only the
+/// SUM, so the individual counters were never needed as values.
+fn instant_leaf_charged_bytes(state: &ClientAggState<'_>) -> u64 {
+    let ClientAggState {
+        // `&'q` borrows into the plan — no heap of their own.
+        compiled: _,
+        client: _,
+        // Fixed-width scalars — no heap.
+        rate_window_ns: _,
+        fan_out: _,
+        present: _,
+        pending_ts: _,
+        needs_ts_order: _,
+        caps: _,
+        // BOUNDED rather than charged — priced by
+        // [`instant_leaf_bounded_bytes`], one term each.
+        base_labels: _,
+        hashes: _,
+        slider_safe: _,
+        pending: _,
+        pending_bytes: _,
+        // CHARGED. The two maps' retained bytes ARE `group_bytes`
+        // (`charge_group_bytes` runs before each insertion and
+        // `discharge_group_bytes` as each entry is consumed), so they
+        // contribute through that counter and not a second time.
+        fp_groups: _,
+        label_groups: _,
+        group_bytes,
+        quantile_values,
+        counter_values,
+    } = state;
+    group_bytes
+        .saturating_add(alloc_block_bytes(
+            quantile_values.saturating_mul(QUANTILE_VALUE_BYTES),
+        ))
+        .saturating_add(alloc_block_bytes(
+            counter_values.saturating_mul(COUNTER_VALUE_BYTES),
+        ))
+}
+
+/// The observed quantities the BOUNDED terms are computed from — the
+/// audit rows that say "bounded by" rather than "charged", for the
+/// INSTANT client leaf (issue #241 wave 2).
+///
+/// A struct rather than four parameters so the terms and their inputs
+/// travel together, and so a fixture's pinned total is a function of
+/// values the fixture itself produced rather than of free parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeafBoundedInput {
+    /// Streams hydrated into the state (`meta.len()`) — the `base_labels`
+    /// / `hashes` / `slider_safe` entry count.
+    pub hydrated_streams: u64,
+    /// `Σ label_set_bytes(series_labels(m))` over the hydrated streams.
+    pub hydrated_label_bytes: u64,
+    /// Series in the returned result.
+    pub emitted_series: u64,
+    /// `Σ label_set_bytes(s.labels)` over the returned series.
+    pub emitted_label_bytes: u64,
+}
+
+impl LeafBoundedInput {
+    /// Reads the four quantities off the seam's own inputs and output.
+    ///
+    /// **The emitted half destructures [`QueryResult`] with no `_` arm,
+    /// and its domain is proved per run rather than declared.** The
+    /// instant leaf's output is CONSTRUCTED by
+    /// `ClientAggState::finish_folded`, which returns
+    /// [`QueryResult::Vector`] on every path — the `absent_over_time` arm
+    /// and the general return alike — so no other variant can reach here
+    /// without the seam itself changing. The other six therefore price
+    /// nothing and say why; a caller that starts producing one of them
+    /// must answer its arm before this compiles differently, and the
+    /// witness additionally asserts `Vector` on every fixture so the
+    /// scope is checked on every run and not just written down.
+    pub fn observe(meta: &HashMap<u64, StreamMetaRow>, result: &QueryResult) -> Self {
+        let hydrated_label_bytes = meta
+            .values()
+            .map(|m| label_set_bytes(&series_labels(m)))
+            .fold(0u64, u64::saturating_add);
+        let (emitted_series, emitted_label_bytes) = match result {
+            QueryResult::Vector(items) => (
+                items.len() as u64,
+                items
+                    .iter()
+                    .map(|s| label_set_bytes(&s.labels))
+                    .fold(0u64, u64::saturating_add),
+            ),
+            // Not produced at this seam: `finish_folded` constructs
+            // `Vector` unconditionally, and the vector-aggregation chain
+            // that runs after it is variant-preserving.
+            QueryResult::Matrix(_) | QueryResult::MatrixHist(_) => (0, 0),
+            // The RANGE leaf's shapes and the metrics engine's histogram
+            // shapes; neither engine reaches this function.
+            QueryResult::VectorHist(_) => (0, 0),
+            // LogQL never produces these (`QueryResult`'s own doc), and
+            // the client-aggregation seam produces none of them.
+            QueryResult::Streams { .. } | QueryResult::Scalar(_) | QueryResult::String(_) => (0, 0),
+        };
+        LeafBoundedInput {
+            hydrated_streams: meta.len() as u64,
+            hydrated_label_bytes,
+            emitted_series,
+            emitted_label_bytes,
+        }
+    }
+}
+
+/// Declares [`LeafBoundedTerm`] and its COMPLETE suppressible-term list
+/// from one source (issue #241 wave 2) — the `bin_ops!` shape, so the
+/// necessity sweep cannot iterate a slice that has drifted from the enum
+/// the model's suppression `match` reads.
+macro_rules! leaf_bounded_terms {
+    ($($(#[$meta:meta])* $variant:ident,)+) => {
+        /// One term of [`instant_leaf_bounded_bytes`]; see that
+        /// function's table for what each prices.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum LeafBoundedTerm {
+            /// The shipped model, no term suppressed.
+            None,
+            $($(#[$meta])* $variant),+
+        }
+
+        impl LeafBoundedTerm {
+            /// Every SUPPRESSIBLE term, in declaration order.
+            /// [`LeafBoundedTerm::None`] is excluded on purpose: it is the
+            /// shipped model, not a term, and sweeping it would assert the
+            /// model is unnecessary to itself.
+            pub const ALL: &'static [LeafBoundedTerm] = &[$(LeafBoundedTerm::$variant),+];
+        }
+    };
+}
+
+leaf_bounded_terms! {
+    /// B1 — `ClientAggState::base_labels`.
+    BaseLabels,
+    /// B2 — `ClientAggState::hashes`.
+    Hashes,
+    /// B3 — `ClientAggState::slider_safe`.
+    SliderSafe,
+    /// B4 — `ClientAggState::pending`'s staging buffer.
+    PendingStage,
+    /// B5 — the returned `QueryResult::Vector`.
+    EmittedVector,
+}
+
+/// The instant leaf's BOUNDED bytes: one addend per [`ClientAggState`]
+/// field that the audit table bounds rather than charges, plus the
+/// returned result, each priced through an existing `charge` helper
+/// applied to an observed quantity (issue #241 wave 2).
+///
+/// **Every coefficient is a `size_of::<T>()`, an existing pricing helper,
+/// or a shipped cap.** A bare integer literal is not permitted here: a
+/// term can then only be widened by widening a type or moving a shipped
+/// constant, both of which are visible source changes with gates of their
+/// own. `grown_alloc_bytes` appears nowhere in this model — it is
+/// `3 × alloc_block_bytes`, so admitting it as "an existing helper" would
+/// have let a term triple inside the rule meant to pin it.
+///
+/// | term | container | audit row |
+/// |---|---|---|
+/// | B1 | `base_labels: HashMap<u64, Vec<(String, String)>>` | `charge.rs`'s `base_labels`/`hashes` row |
+/// | B2 | `hashes: HashMap<u64, u64>` | same row |
+/// | B3 | `slider_safe: HashSet<u64>` | same row (derived once from the same hydration) |
+/// | B4 | `pending: Vec<PendingSample>` | `charge.rs`'s `coll` staging row ([`MAX_TS_COLLISION_GROUP_BYTES`]) |
+/// | B5 | the returned `QueryResult::Vector` | not a state field; the emitted series the caller receives |
+///
+/// **`present_cover` is deliberately absent**: it is a
+/// [`RangeSlideState`] field and this model is instant-only. Named rather
+/// than omitted, because an omission and a decision look the same in a
+/// table.
+pub fn instant_leaf_bounded_bytes(input: &LeafBoundedInput) -> u64 {
+    instant_leaf_bounded_bytes_without(input, LeafBoundedTerm::None)
+}
+
+/// [`instant_leaf_bounded_bytes`] with one term forced to zero — the
+/// necessity seam, in the shape `post_agg_peak_bytes_without` already
+/// uses. The suppression `match` is a `==` against the dropped term and
+/// [`LeafBoundedTerm::ALL`] is emitted by the enum's own declaration, so a
+/// new term cannot exist without being swept.
+pub fn instant_leaf_bounded_bytes_without(input: &LeafBoundedInput, drop: LeafBoundedTerm) -> u64 {
+    let w = |term: LeafBoundedTerm, bytes: u64| if drop == term { 0 } else { bytes };
+    let s = input.hydrated_streams;
+    // B1 — one map entry per hydrated stream, plus the cloned label sets.
+    let b1 = w(
+        LeafBoundedTerm::BaseLabels,
+        map_entry_bytes(size_of::<(u64, Vec<(String, String)>)>())
+            .saturating_mul(s)
+            .saturating_add(input.hydrated_label_bytes),
+    );
+    // B2 — the per-fingerprint stream hash.
+    let b2 = w(
+        LeafBoundedTerm::Hashes,
+        map_entry_bytes(size_of::<(u64, u64)>()).saturating_mul(s),
+    );
+    // B3 — the slider-safe fingerprint set.
+    let b3 = w(
+        LeafBoundedTerm::SliderSafe,
+        map_entry_bytes(size_of::<u64>()).saturating_mul(s),
+    );
+    // B4 — the equal-timestamp staging buffer. The SHIPPED ceiling, which
+    // is a true upper bound whatever the snapshot timing: the buffer is
+    // charged against `AggCaps::collision_bytes` as it grows and keeps its
+    // capacity after a flush, so its live heap never exceeds the cap and
+    // no peak tracking is needed to bound it.
+    let b4 = w(LeafBoundedTerm::PendingStage, MAX_TS_COLLISION_GROUP_BYTES);
+    // B5 — the emitted vector: the exactly-reserved sample buffer plus the
+    // label sets moved into it.
+    let b5 = w(
+        LeafBoundedTerm::EmittedVector,
+        alloc_block_bytes(
+            input
+                .emitted_series
+                .saturating_mul(size_of::<VectorSample>() as u64),
+        )
+        .saturating_add(input.emitted_label_bytes),
+    );
+    b1.saturating_add(b2)
+        .saturating_add(b3)
+        .saturating_add(b4)
+        .saturating_add(b5)
 }
 
 /// The live engine's per-fold metric-aggregation state: the instant
