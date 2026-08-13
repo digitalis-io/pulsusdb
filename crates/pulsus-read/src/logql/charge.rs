@@ -1744,15 +1744,17 @@ mod tests {
     /// reintroducing a mid-scan group cap.
     ///
     /// **Scope, stated because an unscoped conclusion from a scoped
-    /// census is worthless:** every `.rs` file **directly in**
-    /// `crates/pulsus-read/src/logql/` — the flat level only. The walk is
-    /// NON-RECURSIVE, so subdirectory modules such as `template/` are
-    /// **not** scanned; the flat-file and subdirectory sets are both
-    /// pinned exactly by
-    /// `the_region_scan_covers_every_production_file_and_hides_no_subtree`,
-    /// and making the walks recursive is #302. Truncated at each file's
-    /// column-0 `#[cfg(test)]` marker — i.e. flat-level PRODUCTION
-    /// source. Test code is deliberately
+    /// census is worthless:** every `.rs` file under
+    /// `crates/pulsus-read/src/logql/`, RECURSIVELY, less the
+    /// subdirectories `src/logql/mod.rs` declares `#[cfg(test)]`. The
+    /// walk was flat until issue #302 and `template/` — twelve files of
+    /// production source — sat outside it. What pins the set is
+    /// [`assert_source_set_matches_the_directory`], which compares
+    /// `SOURCES` against that walk at run time, so a file added to the
+    /// region is a loud failure rather than a quiet reduction in scope.
+    /// (This paragraph used to name a test that does not exist.)
+    /// Truncated at each file's column-0 `#[cfg(test)]` marker — i.e.
+    /// PRODUCTION source. Test code is deliberately
     /// out of scope: this very test reads the constant, and so does
     /// `ensure_result_series_admits_exactly_the_cap_and_refuses_one_more`.
     /// The counted unit is SOURCE LINES mentioning the identifier outside
@@ -1791,13 +1793,15 @@ mod tests {
         // not contain them — a literal here would match itself and the
         // assertion would fail for the wrong reason.
         // R5: the corrected scope sentence is ASSERTED, not merely
-        // written — the old claim covered a tree the non-recursive walk
-        // never reads. Assembled at run time so this file does not match
-        // itself, the pattern already used for the deleted-cap needles.
+        // written — the old claim covered a tree the walk did not read.
+        // Assembled at run time so this file does not match itself, the
+        // pattern already used for the deleted-cap needles. It still
+        // holds after issue #302 widened the walk: recursive over
+        // `src/logql/` is not the whole tree either.
         let stale_scope = format!("the whole tree in which the symbol {} nameable", "is");
         assert!(
             !include_str!("charge.rs").contains(&stale_scope),
-            "the census still claims a scope its non-recursive walk does not have"
+            "the census still claims a scope its walk does not have"
         );
         let deleted_cap = format!("MAX_CLIENT_AGG{}SERIES", '_');
         let deleted_field = format!("caps{}series", '.');
@@ -2393,12 +2397,15 @@ mod tests {
     /// appears here or fails the test by name.
     ///
     /// **Scope**, stated because an unscoped conclusion from a scoped
-    /// census is worthless: the same flat, non-recursive `src/logql/*.rs`
+    /// census is worthless: the same RECURSIVE `src/logql/**/*.rs`
     /// PRODUCTION region `max_query_series_is_read_in_exactly_one_place`
     /// walks — reusing its `SOURCES` list, its directory guard and its
-    /// `#[cfg(test)]` truncation. Subdirectories (`template/`, `testkit/`)
-    /// hold no charge site; the directory guard is what stops the region
-    /// shrinking silently.
+    /// `#[cfg(test)]` truncation. `template/` is inside it as of issue
+    /// #302 and holds no charge site, which is now a MEASURED result
+    /// rather than the assertion it was while the walk could not see the
+    /// directory; `testkit/` is excluded as test-only, derived from its
+    /// `#[cfg(test)] mod` declaration. The directory guard is what stops
+    /// the region shrinking silently.
     ///
     /// Fails CLOSED: an occurrence whose first argument is not in the
     /// pinned list is a failure naming the file and the token, not a
@@ -2807,9 +2814,81 @@ mod tests {
             // Issue #277: the per-query response-warning accumulator.
             ("warnings.rs", include_str!("warnings.rs")),
             ("window.rs", include_str!("window.rs")),
+            // Issue #302: `src/logql/template/` is PRODUCTION source and
+            // sat outside this census entirely, because the directory
+            // guard below read one level. `include_str!` still needs
+            // literals, so these are written out — and the run-time
+            // comparison against the now-recursive directory is what
+            // stops the list going stale.
+            ("template/mod.rs", include_str!("template/mod.rs")),
+            ("template/decimal.rs", include_str!("template/decimal.rs")),
+            ("template/eval.rs", include_str!("template/eval.rs")),
+            ("template/funcs.rs", include_str!("template/funcs.rs")),
+            ("template/gofmt.rs", include_str!("template/gofmt.rs")),
+            ("template/golayout.rs", include_str!("template/golayout.rs")),
+            ("template/lex.rs", include_str!("template/lex.rs")),
+            ("template/methods.rs", include_str!("template/methods.rs")),
+            ("template/parse.rs", include_str!("template/parse.rs")),
+            ("template/retained.rs", include_str!("template/retained.rs")),
+            ("template/timefns.rs", include_str!("template/timefns.rs")),
+            ("template/value.rs", include_str!("template/value.rs")),
         ];
         assert_source_set_matches_the_directory(SOURCES);
         SOURCES
+    }
+
+    /// Whether a directory module declared in `mod_rs` is `#[cfg(test)]`.
+    ///
+    /// Textual rather than parsed, because this lives in the production
+    /// crate's own `#[cfg(test)] mod tests` and `syn` is not a dependency
+    /// here. The shape it looks for is the one rustfmt produces and the
+    /// one `src/logql/mod.rs` uses: the attribute on the line directly
+    /// above the declaration.
+    fn is_test_only_mod(mod_rs: &str, name: &str) -> bool {
+        let decl = format!("mod {name};");
+        mod_rs.lines().enumerate().any(|(i, l)| {
+            l.trim() == decl
+                && i > 0
+                && mod_rs
+                    .lines()
+                    .nth(i - 1)
+                    .is_some_and(|prev| prev.trim() == "#[cfg(test)]")
+        })
+    }
+
+    /// Every `.rs` under `dir`, RECURSIVELY, named relative to `root`,
+    /// skipping subdirectories that directory's own `mod.rs` declares
+    /// `#[cfg(test)]` (issue #302).
+    ///
+    /// **Derived, never a name list.** A list would be the thing that
+    /// rots: the first subdirectory added without editing it would drop
+    /// out of a census that still reports full coverage of the region —
+    /// which is exactly how `template/`, twelve files of production
+    /// source, sat outside this walk while it read one level. A new
+    /// subdirectory that is not declared test-only is SCANNED, so the
+    /// failure direction is a loud extra file rather than a quiet gap.
+    fn walk_region(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        let mod_rs = std::fs::read_to_string(dir.join("mod.rs")).unwrap_or_default();
+        for entry in std::fs::read_dir(dir).expect("the logql source directory") {
+            let path = entry.expect("dir entry").path();
+            let name = path
+                .file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .into_owned();
+            if path.is_dir() {
+                if !is_test_only_mod(&mod_rs, &name) {
+                    walk_region(root, &path, out);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(
+                    path.strip_prefix(root)
+                        .expect("a walked file is under the region root")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
     }
 
     /// **The file set must not be able to shrink silently.** `include_str!`
@@ -2821,17 +2900,8 @@ mod tests {
     /// quiet reduction in scope.
     fn assert_source_set_matches_the_directory(sources: &[(&str, &str)]) {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logql");
-        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
-            .expect("the logql source directory")
-            .map(|e| e.expect("dir entry").path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .map(|p| {
-                p.file_name()
-                    .expect("file name")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
+        let mut on_disk: Vec<String> = Vec::new();
+        walk_region(&dir, &dir, &mut on_disk);
         on_disk.sort();
         let mut named: Vec<String> = sources.iter().map(|(n, _)| (*n).to_string()).collect();
         named.sort();

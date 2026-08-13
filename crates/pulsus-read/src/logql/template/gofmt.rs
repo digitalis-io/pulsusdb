@@ -1280,7 +1280,7 @@ impl<'o, 'e> P<'o, 'e> {
             }
 
             // Decode the verb rune (may be multi-byte).
-            let (verb, size) = decode_rune(format, i);
+            let (verb, size) = decode_rune_of_verb(format, i);
             i += size;
 
             if verb == '%' {
@@ -1452,7 +1452,10 @@ fn rune_len(b: &[u8], i: usize) -> usize {
 
 /// Decodes the rune at `b[i]`, returning (rune, size); invalid bytes
 /// yield (U+FFFD, 1) like Go's `utf8.DecodeRune`.
-fn decode_rune(b: &[u8], i: usize) -> (char, usize) {
+/// Named apart from `template/funcs.rs`'s `decode_rune` (issue #302 —
+/// the census keys free functions by bare name). This one decodes the
+/// VERB character of a `%`-directive while scanning a format string.
+fn decode_rune_of_verb(b: &[u8], i: usize) -> (char, usize) {
     let len = rune_len(b, i);
     match std::str::from_utf8(&b[i..i + len]) {
         Ok(s) => (s.chars().next().unwrap_or('\u{FFFD}'), len),

@@ -146,6 +146,15 @@ enum Unreachable {
 /// exactly like a replay finding a mismatch. Every slot this leg uses
 /// must sit inside the window, and the assertion that they do is
 /// [`slots_fit_inside_the_measured_ingestion_window`].
+///
+/// **This is the coarse BRACKET, not the boundary, and slot placement
+/// is governed by [`SERVED_HORIZON`] instead** (issue #278). The ladder
+/// above steps from 2.5 h straight to 3 h and this constant took the
+/// far end; the wall was later measured to sit between 9640 s and
+/// 9700 s. Reading this figure as the space available cost issue #278's
+/// plan a factor of twenty on the run margin. It stays as it is because
+/// it is still the right bound for the prior-run probe below, where a
+/// wider window can only find MORE evidence of a previous run.
 const INGESTION_WINDOW: Duration = Duration::from_secs(3 * 3600);
 
 /// One row's replay inputs, captured during classification so the live
@@ -563,6 +572,86 @@ fn a_ledgered_divergence_row_is_never_replayed() {
     }
 }
 
+/// How many times the capacity prose quotes the `REACHABLE`/ceiling
+/// RATIO, the occupancy PERCENTAGE, the no-margin QUOTIENT and the
+/// no-margin percentage — across this file and `PROVENANCE.md` together.
+///
+/// **Occurrences, not lines** (the #447 rule): one line quoting a figure
+/// twice counts twice, because a line count would let a second quotation
+/// hide on a line that already has one.
+const CAPACITY_QUOTATIONS: [usize; 4] = [2, 3, 5, 3];
+
+/// **The quoted capacity figures, as a check rather than a sentence.**
+///
+/// [`MAX_REACHABLE_ROWS`] and [`REMAINING_SLOTS`] are computed, so the
+/// VALUES cannot go stale — but prose repeating a value is how a figure
+/// goes wrong in one place while staying right in another, and issue
+/// #278 did exactly that twice: round 1 found the no-margin quotient and
+/// its percentage typed beside a correct constant, and round 2 found
+/// their corrected replacements typed as well, drift-provable by
+/// perturbing a digit and building clean.
+///
+/// So the two artefacts are read at compile time and the quotations
+/// counted. **The needles are built at RUN TIME from the constants**,
+/// which is the load-bearing part of the #447 shape
+/// (`logql_row_expansion_ladder.rs`): a typed needle would be a second
+/// declaration of the same value, free to disagree with the first, and
+/// would also match itself so the count would include the searcher.
+///
+/// **If this fails you have added, removed or changed a quotation.**
+/// Open the site that moved, check it states the current value, and only
+/// then update [`CAPACITY_QUOTATIONS`]. Updating the constant first
+/// turns the check back into the sentence it replaced.
+///
+/// **Scope, stated rather than implied.** It counts ONE rendering of
+/// each figure: the ratio as `REACHABLE`-slash-ceiling, each percentage
+/// with its `%` sign, and the no-margin quotient followed by the word
+/// `slots`. A quotation spelled any other way is invisible to it, which
+/// is why those renderings are used consistently across both files.
+///
+/// **This doc deliberately spells none of them.** A literal here would
+/// be found by the search it describes, so the count would include the
+/// searcher — the same trap the run-time needles avoid.
+///
+/// The DELIMITED forms are also deliberate. A bare ceiling figure would
+/// match inside a larger number, and a bare quotient would match the
+/// unrelated `metric query (slice: streams only)` total in the coverage
+/// constants above, coupling slot capacity to accounting that has
+/// nothing to do with it.
+#[test]
+fn the_quoted_capacity_figures_are_counted_so_a_stale_one_cannot_compile() {
+    const SELF_SOURCE: &str = include_str!("logqltest_replay.rs");
+    // `PROVENANCE.md` is not Rust, so it cannot carry a check of its
+    // own; it is read from here instead, which is what keeps its
+    // capacity paragraph inside the same guarantee as the code's.
+    const PROVENANCE: &str = include_str!("logqltest/PROVENANCE.md");
+
+    let no_margin_quotient = SERVED_HORIZON.as_secs() / SLOT_SECS;
+    let needles = [
+        format!("{REACHABLE}/{MAX_REACHABLE_ROWS}"),
+        format!(
+            "{:.1}%",
+            100.0 * REACHABLE as f64 / MAX_REACHABLE_ROWS as f64
+        ),
+        format!("{no_margin_quotient} slots"),
+        format!(
+            "{:.0}%",
+            100.0 * REACHABLE as f64 / no_margin_quotient as f64
+        ),
+    ];
+    for (needle, want) in needles.iter().zip(CAPACITY_QUOTATIONS) {
+        let got = SELF_SOURCE.matches(needle.as_str()).count()
+            + PROVENANCE.matches(needle.as_str()).count();
+        assert_eq!(
+            got, want,
+            "the capacity prose now quotes `{needle}` {got} time(s) across \
+             logqltest_replay.rs and logqltest/PROVENANCE.md, not {want}. Find the site that \
+             moved, check it states the value the constants produce, and update \
+             CAPACITY_QUOTATIONS after that — in that order."
+        );
+    }
+}
+
 /// [`SLOT_SECS`] is squeezed from both sides, and BOTH sides are checked
 /// here — the upper one against the slice, the lower one against the
 /// corpus itself. Without the lower half a slot could be shortened until
@@ -592,6 +681,82 @@ fn slots_fit_inside_the_measured_ingestion_window() {
          {}s window)",
         FIRST_SLOT_AGE.as_secs(),
         INGESTION_WINDOW.as_secs()
+    );
+
+    // ABOVE, the bound that actually bites: the oldest slot must sit
+    // inside what the reference will SERVE, with enough left over for
+    // the run itself. `INGESTION_WINDOW` above is the coarse bracket and
+    // is far looser than the measured wall — see `SERVED_HORIZON`.
+    assert!(
+        FIRST_SLOT_AGE + Duration::from_secs(SLOT_SECS) + RUN_MARGIN <= SERVED_HORIZON,
+        "the oldest slot sits {}s back and the run is allowed {}s, which together pass the \
+         {}s the reference still serves. Free slots and run margin come out of the SAME \
+         budget, so raising FIRST_SLOT_AGE to buy slots spends this.",
+        FIRST_SLOT_AGE.as_secs(),
+        RUN_MARGIN.as_secs(),
+        SERVED_HORIZON.as_secs()
+    );
+
+    // THE CEILING, and the occupancy against it — computed here rather
+    // than written in a comment, because a capacity figure that cannot
+    // go red when one of its inputs moves will be wrong the next time
+    // one does. (It already was: the comment on `FIRST_SLOT_AGE` said
+    // 240 slots, the no-margin quotient, which reads as 96% where the
+    // real figure is 98.7%.)
+    //
+    // **The ceiling is NOT asserted here, and that is deliberate.**
+    // Every term of `REACHABLE <= MAX_REACHABLE_ROWS` is a constant, so
+    // there is nothing to defer to a test run: it is checked at COMPILE
+    // time beside `MAX_REACHABLE_ROWS` itself, and a crate that will not
+    // build is a harder failure than a red test. Measured: setting
+    // RUN_MARGIN to 400 s takes the ceiling to 229 and `cargo build
+    // --tests` fails with that constant's own message, before anything
+    // in this function runs.
+    //
+    // The two checks bound different quantities: the runtime assertions
+    // above bound WHERE the slots are placed, the compile-time one
+    // bounds HOW MANY the budget holds. But the implication runs one way
+    // only, and the measurements say exactly which:
+    //
+    //   * placement can redden while the ceiling holds — raise
+    //     FIRST_SLOT_AGE alone to 9500 s and the build is clean while
+    //     the margin assertion at `:690` reddens;
+    //   * the reverse cannot happen. Chaining the two runtime assertions
+    //     gives the ceiling inequality outright, so the compile-time
+    //     check CANNOT fail while both of them pass. It is redundant at
+    //     run time, and this comment used to claim otherwise.
+    //
+    // What it earns is not extra coverage but an earlier and more
+    // durable failure: it fires at BUILD time, before any test executes,
+    // and it still fires if the runtime assertions are deleted or their
+    // test stops being run.
+    //
+    // What is left here is the REPORT, which is the part a constant
+    // cannot give: the occupancy, printed on every run so the figure
+    // reaches a human without anyone re-deriving it.
+    eprintln!(
+        "replay slot capacity: {REACHABLE}/{MAX_REACHABLE_ROWS} rows ({:.1}% occupied, \
+         {} free at the current FIRST_SLOT_AGE)",
+        100.0 * REACHABLE as f64 / MAX_REACHABLE_ROWS as f64,
+        REMAINING_SLOTS,
+    );
+
+    // `REMAINING_SLOTS` is headroom against the CEILING, and it is now
+    // derived from it. What is still worth asserting is that the current
+    // placement actually REALISES that headroom: `FIRST_SLOT_AGE` sits
+    // within a slot of its own maximum today, so the rows that fit
+    // before the ceiling are also the rows that fit without moving it.
+    // Lower `FIRST_SLOT_AGE` and the two part company — this reddens,
+    // and the next corpus addition needs to know which of the two
+    // numbers it is spending.
+    assert_eq!(
+        (FIRST_SLOT_AGE.as_secs() / SLOT_SECS) as usize - REACHABLE,
+        REMAINING_SLOTS,
+        "the headroom at the current FIRST_SLOT_AGE ({} rows) is no longer the headroom under \
+         the ceiling ({REMAINING_SLOTS} rows). Raising FIRST_SLOT_AGE up to \
+         SERVED_HORIZON - SLOT_SECS - RUN_MARGIN recovers the difference; spending it costs \
+         run margin one for one.",
+        (FIRST_SLOT_AGE.as_secs() / SLOT_SECS) as usize - REACHABLE,
     );
 
     // BELOW: a slot must hold its own case's sample span. Derived from
@@ -773,12 +938,12 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// reachable, so this figure, [`PROVENANCE_PERMITS`] and [`REACHABLE`]
 /// all move together by that share, while its `eval_fail` rows carry
 /// PulsusDB's own error text and land under `our-error-text`.
-const TOTAL_DIRECTIVES: usize = 1_532;
+const TOTAL_DIRECTIVES: usize = 1_540;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_151;
+const PROVENANCE_PERMITS: usize = 1_159;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -804,7 +969,15 @@ const PROVENANCE_PERMITS: usize = 1_151;
 /// shape as well, and it was authored to be: its load spans well inside
 /// [`SLOT_SECS`]'s half, which the widest-case assertion below checks
 /// rather than takes on trust.
-const REACHABLE: usize = 223;
+///
+/// Issue #278 adds `b26_line_filter_pushdown.test`, the rows that
+/// exercise the line filters the planner renders into SQL — which the
+/// hermetic runner could not execute until that issue taught it to. It
+/// is that same shape throughout and was authored to be: every row is a
+/// streams query at a single instant over a relative-offset load set
+/// with no config delta, so its whole share moves this figure,
+/// [`PROVENANCE_PERMITS`] and [`TOTAL_DIRECTIVES`] together.
+const REACHABLE: usize = 231;
 
 /// Issue #406 moved `differential_metric_reducers.test`'s `eval_ordered`
 /// rows off that file's `ported(...)` default onto
@@ -831,10 +1004,150 @@ const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \
 metric query (slice: streams only)=240, range/matrix eval (slice: instant only)=10";
 // corpus-counts: end (replay-coverage-constants)
 
-/// How far back the first slot sits. Bounded above by
-/// [`INGESTION_WINDOW`] and below by the total slot span; both are
+/// **How far back the reference will still SERVE a pushed entry** —
+/// the bound that actually governs slot placement, and it is much
+/// tighter than [`INGESTION_WINDOW`].
+///
+/// `INGESTION_WINDOW` was measured on a coarse ladder (2.5 h served,
+/// 3 h not) and the constant took the 3 h end. Issue #278 needed the
+/// boundary rather than the bracket, because it moves
+/// [`FIRST_SLOT_AGE`] and therefore spends this margin. Measured on a
+/// FRESH container from the pinned digest and `ci/logql/config.yaml`,
+/// one push carrying every age, queried ten seconds later:
+///
+/// | age at push | 9000 | 9240 | 9300 | 9360 | 9500 | 9600 | 9640 | 9700 | 9800 |
+/// |---|---|---|---|---|---|---|---|---|---|
+/// | served | yes | yes | yes | yes | yes | yes | **yes** | **no** | no |
+///
+/// So the wall sits between 9640 s and 9700 s, not at 10800 s — the
+/// window is over-stated by around nineteen minutes. Reproduced on a
+/// used container and on a fresh one, and confirmed dynamically: an
+/// entry pushed at age 9600 s stopped being served between 30 s and
+/// 60 s of wall clock, while one pushed at 9000 s was still served
+/// after 421 s. **It behaves as a fixed age**, so an entry placed at
+/// age `A` survives roughly `SERVED_HORIZON - A` seconds.
+///
+/// Taken as 9600 s: below the last age measured served, so it is a
+/// floor on the wall rather than an estimate of it.
+const SERVED_HORIZON: Duration = Duration::from_secs(9_600);
+
+/// Wall clock the leg is allowed to spend between placing slot 0 and
+/// re-reading it, asserted against [`SERVED_HORIZON`] rather than left
+/// as a hope. Measured: the whole leg takes about 7 s locally against a
+/// fresh container, so this is a factor of twenty-five, not a guess.
+const RUN_MARGIN: Duration = Duration::from_secs(180);
+
+/// How far back the first slot sits. Bounded BELOW by the total slot
+/// span and ABOVE by [`SERVED_HORIZON`] less [`RUN_MARGIN`]; both are
 /// asserted by [`slots_fit_inside_the_measured_ingestion_window`].
-const FIRST_SLOT_AGE: Duration = Duration::from_secs(150 * 60);
+///
+/// It was `150 * 60` until issue #278 added eight reachable rows, which
+/// pushed `SLOT_SECS * REACHABLE` past it. [`SLOT_SECS`] could not
+/// absorb them — its lower bound (`2 * widest case`) is exactly spent —
+/// so the only lever left was this one, which [`SLOT_SECS`]'s own docs
+/// correctly call the dangerous side.
+///
+/// **The two things this constant buys are the SAME resource, which is
+/// what makes it dangerous.** Raising it buys free slots and spends run
+/// margin, one for one, because both come out of [`SERVED_HORIZON`].
+/// [`MAX_REACHABLE_ROWS`] is how many rows that resource can ever hold,
+/// and it is computed rather than written down.
+///
+/// Issue #278's plan set this to `160 * 60` on the arithmetic
+/// `INGESTION_WINDOW - FIRST_SLOT_AGE - SLOT_SECS`, which said the run
+/// had 1160 s; measured against the real horizon it would have had about
+/// 50. The leg still passed at that value, because the run takes 7 s —
+/// but a figure that is wrong by a factor of twenty is not a margin
+/// anyone can plan against, and the next issue to spend
+/// [`REMAINING_SLOTS`] would have taken it to zero.
+const FIRST_SLOT_AGE: Duration = Duration::from_secs(156 * 60);
+
+/// **The ceiling: the most reachable rows this layout can EVER hold.**
+///
+/// Both bounds at once. [`FIRST_SLOT_AGE`] may rise no further than
+/// `SERVED_HORIZON - SLOT_SECS - RUN_MARGIN`, because the oldest slot
+/// occupies a slot's width and the run needs wall clock after placing
+/// it; and `REACHABLE` slots of [`SLOT_SECS`] must fit inside
+/// [`FIRST_SLOT_AGE`]. So the ceiling is that difference divided by the
+/// slot. Asserted against `REACHABLE` by
+/// [`slots_fit_inside_the_measured_ingestion_window`], which also
+/// prints the occupancy — a capacity figure that cannot go red when one
+/// of its inputs moves is wrong the next time one does.
+///
+/// **It is NOT `SERVED_HORIZON / SLOT_SECS`**, which is 240 slots. That
+/// quotient ignores both the oldest slot's own width and
+/// [`RUN_MARGIN`], i.e. exactly the two things the assertions here
+/// enforce. This comment said 240 slots when issue #278 first landed
+/// the horizon work, which reads as 96% occupancy where the true
+/// occupancy is 231/234 = 98.7% — an invitation to add corpus rows into
+/// space that is not there. Round 1's review caught it, and round 2
+/// caught that the corrected figures were still typed: they are counted
+/// now, by
+/// [`the_quoted_capacity_figures_are_counted_so_a_stale_one_cannot_compile`].
+///
+/// It coincides with `FIRST_SLOT_AGE / SLOT_SECS` today only because
+/// [`FIRST_SLOT_AGE`] happens to sit within one slot of its own
+/// maximum; lower that constant and the two diverge, which is why
+/// [`REMAINING_SLOTS`] (headroom at the CURRENT setting) and this
+/// (headroom at the best possible setting) are separate figures.
+const MAX_REACHABLE_ROWS: usize =
+    ((SERVED_HORIZON.as_secs() - SLOT_SECS - RUN_MARGIN.as_secs()) / SLOT_SECS) as usize;
+
+/// The occupancy invariant, checked at COMPILE time — every term is a
+/// constant, so there is nothing to defer to a test run.
+///
+/// **It is REDUNDANT with the runtime assertions, and that is stated
+/// rather than argued around.** Chaining the two in
+/// [`slots_fit_inside_the_measured_ingestion_window`] gives `SLOT_SECS *
+/// REACHABLE <= FIRST_SLOT_AGE <= SERVED_HORIZON - SLOT_SECS -
+/// RUN_MARGIN`, which is exactly this inequality. **So it cannot fail
+/// while both of those pass.** An earlier version of this comment
+/// claimed the two were independent; they are not, and a reader could
+/// disprove it in a line of algebra.
+///
+/// What it buys instead is WHEN and WHETHER the check happens:
+///
+/// * **Build time.** It fails `cargo build`, before any test executes,
+///   so an over-capacity layout cannot even be compiled and run.
+///   Measured: `RUN_MARGIN` at 400 s takes the ceiling to 229 and the
+///   build fails here with this message.
+/// * **It outlives its neighbours.** Delete either runtime assertion, or
+///   stop running that test — `#[ignore]`, a filter, a nightly-only
+///   lane — and the layout is still checked. Redundancy that survives
+///   the removal of what it duplicates is not redundancy at run time.
+///
+/// The implication does not run the other way: the runtime assertions
+/// catch things this cannot, because they bound where the slots are
+/// PLACED rather than how many fit. Measured: raising [`FIRST_SLOT_AGE`]
+/// alone to 9500 s compiles clean here and reddens the margin assertion.
+const _: () = assert!(
+    REACHABLE <= MAX_REACHABLE_ROWS,
+    "REACHABLE exceeds what this slot layout can hold. The ceiling is \
+     (SERVED_HORIZON - SLOT_SECS - RUN_MARGIN) / SLOT_SECS: the oldest slot occupies a slot's \
+     width and the run needs wall clock after placing it. Both levers are spent — SLOT_SECS is \
+     bounded below by twice the widest reachable case — so the next addition needs a NARROWER \
+     widest case, not a bigger FIRST_SLOT_AGE."
+);
+
+/// Reachable rows that still fit before [`FIRST_SLOT_AGE`] has to move
+/// again — the number the next corpus addition is spending.
+///
+/// Recomputed from the three constants it depends on and ASSERTED by
+/// [`slots_fit_inside_the_measured_ingestion_window`], so it cannot be
+/// read as current after any of them moves. A stated figure goes stale
+/// silently; this one reddens.
+///
+/// **It is small, and the smallness is the finding, not an oversight.**
+/// Spending it means raising [`FIRST_SLOT_AGE`], which takes the bytes
+/// straight out of [`RUN_MARGIN`]; past that the only lever left is
+/// [`SLOT_SECS`], and that one is bounded below by twice the widest
+/// reachable case and is exactly spent. **The next addition that does
+/// not fit needs a narrower widest case, not a bigger number here.**
+///
+/// DERIVED from [`MAX_REACHABLE_ROWS`] rather than typed (issue #278
+/// round 2): it was written out as a literal, which could drift from the
+/// ceiling it is headroom against and still compile.
+const REMAINING_SLOTS: usize = MAX_REACHABLE_ROWS - REACHABLE;
 
 /// One case's exclusive time slot: the corpus reuses stream labels
 /// constantly (`clear` scopes them and the reference has no
@@ -1224,6 +1537,49 @@ fn live_replay_of_the_reachable_rows_against_the_reference() {
                 fmt_entries(&got),
             ));
         }
+    }
+
+    // **The oldest slot must still be inside the window.** This leg
+    // spends real wall clock between placing the slots and reading them
+    // — `FIRST_SLOT_AGE + SLOT_SECS` back to `INGESTION_WINDOW` is all
+    // the margin there is, and issue #278 narrowed it to buy slots. If
+    // the run overran, slot 0's entries have aged out of what the
+    // reference will serve and EVERY row that reads like a mismatch is
+    // one, so the diagnosis has to be made here rather than left to
+    // whoever reads the failure.
+    //
+    // Slot 0 is the oldest by construction — the slots march FORWARD
+    // from `FIRST_SLOT_AGE` back, which the span assertion in
+    // `slots_fit_inside_the_measured_ingestion_window` guarantees.
+    //
+    // **What it cannot see:** a MIDDLE slot that was never served (it
+    // checks the oldest, which is the one that ages out first), and
+    // anything at all in the hermetic lane — this is the nightly leg.
+    if !cases.is_empty() {
+        let (slot_zero_ns, _, _) = plan[0];
+        let alive = query_case(&base, slot_zero_ns, 0, 0, r#"{replay_sentinel="0"}"#);
+        assert!(
+            !alive.is_empty(),
+            "PRECONDITION FAILURE, NOT A CORPUS FAILURE. The oldest slot's sentinel has \
+             vanished, so slot 0 aged past the {}s of history the reference still SERVES \
+             while this run was still going.\n\n\
+             THE COMMITTED CORPUS VALUES ARE NOT IMPLICATED — do not go looking at them. The \
+             run took longer than the {}s the oldest slot had ({}s served horizon minus the \
+             {}s FIRST_SLOT_AGE minus one {SLOT_SECS}s slot), so its rows were compared \
+             against a reference that had stopped serving them. Without this check that \
+             surfaces as `N of {REACHABLE} replayed rows disagree with the reference`.\n\n\
+             The budget is SERVED_HORIZON, not INGESTION_WINDOW: the latter is the coarse \
+             bracket the window was first measured on and is looser by around nineteen \
+             minutes.\n\n\
+             Two levers, and they are not equivalent: shorten SLOT_SECS (bounded below by 2x \
+             the widest reachable case, and currently exactly spent), or lower FIRST_SLOT_AGE \
+             (bounded below by SLOT_SECS x REACHABLE). Both are asserted by \
+             `slots_fit_inside_the_measured_ingestion_window`.",
+            SERVED_HORIZON.as_secs(),
+            SERVED_HORIZON.as_secs() - FIRST_SLOT_AGE.as_secs() - SLOT_SECS,
+            SERVED_HORIZON.as_secs(),
+            FIRST_SLOT_AGE.as_secs(),
+        );
     }
 
     assert!(

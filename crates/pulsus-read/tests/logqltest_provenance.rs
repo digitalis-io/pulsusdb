@@ -1936,7 +1936,7 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// rows are all `captured`: its `eval` controls and its `eval_fail` rows
 /// were each measured on `pulsus-c400-loki` (the pinned digest) at the
 /// query text committed in the file, on the date its header records.
-const CAPTURED: usize = 1_441;
+const CAPTURED: usize = 1_449;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1959,7 +1959,7 @@ const PORTED: usize = 30;
 /// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
 /// #277 by `b21_variant_series_cap.test`'s, and issue #400's second
 /// stage by `b25_re2_reject_parity.test`'s.
-const TOTAL: usize = 1_532;
+const TOTAL: usize = 1_540;
 // corpus-counts: end (provenance-corpus-constants)
 
 // ---------------------------------------------------------------------

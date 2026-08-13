@@ -379,7 +379,9 @@ and corpus-gated. PulsusDB does **not** reproduce the reference's
 `parse error : …` / `stage '…' :` envelope wording (accepted cosmetic
 divergence, owner-ruled: status, container and accept/reject decision must
 match; message prose need not). The WebSocket close frame truncates reasons
-at 123 bytes; the LogQL corpus runner's pushdown blind spot is #278.
+at 123 bytes. The LogQL corpus runner did not execute the line filters
+the planner pushes into SQL, so no corpus row could gate them; issue #278
+closed that, and the corpus now carries rows on that path.
 
 **Transport bound on the query-text cap (#279).** The 131,072-byte row
 above is reachable only where the query arrives in a **POST form body**,

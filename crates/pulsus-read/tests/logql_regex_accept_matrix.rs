@@ -2882,7 +2882,7 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         (
             "template/funcs.rs",
             &[
-                ("compile_regex(", 4),
+                ("compile_charged_regex(", 4),
                 ("compile_user_regex_with(", 1),
                 ("regex_compile_transient_bound_with(", 1),
             ],
@@ -2890,7 +2890,11 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
              `count`, plus their shared compile seam. NOT a status axis — a bad pattern here is \
              a 200 carrying `__error__: TemplateFormatErr` — so it is covered by \
              `the_template_regex_boundary_does_not_match_the_reference` rather than by a \
-             matrix position. This file is invisible to a non-recursive walk. Issue #291 \
+             matrix position. This file is invisible to a non-recursive walk. Issue #302 \
+             renamed this file's seam `compile_regex` -> `compile_charged_regex`, because \
+             widening the `src/logql/` censuses to include `template/` made it collide with \
+             `pipeline.rs`'s function of that name; the SITE is unchanged and so is its count \
+             of four. Issue #291 \
              replaced the bare `RegexBuilder::new(` with the budgeted \
              `compile_user_regex_with(` at the SAME 1 MiB program ceiling, and charges the \
              render budget `regex_compile_transient_bound_with(` instead of a flat 1 MiB.",
@@ -2913,6 +2917,13 @@ fn the_regex_compile_sites_are_enumerated_from_the_source() {
         "Regex::new(",
         "RegexBuilder::new(",
         "compile_regex(",
+        // Issue #302: `template/funcs.rs`'s charged seam, renamed out of
+        // a collision with `pipeline.rs`'s `compile_regex`. It is listed
+        // because a marker vocabulary is what this census SEES: without
+        // it those four construction sites vanish from the enumeration
+        // while still compiling user patterns — the same failure the
+        // `compile_user_regex(` block below was added to stop.
+        "compile_charged_regex(",
         "compile_anchored_regex(",
         "validate_anchored_regex(",
         "validate_unanchored_regex(",

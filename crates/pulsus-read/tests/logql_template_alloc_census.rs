@@ -440,7 +440,7 @@ static VIA: &[Via] = &[
         // pipeline boundary where the engine's BYTES become the row's
         // retained `String`, whose repair expansion it charges before
         // allocating (it was free while it lived in a caller's `Vec`).
-        chargers: &["lossy_charged", "compile_regex", "from_engine"],
+        chargers: &["lossy_charged", "compile_charged_regex", "from_engine"],
         other_callers: &[],
     },
     Via {
@@ -918,7 +918,10 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "funcs.rs",
-        func: "compile_regex",
+        // Issue #302 renamed this out of a collision with
+        // `pipeline.rs::compile_regex`, which the widened `src/logql/`
+        // censuses made visible. Same function, same sites.
+        func: "compile_charged_regex",
         callees: &[".clone", ".to_string", "format!", "str::from_utf8"],
         disposition: CHARGED,
         why: "pattern copy (≤3× U+FFFD ceiling when invalid UTF-8, round 4) + what compiling THAT pattern costs, both charged BEFORE converting/building; cache hits share the query-compile program. Issue #291 replaced the `RegexBuilder::new(…).build()` pair with `pulsus_re2::compile_user_regex_with` at the same 1 MiB program ceiling, and the second charge with `regex_compile_transient_bound_with` — the flat ceiling bounded only the NFA phase, so a 32-byte class-heavy pattern allocated 2.67 MB against it",
@@ -1301,7 +1304,10 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "gofmt.rs",
-        func: "decode_rune",
+        // Issue #302: renamed out of a collision with
+        // `funcs.rs::decode_rune`, which is the Pin above and is
+        // deliberately NOT renamed. Same function, same sites.
+        func: "decode_rune_of_verb",
         callees: &["str::from_utf8"],
         disposition: CONST,
         why: "str::from_utf8 borrows — no allocation",

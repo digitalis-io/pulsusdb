@@ -56,15 +56,17 @@ fn count_eval_directives(text: &str) -> usize {
 /// empty checkout is caught) and NO file has been deleted.
 ///
 /// The floor is the count on disk, raised by each batch that adds a file
-/// (issue #249: 39 -> 40 with `b25_structured_metadata.test`). A deletion
+/// (issue #249: 39 -> 40 with `b25_structured_metadata.test`; issue #278:
+/// 40 -> 43, which is 42 files that were already on disk under a floor
+/// nobody had raised, plus `b26_line_filter_pushdown.test`). A deletion
 /// drops the count below the floor and fails here — which is the half of
 /// the anti-drop guarantee that disk discovery cannot give on its own.
 #[test]
 fn corpus_dir_is_populated() {
     let files = corpus_files();
     assert!(
-        files.len() >= 40,
-        "expected at least the 40 committed .test files, found {} — a file was \
+        files.len() >= 43,
+        "expected at least the 43 committed .test files, found {} — a file was \
          deleted, or the batch that added one did not raise this floor: {files:?}",
         files.len()
     );
@@ -195,14 +197,18 @@ fn a_perturbed_expected_value_reddens_the_runner() {
 }
 
 /// Issue #240 AC7(g), the positive direction: the new plan-time regex
-/// validation must reject NOTHING the corpus accepts. The corpus runner
-/// never routes LOG queries through `plan()` (its documented pushdown
-/// blind spot, #278), so this walks every `eval`/`eval_ordered` log
-/// query in the corpus through the real planner and requires `Ok` —
-/// zero false rejections from the pushed-down line-filter/matcher
-/// validation. (Metric queries already plan inside the green corpus
-/// run; `sql_snapshots.rs`/`explain_indexes.rs` prove the emitted SQL
-/// is byte-identical.)
+/// validation must reject NOTHING the corpus accepts. It walks every
+/// `eval`/`eval_ordered` log query in the corpus through the real
+/// planner and requires `Ok` — zero false rejections from the
+/// pushed-down line-filter/matcher validation.
+///
+/// It was written because the corpus runner did not route LOG queries
+/// through `plan()` at all. Issue #278 closed that: the runner now plans
+/// every leg, so a plan-time rejection would surface as a case failure
+/// in the green run too. This is kept as the DIRECT statement of the
+/// property — it names the planner, asserts a floor on how many queries
+/// it reached, and would still fail if a future runner change routed
+/// around `plan()` again.
 #[test]
 fn every_corpus_log_query_still_plans_ok_under_regex_validation() {
     use pulsus_read::logql::{Direction, QueryParams, QuerySpec, plan};
@@ -321,6 +327,313 @@ fn msg_exact_discriminates_and_its_grammar_is_exactly_one_assert_line() {
     let zero = format!("{dataset}{query}\n");
     let err = run_file("inline/msg_zero_lines.test", &zero).expect_err("no assert line");
     assert!(err.contains("requires exactly one"), "grammar error: {err}");
+}
+
+// ---------------------------------------------------------------------
+// Issue #278 — the runner executes the line filters the planner pushes
+// into SQL, on every leg it can reach, and refuses the one it cannot.
+//
+// Each test below names the break that reddens it, because the whole
+// subject of this issue is a check that could not fail.
+// ---------------------------------------------------------------------
+
+/// AC1. A pushed-down line filter is APPLIED on the streams leg.
+///
+/// *Break:* point the `Expr::Log` arm back at `CompiledPipeline::compile`
+/// — the case returns both lines and this goes RED.
+#[test]
+fn the_streams_leg_applies_a_pushed_down_line_filter() {
+    let text = "load\n  {app=\"s\", service_name=\"pd-streams\"}\n\
+                \t0s   alpha foo bravo\n\t5s   alpha bar bravo\n\n\
+                eval instant at 60s {service_name=\"pd-streams\"} |= \"foo\"\n\
+                \t{app=\"s\", service_name=\"pd-streams\"} 0s alpha foo bravo\n";
+    let run = run_file("inline/pushdown_streams.test", text).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "the pushed-down `|= \"foo\"` must exclude the `bar` line: {}",
+        run.cases[0].detail
+    );
+}
+
+/// AC2. And on the metric leg, where the filter changes the COUNT.
+///
+/// The `| logfmt` is not decoration and not a workaround: a range
+/// aggregation with NO pipeline plans server-side (`raw: instant query`,
+/// `client` is `None`) and this hermetic runner has always refused those
+/// — "only client-aggregated (raw-scan) metric plans". A parser stage
+/// is what puts the aggregation on the client path the runner executes,
+/// and it does not rewrite the line, so the filter ahead of it is still
+/// PUSHED. That is the shape this test needs.
+///
+/// *Break:* point `eval_leaf` back at `CompiledPipeline::compile` — the
+/// sum is the unfiltered `2` and this goes RED.
+#[test]
+fn the_metric_leg_applies_a_pushed_down_line_filter() {
+    let text = "load\n  {app=\"m\", service_name=\"pd-metric\"}\n\
+                \t0s   kind=keep n=1\n\t5s   kind=drop n=2\n\n\
+                eval instant at 60s sum(count_over_time({service_name=\"pd-metric\"} \
+                |= \"keep\" | logfmt [1m]))\n\
+                \t{} 1\n";
+    let run = run_file("inline/pushdown_metric.test", text).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "the pushed-down filter must reduce the sum to 1: {}",
+        run.cases[0].detail
+    );
+}
+
+/// AC3. And on the `detected` leg, where the filter removes the only
+/// line carrying a field.
+///
+/// *Break:* the same, in `evaluate_detected` — `b` reappears and `kind`
+/// reports a cardinality of two, RED.
+#[test]
+fn the_detected_leg_applies_a_pushed_down_line_filter() {
+    let text = "load\n  {app=\"d\", service_name=\"pd-detected\"}\n\
+                \t10s  kind=keep a=1\n\t20s  kind=drop b=2\n\n\
+                eval detected at 60s {service_name=\"pd-detected\"} |= \"keep\" | logfmt\n\
+                \ta int 1 logfmt\n\tkind string 1 logfmt\n";
+    let run = run_file("inline/pushdown_detected.test", text).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "the pushed-down filter must keep `b` out of the detected set: {}",
+        run.cases[0].detail
+    );
+}
+
+/// AC5. The one leg `compile_for_corpus` cannot reach is REFUSED, not
+/// answered wrongly: `VariantArena::build` compiles the variants COMMON
+/// pipeline itself, with the pushdown active.
+///
+/// *Break:* delete the refusal in `eval_node`'s `Variants` arm — the
+/// case answers with unfiltered rows, the `eval_fail` verb sees a
+/// success, RED.
+#[test]
+fn a_pushed_down_common_line_filter_in_variants_is_refused() {
+    let text = "load\n  {app=\"v\", service_name=\"pd-variants\"}\n\
+                \t0s   alpha foo bravo\n\t5s   alpha bar bravo\n\n\
+                eval_fail instant at 60s variants(count_over_time({service_name=\"pd-variants\"}[1m])) \
+                of ({service_name=\"pd-variants\"} |= \"foo\" [1m])\n\
+                \tmsg: issue #278\n";
+    let run = run_file("inline/pushdown_variants.test", text).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "a pushed common-side filter must be refused by name, not answered: {}",
+        run.cases[0].detail
+    );
+}
+
+/// Every corpus `eval*` directive, planned, with the number of line
+/// filters the planner PUSHES counted across every plan shape.
+fn pushed_filter_count(query: &str) -> usize {
+    use pulsus_read::logql::{
+        Direction, MetricNode, MetricNodeScc, Plan, PlanCtx, QueryParams, QuerySpec, plan,
+    };
+    let Ok(expr) = pulsus_logql::parse(query) else {
+        return 0;
+    };
+    let params = QueryParams {
+        spec: QuerySpec::Instant {
+            at_ns: 60_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let ctx = PlanCtx {
+        db: "pulsus",
+        streams_idx: "log_streams_idx",
+        streams: "log_streams",
+        samples: "log_samples",
+        rollup_table: "log_metrics_5s",
+        rollup_res_ns: 5_000_000_000,
+        scan_budget_bytes: 50 * 1024 * 1024 * 1024,
+        max_streams: 100_000,
+        pipeline_scan_factor: 10,
+    };
+    match plan(&expr, &params, &ctx) {
+        Ok(Plan::Streams(sp)) => sp.line_filters.len(),
+        Ok(Plan::Metric(mp)) => mp.extra_predicates.len(),
+        Ok(Plan::MetricBinary(node)) => {
+            let mut nodes = Vec::new();
+            pulsus_logql::walk::postorder_into::<MetricNodeScc>(&node, &mut nodes);
+            nodes
+                .iter()
+                .map(|n| match n {
+                    MetricNode::Leaf(mp) => mp.extra_predicates.len(),
+                    MetricNode::Variants { scan, .. } => scan.extra_predicates.len(),
+                    _ => 0,
+                })
+                .sum()
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Every `eval*` directive in the corpus, with its file and line — read
+/// through the corpus's OWN parser, so this cannot drift from what the
+/// replay actually runs.
+fn corpus_eval_directives() -> Vec<(String, usize, String)> {
+    let mut out = Vec::new();
+    for name in &corpus_files() {
+        let path = driver::corpus_dir().join(name);
+        let text = driver::read_file(&path);
+        for c in driver::runner::parse_file(name, &text).unwrap_or_else(|e| panic!("{e}")) {
+            if let driver::runner::Command::Eval(e) = c {
+                out.push((name.clone(), e.line, e.query));
+            }
+        }
+    }
+    out
+}
+
+/// AC6. **The corpus is no longer blind: it contains rows that take the
+/// path.** Without this, reverting the runner fix would be undetectable
+/// — a corpus with no pushed-down filter in it passes either way, which
+/// is exactly the state this issue found.
+///
+/// *Break:* delete `b26_line_filter_pushdown.test` — RED here, and RED
+/// on `corpus_dir_is_populated`'s floor too.
+#[test]
+fn the_corpus_exercises_pushed_down_line_filters() {
+    let rows: Vec<(String, usize)> = corpus_eval_directives()
+        .into_iter()
+        .filter_map(|(f, l, q)| (pushed_filter_count(&q) > 0).then_some((f, l)))
+        .collect();
+    assert!(
+        rows.len() >= 8,
+        "only {} corpus directive(s) plan to a PUSHED-DOWN line filter, below the eight \
+         issue #278 added. The runner's ability to execute that path is only worth having \
+         if the corpus takes it: {rows:?}",
+        rows.len()
+    );
+}
+
+/// AC8. **No new row is vacuous.** A row whose filter excludes nothing
+/// is precisely the row that passed on the blind path and measured
+/// nothing, so it is asserted mechanically rather than left to authoring
+/// care.
+///
+/// **What it compares, exactly:** the row's EXPECTATION against the
+/// sample count its `load` has in force. It does not itself run the
+/// filter. That is the whole property only in combination with
+/// [`corpus_is_fully_green_and_exercises_every_directive`], which pins
+/// expectation == what the pipeline actually produces; together they give
+/// "the filter drops at least one loaded line". Measured, and the reason
+/// the pairing is stated rather than assumed: widening a row's filter to
+/// match everything WITHOUT re-capturing it reddens the green run and not
+/// this test, while widening it and re-capturing — what an author adding
+/// a vacuous row would commit — reddens this one and not the green run.
+///
+/// *Break:* replace a P-row's filter with one that matches every loaded
+/// line and record all three lines as expected — RED, naming the row.
+#[test]
+fn every_pushdown_corpus_row_excludes_at_least_one_loaded_line() {
+    let name = "b26_line_filter_pushdown.test";
+    let text = driver::read_file(&driver::corpus_dir().join(name));
+    let cmds = driver::runner::parse_file(name, &text).unwrap_or_else(|e| panic!("{e}"));
+    let mut loaded = 0usize;
+    let mut checked = 0usize;
+    for c in &cmds {
+        match c {
+            driver::runner::Command::Clear => loaded = 0,
+            driver::runner::Command::Load(specs) => {
+                loaded += specs.iter().map(|s| s.samples.len()).sum::<usize>();
+            }
+            driver::runner::Command::Eval(e) => {
+                assert!(
+                    e.expected.len() < loaded,
+                    "{name}:{}: `{}` expects {} of {loaded} loaded lines — it excludes none, so \
+                     it would pass with the filter dropped entirely and measures nothing",
+                    e.line,
+                    e.query,
+                    e.expected.len()
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 8, "expected the eight P-rows, checked {checked}");
+}
+
+/// AC12. **No artefact still claims the runner is pushdown-blind.**
+///
+/// A tripwire for the EXACT phrase that existed before this issue, over
+/// a file set derived by walking `tests/logqltest/` recursively plus the
+/// two documents that carried it.
+///
+/// **What it cannot see:** a paraphrase, and any file outside that walk.
+/// It is not a proof that the surrounding prose is now true — the
+/// derived sweep in the implementation notes is what did that, and a
+/// reviewer read it. This only stops the literal coming back.
+///
+/// *Break:* restore the phrase in `docs/api.md` — RED.
+#[test]
+fn no_artefact_claims_the_runner_is_pushdown_blind() {
+    // Assembled at run time so THIS file does not contain the needle and
+    // need an exemption from its own check.
+    let needle = format!("{} {} {}", "pushdown", "blind", "spot");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    walk(&root.join("tests/logqltest"), &mut files);
+    let repo = root
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("crates/pulsus-read");
+    files.push(repo.join("docs/api.md"));
+    files.push(repo.join("docs/benchmarks/logs-differential-ledger.md"));
+    assert!(
+        files.len() > 40,
+        "the walk found only {} files — it is looking in the wrong place",
+        files.len()
+    );
+    let offenders: Vec<String> = files
+        .iter()
+        .filter(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains(needle.as_str())))
+        .map(|p| p.display().to_string())
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these artefacts still describe the corpus runner as blind to the pushdown path, \
+         which issue #278 closed: {offenders:?}"
+    );
+}
+
+/// AC15. **The "not luck" evidence is in the tree, not only on the
+/// issue.** Zero committed rows moved when the runner was fixed, and a
+/// reader meeting that figure alone concludes the defect was harmless.
+/// It was the opposite: three committed files document authors inserting
+/// `| decolorize` or a label filter SPECIFICALLY to defeat the pushdown,
+/// and the new corpus file's header names all three.
+///
+/// **What it cannot see:** whether the sentence around those names is
+/// true. It pins that the pointers exist; a reviewer reads the sentence.
+///
+/// *Break:* delete a file name from the header — RED.
+#[test]
+fn the_pushdown_corpus_names_the_rows_written_around_the_defect() {
+    let text = driver::read_file(&driver::corpus_dir().join("b26_line_filter_pushdown.test"));
+    for named in [
+        "b24_string_escapes.test",
+        "b1_parsers_filters.test",
+        "b13_variants.test",
+    ] {
+        assert!(
+            text.contains(named),
+            "b26's header must name {named} — the file that documents an author working \
+             around the pushdown blindness. Without those pointers the measured `zero rows \
+             affected` reads as `this issue was harmless`."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

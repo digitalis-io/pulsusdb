@@ -52,6 +52,27 @@ jobs:
       - name: Install cargo-nextest (pinned)
         run: curl -LsSf https://get.nexte.st/0.9.140/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
+      # Issue #278: an issue can carry named remaining work while the
+      # defect it was filed on is fixed, and merging with "Closes #N" in
+      # the body then takes that work down with the thread. The manifest
+      # in ci/issues-that-must-stay-open.txt says which issues that
+      # applies to and why.
+      #
+      # The self-test runs UNCONDITIONALLY and is the committed red path
+      # for the matcher itself — a bare "no listed issue would be closed"
+      # on a push tells you nothing about whether the matcher still
+      # works. The scan runs on pull_request only, because that is the
+      # only event with a body to read. PR_BODY arrives through the
+      # environment, never shell-substituted: it is untrusted text.
+      - name: Premature-close matcher self-test
+        run: ci/no-premature-close.sh --self-test
+
+      - name: Issues that must stay open
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: ci/no-premature-close.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 
