@@ -3427,6 +3427,147 @@ fn contains_label(labels: &[(Cow<'_, str>, Cow<'_, str>)], name: &str) -> bool {
     label_position(labels, name).is_some()
 }
 
+/// A name -> position index over the label vector, so a parser emitting
+/// `m` labels resolves each key in O(1) instead of the O(m) scan
+/// [`label_position`] does — `O(m)` total instead of `O(m^2)`.
+///
+/// Issue #447: one uninstrumented `run_into` over a 4 126 651 B flat
+/// object (m = 67 650) cost **34-42 s** before this and **0.11-0.23 s**
+/// after — `tests/logql_row_expansion_ladder.rs`'s
+/// `LADDER-WALL ... B=4126651` line, whose doc carries the command, the
+/// rest of the ladder and the run counts behind both ranges.
+///
+/// **Both are ranges because the measuring machine is shared.** Several
+/// builds run on it concurrently, so any single figure from it is one
+/// draw from a spread this wide; two orders of magnitude separate the
+/// ranges, which is the finding, and no single value inside either one
+/// is reproducible on demand.
+///
+/// **It stores POSITIONS, not names.** Every probe compares against
+/// `labels[i].0`, so the table costs 4 bytes per slot and allocates
+/// nothing per key; the answer is by construction the answer
+/// [`label_position`] gives, because the comparison is the same one. A
+/// `HashMap<String, usize>` would have added `m` allocations instead, and
+/// made `tests/logql_row_expansion_ladder.rs`'s per-row byte measurement
+/// unreadable.
+///
+/// **Where it is valid.** Positions are stable only while the vector is
+/// append-or-overwrite-in-place. That is exactly the `| json` full
+/// flatten's shape ([`insert_flattened`] only ever `put_label_at`s), so
+/// the index is built once per flatten and dropped with it; nothing that
+/// removes or reorders labels (`remove_label`, the `drop`/`keep` stages)
+/// runs inside that window.
+///
+/// **First occurrence wins**, matching `label_position`'s `position`, so
+/// a vector that arrives holding a duplicate name resolves the same way
+/// through both. Pinned by
+/// `tests::the_index_answers_exactly_what_the_scan_answers`.
+#[derive(Debug)]
+struct LabelIndex {
+    /// Open-addressed, linear-probed; each slot holds `position + 1`, so
+    /// `0` is the empty marker and the table needs no separate bitmap.
+    /// Kept at most half full by [`Self::insert_absent`], which is what
+    /// guarantees [`Self::position`]'s probe loop always meets an empty
+    /// slot and terminates.
+    slots: Vec<u32>,
+    mask: usize,
+    len: usize,
+}
+
+/// FNV-1a over the key bytes — the same bytes the comparison walks, so a
+/// name that hashes equal costs one extra `str` compare and nothing else.
+fn hash_label_name(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+impl LabelIndex {
+    /// Builds an index over `labels` as they stand.
+    fn build(labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> Self {
+        let mut idx = LabelIndex {
+            slots: Vec::new(),
+            mask: 0,
+            len: 0,
+        };
+        idx.grow_to(labels.len().max(8).next_power_of_two() * 2, labels);
+        // FORWARD, so first occurrence wins exactly as `position` does.
+        // Reversing this loop makes a duplicate name resolve to its LAST
+        // occurrence, which the differential test rejects.
+        for i in 0..labels.len() {
+            if idx.position(labels, &labels[i].0).is_none() {
+                idx.insert_absent(labels, i);
+            }
+        }
+        idx
+    }
+
+    /// [`label_position`]'s answer, in O(1) expected probes.
+    fn position(&self, labels: &[(Cow<'_, str>, Cow<'_, str>)], name: &str) -> Option<usize> {
+        let mut i = (hash_label_name(name) as usize) & self.mask;
+        loop {
+            let slot = self.slots[i];
+            if slot == 0 {
+                return None;
+            }
+            let at = slot as usize - 1;
+            if labels[at].0 == name {
+                return Some(at);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// Records `labels[at]`, whose name the caller has just established is
+    /// NOT already in the table (the only way the flatten grows the
+    /// vector).
+    ///
+    /// Records nothing if `at + 1` does not fit `u32`, which leaves that
+    /// one name reported absent for the rest of the walk — a later leaf of
+    /// the same name would append beside it instead of overwriting it.
+    /// Out of reach rather than merely unlikely: every emitted leaf first
+    /// charges at least one byte of its key against
+    /// `MAX_JSON_FLATTEN_KEY_BYTES` (64 MiB), so one flatten cannot append
+    /// past ~6.7e7 positions, sixty-four times short of `u32::MAX`. Chosen
+    /// over a panic because this is a read path.
+    fn insert_absent(&mut self, labels: &[(Cow<'_, str>, Cow<'_, str>)], at: usize) {
+        let Ok(slot_value) = u32::try_from(at + 1) else {
+            return;
+        };
+        if (self.len + 1) * 2 > self.slots.len() {
+            self.grow_to(self.slots.len() * 2, labels);
+        }
+        let mut i = (hash_label_name(&labels[at].0) as usize) & self.mask;
+        while self.slots[i] != 0 {
+            i = (i + 1) & self.mask;
+        }
+        self.slots[i] = slot_value;
+        self.len += 1;
+    }
+
+    /// Re-allocates the table at `cap` slots (a power of two) and rehashes
+    /// every position already in it.
+    fn grow_to(&mut self, cap: usize, labels: &[(Cow<'_, str>, Cow<'_, str>)]) {
+        let cap = cap.max(8).next_power_of_two();
+        let old = std::mem::replace(&mut self.slots, vec![0u32; cap]);
+        self.mask = cap - 1;
+        for slot in old {
+            if slot == 0 {
+                continue;
+            }
+            let at = slot as usize - 1;
+            let mut i = (hash_label_name(&labels[at].0) as usize) & self.mask;
+            while self.slots[i] != 0 {
+                i = (i + 1) & self.mask;
+            }
+            self.slots[i] = slot;
+        }
+    }
+}
+
 /// `set_label_at` for a caller that has already located the slot: writes
 /// into `at` when it is `Some`, appends otherwise, and returns the
 /// position either way.
@@ -3590,13 +3731,17 @@ impl<'a> ExtractionState<'a, '_> {
     /// the label vector.
     ///
     /// **Every hot caller passes a presence it has ALREADY looked up.**
-    /// The vector scan is the whole cost of these predicates on a wide
-    /// line — a `| json` over W keys already costs W scans of a W-long
-    /// vector, and the quadratic term is multiplied by however many
-    /// times ONE leaf looks its key up. So resolving the key, testing it
-    /// and writing it share a single lookup on the unrenamed path; a
-    /// rename pays a second, and only fires for a name the stream or the
-    /// metadata supplies.
+    /// The lookup is the whole cost of these predicates on a wide line, so
+    /// resolving the key, testing it and writing it share a single one on
+    /// the unrenamed path; a rename pays a second, and only fires for a
+    /// name the stream or the metadata supplies.
+    ///
+    /// The `| json` full flatten now answers that lookup through
+    /// [`LabelIndex`] rather than a vector scan (issue #447), which took
+    /// the W-scans-of-a-W-long-vector term out of THAT path. Every other
+    /// caller — [`Self::collides`], [`Self::is_extracted`],
+    /// [`add_extracted`] — still scans, so sharing the lookup still
+    /// matters here.
     fn is_extracted_at(&self, key: &str, present: bool) -> bool {
         (present && !self.collides_at(key, present)) || self.removed_parsed.iter().any(|k| k == key)
     }
@@ -4539,6 +4684,9 @@ fn run_json<'a>(
             charged_stack: 0,
             out,
         });
+        // Built once per flatten, over the labels as the stage received
+        // them, and dropped with the walk — see [`LabelIndex`].
+        let mut index = LabelIndex::build(labels);
         flatten_json(
             "",
             Depth::Root,
@@ -4547,6 +4695,7 @@ fn run_json<'a>(
                 labels,
                 st,
                 dirty: &mut errs.dirty,
+                index: &mut index,
             },
             budget,
             capture.as_mut(),
@@ -5666,6 +5815,9 @@ struct FlattenSink<'a, 'r, 'l> {
     labels: &'l mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     st: &'l mut ExtractionState<'a, 'r>,
     dirty: &'l mut bool,
+    /// The name -> position index for THIS walk. See [`LabelIndex`] for
+    /// why a flatten is the window where positions stay valid.
+    index: &'l mut LabelIndex,
 }
 
 /// The reference's `_extracted` collision suffix (`parser.go:25`).
@@ -5709,8 +5861,13 @@ fn insert_flattened<'v>(
     budget: &JsonKeyBudget,
     capture: Option<&mut JsonPathCapture<'v, '_>>,
 ) -> Result<(), RowBudgetExceeded> {
-    let FlattenSink { labels, st, dirty } = sink;
-    let at = label_position(labels, &key);
+    let FlattenSink {
+        labels,
+        st,
+        dirty,
+        index,
+    } = sink;
+    let at = index.position(labels, &key);
     let renamed = st.collides_at(&key, at.is_some());
     let resolved = if renamed {
         match depth {
@@ -5738,7 +5895,7 @@ fn insert_flattened<'v>(
         key
     };
     let at = if renamed {
-        label_position(labels, &resolved)
+        index.position(labels, &resolved)
     } else {
         at
     };
@@ -5748,6 +5905,11 @@ fn insert_flattened<'v>(
     **dirty = true;
     let resolved = st.note_parsed_set(Cow::Owned(resolved));
     let idx = put_label_at(labels, at, resolved, Cow::Owned(value));
+    if at.is_none() {
+        // An append: the name was absent, so the index has to learn it.
+        // An overwrite (`at.is_some()`) leaves every position untouched.
+        index.insert_absent(labels, idx);
+    }
     if let Some(c) = capture {
         c.out.record(idx, &c.stack, raw_part, budget)?;
     }
@@ -9282,5 +9444,121 @@ mod tests {
             ),
             vec![("m".to_string(), "1".to_string())]
         );
+    }
+
+    /// **The equivalence the whole of [`LabelIndex`] rests on** (issue
+    /// #447): for every name, over vectors carrying duplicates,
+    /// `_extracted` collisions, empty names and non-ASCII, `position`
+    /// returns exactly what [`label_position`] returns — the FIRST
+    /// matching index — both as built and after each append the flatten
+    /// could make.
+    ///
+    /// **Watched to fail.** Reversing [`LabelIndex::build`]'s loop to
+    /// `(0..labels.len()).rev()` makes a duplicate name resolve to its
+    /// LAST occurrence and reddens this at `trial 0`, `probe "b"`,
+    /// `left: Some(27) right: Some(16)`.
+    ///
+    /// The OTHER half of the change — [`insert_flattened`]'s
+    /// `insert_absent` after an append — is out of this test's reach,
+    /// because the append loop below calls `insert_absent` itself rather
+    /// than going through the flatten. Deleting that call reddens
+    /// `tests/logqltest_corpus.rs` instead, on six
+    /// `b21_key_collisions.test` rows, `:138` among them
+    /// (`a_extracted="1", a_extracted="2"` where the corpus wants one).
+    ///
+    /// Making `insert_absent` last-wins — the obvious third break —
+    /// reddens NOTHING, and correctly so: [`LabelIndex::position`] stops
+    /// at the first slot whose name matches, so a second slot for a name
+    /// already in the table is unreachable and cannot be observed. That is
+    /// the test being right about what is observable, not weak.
+    #[test]
+    fn the_index_answers_exactly_what_the_scan_answers() {
+        // splitmix64, the project's deterministic-seed pattern
+        // (xtask/src/bench/dataset.rs).
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let alphabet = [
+            "a",
+            "b",
+            "",
+            "aa",
+            "ab",
+            "x_extracted",
+            "x",
+            "k000000",
+            "\u{e9}x",
+        ];
+        for trial in 0..300 {
+            let n = (next() % 40) as usize;
+            let labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = (0..n)
+                .map(|i| {
+                    let k = alphabet[(next() as usize) % alphabet.len()];
+                    // Half borrowed, half owned, so the Cow variants mix.
+                    let k: Cow<'_, str> = if i % 2 == 0 {
+                        Cow::Borrowed(k)
+                    } else {
+                        Cow::Owned(k.to_string())
+                    };
+                    (k, Cow::Borrowed("v"))
+                })
+                .collect();
+            let index = LabelIndex::build(&labels);
+            for probe in alphabet {
+                assert_eq!(
+                    index.position(&labels, probe),
+                    label_position(&labels, probe),
+                    "trial {trial}: probe {probe:?} over {labels:?}"
+                );
+            }
+            // And the append path: every name the flatten could add.
+            let mut labels = labels;
+            let mut index = index;
+            for probe in alphabet {
+                if index.position(&labels, probe).is_none() {
+                    labels.push((Cow::Owned(probe.to_string()), Cow::Borrowed("v")));
+                    index.insert_absent(&labels, labels.len() - 1);
+                }
+                assert_eq!(
+                    index.position(&labels, probe),
+                    label_position(&labels, probe),
+                    "trial {trial}: after append of {probe:?}"
+                );
+            }
+            for probe in alphabet {
+                assert_eq!(
+                    index.position(&labels, probe),
+                    label_position(&labels, probe),
+                    "trial {trial}: final sweep, probe {probe:?}"
+                );
+            }
+        }
+    }
+
+    /// The table stays at most half full through a long run of appends,
+    /// which is what makes [`LabelIndex::position`]'s unbounded probe loop
+    /// terminate: a full table would spin forever on a miss.
+    #[test]
+    fn the_index_never_fills_past_half_so_a_miss_always_meets_an_empty_slot() {
+        let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+        let mut index = LabelIndex::build(&labels);
+        for i in 0..5_000usize {
+            labels.push((Cow::Owned(format!("k{i}")), Cow::Borrowed("v")));
+            index.insert_absent(&labels, labels.len() - 1);
+            assert!(
+                index.len * 2 <= index.slots.len(),
+                "load factor breached at {i}: {} of {}",
+                index.len,
+                index.slots.len()
+            );
+            // A name that is definitely absent must TERMINATE, not spin.
+            assert_eq!(index.position(&labels, "definitely-absent"), None);
+        }
+        assert_eq!(index.len, 5_000);
     }
 }

@@ -62,7 +62,9 @@ use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use flate2::Compression;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use prost::Message;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 
@@ -1886,37 +1888,49 @@ fn assert_gzip_identity(port: u16, path: &str, query: &str, spawn: &str) {
     );
 }
 
-/// `/metrics`'s own gzip-identity leg: unlike every other route this
-/// matrix drives, `ops::metrics_handler` bridges the label cache's *live*
-/// counters/gauges into the response on every single scrape (`ops.rs`'s
-/// own doc comment) — `pulsus_label_cache_age_ms`'s value (and, per the
-/// underlying exporter's label-set registration order, the ordering of
-/// the labelled `pulsus_label_cache_misses_total{reason=...}` series)
-/// genuinely differ between two back-to-back requests, by design, not by
-/// a gzip-layer defect. Normalizes both bodies the same way
-/// (`explain_indexes.rs`'s established "collapse the volatile part before
-/// comparing" idiom, applied to whole lines here rather than digits) so
-/// this still proves gzip decode fidelity — corruption in the compression
-/// layer would show up as a genuine content mismatch even after
-/// normalizing away the one known-live gauge and the label-order
-/// nondeterminism.
+/// `/metrics`'s own gzip-identity leg. **Two scrapes, but nothing is
+/// compared BETWEEN them** (issue #447).
+///
+/// `assert_gzip_identity`'s shape — scrape identity, scrape gzip, require
+/// the two decoded bodies to be equal — cannot work here, because
+/// `ops::metrics_handler` bridges the label cache's *live* counters and
+/// gauges into the response on every single scrape (`ops.rs`'s own doc
+/// comment). `pulsus_label_cache_age_ms` moves between two back-to-back
+/// requests by design, and so, per the exporter's label-set registration
+/// order, can the ordering of the labelled
+/// `pulsus_label_cache_misses_total{reason=...}` series. Filtering the one
+/// gauge name out and sorting the lines was the previous shape, and it is
+/// fragile by construction: ANY second value that starts moving fails it.
+/// It flaked on PR #446, on a change touching no metrics code.
+///
+/// **The flake was only ever in the body comparison, so only the body
+/// comparison changes.** The headers of two scrapes do not race, so both
+/// legs keep their own header cells, each asserted against its own
+/// response and never against the other's:
+///
+/// * the identity leg carries NO `Content-Encoding` — a per-route cell,
+///   and the matrix exists precisely to catch a route that stops going
+///   through the global `CompressionLayer` (`middleware.rs:26`), which is
+///   something the other routes' passing legs cannot show;
+/// * the gzip leg negotiates gzip and says so;
+/// * status and Content-Type on both.
+///
+/// The body equality then comes from ONE response gzipped locally rather
+/// than from the two scrapes, which is what removes the race and with it
+/// the need for any filter. That still reaches the compression layer:
+/// `raw_request`'s `GzDecoder` checks the gzip stream's trailing CRC32 and
+/// ISIZE, so corruption on the wire fails the gzip leg outright rather
+/// than quietly, and the round trip proves this body — exposition text,
+/// far more repetitive than the JSON the other routes return — survives
+/// deflate byte-for-byte.
 fn assert_gzip_identity_metrics(port: u16, spawn: &str) {
-    fn normalize(body: &[u8]) -> Vec<String> {
-        let mut lines: Vec<String> = String::from_utf8_lossy(body)
-            .lines()
-            .filter(|line| !line.contains("pulsus_label_cache_age_ms"))
-            .map(str::to_string)
-            .collect();
-        lines.sort();
-        lines
-    }
-
     // Round-10 finding (medium): full cell identifiers, per leg.
     let ctx_id = format!("[{spawn}] GET /metrics case=gzip-identity leg=identity");
     let ctx_gz = format!("[{spawn}] GET /metrics case=gzip-identity leg=gzip");
     let mut req = manifest::Req::new("GET", "/metrics".to_string());
     // Round-8 finding (medium): explicit `identity` + Content-Encoding
-    // absence, same as `assert_gzip_identity`.
+    // absence, same as `assert_gzip_identity`. Its BODY is deliberately
+    // never read — that comparison is what raced.
     req.headers
         .push(("accept-encoding", "identity".to_string()));
     let identity = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx_id}: must be reachable"));
@@ -1925,6 +1939,14 @@ fn assert_gzip_identity_metrics(port: u16, spawn: &str) {
         "{ctx_id}: must carry no Content-Encoding header, got {:?}",
         identity.headers.get("content-encoding")
     );
+    // Round-7 finding (medium): status + Content-Type, not just the body.
+    assert_eq!(identity.status, 200, "{ctx_id}: status");
+    assert_eq!(
+        identity.content_type(),
+        Some("text/plain; version=0.0.4"),
+        "{ctx_id}: Content-Type (`ops.rs:122`)"
+    );
+
     req.headers.pop();
     req.headers.push(("accept-encoding", "gzip".to_string()));
     let gz = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx_gz}: must be reachable"));
@@ -1933,22 +1955,28 @@ fn assert_gzip_identity_metrics(port: u16, spawn: &str) {
         Some("gzip"),
         "{ctx_gz}: must actually negotiate gzip for this assertion to be meaningful"
     );
-    // Round-7 finding (medium): status + Content-Type equality too.
-    assert_eq!(identity.status, 200, "{ctx_id}: status");
-    assert_eq!(
-        gz.status, identity.status,
-        "{ctx_gz}: status must equal the identity leg's"
-    );
+    assert_eq!(gz.status, 200, "{ctx_gz}: status");
     assert_eq!(
         gz.content_type(),
-        identity.content_type(),
-        "{ctx_gz}: Content-Type must equal the identity leg's"
+        Some("text/plain; version=0.0.4"),
+        "{ctx_gz}: Content-Type under gzip negotiation (`ops.rs:122`)"
     );
+
+    // ONE body, round-tripped: no second scrape enters this assertion.
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&gz.body)
+        .unwrap_or_else(|e| panic!("{ctx_gz}: gzip encode: {e}"));
+    let recompressed = encoder
+        .finish()
+        .unwrap_or_else(|e| panic!("{ctx_gz}: gzip finish: {e}"));
+    let mut round_tripped = Vec::new();
+    GzDecoder::new(&recompressed[..])
+        .read_to_end(&mut round_tripped)
+        .unwrap_or_else(|e| panic!("{ctx_gz}: gzip decode: {e}"));
     assert_eq!(
-        normalize(&gz.body),
-        normalize(&identity.body),
-        "{ctx_gz}: gzip-decoded body must match the identity response once the one known-live \
-         gauge line and label-set ordering are normalized away"
+        round_tripped, gz.body,
+        "{ctx_gz}: the scraped body must survive a gzip round trip byte-for-byte"
     );
 }
 
