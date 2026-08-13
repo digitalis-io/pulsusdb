@@ -175,11 +175,15 @@ const COMBINED_SKIP_NAME: &str = "Name: <Combined skip indexes>";
 ///
 /// Measured for issue #376 on the real `log_samples` DDL with a 100k-row
 /// corpus: absent on 24.8.14.39 for every stage-3 shape; on 26.3.17.110
-/// absent for `|=`, `|~` and `!~`, and **present** for `!=`, whose
-/// rendered predicate is `NOT (hasToken AND hasToken AND position)` — a
-/// negated conjunction, i.e. the AND/OR mix the block reports on. Net
-/// granule selection is 12/12 on both versions for that shape, so the
-/// block is a reporting addition, not a plan change.
+/// absent for every single-predicate shape and **present** for the shape
+/// whose predicate genuinely mixes AND and OR over `body`. Issue #450
+/// moved which shape that is: `!=` used to render
+/// `NOT (hasToken AND hasToken AND position)` — a negated conjunction —
+/// and now renders `NOT (body LIKE …)`, a single negated predicate, so it
+/// no longer carries the block; the `or` group
+/// (`((body LIKE …) OR (body LIKE …))`) does. Net granule selection is
+/// unchanged by the block's presence, so it is a reporting addition, not
+/// a plan change.
 fn combined_skip_present(raw: &str) -> bool {
     raw.lines().any(|l| l.trim() == COMBINED_SKIP_NAME)
 }
@@ -952,8 +956,9 @@ impl PrunesBy {
 enum CombinedSkip {
     /// The filter is a plain conjunction over `body`.
     Absent,
-    /// The filter mixes AND and OR over `body` — a negated conjunction
-    /// (`!=`) is the shape that does this in our SQL.
+    /// The filter mixes AND and OR over `body` — an `or` group
+    /// (`((body LIKE …) OR (body LIKE …))`) is the shape that does this in
+    /// our SQL (issue #450; before it, `!=`'s negated conjunction did).
     Present,
 }
 
@@ -1062,28 +1067,63 @@ async fn stage3_not_contains_line_filter_uses_the_primary_key_and_the_token_skip
     let ts_ns = now_ns();
     let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
-    // The one stage-3 shape whose extract MOVED on 26.3 (issue #376).
-    // `!=` renders `NOT (hasToken AND hasToken AND position)`, a negated
-    // conjunction, and 26.x reports an extra `<Combined skip indexes>`
-    // pseudo-block for exactly that AND/OR mix. Judged **moved-correct**:
-    // net granule selection is 12/12 on a 100k-row corpus on BOTH
-    // 24.8.14.39 and 26.3.17.110, i.e. a negated line filter prunes
-    // nothing on either version and the block is a reporting addition.
-    // The declared skip-index SET is unchanged, which is what the
-    // assertion below actually pins.
+    // Issue #376 recorded this as the one stage-3 shape whose extract
+    // MOVED on 26.3, because `!=` then rendered
+    // `NOT (hasToken AND hasToken AND position)` — a negated conjunction,
+    // the AND/OR mix 26.x reports a `<Combined skip indexes>` pseudo-block
+    // for. Issue #450 deleted that conjunction: `!=` now renders
+    // `NOT (body LIKE '%connection refused%')`, a single negated
+    // predicate, so the block is gone and the expectation below is
+    // `Absent`. The block did not become untested — the shape that mixes
+    // AND and OR over `body` under the new rendering is the `or` group,
+    // and
+    // [`stage3_or_group_line_filter_carries_the_combined_skip_block`]
+    // asserts `Present` for it. What did NOT move: a negated line filter
+    // still prunes nothing (12/12 granules), which `PrunesBy::NotAtAll`
+    // pins, and the declared skip-index SET is unchanged.
     assert_stage3_usage(
         db,
         ts_ns,
         &client,
         r#"{service_name="checkout"} != "connection refused""#,
-        CombinedSkip::Present,
+        CombinedSkip::Absent,
         PrunesBy::NotAtAll,
     )
     .await;
 }
 
+/// Issue #450: the `or` group is the stage-3 shape whose pushed-down
+/// predicate genuinely mixes AND and OR over `body`
+/// (`((body LIKE '%a%') OR (body LIKE '%b%'))` ANDed with the PK bounds),
+/// so it is where 26.x's `<Combined skip indexes>` pseudo-block lives once
+/// `!=` stopped rendering a negated conjunction. The `Present` variant
+/// stays a live, falsifiable expectation rather than a dead one.
+///
+/// `"nomatchzzzz"` is absent from the corpus, so the disjunction still
+/// selects only the granules carrying `"connection refused"` — the block
+/// is a reporting addition here too, not a loss of pruning, which
+/// `PrunesBy::Strongly` pins against the same-run `use_skip_indexes = 0`
+/// control.
 #[tokio::test]
-async fn stage3_regex_line_filter_over_a_plain_literal_uses_the_token_skip_index() {
+async fn stage3_or_group_line_filter_carries_the_combined_skip_block() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_s3_or_group");
+    let ts_ns = now_ns();
+    let client = setup_with_line_filter_corpus(db, ts_ns).await;
+
+    assert_stage3_usage(
+        db,
+        ts_ns,
+        &client,
+        r#"{service_name="checkout"} |= "connection refused" or "nomatchzzzz""#,
+        CombinedSkip::Present,
+        PrunesBy::Strongly,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stage3_regex_line_filter_over_a_plain_literal_uses_the_body_skip_indexes() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_s3_regex");
     let ts_ns = now_ns();
@@ -1108,9 +1148,9 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_still_lists_t
     let ts_ns = now_ns();
     let client = setup_with_line_filter_corpus(db, ts_ns).await;
 
-    // Not a plain literal (`.*` is a regex metacharacter sequence) — no
-    // `hasToken` prefilter is generated (`plan::is_plain_literal`), only
-    // `match(body, ...)`. ClickHouse's `EXPLAIN indexes = 1` still lists
+    // `!~` renders `NOT (match(body, ...))` and nothing else — no
+    // prefilter of any kind is minted (issue #450).
+    // ClickHouse's `EXPLAIN indexes = 1` still lists
     // both `body` skip indexes as *considered* (any predicate referencing
     // `body` surfaces every skip index declared on that column) — the
     // `Parts:`/`Granules:` counts this file deliberately drops are what
@@ -1130,7 +1170,7 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_still_lists_t
 /// by parser/label-filter stages keeps the stage-3 `EXPLAIN indexes = 1`
 /// extract EXACTLY equal to the plain line-filter expectation — the
 /// `json`/`status` stages are pure post-fetch and add nothing to the SQL,
-/// so the `tokenbf_v1` skip index stays engaged for `|= "refused"`.
+/// so the body skip indexes stay engaged for `|= "connection refused"`.
 #[tokio::test]
 async fn stage3_line_filter_before_a_parser_keeps_the_exact_skip_index_usage() {
     skip_unless_live!();

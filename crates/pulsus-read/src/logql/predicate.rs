@@ -226,6 +226,7 @@
 
 use pulsus_logql::{LineFilter, LineFilterOp};
 
+use super::escape::ch_like_contains;
 use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string};
 use super::pipeline::PipelineError;
 
@@ -459,21 +460,30 @@ pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, Pip
 }
 
 /// Compiles one pushed-down `LineFilter` stage. Positive ops (`|=`, `|~`)
-/// render `hasToken` prefilter(s) ANDed with the exact predicate. Negative
-/// ops (`!=`, `!~`) wrap the *same* compound predicate in `NOT (...)` rather
-/// than negating only the exact predicate: `hasToken` never has false
-/// negatives (a bloom filter can only ever say "maybe present" or
-/// "definitely absent"), so `hasToken(...) AND exact(...)` is exactly
-/// equivalent to `exact(...)` alone — `NOT (hasToken(...) AND exact(...))` is
-/// therefore provably equivalent to `NOT exact(...)`, the correct exclusion
-/// semantic, while still surfacing the prefilter for ClickHouse's optimizer
-/// to exploit where it can (architect plan: "Prefilter is always paired with
-/// the exact predicate").
+/// render exactly one predicate over `body` — `body LIKE '%needle%'` or
+/// `match(body, …)` — and negative ops (`!=`, `!~`) wrap it in `NOT (...)`,
+/// which is the exclusion semantic directly because `body` is a non-NULL
+/// `String` column and the positive predicate is total over it.
+///
+/// **No token prefilter is minted, in any form (issue #450).** The old
+/// rendering ANDed `hasToken(body, <token>)` onto the exact predicate on
+/// the claim that a bloom filter has no false negatives. That is true of
+/// the `tokenbf_v1` *skip index* and false of the `hasToken()` *function*,
+/// which is an exact whole-token membership test: a needle that is a
+/// fragment of a longer token gives `hasToken = 0` while the text is
+/// plainly present, so `|=` dropped matching lines, `!=` kept lines it
+/// should have excluded, and a needle containing `_` failed the query
+/// outright (`BAD_ARGUMENTS`). There is no safe subset for us to write —
+/// a token prefilter is equivalence-preserving only when the needle is
+/// token-aligned *in the data*, which the query cannot know. ClickHouse's
+/// own `LIKE`/`match` index analysis derives the sound version of that
+/// rule (a token is required only when it is separator-delimited *inside
+/// the pattern*) and applies it to `tokenbf_v1` for free, and the
+/// `ngrambf_v1(4, …)` body index prunes for both forms.
 ///
 /// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
-/// per-alternative compound predicate: `((a) OR (b) …)` for positive ops,
-/// `NOT ((a) OR (b) …)` for negative ops (each disjunct's `hasToken`
-/// prefilter is preserved, so the `tokenbf_v1` skip index still prunes). A
+/// per-alternative predicate: `((a) OR (b) …)` for positive ops,
+/// `NOT ((a) OR (b) …)` for negative ops. A
 /// single-value filter is left un-wrapped so its pushed-down SQL is
 /// byte-identical to the pre-`or` output. Callers must gate on
 /// [`super::plan::is_pushable_line_filter`], which stays in `plan.rs`: this
@@ -525,53 +535,15 @@ pub(super) fn non_id_values_expr() -> CheckedFragment {
     }
 }
 
-/// ClickHouse's `tokenbf_v1` splits on non-alphanumeric ASCII; a `hasToken`
-/// prefilter must extract tokens the same way or it misses granules that
-/// truly contain the phrase.
-fn tokenize(literal: &str) -> Vec<String> {
-    literal
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-const REGEX_METACHARS: &[char] = &[
-    '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\',
-];
-
-/// Conservative, safe-by-construction heuristic: a pattern with zero regex
-/// metacharacters is a plain literal, so its tokens can seed a `hasToken`
-/// prefilter exactly like a `|=` phrase. Anything else skips the prefilter
-/// (never wrong, just less pruning) rather than attempting regex analysis
-/// (out of scope — see the AST's own "regex not validated" contract).
-fn is_plain_literal(pattern: &str) -> bool {
-    !pattern.chars().any(|c| REGEX_METACHARS.contains(&c))
-}
-
 fn contains_predicate(phrase: &str) -> String {
-    let mut parts: Vec<String> = tokenize(phrase)
-        .iter()
-        .map(|t| format!("hasToken(body, {})", ch_string(t)))
-        .collect();
-    parts.push(format!("position(body, {}) > 0", ch_string(phrase)));
-    parts.join(" AND ")
+    format!("body LIKE {}", ch_like_contains(phrase))
 }
 
 fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
-    let mut parts: Vec<String> = Vec::new();
-    if is_plain_literal(pattern) {
-        parts.extend(
-            tokenize(pattern)
-                .iter()
-                .map(|t| format!("hasToken(body, {})", ch_string(t))),
-        );
-    }
-    parts.push(format!(
+    Ok(format!(
         "match(body, {})",
         ch_regex_unanchored_checked(pattern)?
-    ));
-    Ok(parts.join(" AND "))
+    ))
 }
 
 #[cfg(test)]
@@ -584,30 +556,6 @@ mod tests {
             value: value.to_string(),
             value_is_ip: false,
             or_matches: Vec::new(),
-        }
-    }
-
-    // Both moved verbatim from `plan.rs`'s `mod tests` with the functions
-    // they cover (issue #286), plus one added assertion over the whole
-    // `REGEX_METACHARS` set.
-    #[test]
-    fn tokenize_splits_on_non_alphanumeric_boundaries() {
-        assert_eq!(
-            tokenize("connection refused"),
-            vec!["connection".to_string(), "refused".to_string()]
-        );
-        assert_eq!(tokenize("a_b-c"), vec!["a_b".to_string(), "c".to_string()]);
-    }
-
-    #[test]
-    fn is_plain_literal_rejects_regex_metacharacters() {
-        assert!(is_plain_literal("connection refused"));
-        assert!(!is_plain_literal("test.*"));
-        for meta in REGEX_METACHARS {
-            assert!(
-                !is_plain_literal(&format!("a{meta}b")),
-                "metachar {meta:?} must disqualify the hasToken prefilter"
-            );
         }
     }
 
@@ -697,12 +645,85 @@ mod tests {
     }
 
     #[test]
-    fn a_regex_line_filter_pairs_the_token_prefilter_with_the_exact_predicate() {
+    fn a_regex_line_filter_renders_the_bare_unanchored_match() {
         assert_eq!(
             line_filter(&regex_filter("boom"))
                 .expect("`boom` compiles")
                 .as_sql(),
-            "hasToken(body, 'boom') AND match(body, 'boom')"
+            "match(body, 'boom')"
         );
+    }
+
+    /// AC4 (issue #450): the correctness condition is not a comment and not
+    /// a predicate we maintain — **we mint no token prefilter at all**. A
+    /// `hasToken(body, …)` conjunct is only equivalence-preserving when the
+    /// needle happens to be token-aligned in the data, which the query
+    /// cannot know; re-introducing one in any form fails this test.
+    ///
+    /// Every needle here is a valid RE2 pattern as well as a literal, so
+    /// all four ops can be minted from the same list.
+    #[test]
+    fn no_line_filter_op_mints_a_token_prefilter_for_any_shaped_needle() {
+        const SHAPED: &[&str] = &[
+            "connection refused",
+            "user_id",
+            "06Q924X3qTas",
+            "a-b.c/d:e",
+            "100%",
+            "a_b",
+            "a\\\\b",
+            "café",
+            "a—b",
+            "🙂",
+            "",
+        ];
+        for op in [
+            LineFilterOp::Contains,
+            LineFilterOp::NotContains,
+            LineFilterOp::Regex,
+            LineFilterOp::NotRegex,
+        ] {
+            for needle in SHAPED {
+                let sql = line_filter(&LineFilter {
+                    op,
+                    value: (*needle).to_string(),
+                    value_is_ip: false,
+                    or_matches: Vec::new(),
+                })
+                .unwrap_or_else(|e| panic!("{op:?} {needle:?} must mint: {e:?}"))
+                .as_sql()
+                .to_string();
+                assert!(
+                    !sql.contains("hasToken("),
+                    "{op:?} {needle:?} minted a token prefilter: {sql}"
+                );
+            }
+        }
+    }
+
+    /// The `|=` mint is the LIKE escaper, and `%`/`_`/`\` in the needle are
+    /// escaped so they match literally rather than as LIKE wildcards
+    /// (issue #450: the previous rendering failed the query outright on a
+    /// needle containing `_`).
+    #[test]
+    fn a_contains_line_filter_renders_an_escaped_like_pattern() {
+        for (needle, expected) in [
+            ("connection refused", "body LIKE '%connection refused%'"),
+            ("user_id", "body LIKE '%user\\\\_id%'"),
+            ("100%", "body LIKE '%100\\\\%%'"),
+            ("a\\b", "body LIKE '%a\\\\\\\\b%'"),
+            ("", "body LIKE '%%'"),
+        ] {
+            let f = LineFilter {
+                op: LineFilterOp::Contains,
+                value: needle.to_string(),
+                value_is_ip: false,
+                or_matches: Vec::new(),
+            };
+            assert_eq!(
+                line_filter(&f).expect("a literal always mints").as_sql(),
+                expected
+            );
+        }
     }
 }

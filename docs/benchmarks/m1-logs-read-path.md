@@ -147,6 +147,17 @@ absolute threshold breaks the moment the corpus grows):
   `tokenbf_v1`/`ngrambf_v1` skip indexes actually prune granules that
   cannot contain the needle.
 
+> **Dated note (2026-08-13, issue #450).** Every capture on this page,
+> including the committed `data/logs-read-ci.json` and
+> `data/logs-read-dist.json`, predates #450 and therefore quotes the
+> pre-#450 line-filter SQL
+> (`hasToken(body, …) AND position(body, …) > 0`). That rendering returned
+> wrong rows and was replaced by `body LIKE '%…%'`. The JSONs are captures
+> of a past run and are **not** hand-edited; no test reads them. The
+> pruning conclusions still hold under the new rendering — `ngrambf_v1`
+> serves `LIKE` — but the `SelectedMarks`/`read_rows` figures below were
+> measured against the old predicate and should not be quoted as current.
+
 Verified live in this session (podman, ClickHouse 24.8):
 
 ```

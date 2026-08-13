@@ -3,8 +3,8 @@
 //! `regexp`/`pattern`), label filters, `line_format`, and `label_format`
 //! are opaque to the columnar store (they read the log body), so they
 //! evaluate here, over rows stage 3 already fetched — **after** line
-//! filters pushed down to the `tokenbf_v1` skip index / PREWHERE reduced
-//! the row set (features.md §2; the pushdown itself is
+//! filters pushed down to the `ngrambf_v1` body skip index / PREWHERE
+//! reduced the row set (features.md §2; the pushdown itself is
 //! [`super::plan::compile_line_filters`]'s job and is untouched by this
 //! module).
 //!
@@ -424,8 +424,8 @@ pub enum MetricRun<'a> {
 /// One alternative of a client-side line filter (M8-LQ2 `linefilter.or`).
 /// A filter's alternatives are an `or` disjunction: the stage matches iff
 /// ANY alternative matches the current line. An `ip("…")` head/alternative
-/// compiles to [`LineMatcher::Ip`] (a range test with no token prefilter,
-/// so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
+/// compiles to [`LineMatcher::Ip`] (a range test that renders no `body`
+/// predicate, so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
 /// down and it is evaluated here); a plain value compiles to `Literal`
 /// (`|=`/`!=`) or `Regex` (`|~`/`!~`).
 #[derive(Debug, Clone)]
@@ -7467,8 +7467,8 @@ mod tests {
         }
     }
 
-    /// Issue #201 regression: an `ip(…)` line filter has no token/skip-index
-    /// prefilter, so it does NOT push down — it compiles a run-stage and must
+    /// Issue #201 regression: an `ip(…)` line filter renders no `body`
+    /// predicate, so it does NOT push down — it compiles a run-stage and must
     /// therefore decline the `is_line_filter_only` fast path. If the gate
     /// wrongly reported `true`, exec would skip the client-side IP scan and the
     /// filter would silently no-op. A plain literal line filter still qualifies.

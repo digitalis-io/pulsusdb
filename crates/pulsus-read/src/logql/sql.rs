@@ -690,8 +690,8 @@ pub fn log_stats_rollup(rollup_table: &str, fingerprints: &[u64], window: TimeWi
 
 /// The `/api/logs/v1/stats` raw fallback (issue #74, line-filtered): the
 /// rollup is body-content-blind, so a line filter forces a `log_samples`
-/// scan with the identical `PREWHERE service` + skip-index line-filter
-/// prefilters [`stage3`] emits (granule-skipped, PK-pruned). Same
+/// scan with the identical `PREWHERE service` + skip-index-prunable
+/// line-filter predicates [`stage3`] emits (granule-skipped, PK-pruned). Same
 /// `streams`/`chunks` shape as [`log_stats_rollup`]; `entries`/`bytes`
 /// count matching lines exactly.
 pub fn log_stats_raw(
@@ -1051,7 +1051,7 @@ mod tests {
     /// minted one: [`CheckedFragment`] has no constructor outside
     /// `logql::predicate`, and no mint renders `positionCaseSensitive`, so
     /// the old fixture is not expressible. `|= "err"` renders
-    /// `hasToken(body, 'err') AND position(body, 'err') > 0`, and the three
+    /// `body LIKE '%err%'` (issue #450), and the three
     /// expectations below carry that text instead. The property under test
     /// — the builder appends each fragment behind its own `AND` — is
     /// unchanged.
@@ -1460,7 +1460,7 @@ mod tests {
              WHERE fingerprint IN (1, 2)\n\
              \x20 AND timestamp_ns >= 1500 AND timestamp_ns <= 2000\n\
              \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) >= (1500, 7, 42)\n\
-             \x20 AND hasToken(body, 'err') AND position(body, 'err') > 0\n\
+             \x20 AND body LIKE '%err%'\n\
              ORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC\n\
              LIMIT 500 OFFSET 3"
         );
@@ -1529,7 +1529,7 @@ mod tests {
              WHERE fingerprint IN (1, 2)\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 1500\n\
              \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) <= (1500, 7, 42)\n\
-             \x20 AND hasToken(body, 'err') AND position(body, 'err') > 0\n\
+             \x20 AND body LIKE '%err%'\n\
              ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC\n\
              LIMIT 500 OFFSET 3"
         );
@@ -1630,7 +1630,7 @@ mod tests {
              PREWHERE service = 'checkout'\n\
              WHERE fingerprint IN (18374)\n\
              \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
-             \x20 AND hasToken(body, 'err') AND position(body, 'err') > 0"
+             \x20 AND body LIKE '%err%'"
         );
     }
 

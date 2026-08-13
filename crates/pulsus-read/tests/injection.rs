@@ -6,7 +6,7 @@
 //! regex value flows through escape.rs").
 
 use pulsus_logql::{LineFilter, LineFilterOp, MatchOp, Matcher, StreamSelector};
-use pulsus_read::logql::escape::{ch_ident, ch_string};
+use pulsus_read::logql::escape::{ch_ident, ch_like_contains, ch_string};
 use pulsus_read::logql::plan;
 use pulsus_read::logql::predicate::{CheckedFragment, literal};
 use pulsus_read::logql::sql::{self, TimeWindow};
@@ -86,6 +86,22 @@ fn ch_string_never_emits_a_bare_quote_for_any_payload() {
         PAYLOAD_REGEX_META,
     ] {
         assert_no_unescaped_quote_or_backslash(&ch_string(payload));
+    }
+}
+
+/// The `|=` LIKE pattern literal is `ch_string`'s output too (issue #450:
+/// LIKE-escaping runs first, the string-literal escaping second), so the
+/// same property must hold for every payload.
+#[test]
+fn ch_like_contains_never_emits_a_bare_quote_for_any_payload() {
+    for payload in [
+        PAYLOAD_QUOTE,
+        PAYLOAD_BACKSLASH_QUOTE,
+        PAYLOAD_COMMENT,
+        PAYLOAD_PAREN,
+        PAYLOAD_REGEX_META,
+    ] {
+        assert_no_unescaped_quote_or_backslash(&ch_like_contains(payload));
     }
 }
 
@@ -178,9 +194,9 @@ fn a_line_filter_payload_stays_inside_one_literal_in_the_exact_predicate() {
     assert!(
         clauses[0]
             .as_sql()
-            .contains(&format!("position(body, {})", ch_string(PAYLOAD_PAREN)))
+            .contains(&format!("body LIKE {}", ch_like_contains(PAYLOAD_PAREN)))
     );
-    assert_no_unescaped_quote_or_backslash(&ch_string(PAYLOAD_PAREN));
+    assert_no_unescaped_quote_or_backslash(&ch_like_contains(PAYLOAD_PAREN));
 }
 
 /// Issue #169: a hostile `targetLabels` value enters the plan as an
@@ -243,7 +259,9 @@ fn stage3_with_an_injection_payload_in_the_line_filter_keeps_the_statement_well_
         100,
     );
     assert!(sql.trim_end().ends_with("LIMIT 100"));
-    assert!(sql.contains(&ch_string(PAYLOAD_COMMENT)));
+    // Issue #450: the payload rides the `LIKE` pattern literal now, so the
+    // literal it must appear as is `ch_like_contains`'s, not `ch_string`'s.
+    assert!(sql.contains(&ch_like_contains(PAYLOAD_COMMENT)));
 }
 
 // --- helpers reaching into `pulsus_read::logql::plan`'s private matcher/line-filter

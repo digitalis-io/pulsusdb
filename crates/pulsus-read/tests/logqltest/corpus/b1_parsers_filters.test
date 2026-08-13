@@ -294,7 +294,7 @@ clear
 # =====================================================================
 # line filters (|=, !=, |~, !~, ip())
 #
-# A bare leading line filter is pushed down to ClickHouse (`hasToken`/
+# A bare leading line filter is pushed down to ClickHouse (`body LIKE`/
 # `match`). The leading `| decolorize` below (identity on an ANSI-free
 # line) forces the following filter to evaluate client-side — the same
 # split the engine uses for a post-`line_format` filter — so these rows
