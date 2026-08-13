@@ -371,9 +371,10 @@ const PINNED: &[(&str, &str, &str)] = &[
     // --- are NOT streams retention and are charged, where they are
     // --- charged at all, against the metric caps.
     ("exec.rs", "run_metric_client", "chunk.push"),
-    ("exec.rs", "run_metric_inner", "by_fp.collect"),
-    ("exec.rs", "run_metric_inner", "by_fp.insert"),
-    ("exec.rs", "run_metric_inner", "by_fp.or_default"),
+    // Issue #241 removed `run_metric_inner`'s three `by_fp` rows with the
+    // SQL-aggregated RANGE arm that held them: that arm was structurally
+    // unreachable (`metric_plan` forces `client = Some(..)` for every
+    // `QuerySpec::Range`), so the sites are gone rather than re-homed.
     ("exec.rs", "run_variants", "chunk.push"),
 ];
 

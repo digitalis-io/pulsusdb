@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 
 use pulsus_logql::{BinOp, parse};
-use pulsus_read::logql::{Direction, PlanCtx, QueryParams, QuerySpec, plan};
+use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 const GOLDEN: &str = include_str!("golden/plan_build_differential.txt");
 
@@ -307,6 +307,65 @@ fn both_return_bool_states_and_every_vector_matching_shape_are_planned() {
             "no golden row plans {expected:?} — the binary construct space is only sampled"
         );
     }
+}
+
+/// Issue #241 — the invariant `run_metric_inner`'s refusal rests on:
+/// **every planned RANGE leaf is client-aggregated.**
+///
+/// `metric_plan` forces `client = Some(..)` for every `QuerySpec::Range`
+/// (`plan.rs`'s `metric_plan`, the `|| is_range` disjunct), so the
+/// SQL-aggregated
+/// range arm's guard — `client.is_none() && step_ns.is_some()` — is
+/// unsatisfiable. That arm is removed; what stands in its place is an
+/// internal refusal, and this is the tripwire that catches a planner
+/// change reintroducing the state before a request does.
+///
+/// **Scope, so nobody reads this as the proof.** The PROOF is a total
+/// read of the only `MetricPlan` constructor: `git grep -n "MetricPlan {"
+/// -- crates` has one production hit, `plan.rs`'s `metric_plan`, and
+/// `|| is_range` is a total statement about it. This test covers the
+/// corpus below — dozens of queries, not the query language — so it is a
+/// regression DETECTOR, not the establishing argument.
+///
+/// Non-vacuity is asserted by a leaf count, not by the test passing: a
+/// corpus that planned nothing would satisfy a bare `all()`.
+#[test]
+fn every_planned_range_leaf_is_client_aggregated() {
+    let c = ctx();
+    let params = range_params();
+    let mut leaves = 0usize;
+    let mut planned = 0usize;
+    for query in &all_queries() {
+        let expr = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let Ok(p) = plan(&expr, &params, &c) else {
+            continue;
+        };
+        planned += 1;
+        let mps: Vec<&pulsus_read::logql::MetricPlan> = match &p {
+            Plan::Streams(_) => Vec::new(),
+            Plan::Metric(mp) => vec![mp],
+            Plan::MetricBinary(node) => node.leaves(),
+        };
+        for mp in mps {
+            leaves += 1;
+            assert!(
+                mp.client.is_some(),
+                "`{query}` planned a RANGE leaf with `client: None` — the SQL-aggregated \
+                 range arm is removed as unreachable, so this plan now reaches an internal \
+                 refusal at execution (issue #241 / #257)"
+            );
+            assert!(
+                mp.step_ns.is_some(),
+                "`{query}` planned a range query with `step_ns: None` — the instant/range \
+                 discriminant `run_metric_inner` branches on has moved"
+            );
+        }
+    }
+    assert!(
+        planned >= 40 && leaves >= 40,
+        "the range corpus collapsed: {planned} plans / {leaves} metric leaves — a vacuous \
+         pass here would prove nothing"
+    );
 }
 
 /// `cargo test -p pulsus-read --test logql_plan_build_differential -- --ignored zz_regenerate`

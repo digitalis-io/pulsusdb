@@ -4152,6 +4152,17 @@ impl JsonKeyBudget {
 /// claimed: the row's label vector spine and the parsed
 /// `serde_json::Value`. Both predate the capture and sit outside issue
 /// #287's model, which prices key STRINGS.
+///
+/// **That residual is owned by issue #241** (formerly #265), so it
+/// carries an owning issue rather than sitting as an orphan note. Its
+/// settled shape, established by reading rather than assumed: it is
+/// **per-ROW, not query-lifetime** — one row is live at a time on this
+/// path, so nothing here accumulates across a scan — and the half that
+/// IS charged is charged already, since
+/// [`MAX_JSON_FLATTEN_KEY_BYTES`] covers both the flatten's key strings
+/// and all four capture containers tabulated above. What remains
+/// uncharged is the pair named in the previous paragraph and nothing
+/// else.
 #[derive(Debug, Default)]
 pub(crate) struct JsonPaths {
     /// Indexed by position in the label vector; `None` for a label the

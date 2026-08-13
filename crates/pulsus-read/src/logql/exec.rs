@@ -15,8 +15,8 @@ use super::pipeline::CompiledPipeline;
 use super::plan::{self, ClientAgg, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::predicate::CheckedLiteral;
 use super::rows::{
-    DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow,
-    MetricScanRow, PatternFetchRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
+    DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow, MetricScanRow,
+    PatternFetchRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -33,7 +33,7 @@ use super::sql::ScanProjection;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::agg::{InstantSeries, LabelSet, RangeSeries};
+use super::agg::{InstantSeries, LabelSet};
 use super::charge::{AggCaps, ensure_result_series};
 use super::client_agg::{
     CLIENT_AGG_CHUNK_ROWS, ClientAggState, MetricAggState, RangeSlideState, run_client_agg_rows,
@@ -49,7 +49,7 @@ use super::labels::{
 };
 use super::post_agg::{
     MAX_POST_AGG_BYTES, apply_label_replace, apply_vector_aggs, charged_instant_chain,
-    charged_range_chain, combine_binary,
+    combine_binary,
 };
 use super::variants::{MAX_VARIANT_FANOUT_STATE_BYTES, VariantArena, VariantsAggState};
 use super::warnings::Warnings;
@@ -1334,59 +1334,33 @@ impl LogQlEngine {
                     .collect(),
             ))
         } else {
-            let step_ns = mp.step_ns.expect("checked by is_instant above");
-            let sql = super::sql::metric_range(
-                source,
-                &services,
-                &fingerprints,
-                super::sql::TimeWindow {
-                    start_ns: mp.start_ns,
-                    end_ns: mp.end_ns,
-                },
-                mp.scan_lower,
-                step_ns.as_u64(),
-                &mp.extra_predicates,
-            );
-            if let Some(e) = explain.as_mut() {
-                e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
-            }
-            let mut stream = self
-                .query_stream::<MetricBucketRow>(&sql, &self.budget_settings())
-                .await?;
-            let mut by_fp: HashMap<u64, BTreeMap<i64, f64>> = HashMap::new();
-            while let Some(row) = stream.next().await {
-                let row = row.map_err(|e| {
-                    map_read_error(
-                        e,
-                        self.config.scan_budget_bytes,
-                        self.config.read_max_memory_bytes,
-                    )
-                })?;
-                let value = apply_rate(row.n as f64, mp.rate_window_ns);
-                by_fp
-                    .entry(row.fingerprint)
-                    .or_default()
-                    .insert(row.step, value);
-            }
-            let series: Vec<RangeSeries> = by_fp
-                .into_iter()
-                .filter_map(|(fp, points)| {
-                    meta.get(&fp).map(|m| RangeSeries {
-                        labels: series_labels(m),
-                        points,
-                    })
-                })
-                .collect();
-            let series = charged_range_chain(series, &mp.vector_aggs, MAX_POST_AGG_BYTES)?;
-            Ok(QueryResult::Matrix(
-                series
-                    .into_iter()
-                    .map(|s| MatrixSeries {
-                        labels: s.labels,
-                        points: s.points.into_iter().collect(),
-                    })
-                    .collect(),
-            ))
+            // **Structurally unreachable, and removed rather than charged
+            // (issues #241 / #257).** Reaching here needs `client.is_none()`
+            // (the arm above returned otherwise) AND `step_ns.is_some()`.
+            // `metric_plan` forces `client = Some(..)` for every
+            // `QuerySpec::Range` (`plan.rs`'s `metric_plan`, the `|| is_range`
+            // disjunct) and derives `step_ns = None` for exactly
+            // `QuerySpec::Instant` (the same function's `match p.spec` binding
+            // `step_ns`; both `Range` arms yield `Some(step)`), so
+            // the conjunction is unsatisfiable — and it already was on the day
+            // #257 was filed against the SQL-aggregated range arm that stood
+            // here (`git show 8d1f4519:…/exec.rs`, lines 1004-1021).
+            //
+            // #257's remedy is therefore removal: there is nothing to charge
+            // because the code cannot run. `sql::metric_range` is untouched —
+            // it is `pub`, `docs/schemas.md` §3.2 documents its shape, and
+            // `tests/rollup_differential.rs` drives it live.
+            //
+            // A refusal rather than a deletion because the planner could
+            // reintroduce the state; the tripwire that would catch that
+            // BEFORE a request does is
+            // `logql_plan_build_differential.rs::
+            // every_planned_range_leaf_is_client_aggregated`.
+            Err(ReadError::PipelineInvalid {
+                reason: "internal: a range metric plan reached the SQL-aggregated path; every \
+                         QuerySpec::Range forces client aggregation (plan.rs)"
+                    .to_string(),
+            })
         }
     }
 
@@ -1808,15 +1782,19 @@ impl LogQlEngine {
         } else {
             let source = metric_source(mp);
             match mp.step_ns {
-                Some(step_ns) => super::sql::metric_range(
-                    source,
-                    &services,
-                    &fingerprints,
-                    window,
-                    mp.scan_lower,
-                    step_ns.as_u64(),
-                    &mp.extra_predicates,
-                ),
+                // The execution twin's unreachable arm, refused for the same
+                // reason and by the same condition (issues #241 / #257): an
+                // EXPLAIN of a plan the engine would refuse must refuse too,
+                // or the explain payload would name SQL that can never run.
+                // See `run_metric_inner`'s `else` arm for the derivation.
+                Some(_) => {
+                    return Err(ReadError::PipelineInvalid {
+                        reason: "internal: a range metric plan reached the SQL-aggregated \
+                                 path; every QuerySpec::Range forces client aggregation \
+                                 (plan.rs)"
+                            .to_string(),
+                    });
+                }
                 None => super::sql::metric_instant(
                     source,
                     &services,
