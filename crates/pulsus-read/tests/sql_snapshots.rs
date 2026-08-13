@@ -236,35 +236,31 @@ fn negative_only_selector_is_rejected() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn line_filter_contains_pushes_down_token_prefilter_and_exact_predicate() {
+fn line_filter_contains_pushes_down_an_escaped_like_predicate() {
     let sp = streams_plan(
         r#"{service_name="checkout"} |= "connection refused""#,
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec![
-            "hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0"
-        ]
+        vec!["body LIKE '%connection refused%'"]
     );
 }
 
 #[test]
-fn line_filter_not_contains_negates_the_whole_compound_predicate() {
+fn line_filter_not_contains_negates_the_whole_body_predicate() {
     let sp = streams_plan(
         r#"{service_name="checkout"} != "connection refused""#,
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec![
-            "NOT (hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0)"
-        ]
+        vec!["NOT (body LIKE '%connection refused%')"]
     );
 }
 
 #[test]
-fn line_filter_regex_uses_match_without_a_prefilter_when_not_a_plain_literal() {
+fn line_filter_regex_uses_a_bare_unanchored_match() {
     let sp = streams_plan(
         r#"{service_name="checkout"} |~ "err.*""#,
         &range_params(100, Direction::Backward),
@@ -273,16 +269,14 @@ fn line_filter_regex_uses_match_without_a_prefilter_when_not_a_plain_literal() {
 }
 
 #[test]
-fn line_filter_regex_extracts_a_token_prefilter_for_a_plain_literal_pattern() {
+fn line_filter_regex_over_a_plain_literal_is_the_same_bare_match() {
     let sp = streams_plan(
         r#"{service_name="checkout"} |~ "connection refused""#,
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec![
-            "hasToken(body, 'connection') AND hasToken(body, 'refused') AND match(body, 'connection refused')"
-        ]
+        vec!["match(body, 'connection refused')"]
     );
 }
 
@@ -297,17 +291,15 @@ fn line_filter_not_regex_negates_the_whole_compound_predicate() {
 
 #[test]
 fn or_line_filter_of_literals_pushes_down_as_a_parenthesized_disjunction() {
-    // M8-LQ2 `linefilter.or`: each disjunct keeps its own `hasToken`
-    // prefilter, so the `tokenbf_v1` skip index still prunes per alternative.
+    // M8-LQ2 `linefilter.or`: each disjunct is the same `body LIKE`
+    // predicate, so the `ngrambf_v1` skip index still prunes per alternative.
     let sp = streams_plan(
         r#"{service_name="checkout"} |= "foo" or "bar""#,
         &range_params(100, Direction::Backward),
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec![
-            "((hasToken(body, 'foo') AND position(body, 'foo') > 0) OR (hasToken(body, 'bar') AND position(body, 'bar') > 0))"
-        ]
+        vec!["((body LIKE '%foo%') OR (body LIKE '%bar%'))"]
     );
 }
 
@@ -319,15 +311,13 @@ fn or_line_filter_negative_op_wraps_the_disjunction_in_not() {
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec![
-            "NOT ((hasToken(body, 'foo') AND position(body, 'foo') > 0) OR (hasToken(body, 'bar') AND position(body, 'bar') > 0))"
-        ]
+        vec!["NOT ((body LIKE '%foo%') OR (body LIKE '%bar%'))"]
     );
 }
 
 #[test]
 fn ip_line_filter_is_not_pushed_down_while_a_sibling_literal_filter_is() {
-    // An `ip()` line filter has no token/skip-index prefilter, so it is served
+    // An `ip()` line filter renders no `body` predicate, so it is served
     // client-side and must NOT appear in `sp.line_filters`; a sibling literal
     // filter still pushes down (and still prunes granules).
     let sp = streams_plan(
@@ -336,7 +326,7 @@ fn ip_line_filter_is_not_pushed_down_while_a_sibling_literal_filter_is() {
     );
     assert_eq!(
         sqls(&sp.line_filters),
-        vec!["hasToken(body, 'boot') AND position(body, 'boot') > 0"],
+        vec!["body LIKE '%boot%'"],
         "only the literal filter pushes down; the ip() filter is client-side"
     );
     assert!(
@@ -373,7 +363,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
          PREWHERE service = 'checkout'\n\
          WHERE fingerprint IN (18374, 99120)\n\
          \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
-         \x20 AND hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0\n\
+         \x20 AND body LIKE '%connection refused%'\n\
          ORDER BY timestamp_ns DESC, fingerprint DESC, cityHash64(body) DESC, body DESC\n\
          LIMIT 100"
     );
@@ -488,7 +478,7 @@ fn direction_backward_orders_descending() {
 
 // ---------------------------------------------------------------------
 // Issue M6-09 (AC3): pushdown byte-identity around parser stages. A line
-// filter BEFORE a parser keeps the exact `hasToken`+`position` pushdown
+// filter BEFORE a parser keeps the exact `body LIKE` pushdown
 // (the parser is pure post-fetch — the named perf gate); a line filter
 // AFTER `line_format` references the rewritten line and must be ABSENT
 // from the stage-3 SQL.
@@ -511,9 +501,7 @@ fn a_line_filter_before_a_parser_still_pushes_down_byte_identically() {
     );
     assert_eq!(
         sqls(&with_parser.line_filters),
-        vec![
-            "hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0"
-        ]
+        vec!["body LIKE '%connection refused%'"]
     );
     // The label filter is an unpushed dropping stage: the scan oversamples
     // while the response cap stays put (AC9's plan-side half).
@@ -533,9 +521,7 @@ fn a_line_filter_before_a_parser_still_pushes_down_byte_identically() {
         with_parser.scan_limit,
     );
     assert!(
-        sql.contains(
-            "AND hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0"
-        ),
+        sql.contains("AND body LIKE '%connection refused%'"),
         "stage-3 SQL must render the pushdown predicate: {sql}"
     );
     assert!(sql.ends_with("LIMIT 1000"), "{sql}");
@@ -567,9 +553,7 @@ fn a_line_filter_after_line_format_is_absent_from_stage3_sql() {
     // legitimately appears in the SELECT projection alongside
     // `structured_metadata`, so match the predicate forms directly instead).
     assert!(
-        !sql.contains("hasToken(body")
-            && !sql.contains("position(body")
-            && !sql.contains("match(body"),
+        !sql.contains("body LIKE") && !sql.contains("match(body"),
         "no body predicate may appear in stage-3 SQL: {sql}"
     );
     // The unpushed dropping filter triggers the oversample.
@@ -636,7 +620,7 @@ fn a_line_filter_after_drop_or_keep_still_pushes_down() {
         let sp = streams_plan(query, &range_params(100, Direction::Backward));
         assert_eq!(
             sqls(&sp.line_filters),
-            vec!["hasToken(body, 'err') AND position(body, 'err') > 0"],
+            vec!["body LIKE '%err%'"],
             "a line filter after drop/keep must still push down: {query}"
         );
     }
@@ -1305,7 +1289,7 @@ fn a_piped_count_over_time_renders_the_raw_scan_with_the_line_filter_pushed_down
     assert!(!mp.rollup);
     let sql = client_metric_sql(&mp);
     assert!(
-        sql.contains("hasToken(body, 'err') AND position(body, 'err') > 0"),
+        sql.contains("body LIKE '%err%'"),
         "the pre-parser line filter still pushes down: {sql}"
     );
     assert!(!sql.contains("count()"), "{sql}");
@@ -1325,7 +1309,7 @@ fn a_post_line_format_metric_line_filter_is_absent_from_the_raw_scan_sql() {
     );
     let sql = client_metric_sql(&mp);
     assert!(
-        sql.contains("position(body, 'a') > 0"),
+        sql.contains("body LIKE '%a%'"),
         "the pre-line_format filter pushes down: {sql}"
     );
     assert!(
@@ -1402,7 +1386,7 @@ fn n_variants(n: usize, common: &str) -> String {
 /// (LR)` and `variants(V1..V5) of (LR)` are byte-identical to each other
 /// AND to the client-aggregated `count_over_time(LR)` plan's, at both
 /// range and instant — same fingerprint resolution, same `PREWHERE
-/// service` PK-prefix engagement, same `tokenbf_v1` line-filter pushdown
+/// service` PK-prefix engagement, same `body LIKE` line-filter pushdown
 /// surface, same single round-trip. A common-range `unwrap` (dead
 /// syntax) changes neither string.
 ///

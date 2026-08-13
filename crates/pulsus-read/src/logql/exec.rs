@@ -2789,7 +2789,7 @@ impl LogQlEngine {
     /// feeding a [`FieldAccumulator`] + a post-pipeline matched-entry
     /// counter instead of a `StreamAccumulator`. Shares the #90 pieces
     /// verbatim: [`super::sql::stage3_keyset`] pages (PK-pruned,
-    /// skip-index prefilters, keyset total order), [`advance_tail_cursor`]
+    /// skip-index-prunable predicates, keyset total order), [`advance_tail_cursor`]
     /// over the **raw** page (a page fully discarded by the pipeline never
     /// stalls the walk), [`LogQlEngine::paging_settings`]`(budget − spent)`
     /// with `wait_end_of_query = 1`, and the [`scan_budget_spent`]
@@ -5246,14 +5246,14 @@ mod tests {
         //
         // Issue #286: a raw 65,536-byte string is no longer constructible
         // as a fragment, so the envelope is MINTED at exactly that size and
-        // the size is asserted rather than assumed. `-` is neither
-        // alphanumeric nor `_`, so `tokenize` yields no token and
-        // `ch_string` escapes nothing: a `|=` filter over N dashes renders
-        // `position(body, '<N dashes>') > 0`, which is `15 + (N + 2) + 5`
-        // bytes. N = 65,514 gives exactly 65,536.
+        // the size is asserted rather than assumed. `-` is neither `%`, `_`
+        // nor `\`, so neither `ch_like_contains` nor `ch_string` escapes
+        // anything: a `|=` filter over N dashes renders
+        // `body LIKE '%<N dashes>%'`, which is `10 + 2 + N + 2` bytes
+        // (issue #450). N = 65,522 gives exactly 65,536.
         let filter = super::super::predicate::line_filter(&pulsus_logql::LineFilter {
             op: pulsus_logql::LineFilterOp::Contains,
-            value: "-".repeat(65_514),
+            value: "-".repeat(65_522),
             value_is_ip: false,
             or_matches: Vec::new(),
         })

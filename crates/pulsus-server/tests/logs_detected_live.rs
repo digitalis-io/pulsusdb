@@ -10,8 +10,8 @@
 //!   #254), respects `limit` (first-seen field cap) and `line_limit`
 //!   (sample size), and answers a zero-field sample with the reference's
 //!   bare `{}` (issue #258);
-//! - `X-Pulsus-Explain` shows the single stage-3 scan with skip-index
-//!   line-filter prefilters + `LIMIT <line_limit>` (Tier-1 pushdown
+//! - `X-Pulsus-Explain` shows the single stage-3 scan with the
+//!   skip-index-prunable line-filter predicate + `LIMIT <line_limit>` (Tier-1 pushdown
 //!   evidence at the endpoint level), and the paged keyset route when a
 //!   dropping stage is present;
 //! - the issue #170 plan-v2 sparse-filter fix: matches occurring only
@@ -648,8 +648,8 @@ async fn detected_labels_and_fields_end_to_end() {
     assert_eq!(res.body, "{}");
 
     // -- Explain, fast path: the single stage-3 scan carries the
-    //    skip-index line-filter prefilters + LIMIT <line_limit> (Tier-1
-    //    pushdown evidence at the endpoint level) -------------------------
+    //    skip-index-prunable line-filter predicate + LIMIT <line_limit>
+    //    (Tier-1 pushdown evidence at the endpoint level) -----------------
     let line_filtered = "query=%7Bservice_name%3D%22checkout%22%7D%20%7C%3D%20%22hello%22";
     let res = http_get(
         port,
@@ -668,8 +668,8 @@ async fn detected_labels_and_fields_end_to_end() {
     assert_eq!(read["note"], "single-scan: no unpushed dropping stage");
     let sql = read["sql"].as_str().expect("sql");
     assert!(
-        sql.contains("hasToken(body, 'hello')"),
-        "line-filter token prefilter must push down: {sql}"
+        sql.contains("body LIKE '%hello%'"),
+        "the line-filter body predicate must push down: {sql}"
     );
     assert!(
         sql.ends_with("LIMIT 2"),

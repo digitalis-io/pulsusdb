@@ -1316,6 +1316,16 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test rollup_differential
 
+      # Issue #450: every `|=`/`!=` needle generated from the suite's own
+      # committed bodies must return exactly what Loki's `bytes.Contains`
+      # returns. The corpus runner evaluates line filters in Rust and never
+      # emits their SQL, so only a live suite can see a rendering defect.
+      - name: LogQL line-filter differential suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test logql_line_filter_differential
+
       - name: Series stream cap suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"

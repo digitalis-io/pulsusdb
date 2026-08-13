@@ -7,7 +7,7 @@
 //! - the Tier-1 pushdown routing gate, from `X-Pulsus-Explain`'s stage
 //!   SQL: no line filter → the `log_metrics_5s` rollup (zero body
 //!   reads); a line filter → a `log_samples` scan carrying the exact
-//!   stage-3 skip-index prefilters;
+//!   stage-3 line-filter predicate;
 //! - line-filtered counters are exact (matching rows only);
 //! - a selector matching nothing returns all-zero 200;
 //! - the `/loki/api/v1/index/stats` alias is byte-identical to native.
@@ -315,8 +315,8 @@ async fn stats_counters_routing_gate_and_alias_identity() {
         "filtered stats must scan log_samples: {sql}"
     );
     assert!(
-        sql.contains("hasToken(body, 'err')") && sql.contains("position(body, 'err') > 0"),
-        "the stage-3 skip-index line-filter prefilters must be pushed down: {sql}"
+        sql.contains("body LIKE '%err%'"),
+        "the stage-3 line-filter predicate must be pushed down: {sql}"
     );
     assert!(
         sql.contains("PREWHERE service = 'checkout'"),
