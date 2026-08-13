@@ -2432,8 +2432,11 @@ clients only display it).
   check-C guard (`^(?:{` at exactly two committed sites); the
   unanchored form is a dataflow property no lexical gate can see —
   the fix is a validated-literal newtype through `logql::sql`'s
-  builders (#286). The corpus runner's pushdown blind spot (**#278**)
-  is why AC7's gates are Rust tests rather than corpus rows.
+  builders (#286). AC7's gates are Rust tests rather than corpus rows
+  because at the time the corpus runner did not execute a pushed-down
+  line filter at all (**#278**, since closed); they were not moved
+  afterwards, since a Rust test states that property more directly than
+  a corpus row would.
 
 ## Issue #291 — the regex compile budget
 

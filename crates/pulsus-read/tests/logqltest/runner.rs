@@ -27,20 +27,44 @@
 //! from the container, or hand-derived for integer-exact reducers verified
 //! against `pkg/logql/range_vector.go` — see `PROVENANCE.md`).
 //!
-//! Evaluation drives the SAME pure functions the engine executes — for a
-//! log query `CompiledPipeline::run` per loaded line; for a metric query
-//! `plan()` → `run_client_agg_rows_folded`/`apply_vector_aggs`/`combine_binary`
-//! at `QuerySpec::Instant` — and compares with EXACT-f64 equality
-//! (`f64::to_bits`, no tolerance — the #218 discipline). No ClickHouse.
+//! Evaluation drives the SAME pure functions the engine executes. EVERY
+//! leg — streams, metric and `detected` alike — goes through `plan()`
+//! first (issue #278) and then evaluates the PLANNED pipeline:
+//! `CompiledPipeline::run` per loaded line for a log query;
+//! `run_client_agg_rows_folded`/`apply_vector_aggs`/`combine_binary` for
+//! a metric one. Comparison is EXACT-f64 (`f64::to_bits`, no tolerance —
+//! the #218 discipline). No ClickHouse.
+//!
+//! **The runner applies the pushed-down line filters itself.** The
+//! planner splits a pipeline's line filters in two: the pushable
+//! pre-`line_format` ones become stage-3 SQL fragments
+//! (`plan::compile_line_filters`), and `CompiledPipeline::compile` then
+//! elides exactly those so the engine does not evaluate them twice. This
+//! runner executes no SQL, so it compiles through
+//! `compile_for_corpus` -> `CompiledPipeline::compile_client_side`, which
+//! keeps them, and asserts the count survived. Before #278 it used plain
+//! `compile`, and a case of the form `{x="y"} |= "foo"` answered with
+//! every loaded line, silently.
+//!
+//! **What that models, and what it does not.** The real answer is
+//! `stage-3 SQL predicate ∘ client pipeline`; this is `client pipeline
+//! with every filter`. Those agree on the rows selected only insofar as
+//! ClickHouse's `position`/`match` and the Rust `LineMatcher` agree. **A
+//! dialect divergence between the two is invisible to this corpus by
+//! construction** — it belongs to `re2_screen_differential.rs`,
+//! `logql_regex_accept_matrix.rs` and the regex-dialect doc (#336/#369),
+//! and a green corpus must not be read as covering it.
 //!
 //! Dataset == query scope: within one `load`/`clear` section, an eval sees
-//! every loaded stream (the stream selector is not re-applied — the real
-//! engine pushes it to SQL). Author each section so its loaded streams are
-//! exactly the scope its evals select; use `clear` to switch scope.
+//! every loaded stream. The stream SELECTOR is still not re-applied —
+//! that part of the contract is unchanged, because the real engine
+//! resolves matchers in stage-1 SQL, which this runner does not execute.
+//! Author each section so its loaded streams are exactly the scope its
+//! evals select; use `clear` to switch scope.
 
 use std::collections::HashMap;
 
-use pulsus_logql::{Expr, parse};
+use pulsus_logql::{Expr, Stage, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
@@ -57,6 +81,36 @@ pub type Labels = Vec<(String, String)>;
 pub type StreamEntry = (Labels, i64, String);
 /// One resolved instant-vector sample: `(sorted labels, value)`.
 type VectorEntry = (Labels, f64);
+
+/// The ONE compile seam every evaluator leg goes through (issue #278).
+///
+/// Compiles CLIENT-SIDE — including the line filters the planner renders
+/// into stage-3 SQL — because this runner executes the pipeline and no
+/// SQL, then CHECKS that nothing was elided. The check is not
+/// decoration: `CompiledPipeline::compile` returns `Ok(None)` for every
+/// pushable pre-`line_format` line filter (`pipeline.rs:1009-1014`), so
+/// a filter lost here produces no error at all — just extra lines, in a
+/// case whose expectation was captured through the same hole.
+fn compile_for_corpus(stages: &[Stage]) -> Result<CompiledPipeline, String> {
+    let compiled = CompiledPipeline::compile_client_side(stages).map_err(|e| e.to_string())?;
+    let want = stages
+        .iter()
+        .filter(|s| matches!(s, Stage::LineFilter(_)))
+        .count();
+    let got = compiled.compiled_line_filter_count();
+    if got != want {
+        return Err(format!(
+            "issue #278: the corpus runner compiled {got} of {want} line-filter stages. The SQL \
+             pushdown elided the rest and this runner has no SQL leg beneath it, so those \
+             filters would not be applied and the case would answer with lines it asked to \
+             exclude."
+        ));
+    }
+    // Pin the template environment to the capture precondition (stock
+    // container: degenerate-UTC Local, PROVENANCE §230) so goldens
+    // replay identically on any host/CI timezone.
+    Ok(compiled.with_template_env(TemplateEnv::default()))
+}
 
 /// The plan context the corpus evaluates under — the same table/budget
 /// shape the hermetic metric-agg goldens use (`logql_metric_agg_golden.rs`).
@@ -933,13 +987,37 @@ fn validate_distinct_timestamps(store: &Store) -> Result<(), String> {
 /// `timestamp_ns` DESC, ties `(fingerprint, body)` ASC — the engine's
 /// stage-3 `ORDER BY … DESC` under `Direction::Backward`, the reference's
 /// `Direction: logproto.BACKWARD`.
-fn evaluate_detected(store: &Store, query: &str, de: DetectedEval) -> Result<Outcome, String> {
+fn evaluate_detected(
+    store: &Store,
+    query: &str,
+    de: DetectedEval,
+    at_ns: i64,
+) -> Result<Outcome, String> {
     // (a) parse; a metric expression is a case failure with the engine's
-    // own text.
+    // own text — issue #278 takes that rejection from the PLANNER rather
+    // than restating it here (the two strings were already identical).
     let expr = parse(query).map_err(|e| e.to_string())?;
-    let le = match expr {
-        Expr::Log(le) => le,
-        Expr::Metric(_) => {
+    reject_metadata_for_label_leg(store, "`eval detected`")?;
+    // (b) plan, mirroring `exec.rs`'s `/detected_fields` entry, then
+    // compile the PLANNED pipeline; a compile error is a case failure.
+    //
+    // The bounds are INERT — the runner feeds every loaded row whatever
+    // the window says (the module-doc contract: dataset == query scope).
+    // They exist only so `plan()` sees the same request shape the engine
+    // builds, and so the pushed-down line filters land in `sp.pipeline`
+    // where this runner can execute them.
+    let qp = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: 0,
+            end_ns: at_ns,
+            step_ns: 1_000_000_000,
+        },
+        limit: de.line_limit,
+        direction: Direction::Backward,
+    };
+    let sp = match plan(&expr, &qp, &ctx()).map_err(|e| e.to_string())? {
+        Plan::Streams(sp) => sp,
+        _ => {
             return Err(
                 "detected_fields requires a log stream selector query (a metric query has no \
                  per-entry fields)"
@@ -947,11 +1025,7 @@ fn evaluate_detected(store: &Store, query: &str, de: DetectedEval) -> Result<Out
             );
         }
     };
-    reject_metadata_for_label_leg(store, "`eval detected`")?;
-    // (b) compile; a compile error is a case failure.
-    let compiled = CompiledPipeline::compile(&le.pipeline)
-        .map_err(|e| e.to_string())?
-        .with_template_env(TemplateEnv::default());
+    let compiled = compile_for_corpus(&sp.pipeline)?;
     // (c) flatten EVERY loaded stream's samples (no matcher filtering).
     let mut rows: Vec<(u64, i64, &str)> = Vec::new();
     for stream in &store.streams {
@@ -1009,17 +1083,24 @@ fn reject_metadata_for_label_leg(store: &Store, leg: &str) -> Result<(), String>
 fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, String> {
     let expr = parse(query).map_err(|e| e.to_string())?;
     match &expr {
-        Expr::Log(log) => {
+        Expr::Log(_) => {
             if matches!(spec, QuerySpec::Range { .. }) {
                 return Err("a `range` eval requires a metric query".to_string());
             }
             reject_metadata_for_label_leg(store, "streams")?;
-            // Pin the template environment to the capture precondition
-            // (stock container: degenerate-UTC Local, PROVENANCE §230) so
-            // goldens replay identically on any host/CI timezone.
-            let compiled = CompiledPipeline::compile(&log.pipeline)
-                .map_err(|e| e.to_string())?
-                .with_template_env(TemplateEnv::default());
+            // Issue #278: through `plan()`, the real chain — the range
+            // rejection and the metadata refusal stay AHEAD of it so no
+            // committed `eval_fail` row's message changes.
+            let params = QueryParams {
+                spec,
+                limit: 100,
+                direction: Direction::Backward,
+            };
+            let sp = match plan(&expr, &params, &ctx()).map_err(|e| e.to_string())? {
+                Plan::Streams(sp) => sp,
+                _ => return Err("a log expression planned to a metric query".to_string()),
+            };
+            let compiled = compile_for_corpus(&sp.pipeline)?;
             let mut out = Vec::new();
             for stream in &store.streams {
                 for (ts, _sm, body) in &stream.samples {
@@ -1086,9 +1167,7 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
     let client = mp.client.as_ref().ok_or_else(|| {
         "logqltest supports only client-aggregated (raw-scan) metric plans (Batch 0)".to_string()
     })?;
-    let compiled = CompiledPipeline::compile(&client.pipeline)
-        .map_err(|e| e.to_string())?
-        .with_template_env(TemplateEnv::default());
+    let compiled = compile_for_corpus(&client.pipeline)?;
     // Issue #236 Part B: the folded seam, so the corpus exercises the
     // engine's ACTUAL sequence — innermost aggregation folded at the leaf
     // on a range query, the remaining prefix materialised — rather than a
@@ -1164,6 +1243,24 @@ pub fn eval_node(
             // charging path. The common pipeline comes from the scan plan
             // (already truncated at any dead common-range `unwrap`).
             MetricNode::Variants { scan, variants, .. } => {
+                // Issue #278: the ONE leg `compile_for_corpus` cannot
+                // reach. `VariantArena::build` compiles the COMMON
+                // pipeline itself (`variants.rs:510`) with the pushdown
+                // ACTIVE — correct in production, where stage-3 SQL
+                // applies those filters, and wrong here, where nothing
+                // does. A hermetic case would silently not apply them,
+                // so it is refused instead of answered.
+                if !scan.extra_predicates.is_empty() {
+                    return Err(format!(
+                        "issue #278: the variants COMMON range carries {} line filter(s) the \
+                         planner pushes into SQL, and `VariantArena::build` compiles the common \
+                         pipeline with the pushdown active, below this runner's reach. A \
+                         hermetic case would silently not apply them. Use a label filter on the \
+                         common side (b13_variants.test W11/W12) or cover the case on the live \
+                         path.",
+                        scan.extra_predicates.len()
+                    ));
+                }
                 let common = scan
                     .client
                     .as_ref()
@@ -1633,7 +1730,7 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                     // a GRAMMAR error (file-fatal), not a case failure.
                     validate_distinct_timestamps(&store)
                         .map_err(|e| format!("{file}:{}: {e}", cmd.line))?;
-                    evaluate_detected(&store, &cmd.query, de)
+                    evaluate_detected(&store, &cmd.query, de, cmd.at_ns)
                 } else {
                     let spec = match cmd.range {
                         Some(r) => QuerySpec::Range {
@@ -1883,6 +1980,7 @@ mod tests {
                 line_limit: 100,
                 field_limit: 1000,
             },
+            60_000_000_000,
         )
         .err()
         .expect("metric query must fail");

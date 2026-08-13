@@ -1,0 +1,181 @@
+# b26_line_filter_pushdown.test — issue #278: the line filters the PLANNER
+# PUSHES INTO SQL, executed by the hermetic runner for the first time.
+#
+# Every expected label set and line below is a byte-exact capture from
+# grafana/loki:3.7.4, image digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc,
+# booted on `ci/logql/config.yaml` with no delta of its own;
+# `detected_level` stripped per PROVENANCE.md. Container identity READ
+# FROM THE RUNNING PROCESS, not from this header:
+# /loki/api/v1/status/buildinfo answered {"version":"3.7.4",
+# "revision":"b318f282","branch":"release-3.7.x"} on `pulsus-c278-loki`
+# — the same b318f282 the pinned digest and the Go checkout at v3.7.4
+# resolve to. Captured 2026-08-13 over `/loki/api/v1/query_range`, every
+# row replayed from the query text read back out of this file, and every
+# expected line GENERATED from the response bytes rather than typed.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.
+#  A row may override it with its own `# provenance:` line.)
+#
+# WHY THIS FILE EXISTS, and why "no committed row was wrong" is not the
+# same as "this did not matter".
+#
+# The planner splits a pipeline's line filters in two. A filter that
+# precedes the first line-REWRITING stage and carries no `ip(…)`
+# alternative is rendered into stage-3 SQL by `plan::compile_line_filters`,
+# and `CompiledPipeline::compile` then returns `Ok(None)` for exactly
+# those (`pipeline.rs:1009-1014`) so the engine does not evaluate them
+# twice. Until this issue the corpus runner called `compile` directly and
+# executed no SQL underneath it, so a row of the form `{x="y"} |= "foo"`
+# returned EVERY loaded line — and passed, because its expectation had
+# been captured through the same hole.
+#
+# Measured over the whole corpus at the commit this file was added: zero
+# committed rows were affected. **That is not luck, and it is not a sign
+# the defect was harmless.** It is the visible trace of authors stepping
+# around a hole they had each found for themselves, and three committed
+# files say so in as many words:
+#
+#   * `b24_string_escapes.test` — "`| decolorize` is load-bearing and not
+#     decoration"; without it "every row here passes … while measuring
+#     nothing".
+#   * `b1_parsers_filters.test` — "a leading `| decolorize` … forces the
+#     following filter to evaluate client-side".
+#   * `b13_variants.test` — "EVERY metric row in this corpus is blind to a
+#     pushable line filter on the COMMON side".
+#
+# The workaround was still spreading: over one week the count of line
+# filters shielded behind a rewriting stage went from 23 to 37 while the
+# count on the pushed-down path stayed at 0. The rows below are the first
+# that take the path instead of going round it, and the runner's
+# `compile_for_corpus` seam is what stops the next author having to know
+# any of this.
+#
+# EVERY SECTION LOADS A LINE ITS FILTER EXCLUDES. A row whose filter
+# excludes nothing is precisely the row that passed on the blind path and
+# measured nothing, so it is asserted mechanically rather than left to
+# authoring care (`logqltest_corpus.rs`).
+#
+# WHAT THESE ROWS DO NOT ESTABLISH. The runner models `stage-3 SQL
+# predicate ∘ client pipeline` as `client pipeline with every filter`.
+# Those agree on the rows selected only insofar as ClickHouse's
+# `position`/`match` and the Rust `LineMatcher` agree; a dialect
+# divergence between the two is invisible here by construction and is
+# owned by `re2_screen_differential.rs`, `logql_regex_accept_matrix.rs`
+# and the regex-dialect doc (#336/#369).
+#
+# Loads span 10s, well inside the replay slot's half-width, so every row
+# is provenance-permitted AND physically reachable by the nightly live
+# replay (`logqltest_replay.rs`).
+
+# --- P1: `|=` contains, PUSHED -----------------------------------------
+# The plainest shape there is, and the one the corpus could not run.
+load
+  {app="p1", service_name="p26-contains"}
+  0s   alpha foo bravo
+  5s   alpha bar bravo
+  10s  charlie foo delta
+
+eval instant at 60s {service_name="p26-contains"} |= "foo"
+  {app="p1", service_name="p26-contains"} 0s alpha foo bravo
+  {app="p1", service_name="p26-contains"} 10s charlie foo delta
+
+clear
+
+# --- P2: `!=` not-contains, PUSHED -------------------------------------
+load
+  {app="p2", service_name="p26-notcontains"}
+  0s   alpha foo bravo
+  5s   alpha bar bravo
+  10s  charlie foo delta
+
+eval instant at 60s {service_name="p26-notcontains"} != "foo"
+  {app="p2", service_name="p26-notcontains"} 5s alpha bar bravo
+
+clear
+
+# --- P3: `|~` regex, PUSHED --------------------------------------------
+load
+  {app="p3", service_name="p26-regex"}
+  0s   alpha f0o bravo
+  5s   alpha bar bravo
+  10s  charlie fzo delta
+
+eval instant at 60s {service_name="p26-regex"} |~ "f.o"
+  {app="p3", service_name="p26-regex"} 0s alpha f0o bravo
+  {app="p3", service_name="p26-regex"} 10s charlie fzo delta
+
+clear
+
+# --- P4: `!~` not-regex, PUSHED ----------------------------------------
+load
+  {app="p4", service_name="p26-notregex"}
+  0s   alpha f0o bravo
+  5s   alpha bar bravo
+  10s  charlie fzo delta
+
+eval instant at 60s {service_name="p26-notregex"} !~ "f.o"
+  {app="p4", service_name="p26-notregex"} 5s alpha bar bravo
+
+clear
+
+# --- P5: a pushable `or` GROUP -----------------------------------------
+# Every alternative is a literal, so the whole group pushes. (One `ip(…)`
+# alternative would make the group unpushable — that is P7's subject.)
+load
+  {app="p5", service_name="p26-orgroup"}
+  0s   alpha foo bravo
+  5s   alpha bar bravo
+  10s  charlie quux delta
+
+eval instant at 60s {service_name="p26-orgroup"} |= "foo" or "bar"
+  {app="p5", service_name="p26-orgroup"} 0s alpha foo bravo
+  {app="p5", service_name="p26-orgroup"} 5s alpha bar bravo
+
+clear
+
+# --- P6: a PARSER does not rewrite the line, so the filter still pushes -
+# `| json` sets `mutates_labels`, not `seen_line_format`, so the filter
+# ahead of it still references the original body and is still pushed.
+load
+  {app="p6", service_name="p26-parser"}
+  0s   {"kind":"keep","n":"1"}
+  5s   {"kind":"drop","n":"2"}
+  10s  {"kind":"keep","n":"3"}
+
+eval instant at 60s {service_name="p26-parser"} |= "keep" | json
+  {app="p6", kind="keep", n="1", service_name="p26-parser"} 0s {"kind":"keep","n":"1"}
+  {app="p6", kind="keep", n="3", service_name="p26-parser"} 10s {"kind":"keep","n":"3"}
+
+clear
+
+# --- P7: the SPLIT — one filter to SQL, one client-side -----------------
+# `|= "ok"` is pushable and goes to stage-3 SQL; `|= ip(…)` is not
+# pushable and compiles client-side. Each excludes a different line, so a
+# row that dropped either would answer differently.
+load
+  {app="p7", service_name="p26-split-ip"}
+  0s   auth ok from 10.0.0.7
+  5s   auth ok from 10.0.1.9
+  10s  auth denied from 10.0.0.8
+
+eval instant at 60s {service_name="p26-split-ip"} |= "ok" |= ip("10.0.0.0/24")
+  {app="p7", service_name="p26-split-ip"} 0s auth ok from 10.0.0.7
+
+clear
+
+# --- P8: the other SPLIT — pushed head, post-rewrite tail ---------------
+# `|= "alpha"` precedes the `line_format` and is pushed; the trailing
+# filter sees the REWRITTEN line and compiles client-side. The tail
+# matches `zalpha`, a string no loaded body contains — only the rewrite
+# creates it — so a tail evaluated against the original body would return
+# nothing at all.
+load
+  {app="p8", service_name="p26-split-rewrite"}
+  0s   alpha one
+  5s   bravo one
+  10s  beta alpha
+
+eval instant at 60s {service_name="p26-split-rewrite"} |= "alpha" | line_format "z{{ __line__ }}" |= "zalpha"
+  {app="p8", service_name="p26-split-rewrite"} 0s zalpha one

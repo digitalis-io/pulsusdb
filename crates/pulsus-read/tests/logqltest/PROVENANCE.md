@@ -1116,3 +1116,171 @@ v3.7.4 b318f282`, "A VariantsExpr is a specific type of SampleExpr, so
 make sure this case is evaluated first") into `evalVariants` →
 `JoinMultiVariantSampleVector`, which caps per variant; every other root
 goes to `JoinSampleVector` and its plain cap.
+
+## Issue #278 — the pushed-down line filters (`b26_line_filter_pushdown.test`)
+
+### What changed in the runner, and what the DSL contract now says
+
+Before this issue the runner compiled a query's pipeline with
+`CompiledPipeline::compile` and evaluated that. The planner splits a
+pipeline's line filters in two — a filter that precedes the first
+line-REWRITING stage and carries no `ip(…)` alternative is rendered into
+stage-3 SQL by `plan::compile_line_filters`, and `compile` then returns
+`Ok(None)` for exactly those (`pipeline.rs:1009-1014`) so the engine does
+not evaluate them twice. The runner executes no SQL, so those filters
+were **not applied at all**: a row `{x="y"} |= "foo"` returned every
+loaded line and passed, because its expectation had been captured through
+the same hole.
+
+**The contract now.** Every leg — streams, metric and `detected` — calls
+`plan()` first and evaluates the PLANNED pipeline, compiled through the
+one seam `compile_for_corpus` → `CompiledPipeline::compile_client_side`,
+which keeps the pushed filters. The seam then compares the compiled
+line-filter count against the stage list it was handed and fails loudly
+if they differ, because an elided filter produces no error of its own.
+
+**Unchanged:** the stream SELECTOR is still not re-applied. The real
+engine resolves matchers in stage-1 SQL, which this runner does not
+execute, so "dataset == query scope" still holds and every section must
+still load exactly what its query selects.
+
+**What this models, and what it does not.** The engine's answer is
+`stage-3 SQL predicate ∘ client pipeline`; the runner's is `client
+pipeline with every filter`. Those agree on the rows selected only
+insofar as ClickHouse's `position`/`match` and the Rust `LineMatcher`
+agree. A dialect divergence between the two is **invisible to this
+corpus by construction** and is owned by `re2_screen_differential.rs`,
+`logql_regex_accept_matrix.rs` and the regex-dialect doc (#336/#369). A
+green corpus must not be read as covering it.
+
+### The one leg that is refused rather than answered
+
+`VariantArena::build` compiles the variants COMMON pipeline itself
+(`variants.rs`), with the pushdown active — correct in production, where
+stage-3 SQL applies those filters, and wrong here. That call is below the
+runner's reach, so a `variants(...)` whose COMMON range carries a
+pushable line filter is now a **loud refusal naming issue #278**, in the
+idiom of `reject_metadata_for_label_leg`. It is a named DSL limitation,
+not coverage: the pushed-common case stays uncovered hermetically,
+exactly as `b13_variants.test`'s W11/W12 notes already recorded, and the
+refusal makes that boundary loud instead of silent. Cover it on the live
+path.
+
+### Zero committed rows moved — and why that is not "this was harmless"
+
+Measured over the whole corpus: no committed expectation changed under
+the fixed chain. The reason is not luck. Three committed files document
+authors inserting `| decolorize`, or a label filter on the variants
+common side, **specifically to defeat the pushdown** so the runner would
+evaluate the filter at all — `b24_string_escapes.test`,
+`b1_parsers_filters.test` and `b13_variants.test`, each quoted in
+`b26`'s own header and pinned by
+`logqltest_corpus.rs::the_pushdown_corpus_names_the_rows_written_around_the_defect`.
+The workaround was still spreading week by week while the count of rows
+on the pushed path stayed at zero. The corpus was clean because people
+kept stepping around a hole, which is precisely why the gate had to exist
+before anyone stopped.
+
+### Capture transcript (2026-08-13)
+
+- **Image:** `grafana/loki:3.7.4`, digest
+  `sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+  container `pulsus-c278-loki` on a private port. Identity read from the
+  RUNNING process, not from a header:
+
+  ```
+  $ curl -s http://localhost:13278/loki/api/v1/status/buildinfo
+  {"version":"3.7.4","revision":"b318f282","branch":"release-3.7.x",
+   "buildUser":"root@buildkitsandbox","buildDate":"2026-07-22T03:46:58Z",...}
+  ```
+
+- **Config delta:** none of its own. Booted on `ci/logql/config.yaml`,
+  the same file the CI oracle runs, so `b26_line_filter_pushdown.test` is
+  **not** in `CONFIG_DELTA_FILES` and every row of it is replayed live.
+- **Generated, never transcribed.** A throwaway probe parsed the
+  committed `.test` file with the corpus's OWN parser
+  (`logqltest::runner::parse_file`), pushed each section's `load` at the
+  offsets that file spells, and rendered the expected lines from the
+  container's response bytes. So the pushed bodies cannot drift from what
+  is committed, and no expected line was typed by hand.
+- **Query shape mirrors the replay leg exactly** —
+  `/loki/api/v1/query_range` with `start` at the slot, `end` at
+  `slot + span + 1`, `limit=5000`, `direction=forward`, and
+  `detected_level` stripped — i.e. `logqltest_replay.rs`'s `query_case`,
+  so the nightly leg reproduces what was captured rather than something
+  adjacent to it. Each section was pushed into its own 40 s slot behind
+  its own sentinel stream, the same barrier the replay leg uses.
+
+### The eight rows, and what each discriminates
+
+| row | shape | discriminates |
+|---|---|---|
+| P1 | `\|= "…"` | contains, pushed |
+| P2 | `!= "…"` | not-contains, pushed |
+| P3 | `\|~ "…"` | regex, pushed |
+| P4 | `!~ "…"` | not-regex, pushed |
+| P5 | `\|= "a" or "b"` | a pushable `or` group (no `ip` alternative) |
+| P6 | `\|= "…" \| json` | a parser does not rewrite the line, so the filter still pushes |
+| P7 | `\|= "…" \|= ip("…")` | the SPLIT: one filter to SQL, one client-side |
+| P8 | `\|= "…" \| line_format "…" \|= "…"` | the other SPLIT: pushed head, post-rewrite tail |
+
+Every section loads at least one line its filter excludes — asserted
+mechanically by
+`logqltest_corpus.rs::every_pushdown_corpus_row_excludes_at_least_one_loaded_line`,
+because a row whose filter excludes nothing is exactly the row that
+passed on the blind path and measured nothing.
+
+### The replay slot budget this file spent
+
+Eight reachable rows pushed `SLOT_SECS * REACHABLE` past `FIRST_SLOT_AGE`,
+and `SLOT_SECS`'s lower bound (`2 × the widest reachable case`) was
+already exactly spent, so `FIRST_SLOT_AGE` had to move. It did, and the
+cost is the nightly leg's own wall-clock headroom before the OLDEST slot
+ages out of `INGESTION_WINDOW` mid-run. That failure mode used to surface
+as "N of the replayed rows disagree with the reference", sending the
+reader after captures that are fine; it is now named at the point of
+failure by an end-of-run re-query of slot 0's sentinel, opening
+`PRECONDITION FAILURE, NOT A CORPUS FAILURE`. What remains free is
+`REMAINING_SLOTS`, recomputed from the three constants and asserted, not
+stated.
+
+**And the budget those slots come out of was re-measured, because this
+issue was the first to spend it.** `INGESTION_WINDOW` was measured on a
+ladder that steps from 2.5 h straight to 3 h, and the constant took the
+3 h end; the wall is actually between 9640 s and 9700 s. Measured on a
+FRESH container from the pinned digest and `ci/logql/config.yaml`, one
+push carrying every age, queried ten seconds later:
+
+| age at push | 9000 | 9240 | 9300 | 9360 | 9500 | 9600 | 9640 | 9700 | 9800 |
+|---|---|---|---|---|---|---|---|---|---|
+| served | yes | yes | yes | yes | yes | yes | yes | **no** | no |
+
+It behaves as a fixed age rather than a moving absolute time: an entry
+pushed at age 9600 s stopped being served between 30 s and 60 s of wall
+clock, while one at 9000 s was still served after 421 s. So an entry
+placed at age `A` survives roughly `SERVED_HORIZON - A` seconds, and
+`SERVED_HORIZON` is committed as 9600 s — below the last age measured
+served, i.e. a floor on the wall rather than an estimate of it.
+
+The consequence is worth stating plainly for whoever grows the corpus
+next: **free slots and run margin are the same resource.** The ceiling is
+`MAX_REACHABLE_ROWS`, computed in `logqltest_replay.rs` as
+`(SERVED_HORIZON - SLOT_SECS - RUN_MARGIN) / SLOT_SECS`, and checked at
+compile time against `REACHABLE` rather than written down. The leg
+occupies 231/234 of it — **98.7% occupied, three rows from the wall.**
+
+That is not `SERVED_HORIZON / SLOT_SECS`, which is 240 slots and ignores
+both the slot the oldest case occupies and the wall clock the run needs
+after placing it. This paragraph said 240 slots when the horizon work
+first landed, which reads as 96% occupancy and invites someone to add
+rows into space that does not exist; #278's round-1 review caught the
+figure and round 2 caught that its replacement was still TYPED. **Every
+capacity figure quoted above is now counted** against the constants that
+produce it, by
+`logqltest_replay.rs::the_quoted_capacity_figures_are_counted_so_a_stale_one_cannot_compile`,
+which reads this file as well as its own source — so a quotation here
+that drifts reddens rather than compiling.
+
+The remaining lever is `SLOT_SECS`, bounded below by twice the widest
+reachable case and exactly spent — so the next addition that does not fit
+needs a narrower widest case, not a larger `FIRST_SLOT_AGE`.
