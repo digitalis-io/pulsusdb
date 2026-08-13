@@ -1,0 +1,18 @@
+# Issues that a merge must NOT close, one per line: <number> <reason>.
+#
+# GitHub closes an issue when a merged PR body or commit message carries a
+# closing keyword ("Closes #N"). That is usually what you want. It is not
+# what you want when a change closes the DEFECT an issue was filed on
+# while the issue still carries named work nobody has picked up — the
+# work then disappears with the issue, and the only record that it was
+# owed is a closed thread.
+#
+# `ci/no-premature-close.sh` reads this file and fails the build if a PR
+# body or any commit in the PR's range would close a listed issue. Delete
+# an entry when the work it names has landed; an entry with no reason is
+# a failure, because an unexplained exemption is the thing this file
+# exists to stop.
+#
+# Lines beginning with `#` are comments; blank lines are ignored.
+
+278 the TraceQL and PromQL corpus-harness audit is still owed - #278 found the LogQL harness compiling past the pushdown path it reported a pass rate for, and whether the sibling harnesses do the same is unanswered
