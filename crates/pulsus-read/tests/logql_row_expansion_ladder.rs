@@ -58,19 +58,47 @@
 //!   `#[global_allocator]` is per-test-binary. **A defect fixed in one
 //!   copy exists in the others.**
 //!
-//! # A read-path performance finding this ladder surfaced (NOT a #241 fix)
+//! # A read-path performance finding this ladder surfaced — since FIXED
 //!
-//! The wall times below are quadratic in the emitted label count, and the
-//! `LADDER-WALL` line proves it is not the instrument: one UNINSTRUMENTED
-//! `run_into` over a flat `| json` body costs 129.8 us at 977 B, 1.21 ms
-//! at 16 105 B, 138.7 ms at 257 909 B and **40.52 s** at 4 126 651 B —
-//! 16x the input for ~290x the time, twice over. The source agrees:
-//! `set_label_at` (`pipeline.rs:3411`) resolves each emitted key with
-//! `labels.iter().position(..)`, a linear scan of the label vector, and
-//! the flatten calls it once per leaf, so a row emitting `m` labels costs
-//! `O(m^2)` comparisons. Flagged, not fixed: it is a LATENCY property and
-//! issue #241 is about bytes. The byte ratio this file measures is flat
-//! across the same ladder, so the two are independent.
+//! Kept as the record of how it was caught. As first measured here, the
+//! wall times were quadratic in the emitted label count, and the
+//! `LADDER-WALL` line proved it was not the instrument: one
+//! UNINSTRUMENTED `run_into` over a flat `| json` body cost 60-116 us at
+//! 977 B, 0.81-1.12 ms at 16 105 B, 127-196 ms at 257 909 B and
+//! **34-42 s** at 4 126 651 B. Each of the top two steps is 16x the input
+//! for over 100x the time — 113-242x then 183-331x, taking the ranges at
+//! their most and least favourable ends, so the superlinearity holds
+//! everywhere in them and is not an artefact of pairing two lucky runs.
+//! The source
+//! agreed: the flatten resolved each emitted key with
+//! `labels.iter().position(..)`, a linear scan of the label vector, once
+//! per leaf, so a row emitting `m` labels cost `O(m^2)` comparisons.
+//! Flagged and not fixed at the time: it is a LATENCY property and issue
+//! #241 is about bytes.
+//!
+//! Issue #447 fixed it — `pipeline.rs`'s `LabelIndex`, a positions-only
+//! open-addressed table built once per flatten. The same uninstrumented
+//! `LADDER-WALL` line now reads, across the same four rungs,
+//! 76-310 us / 0.38-1.07 ms / 5.8-21.4 ms / **0.11-0.23 s**.
+//!
+//! **Every wall time in this file is a RANGE, and must stay one.** The
+//! measuring machine is shared: several builds run on it at once, so a
+//! single figure is one draw from a spread of roughly 2x, and quoting one
+//! is how a lucky run becomes a claim. The ranges above are the observed
+//! min and max over 60 runs of `zz_the_full_precommitted_ladder`, one
+//! process per run; the pre-#447 range below is over 4. Both are wide,
+//! two orders of magnitude apart, and it is the gap that is the finding —
+//! not any value inside either range.
+//!
+//! The fix did move the byte ratio this file measures, by the index
+//! table's doubling transient: `F` went 3.583 -> 3.934. That number is
+//! NOT a wall time and NOT a range, and the reason it is exempt from the
+//! rule above is that `apply_the_rule` asserts it by EQUALITY against
+//! `F_MILLI` — likewise `264 006 270 B` against `WORST_CASE_BYTES`. They
+//! are deterministic allocation counts under a pinned toolchain, so an
+//! exact gate is available for them and a stale figure here fails the
+//! test rather than sitting in prose. The rule's branch selection and the
+//! linearity bounds are asserted as well, and all of them still hold.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
@@ -235,18 +263,20 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, u64, u64) {
 /// The pre-committed body sizes, in bytes.
 const LADDER: [usize; 4] = [1024, 16 * 1024, 256 * 1024, 4 * 1024 * 1024];
 
-/// The rungs the ALWAYS-ON test walks: the pre-committed ladder's prefix.
+/// The rungs the shorter test walks: the pre-committed ladder's prefix.
 ///
-/// **A disclosed deviation, with the measurement that forced it.** The
-/// plan chose 4 MiB as the top rung "so the whole file stays inside the
-/// `ci` job"; that assumption is false. One 4 MiB rung costs **231.6 s**
-/// measured and **40.5 s** with no window open at all — because
-/// `run_into`'s `| json` flatten is QUADRATIC in the emitted label count
-/// (`set_label_at`, `pipeline.rs:3411`, does a linear
-/// `labels.iter().position(..)` per emitted leaf), not because of the
-/// instrument. Wall times from one run on this machine, `cargo test -p
-/// pulsus-read --test logql_row_expansion_ladder -- --nocapture
-/// --test-threads=1`:
+/// **A disclosed deviation, and the measurement that FORCED it has since
+/// been repealed.** The plan chose 4 MiB as the top rung "so the whole
+/// file stays inside the `ci` job", and at the time that was false: one
+/// 4 MiB rung cost **228-264 s** measured and **34-42 s** with no window
+/// open at all, because the `| json` flatten was then QUADRATIC in the
+/// emitted label count. Ranges, not values, for the reason the module doc
+/// gives — the machine is shared, so one figure is one draw.
+///
+/// The single run that first caught it, kept verbatim as the record of
+/// how it was caught and NOT as a claim about what the rung costs
+/// (`cargo test -p pulsus-read --test logql_row_expansion_ladder --
+/// --nocapture --test-threads=1`):
 ///
 /// ```text
 /// B=      977  uninstrumented   129.8us   measured    1.18ms
@@ -255,13 +285,15 @@ const LADDER: [usize; 4] = [1024, 16 * 1024, 256 * 1024, 4 * 1024 * 1024];
 /// B=4 126 651  uninstrumented    40.52s   measured  256.70s
 /// ```
 ///
-/// So the FULL pre-committed ladder is run by
-/// `zz_the_full_precommitted_ladder`, which is `#[ignore]`d the way
-/// `zz_regenerate_golden` is, and its transcript is recorded on issue
-/// #241. The always-on test walks this prefix, which still spans 256x —
-/// four times the `>= 64x` bar — and yields the SAME `F`, because the
-/// maximum median sits at the 16 KiB rung and the higher rungs are flat
-/// (3.583 / 3.582 / 3.581).
+/// Issue #447 removed the quadratic term, so
+/// `zz_the_full_precommitted_ladder` no longer needs `#[ignore]` and now
+/// runs always-on — see its own doc for the measurement that repealed it.
+/// This prefix is kept, and `the_measured_expansion_factor_is_recorded`
+/// still walks it, for two reasons: it spans 256x on its own — four times
+/// the `>= 64x` bar — and it yields the SAME `F` as the full ladder, so it
+/// is the standing evidence that the rule's answer does not depend on the
+/// top rung. Post-#447 medians: 3.055 / 3.934 / 3.934, against the full
+/// ladder's 3.055 / 3.934 / 3.934 / 3.934.
 const CI_LADDER: [usize; 3] = [1024, 16 * 1024, 256 * 1024];
 
 /// Reps per rung; the first is discarded as warm-up.
@@ -355,14 +387,37 @@ fn the_measured_expansion_factor_is_recorded() {
     apply_the_rule(&CI_LADDER);
 }
 
-/// The FULL pre-committed ladder, 4 MiB rung included. `#[ignore]`d for
-/// wall-time only — see [`CI_LADDER`] for the measured reason and for the
-/// transcript this produced.
+/// The FULL pre-committed ladder, 4 MiB rung included.
 ///
-/// `cargo test -p pulsus-read --test logql_row_expansion_ladder -- \
-///  --ignored --nocapture --test-threads=1`
+/// **The `#[ignore]` is gone, and only because the wall time that forced
+/// it is gone** (issue #447). It was `#[ignore]`d "for wall-time only" —
+/// see [`CI_LADDER`] for the transcript — and after the flatten's O(m^2)
+/// key lookup was replaced the whole test costs **1.2-2.0 s**.
+///
+/// Ranges over 60 runs of this test, one process per run,
+/// `CARGO_INCREMENTAL=0 cargo test -p pulsus-read --test
+/// logql_row_expansion_ladder -- --nocapture --test-threads=1`, on a
+/// SHARED build machine — several builds run on it concurrently, so
+/// loadavg was 0.88-1.28 across the 120 samples taken either side of the
+/// 60 runs and no single figure below is reproducible on demand:
+///
+/// ```text
+///                    uninstrumented run_into        rung total
+/// B=      977          76 us -    310 us         0.71 ms -  2.61 ms
+/// B=   16 105        0.38 ms -   1.07 ms         11.4 ms -  26.4 ms
+/// B=  257 909         5.8 ms -   21.4 ms         62.5 ms - 248.2 ms
+/// B=4 126 651        0.11 s  -    0.23 s          1.09 s -  1.73 s
+/// ```
+///
+/// The pre-#447 top rung was 34-42 s uninstrumented over 4 runs of the
+/// same test on the same machine, so the gap is roughly two orders of
+/// magnitude at every point in both ranges. **Quote the range, never a
+/// value from inside it** — a single figure from this machine is one
+/// draw, and the 4 MiB rung's spread is about 2x.
+///
+/// Restore the attribute if the 4 MiB rung ever climbs back into the tens
+/// of seconds — that would itself be the regression worth failing on.
 #[test]
-#[ignore = "the 4 MiB rung costs ~232 s; the always-on prefix decides the same rule"]
 fn zz_the_full_precommitted_ladder() {
     apply_the_rule(&LADDER);
 }
@@ -404,7 +459,9 @@ fn apply_the_rule(rungs: &[usize]) {
 
     // **THE RECORDED OUTCOME, and where it stops.**
     //
-    // `F = 3.583`, so `F * MAX_DECOMPRESSED_BYTES = 240 451 059 B`
+    // `F = 3.934` (3.583 before issue #447 added the flatten's label
+    // index, whose table carries a doubling transient), so
+    // `F * MAX_DECOMPRESSED_BYTES = 264 006 270 B` (was 240 451 059 B)
     // exceeds `MAX_JSON_FLATTEN_KEY_BYTES = 67 108 864 B`. The rule's
     // record-nothing branch does NOT fire; the rule selects **charge the
     // residual**, and that selection is asserted below so it cannot be
@@ -418,7 +475,7 @@ fn apply_the_rule(rungs: &[usize]) {
     // `plan_recursive_control.rs:21-24` says in terms must never be
     // pinned as a threshold. Charging `alloc_block_bytes(body.len())`
     // (2x) or `grown_alloc_bytes(body.len())` (3x) both sit BELOW the
-    // measured 3.583x, so they would under-charge; charging at the
+    // measured 3.934x, so they would under-charge; charging at the
     // measured ratio pins that ratio. Separately, any of them tightens
     // the existing `RowBudget::JsonFlattenKeys` 422 to refuse a `| json`
     // row the reference serves, which is a divergence and needs the
@@ -427,9 +484,17 @@ fn apply_the_rule(rungs: &[usize]) {
     // than guessed; see the issue's closeout comment.
     //
     // What IS asserted, so a regression cannot pass quietly: the rule's
-    // branch, and that the expansion stays a small constant multiple of
-    // the body — `O(B)`, not `O(B^2)` — across a ladder spanning at
-    // least 64x.
+    // branch, that the expansion stays a small constant multiple of the
+    // body — `O(B)`, not `O(B^2)` — across a ladder spanning at least
+    // 64x, and the two exact byte figures the docs quote.
+    //
+    // **The exact figures are asserted by EQUALITY, and that is why they
+    // are the one pair of numbers in this file written as single values
+    // rather than ranges.** They are deterministic allocation counts
+    // under a pinned toolchain, not wall times, so equality is available
+    // here in a way it is not for anything timed. The bounds below would
+    // pass over a wide band; only the equality makes the quoted `3.934`
+    // and `264 006 270 B` a claim a test can refute.
     assert!(
         f_max_milli >= 1000,
         "F fell below 1.0, which would put the rule on its record-nothing branch — re-run \
@@ -448,6 +513,128 @@ fn apply_the_rule(rungs: &[usize]) {
         "the measured F now satisfies `F * MAX_DECOMPRESSED_BYTES <= \
          MAX_JSON_FLATTEN_KEY_BYTES`, so the rule's record-nothing branch fires and the \
          residual note in `pipeline.rs` should carry the inequality"
+    );
+    assert_eq!(
+        f_max_milli,
+        F_MILLI,
+        "F is no longer exactly {}.{:03}. This is a DETERMINISTIC allocation count, not a \
+         wall time, so a move here is a real change in the flatten's allocation shape — not \
+         machine noise. Re-derive it, then update this constant and every site that quotes \
+         it — `the_quoted_figures_are_counted_so_a_new_quotation_cannot_go_unchecked` will \
+         tell you how many there are; do not relax this assertion.",
+        F_MILLI / 1000,
+        F_MILLI % 1000
+    );
+    assert_eq!(
+        worst_case_bytes, WORST_CASE_BYTES,
+        "`F * MAX_DECOMPRESSED_BYTES` is no longer exactly {WORST_CASE_BYTES} B. Same rule as \
+         for F: re-derive and update the constant and the docs, do not widen this."
+    );
+}
+
+/// `F` in milli-units, as [`apply_the_rule`] computes it and asserts it
+/// by equality.
+///
+/// **How many places quote it is COUNTED, not listed** — see
+/// [`the_quoted_figures_are_counted_so_a_new_quotation_cannot_go_unchecked`].
+/// A hand-written inventory of quotation sites has no failure mode: the
+/// next edit that adds a mention silently falsifies it, which is exactly
+/// what happened to the list that used to sit here, and the edit that
+/// falsified it was the one that introduced it. The count fails instead.
+///
+/// The one quotation the count cannot reach is issue #241's closeout
+/// comment, which is outside the tree and outside any test's reach. It
+/// quotes this value too, and a re-derivation has to go and correct it by
+/// hand; that is why it is named here rather than counted.
+///
+/// Both ladders yield it: the 4 MiB rung is not what sets it (the 16 KiB
+/// rung already reaches it), which is [`CI_LADDER`]'s standing point. It
+/// was 3.583 before issue #447's label index added the table's doubling
+/// transient.
+const F_MILLI: u64 = 3934;
+
+/// `F * MAX_DECOMPRESSED_BYTES` in bytes (240 451 059 B before issue
+/// #447), derived from [`F_MILLI`] and asserted separately in
+/// [`apply_the_rule`] so the integer arithmetic that produces it is
+/// pinned too. Its quotations are counted in the same test as
+/// [`F_MILLI`]'s, and issue #241's closeout quotes it as well.
+const WORST_CASE_BYTES: u64 = 264_006_270;
+
+/// Renders `n` with a space every three digits, the way this file's prose
+/// writes byte figures.
+///
+/// It exists so the needle
+/// [`the_quoted_figures_are_counted_so_a_new_quotation_cannot_go_unchecked`]
+/// searches for is DERIVED from [`WORST_CASE_BYTES`] rather than typed
+/// out beside it. A typed needle is a second declaration of the same
+/// value, free to disagree with the first — and it would also be found by
+/// its own search, so the count would include the searcher.
+fn digit_grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.char_indices() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// How many times this file's own source quotes `F`'s rendered value.
+///
+/// **Occurrences, not lines** — one line quoting it three times counts
+/// three, because a line count would let a quotation be added to a line
+/// that already has one and go unseen.
+const F_QUOTATIONS: usize = 9;
+
+/// How many times this file's own source quotes [`WORST_CASE_BYTES`] in
+/// the space-grouped rendering [`digit_grouped`] produces. Occurrences,
+/// not lines, for the reason [`F_QUOTATIONS`] gives.
+const WORST_CASE_QUOTATIONS: usize = 3;
+
+/// **The inventory of quotation sites, as a check rather than a
+/// sentence.**
+///
+/// Both figures are exempt from this file's range-only rule because
+/// [`apply_the_rule`] pins them by equality — but that pins the values,
+/// not the prose repeating them, and prose repeating a number is how a
+/// figure goes stale in one place while staying right in another. So the
+/// file reads its own source and counts.
+///
+/// **If this fails you have added or removed a quotation.** Open the site
+/// that moved, check it states the current value, and only then update
+/// the constant. Updating the constant first turns the check back into
+/// the sentence it replaced.
+///
+/// Scope, stated rather than implied: this counts one RENDERING of each
+/// figure in THIS file — `F` as `{units}.{milli:03}` and the byte figure
+/// space-grouped. The forms the code itself produces are deliberately
+/// outside it: `F_MILLI`'s and `WORST_CASE_BYTES`'s own literals, and the
+/// undelimited `worst_case` value the `LADDER` transcript prints. Those
+/// are computed, not quoted, so they cannot go stale.
+#[test]
+fn the_quoted_figures_are_counted_so_a_new_quotation_cannot_go_unchecked() {
+    // The file's own source, embedded at compile time. Needles are built
+    // from the constants at run time, so neither literal appears here and
+    // the count is of quotations elsewhere, never of the searcher.
+    const SELF_SOURCE: &str = include_str!("logql_row_expansion_ladder.rs");
+
+    let f_text = format!("{}.{:03}", F_MILLI / 1000, F_MILLI % 1000);
+    let bytes_text = digit_grouped(WORST_CASE_BYTES);
+
+    assert_eq!(
+        SELF_SOURCE.matches(f_text.as_str()).count(),
+        F_QUOTATIONS,
+        "this file now quotes `{f_text}` a different number of times. Find the site that \
+         changed, check it carries the value `apply_the_rule` asserts, then update \
+         `F_QUOTATIONS` — in that order."
+    );
+    assert_eq!(
+        SELF_SOURCE.matches(bytes_text.as_str()).count(),
+        WORST_CASE_QUOTATIONS,
+        "this file now quotes `{bytes_text}` a different number of times. Same order as for \
+         `F_QUOTATIONS`: check the site first, update `WORST_CASE_QUOTATIONS` second."
     );
 }
 
