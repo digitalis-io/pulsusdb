@@ -561,7 +561,7 @@ pub static REGISTRY: [FuncDef; 67] = [
         bytes_of(&a[0])
     )?))),
     f!("regexReplaceAll", [Str, Str, Str], None, |c, a| {
-        let re = compile_regex(c, bytes_of(&a[0]))?;
+        let re = compile_charged_regex(c, bytes_of(&a[0]))?;
         // Borrowed Cow args (round 3); an INVALID-UTF-8 input's ≤3×
         // owned substitution buffer is charged before converting
         // (round 4 — the shape the ordering leg had not covered).
@@ -578,7 +578,7 @@ pub static REGISTRY: [FuncDef; 67] = [
         ))
     }),
     f!("regexReplaceAllLiteral", [Str, Str, Str], None, |c, a| {
-        let re = compile_regex(c, bytes_of(&a[0]))?;
+        let re = compile_charged_regex(c, bytes_of(&a[0]))?;
         let s = lossy_charged(c, bytes_of(&a[1]))?;
         let repl = lossy_charged(c, bytes_of(&a[2]))?;
         c.charge(
@@ -592,7 +592,7 @@ pub static REGISTRY: [FuncDef; 67] = [
         ))
     }),
     f!("count", [Str, Str], None, |c, a| {
-        let re = compile_regex(c, bytes_of(&a[0]))?;
+        let re = compile_charged_regex(c, bytes_of(&a[0]))?;
         let s = lossy_charged(c, bytes_of(&a[1]))?;
         Ok(Value::int(re.find_iter(s.as_ref()).count() as i64))
     }),
@@ -1781,7 +1781,12 @@ fn json_to_value<'a>(v: serde_json::Value) -> Value<'a> {
 /// scope for #291.
 const DYNAMIC_REGEX_PROGRAM_CEILING: usize = 1 << 20;
 
-fn compile_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex::Regex, String> {
+/// Named apart from `pipeline.rs`'s `compile_regex` (issue #302): the
+/// `src/logql/` census keys free functions by BARE NAME and panics on a
+/// duplicate, because its call-graph closure would otherwise resolve to
+/// whichever body it saw first. This one is the CHARGED variant — it
+/// bills the pattern copy against the query budget.
+fn compile_charged_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex::Regex, String> {
     // The pattern copy is charged too (repeatable per call) — at the
     // EXACT repaired length when the pattern bytes are invalid UTF-8
     // (rounds 4+6: the conversion must neither allocate before its

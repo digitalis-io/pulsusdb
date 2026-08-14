@@ -53,14 +53,23 @@
 # The hermetic runner does not re-apply the stream SELECTOR (§ the DSL
 # note in PROVENANCE.md: an eval replays every loaded line), so the rows
 # below put the same escapes in a LINE FILTER instead. **`| decolorize`
-# is load-bearing and not decoration**: a line filter sitting directly on
-# the selector is PUSHED DOWN to SQL, so `CompiledPipeline::compile`
-# skips it (`pipeline.rs:986-996` returns `Ok(None)`) and this runner —
-# which executes the pipeline and no SQL — returns every loaded line
-# whatever the pattern says. Written without it, every row here passes
-# before and after Stage 1 while measuring nothing. `| decolorize` is a
-# no-op on these bodies (no ANSI escapes) and clears the pushdown, which
-# is the same device `b1_parsers_filters.test` uses. The SELECTOR
+# was load-bearing and not decoration when these rows were written**: a
+# line filter sitting directly on the selector is PUSHED DOWN to SQL, so
+# `CompiledPipeline::compile` skips it (`pipeline.rs:1009-1014` returns
+# `Ok(None)`) and this runner — which executes the pipeline and no SQL —
+# returned every loaded line whatever the pattern said. Written without
+# it, every row here would have passed before and after Stage 1 while
+# measuring nothing. (The line citation above read `:986-996` until issue
+# #278; the check had moved, and the sentence around it was rewritten at
+# the same time.)
+#
+# **That is no longer why the `| decolorize` is here.** Issue #278 taught
+# the runner to plan first and compile client-side, so a pushed-down
+# filter IS applied now, and `b26_line_filter_pushdown.test` covers that
+# path directly. These rows keep the spelling that was captured — the
+# queries of committed rows do not change — and `| decolorize` remains a
+# no-op on these bodies (no ANSI escapes), which is the same device
+# `b1_parsers_filters.test` uses. The SELECTOR
 # spelling is pinned instead by
 # `crates/pulsus-logql/tests/string_escapes.rs`, which asserts the
 # decoded matcher value as BYTES.

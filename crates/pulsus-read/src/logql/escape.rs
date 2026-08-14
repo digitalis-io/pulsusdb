@@ -66,6 +66,45 @@ pub fn ch_string(s: &str) -> String {
     out
 }
 
+/// The `LIKE` pattern literal for a substring search — `'%…%'` with the
+/// needle's own `\`, `%` and `_` escaped so they match literally. LogQL's
+/// `|=`/`!=` are byte-substring tests (Loki `pkg/logql/log/filter.go`'s
+/// `containsFilter` is `bytes.Contains`, `filter.go:435-444` @ `v3.7.4`),
+/// and `body LIKE '%needle%'` is exactly that — unlike
+/// `position(body, 'needle') > 0` it is a form ClickHouse's `ngrambf_v1`
+/// skip index can prune with, and its `tokenbf_v1` analysis re-derives the
+/// sound token requirement (only for tokens separator-delimited *within
+/// the pattern*) on its own.
+///
+/// LIKE-escaping runs BEFORE the string-literal escaping, never after:
+/// [`ch_string`] doubles the backslashes this step introduces, which is
+/// what makes `\%` survive the SQL parser as a LIKE escape.
+///
+/// **Pruning residual (issue #450).** `log_samples`' body ngram index is
+/// `ngrambf_v1(4, …)`, so a needle **shorter than 4 bytes** produces no
+/// n-gram the index can test and prunes NOTHING: `|= "err"` reads every
+/// granule in the selector/time window (measured on 26.3.17.110:
+/// 1223/1223 granules, 10M rows). That read is still bounded by stage 3's
+/// `service`/`fingerprint`/`timestamp_ns` primary key, never by the table.
+/// No prefilter can fix it — `hasToken` here is what issue #450 removed
+/// for returning wrong rows. Scale behaviour of short needles is issue
+/// #25's (Tier-2, the 1TB reference run); do not re-introduce a token
+/// prefilter to chase it.
+pub fn ch_like_contains(needle: &str) -> String {
+    let mut pattern = String::with_capacity(needle.len() + 2);
+    pattern.push('%');
+    for c in needle.chars() {
+        match c {
+            '\\' => pattern.push_str("\\\\"),
+            '%' => pattern.push_str("\\%"),
+            '_' => pattern.push_str("\\_"),
+            other => pattern.push(other),
+        }
+    }
+    pattern.push('%');
+    ch_string(&pattern)
+}
+
 /// Renders `s` as a backtick-quoted ClickHouse identifier. Reserved for
 /// fixed, trusted schema names (database/table) supplied by [`super::params::PlanCtx`]
 /// — matcher keys and values are always string literals via [`ch_string`],

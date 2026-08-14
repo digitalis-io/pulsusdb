@@ -294,12 +294,21 @@ clear
 # =====================================================================
 # line filters (|=, !=, |~, !~, ip())
 #
-# A bare leading line filter is pushed down to ClickHouse (`hasToken`/
-# `match`), so the hermetic runner (which replays only the client pipeline)
-# would not re-apply it. A leading `| decolorize` (identity on an ANSI-free
+# A bare leading line filter is pushed down to ClickHouse (`body LIKE`/
+# `match`). The leading `| decolorize` below (identity on an ANSI-free
 # line) forces the following filter to evaluate client-side — the same
-# split the engine uses for a post-`line_format` filter — so these exercise
-# the client-side `LineMatcher` path. Values are still captured from Loki.
+# split the engine uses for a post-`line_format` filter — so these rows
+# exercise the client-side `LineMatcher` path. Values are captured from
+# Loki.
+#
+# WHEN THESE ROWS WERE WRITTEN the `| decolorize` was doing a second job:
+# the hermetic runner replayed only the client pipeline, so a pushed-down
+# filter was not applied AT ALL and a row without it passed while
+# measuring nothing (issue #278). That is fixed — the runner plans, then
+# compiles client-side, and `b26_line_filter_pushdown.test` covers the
+# pushed path directly. These rows keep `| decolorize` because it is what
+# was captured, and because the post-rewrite path is a real path worth
+# its own rows; it is no longer a workaround.
 # =====================================================================
 
 # --- |= contains -------------------------------------------------------

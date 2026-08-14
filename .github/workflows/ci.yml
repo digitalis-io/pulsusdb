@@ -52,6 +52,27 @@ jobs:
       - name: Install cargo-nextest (pinned)
         run: curl -LsSf https://get.nexte.st/0.9.140/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
+      # Issue #278: an issue can carry named remaining work while the
+      # defect it was filed on is fixed, and merging with "Closes #N" in
+      # the body then takes that work down with the thread. The manifest
+      # in ci/issues-that-must-stay-open.txt says which issues that
+      # applies to and why.
+      #
+      # The self-test runs UNCONDITIONALLY and is the committed red path
+      # for the matcher itself — a bare "no listed issue would be closed"
+      # on a push tells you nothing about whether the matcher still
+      # works. The scan runs on pull_request only, because that is the
+      # only event with a body to read. PR_BODY arrives through the
+      # environment, never shell-substituted: it is untrusted text.
+      - name: Premature-close matcher self-test
+        run: ci/no-premature-close.sh --self-test
+
+      - name: Issues that must stay open
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: ci/no-premature-close.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -1294,6 +1315,16 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test rollup_differential
+
+      # Issue #450: every `|=`/`!=` needle generated from the suite's own
+      # committed bodies must return exactly what Loki's `bytes.Contains`
+      # returns. The corpus runner evaluates line filters in Rust and never
+      # emits their SQL, so only a live suite can see a rendering defect.
+      - name: LogQL line-filter differential suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test logql_line_filter_differential
 
       - name: Series stream cap suite
         env:

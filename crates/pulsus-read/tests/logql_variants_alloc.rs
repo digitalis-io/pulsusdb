@@ -10,7 +10,15 @@
 //! |---|---|---|
 //! | `TOTAL_BYTES` | `+size` on alloc, `+new` on realloc | sees EVERY allocation, retained or dropped — catches large uncharged per-variant work |
 //! | `ALLOC_CALLS` | `+1` on alloc and realloc | one count per allocation, NO byte-model slack — catches a SMALL per-variant transient a byte gate would absorb. **A count band catches any non-zero-sized heap allocation, whatever its size** — the 32-byte mutation demonstrator is a sufficient choice, not a detection floor (Δ10.0). |
-//! | `LIVE`/`PEAK` | `+`/`−`, `fetch_max`; realloc charges old+new | the OOM-relevant high-water mark the cap exists to bound |
+//! | `LIVE`/`PEAK` | `+`/`−` for POINTERS THIS WINDOW ALLOCATED, `fetch_max`; realloc charges old+new | the OOM-relevant high-water mark the cap exists to bound |
+//!
+//! `LIVE` is attributed by POINTER, not by size (issue #281). A
+//! `dealloc` of a pointer the window did not allocate is IGNORED,
+//! where it used to be subtracted with a saturating clamp — which
+//! destroyed live in-window bytes and under-reported `PEAK`, the left
+//! side of every `<= charge` assertion here. Measured before the fix:
+//! a reported peak of 512 000 against a true in-window high-water of
+//! 921 600.
 //!
 //! The v6 retained-delta quantity (`live_after − live_before`) appears
 //! nowhere as a decision gate: it is structurally blind to anything
@@ -193,7 +201,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use pulsus_logql::{Grouping, GroupingKind, VectorAggOp, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
@@ -288,50 +296,200 @@ impl Drop for Serialized {
 
 struct TripleCounterAlloc;
 
-fn on_alloc(size: u64) {
-    if measuring() {
-        TOTAL_BYTES.fetch_add(size, Ordering::Relaxed);
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-        let now = LIVE.fetch_add(size, Ordering::Relaxed) + size;
-        PEAK.fetch_max(now, Ordering::Relaxed);
-    }
+// ---------------------------------------------------------------------
+// Issue #281 — the in-window pointer table.
+//
+// `PEAK` is the high-water of bytes THIS WINDOW allocated and still
+// holds, and it is the LEFT-hand side of the `<= charge` assertions
+// below, so an under-report is a gate that passes while the property it
+// guards is false.
+//
+// The allocator hooks see sizes, not identities. A `dealloc` of a
+// PRE-WINDOW pointer is therefore indistinguishable from a dealloc of an
+// in-window one, and the harness used to subtract it from `LIVE` with a
+// saturating clamp — silently destroying live in-window bytes. Measured:
+// allocate 500 KiB, free a 1 MiB pre-window buffer, allocate 400 KiB,
+// and the reported peak was 512 000 against a true in-window high-water
+// of 921 600.
+//
+// **No arithmetic on sizes alone can fix that** — not a signed counter,
+// not a running minimum — because the missing information is WHOSE
+// POINTER THIS IS. So it is supplied: an open-addressed `(ptr, size)`
+// table of what the window allocated. `on_dealloc` subtracts ONLY for
+// pointers in it, and ignores a pre-window pointer rather than clamping
+// it.
+//
+// **Allocation-free by construction.** Static atomic arrays, fixed
+// capacity, linear probing — an allocating fix inside an allocation gate
+// would re-enter the allocator it is measuring. And exhaustion is a LOUD
+// window failure ([`TABLE_OVERFLOW`], asserted by [`measured`]), never a
+// silent fall back to the old under-reporting behaviour: a fixed
+// capacity that quietly gives a wrong answer is the defect again.
+// ---------------------------------------------------------------------
+
+/// Slots in the in-window pointer table; a power of two, so the probe
+/// index wraps with a mask. 128 Ki slots is 2 MiB of static BSS.
+const PTR_SLOTS: usize = 1 << 17;
+/// How far a linear probe runs before declaring the table exhausted.
+const PTR_PROBE: usize = 64;
+/// A slot that has never held a pointer. Ends a probe chain, because
+/// nothing can have been inserted past it. A real allocation is never
+/// null, so zero is free to mean this.
+const PTR_EMPTY: usize = 0;
+/// A slot whose pointer has been freed. Does NOT end a probe chain —
+/// entries inserted past it while it was occupied must stay reachable.
+const PTR_TOMB: usize = usize::MAX;
+
+static PTR_KEYS: [AtomicUsize; PTR_SLOTS] = [const { AtomicUsize::new(PTR_EMPTY) }; PTR_SLOTS];
+static PTR_SIZES: [AtomicU64; PTR_SLOTS] = [const { AtomicU64::new(0) }; PTR_SLOTS];
+/// Insertions that found no free slot within [`PTR_PROBE`]. Non-zero
+/// means the window's accounting is incomplete, and [`measured`] fails
+/// on it rather than reporting a number that is quietly too small.
+static TABLE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+fn ptr_slot(ptr: usize) -> usize {
+    // Fibonacci hashing on the high bits; allocator addresses are
+    // heavily aligned, so the low bits carry little entropy.
+    let h = (ptr as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ((h >> 32) as usize) & (PTR_SLOTS - 1)
 }
 
-fn on_dealloc(size: u64) {
-    if measuring() {
-        // Saturating: a pre-window allocation freed inside the window
-        // would push `LIVE` negative; clamping at 0 only ever over-states
-        // the peak — the safe direction for a `≤ charge` assertion.
-        let mut cur = LIVE.load(Ordering::Relaxed);
-        loop {
-            let next = cur.saturating_sub(size);
-            match LIVE.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(observed) => cur = observed,
-            }
+/// Records `ptr` as allocated by this window.
+fn table_insert(ptr: usize, size: u64) {
+    let mut i = ptr_slot(ptr);
+    for _ in 0..PTR_PROBE {
+        let k = PTR_KEYS[i].load(Ordering::Relaxed);
+        if k == PTR_EMPTY || k == PTR_TOMB || k == ptr {
+            PTR_KEYS[i].store(ptr, Ordering::Relaxed);
+            PTR_SIZES[i].store(size, Ordering::Relaxed);
+            return;
         }
+        i = (i + 1) & (PTR_SLOTS - 1);
     }
+    TABLE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Removes `ptr` if this window allocated it, yielding the size that was
+/// recorded for it. `None` = a PRE-WINDOW pointer, which is ignored
+/// rather than clamped — the whole point of the table.
+fn table_take(ptr: usize) -> Option<u64> {
+    let mut i = ptr_slot(ptr);
+    for _ in 0..PTR_PROBE {
+        let k = PTR_KEYS[i].load(Ordering::Relaxed);
+        if k == PTR_EMPTY {
+            return None;
+        }
+        if k == ptr {
+            let size = PTR_SIZES[i].load(Ordering::Relaxed);
+            PTR_KEYS[i].store(PTR_TOMB, Ordering::Relaxed);
+            return Some(size);
+        }
+        i = (i + 1) & (PTR_SLOTS - 1);
+    }
+    None
+}
+
+/// Rewrites `ptr`'s recorded size in place, yielding the previous one.
+/// `None` = not this window's pointer.
+fn table_resize(ptr: usize, size: u64) -> Option<u64> {
+    let mut i = ptr_slot(ptr);
+    for _ in 0..PTR_PROBE {
+        let k = PTR_KEYS[i].load(Ordering::Relaxed);
+        if k == PTR_EMPTY {
+            return None;
+        }
+        if k == ptr {
+            let old = PTR_SIZES[i].load(Ordering::Relaxed);
+            PTR_SIZES[i].store(size, Ordering::Relaxed);
+            return Some(old);
+        }
+        i = (i + 1) & (PTR_SLOTS - 1);
+    }
+    None
+}
+
+fn table_clear() {
+    for k in PTR_KEYS.iter() {
+        k.store(PTR_EMPTY, Ordering::Relaxed);
+    }
+    TABLE_OVERFLOW.store(0, Ordering::Relaxed);
+}
+
+/// Adds `size` to the in-window live total and re-marks the peak.
+fn live_add(size: u64) {
+    let now = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+    PEAK.fetch_max(now, Ordering::Relaxed);
+}
+
+/// The `TOTAL_BYTES`/`ALLOC_CALLS` half, charged for every allocation
+/// event exactly as before — the itemized per-variant constants depend
+/// on those two counters and this issue does not move them.
+fn charge_totals(size: u64) {
+    TOTAL_BYTES.fetch_add(size, Ordering::Relaxed);
+    ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 // SAFETY: delegates verbatim to the system allocator; the only side
 // effects are relaxed atomic updates (gated by the `MEASURING` TLS flag,
-// whose `const`-init non-`Drop` slot is read without allocating) which
-// allocate nothing and cannot re-enter the allocator.
+// whose `const`-init non-`Drop` slot is read without allocating) plus
+// reads and writes of the STATIC atomic arrays above, which allocate
+// nothing. So nothing here can re-enter the allocator. The hooks now run
+// AFTER delegating, because attributing a size to a pointer needs the
+// pointer the system allocator returns.
 unsafe impl GlobalAlloc for TripleCounterAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        on_alloc(layout.size() as u64);
-        unsafe { System.alloc(layout) }
+        let ptr = unsafe { System.alloc(layout) };
+        if measuring() {
+            let size = layout.size() as u64;
+            charge_totals(size);
+            if !ptr.is_null() {
+                table_insert(ptr as usize, size);
+                live_add(size);
+            }
+        }
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        on_dealloc(layout.size() as u64);
+        if measuring() {
+            // Only OUR pointers move `LIVE`. A pre-window pointer is
+            // ignored — never clamped, which is what used to destroy
+            // in-window live bytes.
+            if let Some(size) = table_take(ptr as usize) {
+                LIVE.fetch_sub(size, Ordering::Relaxed);
+            }
+        }
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // Old+new both live during a non-in-place realloc; TOTAL charges
-        // the new request, CALLS counts one allocation event.
-        on_alloc(new_size as u64);
-        on_dealloc(layout.size() as u64);
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if measuring() {
+            // TOTAL charges the new request, CALLS counts one allocation
+            // event — unchanged, and charged whether or not the block is
+            // this window's.
+            charge_totals(new_size as u64);
+            if !new_ptr.is_null() {
+                if new_ptr == ptr {
+                    // In place. Old+new both live across the call, which
+                    // is the peak semantics this harness has always had:
+                    // add the new size, mark the peak, then release the
+                    // old. A block the window did not allocate stays out
+                    // of `LIVE` entirely.
+                    if let Some(old) = table_resize(new_ptr as usize, new_size as u64) {
+                        live_add(new_size as u64);
+                        LIVE.fetch_sub(old, Ordering::Relaxed);
+                    }
+                } else {
+                    // Moved. NEW first, so the peak sees both live —
+                    // then release the old, if it was ours.
+                    table_insert(new_ptr as usize, new_size as u64);
+                    live_add(new_size as u64);
+                    if let Some(old) = table_take(ptr as usize) {
+                        LIVE.fetch_sub(old, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        new_ptr
     }
 }
 
@@ -354,9 +512,25 @@ fn measured<T>(f: impl FnOnce() -> T) -> (u64, u64, u64, T) {
     ALLOC_CALLS.store(0, Ordering::SeqCst);
     LIVE.store(0, Ordering::SeqCst);
     PEAK.store(0, Ordering::SeqCst);
+    // Issue #281: the window owns nothing yet. Cleared BEFORE the flag
+    // goes up, so the clear's own stores are not attributed to it.
+    table_clear();
     MEASURING.set(true);
     let out = f();
     MEASURING.set(false);
+    // A full table stops being able to say whose pointer a free was, and
+    // an unattributed free is the under-report this table exists to
+    // close. So exhaustion FAILS the window rather than degrading it —
+    // formatting this message allocates, which is why the flag is
+    // already down.
+    let overflow = TABLE_OVERFLOW.load(Ordering::SeqCst);
+    assert_eq!(
+        overflow, 0,
+        "the in-window pointer table overflowed {overflow} time(s): more than {PTR_SLOTS} live \
+         allocations, or a probe run of {PTR_PROBE} exhausted by clustering. The peak below \
+         would be an under-report, which is exactly what issue #281 closed — raise PTR_SLOTS, \
+         do not ignore this."
+    );
     (
         ALLOC_CALLS.load(Ordering::SeqCst),
         TOTAL_BYTES.load(Ordering::SeqCst),
@@ -3542,6 +3716,55 @@ fn g4_frame_census_and_inventory_closure() {
     assert!(
         include_str!("logql_pipeline_alloc.rs").contains("CLIENT_AGG_FLAT_BUDGET"),
         "the NOT-EXEC delegation target must exist"
+    );
+}
+
+/// **Issue #281: a free of a PRE-WINDOW pointer must not lower the
+/// reported peak.**
+///
+/// `PEAK` is meant to be the high-water of bytes THIS WINDOW allocated
+/// and still holds, and it is the left-hand side of the `<= charge`
+/// assertions in `variants_allocation_gates`. An under-report is
+/// therefore a gate that passes while the property it guards is false —
+/// the worst direction, and the opposite of what the harness used to
+/// claim.
+///
+/// The walk below is the smallest thing that shows it: allocate 500 KiB
+/// inside the window, free a 1 MiB buffer allocated BEFORE it, allocate
+/// 400 KiB. The true in-window high-water is 900 KiB, because both
+/// in-window buffers are still live at the end.
+///
+/// **Why no arithmetic on sizes alone can fix this**, which is the
+/// finding rather than the fix: the allocator hooks see sizes, not
+/// identities, so a `dealloc` of a pre-window pointer is indistinguishable
+/// from a dealloc of an in-window one. A saturating counter clamps the
+/// first at zero and silently destroys live in-window bytes; a running
+/// minimum does not recover them either. The missing information is
+/// WHOSE POINTER THIS IS, so the fix supplies it — a fixed-capacity,
+/// allocation-free `(ptr, size)` table that subtracts only for pointers
+/// the window itself allocated, and IGNORES a pre-window pointer rather
+/// than clamping it.
+#[test]
+fn a_pre_window_free_cannot_lower_the_reported_peak() {
+    let _serial = serialize();
+    // Allocated BEFORE the window opens, so the window never saw it
+    // come in — only go out.
+    let pre: Vec<u8> = Vec::with_capacity(1024 * 1024);
+    let (_calls, _total, peak, keep) = measured(move || {
+        let a: Vec<u8> = Vec::with_capacity(500 * 1024);
+        drop(pre);
+        let b: Vec<u8> = Vec::with_capacity(400 * 1024);
+        // Returned, not forgotten, so both stay live for the whole
+        // window and the true high-water is their sum.
+        (a, b)
+    });
+    drop(keep);
+    assert!(
+        peak >= 900 * 1024,
+        "reported peak {peak} is below the {} bytes this window allocated and still held. A \
+         pre-window free was charged against in-window live bytes, so every `peak <= charge` \
+         gate in this file is being satisfied by an under-report.",
+        900 * 1024
     );
 }
 

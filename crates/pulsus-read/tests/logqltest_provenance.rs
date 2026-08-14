@@ -430,6 +430,7 @@ const ESCAPE_ITEMS: &[&str] = &[
     "use super::pipeline::PipelineError",
     "use pulsus_re2::ClickhouseMatchStrategy",
     "pub fn ch_string(s: &str) -> String",
+    "pub fn ch_like_contains(needle: &str) -> String",
     "pub fn ch_ident(s: &str) -> String",
     "fn anchored_match_regex(pat: &str) -> String",
     "fn unanchored_match_regex(pat: &str) -> String",
@@ -663,6 +664,44 @@ fn check_d_escape_rs_surface_is_allowlisted_and_fail_closed() {
     }
 
     assert!(errors.is_empty(), "{errors}");
+}
+
+/// Issue #450 AC3b — the pruning residual is stated where the renderer is
+/// read, not only in the issue trail.
+///
+/// `ch_like_contains` recovered granule pruning by rendering a form
+/// `ngrambf_v1` can serve. That index has order `n = 4`, so a needle
+/// shorter than four bytes produces no n-gram to test and prunes nothing;
+/// the next reader of this function is entitled to learn that from the
+/// function, and to be told the scale question belongs to issue #25 rather
+/// than to a re-introduced token prefilter. Isolating the contiguous `///`
+/// block immediately above the signature — rather than searching the whole
+/// file — is what makes the check discriminating: moving the paragraph
+/// somewhere else in `escape.rs` fails it.
+#[test]
+fn check_d8_the_like_renderer_states_its_pruning_residual() {
+    let text = read("src/logql/escape.rs");
+    const SIG: &str = "pub fn ch_like_contains(needle: &str) -> String {";
+    let (before, _) = text
+        .split_once(SIG)
+        .unwrap_or_else(|| panic!("escape.rs must declare `{SIG}`"));
+    let doc: Vec<&str> = before
+        .lines()
+        .rev()
+        .take_while(|l| l.trim_start().starts_with("///"))
+        .collect();
+    assert!(
+        !doc.is_empty(),
+        "`ch_like_contains` must carry a doc comment stating its pruning residual"
+    );
+    let doc = doc.join("\n");
+    for marker in ["ngrambf_v1", "4", "#25"] {
+        assert!(
+            doc.contains(marker),
+            "the doc block immediately above `ch_like_contains` must state its pruning \
+             residual: {marker:?} is missing from:\n{doc}"
+        );
+    }
 }
 
 /// D7 (secondary; D1–D6 cannot see other files): the exemption
@@ -1936,7 +1975,7 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// rows are all `captured`: its `eval` controls and its `eval_fail` rows
 /// were each measured on `pulsus-c400-loki` (the pinned digest) at the
 /// query text committed in the file, on the date its header records.
-const CAPTURED: usize = 1_441;
+const CAPTURED: usize = 1_449;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1959,7 +1998,7 @@ const PORTED: usize = 30;
 /// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
 /// #277 by `b21_variant_series_cap.test`'s, and issue #400's second
 /// stage by `b25_re2_reject_parity.test`'s.
-const TOTAL: usize = 1_532;
+const TOTAL: usize = 1_540;
 // corpus-counts: end (provenance-corpus-constants)
 
 // ---------------------------------------------------------------------
@@ -2250,6 +2289,7 @@ fn check_g_match_render_inventory() {
 /// contributor would reach first (issue #286 review round 1).
 const PREDICATE_ITEMS: &[&str] = &[
     "use pulsus_logql::{LineFilter, LineFilterOp}",
+    "use super::escape::ch_like_contains",
     "use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string}",
     "use super::pipeline::PipelineError",
     "const UUID_RE: &str = r_",
@@ -2275,19 +2315,12 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
-    "fn tokenize(literal: &str) -> Vec<String>",
-    "const REGEX_METACHARS: &[char] = &[ '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '\\\\', ]",
-    "fn is_plain_literal(pattern: &str) -> bool",
     "fn contains_predicate(phrase: &str) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
     "#[cfg(test)]",
     "mod tests",
     "mod tests :: use super::*",
     "mod tests :: fn regex_filter(value: &str) -> LineFilter",
-    "mod tests :: #[test]",
-    "mod tests :: fn tokenize_splits_on_non_alphanumeric_boundaries()",
-    "mod tests :: #[test]",
-    "mod tests :: fn is_plain_literal_rejects_regex_metacharacters()",
     "mod tests :: #[test]",
     "mod tests :: fn an_uncompilable_pattern_is_refused_at_the_line_filter_mint()",
     "mod tests :: #[test]",
@@ -2306,7 +2339,12 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: #[test]",
     "mod tests :: fn the_non_id_values_aggregate_takes_no_caller_input()",
     "mod tests :: #[test]",
-    "mod tests :: fn a_regex_line_filter_pairs_the_token_prefilter_with_the_exact_predicate()",
+    "mod tests :: fn a_regex_line_filter_renders_the_bare_unanchored_match()",
+    "mod tests :: #[test]",
+    "mod tests :: fn no_line_filter_op_mints_a_token_prefilter_for_any_shaped_needle()",
+    "mod tests :: fn no_line_filter_op_mints_a_token_prefilter_for_any_shaped_needle() :: const SHAPED: &[&str] = &[ _, _, _, _, _, _, _, _, _, _, _, ]",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_contains_line_filter_renders_an_escaped_like_pattern()",
 ];
 
 /// The number of MINT-shaped entries: an `fn` whose OWN signature (the last

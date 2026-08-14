@@ -3,8 +3,8 @@
 //! `regexp`/`pattern`), label filters, `line_format`, and `label_format`
 //! are opaque to the columnar store (they read the log body), so they
 //! evaluate here, over rows stage 3 already fetched — **after** line
-//! filters pushed down to the `tokenbf_v1` skip index / PREWHERE reduced
-//! the row set (features.md §2; the pushdown itself is
+//! filters pushed down to the `ngrambf_v1` body skip index / PREWHERE
+//! reduced the row set (features.md §2; the pushdown itself is
 //! [`super::plan::compile_line_filters`]'s job and is untouched by this
 //! module).
 //!
@@ -424,8 +424,8 @@ pub enum MetricRun<'a> {
 /// One alternative of a client-side line filter (M8-LQ2 `linefilter.or`).
 /// A filter's alternatives are an `or` disjunction: the stage matches iff
 /// ANY alternative matches the current line. An `ip("…")` head/alternative
-/// compiles to [`LineMatcher::Ip`] (a range test with no token prefilter,
-/// so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
+/// compiles to [`LineMatcher::Ip`] (a range test that renders no `body`
+/// predicate, so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
 /// down and it is evaluated here); a plain value compiles to `Literal`
 /// (`|=`/`!=`) or `Regex` (`|~`/`!~`).
 #[derive(Debug, Clone)]
@@ -1168,6 +1168,41 @@ impl CompiledPipeline {
         Ok(Self::from_parts(compiled, st))
     }
 
+    /// Compiles every stage CLIENT-SIDE, **including the line filters a
+    /// scan plan would render into stage-3 SQL** — the same per-stage
+    /// implementation as [`CompiledPipeline::compile`], seeded with
+    /// `pushdown_active: false`.
+    ///
+    /// For callers with **no SQL leg beneath them**. `exec.rs` must keep
+    /// using [`CompiledPipeline::compile`], which elides the pushed-down
+    /// filters so they are not evaluated twice — once by ClickHouse and
+    /// once here.
+    ///
+    /// Issue #278: its one caller is the hermetic `logqltest` corpus
+    /// runner, which executes the pipeline and no SQL. Compiling with
+    /// `compile` there made every pushable pre-`line_format` line filter
+    /// vanish, so a case of the form `{x="y"} |= "foo"` answered with
+    /// every loaded line — including the ones it asked to exclude.
+    ///
+    /// Not a new mechanism: [`CompiledPipeline::extended_with`] already
+    /// seeds the same flag `false` for the variants TAIL (issue #397),
+    /// which is never rendered into SQL either. This is the same
+    /// property applied to a whole pipeline rather than a suffix, named
+    /// rather than spelled `compile(&[]).extended_with(stages)`.
+    pub fn compile_client_side(stages: &[Stage]) -> Result<Self, PipelineError> {
+        let mut st = CompileState {
+            pushdown_active: false,
+            ..CompileState::default()
+        };
+        let mut compiled = Vec::new();
+        for stage in stages {
+            if let Some(cs) = compile_stage(stage, &mut st)? {
+                compiled.push(cs);
+            }
+        }
+        Ok(Self::from_parts(compiled, st))
+    }
+
     /// A clone of `self` with `tail` compiled and appended, RESUMING the
     /// compile state (`seen_line_format` etc.), so the result is
     /// behaviourally identical to `compile(source ++ tail)` for ANY tail
@@ -1236,6 +1271,23 @@ impl CompiledPipeline {
     /// changing an op, or that dropped either unrendered field, renders
     /// identically. Compiled regex programs are compared by their source
     /// pattern, which is the only stable identity a `regex::Regex` has.
+    /// How many `LineFilter` stages actually COMPILED — i.e. how many
+    /// will run per line, as opposed to how many the source pipeline
+    /// spelled.
+    ///
+    /// Test-support, and narrowly scoped (issue #278): a caller with no
+    /// SQL leg beneath it needs to prove nothing was elided, and the
+    /// difference between the two counts is invisible from outside —
+    /// an elided filter produces no error, just extra lines. The corpus
+    /// runner compares this against the stage list it handed in.
+    #[doc(hidden)]
+    pub fn compiled_line_filter_count(&self) -> usize {
+        self.stages
+            .iter()
+            .filter(|s| matches!(s, CompiledStage::LineFilter { .. }))
+            .count()
+    }
+
     #[doc(hidden)]
     pub fn label_filter_programs_eq(&self, other: &Self) -> bool {
         fn programs(p: &CompiledPipeline) -> Vec<&CompiledLabelFilter> {
@@ -7415,8 +7467,8 @@ mod tests {
         }
     }
 
-    /// Issue #201 regression: an `ip(…)` line filter has no token/skip-index
-    /// prefilter, so it does NOT push down — it compiles a run-stage and must
+    /// Issue #201 regression: an `ip(…)` line filter renders no `body`
+    /// predicate, so it does NOT push down — it compiles a run-stage and must
     /// therefore decline the `is_line_filter_only` fast path. If the gate
     /// wrongly reported `true`, exec would skip the client-side IP scan and the
     /// filter would silently no-op. A plain literal line filter still qualifies.

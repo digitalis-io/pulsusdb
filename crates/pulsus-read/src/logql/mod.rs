@@ -24,9 +24,11 @@
 //! [`detected_probe`] (detected-fields probing and the tail cursor) and
 //! [`post_agg`] (post-aggregation and its byte ledger), plus [`order`]
 //! (issue #406: whether a `sort`/`sort_desc`'s order sets the wire order
-//! of an instant vector). Flat, never a subdirectory: the censuses over
-//! this directory are non-recursive, so a nested module would be
-//! invisible to them.
+//! of an instant vector). Flat by convention rather than by necessity:
+//! the censuses over this directory used to be non-recursive, so a
+//! nested module was invisible to them — issue #302 made them recursive,
+//! with test-only subdirectories excluded by their own `#[cfg(test)]`
+//! `mod` declaration below.
 //!
 //! **Range-query semantics (issue #227): Loki-exact SLIDING windows.**
 //! A range metric query re-evaluates the `[range]` window `(t - range, t]` at
@@ -107,9 +109,15 @@ pub mod sql;
 pub mod template;
 /// Test-only helpers shared by more than one region module's
 /// `#[cfg(test)] mod tests` (issue #299). A SUBDIRECTORY, never a flat
-/// `.rs`: both directory censuses over `src/logql/` are non-recursive and
-/// filter on `.rs`, so a flat test-only file would be walked as production
-/// source while a subdirectory is invisible to them by construction.
+/// `.rs`.
+///
+/// Issue #302 made both directory censuses over `src/logql/` RECURSIVE,
+/// so a subdirectory is no longer invisible to them by construction —
+/// `template/` is production source and was outside both. What keeps
+/// this one out is now DERIVED from the line below rather than from its
+/// name: a census skips a subdirectory whose `mod` declaration here
+/// carries `#[cfg(test)]`. A new subdirectory that is not so declared is
+/// scanned, so fail-open is not available.
 #[cfg(test)]
 mod testkit;
 pub(crate) mod variants;

@@ -3054,7 +3054,7 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFrag
     for stage in pipeline {
         match stage {
             // Non-pushable line filters (`ip(…)` / any `or` alternative that
-            // is an `ip`) have no literal/token prefilter and are evaluated
+            // is an `ip`) render no `body` predicate at all and are evaluated
             // in the client pipeline — never emit SQL for them here (doing so
             // would drop lines the client scan must keep / re-test).
             Stage::LineFilter(lf) if is_pushable_line_filter(lf) => {
@@ -3078,11 +3078,11 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFrag
 /// `metric_pipeline_construct`; `pipeline.rs`'s compile/`line_filter_only`;
 /// `exec.rs`'s `stats` gate) so the two paths never drift.
 ///
-/// An `ip(…)` alternative is a range test over IP-shaped substrings — it has
-/// no `tokenbf_v1`/`hasToken` prefilter and cannot prune granules, so it (and
-/// any `or` group containing one) evaluates client-side. A pure literal/regex
-/// `or` group pushes down as a disjunction that preserves each disjunct's
-/// token prefilter.
+/// An `ip(…)` alternative is a range test over IP-shaped substrings — it
+/// renders no `body LIKE`/`match(body, …)` predicate the body skip indexes
+/// could prune with, so it (and any `or` group containing one) evaluates
+/// client-side. A pure literal/regex `or` group pushes down as a
+/// disjunction of the same per-alternative predicate.
 pub(crate) fn is_pushable_line_filter(lf: &LineFilter) -> bool {
     !lf.value_is_ip && lf.or_matches.iter().all(|m| !m.is_ip)
 }
@@ -4886,8 +4886,8 @@ mod tests {
             1,
             "only the pre-line_format filter pushes down"
         );
-        assert!(mp.extra_predicates[0].as_sql().contains("'a'"));
-        assert!(!mp.extra_predicates[0].as_sql().contains("'b'"));
+        assert!(mp.extra_predicates[0].as_sql().contains("body LIKE '%a%'"));
+        assert!(!mp.extra_predicates[0].as_sql().contains("'%b%'"));
         // The full ordered pipeline (including the unpushed filter) rides
         // the client spec for in-engine evaluation.
         assert_eq!(mp.client.as_ref().unwrap().pipeline.len(), 3);
@@ -5850,7 +5850,7 @@ mod tests {
             "the control must NOT be byte-identical to the baseline"
         );
         assert!(
-            control_sql.contains("hasToken"),
+            control_sql.contains("body LIKE '%tok%'"),
             "the control must render its own pushed predicate: {control_sql}"
         );
         // ...and `structured_metadata` appears ONLY in the SELECT list,

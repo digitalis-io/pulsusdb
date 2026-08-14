@@ -5,8 +5,8 @@
 //! address (`10.1.2.3` / `2001:db8::1`), a CIDR block (`10.0.0.0/8`), or an
 //! inclusive `start-end` range (`10.0.0.1-10.0.0.100`), for IPv4 **and**
 //! IPv6. All matching is client-side ([`super::pipeline`]) — an IP-range
-//! test over IP-shaped substrings has no token/skip-index prefilter, so it
-//! cannot push down (see [`super::plan::is_pushable_line_filter`]).
+//! test over IP-shaped substrings renders no `body` predicate a skip index
+//! could prune with, so it cannot push down (see [`super::plan::is_pushable_line_filter`]).
 //!
 //! Uses only `std::net` (parsing + integer comparison) and the already-present
 //! `regex` crate (the line-scan candidate extractor, compiled once per query).

@@ -5,12 +5,17 @@
 //!
 //! # What it checks — stated as narrowly as the mechanism allows
 //!
-//! Two **substring** properties of `crates/*/tests/*.rs`, and nothing
+//! Three **substring** properties of `crates/*/tests/*.rs`, and nothing
 //! more:
 //!
 //! 1. no file contains the exact byte sequence `env::var("<GATE>`, for
 //!    each of this crate's two gate constants;
-//! 2. at least [`MIGRATED_SUITE_FLOOR`] files mention `pulsus_testkit::`.
+//! 2. at least [`MIGRATED_SUITE_FLOOR`] files mention `pulsus_testkit::`;
+//! 3. every file that READS a gate is invoked by a `--test <name>` step
+//!    in `ci.yml`, or is named in `DELIBERATELY_UNWIRED` with the reason
+//!    it is not (issue #323).
+//!
+//! (1) and (2) are issue #320's and are unchanged.
 //!
 //! Property (1) is **one spelling**, not a rule about `env::var` calls.
 //! This is a substring scan over source text, not a parse, so it sees
@@ -60,7 +65,11 @@
 //! * **`#[ignore]`d tests**, which the gate never runs for anyway.
 //! * **A test inside a gated binary that reaches no guard** — the three
 //!   found during #320. Only the runtime census above sees these.
-//! * **A gated suite with no CI step at all** — issue #323.
+//! * **A gated suite with no CI step at all** — closed by issue #323,
+//!   the third property below. What that one still cannot see is
+//!   narrower and is stated at the test itself: a step that exists but
+//!   never runs, and a gated TEST inside a binary whose hermetic half
+//!   gives the binary a step.
 //! * **Anything outside `crates/`**: `xtask/` and `e2e/` are not scanned.
 
 use std::path::{Path, PathBuf};
@@ -194,4 +203,179 @@ fn at_least_the_migrated_population_still_mentions_the_testkit() {
          issue #320 migrated. A gated suite has lost its live-CI-job guard: {migrated:?}",
         migrated.len()
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #323 — property (3): a gated suite with NO CI step at all.
+//
+// This is the gap the module doc above already named as out of scope.
+// #320 built the derived walk and the population floor; what was missing
+// is that a suite nobody wired up looks exactly like a suite deliberately
+// left unwired, and "someone forgot" is then indistinguishable from a
+// decision. Same class as #272's provenance step, which shipped and never
+// ran.
+//
+// The check does not decide which absence is which — it forces the
+// decision into a committed reason string, which is what "deliberate
+// versus forgotten" means mechanically.
+// ---------------------------------------------------------------------
+
+/// Gated suites with **no** `--test <name>` step in `ci.yml`, each with
+/// the reason it has none.
+///
+/// A reason amounting to "forgotten" is not admissible: wire the suite
+/// up instead. The staleness half of the check below is what stops this
+/// becoming a list that only ever grows — an entry whose suite has since
+/// been wired up, or has been deleted, fails.
+const DELIBERATELY_UNWIRED: &[(&str, &str)] = &[
+    (
+        "live_tls",
+        "needs a TLS-enabled ClickHouse; no job starts one. The hermetic half of TLS is \
+         covered by pulsus-server/tests/tls_live.rs, which does have a step.",
+    ),
+    (
+        "nestedset_value_differential",
+        "needs a live ClickHouse AND a pinned grafana/tempo:3.0.2 in the same job; no job \
+         runs both. It is the #185 closeout hook and runs by hand against that pair.",
+    ),
+    (
+        "re2_reject_classes",
+        "MIXED, and the reason is the unit rather than the suite: its four hermetic tests do \
+         run, in the workspace lane, and only its one PULSUSDB_LOGQL_DIFF_URL probe does not. \
+         Found by this check rather than known — the reference container it wants is the \
+         logql-diff one, which lives in the nightly job, and that job runs no pulsus-re2 \
+         step. Recorded here rather than wired up because pulsus-re2 has a suite that takes \
+         minutes and the nightly job is not the place to discover that; the probe carries its \
+         own by-hand invocation in its doc comment.",
+    ),
+];
+
+/// Every suite name `ci.yml` invokes as `--test <name>`, however the
+/// command is spelled — a bare `cargo test`, or through
+/// `ci/test-summary.sh run <label> … --test <name>`.
+fn suites_with_a_ci_step() -> std::collections::BTreeSet<String> {
+    let path = workspace_root().join(".github/workflows/ci.yml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let mut out = std::collections::BTreeSet::new();
+    for (i, part) in text.split("--test").enumerate() {
+        // `split` yields the text BEFORE the first separator first.
+        if i == 0 {
+            continue;
+        }
+        if let Some(name) = part.split_whitespace().next() {
+            out.insert(name.to_string());
+        }
+    }
+    assert!(
+        out.len() > 50,
+        "only {} `--test <name>` invocations found in the workflow — the scan is no longer \
+         reading the steps, so every suite would look unwired",
+        out.len()
+    );
+    out
+}
+
+/// The spellings that make a suite GATED — i.e. that make some test in
+/// it SKIP when the gate is absent.
+///
+/// **Deliberately not the #320 population.** That one is "the source
+/// mentions `pulsus_testkit::`", which is the right floor for property
+/// (2) and the wrong population here: it includes suites that merely
+/// NAME the crate. Measured — with the #320 population this check
+/// reported `live_db_naming` as an unwired gated suite, and it is a
+/// hermetic source-scanner whose whole subject is the literal text
+/// `pulsus_testkit::test_db(`, which it carries as a search NEEDLE. It
+/// runs in the workspace lane on every push. Excusing it would have been
+/// a committed reason for a suite that never needed one.
+///
+/// So the population is the suites that READ a gate: this crate's three
+/// gate-reading entry points, plus the one gate it does not own.
+const GATE_READ_SPELLINGS: &[&str] = &[
+    "require_live_gate",
+    "live_gate_enabled",
+    "live_clickhouse_enabled",
+    "PULSUSDB_LOGQL_DIFF_URL",
+];
+
+/// Property (3): every gated test binary either has a CI step, or is
+/// named in [`DELIBERATELY_UNWIRED`] with a reason — **and** no entry in
+/// that list is stale.
+///
+/// **Stated limits**, inherited and new:
+///
+/// * the population is a SUBSTRING property over `crates/*/tests/*.rs`,
+///   exactly [`test_binaries`]'s scope — a suite gated on some third
+///   variable, or living outside `crates/`, is invisible;
+/// * the step scan sees the workflow's LITERAL `--test <name>`
+///   invocations. A suite reached through a script that composes the
+///   name, or run by a different workflow file, reads as unwired;
+/// * it says nothing about whether a step that exists actually RUNS —
+///   a step behind an `if:` that is never true passes this check. That
+///   is #272's failure and is not what this closes;
+/// * the unit is the BINARY. A binary that mixes hermetic tests with one
+///   gated test has a step as soon as the hermetic half is run by the
+///   workspace lane, so a gated test inside it can still be unreached.
+///   `re2_reject_classes` is exactly that shape and is recorded in
+///   [`DELIBERATELY_UNWIRED`] for it.
+#[test]
+fn every_gated_suite_has_a_ci_step_or_a_committed_reason() {
+    let with_step = suites_with_a_ci_step();
+    let excused: std::collections::BTreeMap<&str, &str> =
+        DELIBERATELY_UNWIRED.iter().copied().collect();
+
+    let mut gated: Vec<String> = Vec::new();
+    for path in test_binaries() {
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        if GATE_READ_SPELLINGS.iter().any(|n| src.contains(n)) {
+            gated.push(
+                path.file_stem()
+                    .expect("a .rs file has a stem")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    gated.sort();
+    assert!(
+        gated.len() > 40,
+        "only {} gated suites found — the population predicate stopped matching and every \
+         absence below would read as fine: {gated:?}",
+        gated.len()
+    );
+
+    let unwired: Vec<&String> = gated
+        .iter()
+        .filter(|s| !with_step.contains(s.as_str()))
+        .collect();
+    let unexcused: Vec<&&String> = unwired
+        .iter()
+        .filter(|s| !excused.contains_key(s.as_str()))
+        .collect();
+    assert!(
+        unexcused.is_empty(),
+        "these gated suites have no `--test <name>` step in ci.yml, so they never run \
+         anywhere and a regression in them is invisible: {unexcused:?}. Wire each up, or add \
+         it to DELIBERATELY_UNWIRED with the reason it cannot be — a reason amounting to \
+         `forgotten` is not admissible."
+    );
+
+    // The other half, and the one that keeps this from becoming a list
+    // that only grows: an excused suite that HAS a step, or that no
+    // longer exists, is a stale excuse.
+    for (suite, reason) in DELIBERATELY_UNWIRED {
+        assert!(
+            !reason.trim().is_empty(),
+            "{suite} is excused with an empty reason, which excuses nothing"
+        );
+        assert!(
+            gated.iter().any(|g| g == suite),
+            "DELIBERATELY_UNWIRED names {suite}, which is not a gated suite in this workspace \
+             — it was renamed or deleted, and the entry is now excusing nothing"
+        );
+        assert!(
+            !with_step.contains(*suite),
+            "DELIBERATELY_UNWIRED still excuses {suite}, but ci.yml now runs it. Delete the \
+             entry — a list of exemptions that can only grow stops meaning anything"
+        );
+    }
 }

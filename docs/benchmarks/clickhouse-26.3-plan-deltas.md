@@ -34,10 +34,21 @@ Two of the 79 gated shapes, plus one live fixture outside that set (row 3).
 ### Row 1 — the `<Combined skip indexes>` block
 
 **What it is.** 26.x emits an extra pseudo-block when a filter mixes AND and
-OR over skip-indexed columns. `!=` renders
+OR over skip-indexed columns. At the time of this study `!=` rendered
 `NOT (hasToken(body,…) AND hasToken(body,…) AND position(body,…) > 0)` — a
 negated conjunction, i.e. a disjunction — which is exactly that shape. The
-other three stage-3 line filters (`|=`, `|~`, `!~`) do not produce it.
+other three stage-3 line filters (`|=`, `|~`, `!~`) did not produce it.
+
+> **Superseded for `!=` by issue #450 (2026-08-13), which does not change
+> this study's conclusion.** The `hasToken` conjunction returned wrong rows
+> and was deleted; `!=` now renders `NOT (body LIKE '%…%')`, a single
+> negated predicate, and no longer carries the pseudo-block. The shape that
+> mixes AND and OR over `body` under the new rendering is the `or` group
+> (`((body LIKE …) OR (body LIKE …))`), and that is where
+> `explain_indexes.rs` now asserts `CombinedSkip::Present`. Row 1's finding
+> — the block is a reporting addition that changes no granule — is what
+> carried over; the table below is the 2026-07 measurement of the old
+> rendering, kept as the record of it.
 
 **Why it is not a regression.** Measured on the real `log_samples` DDL with a
 100 000-row corpus, `EXPLAIN indexes = 1`, all four line-filter shapes on

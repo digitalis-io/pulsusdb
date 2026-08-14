@@ -117,7 +117,10 @@ fn bytes_val<'a>(b: Vec<u8>) -> Value<'a> {
     Value::Bytes(Cow::Owned(b))
 }
 
-fn str_val<'a>(s: String) -> Value<'a> {
+/// Named apart from `template/funcs.rs`'s `str_val` (issue #302 — the
+/// census keys free functions by bare name). This one wraps an owned
+/// `String`; that one wraps a `Vec<u8>`.
+fn str_value_of<'a>(s: String) -> Value<'a> {
     Value::Str(Cow::Owned(s.into_bytes()))
 }
 
@@ -243,7 +246,7 @@ fn time_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "GoString" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e, _b| Ok(str_val(recv_time(r).go_string(e))))
+            MethodImpl::Call(|r, _a, e, _b| Ok(str_value_of(recv_time(r).go_string(e))))
         ),
         "GobEncode" => sig!(
             &[],
@@ -320,7 +323,7 @@ fn time_method(name: &str) -> Option<&'static MethodSig> {
         ),
         "String" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, e, _b| Ok(str_val(recv_time(r).string(e))))
+            MethodImpl::Call(|r, _a, e, _b| Ok(str_value_of(recv_time(r).string(e))))
         ),
         "Sub" => sig!(
             &[Time],
@@ -371,7 +374,9 @@ fn duration_method(name: &str) -> Option<&'static MethodSig> {
     match name {
         "String" => sig!(
             &[],
-            MethodImpl::Call(|r, _a, _e, _b| Ok(str_val(timefns::duration_string(recv_dur(r)))))
+            MethodImpl::Call(
+                |r, _a, _e, _b| Ok(str_value_of(timefns::duration_string(recv_dur(r))))
+            )
         ),
         "Nanoseconds" => sig!(
             &[],
@@ -481,8 +486,8 @@ fn named_int_string<'a>(
     _budget: &super::RenderBudget,
 ) -> Result<Value<'a>, String> {
     Ok(match receiver {
-        Value::Month(m) => str_val(timefns::month_string(*m)),
-        Value::Weekday(w) => str_val(timefns::weekday_string(*w)),
+        Value::Month(m) => str_value_of(timefns::month_string(*m)),
+        Value::Weekday(w) => str_value_of(timefns::weekday_string(*w)),
         _ => unreachable!("String method dispatched on a non-Month/Weekday receiver"),
     })
 }
@@ -494,7 +499,7 @@ fn location_string<'a>(
     _budget: &super::RenderBudget,
 ) -> Result<Value<'a>, String> {
     match receiver {
-        Value::Location(loc) => Ok(str_val(timefns::location_name(loc, env))),
+        Value::Location(loc) => Ok(str_value_of(timefns::location_name(loc, env))),
         _ => unreachable!("String method dispatched on a non-Location receiver"),
     }
 }

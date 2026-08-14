@@ -96,9 +96,14 @@
 //! # What this crate does not police at all
 //!
 //! A gated suite with **no CI step** never runs anywhere, so no per-test
-//! guard can notice it. Two exist today (`pulsus-clickhouse/live_tls`,
-//! `pulsus-read/nestedset_value_differential`); the checked
-//! suite-to-CI-step inventory that would close that class is issue #323.
+//! guard can notice it. That class is closed by issue #323, in
+//! `tests/gated_suite_inventory.rs`: every gated suite must either have a
+//! `--test <name>` step or be named in a committed `DELIBERATELY_UNWIRED`
+//! list with the reason it cannot have one — and an entry whose suite has
+//! since been wired up fails as stale, so the list cannot only grow.
+//! Which absences are deliberate is not decided there; it is forced into
+//! a reason string, which is what "deliberate versus forgotten" means
+//! mechanically.
 //!
 //! # Naming a test database
 //!
