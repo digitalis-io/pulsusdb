@@ -54,7 +54,12 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
   Prometheus Grafana datasources against pulsusdb (alongside the existing
   Loki-compat one), a vendored copy of the `firehose` synthetic
   logs/metrics/traces generator (`deploy/e2e/firehose/`, real-time
-  `SPEEDUP=1` against a laptop-sized 5-host fleet), a dedicated
+  `SPEEDUP=1` against a laptop-sized 5-host fleet, emitting all three
+  signals under a `service.namespace=pulsus-e2e` resource attribute so
+  Grafana sees a `service_namespace` label on all three — the metrics
+  leg needs `resource_to_telemetry_conversion` on the collector's
+  `prometheusremotewrite` exporter, which otherwise folds the attribute
+  into `job` alone), a dedicated
   otel-collector config (`deploy/e2e/otel-config.grafana.yaml`, kept
   separate from the CI-shared `otel-config.single.yaml`), and a
   provisioned dashboard (`deploy/e2e/grafana/provisioning/dashboards/`)

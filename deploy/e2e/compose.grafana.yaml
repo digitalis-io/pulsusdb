@@ -57,6 +57,12 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://172.29.0.12:4317"
       OTEL_EXPORTER_OTLP_INSECURE: "true"
       OTEL_SERVICE_NAME: "firehose"
+      # Resource-level `service.namespace`, picked up by
+      # `resource.WithFromEnv()` in firehose's `initResource` and so
+      # attached to all three signals (logs/metrics/traces) at once.
+      # Reaches Grafana as the `service_namespace` label — OTLP attribute
+      # dots become underscores in Loki/Prometheus label names.
+      OTEL_RESOURCE_ATTRIBUTES: "service.namespace=pulsus-e2e"
       # Scaled down from firehose's production-envelope defaults (600
       # hosts / 30 APM hosts / 6000 containers / 6100 custom series) to a
       # size a laptop-local single-node stack can comfortably ingest —

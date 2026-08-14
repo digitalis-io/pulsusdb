@@ -40,6 +40,15 @@ exporters:
   prometheusremotewrite/pulsus:
     endpoint: http://172.29.0.11:3100/api/v1/write
     add_metric_suffixes: false
+    # Copy OTLP resource attributes onto every series as labels. Without
+    # it this exporter folds `service.namespace`/`service.name` into
+    # `job` ("pulsus-e2e/firehose") and drops the rest, so the
+    # `service_namespace` dashboard variable has no values to pick from —
+    # logs and traces carry the attribute, metrics did not. The demo's
+    # resource set is small (service.*, telemetry.sdk.*), so the extra
+    # per-series labels are cheap here.
+    resource_to_telemetry_conversion:
+      enabled: true
 
 service:
   pipelines:
