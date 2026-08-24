@@ -26,8 +26,13 @@
 //! name/service.
 //! Tempo v3.0.2 emits `statusMessage=""` as a DISTINCT value (verified
 //! against the pinned reference, #185), so the metrics_sql builder emits it
-//! verbatim (no `arrayFilter` fold to nil) to match. Because it is
-//! env-gated, fast CI never runs it.
+//! verbatim (no `arrayFilter` fold to nil) to match. The `ci` job's
+//! aggregate `--workspace` run executes this binary, where it self-skips
+//! green; the `schema-it` job supplies its gate and runs it **enforced**
+//! (`.github/workflows/ci.yml:686-691`, no `continue-on-error`). (Issue
+//! #278 measured the claim this sentence replaced — that being env-gated
+//! kept fast CI from running the binary at all — and found it false in
+//! both of those ways.)
 //!
 //! Gate: skips unless `PULSUS_TEST_CLICKHOUSE=1` AND
 //! `PULSUSDB_COMPARE_DIFF_URL` (Tempo metrics API base, e.g.

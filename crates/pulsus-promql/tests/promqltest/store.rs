@@ -3,12 +3,55 @@
 //! `testStartTime = time.Unix(0,0)`), `clear` wipes them, and
 //! [`TestStorage::fetch`] replicates `pulsus-read::metrics::exec`'s
 //! per-selector match-and-window step against a [`QueryPlan`] — matcher
-//! semantics (`Eq`/`Neq`/`Re`/`Nre`, regex fully anchored `^(?:pat)$`,
-//! missing label matched as `""`, exactly like Prometheus's
-//! `labels.Matcher`) plus the left-open right-closed
-//! [`SelectorSpec::fetch_window`] bounds. The evaluator itself is the real
-//! `pulsus_promql::evaluate` — this store only stands in for the
-//! ClickHouse fetch layer, keeping the whole replay hermetic.
+//! semantics (`Eq`/`Neq`/`Re`/`Nre`; a `Re`/`Nre` pattern is compiled
+//! through the *same expression production uses*,
+//! `pulsus_re2::compile_user_regex_anchored(&pulsus_re2::re2_pattern_to_rust(p))`
+//! — RE2's reading of the pattern, fully anchored `^(?:pat)$` — never a
+//! bare `regex::Regex::new`, which reads `\d`/`\w`/`\s` as Unicode and
+//! rejects a malformed brace run that RE2 takes as a literal (issue #278;
+//! issue #317 is the rewrite itself). The production sites this mirrors are
+//! `crates/pulsus-read/src/metrics/labels.rs:274` (the concrete-name path)
+//! and `:620` (the cached path); a missing label is matched as `""`,
+//! exactly like Prometheus's `labels.Matcher`) plus the left-open
+//! right-closed [`SelectorSpec::fetch_window`] bounds. The evaluator itself
+//! is the real `pulsus_promql::evaluate` — this store only stands in for
+//! the ClickHouse fetch layer, keeping the whole replay hermetic.
+//!
+//! # What this stand-in substitutes, and what covers each stage instead
+//!
+//! Every stage between a corpus directive and the answer it compares. One
+//! row per hidden concern, never a compound one, so a single annotation can
+//! be true of the whole row. The annotation vocabulary is closed to three
+//! forms and machine-checked by
+//! `crates/pulsus-promql/tests/promqltest_corpus.rs::the_substitution_inventory_annotates_every_row`
+//! — see that test's own doc comment for exactly what the check proves,
+//! what it does not, and who does.
+//!
+//! // --- SUBSTITUTION INVENTORY BEGIN ---
+//!
+//! | stage / hidden concern | annotation |
+//! |---|---|
+//! | parse | Nothing substituted |
+//! | plan (`plan(&expr, params)`) | Nothing substituted |
+//! | `PlanParams` construction | Nothing substituted |
+//! | series resolution — cold / stale / warm cache fallback routing | Covered by: crates/pulsus-read/tests/live_metrics_cache.rs::a_cold_cache_falls_back_to_sql_with_the_same_result_a_warm_cache_would_give, crates/pulsus-read/tests/live_metrics_cache.rs::stale_cache_degrades_to_sql_identical_to_ground_truth_and_a_fresh_refresh, crates/pulsus-read/tests/live_metrics_cache.rs::warm_cache_and_sql_fallback_return_identical_results |
+//! | series resolution — the `labels` JSON round-trip | Covered by: crates/pulsus-read/tests/live_metrics_cache.rs::a_quote_and_backslash_bearing_label_key_round_trips_identically_on_both_paths |
+//! | series resolution — metric-name fan-out cap, `QueryTooBroad(MetricFanout)` | Covered by: crates/pulsus-read/tests/live_discovery_fallback.rs::degraded_regex_name_discovery_over_the_fanout_cap_is_query_too_broad, crates/pulsus-server/tests/prom_api_live.rs::prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution |
+//! | series resolution — info-family cardinality cap, `QueryTooBroad(InfoCardinality)` | Covered by: crates/pulsus-read/tests/live_metrics_engine.rs::info_cardinality_cap_rejects_over_cap_before_materialization, crates/pulsus-read/tests/live_metrics_engine.rs::info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path |
+//! | series resolution — `OverCardinality` → SQL fallback | Covered by: crates/pulsus-read/src/metrics/labels.rs::tests::a_match_exceeding_cache_max_series_falls_back_to_sql_not_a_giant_in_list, crates/pulsus-read/src/metrics/labels.rs::tests::multi_metric_total_series_over_cache_max_series_is_unresolvable<br>`Limit:` hermetic only — the four live metrics suites in `pulsus-read` set `cache_max_series: 50_000` explicitly and `prom_api_live.rs` inherits the same value from the config default (`crates/pulsus-config/src/model.rs:456`), so no live suite can trip this cap. |
+//! | **matcher semantics (the defect)** | Covered by: crates/pulsus-promql/tests/promqltest/corpus/proof/m7_selector_regex_re2.test, crates/pulsus-read/tests/live_metrics_engine.rs::selector_regex_matches_prometheus_on_cold_and_warm_resolution<br>`Limit:` both artifacts are created by issue #278; before it landed this row read `No suite covers this stage`. |
+//! | sample fetch — window rendering (the `unix_milli <= end` right edge) | Covered by: crates/pulsus-read/tests/live_metrics_engine.rs::count_by_job_up_is_lookback_correct_and_excludes_a_silent_series |
+//! | sample fetch — `Float64`/`Gorilla` value round-trip, ingest → storage | Covered by: crates/pulsus-write/tests/metric_ingest_float_roundtrip.rs::otlp_json_metrics_store_the_nearest_representable_f64_bits |
+//! | sample fetch — value decode, storage → engine | Covered by: crates/pulsus-read/tests/live_metrics_engine.rs::rate_end_to_end_against_real_samples<br>`Limit:` answer-level. A scan for the two bit-exactness spellings this workspace uses — `reinterpretAsUInt64` and `to_bits` — finds no read-side metric-sample assertion, only write-side ones; an ordinary `assert_eq!` on a non-NaN `f64` is itself bit-exact, so the residual gap is narrower than a bare "not bit-level" would imply. |
+//! | sample fetch — duplicate / replayed rows at the same `(metric_name, fingerprint, unix_milli)` | No suite covers this stage |
+//! | sample fetch — `max_samples` budget | Covered by: crates/pulsus-read/tests/live_metrics_engine.rs::sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap |
+//! | histogram storage — the 13 `metric_hist_samples` value columns round-trip through ClickHouse | Covered by: crates/pulsus-schema/tests/live_hist_schema.rs::native_histogram_row_round_trips_losslessly_exponential_and_nhcb, crates/pulsus-schema/tests/live_hist_schema.rs::counter_reset_hint_column_is_additive_uint8_default_zero<br>`Limit:` the first asserts 12 of the 13 columns field-for-field on two samples — an exponential one with populated zero threshold/count and **both** positive and negative spans and bucket deltas, and an NHCB one with populated `custom_values`; the second covers the 13th, `counter_reset_hint` (UInt8, `DEFAULT 0`, a row inserted without it reads back 0). |
+//! | histogram fetch — read-side decode of those columns into the engine's histogram type | Covered by: crates/pulsus-read/tests/live_metrics_engine.rs::dual_read_merges_and_decodes_histogram_samples_end_to_end |
+//! | histogram ingest — the writer's encode of a `NativeHistogram` into those columns | Covered by: crates/pulsus-write/tests/live_metric_hist_writer.rs::native_exp_histogram_round_trips_absolute_counts_through_clickhouse<br>`Limit:` asserts schema, count, sum, positive spans, positive bucket deltas and the reset hint; zero threshold, zero count, the negative fields and `custom_values` are left at their defaults and are not asserted, so the writer emitting a populated negative side or NHCB custom values is uncovered. |
+//! | evaluate (`evaluate(&query_plan, &data)`) | Nothing substituted |
+//! | response marshalling (`pulsus-server` JSON) | Covered by: crates/pulsus-server/tests/api_conformance.rs::prom_query_string_literal_renders_result_type_string_live_case, crates/pulsus-server/tests/prom_api_live.rs::prom_api_serves_discovery_and_query_against_real_clickhouse<br>`Limit:` the first pins the JSON envelope byte-exactly on a **selector-free** string query — the *query* touches no tables, but the *setup* is real: `spawn_ready` (`crates/pulsus-server/tests/api_conformance.rs:299-321`) spawns the actual `pulsusdb` binary against a live ClickHouse database and blocks until `/ready` returns 200. The real result-body path is the second citation. |
+//!
+//! // --- SUBSTITUTION INVENTORY END ---
 
 use std::collections::BTreeMap;
 
@@ -189,6 +232,9 @@ impl TestStorage {
         let mut data = SeriesData::new();
         for spec in &plan.selectors {
             let (lower_excl, upper_incl) = spec.fetch_window(&plan.params);
+            // Issue #278: compiled ONCE per selector, before the scan.
+            let name_regexes = compile_matcher_regexes(&spec.name_matchers)?;
+            let regexes = compile_matcher_regexes(&spec.matchers)?;
             let mut fetched = Vec::new();
             for (idx, stored) in self.series.iter().enumerate() {
                 let name = stored.labels.get("__name__").map(String::as_str);
@@ -198,19 +244,19 @@ impl TestStorage {
                     continue;
                 }
                 let mut matched = true;
-                for m in &spec.name_matchers {
+                for (m, re) in spec.name_matchers.iter().zip(&name_regexes) {
                     // Absent `__name__` matches as `""`, like any label.
-                    if !matcher_matches(&m.op, &m.value, name.unwrap_or(""))? {
+                    if !matcher_matches(re.as_ref(), &m.op, &m.value, name.unwrap_or("")) {
                         matched = false;
                         break;
                     }
                 }
-                for m in &spec.matchers {
+                for (m, re) in spec.matchers.iter().zip(&regexes) {
                     if !matched {
                         break;
                     }
                     let value = stored.labels.get(&m.key).map(String::as_str).unwrap_or("");
-                    if !matcher_matches(&m.op, &m.value, value)? {
+                    if !matcher_matches(re.as_ref(), &m.op, &m.value, value) {
                         matched = false;
                     }
                 }
@@ -356,20 +402,57 @@ fn readback_hints(samples: &[Sample]) -> Vec<CounterResetHint> {
     out
 }
 
-/// Prometheus matcher semantics: regexes fully anchored (`^(?:pat)$`), a
+/// Issue #278: the ONE expression production uses, and the only place in
+/// this driver that compiles a *user* selector pattern.
+///
+/// Mirrors `crates/pulsus-read/src/metrics/labels.rs:274` (the
+/// concrete-name path) and `:620` (the cached path) exactly:
+/// `compile_user_regex_anchored` supplies the `^(?:pat)$` anchoring and
+/// the shared compile budget, and `re2_pattern_to_rust` supplies RE2's
+/// reading of the pattern (issue #317). Do NOT pre-anchor here — the
+/// anchoring is inside `compile_user_regex_anchored`.
+///
+/// Before this existed the store called `regex::Regex::new` on the raw
+/// pattern, a second, private implementation of matcher semantics that
+/// disagreed with Prometheus *and* with our own engine: it read
+/// `\d`/`\w`/`\s` as Unicode classes (so `a\wb` matched `aµb`) and
+/// rejected `a{,3}`, which RE2 takes as the literal text `a{,3}`.
+fn compile_selector_regex(pattern: &str) -> Result<regex::Regex, String> {
+    pulsus_re2::compile_user_regex_anchored(&pulsus_re2::re2_pattern_to_rust(pattern))
+        .map_err(|e| format!("invalid selector regex {pattern:?}: {e}"))
+}
+
+/// Compiles the `Re`/`Nre` patterns of `matchers` once, in matcher order —
+/// `None` for `Eq`/`Neq`, which need no regex. Called once per selector by
+/// [`TestStorage::fetch`], never once per stored series (before issue #278
+/// the compile sat inside the per-series scan, `O(series x matchers)`).
+fn compile_matcher_regexes(
+    matchers: &[pulsus_model::LabelMatcher],
+) -> Result<Vec<Option<regex::Regex>>, String> {
+    matchers
+        .iter()
+        .map(|m| match m.op {
+            MatchOp::Eq | MatchOp::Neq => Ok(None),
+            MatchOp::Re | MatchOp::Nre => compile_selector_regex(&m.value).map(Some),
+        })
+        .collect()
+}
+
+/// Prometheus matcher semantics against one label value. `re` is the
+/// pre-compiled pattern for this matcher (`None` for `Eq`/`Neq`); a
 /// missing label matches as the empty string (handled by the caller).
-fn matcher_matches(op: &MatchOp, pattern: &str, value: &str) -> Result<bool, String> {
+fn matcher_matches(re: Option<&regex::Regex>, op: &MatchOp, pattern: &str, value: &str) -> bool {
     match op {
-        MatchOp::Eq => Ok(value == pattern),
-        MatchOp::Neq => Ok(value != pattern),
+        MatchOp::Eq => value == pattern,
+        MatchOp::Neq => value != pattern,
         MatchOp::Re | MatchOp::Nre => {
-            let re = regex::Regex::new(&format!("^(?:{pattern})$"))
-                .map_err(|e| format!("invalid selector regex {pattern:?}: {e}"))?;
-            let is_match = re.is_match(value);
-            Ok(match op {
+            let is_match = re
+                .expect("compile_matcher_regexes supplies a regex for every Re/Nre matcher")
+                .is_match(value);
+            match op {
                 MatchOp::Re => is_match,
                 _ => !is_match,
-            })
+            }
         }
     }
 }
@@ -641,5 +724,66 @@ mod tests {
             vec![120_000]
         );
         assert_eq!(fetched[0].start_ts, Some(vec![119_000]));
+    }
+
+    /// Issue #278: the vertical-tab case, which cannot live in a `.test`
+    /// corpus file without an invisible control byte in the diff.
+    ///
+    /// RE2's `\s` is exactly `[\t\n\f\r ]` — five characters, **no**
+    /// U+000B VERTICAL TAB (`re2/parse.cc`'s perl class table; our own
+    /// rewrite pins the same set, see
+    /// `crates/pulsus-re2/src/re2_syntax.rs`). The Rust `regex` crate's
+    /// `\s` is the Unicode `White_Space` property, which DOES include
+    /// U+000B. So `a\sb` must NOT match `a\u{000B}b`.
+    ///
+    /// The two live U+00A0 / U+0020 cases beside it are in
+    /// `corpus/proof/m7_selector_regex_re2.test`; this one is here only
+    /// because the byte is unreviewable in a text fixture.
+    #[test]
+    fn a_vertical_tab_is_not_re2_whitespace() {
+        let re = compile_selector_regex(r"a\sb").expect(r"`a\sb` compiles");
+        assert!(
+            !re.is_match("a\u{000B}b"),
+            "RE2's \\s is [\\t\\n\\f\\r ] and excludes U+000B VERTICAL TAB; the Rust \
+             crate's Unicode \\s would match it"
+        );
+        // The four characters RE2's `\s` DOES accept in the middle,
+        // plus the plain space, all match — so the assertion above is a
+        // statement about U+000B, not about a regex that matches nothing.
+        for c in ['\t', '\n', '\u{000C}', '\r', ' '] {
+            assert!(
+                re.is_match(&format!("a{c}b")),
+                "RE2's \\s must accept {:?}",
+                c
+            );
+        }
+    }
+
+    /// Issue #278, the same divergence on the other three constructs, as
+    /// unit-level companions to the corpus rows: `\w`/`\d` are ASCII-only
+    /// under RE2, and a malformed brace run is a literal, not a
+    /// repetition (which the Rust crate rejects outright).
+    #[test]
+    fn perl_classes_are_ascii_and_a_malformed_brace_run_is_a_literal() {
+        let w = compile_selector_regex(r"a\wb").expect("compiles");
+        assert!(w.is_match("awb") && w.is_match("a3b"));
+        assert!(
+            !w.is_match("a\u{00B5}b"),
+            "U+00B5 MICRO SIGN is not ASCII \\w"
+        );
+        assert!(!w.is_match("a\u{0663}b"), "U+0663 is not ASCII \\w");
+
+        let d = compile_selector_regex(r"a\db").expect("compiles");
+        assert!(d.is_match("a3b"));
+        assert!(
+            !d.is_match("a\u{0663}b"),
+            "U+0663 ARABIC-INDIC DIGIT THREE is not ASCII \\d"
+        );
+
+        // `regex::Regex::new("^(?:a{,3})$")` — what this store used to do
+        // — is an ERROR here, which aborted the whole corpus file.
+        let brace = compile_selector_regex("a{,3}").expect("RE2 reads `a{,3}` as a literal");
+        assert!(brace.is_match("a{,3}"));
+        assert!(!brace.is_match("aaa"), "it is a literal, not a repetition");
     }
 }

@@ -39,7 +39,13 @@
 //!
 //! The divergent classes are NOT rigged to pass and NOT silently skipped:
 //! a gated run today fails loudly on classes 2 and 3 with the two #185
-//! resolution paths named. Because it is env-gated, fast CI never runs it.
+//! resolution paths named. No workflow supplies its gate: the `ci` job's
+//! aggregate `--workspace` run does execute this binary, where it
+//! self-skips green, so CI never observes a result. (Issue #278 measured
+//! the claim this sentence replaced — that being env-gated kept fast CI
+//! from running the binary at all — and found it false:
+//! `ci/nextest.toml`'s `[profile.ci]` sets no `default-filter`, so
+//! `--workspace` selects every test binary.)
 //!
 //! **#185 activation.** #185 flips this leg to a BLOCKING close condition.
 //! It cannot close at 100% parity until classes 2 and 3 are resolved by
