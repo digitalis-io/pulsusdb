@@ -3624,3 +3624,240 @@ async fn a_nameless_selector_with_an_uncompilable_matcher_is_bad_data_not_execut
 
     drop_database(&bootstrap, db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #278: selector-regex matcher semantics, on BOTH resolution paths.
+// ---------------------------------------------------------------------
+
+/// The nine `p278` label values, with the sample value that identifies
+/// each. Chosen adversarially at the FRAGMENT level: each is a trap for
+/// one Perl class as the Rust `regex` crate reads it and RE2 does not,
+/// plus a brace run that is not a well-formed repetition.
+///
+/// ```text
+///   U+00B5 MICRO SIGN            Unicode \w, NOT ASCII \w
+///   U+0663 ARABIC-INDIC THREE    Unicode \d, NOT ASCII \d
+///   U+00A0 NO-BREAK SPACE        Unicode \s, NOT RE2 \s
+///   U+000B VERTICAL TAB          Unicode \s, NOT RE2 \s
+///   a{,3}                        RE2 reads the literal text; the Rust
+///                                crate rejects the pattern outright
+/// ```
+const P278_FIXTURE: &[(&str, f64)] = &[
+    ("a\u{00B5}b", 1.0),
+    ("a\u{0663}b", 2.0),
+    ("a\u{00A0}b", 3.0),
+    ("a\u{000B}b", 4.0),
+    ("ab", 5.0),
+    ("a{,3}", 6.0),
+    ("awb", 7.0),
+    ("a3b", 8.0),
+    ("a b", 9.0),
+];
+
+/// Issue #278: the four selectors and the fifth negation, with the answers
+/// captured from `prom/prometheus:v3.13.0` (image digest
+/// `sha256:0e698e35e50d1ddc2d11a4a55b089fe62eb71358a5c204dfafd21bdf8ffe04b8`,
+/// self-reporting revision `40af9c2cdc0eda00f3622e867a27f6359f7295f3` —
+/// the commit `promqltest`'s `upstream-manifest.json` pins) over the same
+/// nine-series fixture, read back through `GET /api/v1/query`, 2026-08-24.
+///
+/// The expectation is the `lbl` value of every series the reference
+/// returned, sorted. Never our own output.
+fn p278_expectations() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        (r#"p278{lbl=~"a\\wb"}"#, vec!["a3b", "awb"]),
+        (r#"p278{lbl=~"a\\db"}"#, vec!["a3b"]),
+        (r#"p278{lbl=~"a\\sb"}"#, vec!["a b"]),
+        (r#"p278{lbl=~"a{,3}"}"#, vec!["a{,3}"]),
+        (
+            r#"p278{lbl!~"a\\wb"}"#,
+            vec![
+                "a b",
+                "a\u{000B}b",
+                "a\u{00A0}b",
+                "a\u{00B5}b",
+                "a\u{0663}b",
+                "a{,3}",
+                "ab",
+            ],
+        ),
+    ]
+}
+
+/// Issue #278 (the sibling-harness audit). The promqltest store — the
+/// PromQL corpus's stand-in for this fetch layer — carried a second,
+/// private implementation of matcher semantics
+/// (`regex::Regex::new(&format!("^(?:{pattern})$"))`) that disagreed with
+/// Prometheus AND with the production paths below. The corpus is
+/// structurally unable to reach a line of this crate — `cargo tree -p
+/// pulsus-promql -e normal,dev` shows no `pulsus-read` — so no corpus row
+/// can gate the fetch layer's matcher semantics. This test is that gate.
+///
+/// It runs the SAME five selectors on BOTH resolution paths, because
+/// #335's lesson is that a rule read off one layer can be overridden
+/// below it:
+///
+/// * **cold** — the [`LabelCache`] is never refreshed, so
+///   [`pulsus_read::FallbackReason::ColdCache`] routes the selector into
+///   the `metric_series` sub-query and **ClickHouse's own RE2** renders
+///   the matcher;
+/// * **warm** — the cache is refreshed and the in-process rewrite
+///   (`labels.rs:620`, `compile_user_regex_anchored(&re2_pattern_to_rust
+///   (p))`) answers.
+///
+/// Both must produce the reference's answer, byte for byte on the `lbl`
+/// value set.
+#[tokio::test]
+async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_engine_selector_regex");
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    let series: Vec<SeedSeriesRow> = P278_FIXTURE
+        .iter()
+        .enumerate()
+        .map(|(i, (lbl, _))| SeedSeriesRow {
+            metric_name: "p278".to_string(),
+            fingerprint: i as u64 + 1,
+            unix_milli: recent_bucket,
+            // Built through serde_json, not a hand-written literal: the
+            // fixture carries a control character and two non-ASCII
+            // spaces, and the `labels` column must hold exactly what
+            // `JSONExtractString` will hand back.
+            labels: serde_json::json!({ "lbl": lbl }).to_string(),
+        })
+        .collect();
+    let samples: Vec<SeedSampleRow> = P278_FIXTURE
+        .iter()
+        .enumerate()
+        .map(|(i, (_, v))| SeedSampleRow {
+            metric_name: "p278".to_string(),
+            fingerprint: i as u64 + 1,
+            unix_milli: recent_bucket,
+            value: *v,
+        })
+        .collect();
+    seed_series(&client, &series).await;
+    seed_samples(&client, &samples).await;
+
+    let params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+        step_ms: 0,
+    };
+
+    for warm in [false, true] {
+        let leg = if warm {
+            "WARM/label-cache"
+        } else {
+            "COLD/sql-fallback"
+        };
+        let cache_client = ChClient::new(test_config(db))
+            .await
+            .expect("connect (cache client)");
+        let engine_client = ChClient::new(test_config(db))
+            .await
+            .expect("connect (engine client)");
+        let cache = Arc::new(LabelCache::new(
+            cache_client,
+            cache_config(db, 24 * 3_600_000),
+        ));
+        if warm {
+            cache.refresh().await.expect("refresh");
+            assert!(cache.is_warm(), "the warm leg must resolve in-process");
+        } else {
+            assert!(
+                !cache.is_warm(),
+                "the cold leg must degrade to the metric_series sub-query, so ClickHouse's \
+                 RE2 renders the matcher"
+            );
+        }
+        let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+
+        for (query, want) in p278_expectations() {
+            let expr = parse(query).unwrap_or_else(|e| panic!("parse {query}: {e}"));
+            let (result, _annotations, explain) = engine
+                .query_explained(&expr, &params)
+                .await
+                .unwrap_or_else(|e| panic!("[{leg}] {query}: {e}"));
+
+            if !warm {
+                // The cold leg must actually be the degraded path: the
+                // matcher is inside the `metric_series` sub-query, which
+                // is what makes ClickHouse's RE2 the thing under test.
+                let fetch = stage(&explain, "sample_fetch");
+                assert!(
+                    fetch
+                        .sql
+                        .contains("fingerprint IN (\nSELECT fingerprint\nFROM metric_series"),
+                    "[{leg}] {query}: expected the SqlFallback sub-query shape, got: {}",
+                    fetch.sql
+                );
+            }
+
+            let QueryResult::Vector(v) = result else {
+                panic!("[{leg}] {query}: expected an instant vector");
+            };
+            let mut got: Vec<(String, f64)> = v
+                .iter()
+                .map(|s| {
+                    let lbl = s
+                        .labels
+                        .iter()
+                        .find(|(k, _)| k == "lbl")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| panic!("[{leg}] {query}: a series without `lbl`"));
+                    (lbl, s.value)
+                })
+                .collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut want_pairs: Vec<(String, f64)> = want
+                .iter()
+                .map(|lbl| {
+                    let value = P278_FIXTURE
+                        .iter()
+                        .find(|(l, _)| l == lbl)
+                        .map(|(_, v)| *v)
+                        .expect("every expected label is in the fixture");
+                    ((*lbl).to_string(), value)
+                })
+                .collect();
+            // Both sides sorted by the SAME comparator: the expectation is
+            // the reference's series SET, not its response order (an
+            // instant vector is unordered).
+            want_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            println!(
+                "[{leg}] {query} -> {:?}",
+                got.iter()
+                    .map(|(l, v)| format!("{}={v}", l.escape_debug()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                got,
+                want_pairs,
+                "[{leg}] {query} must answer exactly what prom/prometheus:v3.13.0 answered \
+                 over this fixture. Escaped: got {:?}, want {:?}",
+                got.iter()
+                    .map(|(l, v)| (l.escape_debug().to_string(), *v))
+                    .collect::<Vec<_>>(),
+                want_pairs
+                    .iter()
+                    .map(|(l, v)| (l.escape_debug().to_string(), *v))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    drop_database(&bootstrap, db).await;
+}
