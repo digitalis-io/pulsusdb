@@ -15,4 +15,3 @@
 #
 # Lines beginning with `#` are comments; blank lines are ignored.
 
-278 the TraceQL and PromQL corpus-harness audit is still owed - #278 found the LogQL harness compiling past the pushdown path it reported a pass rate for, and whether the sibling harnesses do the same is unanswered
