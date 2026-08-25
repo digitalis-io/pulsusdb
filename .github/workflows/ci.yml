@@ -1936,6 +1936,44 @@ jobs:
             --ignored --nocapture --test-threads=1 \
             zz_large_scale_cell_stays_inside_the_model
 
+  # Issue #262 (AC 7): the ONLY gate that measures the shipped
+  # configuration — release frames on a pinned 2 MiB stack (tokio's worker
+  # default), for each of the fifteen shapes whose abort floors were
+  # measured for that issue. Each shape is a pair: it must survive
+  # `parse -> plan -> evaluate` at `MAX_EXPR_DEPTH`, and the same shape at
+  # depth 4,000 must overflow, so the positive leg cannot pass because
+  # frames got smaller rather than because the cap holds.
+  #
+  # Nightly/dispatch only, and the reason is not budget: there is no
+  # `--release` leg anywhere else in this file, and in a DEBUG build the
+  # positive legs abort at depth 250 (debug's worst-shape floor is 70), so
+  # this cannot ride the `ci` job. A PR can therefore go green without the
+  # production margin having been measured — stated here rather than
+  # papered over with a debug-profile gate that would prove nothing about
+  # a 2 MiB release binary.
+  promql-depth-stack-release:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+
+      - name: PromQL depth-cap pinned-stack gate (release, 2 MiB)
+        env:
+          CARGO_INCREMENTAL: "0"
+          PULSUS_PROMQL_DEPTH_STACK: "1"
+        run: |
+          cargo test --release -p pulsus-promql --test promql_depth_stack -- \
+            --nocapture --test-threads=1
+
   # Issue #16, docs/schemas.md §9's two-tier model, Tier 1 distributed leg:
   # captures per-shard system.query_log + EXPLAIN PIPELINE evidence for the
   # logs-family shard-locality claims (docs/schemas.md §7,

@@ -641,6 +641,35 @@ GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 
 One boundary remains, and it is storage's, not the cache's: ClickHouse compiles a matcher regex only when it evaluates `match()` on a row, so a selector naming a metric with **no stored rows in the queried window** is answered `200` with an empty result on every path — degraded and warm alike — whatever the pattern.
 
+### 3.5 Limits and accepted divergences
+
+PulsusDB's metrics surface has one deliberate divergence from Prometheus that a client can see. It lives here rather than in a `docs/benchmarks/metrics-differential-ledger.md`, because creating a whole ledger file for a single row is over-build: **if a second metrics divergence appears, that is when this graduates this row to its own file.**
+
+| Divergence | Limit | Rule | Response | Prometheus v3.13.0 | Why we diverge |
+|---|---|---|---|---|---|
+| `promql-expression-depth-cap` | `250` | Reject a query iff the **depth of the tree the parser built** exceeds the limit. Depth is measured after parsing and before anything plans or evaluates, so a flat chain of N terms — which the parser reads in a loop at grammar-nesting depth 1 — is depth N, and 250 `+` terms are accepted while 250 nested parentheses are refused. | `400` `bad_data`, body `query expression nesting depth <measured> exceeds the 250 level limit`. The message names **both** the depth measured and the limit, so anyone who hits it can tell a cap from a bug. | **No limit of any kind.** `promql/parser/lex.go`'s `parenDepth` is an unbalanced-paren counter tested only for `< 0`; `promql/parser/parse.go` has no input-length guard; `web/api/v1/api.go` has no `MaxBytesReader` (read at `40af9c2cdc0eda00f3622e867a27f6359f7295f3`, the pinned `v3.13.0`). Measured against `prom/prometheus:v3.13.0`, the exact query PulsusDB now refuses is a **`200`** there, and so is the same shape at 20,000 terms; the reference only stops at 50,000, on its ordinary two-minute query timeout. Go grows its goroutine stacks, so it can. | A Rust stack overflow **aborts the process** and cannot be caught, so one deep-enough request kills every other in-flight query on the node — a failure whose blast radius is the whole node rather than the caller. Measured through the HTTP surface on the release binary: `label_replace` nesting aborts at **888** levels (34,634 bytes, POST) and `1 + 1 + …` at **1,220** (4,877 bytes, a plain `GET`). The cap is 250, a **3.55×** margin on that floor, against a Prometheus conformance corpus whose deepest expression across all 2,183 `eval` queries is **10**. |
+
+**The same cap governs `match[]`** on `/api/v1/series`, `/api/v1/labels` and `/api/v1/label/{name}/values`. An over-deep `match[]` value was previously a `422 execution` here; it is now `400 bad_data`, which moves this surface **toward** the reference — Prometheus parses `match[]` with a selector-only parser, so a non-selector value is a parse-time `400` there too.
+
+**What this cap does not cover.** The cap is measured on the *parsed tree*, so it exists only once `promql_parser::parser::parse` has returned. Parsing itself recurses on **grammar nesting**, a pre-existing property the vendored parser documents in its own source (`vendor/promql-parser/src/parser/ast.rs:2318-2329`). The quantity that drives it is the **number of nesting levels**, not the query's size. Measured on right-deep expression nesting — `1 + (1 + (1 + … 1 …))` — release build, 2 MiB stack, `parse` only:
+
+| nesting levels | `parse` |
+|---|---|
+| 100,000 | returns |
+| 150,000 | **stack overflow; the process aborts** |
+
+**The threshold lies in `(100,000, 150,000]` levels and is deliberately not established.** Bisecting it requires repeatedly parsing hundreds of thousands of nesting levels, and its value changes no decision recorded here.
+
+**Byte counts belong to a spelling, never to the residual.** The same nesting is `6N + 1` bytes written as `1 + (…` and `4N + 1` written as `1+(…`. The smallest input observed to abort is **600,001 bytes**, at the tighter of the two spellings. **No lower bound on size is claimed** — a denser spelling, or a different nesting construct, could abort on less. Do not read any byte figure here as a size floor below which input is safe.
+
+A 2 MiB `DefaultBodyLimit` (axum's default; nothing in this workspace calls `DefaultBodyLimit` at all, so no route raises or lowers it) caps how many levels can arrive at once — **at least 524,287** of them, at the tighter of the two spellings measured (`4N + 1` bytes; the looser `6N + 1` admits 349,525). It is a ceiling on input, not a threshold on behaviour: the largest query that fits at either spelling aborts.
+
+**The trigger is nesting through the expression rule — not length, and not tree depth.** Controls, same build and stack: `((((… 1 …))))` at 400,000 levels (800,001 bytes) parses and returns; `- - - … - 1` at 1,000 unary operators (2,001 bytes) parses and returns, folding to a tree of depth **1**.
+
+**Every figure above is this toolchain, target and profile** (release, 2 MiB stack); a compiler change moves all of them.
+
+**So:** this cap closes every *width* vector — the flat chains this issue was filed for, including the 4,881-byte `GET` — because those parse iteratively and the guard runs on the finished tree. It does not close deep grammar nesting, which aborts inside the parser before any after-parse guard exists to run. That residual is pre-existing, is not introduced by this change, and is closed only by converting the parser's grammar recursion.
+
 ---
 
 ## 4. Traces query API
