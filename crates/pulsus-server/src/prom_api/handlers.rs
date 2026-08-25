@@ -583,9 +583,7 @@ mod tests {
     /// are ignored by `params::get`, so one string drives all 17 pairs.
     fn every_param(expr: &str) -> String {
         let e = urlencode(expr);
-        format!(
-            "query={e}&match%5B%5D={e}&start=1700000000&end=1700000060&step=10&time=1700000000"
-        )
+        format!("query={e}&match%5B%5D={e}&start=1700000000&end=1700000060&step=10&time=1700000000")
     }
 
     /// Drives one `(path, method)` pair through the REAL router with the
@@ -695,8 +693,7 @@ mod tests {
                 assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {method}");
                 assert_eq!(json["errorType"], "bad_data", "{path} {method}");
                 assert_eq!(
-                    json["error"],
-                    "query expression nesting depth 251 exceeds the 250 level limit",
+                    json["error"], "query expression nesting depth 251 exceeds the 250 level limit",
                     "{path} {method}"
                 );
                 assert_eq!(content_type, "application/json", "{path} {method}");
@@ -785,26 +782,192 @@ mod tests {
         // Byte lengths are pinned so a generator edited into a
         // paraphrase reddens rather than quietly measuring something
         // else.
-        let cases: Vec<(&str, &str, &str, String, usize, StatusCode, &str, Option<&str>)> = vec![
+        struct Case {
+            id: &'static str,
+            path: &'static str,
+            method: &'static str,
+            query: String,
+            bytes: usize,
+            status: StatusCode,
+            error_type: &'static str,
+            error: Option<&'static str>,
+        }
+        let case = |id, path, method, query: String, bytes, status, error_type, error| Case {
+            id,
+            path,
+            method,
+            query,
+            bytes,
+            status,
+            error_type,
+            error,
+        };
+
+        let cases: Vec<Case> = vec![
             // id, path, method, query, bytes, status, errorType, error
-            ("Q1 boundary accepted", "/api/v1/query", "GET", bin_chain(250), 997, UNAVAILABLE, "unavailable", None),
-            ("Q2 one level deeper", "/api/v1/query", "GET", bin_chain(251), 1001, BAD, "bad_data", Some(TOO_DEEP_251)),
-            ("Q3 terms are not depth", "/api/v1/query", "POST", sum_chain(249), 2875, UNAVAILABLE, "unavailable", None),
-            ("Q3 one term more", "/api/v1/query", "POST", sum_chain(250), 2887, BAD, "bad_data", Some(TOO_DEEP_251)),
-            ("Q4 parens cost a level", "/api/v1/query", "GET", paren(249), 499, UNAVAILABLE, "unavailable", None),
-            ("Q4 one paren more", "/api/v1/query", "GET", paren(250), 501, BAD, "bad_data", Some(TOO_DEEP_251)),
-            ("Q5 2001 bytes, depth 1", "/api/v1/query", "GET", unary(1000), 2001, UNAVAILABLE, "unavailable", None),
-            ("Q6 least-headroom shape", "/api/v1/query", "POST", label_replace(249), 9713, UNAVAILABLE, "unavailable", None),
-            ("Q6 one level more", "/api/v1/query", "POST", label_replace(250), 9752, BAD, "bad_data", Some(TOO_DEEP_251)),
-            ("Q7 the #255 datapoint", "/api/v1/query", "GET", or_chain(177), 2541, UNAVAILABLE, "unavailable", None),
-            ("Q8 the issue's own query", "/api/v1/query", "GET", bin_chain(1221), 4881, BAD, "bad_data", Some("query expression nesting depth 1221 exceeds the 250 level limit")),
-            ("Q9 series", "/api/v1/series", "POST", bin_chain(251), 1001, BAD, "bad_data", Some(TOO_DEEP_251)),
-            ("Q9 labels", "/api/v1/labels", "GET", bin_chain(251), 1001, BAD, "bad_data", Some(TOO_DEEP_251)),
-            ("Q9 label values", "/api/v1/label/{name}/values", "GET", bin_chain(251), 1001, BAD, "bad_data", Some(TOO_DEEP_251)),
-            ("Q11 empty query", "/api/v1/query", "POST", String::new(), 0, BAD, "bad_data", Some("no expression found in input")),
+            case(
+                "Q1 boundary accepted",
+                "/api/v1/query",
+                "GET",
+                bin_chain(250),
+                997,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q2 one level deeper",
+                "/api/v1/query",
+                "GET",
+                bin_chain(251),
+                1001,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q3 terms are not depth",
+                "/api/v1/query",
+                "POST",
+                sum_chain(249),
+                2875,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q3 one term more",
+                "/api/v1/query",
+                "POST",
+                sum_chain(250),
+                2887,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q4 parens cost a level",
+                "/api/v1/query",
+                "GET",
+                paren(249),
+                499,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q4 one paren more",
+                "/api/v1/query",
+                "GET",
+                paren(250),
+                501,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q5 2001 bytes, depth 1",
+                "/api/v1/query",
+                "GET",
+                unary(1000),
+                2001,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q6 least-headroom shape",
+                "/api/v1/query",
+                "POST",
+                label_replace(249),
+                9713,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q6 one level more",
+                "/api/v1/query",
+                "POST",
+                label_replace(250),
+                9752,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q7 the #255 datapoint",
+                "/api/v1/query",
+                "GET",
+                or_chain(177),
+                2541,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q8 the issue's own query",
+                "/api/v1/query",
+                "GET",
+                bin_chain(1221),
+                4881,
+                BAD,
+                "bad_data",
+                Some("query expression nesting depth 1221 exceeds the 250 level limit"),
+            ),
+            case(
+                "Q9 series",
+                "/api/v1/series",
+                "POST",
+                bin_chain(251),
+                1001,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q9 labels",
+                "/api/v1/labels",
+                "GET",
+                bin_chain(251),
+                1001,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q9 label values",
+                "/api/v1/label/{name}/values",
+                "GET",
+                bin_chain(251),
+                1001,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q11 empty query",
+                "/api/v1/query",
+                "POST",
+                String::new(),
+                0,
+                BAD,
+                "bad_data",
+                Some("no expression found in input"),
+            ),
         ];
 
-        for (id, path, method, query, bytes, status, error_type, error) in cases {
+        for Case {
+            id,
+            path,
+            method,
+            query,
+            bytes,
+            status,
+            error_type,
+            error,
+        } in cases
+        {
             assert_eq!(query.len(), bytes, "{id}: generated query length");
             let (got, content_type, json) = drive(path, method, &every_param(&query)).await;
             assert_eq!(got, status, "{id}: {json}");

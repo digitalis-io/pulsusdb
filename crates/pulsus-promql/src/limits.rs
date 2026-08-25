@@ -189,7 +189,6 @@ pub(crate) fn dismantle(expr: Expr) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,12 +494,7 @@ mod tests {
             ("or_chain", or_chain(250), 250, 4),
             ("sum_chain", sum_chain(249), 250, 4),
             ("paren_nesting", paren_nesting(249), 250, 4),
-            (
-                "label_replace_nesting",
-                label_replace_nesting(249),
-                250,
-                8,
-            ),
+            ("label_replace_nesting", label_replace_nesting(249), 250, 8),
             ("right_deep_nesting", right_deep_nesting(124), 249, 128),
         ];
         for (shape, query, want_depth, want_capacity) in rows {

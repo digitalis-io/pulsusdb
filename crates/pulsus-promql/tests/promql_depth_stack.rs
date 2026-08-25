@@ -64,7 +64,9 @@ const CONTROL_DEPTH: usize = 4_000;
 /// Each builder takes the TREE DEPTH it must produce, not a term or
 /// nesting count — the two differ per shape, and getting that wrong
 /// silently is exactly what the boundary oracle below catches.
-const SHAPES: &[(&str, fn(usize) -> String)] = &[
+type Shape = (&'static str, fn(usize) -> String);
+
+const SHAPES: &[Shape] = &[
     ("lr", lr),
     ("call", call),
     ("clamp", clamp),
@@ -88,7 +90,12 @@ fn nest(depth: usize, open: &str, close: &str, leaf: &str) -> String {
 }
 
 fn lr(depth: usize) -> String {
-    nest(depth, "label_replace(", r#", "d", "$1", "s", "(.*)")"#, "up")
+    nest(
+        depth,
+        "label_replace(",
+        r#", "d", "$1", "s", "(.*)")"#,
+        "up",
+    )
 }
 fn call(depth: usize) -> String {
     nest(depth, "abs(", ")", "up")

@@ -1496,7 +1496,12 @@ fn corpus_expression_depths_match_their_pinned_artifact() {
     let (_manifest, upstream) = load_upstream_verified();
     let proof: Vec<(String, String)> = PROOF_FILES
         .iter()
-        .map(|name| ((*name).to_string(), driver::read_file(&proof_dir().join(name))))
+        .map(|name| {
+            (
+                (*name).to_string(),
+                driver::read_file(&proof_dir().join(name)),
+            )
+        })
         .collect();
 
     // Pin 1 — file count.
