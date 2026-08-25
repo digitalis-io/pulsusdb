@@ -643,7 +643,7 @@ One boundary remains, and it is storage's, not the cache's: ClickHouse compiles 
 
 ### 3.5 Limits and accepted divergences
 
-PulsusDB's metrics surface has one deliberate divergence from Prometheus that a client can see. It lives here rather than in a `docs/benchmarks/metrics-differential-ledger.md`, because creating a whole ledger file for a single row is over-build: **if a second metrics divergence appears, that is when this graduates this row to its own file.**
+PulsusDB's metrics surface has one deliberate divergence from Prometheus that a client can see. It lives here rather than in a `docs/benchmarks/metrics-differential-ledger.md`, because creating a whole ledger file for a single row is over-build: **a second metrics divergence graduates this row to its own file.**
 
 | Divergence | Limit | Rule | Response | Prometheus v3.13.0 | Why we diverge |
 |---|---|---|---|---|---|

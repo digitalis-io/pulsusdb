@@ -29,14 +29,29 @@ pub const CHILD_ENV: &str = "PULSUS_PROMQL_DEPTH_STACK_CHILD";
 /// The suite's own gate. Unset, every test in the binary skips cleanly:
 /// the control legs deliberately abort the process, so this suite is
 /// nightly/dispatch-only and never rides a PR.
+///
+/// Set it to exactly `1` — that is `pulsus_testkit::live_gate`'s
+/// contract, not a local convention.
 pub const GATE_ENV: &str = "PULSUS_PROMQL_DEPTH_STACK";
 
 pub fn child_mode() -> Option<String> {
     std::env::var(CHILD_ENV).ok()
 }
 
+/// `true` when the pinned-stack legs should run.
+///
+/// Routed through `pulsus_testkit` rather than reading the variable
+/// directly, and the difference is the whole point: an absent gate on a
+/// laptop or in the hermetic `ci` lane is a clean skip, but an absent
+/// gate in the `promql-depth-stack-release` job — which exists to run
+/// exactly this — **panics** instead of reporting green having executed
+/// nothing. This suite is by its own doc the only gate that measures the
+/// shipped configuration, and it already never runs on a PR; a silent
+/// green is the one failure it cannot afford. `HERMETIC_CI_JOBS` is
+/// `["ci"]` and the discriminator is fail-closed, so every other job id
+/// is treated as live (issue #320).
 pub fn gate_is_open() -> bool {
-    std::env::var(GATE_ENV).is_ok_and(|v| !v.is_empty())
+    pulsus_testkit::live_gate_enabled(GATE_ENV)
 }
 
 /// Runs `f` on a thread whose stack is pinned to exactly `bytes`. An

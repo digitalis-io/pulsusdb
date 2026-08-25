@@ -1751,6 +1751,7 @@ dependencies = [
  "promql-parser",
  "pulsus-model",
  "pulsus-re2",
+ "pulsus-testkit",
  "regex",
  "serde",
  "serde_json",

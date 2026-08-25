@@ -179,6 +179,11 @@ fn plan_and_evaluate(expr: &pulsus_promql::parser::Expr) {
 /// the parent can name-filter it exactly.
 #[test]
 fn depth_stack_child() {
+    // First, and before the child-mode early return: in the parent
+    // process this test reaches no gate of its own, so without this a
+    // live CI job with the gate missing would see it report `ok` having
+    // run nothing (`pulsus_testkit`'s module doc, issue #320).
+    pulsus_testkit::require_live_gate(stackgate::GATE_ENV);
     let Some(mode) = stackgate::child_mode() else {
         return;
     };
