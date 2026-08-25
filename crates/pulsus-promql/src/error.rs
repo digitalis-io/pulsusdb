@@ -122,6 +122,20 @@ pub enum PromqlError {
     #[error("invalid regexp: {detail}")]
     InvalidRegexMatcher { detail: String },
 
+    /// The parsed expression tree is deeper than
+    /// [`crate::MAX_EXPR_DEPTH`] (issue #262). `depth` is the tree's
+    /// FULL depth, not `limit + 1`: the binding ruling requires the
+    /// message to name what was measured, so anyone who hits this can
+    /// tell immediately that they met a cap rather than a bug.
+    ///
+    /// Prose is ours — Prometheus has no such rejection and therefore no
+    /// message to match (the #280 precedent: status and rejection
+    /// boundary are the contract, message text is not). Maps to
+    /// **400 `bad_data`**, the same class as `Parse`: a malformed
+    /// request, not a well-formed query the engine declined.
+    #[error("query expression nesting depth {depth} exceeds the {limit} level limit")]
+    ExprTooDeep { depth: usize, limit: usize },
+
     /// The evaluation was cancelled by a live [`crate::eval::CancelToken`]
     /// (issue #93) — observed at a per-step/per-grid-point checkpoint after
     /// the awaiting request future was dropped (client disconnect, or the
@@ -230,6 +244,22 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "smoothed modifier is not supported with histograms"
+        );
+    }
+
+    /// Issue #262: the message names BOTH the depth measured and the
+    /// limit — the binding ruling's requirement, and what makes a cap
+    /// distinguishable from a bug by anyone who hits it. `depth` is the
+    /// tree's full depth, never `limit + 1`.
+    #[test]
+    fn expr_too_deep_display_names_the_measured_depth_and_the_limit() {
+        let err = PromqlError::ExprTooDeep {
+            depth: 1221,
+            limit: 250,
+        };
+        assert_eq!(
+            err.to_string(),
+            "query expression nesting depth 1221 exceeds the 250 level limit"
         );
     }
 

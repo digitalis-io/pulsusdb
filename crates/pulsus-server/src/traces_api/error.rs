@@ -390,9 +390,9 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
         // `a_non_cancellation_promql_error_maps_to_400`.
         //
         // The comparison a reader will want, because the two surfaces
-        // differ here: `prom_api` splits the same ten `PromqlError`
+        // differ here: `prom_api` splits the same eleven `PromqlError`
         // inners three ways — read `prom_api::error::promql_error_parts`;
-        // as read at this commit, two on 400 `bad_data`, seven on 422
+        // as read at this commit, three on 400 `bad_data`, seven on 422
         // `execution`, `Cancelled` on 408. This surface keeps the uniform
         // 400 on purpose, and puts its declined-query class on 422 in the
         // arms above (docs/api.md §4.2/§4.3/§4.4).

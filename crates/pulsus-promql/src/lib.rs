@@ -6,6 +6,9 @@
 pub mod annotations;
 pub mod error;
 pub mod eval;
+/// The parsed-expression depth cap (issue #262) — see the module doc
+/// for why it exists and `docs/api.md` §3.5 for the divergence row.
+pub mod limits;
 pub mod math;
 pub mod parser;
 pub mod plan;
@@ -22,6 +25,7 @@ pub mod value;
 pub use annotations::{Annotation, AnnotationKind, Annotations, ForcedMonotonicityDetail};
 pub use error::PromqlError;
 pub use eval::{CancelToken, evaluate, evaluate_cancellable};
+pub use limits::MAX_EXPR_DEPTH;
 pub use math::KahanSum;
 pub use parser::parse;
 pub use plan::{
