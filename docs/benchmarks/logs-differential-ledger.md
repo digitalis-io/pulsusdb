@@ -3665,6 +3665,44 @@ absence of a corpus row for an oversight.
   in the extraction LIST is a `syntax.y` production error refused by
   `ParseExpr` — window-independent. Both are `400` in every window here.
 
+- **Issue #388 adds two more sub-grammars, and they land on OPPOSITE
+  sides of this entry's split** (measured 2026-08-13 on the same pinned
+  image, as container `pulsus-c388-loki` on port 13488; 1 h window ending
+  now vs 1 h window ending 24 h ago):
+
+  | query | recent | 24 h old | PulsusDB |
+  |---|---|---|---|
+  | `{service_name="m"} \| json v="b-c"` | `400` | `200` | `400` |
+  | `{service_name="m"} \| json v="b c"` | `400` | `200` | `400` |
+  | `{service_name="m"} \| json v="b 1.5"` | `400` | `200` | `400` |
+  | `{service_name="m"} \| pattern "<a> <a>"` | `400` | **`400`** | `400` |
+  | `{service_name="m"} \| pattern "<1a> x"` | `400` | **`400`** | `400` |
+  | `{service_name="m"} \| pattern ""` | `400` | **`400`** | `400` |
+
+  The `| json` rows are window-dependent for exactly the reason the
+  logfmt row above is: `jsonexpr.Parse` runs from
+  `NewJSONExpressionParser` (`pkg/logql/log/parser.go:634-651 @ v3.7.4`)
+  at `Stage()`, which is pipeline-build.
+
+  **The `| pattern` rows are window-INDEPENDENT on both sides, and that
+  is a new fact for this entry.** `NewPatternParser` is called from
+  `newLabelParserExpr` (`pkg/logql/syntax/ast.go:730-741 @ v3.7.4`),
+  which **panics with a `logqlmodel.ParseError` during `ParseExpr`** —
+  one layer earlier than every other build error catalogued here. So a
+  malformed pattern is refused before the store's stale-window short
+  circuit can hide it, and it is refused at `variants(...)`' common
+  pipeline too, where a `Stage()` error is swallowed: measured,
+  `variants(count_over_time({service_name="m"}[5m])) of
+  ({service_name="m"} | pattern "<a> <a>" [5m])` is `400` while the same
+  shape with `| json v="b-c"` is `200`, empty.
+
+  That difference is why the two halves of #388 have two matrices with
+  two windows and no shared harness —
+  `crates/pulsus-read/tests/logql_pattern_expr_matrix.rs` asserts the
+  window-independence and `logql_json_expr_matrix.rs` asserts the
+  window-dependence, each with the other stage as its control, so neither
+  claim can quietly become a statement about stale windows in general.
+
 - **The window is not the only way the reference hides one of these — a
   `variants(...)` common pipeline hides it in EVERY window** (issue #247,
   measured 2026-08-07 on the same pinned image, window ending now):
@@ -5562,3 +5600,46 @@ divergence rather than a gap.
   at the worst shape. The `6R` figure is a model; the `2.09 R` is a
   measurement, and they are labelled here so nobody quotes one as the
   other.
+
+### `json-expression-bracket-key-unreachable` (issue #388, deliberate WITHDRAWAL, owner ruling 2026-08-13)
+
+- **What is withdrawn.** A JSON key containing `]` was reachable through
+  a `| json <id>="<expr>"` extraction at `5d91ef1` and is not after this
+  change. It is the one capability #388 removes, and it is removed
+  because the reference cannot express it either.
+
+- **Measured** 2026-08-13 against the pinned oracle
+  (`grafana/loki@sha256:87f0a067…f756cfcc`, in-process identity
+  `3.7.4` / `b318f282` read from `/loki/api/v1/status/buildinfo`), over a
+  line carrying the key: `{"b]":"brk", …}`. Both bodies are literal
+  captures, not paraphrases:
+
+  | probe | PulsusDB `5d91ef1` | the reference `v3.7.4` | PulsusDB now |
+  |---|---|---|---|
+  | `\| json v="b]"` | `200`, `v="brk"` | `400` — `parse error : stage '\| json v="b]"' : cannot parse expression [b]]: syntax error: unexpected RSB` | `400` |
+  | `\| json v="[\"b]\"]"` | `400` — `index must be a number or a quoted key` | `400` — `parse error : stage '\| json v="[\"b]\"]"' : cannot parse expression [["b]"]]: syntax error: unexpected STRING, expecting RSB` | `400` |
+
+- **The second row is why the loss is TOTAL rather than a change of
+  spelling.** The bracket-quoted form is the escape hatch that reaches
+  every other punctuated key — `[ "b-c" ]` and `[ "b c" ]` both work on
+  both sides — but it does not reach this one, because `scanStr`
+  terminates on `]` as well as on `"`
+  (`pkg/logql/log/jsonexpr/lexer.go:124-125 @ v3.7.4`). So after this
+  change no expression addresses such a key at all.
+
+- **Why it is taken.** Being able to extract something the reference
+  cannot is a query that works here and does not port: the user builds on
+  it and discovers the gap when the query moves. A capability nobody else
+  offers, on a pathological key, is not worth a divergence.
+
+- **Search space for existing use, with its scope stated.**
+  `git grep -n -E '\| json [^"[:space:]]+="[^"]*\][^"]*"' -- crates/pulsus-read/tests/logqltest/corpus`
+  → eight rows, all array-index paths, no `]` key. **That search covers
+  the corpus directory and nothing else** — it says nothing about the
+  rest of the tree or about user data, and the withdrawal is taken
+  anyway. Recorded as reading R13 in
+  `crates/pulsus-read/src/logql/pattern_expr.rs`'s non-derivable table.
+
+- **Pinned by** `b26_json_expr.test`'s two `eval_fail` rows and
+  `json_expr.rs`'s
+  `a_bracket_ends_a_quoted_key_so_such_a_key_is_unreachable`.

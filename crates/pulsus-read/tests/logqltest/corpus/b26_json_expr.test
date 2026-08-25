@@ -1,0 +1,193 @@
+# b26_json_expr.test — issue #394, folded into #388: the
+# `| json <id>="<expr>"` extraction-expression sub-grammar. BOTH
+# directions — the expressions PulsusDB served and the reference refuses,
+# AND the four it REFUSED that the reference serves.
+#
+# The second direction is the load-bearing one and the issue's title
+# points the other way: `arr[ 0 ]`, `arr[0 ]`, `b[ "c" ]` and
+# `[ "b-c" ]` were all 200 on the reference and 400 here, so a user
+# moving a working query to PulsusDB lost it with no warning.
+#
+# Every status and every label value below was measured on the pinned
+# reference, grafana/loki:3.7.4, image digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc,
+# booted on `ci/logql/config.yaml` with no delta of its own, as container
+# `pulsus-c388-loki` on port 13488, 2026-08-13. Captured over
+# `/loki/api/v1/query_range` with a window ending at `now` — LOAD-BEARING
+# here, unlike b25's: this rejection is a Stage() error and is a 200 over
+# a window whose end is older than query_ingesters_within (measured on
+# this container: `| json v="b-c"` is 400 over a fresh window and 200
+# over one ending 24 h back). `detected_level` stripped per
+# PROVENANCE.md.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.)
+#
+# THE RULE, read from the reference rather than inferred from these rows.
+# The whole grammar is six productions (pkg/logql/log/jsonexpr/jsonexpr.y:34-41
+# @ v3.7.4):
+#
+#   values := FIELD | key_access | index_access
+#           | values key_access | values index_access | values DOT FIELD
+#   key_access   := '[' STRING ']'
+#   index_access := '[' INDEX  ']'
+#
+# with WHITESPACE SKIPPED between every token (lexer.go:47-49) — that is
+# the half PulsusDB refused. A FIELD is `[A-Za-z_][A-Za-z0-9_]*`
+# (lexer.go:86-92); a STRING runs from `"` to the next `"`, to a `]`, to
+# a NUL or to end of input (lexer.go:109-130); an INDEX is digits bounded
+# by Go's `int` (lexer.go:132-154, whose final strconv.Atoi is a rule of
+# its own).
+#
+# ERROR PRECEDENCE: the LAST writer to sc.err wins (lexer.go:25-28), so a
+# lexer error survives only when the parser can accept the prefix it has
+# already shifted. `b-c` reports `unexpected char -`; `b[0` reports the
+# syntax error and NOT `non-integer value`.
+#
+# The eval_fail rows' `msg:` gate is a fragment of PulsusDB's own
+# Display. PulsusDB reproduces the reference's inner text verbatim for
+# every rule but the out-of-range index, whose reference text names a Go
+# standard-library function (`strconv.Atoi: parsing "…": value out of
+# range`) and where only the VERDICT is matched.
+
+load
+  {service_name="js388"}
+  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+# --- served THERE and refused HERE before #388 ------------------------
+# The four whitespace forms, with the values they extract.
+
+eval instant at 60s {service_name="js388"} | json v="arr[ 0 ]"
+  {service_name="js388", v="a0"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+eval instant at 60s {service_name="js388"} | json v="arr[0 ]"
+  {service_name="js388", v="a0"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+eval instant at 60s {service_name="js388"} | json v="b[ \"c\" ]"
+  {service_name="js388", v="nested"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+# A bracket-quoted key is how a punctuated key is reached at all, and it
+# may lead the expression.
+eval instant at 60s {service_name="js388"} | json v="[ \"b-c\" ]"
+  {service_name="js388", v="dash"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+eval instant at 60s {service_name="js388"} | json v="[ \"b c\" ]"
+  {service_name="js388", v="space"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+# --- served on both sides, and MIS-RESOLVED here before #388 ----------
+# The path is the PARSED one, so the whitespace is not part of a key:
+# these read ["b","c"] and answered `nested`, where PulsusDB read a
+# literal `b ` / ` c` pair and answered the empty string.
+
+eval instant at 60s {service_name="js388"} | json v="b . c"
+  {service_name="js388", v="nested"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+eval instant at 60s {service_name="js388"} | json v="b.c "
+  {service_name="js388", v="nested"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+# --- the Index/Field split, which this change must NOT move -----------
+# A quoted `"0"` is a KEY and a bare `0` is an INDEX, on both sides.
+
+eval instant at 60s {service_name="js388"} | json v="b[\"0\"]"
+  {service_name="js388", v="zero"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+eval instant at 60s {service_name="js388"} | json v="b[0]"
+  {service_name="js388", v=""}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+eval instant at 60s {service_name="js388"} | json v="arr[\"0\"]"
+  {service_name="js388", v=""}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+eval instant at 60s {service_name="js388"} | json v="b.c"
+  {service_name="js388", v="nested"}  0s  {"b":{"c":"nested","0":"zero"},"b-c":"dash","b c":"space","arr":["a0","a1"]}
+
+# --- refused: an identifier ends at any character outside the class ---
+# The lexer's message survives, because the parser accepted the prefix.
+
+eval_fail instant at 60s {service_name="js388"} | json v="b-c"
+  msg: unexpected char -
+
+eval_fail instant at 60s {service_name="js388"} | json v="b/c"
+  msg: unexpected char /
+
+eval_fail instant at 60s {service_name="js388"} | json v="b!"
+  msg: unexpected char !
+
+# --- refused: a syntax error, which OVERWRITES a lexer error ----------
+
+# Two FIELDs in a row: there is no `values FIELD` production, only
+# `values DOT FIELD`.
+eval_fail instant at 60s {service_name="js388"} | json v="b c"
+  msg: unexpected FIELD
+
+eval_fail instant at 60s {service_name="js388"} | json v=""
+  msg: unexpected $end, expecting LSB or FIELD
+
+eval_fail instant at 60s {service_name="js388"} | json v=" "
+  msg: unexpected $end, expecting LSB or FIELD
+
+# `0b` reaches the lexer's `non-integer value` first — and nothing was
+# shifted, so the yacc error overwrites it.
+eval_fail instant at 60s {service_name="js388"} | json v="0b"
+  msg: unexpected $end, expecting LSB or FIELD
+
+eval_fail instant at 60s {service_name="js388"} | json v="b[0"
+  msg: unexpected $end, expecting STRING or INDEX
+
+eval_fail instant at 60s {service_name="js388"} | json v="b[c]"
+  msg: unexpected FIELD, expecting STRING or INDEX
+
+eval_fail instant at 60s {service_name="js388"} | json v="b..c"
+  msg: unexpected DOT, expecting FIELD
+
+eval_fail instant at 60s {service_name="js388"} | json v="b.0"
+  msg: unexpected $end, expecting FIELD
+
+eval_fail instant at 60s {service_name="js388"} | json v=".b"
+  msg: unexpected DOT, expecting LSB or FIELD
+
+# --- refused: scanInt, whose text SURVIVES outside a bracket ----------
+# Reasoning said these were always overwritten; they are not. A digit can
+# start a token outside `[`, and there the parser accepts what it has.
+
+eval_fail instant at 60s {service_name="js388"} | json v="b 1.5"
+  msg: cannot use float as array index
+
+eval_fail instant at 60s {service_name="js388"} | json v="b.c 1.5"
+  msg: cannot use float as array index
+
+# `b 0` reaches the same arm, but its `%c` formats the NUL that read()
+# returns at end of input and the reference's response body carries that
+# unprintable byte — so the committed witness is the printable one.
+eval_fail instant at 60s {service_name="js388"} | json v="b 1x"
+  msg: non-integer value: x
+
+# --- refused: the index bound is Go's `int`, not an unbounded integer -
+# `b[9223372036854775807]` is 200 on both sides; one more is not. The
+# reference's text for the surviving form names strconv.Atoi, so only
+# the verdict is matched there.
+
+eval_fail instant at 60s {service_name="js388"} | json v="b[9223372036854775808]"
+  msg: unexpected $end, expecting STRING or INDEX
+
+eval_fail instant at 60s {service_name="js388"} | json v="b 9223372036854775808]"
+  msg: array index out of range
+
+# --- the capability this DELIBERATELY withdraws -----------------------
+# A JSON key containing `]` was reachable here and is not at the
+# reference. scanStr terminates on `]` as well as on `"`
+# (lexer.go:124-125), so the bracket-quoted escape hatch that reaches
+# every other punctuated key does not reach this one either. Ledgered as
+# `json-expression-bracket-key-unreachable`.
+
+eval_fail instant at 60s {service_name="js388"} | json v="b]"
+  msg: unexpected RSB
+
+eval_fail instant at 60s {service_name="js388"} | json v="[\"b]\"]"
+  msg: unexpected STRING, expecting RSB
+
+# --- refused inside a metric query ------------------------------------
+
+eval_fail instant at 60s count_over_time({service_name="js388"} | json v="b c" [5m])
+  msg: unexpected FIELD
+
+clear

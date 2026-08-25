@@ -88,6 +88,11 @@ pub mod exec;
 pub mod explain;
 pub(crate) mod fold;
 mod ip;
+/// Issue #394 (folded into #388): the extraction-expression sub-grammar
+/// of a `json` parser stage. Physically independent of [`pattern_expr`] —
+/// no shared code, no shared error type — because the reference validates
+/// the two through different sub-grammars AND at different layers.
+mod json_expr;
 pub(crate) mod labels;
 /// Issue #247: the `| logfmt <id>="<expr>"` extraction-expression
 /// sub-grammar — a module of its own rather than more of [`pipeline`],
@@ -95,6 +100,10 @@ pub(crate) mod labels;
 mod logfmt_expr;
 pub mod order;
 pub mod params;
+/// Issue #388: the sub-grammar of a `pattern` parser stage's argument.
+/// Also carries, in one table, the fourteen readings behind BOTH halves
+/// of #388 that no test can contradict.
+mod pattern_expr;
 pub mod pipeline;
 pub mod plan;
 pub(crate) mod post_agg;

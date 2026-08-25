@@ -153,11 +153,13 @@
 //!   us for an unrelated reason. It is a whole-lexer question touching
 //!   every identifier position, hence its own issue and its absence from
 //!   this matrix.
-//! - **The `| json` expression grammar — #394.** `| json a="b c"` and
-//!   `| json a="b-c"` are 400 on the reference and accepted here. It uses
-//!   a DIFFERENT sub-grammar (`pkg/logql/log/jsonexpr/`), so the logfmt
-//!   one must not be reused for it. Only the shared list-shape rule
-//!   (a dangling comma) is in this matrix for `| json`.
+//! - **The `| json` expression grammar — #394, CLOSED by #388.**
+//!   `| json a="b c"` and `| json a="b-c"` were 400 on the reference and
+//!   accepted here; both are 400 on both sides now. It uses a DIFFERENT
+//!   sub-grammar (`pkg/logql/log/jsonexpr/`), so the logfmt one is not
+//!   reused for it — `logql_json_expr_matrix.rs` is its own matrix, with
+//!   its own window argument. Only the shared list-shape rule (a
+//!   dangling comma) is in this matrix for `| json`.
 //! - **The three evaluation divergences — #393.** What a SURVIVING
 //!   expression returns is not this issue; only the resolved source key
 //!   is adopted here, because it is the sub-grammar's own output.

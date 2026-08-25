@@ -2796,6 +2796,9 @@ mod tests {
             ("explain.rs", include_str!("explain.rs")),
             ("escape.rs", include_str!("escape.rs")),
             ("ip.rs", include_str!("ip.rs")),
+            // Issue #394 (folded into #388): the `json` stage's
+            // extraction-expression sub-grammar.
+            ("json_expr.rs", include_str!("json_expr.rs")),
             ("agg.rs", include_str!("agg.rs")),
             ("charge.rs", include_str!("charge.rs")),
             ("client_agg.rs", include_str!("client_agg.rs")),
@@ -2806,6 +2809,8 @@ mod tests {
             ("logfmt_expr.rs", include_str!("logfmt_expr.rs")),
             // Issue #406: the instant-vector wire-order predicate.
             ("order.rs", include_str!("order.rs")),
+            // Issue #388: the `pattern` stage's argument sub-grammar.
+            ("pattern_expr.rs", include_str!("pattern_expr.rs")),
             ("post_agg.rs", include_str!("post_agg.rs")),
             // Issue #286: the checked-fragment/literal leaf.
             ("predicate.rs", include_str!("predicate.rs")),
