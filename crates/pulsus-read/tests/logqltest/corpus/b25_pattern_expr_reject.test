@@ -1,0 +1,165 @@
+# b25_pattern_expr_reject.test — issue #388: the `| pattern "…"`
+# sub-grammar. Which patterns the reference REFUSES and PulsusDB served,
+# and which `<name>` is a capture at all.
+#
+# Every status and every label set below was measured on the pinned
+# reference, grafana/loki:3.7.4, image digest
+# sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc,
+# booted on `ci/logql/config.yaml` with no delta of its own, as container
+# `pulsus-c388-loki` on port 13488, 2026-08-13. Captured over
+# `/loki/api/v1/query_range` with a window ending at `now`, from exactly
+# the query text committed below; `detected_level` stripped per
+# PROVENANCE.md.
+#
+# provenance: captured
+# (file default; see logqltest/PROVENANCE.md §provenance markers.)
+#
+# THE RULE, read from the reference rather than inferred from these rows.
+# A `| pattern` argument has a grammar of its own — a Ragel lexer whose
+# whole token set is two lines (pkg/logql/log/pattern/lexer.rl:32-35 @
+# v3.7.4), a yacc grammar of five productions (pattern/expr.y:29-45) and
+# three validations (pattern/ast.go:18-58) — driven by pattern.New
+# (pattern/pattern.go:21-33) from NewPatternParser (log/parser.go:456-470).
+#
+#   identifier   '<' (alpha|'_') (alnum|'_')* '>'      lexer.rl:33
+#   literal      any other rune                        lexer.rl:34
+#   no NAMED capture               -> refused          ast.go:18-21
+#   two ADJACENT captures          -> refused          ast.go:37-49
+#   a repeated NAMED capture       -> refused          ast.go:26-33
+#   an empty pattern               -> syntax error     expr.y:32-35
+#
+# THE ORDER IS OBSERVABLE and is part of the rule: validate() checks
+# no-capture, then consecutive, then duplicate, so `<a><a>` is `found
+# consecutive capture` and `<_><_>` is `at least one capture is
+# required`. `<_>` is unnamed and `<__>` is NOT: isUnnamed is
+# `len(c) == 1 && c[0] == '_'` (ast.go:83-85).
+#
+# WINDOW-INDEPENDENT, unlike b22's and b26's rejections. NewPatternParser
+# runs inside newLabelParserExpr (syntax/ast.go:730-741), which panics
+# with a ParseError during ParseExpr — so these are 400 in every window,
+# where a `| json` or `| logfmt` expression rejection is a 200 once the
+# window's end is older than query_ingesters_within. Measured on this
+# container over a window ending 24 h back: `| pattern "<a> <a>"` stayed
+# 400 while `| json v="b-c"` and `| logfmt a="b.c"` were 200.
+#
+# The eval_fail rows' `msg:` gate is a fragment of PulsusDB's own
+# Display; the REJECTION each pins was captured, and PulsusDB reproduces
+# the reference's inner text verbatim for all four rules.
+
+load
+  {service_name="pat388"}
+  0s  one two three
+
+# --- served, and unchanged by this issue ------------------------------
+
+eval instant at 60s {service_name="pat388"} | pattern "<a> <b> <c>"
+  {a="one", b="two", c="three", service_name="pat388"}  0s  one two three
+
+# An UNNAMED capture extracts nothing and does not enter the duplicate
+# set, so it may repeat.
+eval instant at 60s {service_name="pat388"} | pattern "<a> <_> <c>"
+  {a="one", c="three", service_name="pat388"}  0s  one two three
+
+eval instant at 60s {service_name="pat388"} | pattern "<_> <b> <_>"
+  {b="two", service_name="pat388"}  0s  one two three
+
+# Capture names are CASE SENSITIVE: `<A>` and `<a>` are two names, not a
+# duplicate.
+eval instant at 60s {service_name="pat388"} | pattern "<A> two <a>"
+  {A="one", a="three", service_name="pat388"}  0s  one two three
+
+# --- refused: a repeated NAMED capture (ast.go:26-33) -----------------
+# THE ISSUE. All three were SERVED here before #388, answering only the
+# first capture because the second was silently discarded.
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<a> <a>"
+  msg: duplicate capture name (a)
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<a> x <a>"
+  msg: duplicate capture name (a)
+
+# `<__>` is a NAMED capture — isUnnamed tests LENGTH 1 — so repeating it
+# is a duplicate, while `<_>` beside it is not.
+eval_fail instant at 60s {service_name="pat388"} | pattern "<__> x <__>"
+  msg: duplicate capture name (__)
+
+# --- refused: two ADJACENT captures (ast.go:37-49) --------------------
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<a><b>"
+  msg: found consecutive capture '<a><b>'
+
+# ORDER: this is `consecutive`, not `duplicate`.
+eval_fail instant at 60s {service_name="pat388"} | pattern "<a><a>"
+  msg: found consecutive capture '<a><a>'
+
+# --- refused: no NAMED capture (ast.go:18-21) -------------------------
+
+# ORDER again: `<_><_>` is two adjacent captures AND has no named
+# capture, and the reference reports the second. PulsusDB reported
+# `consecutive` here before #388 — same verdict, wrong reason.
+eval_fail instant at 60s {service_name="pat388"} | pattern "<_><_>"
+  msg: at least one capture is required
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<_> <_>"
+  msg: at least one capture is required
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "no captures"
+  msg: at least one capture is required
+
+# --- refused: the IDENTIFIER CHARSET (lexer.rl:33) --------------------
+# `<1a>` is not an identifier, so it is LITERAL TEXT and the pattern has
+# no capture at all. PulsusDB's test was `[A-Za-z0-9_]+`, so it made
+# `<1a>` a capture and INVENTED a label the user never wrote.
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<1a> x"
+  msg: at least one capture is required
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<1> x"
+  msg: at least one capture is required
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<a-b> x"
+  msg: at least one capture is required
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<a b> x"
+  msg: at least one capture is required
+
+eval_fail instant at 60s {service_name="pat388"} | pattern "<> x"
+  msg: at least one capture is required
+
+# Non-ASCII is outside the lexer's byte machine.
+eval_fail instant at 60s {service_name="pat388"} | pattern "<é> x"
+  msg: at least one capture is required
+
+# --- refused: the empty pattern (expr.y:32-35) ------------------------
+# The only reachable syntax error: every other byte lexes as an
+# identifier or as a literal rune.
+
+eval_fail instant at 60s {service_name="pat388"} | pattern ""
+  msg: unexpected $end, expecting IDENTIFIER or LITERAL
+
+# --- refused inside a metric query ------------------------------------
+# Every entry point compiles its pipeline before any I/O, so no position
+# is exempt.
+
+eval_fail instant at 60s count_over_time({service_name="pat388"} | pattern "<a> <a>" [5m])
+  msg: duplicate capture name (a)
+
+eval_fail instant at 60s sum by (a) (count_over_time({service_name="pat388"} | pattern "<a> <a>" [5m]))
+  msg: duplicate capture name (a)
+
+clear
+
+# --- the charset change moves an extracted LABEL, not only a verdict --
+# `<a> <1b>` is 200 on BOTH sides. The reference reads `<1b>` as literal
+# text, so it extracts only `a`; PulsusDB extracted `a` AND a
+# manufactured `_1b` before #388. This line carries the literal, so the
+# pattern matches and the difference is a label rather than a miss.
+
+load
+  {service_name="pat388b"}
+  0s  one <1b>
+
+eval instant at 60s {service_name="pat388b"} | pattern "<a> <1b>"
+  {a="one", service_name="pat388b"}  0s  one <1b>
+
+clear

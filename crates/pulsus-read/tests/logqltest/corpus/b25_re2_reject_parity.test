@@ -60,12 +60,15 @@
 # measure nothing. That is Stage 1's finding, applied here. `| decolorize`
 # is a no-op on these bodies (no ANSI escapes) and clears the pushdown.
 #
-# WHY TWO `eval` ROWS AND NOT MORE. This file's slot budget is two
+# WHY TWO `eval` ROWS AND NOT MORE. This file's placement budget is two
 # permanent reachable rows (`logqltest_replay.rs`'s `REACHABLE` /
-# `SLOT_SECS` / `FIRST_SLOT_AGE`); `eval_fail` rows are not reachable and
-# cost none. The two are chosen as the BOUNDARY of two rules rather than
-# as examples: `[[:alnum:]]` is a POSIX name that IS in `posixGroup` and
-# `a{999}` a bound that IS under `maxRepeat`, so a rule that over-reached
+# `MIN_GAP_SECS` / `PLACED_SPAN_SECS`); `eval_fail` rows are not reachable
+# and cost none. Both rows here are single-entry, so each costs
+# `MIN_GAP_SECS` and nothing more; a row whose load spanned several
+# seconds would cost twice its own span. The two are chosen as the
+# BOUNDARY of two rules rather than as examples: `[[:alnum:]]` is a POSIX
+# name that IS in `posixGroup` and `a{999}` a bound that IS under
+# `maxRepeat`, so a rule that over-reached
 # by one — the whole `[[:` prefix, or `>= 999` — turns each into an
 # `eval_fail` and this file goes red.
 

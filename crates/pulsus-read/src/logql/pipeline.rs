@@ -87,8 +87,10 @@ use pulsus_logql::{
 };
 
 use super::ip::{IpMatcher, line_has_ip_in};
+use super::json_expr;
 use super::labels::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
 use super::logfmt_expr;
+use super::pattern_expr;
 use super::template::{self, Part as TmplPart, Template, TemplateEnv, TemplateKind};
 // Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
 // Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go
@@ -680,14 +682,20 @@ impl fmt::Debug for CompiledLabelFilter {
 }
 
 /// One `json` extraction path segment (`a.b[0].c` / `a["k"]` shapes).
+///
+/// `pub(super)` since #388: [`super::json_expr`] builds it. It reaches no
+/// public signature — `CompiledStage` is private and
+/// `CompiledPipeline.stages` is a private field — so no
+/// `private_interfaces` warning follows.
 #[derive(Debug, Clone, PartialEq)]
-enum JsonPathSeg {
+pub(super) enum JsonPathSeg {
     Field(String),
     Index(usize),
 }
 
-#[derive(Debug, Clone)]
-enum PatternTok {
+/// `pub(super)` since #388, for the same reason as [`JsonPathSeg`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PatternTok {
     Literal(String),
     Capture(String),
     Discard,
@@ -2555,9 +2563,22 @@ fn compile_anchored_regex(pattern: &str) -> Result<regex::Regex, PipelineError> 
 fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
     match p {
         ParserStage::Json { extractions } => {
+            // Issue #394 (folded into #388): an extraction EXPRESSION has
+            // its own grammar in the reference (`pkg/logql/log/jsonexpr/
+            // @ v3.7.4`), refused at `Stage()` and surfaced as a 400 — so
+            // it is refused here, at the pipeline compile every entry
+            // point runs before any I/O. A bare `| json` has no
+            // extractions, so the loop body never runs.
             let mut compiled = Vec::with_capacity(extractions.len());
             for e in extractions {
-                compiled.push((e.label.clone(), parse_json_path(&e.expression)?));
+                let path = json_expr::parse_json_expr(&e.expression).map_err(|err| {
+                    PipelineError::BadParserExpr(format!(
+                        "json expression {:?}: {}",
+                        e.expression,
+                        err.message()
+                    ))
+                })?;
+                compiled.push((e.label.clone(), path));
             }
             Ok(CompiledStage::Json {
                 extractions: compiled,
@@ -2618,111 +2639,19 @@ fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
             }
             Ok(CompiledStage::Regexp(re))
         }
-        ParserStage::Pattern(pattern) => Ok(CompiledStage::Pattern(compile_pattern(pattern)?)),
-    }
-}
-
-/// Parses a `json` extraction expression: dotted fields, `[N]` array
-/// indexes, and `["quoted key"]` segments (`servers[0]`,
-/// `request.headers["User-Agent"]`).
-fn parse_json_path(expr: &str) -> Result<Vec<JsonPathSeg>, PipelineError> {
-    let bad = |msg: &str| PipelineError::BadParserExpr(format!("json expression {expr:?}: {msg}"));
-    let mut segs = Vec::new();
-    let bytes = expr.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'.' => {
-                if segs.is_empty() {
-                    return Err(bad("leading '.'"));
-                }
-                i += 1;
-                // Review round 1 finding 2: a dot must introduce a
-                // non-empty FIELD segment — `a..b`, trailing `a.`, and
-                // `a.[0]` are malformed, never silently normalized.
-                if i >= bytes.len() || bytes[i] == b'.' || bytes[i] == b'[' {
-                    return Err(bad("'.' must be followed by a field name"));
-                }
-            }
-            b'[' => {
-                let close = expr[i..]
-                    .find(']')
-                    .map(|off| i + off)
-                    .ok_or_else(|| bad("unclosed '['"))?;
-                let inner = &expr[i + 1..close];
-                if let Some(quoted) = inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                    segs.push(JsonPathSeg::Field(quoted.to_string()));
-                } else {
-                    let idx: usize = inner
-                        .parse()
-                        .map_err(|_| bad("index must be a number or a quoted key"))?;
-                    segs.push(JsonPathSeg::Index(idx));
-                }
-                i = close + 1;
-            }
-            _ => {
-                let end = expr[i..]
-                    .find(['.', '['])
-                    .map(|off| i + off)
-                    .unwrap_or(expr.len());
-                let field = &expr[i..end];
-                if field.is_empty() {
-                    return Err(bad("empty path segment"));
-                }
-                segs.push(JsonPathSeg::Field(field.to_string()));
-                i = end;
-            }
+        ParserStage::Pattern(pattern) => {
+            // Issue #388: the reference refuses a malformed pattern
+            // inside `ParseExpr` (`syntax/ast.go:736-741 @ v3.7.4`), one
+            // layer EARLIER than the json and logfmt expression
+            // sub-grammars — so its rejection is window-independent. Ours
+            // lands at the same pipeline compile as the others, which is
+            // still before any I/O, so a user sees the same 400.
+            let toks = pattern_expr::parse_pattern(pattern).map_err(|err| {
+                PipelineError::BadParserExpr(format!("pattern {pattern:?}: {}", err.message()))
+            })?;
+            Ok(CompiledStage::Pattern(toks))
         }
     }
-    if segs.is_empty() {
-        return Err(bad("empty expression"));
-    }
-    Ok(segs)
-}
-
-fn compile_pattern(pattern: &str) -> Result<Vec<PatternTok>, PipelineError> {
-    let bad = |msg: &str| PipelineError::BadParserExpr(format!("pattern {pattern:?}: {msg}"));
-    let mut tokens: Vec<PatternTok> = Vec::new();
-    let mut rest = pattern;
-    let mut captures = 0usize;
-    while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix('<') {
-            let close = after.find('>').ok_or_else(|| bad("unclosed '<'"))?;
-            let name = &after[..close];
-            let is_capture_name =
-                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if is_capture_name {
-                let prev_is_capture = matches!(
-                    tokens.last(),
-                    Some(PatternTok::Capture(_) | PatternTok::Discard)
-                );
-                if prev_is_capture {
-                    return Err(bad("consecutive captures without a literal separator"));
-                }
-                if name == "_" {
-                    tokens.push(PatternTok::Discard);
-                } else {
-                    tokens.push(PatternTok::Capture(name.to_string()));
-                    captures += 1;
-                }
-                rest = &after[close + 1..];
-                continue;
-            }
-            // Not a capture shape (`<`, `<a b>`, …): literal text.
-        }
-        // Consume literal text up to the next potential capture.
-        let next = rest[1..].find('<').map(|off| off + 1).unwrap_or(rest.len());
-        let (lit, tail) = rest.split_at(next);
-        match tokens.last_mut() {
-            Some(PatternTok::Literal(existing)) => existing.push_str(lit),
-            _ => tokens.push(PatternTok::Literal(lit.to_string())),
-        }
-        rest = tail;
-    }
-    if captures == 0 {
-        return Err(bad("at least one named capture is required"));
-    }
-    Ok(tokens)
 }
 
 /// Issue #272: emits the flat post-order program directly.
@@ -6526,8 +6455,9 @@ fn walk_pattern<'n, 't>(
                         };
                         (&rest[..at], &rest[at..])
                     }
-                    // compile_pattern rejects consecutive captures, so
-                    // the successor is always a literal or nothing.
+                    // `pattern_expr::parse_pattern` rejects consecutive
+                    // captures, so the successor is always a literal or
+                    // nothing.
                     _ => (rest, ""),
                 };
                 if let PatternTok::Capture(name) = &tokens[i] {
@@ -7438,19 +7368,6 @@ mod tests {
         assert_eq!(rendered.as_str(), "GET -> /x!");
     }
 
-    #[test]
-    fn pattern_compile_rejects_zero_captures_and_consecutive_captures() {
-        assert!(matches!(
-            compile_pattern("no captures here"),
-            Err(PipelineError::BadParserExpr(_))
-        ));
-        assert!(matches!(
-            compile_pattern("<a><b>"),
-            Err(PipelineError::BadParserExpr(_))
-        ));
-        assert!(compile_pattern("<a> <b>").is_ok());
-    }
-
     // -----------------------------------------------------------------
     // Issue M6-10: unwrap evaluation — metric-mode only.
     // -----------------------------------------------------------------
@@ -7809,27 +7726,6 @@ mod tests {
             };
             assert_eq!(value, Some(expected), "{query} over {body:?}");
         }
-    }
-
-    #[test]
-    fn json_path_parses_dotted_indexed_and_quoted_segments() {
-        assert_eq!(
-            parse_json_path(r#"request.headers["User-Agent"]"#).unwrap(),
-            vec![
-                JsonPathSeg::Field("request".to_string()),
-                JsonPathSeg::Field("headers".to_string()),
-                JsonPathSeg::Field("User-Agent".to_string()),
-            ]
-        );
-        assert_eq!(
-            parse_json_path("servers[0]").unwrap(),
-            vec![
-                JsonPathSeg::Field("servers".to_string()),
-                JsonPathSeg::Index(0),
-            ]
-        );
-        assert!(parse_json_path("").is_err());
-        assert!(parse_json_path("a[b").is_err());
     }
 
     // -----------------------------------------------------------------

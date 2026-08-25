@@ -903,6 +903,45 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_logfmt_expr_matrix
 
+      # Issue #388: the `| pattern "…"` argument sub-grammar
+      # (pkg/logql/log/pattern/ @ v3.7.4) x every position the stage can
+      # occupy. Put to this same container and compared against the
+      # verdicts AND the reference's own inner error text committed in
+      # the test.
+      #
+      # The window ends at `now` here too, but for this leg that is NOT
+      # load-bearing and the test says so by asserting the opposite
+      # property: a pattern rejection is raised inside ParseExpr
+      # (syntax/ast.go:730-741), so it is 400 in EVERY window, and
+      # `live_the_pattern_rule_is_window_independent` re-measures every
+      # point over a 24 h-stale window with the json and logfmt rules
+      # beside it as controls. Status only, no pushes. The hermetic half
+      # (PulsusDB's own verdict at parse -> plan -> compile, the
+      # `5d91ef1` rule replayed over the same matrix, the rule-table and
+      # tree-sweep checks) runs in the `ci` job with the gate off.
+      - name: LogQL differential leg (pattern sub-grammar matrix, issue #388)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_pattern_expr_matrix
+
+      # Issue #394, folded into #388: the `| json <id>="<expr>"`
+      # extraction-expression sub-grammar (pkg/logql/log/jsonexpr/ @
+      # v3.7.4 — a DIFFERENT grammar from logfmt's, so no harness is
+      # shared) x every position. Compared against the committed verdicts
+      # and the reference's inner error text.
+      #
+      # The window ends at `now` and here it IS load-bearing, exactly as
+      # in the logfmt leg: this rejection is a Stage() error and the
+      # reference answers 200 for it once the window's end is older than
+      # query_ingesters_within, so a stale window would score the whole
+      # sub-grammar as accepted. `live_the_json_rule_is_window_dependent`
+      # measures that, with the pattern rule beside it as the control.
+      # Status only, no pushes.
+      - name: LogQL differential leg (json expression matrix, issue #388)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_json_expr_matrix
+
       # Issue #246: the regex accept/reject surface — every LogQL
       # construct that carries a user regex x the pattern classes where
       # Go's regexp and the Rust regex crate disagree, plus the two
