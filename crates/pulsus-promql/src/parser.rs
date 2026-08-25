@@ -17,8 +17,32 @@ pub use promql_parser::parser::{
 
 /// Parses `q` into the vendored parser's AST. The `Err` case's `Display`
 /// carries the parser's own error text verbatim — see [`PromqlError::Parse`].
+///
+/// **The depth cap runs here (issue #262)** — after the vendored parser
+/// returns and before any caller can plan or evaluate. The placement is
+/// not a convention but a property of the crate graph: `promql-parser`
+/// appears in exactly one manifest in this workspace
+/// (`crates/pulsus-promql/Cargo.toml`), and this line is the only
+/// non-test call of `promql_parser::parser::parse` inside it, so no
+/// production code in this workspace can obtain an `Expr` without
+/// passing the guard — including entry points added later. See
+/// [`crate::limits`] for why the check and the teardown are both
+/// iterative.
 pub fn parse(q: &str) -> Result<Expr, PromqlError> {
-    promql_parser::parser::parse(q).map_err(PromqlError::Parse)
+    let expr = promql_parser::parser::parse(q).map_err(PromqlError::Parse)?;
+    let (depth, _capacity) = crate::limits::depth_and_capacity(&expr);
+    if depth > crate::limits::MAX_EXPR_DEPTH {
+        // The tree may be far deeper than MAX_EXPR_DEPTH, and letting it
+        // fall out of scope would recurse once per level: measured
+        // drop-glue abort at depth 43,564 release / 21,718 debug on a
+        // 2 MiB stack.
+        crate::limits::dismantle(expr);
+        return Err(PromqlError::ExprTooDeep {
+            depth,
+            limit: crate::limits::MAX_EXPR_DEPTH,
+        });
+    }
+    Ok(expr)
 }
 
 #[cfg(test)]
@@ -223,6 +247,88 @@ mod tests {
         // Hand-built nodes carry no position (the planner's
         // `unwrap_or(0)` fallback input).
         assert_eq!(Expr::from(1.0).pos_start(), None);
+    }
+
+    /// Issue #262 (AC 1, parse-level twin). The depth cap's boundary
+    /// over real query text rather than a constructed tree: the deepest
+    /// ACCEPTED expression has depth exactly `MAX_EXPR_DEPTH`, and one
+    /// level more is `ExprTooDeep` naming both the depth measured and
+    /// the limit.
+    ///
+    /// Term count is NOT depth, which is the arithmetic a user will get
+    /// wrong: `m0 + … + m249` is 250 terms at depth 250, while
+    /// `sum(m0) + … + sum(m248)` is 249 terms at depth 250 — each term
+    /// is itself an `Aggregate` over a selector.
+    ///
+    /// These parse only; they never plan or evaluate, so they are safe
+    /// on a default 2 MiB stack in both profiles.
+    #[test]
+    fn the_depth_cap_accepts_the_boundary_and_rejects_one_level_deeper() {
+        let named = |terms: usize| {
+            let mut q = "m0".to_string();
+            for i in 1..terms {
+                q.push_str(&format!(" + m{i}"));
+            }
+            q
+        };
+        let summed = |terms: usize| {
+            let mut q = "sum(m0)".to_string();
+            for i in 1..terms {
+                q.push_str(&format!(" + sum(m{i})"));
+            }
+            q
+        };
+
+        // (query, depth of the tree it builds)
+        for (query, depth) in [(named(250), 250), (summed(249), 250)] {
+            assert!(
+                parse(&query).is_ok(),
+                "depth {depth} is the deepest ACCEPTED expression"
+            );
+        }
+        for (query, depth) in [(named(251), 251), (summed(250), 251)] {
+            match parse(&query) {
+                Err(PromqlError::ExprTooDeep { depth: got, limit }) => {
+                    assert_eq!(got, depth);
+                    assert_eq!(limit, crate::limits::MAX_EXPR_DEPTH);
+                }
+                other => panic!("expected ExprTooDeep at depth {depth}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #262 non-vacuity: a 2,001-byte query that must NOT be
+    /// refused. The parser folds a unary chain into a single
+    /// `NumberLiteral` (depth 1), so a cap implemented on query bytes,
+    /// token count or a parse-time counter fails this case and a cap on
+    /// the BUILT TREE's depth passes it.
+    #[test]
+    fn a_two_kilobyte_unary_chain_folds_to_depth_one_and_is_accepted() {
+        let query = format!("{}1", "- ".repeat(1_000));
+        assert_eq!(query.len(), 2_001);
+        let expr = parse(&query).expect("a folded unary chain is depth 1");
+        assert!(matches!(expr, Expr::NumberLiteral(_)));
+    }
+
+    /// Issue #262: the reject path tears the tree down iteratively, so a
+    /// rejection far past the cap returns rather than aborting. 60,000
+    /// terms is above BOTH measured drop-glue floors (43,564 release /
+    /// 21,718 debug on 2 MiB) — but parsing that chain costs minutes
+    /// (the vendored parser is superlinear in chain length), so this
+    /// standing test runs a cheap depth-1,000 rejection and the
+    /// out-of-process 100,000-level teardown gate lives in
+    /// `limits.rs`'s own tests.
+    #[test]
+    fn an_over_deep_query_is_rejected_rather_than_planned() {
+        let mut query = "1".to_string();
+        query.push_str(&" + 1".repeat(999));
+        match parse(&query) {
+            Err(PromqlError::ExprTooDeep { depth, limit }) => {
+                assert_eq!(depth, 1_000);
+                assert_eq!(limit, crate::limits::MAX_EXPR_DEPTH);
+            }
+            other => panic!("expected ExprTooDeep, got {other:?}"),
+        }
     }
 
     #[test]

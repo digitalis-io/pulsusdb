@@ -101,6 +101,7 @@ impl IntoResponse for ApiError {
 /// | source | HTTP | `errorType` |
 /// |---|---|---|
 /// | `PromqlError::Parse` (position **in** the message) | 400 | `bad_data` |
+/// | `PromqlError::ExprTooDeep` (issue #262, docs/api.md §3.5) | 400 | `bad_data` |
 /// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet,ScalarOp,ExtendedHistogram}` | 422 | `execution` |
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
@@ -119,9 +120,19 @@ fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
         // this rides the `Parse` arm's mapping and NOT the 422
         // `execution` class below (an invalid regex is a malformed
         // request, not a well-formed query the engine declined).
-        PromqlError::Parse(_) | PromqlError::InvalidRegexMatcher { .. } => {
-            (StatusCode::BAD_REQUEST, "bad_data", e.to_string())
-        }
+        //
+        // Issue #262: `ExprTooDeep` rides the same arm. A parsed
+        // expression deeper than `pulsus_promql::MAX_EXPR_DEPTH` is a
+        // malformed request in exactly the sense `Parse` is — the guard
+        // sits INSIDE `pulsus_promql::parse`, before anything plans or
+        // evaluates — so it is a 400 `bad_data`, never a 422 declined
+        // query. Prometheus has no such rejection at all (it grows its
+        // stacks and answers the query), which is why this is a
+        // ledgered divergence rather than a parity fix: docs/api.md
+        // §3.5, row `promql-expression-depth-cap`.
+        PromqlError::Parse(_)
+        | PromqlError::InvalidRegexMatcher { .. }
+        | PromqlError::ExprTooDeep { .. } => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
         // `InvalidParameter` (issue #67: an out-of-range
         // `double_exponential_smoothing` factor) maps like
         // `HistogramBucket`: a well-formed query whose evaluation is

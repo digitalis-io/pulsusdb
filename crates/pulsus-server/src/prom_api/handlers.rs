@@ -466,6 +466,9 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use pulsus_config::Config;
+    use pulsus_promql::MAX_EXPR_DEPTH;
+    use serde_json::Value as JsonValue;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -499,6 +502,501 @@ mod tests {
         let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         (status, json)
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #262 — the depth cap at every PromQL entry point (AC 6/11)
+    // -----------------------------------------------------------------
+
+    /// Every `(path, method)` pair [`crate::prom_api::router`] mounts,
+    /// extracted from `mod.rs`'s own `.route(` calls at test time — so a
+    /// route added to `router()` is driven by the gate below
+    /// automatically, rather than being copied into a hand list that
+    /// goes stale.
+    ///
+    /// **Per route CALL, never per line.** `mod.rs`'s route calls are
+    /// rustfmt-wrapped, so a line-based pair extractor lands on **6**
+    /// (the six single-line `get(` routes, none of which carries a
+    /// `post(`) rather than 17. The pinned counts below are what redden
+    /// that implementation.
+    ///
+    /// Hard-fails on any fragment whose path or methods it cannot
+    /// classify, so a silent extraction failure cannot pass vacuously.
+    fn mounted_route_pairs() -> Vec<(String, &'static str)> {
+        const MOD_RS: &str = include_str!("mod.rs");
+        let body_start = MOD_RS
+            .find("pub(crate) fn router()")
+            .expect("mod.rs must declare `pub(crate) fn router()`");
+        let body_end = MOD_RS[body_start..]
+            .find("\n}\n")
+            .expect("router()'s body must end at a column-0 brace")
+            + body_start;
+        let body = &MOD_RS[body_start..body_end];
+
+        let mut pairs = Vec::new();
+        for fragment in body.split(".route(").skip(1) {
+            let open = fragment
+                .find('"')
+                .unwrap_or_else(|| panic!("unclassifiable .route( fragment: {fragment:?}"));
+            let close = fragment[open + 1..]
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated route path in: {fragment:?}"))
+                + open
+                + 1;
+            let path = fragment[open + 1..close].to_string();
+            let mut methods: Vec<&'static str> = Vec::new();
+            if fragment.contains("get(") {
+                methods.push("GET");
+            }
+            if fragment.contains("post(") {
+                methods.push("POST");
+            }
+            assert!(
+                !methods.is_empty(),
+                "no method could be classified for route {path}: {fragment:?}"
+            );
+            for method in methods {
+                pairs.push((path.clone(), method));
+            }
+        }
+        pairs
+    }
+
+    /// Percent-encodes every byte outside the unreserved set — `+` and
+    /// space included, because a `+` in a form value decodes to a space
+    /// and would silently change the query.
+    fn urlencode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    /// One PromQL expression, sent as BOTH `query` and `match[]`, with
+    /// every range parameter every handler might want. Extra parameters
+    /// are ignored by `params::get`, so one string drives all 17 pairs.
+    fn every_param(expr: &str) -> String {
+        let e = urlencode(expr);
+        format!("query={e}&match%5B%5D={e}&start=1700000000&end=1700000060&step=10&time=1700000000")
+    }
+
+    /// Drives one `(path, method)` pair through the REAL router with the
+    /// hermetic `test_state()` (`pool: None`).
+    async fn drive(path: &str, method: &str, params: &str) -> (StatusCode, String, JsonValue) {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let uri = path.replace("{name}", "job");
+        let app: Router = crate::prom_api::router().with_state(test_state());
+        let request = if method == "GET" {
+            Request::builder()
+                .method("GET")
+                .uri(format!("{uri}?{params}"))
+                .body(Body::empty())
+                .expect("GET request")
+        } else {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(params.to_string()))
+                .expect("POST request")
+        };
+        let res = app.oneshot(request).await.expect("router response");
+        let content_type = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|v| v.to_str().expect("ascii content-type").to_string())
+            .unwrap_or_default();
+        let (status, json) = status_and_body(res).await;
+        (status, content_type, json)
+    }
+
+    /// A left-deep `+` chain of `terms` terms — tree depth `terms`.
+    /// Generated, never retyped.
+    fn bin_chain(terms: usize) -> String {
+        format!("1{}", " + 1".repeat(terms - 1))
+    }
+
+    /// **AC 6/11.** Every entry point `router()` mounts, driven with an
+    /// over-deep expression in both `query` and `match[]`, against a
+    /// pinned `(path, method) -> status` map.
+    ///
+    /// **The 503 leg is what makes the 400 leg mean something.** With
+    /// `pool: None`, anything that gets PAST parse answers `503
+    /// unavailable` and only a parse-time rejection answers `400` — the
+    /// tree's own `query_without_a_pool_is_503_unavailable` and
+    /// `query_malformed_promql_is_400_bad_data` are the standing proof
+    /// of that split. So each PromQL-reading pair is asserted twice: the
+    /// over-deep expression is a 400, and a well-formed `up` on the same
+    /// pair is a 503. A handler answering 400 unconditionally fails.
+    #[tokio::test]
+    async fn every_mounted_promql_entry_point_rejects_an_over_deep_expression() {
+        let pairs = mounted_route_pairs();
+        let paths: BTreeSet<&str> = pairs.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(pairs.len(), 17, "extracted (path, method) pairs: {pairs:?}");
+        assert_eq!(paths.len(), 12, "extracted paths: {paths:?}");
+
+        // The nine PromQL-reading pairs. Every one parses BEFORE
+        // `engine_for`, which is why a pool-less state answers 400 here
+        // and 503 on the control leg.
+        let reading: BTreeSet<(&str, &str)> = [
+            ("/api/v1/query", "GET"),
+            ("/api/v1/query", "POST"),
+            ("/api/v1/query_range", "GET"),
+            ("/api/v1/query_range", "POST"),
+            ("/api/v1/labels", "GET"),
+            ("/api/v1/labels", "POST"),
+            ("/api/v1/label/{name}/values", "GET"),
+            ("/api/v1/series", "GET"),
+            ("/api/v1/series", "POST"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(reading.len(), 9);
+
+        // The eight that never reach the guard. `metadata` and
+        // `status/tsdb` call `engine_for` themselves, so hermetically
+        // they are 503 — their `200`s in the plan's query set are LIVE
+        // answers from a server that has a pool.
+        let expected: BTreeMap<(&str, &str), StatusCode> = [
+            ("/api/v1/metadata", StatusCode::SERVICE_UNAVAILABLE),
+            ("/api/v1/status/tsdb", StatusCode::SERVICE_UNAVAILABLE),
+            ("/api/v1/query_exemplars", StatusCode::OK),
+            ("/api/v1/status/buildinfo", StatusCode::OK),
+            ("/api/v1/status/config", StatusCode::OK),
+            ("/api/v1/status/flags", StatusCode::OK),
+            ("/api/v1/status/runtimeinfo", StatusCode::OK),
+        ]
+        .into_iter()
+        .flat_map(|(path, status)| [(path, "GET"), (path, "POST")].map(|k| (k, status)))
+        .collect();
+
+        let over_deep = every_param(&bin_chain(MAX_EXPR_DEPTH + 1));
+        let well_formed = every_param("up");
+        let mut observed: BTreeMap<(String, &'static str), u16> = BTreeMap::new();
+
+        for (path, method) in &pairs {
+            let key = (path.as_str(), *method);
+            let (status, content_type, json) = drive(path, method, &over_deep).await;
+            observed.insert((path.clone(), method), status.as_u16());
+
+            if reading.contains(&key) {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {method}");
+                assert_eq!(json["errorType"], "bad_data", "{path} {method}");
+                assert_eq!(
+                    json["error"], "query expression nesting depth 251 exceeds the 250 level limit",
+                    "{path} {method}"
+                );
+                assert_eq!(content_type, "application/json", "{path} {method}");
+
+                // The control leg: the SAME pair, a well-formed query,
+                // no pool.
+                let (status, _, json) = drive(path, method, &well_formed).await;
+                assert_eq!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{path} {method} control leg"
+                );
+                assert_eq!(json["errorType"], "unavailable", "{path} {method}");
+            } else {
+                let want = expected
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("unpinned non-reading pair {path} {method}"));
+                assert_eq!(status, *want, "{path} {method}");
+            }
+        }
+
+        // The whole map as one artifact, so a pair that quietly stops
+        // being driven cannot pass by being absent from the loop above.
+        let pinned: BTreeMap<(String, &'static str), u16> = pairs
+            .iter()
+            .map(|(path, method)| {
+                let code = if reading.contains(&(path.as_str(), *method)) {
+                    400
+                } else {
+                    expected[&(path.as_str(), *method)].as_u16()
+                };
+                ((path.clone(), *method), code)
+            })
+            .collect();
+        assert_eq!(observed, pinned);
+    }
+
+    /// **AC 11.** The plan's eleven literal queries, driven through the
+    /// real router.
+    ///
+    /// **What the hermetic form can and cannot pin.** With `pool: None`
+    /// an ACCEPTED query cannot reach an engine, so where the plan's
+    /// query set records a live `200` this asserts the `503
+    /// unavailable` that the same input produces here — which is the
+    /// discriminator that matters: past parse is 503, a parse-time
+    /// rejection is 400, and the guard sits inside parse. The `400`
+    /// rows are byte-for-byte what a live server answers, because they
+    /// never reach the pool.
+    ///
+    /// Q5 and Q7 are the non-vacuity legs: a cap implemented on query
+    /// BYTES or token count refuses a 2,001-byte unary chain that folds
+    /// to depth 1, or a 2,541-byte 177-term `or` chain that a dashboard
+    /// could plausibly emit. Q8 is the query this issue exists for, and
+    /// its depth field is asserted at **1,221** so the message is proved
+    /// to carry the measured depth and not `limit + 1`.
+    #[tokio::test]
+    async fn the_plans_eleven_queries_answer_exactly_as_written() {
+        let paren = |levels: usize| format!("{}1{}", "(".repeat(levels), ")".repeat(levels));
+        let unary = |ops: usize| format!("{}1", "- ".repeat(ops));
+        let sum_chain = |terms: usize| {
+            let mut q = "sum(m0)".to_string();
+            for i in 1..terms {
+                q.push_str(&format!(" + sum(m{i})"));
+            }
+            q
+        };
+        let or_chain = |terms: usize| {
+            let mut q = r#"up{i="0"}"#.to_string();
+            for i in 1..terms {
+                q.push_str(&format!(r#" or up{{i="{i}"}}"#));
+            }
+            q
+        };
+        let label_replace = |levels: usize| {
+            format!(
+                "{}up{}",
+                "label_replace(".repeat(levels),
+                r#", "d", "$1", "s", "(.*)")"#.repeat(levels)
+            )
+        };
+
+        const TOO_DEEP_251: &str = "query expression nesting depth 251 exceeds the 250 level limit";
+        const UNAVAILABLE: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
+        const BAD: StatusCode = StatusCode::BAD_REQUEST;
+
+        // Byte lengths are pinned so a generator edited into a
+        // paraphrase reddens rather than quietly measuring something
+        // else.
+        struct Case {
+            id: &'static str,
+            path: &'static str,
+            method: &'static str,
+            query: String,
+            bytes: usize,
+            status: StatusCode,
+            error_type: &'static str,
+            error: Option<&'static str>,
+        }
+        let case = |id, path, method, query: String, bytes, status, error_type, error| Case {
+            id,
+            path,
+            method,
+            query,
+            bytes,
+            status,
+            error_type,
+            error,
+        };
+
+        let cases: Vec<Case> = vec![
+            // id, path, method, query, bytes, status, errorType, error
+            case(
+                "Q1 boundary accepted",
+                "/api/v1/query",
+                "GET",
+                bin_chain(250),
+                997,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q2 one level deeper",
+                "/api/v1/query",
+                "GET",
+                bin_chain(251),
+                1001,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q3 terms are not depth",
+                "/api/v1/query",
+                "POST",
+                sum_chain(249),
+                2875,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q3 one term more",
+                "/api/v1/query",
+                "POST",
+                sum_chain(250),
+                2887,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q4 parens cost a level",
+                "/api/v1/query",
+                "GET",
+                paren(249),
+                499,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q4 one paren more",
+                "/api/v1/query",
+                "GET",
+                paren(250),
+                501,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q5 2001 bytes, depth 1",
+                "/api/v1/query",
+                "GET",
+                unary(1000),
+                2001,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q6 least-headroom shape",
+                "/api/v1/query",
+                "POST",
+                label_replace(249),
+                9713,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q6 one level more",
+                "/api/v1/query",
+                "POST",
+                label_replace(250),
+                9752,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q7 the #255 datapoint",
+                "/api/v1/query",
+                "GET",
+                or_chain(177),
+                2541,
+                UNAVAILABLE,
+                "unavailable",
+                None,
+            ),
+            case(
+                "Q8 the issue's own query",
+                "/api/v1/query",
+                "GET",
+                bin_chain(1221),
+                4881,
+                BAD,
+                "bad_data",
+                Some("query expression nesting depth 1221 exceeds the 250 level limit"),
+            ),
+            case(
+                "Q9 series",
+                "/api/v1/series",
+                "POST",
+                bin_chain(251),
+                1001,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q9 labels",
+                "/api/v1/labels",
+                "GET",
+                bin_chain(251),
+                1001,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q9 label values",
+                "/api/v1/label/{name}/values",
+                "GET",
+                bin_chain(251),
+                1001,
+                BAD,
+                "bad_data",
+                Some(TOO_DEEP_251),
+            ),
+            case(
+                "Q11 empty query",
+                "/api/v1/query",
+                "POST",
+                String::new(),
+                0,
+                BAD,
+                "bad_data",
+                Some("no expression found in input"),
+            ),
+        ];
+
+        for Case {
+            id,
+            path,
+            method,
+            query,
+            bytes,
+            status,
+            error_type,
+            error,
+        } in cases
+        {
+            assert_eq!(query.len(), bytes, "{id}: generated query length");
+            let (got, content_type, json) = drive(path, method, &every_param(&query)).await;
+            assert_eq!(got, status, "{id}: {json}");
+            assert_eq!(json["errorType"], error_type, "{id}");
+            if let Some(error) = error {
+                assert_eq!(json["error"], error, "{id}");
+            }
+            assert_eq!(json["status"], "error", "{id}");
+            assert_eq!(
+                json.as_object().expect("object").len(),
+                3,
+                "{id}: the envelope is exactly three fields"
+            );
+            assert_eq!(content_type, "application/json", "{id}");
+        }
+
+        // Q10 — the routes that never reach the guard, driven with the
+        // same over-deep `query`. `query_exemplars` takes no arguments
+        // at all; `metadata` calls `engine_for` itself, so its plan-set
+        // `200` is a LIVE answer and 503 is the hermetic one.
+        let over_deep = every_param(&bin_chain(251));
+        let (status, content_type, json) =
+            drive("/api/v1/query_exemplars", "POST", &over_deep).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!({"status": "success", "data": []}));
+        assert_eq!(content_type, "application/json");
+        let (status, _, json) = drive("/api/v1/metadata", "GET", &over_deep).await;
+        assert_eq!(status, UNAVAILABLE);
+        assert_eq!(json["errorType"], "unavailable");
     }
 
     #[tokio::test]

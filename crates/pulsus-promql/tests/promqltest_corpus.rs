@@ -1351,3 +1351,281 @@ fn the_substitution_inventory_annotates_every_row() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #262 (AC 8) — CI cannot wander into the debug window
+// ---------------------------------------------------------------------
+
+/// The `eval`-family directives, as a first-whitespace-token set. Used by
+/// BOTH the census (pin 2) and the query extractor (pin 3) — see
+/// `corpus_expression_depths_match_their_pinned_artifact`'s doc for
+/// exactly how far that shared constant limits the independence claim.
+const EVAL_DIRECTIVE_FAMILY: &[&str] = &[
+    "eval",
+    "eval_ordered",
+    "eval_fail",
+    "eval_warn",
+    "eval_info",
+];
+
+/// Counts directives by a deliberately dumber rule than the extractor's:
+/// the first whitespace token of each line, and nothing else. It never
+/// looks at the rest of the line, so an extractor that mislocates or
+/// drops a query cannot move this number with it.
+fn directive_census(text: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut census = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        if let Some(first) = line.split_ascii_whitespace().next()
+            && EVAL_DIRECTIVE_FAMILY.contains(&first)
+        {
+            *census.entry(first.to_string()).or_insert(0) += 1;
+        }
+    }
+    census
+}
+
+/// Every `eval`-family query in `text`, extracted the way
+/// `promqltest/grammar.rs::parse_eval` locates one: `instant [at <dur>]`
+/// or `range from <dur> to <dur> step <dur>`, then the rest of the line.
+/// A directive line whose query it cannot locate is returned in the
+/// second element, and pin 3 requires that to be empty.
+fn extract_eval_queries(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut queries = Vec::new();
+    let mut unlocatable = Vec::new();
+    for line in text.lines() {
+        let Some(first) = line.split_ascii_whitespace().next() else {
+            continue;
+        };
+        if !EVAL_DIRECTIVE_FAMILY.contains(&first) {
+            continue;
+        }
+        let rest = line[first.len()..].trim_start();
+        let query = if let Some(rest) = rest.strip_prefix("instant") {
+            let rest = rest.trim_start();
+            match rest.strip_prefix("at ") {
+                Some(rest) => rest
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map(|(_, q)| q.trim().to_string()),
+                None => Some(rest.trim().to_string()),
+            }
+        } else if let Some(rest) = rest.strip_prefix("range") {
+            // from <dur> to <dur> step <dur> <query...>
+            let rest = rest.trim_start();
+            let mut it = rest.splitn(7, char::is_whitespace);
+            let head: Vec<&str> = (&mut it).take(6).collect();
+            match (head.len(), it.next()) {
+                (6, Some(q)) => Some(q.trim().to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match query {
+            Some(q) if !q.is_empty() => queries.push(q),
+            _ => unlocatable.push(line.to_string()),
+        }
+    }
+    (queries, unlocatable)
+}
+
+/// The depth of a parsed expression — a **census-local** iterative walk.
+///
+/// The production walk (`pulsus_promql::limits::depth_and_capacity`) is
+/// `pub(crate)` by design: there is exactly one walk in that crate and no
+/// copy for a refactor to let drift. This is a second opinion computed in
+/// the test, over the same arm set; if it ever drifts from production's,
+/// the pinned histograms below move and this test reddens.
+fn expr_depth(expr: &promql_parser::parser::Expr) -> usize {
+    use promql_parser::parser::Expr;
+    let mut work: Vec<(&Expr, usize)> = vec![(expr, 1)];
+    let mut max_depth = 0usize;
+    while let Some((node, depth)) = work.pop() {
+        max_depth = max_depth.max(depth);
+        let child = depth + 1;
+        match node {
+            Expr::Aggregate(agg) => {
+                work.push((agg.expr.as_ref(), child));
+                if let Some(param) = &agg.param {
+                    work.push((param.as_ref(), child));
+                }
+            }
+            Expr::Unary(u) => work.push((u.expr.as_ref(), child)),
+            Expr::Binary(b) => {
+                work.push((b.lhs.as_ref(), child));
+                work.push((b.rhs.as_ref(), child));
+            }
+            Expr::Paren(p) => work.push((p.expr.as_ref(), child)),
+            Expr::Subquery(sq) => work.push((sq.expr.as_ref(), child)),
+            Expr::Call(c) => work.extend(c.args.args.iter().map(|b| (b.as_ref(), child))),
+            Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::VectorSelector(_)
+            | Expr::MatrixSelector(_)
+            | Expr::Extension(_) => {}
+        }
+    }
+    max_depth
+}
+
+/// **AC 8 (issue #262).** The depth cap is 250 and CI builds in **debug**,
+/// whose worst-shape abort floor is **70** — so a debug build is
+/// unprotected in the depth window 71-250, and nothing reaches that
+/// window unless we write it. This is the tripwire that makes "nothing
+/// reaches it" a check rather than a belief.
+///
+/// It pins the **artifact** the number is computed from, not a bound: an
+/// extractor that quietly skips input satisfies `max_depth <= 32`
+/// perfectly, which is the one thing a bound cannot see going wrong.
+///
+/// **On the word "independent".** The census is independent of the
+/// extractor's *slicing*, not of its *detection*: both decide "is this
+/// line a directive" by first-token membership in
+/// [`EVAL_DIRECTIVE_FAMILY`]. What protects the census counts is that
+/// they are **pinned literals**, not that they are independently
+/// computed.
+///
+/// Every pin here is exact rather than a bound, deliberately: the
+/// upstream corpus is byte-frozen by `upstream-manifest.json` and the
+/// proof corpus's file list is pinned by
+/// `proof_corpus_files_match_the_directory`, so both change only by a
+/// deliberate act — and that act must update these numbers in the same
+/// commit.
+#[test]
+fn corpus_expression_depths_match_their_pinned_artifact() {
+    let (_manifest, upstream) = load_upstream_verified();
+    let proof: Vec<(String, String)> = PROOF_FILES
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                driver::read_file(&proof_dir().join(name)),
+            )
+        })
+        .collect();
+
+    // Pin 1 — file count.
+    assert_eq!(upstream.len(), 21, "upstream .test files");
+    assert_eq!(proof.len(), 21, "in-repo proof .test files");
+
+    for (corpus, files, want_census, want_histogram, want_unparsed) in [
+        (
+            "upstream",
+            upstream
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>(),
+            vec![("eval", 2_180usize), ("eval_fail", 3)],
+            vec![
+                (1usize, 137usize),
+                (2, 1_531),
+                (3, 352),
+                (4, 110),
+                (5, 38),
+                (6, 11),
+                (8, 2),
+                (10, 2),
+            ],
+            Vec::<&str>::new(),
+        ),
+        (
+            "proof",
+            proof.clone(),
+            vec![("eval", 450), ("eval_fail", 27), ("eval_ordered", 17)],
+            vec![(1, 68), (2, 328), (3, 58), (4, 24), (5, 6), (6, 4), (7, 1)],
+            vec![
+                "info(n1, n1)",
+                "metric1_total offset 9.5e10",
+                "rate(metric1_total[-1])",
+                "rate(metric1_total[5s%0d])",
+                "rate(metric1_total[5s/0d])",
+            ],
+        ),
+    ] {
+        let mut census: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut queries: Vec<(String, String)> = Vec::new();
+        let mut unlocatable: Vec<String> = Vec::new();
+        for (name, text) in &files {
+            for (directive, count) in directive_census(text) {
+                *census.entry(directive).or_insert(0) += count;
+            }
+            let (found, missed) = extract_eval_queries(text);
+            queries.extend(found.into_iter().map(|q| (name.clone(), q)));
+            unlocatable.extend(missed);
+        }
+
+        // Pin 2 — the directive census, by the dumber rule.
+        let want_census: std::collections::BTreeMap<String, usize> = want_census
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        assert_eq!(census, want_census, "{corpus} directive census");
+        let census_total: usize = census.values().sum();
+
+        // Pin 3 — extracted == census, so a directive whose query the
+        // extractor cannot locate fails loudly instead of vanishing.
+        assert!(
+            unlocatable.is_empty(),
+            "{corpus}: {} directive lines had no locatable query: {unlocatable:?}",
+            unlocatable.len()
+        );
+        assert_eq!(
+            queries.len(),
+            census_total,
+            "{corpus}: extracted {} queries against a census of {census_total}",
+            queries.len()
+        );
+
+        // Pins 4 and 5 — the full depth histogram, and the unparsed
+        // list, both literal.
+        let mut histogram: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        let mut unparsed: Vec<String> = Vec::new();
+        let mut deepest: Option<(usize, String, String)> = None;
+        for (file, query) in &queries {
+            match promql_parser::parser::parse(query) {
+                Ok(expr) => {
+                    let depth = expr_depth(&expr);
+                    *histogram.entry(depth).or_insert(0) += 1;
+                    if deepest.as_ref().is_none_or(|(d, _, _)| depth > *d) {
+                        deepest = Some((depth, file.clone(), query.clone()));
+                    }
+                }
+                Err(_) => unparsed.push(query.clone()),
+            }
+        }
+        unparsed.sort();
+        unparsed.dedup();
+
+        let want_histogram: std::collections::BTreeMap<usize, usize> =
+            want_histogram.into_iter().collect();
+        assert_eq!(histogram, want_histogram, "{corpus} depth histogram");
+        assert_eq!(
+            unparsed,
+            want_unparsed
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            "{corpus} unparsed queries"
+        );
+        assert_eq!(
+            histogram.values().sum::<usize>() + unparsed.len(),
+            census_total,
+            "{corpus}: every extracted query is either parsed or listed unparsed"
+        );
+
+        // Pin 6 — the tripwire. 32 is deliberately NOT the cap: it fires
+        // long before the debug floor (70) or `MAX_EXPR_DEPTH` (250), so
+        // a corpus refresh that deepens materially forces a human
+        // decision instead of a silent divergence.
+        let max_depth = histogram.keys().copied().max().unwrap_or(0);
+        assert!(
+            max_depth <= 32,
+            "{corpus}: deepest expression is {max_depth} (tripwire 32, \
+             debug abort floor 70, MAX_EXPR_DEPTH {}); deepest: {:?}",
+            pulsus_promql::MAX_EXPR_DEPTH,
+            deepest
+        );
+    }
+}
