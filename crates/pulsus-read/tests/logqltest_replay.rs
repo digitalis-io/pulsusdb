@@ -970,12 +970,16 @@ fn the_config_delta_file_list_matches_the_corpus_headers() {
 /// `eval_fail` rows carry PulsusDB's own error text and land under
 /// `our-error-text`, which the markers never permitted in the first
 /// place.
-const TOTAL_DIRECTIVES: usize = 1_593;
+/// Issue #294 adds `t6_errors_edges.test` rows. They are template-corpus
+/// rows, so they move this figure and [`PROVENANCE_PERMITS`] together
+/// and leave [`REACHABLE`] alone: the template files carry an absolute
+/// timestamp, which is the largest unreachable bucket.
+const TOTAL_DIRECTIVES: usize = 1_604;
 
 /// What the provenance markers ALLOW a replay to compare. Named
 /// `REPLAYABLE` until the live leg existed, which was wrong: most of
 /// these cannot be reached at all. See the module docs.
-const PROVENANCE_PERMITS: usize = 1_175;
+const PROVENANCE_PERMITS: usize = 1_186;
 
 /// What the live leg can PHYSICALLY compare today. The gap to
 /// `PROVENANCE_PERMITS` is enumerated by
@@ -1049,7 +1053,7 @@ not a capture claim (ported)=27, our-error-text (eval_fail)=148, pinned-divergen
 /// replays log (streams) queries at a single instant — so they enlarge
 /// the ENUMERATED gap rather than the coverage. Both are levers the
 /// module docs already name.
-const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=678, \
+const UNREACHABLE_BY_REASON: &str = "absolute-timestamp (template corpus)=689, \
 metric query (slice: streams only)=240, range/matrix eval (slice: instant only)=10";
 // corpus-counts: end (replay-coverage-constants)
 

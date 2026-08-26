@@ -1886,10 +1886,13 @@ not "fix" us toward the panic.
 ## Issue #230 — `line_format`/`label_format` template engine
 
 The full Go `text/template` + reference function-map surface landed in
-issue #230; 688 container-captured corpus directives — 678 `eval`
-(60+228+34+29+258+69 across `tests/logqltest/corpus/t1…t6_*.test`) +
+issue #230; 699 container-captured corpus directives — 689 `eval`
+(60+228+34+29+258+80 across `tests/logqltest/corpus/t1…t6_*.test`) +
 10 `eval_fail` reject-parity cases (all in t1) — replay byte-exact
-hermetically, including execution-error strings. (The pre-round-2
+hermetically, including execution-error strings. (Issue #294 added the
+last of the t6 rows: the `duration`/`duration_seconds` failures over
+invalid-UTF-8 arguments, whose quoted halves were `\xef\xbf\xbd`
+escapes before that issue made the parse read raw bytes.) (The pre-round-2
 "676 cases" figure was 666 `eval` + the 10 `eval_fail` counted without
 saying so; round 2 added 12 captured `fromJson` invalid-UTF-8 /
 surrogate cases to t6.) The following residuals are the
@@ -2165,6 +2168,108 @@ clients only display it).
   fit comfortably but whose SUM does not is the same clean 422, and the
   identical fixture is shown to be ACCEPTED under a reconstructed
   per-render lifetime, so the gate fails if the lifetime regresses.
+- **Issue #294 — the error text is charged, and the parse moved to raw
+  bytes.** The gate's ordering leg used to admit a shape only when it
+  returned a retainable `Ok`, so **every branch that allocated and then
+  returned a scalar or an error sat outside it at any size**. Admitting
+  on ALLOCATION instead turned 31 shapes across 22 registry functions
+  red on `df4bdbd`, all one mechanism: caller bytes converted or copied
+  inside a template function with no charge covering the copy. The
+  fixes: `duration`/`duration_seconds`/`unixToTime` parse the RAW bytes
+  and charge the EXACT rendered length of their failure before building
+  it; `cast_to_i64`/`cast_to_f64` borrow instead of repairing (a repair
+  inserts U+FFFD, which neither Go parser accepts, so the value cannot
+  move); `toDateInZone` borrows all three arguments; `bytes` keeps its
+  repair but pays for it through the charged conversion. The 31 are
+  sealed by name in `logql_template_alloc_gate.rs`'s
+  `WERE_RED_ON_DF4BDBD`, and the six error shapes additionally satisfy
+  `charged == allocated == err.len()` — an equality, not a bound.
+
+  **A byte-level parity divergence closed in passing.** Repairing the
+  argument before parsing it also repaired what the message QUOTED.
+  Measured on `grafana/loki:3.7.4`
+  (`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`,
+  2026-08-26) against `df4bdbd`:
+
+  | query | reference | `df4bdbd` |
+  |---|---|---|
+  | `{{ duration (b64dec "/////////////w==") }}` (10 B) | `time: invalid duration "\xff"`×10 | `"\xef\xbf\xbd"`×10 |
+  | `{{ duration (b64dec "YYCA") }}` (3 B) | `time: invalid duration "a\x80\x80"` | `"a\xef\xbf\xbd\xef\xbf\xbd"` |
+  | `{{ duration (b64dec "4IA=") }}` (2 B) | `time: invalid duration "\xe0\x80"` | `"\xef\xbf\xbd\xef\xbf\xbd"` |
+  | `{{ duration (b64dec "MTL/") }}` (3 B) | `time: unknown unit "\xff" in duration "12\xff"` | both halves U+FFFD |
+  | `{{ unixToTime (b64dec "//8=") }}` (2 B) | quoted half `parsing "\xff\xff"` | quoted half U+FFFD |
+
+  All now match. The four `duration` rows are captured into
+  `t6_errors_edges.test`; the `unixToTime` row is **not** — its `%v`
+  half carries a raw invalid byte the reference serves and a
+  `.test` label value cannot, so it is asserted in
+  `tests/logql_template_engine.rs`
+  (`unix_to_time_quotes_the_raw_argument_and_repairs_only_the_percent_v_half`),
+  which pins both halves on one string. A genuine U+FFFD still escapes
+  as its three bytes (`Ye+/vWI=`, 5 B) — Go's `time.quote` escapes
+  `width` bytes, which is 1 for a decode error and 3 for a real
+  replacement character.
+
+  **The accept surface moved, and it moved inside the reference's own
+  failure region.** Charging the error text means a big enough argument
+  now refuses the query. Measured on the same container, one 80-byte
+  line, argument grown in-template by `{{ duration (repeat N __line__) }}`:
+
+  | argument | reference | mechanism |
+  |---|---|---|
+  | 1,048,560 B | **200**, `__error_details__` = 1,048,685 B | served |
+  | 2,097,120 / 4,194,240 / 8,388,560 B | **500** `rpc error: code = ResourceExhausted … max (… vs. 4194304)` | gRPC send cap, **configurable**; its operand is not stable between runs and is deliberately not pinned |
+  | 16,777,200 B | **500** `error while processing request: String too long to encode as label.` | recovered panic — `sizeWhenEncoded` refuses `> 1<<24`, `vendor/github.com/prometheus/prometheus/model/labels/labels_stringlabels.go:543-549 @ v3.7.4` |
+  | 33,554,400 B | **500** same panic | as above |
+
+  Our first refusal for that template lands at 419,430 repeats
+  (33,554,400 B) and 419,429 is still served — pinned both ways by
+  `a_thirty_two_mib_duration_argument_is_the_bounded_422_not_a_served_error_detail`.
+  Every argument our `422` refuses is one the reference answers with a
+  `500`; the `1<<24` label cap is not tunable, so that row alone carries
+  the claim.
+
+- **Two U+FFFD divergences #294 did NOT change, recorded as they stand.**
+  Both are the same cause — `ExecError.msg` is a `String` and
+  `ErrorSlots::details` a `Cow<'a, str>`, so neither can carry a raw
+  invalid byte:
+  - `unixToTime`'s `unable to parse time '%v'` half renders U+FFFD where
+    the reference renders the raw bytes. Its OTHER half is now
+    byte-exact, so the message is half-corrected — stated at the site
+    (`funcs.rs`, `unix_to_time`) as well as here, because a
+    half-corrected message with no note reads as a whole-corrected one.
+  - `bytes`'s `unhandled size name: …` unit renders U+FFFD. Its
+    conversion is charged rather than exact: `humanize.ParseBytes`
+    chooses one of three failure texts by parsing, and each embeds the
+    caller's argument in a RETAINED `__error_details__`, so `bytes`
+    charges the bound `4*len + 64` before converting (review round 1 —
+    before it, a 1 MiB numeric overflow allocated 3,145,761 B and a
+    1 MiB unknown unit 3,145,807 B, both with nothing charged). That is
+    an over-charge of up to 4x on the two arms that embed the argument
+    verbatim, and it moves the same accept surface the boundary table
+    above describes, one quarter as far out. Measured:
+    `{{ bytes (b64dec "MTL/") }}` (3 B, `31 32 FF`) returns HTTP **500**
+    `could not write JSON response: 1:51: parse error: invalid UTF-8
+    rune` from the reference and a served `200` from us. The `500` is
+    the reference's own serialisation refusing a well-formed result:
+    `encodeStream` re-parses the stream labels with Prometheus' lexer
+    (`pkg/util/marshal/query.go:416 @ v3.7.4`) and `marshal.go:60` wraps
+    the rejection. **We never reproduce that `500`** — the
+    "except where they are wrong" case. The reference's other encode
+    path sanitises instead, mapping every `utf8.RuneError` rune to a
+    space (`query.go:25-32`, applied in `NewStreams` at `:92-93`), which
+    is one space per invalid byte and also swallows a genuine U+FFFD;
+    and we do not reproduce that substitution either. Parity controls on the
+    same branch: `MTJ4` (3 B) gives `unhandled size name: x` and `MTIg`
+    (3 B) renders `12` on both sides.
+
+    **Which encode path a given deployment takes is read, not
+    established** — both were read, one was reproduced here. Matching
+    the substitution rule (and the observers that would see it early)
+    is **#455**, unscheduled; nothing in #294 gates it. The rows above
+    are pinned by
+    `the_two_recorded_utf8_divergences_render_as_they_did_before_this_issue`.
+
 - **Why deliberate:** the reference has no bound, so no finite cap can
   match it (the #236 O1 shape); the standing charge-before-allocate
   rule (#227) and the "never copy the reference where it is wrong"

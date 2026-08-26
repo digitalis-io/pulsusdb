@@ -1126,3 +1126,277 @@ fn every_caller_amplified_allocation_path_charges_the_budget() {
         "ababab",
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #294: the parse sees RAW BYTES, and the error text is charged
+// exactly. The rows below are the ones the `.test` corpus cannot carry —
+// either because the expected value contains a raw non-UTF-8 byte, or
+// because it is an HTTP-level refusal rather than a rendered line.
+// ---------------------------------------------------------------------
+
+/// AC-13. `unixToTime`'s message writes its argument TWICE — raw through
+/// Go's `%v`, and `strconv`-quoted inside the wrapped `*strconv.NumError`
+/// (`fmt.go:141 @ v3.7.4`, `fmt.Errorf("unable to parse time '%v': %w",
+/// epoch, err)`). Since #294 the QUOTED half is byte-exact with the
+/// reference: it quotes the raw bytes, so `FF FF` renders `\xff\xff`.
+///
+/// Captured 2026-08-26 from `grafana/loki:3.7.4`
+/// (`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`):
+///
+/// ```text
+/// error calling unixToTime: unable to parse time '<FF FF>': \
+///   strconv.ParseInt: parsing "\xff\xff": invalid syntax
+/// ```
+///
+/// The RAW half stays U+FFFD-repaired, and the reason is a TYPE rather
+/// than a choice: it flows into `ExecError.msg`, a `String`, and from
+/// there into `ErrorSlots::details`, a `Cow<'a, str>`; neither can hold
+/// invalid UTF-8. That divergence is recorded in the differential ledger
+/// under `template-output-budget`, unchanged by this issue.
+#[test]
+fn unix_to_time_quotes_the_raw_argument_and_repairs_only_the_percent_v_half() {
+    use base64::Engine as _;
+    // `//8=` is TWO bytes, `FF FF` — asserted, not asserted-in-prose,
+    // because the plan carried a wrong length for this payload through
+    // two revisions.
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode("//8=")
+        .expect("valid base64");
+    assert_eq!(payload, b"\xff\xff", "the `//8=` payload is 2 bytes, FF FF");
+    assert_eq!(payload.len(), 2);
+
+    let err = render(r#"{{ unixToTime (b64dec "//8=") }}"#, 0).expect_err("FF FF is not an epoch");
+    // Both halves, asserted on ONE string so their relationship is
+    // pinned rather than two independent facts.
+    assert!(
+        err.contains(r#"strconv.ParseInt: parsing "\xff\xff": invalid syntax"#),
+        "the strconv-quoted half must quote the RAW bytes: {err}"
+    );
+    assert!(
+        err.contains("unable to parse time '\u{FFFD}\u{FFFD}':"),
+        "the `%v` half carries the U+FFFD repair (a `String` cannot hold \
+         the raw bytes — ledgered divergence): {err}"
+    );
+}
+
+/// The `duration` family's byte-exactness, on the one payload class the
+/// `.test` corpus already covers — kept here as the engine-level twin
+/// so a corpus deletion cannot silently retire it, and because the
+/// UnknownUnit arm quotes TWO borrowed slices (the unit and the whole
+/// argument) and only this shape exercises the pair.
+///
+/// Captured values, same container/digest as above.
+#[test]
+fn duration_errors_quote_the_raw_argument_byte_for_byte() {
+    for (tmpl, want) in [
+        (
+            r#"{{ duration (b64dec "/////////////w==") }}"#,
+            r#"time: invalid duration "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff""#,
+        ),
+        // 3 B: 61 80 80.
+        (
+            r#"{{ duration (b64dec "YYCA") }}"#,
+            r#"time: invalid duration "a\x80\x80""#,
+        ),
+        // 2 B: E0 80 — a truncated sequence, one escape per byte, NOT
+        // one U+FFFD for the maximal subpart.
+        (
+            r#"{{ duration (b64dec "4IA=") }}"#,
+            r#"time: invalid duration "\xe0\x80""#,
+        ),
+        // 3 B: 31 32 FF — the UnknownUnit arm, both slices raw.
+        (
+            r#"{{ duration (b64dec "MTL/") }}"#,
+            r#"time: unknown unit "\xff" in duration "12\xff""#,
+        ),
+        // 5 B: 61 EF BF BD 62 — a GENUINE U+FFFD still escapes as its
+        // three bytes, which is what separates Go's rule from a naive
+        // per-invalid-byte one.
+        (
+            r#"{{ duration (b64dec "Ye+/vWI=") }}"#,
+            r#"time: invalid duration "a\xef\xbf\xbdb""#,
+        ),
+        (
+            r#"{{ duration "1" }}"#,
+            r#"time: missing unit in duration "1""#,
+        ),
+    ] {
+        let err = render(tmpl, 0).expect_err("must not parse");
+        assert!(err.ends_with(want), "{tmpl}\n  got: {err}\n want: …{want}");
+    }
+}
+
+/// AC-8, the regression fence for the `cast_to_*` rewrite. **Nothing
+/// covered these before:** perturbing `cast_to_i64`'s invalid-UTF-8 arm
+/// to return `7` reddened only `logql_template_alloc_census`, whose
+/// message is a callee-set drift and not a value check. In the required
+/// words, `No suite covers this` — this is the suite that does.
+///
+/// Every expectation is the reference's, captured at the digest above.
+#[test]
+fn the_invalid_utf8_coercions_and_the_valid_paths_keep_their_values() {
+    for (tmpl, want) in [
+        // The invalid-UTF-8 branch of every coercion the rewrite touched.
+        (r#"{{ int (b64dec "//8=") }}"#, "0"),
+        (r#"{{ float64 (b64dec "//8=") }}"#, "0"),
+        (
+            r#"{{ float64 (b64dec "/////////////w==") }}|{{ add (b64dec "/////////////w==") 1 }}|{{ ceil (b64dec "/////////////w==") }}"#,
+            "0|1|0",
+        ),
+        // The valid-UTF-8 paths the rewrite must not move.
+        (r#"{{ duration "300ms" }}"#, "0.3"),
+        (r#"{{ duration "3µs" }}"#, "3e-06"),
+        (r#"{{ bytes "17MB" }}"#, "1.7e+07"),
+        // `toDateInZone` no longer copies its three arguments: an
+        // unknown zone and an invalid-UTF-8 zone must both resolve the
+        // way they did when the zone was U+FFFD-repaired first.
+        (
+            r#"{{ toDateInZone "2006-01-02" "Not/AZone" "2024-05-06" }}"#,
+            "2024-05-06 00:00:00 +0000 UTC",
+        ),
+        (
+            r#"{{ toDateInZone "2006-01-02" (b64dec "//8=") "2024-05-06" }}"#,
+            "2024-05-06 00:00:00 +0000 UTC",
+        ),
+    ] {
+        assert_eq!(render(tmpl, 0).as_deref(), Ok(want), "{tmpl}");
+    }
+    // The error texts on the same fence.
+    for (tmpl, want) in [
+        (
+            r#"{{ duration "1h-2m" }}"#,
+            r#"time: unknown unit "h-" in duration "1h-2m""#,
+        ),
+        (r#"{{ duration "" }}"#, r#"time: invalid duration """#),
+        (
+            r#"{{ unixToTime " " }}"#,
+            r#"unable to parse time ' ': strconv.ParseInt: parsing " ": invalid syntax"#,
+        ),
+        (r#"{{ bytes "17MBB" }}"#, "unhandled size name: mbb"),
+    ] {
+        let err = render(tmpl, 0).expect_err("must not parse");
+        assert!(err.ends_with(want), "{tmpl}\n  got: {err}\n want: …{want}");
+    }
+}
+
+/// AC-9a. Charging the error text moves an accept surface: a template
+/// that grows its argument past the render budget now refuses the QUERY
+/// instead of serving a `200` with a vast `__error_details__`. This pins
+/// where that boundary is, that it is the bounded 422 class, and the
+/// exact body a client receives.
+///
+/// It is inside the reference's OWN failure region: `grafana/loki:3.7.4`
+/// answers `500 error while processing request: String too long to
+/// encode as label.` from ~16,777,216 B (`sizeWhenEncoded` refuses
+/// `> 1<<24`, `vendor/github.com/prometheus/prometheus/model/labels/
+/// labels_stringlabels.go:543-549`), which is half this argument.
+/// Recorded in the differential ledger under `template-output-budget`.
+#[test]
+fn a_thirty_two_mib_duration_argument_is_the_bounded_422_not_a_served_error_detail() {
+    use pulsus_read::logql::error::{ReadError, TooBroadReason};
+    use pulsus_read::logql::exec::run_pipeline_rows;
+    use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
+    use pulsus_read::logql::template::MAX_TEMPLATE_RENDER_BYTES;
+
+    let line = "L".repeat(80);
+    // 419,430 × 80 B = 33,554,400 B of argument, grown in-template so no
+    // ingest limit is involved.
+    let pipeline = compiled(r#"{a="b"} | line_format `{{ duration (repeat 419430 __line__) }}`"#);
+    let meta = std::collections::HashMap::from([(
+        1u64,
+        StreamMetaRow {
+            fingerprint: 1,
+            service: "svc".to_string(),
+            labels: r#"{"env":"prod"}"#.to_string(),
+        },
+    )]);
+    let rows = vec![SampleRow {
+        fingerprint: 1,
+        timestamp_ns: 0,
+        body: line.clone(),
+        structured_metadata: String::new(),
+    }];
+    let err = run_pipeline_rows(rows, &pipeline, &meta, 100)
+        .expect_err("a 33,554,400-byte argument must abort the query");
+    assert!(
+        matches!(
+            err,
+            ReadError::QueryTooBroad(TooBroadReason::TemplateOutputBytes { budget_bytes })
+                if budget_bytes == MAX_TEMPLATE_RENDER_BYTES
+        ),
+        "{err:?}"
+    );
+    // The BODY, from the type rather than from a paraphrase: this is the
+    // text `logs_api::error::read_error_parts` hands to the client with
+    // `StatusCode::UNPROCESSABLE_ENTITY`.
+    assert_eq!(
+        err.to_string(),
+        "query too broad: a line_format/label_format template render exceeded the \
+         67108864-byte output budget — shrink the template's repeat/indent/padding factors"
+    );
+
+    // The fence from below, and the reason the charge has to be EXACT
+    // rather than merely conservative: at 419,429 repeats the same
+    // template is served, with the whole error text in
+    // `__error_details__`, exactly as the reference serves it.
+    let pipeline = compiled(r#"{a="b"} | line_format `{{ duration (repeat 419429 __line__) }}`"#);
+    let rows = vec![SampleRow {
+        fingerprint: 1,
+        timestamp_ns: 0,
+        body: line,
+        structured_metadata: String::new(),
+    }];
+    let streams = run_pipeline_rows(rows, &pipeline, &meta, 100)
+        .expect("one repeat fewer must still be served");
+    let rendered = format!("{streams:?}");
+    assert!(
+        rendered.contains("TemplateFormatErr"),
+        "the served row carries the per-line error tag: {}",
+        &rendered[..rendered.len().min(400)]
+    );
+}
+
+/// The two U+FFFD divergences this issue did NOT change, pinned so the
+/// ledger's `template-output-budget` entry describes something a test
+/// holds still. Both flow from the same type constraint — `ExecError.msg`
+/// is a `String` and `ErrorSlots::details` a `Cow<'a, str>`, so neither
+/// can carry a raw invalid byte — and both are recorded, with the
+/// substitution work itself routed to **#455**.
+///
+/// Reference behaviour, captured 2026-08-26 from `grafana/loki:3.7.4`
+/// (`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`):
+///
+/// | query | reference | here |
+/// |---|---|---|
+/// | `{{ bytes (b64dec "MTL/") }}` (3 B: 31 32 FF) | HTTP **500** `could not write JSON response: 1:51: parse error: invalid UTF-8 rune` | HTTP 200, `unhandled size name: <U+FFFD>` |
+/// | `{{ bytes (b64dec "MTJ4") }}` (3 B: 31 32 78) | 200, `unhandled size name: x` | identical |
+/// | `{{ bytes (b64dec "MTIg") }}` (3 B: 31 32 20) | 200, renders `12` | identical |
+/// | `{{ unixToTime (b64dec "//8=") }}` (2 B: FF FF) | raw half `FF FF` | raw half two U+FFFD |
+///
+/// The reference's `500` is its own serialisation path refusing a
+/// well-formed result: `encodeStream` re-parses the stream's labels with
+/// Prometheus' lexer (`pkg/util/marshal/query.go:416 @ v3.7.4`), which
+/// rejects an invalid rune, and `marshal.go:60` wraps that as `could not
+/// write JSON response: %w`. Its OTHER encode path sanitises instead —
+/// `NewStreams` maps every `utf8.RuneError` rune to a space
+/// (`query.go:25-32`, `:92-93`). We reproduce neither: no `500`, and no
+/// space substitution.
+#[test]
+fn the_two_recorded_utf8_divergences_render_as_they_did_before_this_issue() {
+    // `bytes` keeps its U+FFFD repair; only WHERE it is charged moved.
+    let err = render(r#"{{ bytes (b64dec "MTL/") }}"#, 0).expect_err("FF is not a unit");
+    assert!(
+        err.ends_with("unhandled size name: \u{FFFD}"),
+        "bytes renders the repaired unit: {err}"
+    );
+    // Parity controls on the same branch — an ASCII unit and the empty
+    // unit both answer exactly as the reference answers them, so the row
+    // above is a divergence about invalid BYTES and nothing wider.
+    let err = render(r#"{{ bytes (b64dec "MTJ4") }}"#, 0).expect_err("x is not a unit");
+    assert!(err.ends_with("unhandled size name: x"), "{err}");
+    assert_eq!(
+        render(r#"{{ bytes (b64dec "MTIg") }}"#, 0).as_deref(),
+        Ok("12"),
+        "an empty unit is Byte in Go's bytesSizeTable"
+    );
+}
