@@ -1530,8 +1530,27 @@ pub fn quote_bytes_ascii(s: &[u8]) -> String {
 }
 
 fn quote_with(s: &[u8], quote: char, ascii_only: bool) -> String {
-    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len() + 2);
+    quote_with_into(&mut out, s, quote, ascii_only);
+    out
+}
+
+/// [`quote_bytes`] appended in place (issue #294): the LogQL template's
+/// `unixToTime` error embeds a `strconv.Quote` of its raw argument, and
+/// the whole message must be ONE allocation of its exact final length
+/// (AC-9b: `allocated == charged == err.len()`); a `quote_bytes` call
+/// there would allocate the quoted half a second time.
+pub fn quote_bytes_into(out: &mut String, s: &[u8], quote: char) {
+    quote_with_into(out, s, quote, false);
+}
+
+/// The walk itself, unchanged from the `quote_with` body it was lifted
+/// out of (issue #294) — one transcription of the quoting rule, with
+/// [`quote_bytes`], [`quote_bytes_ascii`] and [`quote_bytes_into`] all
+/// calling it, so the container-captured corpus rows that pin
+/// `quote_bytes` pin every caller.
+fn quote_with_into(out: &mut String, s: &[u8], quote: char, ascii_only: bool) {
+    use std::fmt::Write as _;
     out.push(quote);
     let mut i = 0;
     while i < s.len() {
@@ -1547,10 +1566,85 @@ fn quote_with(s: &[u8], quote: char, ascii_only: bool) -> String {
             .and_then(|t| t.chars().next())
             .unwrap_or('\u{FFFD}');
         i += width;
-        append_escaped_rune(&mut out, r, quote, ascii_only);
+        append_escaped_rune(out, r, quote, ascii_only);
     }
     out.push(quote);
-    out
+}
+
+/// The byte length [`quote_bytes`] would produce, without allocating.
+///
+/// **An INDEPENDENT transcription of the same rule, not a second
+/// consumer of one walk** (issue #294, review round 4): when the length
+/// and the text both fold the same emitted-atom stream, a walk that
+/// emits the WRONG atoms escapes both checks at every input size —
+/// measured, `Ch('a')` swapped for `Ch('b')` left both green. This
+/// counts from the rule directly, with its own decode and its own
+/// escape-width table. Its oracle is [`quote_bytes`] (the exhaustive
+/// sweep in `tests/logql_quote_len_gate.rs`); `quote_bytes`'s oracle is
+/// the container-captured LogQL corpus. Neither reads the other's
+/// source.
+///
+/// `is_print` is deliberately SHARED rather than re-transcribed: it is
+/// a generated Unicode table, not part of the quoting rule, and a
+/// second copy of 1,000 ranges would be a larger drift surface than the
+/// one it removes.
+pub fn quote_bytes_len(s: &[u8], quote: char) -> usize {
+    // The two surrounding quote characters.
+    let mut n = 2;
+    let mut i = 0;
+    while i < s.len() {
+        // Own decode: `strconv.quoteWith` advances one byte on an
+        // invalid encoding and escapes it as `\xNN`.
+        let b = s[i];
+        let want = match b {
+            0x00..=0x7F => 1,
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 0,
+        };
+        let size = if want == 0 || i + want > s.len() {
+            1
+        } else if std::str::from_utf8(&s[i..i + want]).is_ok() {
+            want
+        } else {
+            1
+        };
+        if size == 1 && b >= 0x80 {
+            // Invalid byte: `\xNN`.
+            n += 4;
+            i += 1;
+            continue;
+        }
+        let r = std::str::from_utf8(&s[i..i + size])
+            .ok()
+            .and_then(|t| t.chars().next())
+            .unwrap_or('\u{FFFD}');
+        i += size;
+        n += escaped_rune_len(r, quote);
+    }
+    n
+}
+
+/// The byte length [`append_escaped_rune`] would append, in the same
+/// arm order (`ascii_only` is false — no caller of [`quote_bytes_len`]
+/// needs the `QuoteToASCII` form).
+fn escaped_rune_len(r: char, quote: char) -> usize {
+    if r == quote || r == '\\' {
+        return 1 + r.len_utf8();
+    }
+    if is_print(r) {
+        return r.len_utf8();
+    }
+    match r {
+        '\x07' | '\x08' | '\x0c' | '\n' | '\r' | '\t' | '\x0b' => 2,
+        // `\xNN`
+        c if (c as u32) < 0x20 || c == '\x7f' => 4,
+        // `\uNNNN`
+        c if (c as u32) < 0x10000 => 6,
+        // `\UNNNNNNNN`
+        _ => 10,
+    }
 }
 
 /// `strconv.appendEscapedRune`.

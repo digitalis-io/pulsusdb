@@ -481,6 +481,31 @@ mod tests {
         assert_eq!(body, expected);
     }
 
+    /// Issue #294 AC-9a: charging a template's ERROR TEXT moves an
+    /// accept surface — a `line_format` that grows its argument past the
+    /// render budget now refuses the query. This is the envelope a
+    /// client actually receives for that refusal: `422`, the reason's
+    /// own body, and nothing else. `pulsus-read`'s
+    /// `a_thirty_two_mib_duration_argument_is_the_bounded_422_not_a_served_error_detail`
+    /// is the other half — it produces this error from a real query.
+    #[tokio::test]
+    async fn read_error_template_output_bytes_maps_to_422_with_the_reasons_body() {
+        let err =
+            ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::TemplateOutputBytes {
+                budget_bytes: 67_108_864,
+            });
+        let expected = err.to_string();
+        let (status, body) = rendered(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body, expected);
+        assert_eq!(
+            body,
+            "query too broad: a line_format/label_format template render exceeded the \
+             67108864-byte output budget — shrink the template's repeat/indent/padding \
+             factors"
+        );
+    }
+
     /// Issue #35: the query-text guard's reason rides the existing
     /// `QueryTooBroad(_)` wildcard arm — no mapper change was needed, and
     /// this test proves it.
