@@ -424,6 +424,13 @@ const TEMPO_STEP_S: i64 = 60;
 /// (`max_block_duration: 2s`, `flush_check_period: 1s` in
 /// `ci/tempo/tempo-compare.yaml`), so a batch that is still landing shows a
 /// different map in at least one of them.
+///
+/// The poll budget in [`tempo_counts`] grew from 60 attempts to 90 when
+/// this landed — waiting for the answer to settle costs at most two extra
+/// reads over waiting for it to appear, and the budget is a safety net
+/// rather than an expected duration. On a machine where the partial view
+/// never reproduces at all, a clean live run still took **four** reference
+/// requests before settling, so the extra headroom is not theoretical.
 const STABLE_READS: usize = 3;
 
 /// Polls Tempo's metrics API until `compare()` returns a STABLE view of the
@@ -437,11 +444,17 @@ const STABLE_READS: usize = 3;
 /// Tempo cuts live-store blocks on a timer, so an already-finalised BUCKET
 /// can still be read before every span in it has been flushed. The sibling
 /// suite `traces_metrics_filter_differential.rs` measured an 18-span corpus
-/// reading back as **10** on its first non-zero poll, and on 2026-08-27 this
-/// suite reddened `schema-it` the same way — the reference returned a view
-/// missing the whole T3 trace (`rootName "idle"` absent, `statusMessage ""`
-/// counted 1 against the corpus's 2) and the job went green on a re-run with
-/// nothing changed.
+/// reading back as **10** on its first non-zero poll, and this suite has
+/// reddened `schema-it` the same way **four times over a month** — CI runs
+/// 30258308527, 30610626381, 31510222855 and 33110647702, 2026-07-27 to
+/// 2026-08-27, every one of them on attempt 1 and with the IDENTICAL
+/// five-cell divergence: the reference returned a view missing the whole T3
+/// trace (`rootName "idle"`, `rootServiceName "batch"`,
+/// `instrumentation:name "otel-idle"` and `instrumentation:version "2.1.0"`
+/// all absent) with `statusMessage ""` counted 1 against the corpus's 2.
+/// Each went green on a re-run with nothing changed. The flake predates the
+/// change that finally chased it down; it was found four times and
+/// re-run past four times.
 ///
 /// Past-anchoring is still necessary — it is what stops the poll waiting on
 /// a future wall-clock bucket boundary, which is the flake this suite fixed
@@ -596,10 +609,16 @@ async fn compare_value_differential() {
     // ending 120s in the FUTURE, so the value-bearing bucket only finalised
     // ~120s+ later — racing the poll budget and intermittently red-ing main.
     // With `base` in the past, EVERY bucket covering the corpus is already
-    // finalised by the time the test queries, so the first non-empty poll
-    // returns COMPLETE counts within a few seconds of Tempo flushing the push
-    // (observed ~3s locally), deterministically. 90s stays well inside Tempo's
-    // ~15m `query_backend_after` live_store window, so live_store serves it.
+    // finalised by the time the test queries, so no read waits on a future
+    // wall-clock boundary. 90s stays well inside Tempo's ~15m
+    // `query_backend_after` live_store window, so live_store serves it.
+    //
+    // What past-anchoring does NOT buy is a complete FIRST read: a
+    // finalised bucket can still be queried before every span of the push
+    // has flushed into it. This comment used to claim the opposite — that
+    // the first non-empty poll returns complete counts "deterministically"
+    // — and that claim is false; see `tempo_counts`, which waits for the
+    // answer to stop moving, and the four CI failures it lists.
     let base = now_ns() - 90 * sec;
     // Both reads use this window; it brackets the corpus and, crucially, ENDS
     // in the past (`base+60s`) so every Tempo bucket it touches is complete.
@@ -627,7 +646,9 @@ async fn compare_value_differential() {
     );
     let pulsus = pulsus_counts(&engine, window).await;
 
-    // Tempo readback (past-anchored, already-complete buckets; see tempo_counts).
+    // Tempo readback: past-anchored so no bucket is still forming, then
+    // waited until the answer STOPS MOVING (see `tempo_counts` — the
+    // first non-empty read is not necessarily a complete one).
     let tempo = tempo_counts(&api_base, window);
 
     eprintln!("pulsus compare() counts: {pulsus:#?}");
@@ -659,14 +680,20 @@ async fn compare_value_differential() {
 /// Issue #458: the partial view that reddened `schema-it`, replayed, and
 /// the wait absorbing it.
 ///
-/// **The reproduction is the real numbers.** On 2026-08-27 this suite
-/// failed with the reference returning a view that was missing the whole
-/// T3 trace — `("baseline","rootName","idle")` absent where the corpus has
-/// one, likewise its `rootServiceName`, `instrumentation:name` and
-/// `instrumentation:version`, and `("baseline","statusMessage","")` counted
-/// **1** against the corpus's **2**. The same job passed on a re-run with
+/// **The reproduction is the real numbers**, and they are the same numbers
+/// four separate times: CI runs 30258308527, 30610626381, 31510222855 and
+/// 33110647702 (2026-07-27 to 2026-08-27) each failed on attempt 1 with the
+/// reference returning a view missing the whole T3 trace —
+/// `("baseline","rootName","idle")` absent where the corpus has one,
+/// likewise its `rootServiceName`, `instrumentation:name` and
+/// `instrumentation:version` — and `("baseline","statusMessage","")`
+/// counted **1** against the corpus's **2**. Each passed on a re-run with
 /// nothing changed. `partial` below is that response; `complete` is the
 /// corpus.
+///
+/// That the divergence is identical across a month is what says this is one
+/// mechanism rather than four coincidences, and it is why the fixture can
+/// be a single scripted pair.
 ///
 /// The old rule — take the first non-empty read — returns `partial`, and
 /// the value-parity assertion at the end of the differential then reports a

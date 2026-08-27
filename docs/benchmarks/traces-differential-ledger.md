@@ -767,7 +767,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   |---|---|
   | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` |
   | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` |
-  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_*` |
+  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_DIFF_URL`, `PULSUSDB_NESTEDSET_OTLP_URL` |
 
 - **Why it matters.** Each also checks `PULSUS_TEST_CLICKHOUSE`, which IS
   fail-closed. So with the ClickHouse gate still set and only the URL
