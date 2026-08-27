@@ -9,6 +9,15 @@
 //! Function-call failures return `Err(msg)`; the evaluator wraps them as
 //! `error calling <name>: <msg>` exactly like Go's `evalCall`+`safeCall`
 //! (panics recovered into the same shape).
+//!
+//! **Invalid UTF-8 in an argument is repaired at Go's granularity, not
+//! Rust's** (issue #455). [`lossy_go_len`]/[`lossy_go`]/[`lossy_go_into`]
+//! mirror `utf8.DecodeRune`'s ONE-byte advance on invalid input, so a
+//! truncated multi-byte sequence becomes one U+FFFD per byte.
+//! `String::from_utf8_lossy` would emit one per maximal invalid
+//! subsequence, a rule with no counterpart on the reference's path — the
+//! names say `_go` so no call site can read a promise of std's
+//! semantics into them.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -231,55 +240,65 @@ fn lossy_charged<'v>(ctx: &FuncCtx<'_, '_>, v: &'v [u8]) -> Result<Cow<'v, str>,
             // grow-double to 4× (cumulatively requesting up to 7×), so
             // no constant ceiling is a provable bound; a single
             // allocation of a computed size has no worst case.
-            let need = lossy_repaired_len(v);
+            let need = lossy_go_len(v);
             ctx.charge(need)?;
-            Ok(Cow::Owned(lossy_repaired(v, need)))
+            Ok(Cow::Owned(lossy_go(v, need)))
         }
     }
 }
 
-/// The exact byte length of `String::from_utf8_lossy(v)` — same
-/// substitution granularity as std (one U+FFFD per maximal invalid
-/// sequence, per `Utf8Error::error_len`), computed without allocating.
-pub(super) fn lossy_repaired_len(v: &[u8]) -> usize {
+/// The exact byte length of [`lossy_go`], computed without allocating.
+///
+/// **Go's granularity, not std's** (issue #455). Go's `utf8.DecodeRune`
+/// advances exactly ONE byte on invalid input — measured against
+/// go1.25.5, `utf8.DecodeRuneInString("\xe0\xa0'")` returns size `1` —
+/// so every rune-walking construct on the reference's path emits one
+/// U+FFFD PER INVALID BYTE: `strings.Map`/`strings.ToLower`,
+/// `bytes.Map`, `encoding/json`'s `unquoteBytes` (the rule
+/// [`go_json_sanitize`] already reproduces at its own site).
+/// `String::from_utf8_lossy` emits one per MAXIMAL invalid subsequence
+/// instead, and that rule has no counterpart anywhere the reference
+/// reaches, so the two disagree for every truncated multi-byte sequence:
+/// `\xe0\xa0` is two replacements here and one under std.
+pub(super) fn lossy_go_len(v: &[u8]) -> usize {
     let mut rest = v;
     let mut len = 0usize;
     loop {
         match std::str::from_utf8(rest) {
             Ok(s) => return len + s.len(),
             Err(e) => {
+                // ALWAYS `valid_up_to() + 1`; `error_len()` is
+                // deliberately not consulted — consulting it is std's
+                // maximal-subpart rule, which is the divergence.
                 len += e.valid_up_to() + '\u{FFFD}'.len_utf8();
-                match e.error_len() {
-                    Some(bad) => rest = &rest[e.valid_up_to() + bad..],
-                    // Truncated trailing sequence: one replacement, done.
-                    None => return len,
-                }
+                rest = &rest[e.valid_up_to() + 1..];
             }
         }
     }
 }
 
-/// Builds the lossy repair in ONE allocation of exactly `cap` bytes
-/// (byte-identical to `String::from_utf8_lossy(v)` — pinned by a unit
-/// test below, including the truncated-tail and interleaved cases).
-pub(super) fn lossy_repaired(v: &[u8], cap: usize) -> String {
+/// Builds the Go-granularity repair in ONE allocation of exactly `cap`
+/// bytes, `cap` being [`lossy_go_len`]'s answer for the same input.
+/// Deliberately NOT `String::from_utf8_lossy` — see [`lossy_go_len`] —
+/// and the codepoint counts are pinned by the unit test below.
+pub(super) fn lossy_go(v: &[u8], cap: usize) -> String {
     let mut out = String::with_capacity(cap);
-    lossy_repaired_into(&mut out, v);
-    // Length only — an equality debug_assert against
-    // `String::from_utf8_lossy` would re-run the grow-doubling path in
-    // debug builds and re-appear in the allocation gate; byte equality
-    // is pinned by the unit test below instead.
+    lossy_go_into(&mut out, v);
+    // Length only — an equality debug_assert against a second walk would
+    // re-appear in the allocation gate; byte equality against
+    // `lossy_go_len` is what this asserts, and the RULE is pinned by the
+    // unit test below.
     debug_assert_eq!(out.len(), cap);
     out
 }
 
-/// [`lossy_repaired`] appended in place (issue #294): the `unixToTime`
+/// [`lossy_go`] appended in place (issue #294): the `unixToTime`
 /// error message embeds the repaired argument AND its `strconv.Quote`,
 /// and the whole message must be ONE allocation of its exact final
 /// length (AC-9b) — building either half as a temporary doubles the
 /// allocation the charge accounts for (measured: 4,194,375 allocated
 /// against 2,097,221 charged).
-pub(super) fn lossy_repaired_into(out: &mut String, v: &[u8]) {
+pub(super) fn lossy_go_into(out: &mut String, v: &[u8]) {
     let mut rest = v;
     loop {
         match std::str::from_utf8(rest) {
@@ -291,11 +310,11 @@ pub(super) fn lossy_repaired_into(out: &mut String, v: &[u8]) {
                 let (valid, tail) = rest.split_at(e.valid_up_to());
                 out.push_str(std::str::from_utf8(valid).expect("validated by valid_up_to"));
                 out.push('\u{FFFD}');
-                match e.error_len() {
-                    Some(bad) => rest = &tail[bad..],
-                    // Truncated trailing sequence: one replacement, done.
-                    None => return,
-                }
+                // One byte, always (issue #455): Go's `utf8.DecodeRune`
+                // advance. `error_len()` is not consulted here either —
+                // the two walks must agree with `lossy_go_len` or the
+                // `debug_assert_eq!` above fires.
+                rest = &tail[1..];
             }
         }
     }
@@ -1710,7 +1729,7 @@ impl UnixToTimeError<'_> {
             }
             UnixToTimeError::BadLength { .. } => U_NIL.len(),
         };
-        U_PREFIX.len() + lossy_repaired_len(epoch) + U_MID.len() + tail
+        U_PREFIX.len() + lossy_go_len(epoch) + U_MID.len() + tail
     }
 
     /// ONE `String::with_capacity(rendered_len())`, written in place.
@@ -1719,7 +1738,7 @@ impl UnixToTimeError<'_> {
         let mut out = String::with_capacity(want);
         let epoch = self.epoch();
         out.push_str(U_PREFIX);
-        lossy_repaired_into(&mut out, epoch);
+        lossy_go_into(&mut out, epoch);
         out.push_str(U_MID);
         match self {
             UnixToTimeError::Syntax { .. } | UnixToTimeError::Range { .. } => {
@@ -1969,9 +1988,9 @@ fn compile_charged_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex:
         Err(_) => {
             // Round 6: exact repaired length, one allocation, charged
             // first — same as `lossy_charged` (no growth to bound).
-            let need = lossy_repaired_len(pattern);
+            let need = lossy_go_len(pattern);
             ctx.charge(need)?;
-            lossy_repaired(pattern, need)
+            lossy_go(pattern, need)
         }
     };
     if let Some(re) = ctx.regex_cache.get(&text) {
@@ -2220,51 +2239,105 @@ pub(crate) fn go_parse_duration(orig: &[u8]) -> Result<i64, DurationParseError<'
 
 #[cfg(test)]
 mod tests {
-    use super::{lossy_repaired, lossy_repaired_len};
+    use super::{lossy_go, lossy_go_len};
 
-    /// Round 6: the single-allocation repair must be byte-identical to
-    /// `String::from_utf8_lossy` (std's maximal-subpart substitution
-    /// granularity — NOT the Go per-byte rule `go_json_sanitize`
-    /// implements for fromJson), and `lossy_repaired_len` must be its
-    /// exact length, across the awkward shapes: truncated tails,
-    /// invalid continuations, overlong encodings, interleaved runs.
+    /// Issue #455 — the repair mints **one U+FFFD per invalid BYTE**,
+    /// which is Go's granularity, and NOT one per maximal invalid
+    /// subsequence, which is `String::from_utf8_lossy`'s.
+    ///
+    /// The table carries both counts on purpose. Rows where they DIFFER
+    /// (truncated multi-byte sequences) fail if the `error_len()` advance
+    /// is restored; rows where they AGREE (lone continuation bytes,
+    /// overlongs, invalid leads followed by a non-continuation) fail if
+    /// the walk stops advancing at all. A table of only one kind would
+    /// pass against the other rule.
+    ///
+    /// Counts are CODEPOINTS, never a message byte length and never an
+    /// allocation count: those are properties of how the code is spelled,
+    /// and pinning them here is how this file acquired a test that
+    /// pinned the wrong rule in the first place.
     #[test]
-    fn lossy_repaired_matches_std_from_utf8_lossy_byte_for_byte() {
-        let cases: &[&[u8]] = &[
-            b"",
-            b"plain ascii",
-            "caf\u{e9} \u{1F600}".as_bytes(),
-            &[0xFF],
-            &[0xFF; 7],
-            b"a\xFFb\xFFc",
-            b"\xC2",                   // truncated 2-byte tail
-            b"\xE0\xA0",               // truncated 3-byte tail
-            b"\xF0\x9F\x92",           // truncated 4-byte tail
-            b"a\xF0\x28b",             // invalid continuation mid-stream
-            b"\xC0\xAF",               // overlong encoding (2-byte)
-            b"\xE0\x80\x80",           // overlong encoding (3-byte)
-            b"\xF0\x80\x80\x80",       // overlong encoding (4-byte)
-            b"\xF4\x90\x80\x80",       // above U+10FFFF (first out of range)
-            b"\xF5\x80\x80\x80",       // above U+10FFFF (lead byte 0xF5)
-            b"\xED\xA0\x80",           // surrogate range
-            b"x\xF0\x9F\x92\x96y\xFF", // valid 4-byte + trailing invalid
+    fn lossy_go_replaces_one_invalid_byte_with_one_replacement_char() {
+        // (input, U+FFFD this rule mints, U+FFFD std's rule would mint)
+        let cases: &[(&[u8], usize, usize)] = &[
+            // -- the two rules DISAGREE: truncated multi-byte sequences --
+            (b"\xE0\xA0", 2, 1),     // AC-1 case 1 (Q2/Q3's payload)
+            (b"12\xE0\xA0", 2, 1),   // AC-1's shape inside Q1/Q4's `bytes` argument
+            (b"\xF0\x9F\x98", 3, 1), // AC-1 case 3
+            (b"\xC2", 1, 1),         // truncated 2-byte tail: one byte either way
+            (b"\xF0\x9F\x92", 3, 1), // truncated 4-byte tail
+            // -- the two rules AGREE ------------------------------------
+            (b"\xFF\xFF", 2, 2), // AC-1 case 2 (Q8's payload)
+            (b"", 0, 0),
+            (b"plain ascii", 0, 0),
+            ("caf\u{e9} \u{1F600}".as_bytes(), 0, 0),
+            (&[0xFF], 1, 1),
+            (b"a\xFFb\xFFc", 2, 2),
+            (b"a\xF0\x28b", 1, 1),       // invalid lead, non-continuation next
+            (b"\xC0\xAF", 2, 2),         // overlong (2-byte)
+            (b"\xE0\x80\x80", 3, 3),     // overlong (3-byte)
+            (b"\xF0\x80\x80\x80", 4, 4), // overlong (4-byte)
+            (b"\xF4\x90\x80\x80", 4, 4), // above U+10FFFF
+            (b"\xF5\x80\x80\x80", 4, 4), // above U+10FFFF (lead byte 0xF5)
+            (b"\xED\xA0\x80", 3, 3),     // surrogate range
+            (b"x\xF0\x9F\x92\x96y\xFF", 1, 1), // valid 4-byte + trailing invalid
         ];
-        for v in cases {
-            let expected = String::from_utf8_lossy(v);
-            let need = lossy_repaired_len(v);
-            assert_eq!(need, expected.len(), "{v:X?}");
-            assert_eq!(lossy_repaired(v, need), expected.as_ref(), "{v:X?}");
+        let mut disagreeing = 0usize;
+        let mut agreeing = 0usize;
+        for (v, go_count, std_count) in cases {
+            let need = lossy_go_len(v);
+            let repaired = lossy_go(v, need);
+            assert_eq!(
+                repaired.len(),
+                need,
+                "the length scan and the walk must agree: {v:X?}"
+            );
+            assert_eq!(
+                repaired.chars().filter(|c| *c == '\u{FFFD}').count(),
+                *go_count,
+                "one U+FFFD per invalid BYTE (Go's `utf8.DecodeRune` advance): {v:X?} -> {repaired:?}"
+            );
+            if go_count == std_count {
+                agreeing += 1;
+            } else {
+                disagreeing += 1;
+            }
         }
-        // Every lone continuation byte, bare and mid-stream: std
-        // distinguishes continuation bytes from lead bytes when it
-        // picks the maximal-subpart boundary, so a byte-equality claim
-        // must cover the whole 0x80..=0xBF range, not one exemplar.
+        assert!(
+            disagreeing >= 3 && agreeing >= 3,
+            "the table must contain rows of BOTH kinds or it passes against either rule \
+             (disagreeing={disagreeing}, agreeing={agreeing})"
+        );
+
+        // Valid content around the replacements survives byte-for-byte —
+        // a rule that swallowed it would still satisfy the counts above.
+        assert_eq!(lossy_go(b"\xE0\xA0", 6), "\u{FFFD}\u{FFFD}");
+        assert_eq!(lossy_go(b"\xFF\xFF", 6), "\u{FFFD}\u{FFFD}");
+        assert_eq!(lossy_go(b"\xF0\x9F\x98", 9), "\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(lossy_go(b"a\xF0\x28b", 6), "a\u{FFFD}(b");
+        assert_eq!(
+            lossy_go(b"12\xE0\xA0", 8),
+            "12\u{FFFD}\u{FFFD}",
+            "the digits `bytes` strips before the unit are untouched"
+        );
+
+        // Every lone continuation byte, bare and mid-stream: one per
+        // byte, so a walk that resynchronised on a run would fail here.
         for b in 0x80u8..=0xBF {
-            for v in [&[b][..], &[b'a', b, b'z'][..], &[b, b][..]] {
-                let expected = String::from_utf8_lossy(v);
-                let need = lossy_repaired_len(v);
-                assert_eq!(need, expected.len(), "{v:X?}");
-                assert_eq!(lossy_repaired(v, need), expected.as_ref(), "{v:X?}");
+            for (v, want) in [
+                (&[b][..], 1usize),
+                (&[b'a', b, b'z'][..], 1),
+                (&[b, b][..], 2),
+                (&[b, b, b][..], 3),
+            ] {
+                let need = lossy_go_len(v);
+                let repaired = lossy_go(v, need);
+                assert_eq!(repaired.len(), need, "{v:X?}");
+                assert_eq!(
+                    repaired.chars().filter(|c| *c == '\u{FFFD}').count(),
+                    want,
+                    "{v:X?} -> {repaired:?}"
+                );
             }
         }
     }

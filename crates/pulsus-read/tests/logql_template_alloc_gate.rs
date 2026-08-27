@@ -554,7 +554,7 @@ const R_CONST: &str = "constant-size decimal rendering of a timestamp, \
 ///
 /// The `invalid-repl` / `+invalid-utf8` haystack shapes do NOT cover
 /// this site: they charge through `lossy_charged`, a different call
-/// site from the pattern conversion's `lossy_repaired*`.
+/// site from the pattern conversion's `lossy_go*`.
 const DE_INVALID_PATTERN: &str = "measured on df4bdbd: this shape returns Ok(string) with 4,198,096 B \
      charged — `compile_charged_regex` charges every conversion and the \
      compile estimate before allocating, so the round-8 claim that the \

@@ -848,6 +848,38 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: ci/test-summary.sh run logs_variants_warnings_live -p pulsus-server --test logs_variants_warnings_live
 
+      # Issue #455: the invalid-UTF-8 substitution differential. Spawns
+      # the real `pulsusdb` binary against this job's ClickHouse 26.3 on
+      # 19123 with PULSUS_COMPAT_ENDPOINTS on, pushes the SAME seed to
+      # both stores over /loki/api/v1/push, then compares the
+      # `__error_details__` label and the log line at
+      # /loki/api/v1/query_range against this container — VALUES, not
+      # just HTTP status.
+      #
+      # It asserts both the parity rows (the `bytes` family, where the
+      # reference's own slot already held U+FFFD, is now byte-identical on
+      # the label AND the entry) and the one that stays divergent (the
+      # `%v` family, where the reference serves raw invalid bytes a
+      # `Cow<'a, str>` cannot hold). Its second leg covers the streams
+      # collision: two label sets that become identical after the
+      # substitution, at a window the reference does not split and one it
+      # does, plus a second ordering fixture and a parse rejection.
+      #
+      # MUST STAY ABOVE "Stop LogQL differential oracle" — it needs the
+      # container that step removes. It pushes, so it runs after the
+      # status-only legs above. Both halves are gated: the PulsusDB half
+      # on PULSUS_TEST_CLICKHOUSE, the differential half additionally on
+      # PULSUSDB_LOGQL_DIFF_URL, so the hermetic `ci` job runs the same
+      # binary with both off and skips — while its ledger-shape test calls
+      # the live gate directly, so a lost `env:` block here fails loudly
+      # instead of reporting green (issue #320).
+      - name: LogQL differential leg (invalid-UTF-8 substitution, issue #455)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: ci/test-summary.sh run logs_utf8_substitution_live -p pulsus-server --test logs_utf8_substitution_live
+
       # Issue #392: the identifier rune set — general category `L`, plus
       # `Nd` in non-leading position, which is Go `text/scanner`'s default
       # `isIdentRune` and therefore the reference's rule

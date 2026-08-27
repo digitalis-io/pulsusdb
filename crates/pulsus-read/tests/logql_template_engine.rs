@@ -1153,6 +1153,16 @@ fn every_caller_amplified_allocation_path_charges_the_budget() {
 /// there into `ErrorSlots::details`, a `Cow<'a, str>`; neither can hold
 /// invalid UTF-8. That divergence is recorded in the differential ledger
 /// under `template-output-budget`, unchanged by this issue.
+///
+/// Issue #455 changed neither the value asserted below nor the reason for
+/// it: `FF FF` is two invalid bytes, so it mints two U+FFFD under Go's
+/// per-byte rule exactly as it did under std's maximal-subpart one. What
+/// #455 moved is one layer further out — the streams marshaller maps each
+/// of those two U+FFFD to a space, so the `__error_details__` LABEL a
+/// client reads is now `20 20` against the reference's raw `ff ff`. That
+/// wire value is asserted in
+/// `crates/pulsus-server/tests/logs_utf8_substitution_live.rs`; this test
+/// stays a statement about the RENDER.
 #[test]
 fn unix_to_time_quotes_the_raw_argument_and_repairs_only_the_percent_v_half() {
     use base64::Engine as _;
@@ -1356,34 +1366,56 @@ fn a_thirty_two_mib_duration_argument_is_the_bounded_422_not_a_served_error_deta
     );
 }
 
-/// The two U+FFFD divergences this issue did NOT change, pinned so the
-/// ledger's `template-output-budget` entry describes something a test
-/// holds still. Both flow from the same type constraint — `ExecError.msg`
-/// is a `String` and `ErrorSlots::details` a `Cow<'a, str>`, so neither
-/// can carry a raw invalid byte — and both are recorded, with the
-/// substitution work itself routed to **#455**.
+/// What the TEMPLATE LAYER renders for the recorded U+FFFD cases, pinned
+/// so the ledger's `template-output-budget` entry describes something a
+/// test holds still.
 ///
-/// Reference behaviour, captured 2026-08-26 from `grafana/loki:3.7.4`
-/// (`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`):
+/// The render is where this file can see; the wire is not. Issue #455
+/// substitutes a space for every U+FFFD in a stream LABEL at the response
+/// marshaller, so the label surface of these rows changed while every
+/// value asserted below — a `render()` result — did not. The wire values
+/// are asserted by `logs_utf8_substitution_live.rs`, against the same
+/// container.
 ///
-/// | query | reference | here |
+/// Reference behaviour re-captured 2026-08-27 from
+/// `grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+/// (`/loki/api/v1/status/buildinfo` -> `3.7.4` / `b318f282`), **every row
+/// on route `/loki/api/v1/query_range`, window `start = NS - 1h`,
+/// `end = NS + 1h`, `direction=backward`, `limit=100`**, one pushed line
+/// `hello world` under `{app="foo"}`. A row with no route and no window
+/// cannot be re-measured and goes stale invisibly, which is exactly what
+/// happened to the first row below.
+///
+/// | query | reference `__error_details__` tail | ours, after #455 |
 /// |---|---|---|
-/// | `{{ bytes (b64dec "MTL/") }}` (3 B: 31 32 FF) | HTTP **500** `could not write JSON response: 1:51: parse error: invalid UTF-8 rune` | HTTP 200, `unhandled size name: <U+FFFD>` |
-/// | `{{ bytes (b64dec "MTJ4") }}` (3 B: 31 32 78) | 200, `unhandled size name: x` | identical |
-/// | `{{ bytes (b64dec "MTIg") }}` (3 B: 31 32 20) | 200, renders `12` | identical |
-/// | `{{ unixToTime (b64dec "//8=") }}` (2 B: FF FF) | raw half `FF FF` | raw half two U+FFFD |
+/// | `{{ bytes (b64dec "MTL/") }}` (3 B: 31 32 FF) | `200`, `unhandled size name: ` + `20` | `200`, same — byte-identical |
+/// | `{{ bytes (b64dec "MTJ4") }}` (3 B: 31 32 78) | `200`, `unhandled size name: x` | identical |
+/// | `{{ bytes (b64dec "MTIg") }}` (3 B: 31 32 20) | `200`, renders `12`, no error pair | identical |
+/// | `{{ unixToTime (b64dec "//8=") }}` (2 B: FF FF) | `200`, `%v` half raw `ff ff` | `20 20` — the remaining divergence |
 ///
-/// The reference's `500` is its own serialisation path refusing a
-/// well-formed result: `encodeStream` re-parses the stream's labels with
-/// Prometheus' lexer (`pkg/util/marshal/query.go:416 @ v3.7.4`), which
-/// rejects an invalid rune, and `marshal.go:60` wraps that as `could not
-/// write JSON response: %w`. Its OTHER encode path sanitises instead —
-/// `NewStreams` maps every `utf8.RuneError` rune to a space
-/// (`query.go:25-32`, `:92-93`). We reproduce neither: no `500`, and no
-/// space substitution.
+/// **The first row is a correction.** It used to record the reference at
+/// HTTP `500` `could not write JSON response: 1:51: parse error: invalid
+/// UTF-8 rune`, with no endpoint named. That `500` is real, but it comes
+/// from the OTHER stream-encode path: `encodeStream` re-parses the
+/// stream's labels with Prometheus' lexer
+/// (`pkg/util/marshal/query.go:416 @ v3.7.4`) and `marshal.go:60` wraps
+/// the rejection. On `/loki/api/v1/query_range` the reference answers
+/// `200` and sanitises instead — `NewStreams` maps every
+/// `utf8.RuneError` rune to a space (`query.go:25-32`, applied at
+/// `:92-93`). **We never reproduce the `500`** (the "except where they
+/// are wrong" case) and we now DO reproduce the space.
+///
+/// The last row stays divergent, and it is a type constraint rather than
+/// a preference: `ExecError.msg` is a `String` and `ErrorSlots::details`
+/// a `Cow<'a, str>`, so neither can carry the raw `ff ff` the reference
+/// serves. Our slot holds U+FFFD, the marshaller maps it, and the label
+/// arrives as two spaces — valid UTF-8 where the reference's is not, and
+/// the same character count.
 #[test]
 fn the_two_recorded_utf8_divergences_render_as_they_did_before_this_issue() {
-    // `bytes` keeps its U+FFFD repair; only WHERE it is charged moved.
+    // `bytes` keeps its U+FFFD repair; only WHERE it is charged moved
+    // (#294), and #455 changed the GRANULARITY without changing this
+    // case — `FF` is one invalid byte under both rules.
     let err = render(r#"{{ bytes (b64dec "MTL/") }}"#, 0).expect_err("FF is not a unit");
     assert!(
         err.ends_with("unhandled size name: \u{FFFD}"),
