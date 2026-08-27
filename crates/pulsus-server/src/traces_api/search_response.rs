@@ -2,8 +2,18 @@
 //! (docs/api.md §4.2) from `pulsus_read::SearchOutput` — response
 //! shaping stays server-side so `pulsus-read` stays format-agnostic
 //! (issue #55 layering). 64-bit nanosecond timestamps are emitted as
-//! JSON strings (protojson convention, same as the trace-fetch surface);
-//! `durationMs` is integer milliseconds.
+//! JSON strings (protojson convention, same as the trace-fetch surface).
+//!
+//! **The two duration fields sit at two different levels and are not the
+//! same field** (issue #458). The reference's `TraceSearchMetadata` has
+//! `uint32 durationMs` (`pkg/tempopb/tempo.proto:139` @ v3.0.2) — integer
+//! MILLISECONDS, emitted here by [`trace_json`]. Its `Span` has
+//! `uint64 durationNanos` (`pkg/tempopb/tempo.proto:160` @ v3.0.2), filled
+//! from `span.DurationNanos()` (`pkg/traceql/engine.go:311` @ v3.0.2) —
+//! NANOSECONDS, and protojson renders a `uint64` as a JSON **string**, so
+//! [`span_json`] emits it as one. The string is load-bearing rather than
+//! cosmetic: a span of 9007199254740993 ns (2^53 + 1) survives it and
+//! would not survive a JSON number.
 
 use serde_json::{Value, json};
 
@@ -17,16 +27,25 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Trace-level milliseconds only — `TraceSearchMetadata.durationMs`
+/// (`pkg/tempopb/tempo.proto:139` @ v3.0.2). A span never carries this.
 fn duration_ms(duration_ns: i64) -> i64 {
     duration_ns / 1_000_000
 }
 
+/// One `SpanSet.spans[]` entry. `durationNanos` is the reference's
+/// `uint64` (`pkg/tempopb/tempo.proto:160` @ v3.0.2) rendered the way
+/// protojson renders a `uint64` — as a JSON string. `duration_ns` is
+/// non-negative by ingest construction (`otlp_traces::resolve_duration_ns`
+/// clamps `end < start` and `end == 0` to `0`), and deliberately NOT
+/// re-clamped here: a negative value must surface a writer regression, not
+/// be hidden by the renderer.
 fn span_json(span: &SpanSummary) -> Value {
     let mut obj = json!({
         "spanID": hex(&span.span_id),
         "name": span.name,
         "startTimeUnixNano": span.start_ns.to_string(),
-        "durationMs": duration_ms(span.duration_ns),
+        "durationNanos": span.duration_ns.to_string(),
     });
     if !span.attributes.is_empty() {
         obj["attributes"] = Value::Array(
@@ -152,6 +171,14 @@ mod tests {
         assert_eq!(v["metrics"]["returned"], 1);
     }
 
+    /// Issue #458 defect A: a span carries `durationNanos` as a protojson
+    /// `uint64` — a JSON **string** of NANOSECONDS
+    /// (`pkg/tempopb/tempo.proto:160`, `pkg/traceql/engine.go:311` @
+    /// v3.0.2) — and carries no `durationMs` at all. The Grafana Tempo
+    /// datasource reads exactly this field: `src/types.ts:89` types it
+    /// `durationNanos: string` and `src/resultTransformer.ts:942` does
+    /// `parseInt(span.durationNanos, 10)` into an `ns`-unit frame column,
+    /// so an absent field renders the Duration column as `NaN`.
     #[test]
     fn span_sets_carry_matched_count_and_span_summaries() {
         let v = render(&sample_output());
@@ -159,10 +186,59 @@ mod tests {
         assert_eq!(set["matched"], 5);
         assert_eq!(set["spans"][0]["spanID"], "cdcdcdcdcdcdcdcd");
         assert_eq!(set["spans"][0]["name"], "charge");
-        assert_eq!(set["spans"][0]["durationMs"], 42);
+        assert_eq!(
+            set["spans"][0]["durationNanos"],
+            serde_json::Value::String("42000000".to_string()),
+            "protojson renders a uint64 as a JSON string, not a number"
+        );
+        assert!(
+            set["spans"][0].get("durationMs").is_none(),
+            "the reference's Span message has no durationMs field; it belongs to \
+             TraceSearchMetadata one level up"
+        );
         assert_eq!(
             set["spans"][0]["attributes"][0],
             serde_json::json!({"key": "span.foo", "value": {"stringValue": "bar"}})
+        );
+    }
+
+    /// Issue #458 defect A, the widths a millisecond field or a JSON
+    /// number would destroy. `9007199254740993` is `2^53 + 1`: a JSON
+    /// number rounds it to `9007199254740992` and a millisecond integer
+    /// loses nine significant digits. `545000` is sub-millisecond and
+    /// renders `0` as milliseconds.
+    #[test]
+    fn span_duration_nanos_survives_every_representable_width() {
+        for (ns, want) in [
+            (0i64, "0"),
+            (1, "1"),
+            (545_000, "545000"),
+            (42_000_000, "42000000"),
+            (9_007_199_254_740_993, "9007199254740993"),
+            (i64::MAX, "9223372036854775807"),
+        ] {
+            let mut output = sample_output();
+            output.traces[0].spans[0].duration_ns = ns;
+            let v = render(&output);
+            assert_eq!(
+                v["traces"][0]["spanSets"][0]["spans"][0]["durationNanos"],
+                serde_json::Value::String(want.to_string()),
+                "width {ns} ns"
+            );
+        }
+    }
+
+    /// Issue #458: the TRACE level is unchanged and must stay
+    /// `durationMs` — integer milliseconds from the root span's duration
+    /// (`pkg/tempopb/tempo.proto:139` @ v3.0.2). This is the field the
+    /// issue records as already correct.
+    #[test]
+    fn the_trace_level_keeps_integer_millisecond_duration_ms() {
+        let v = render(&sample_output());
+        assert_eq!(v["traces"][0]["durationMs"], 2500);
+        assert!(
+            v["traces"][0].get("durationNanos").is_none(),
+            "the trace level has no durationNanos in the reference"
         );
     }
 
