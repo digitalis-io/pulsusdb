@@ -644,3 +644,115 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Where it is enforced.** `parser::tests::the_spanset_by_takes_one_key_and_that_key_is_a_field_expression`,
   the `reject/by_multi_key` corpus case, and the accept-surface matrix's
   D16 rows. User-facing write-up: docs/api.md §4.2.
+
+### `traceql-metrics-filter-residual-refusals` (issue #458, wave 1) — **a GAP record, not a divergence**
+
+- **What.** The metrics filter compiler (`render_expr` in
+  `crates/pulsus-read/src/traces/metrics_sql.rs`) refuses constructs the
+  reference serves. Enumerated from the **reference's** behaviour rather
+  than from our source — a list derived from our own refusals cannot see
+  one we should have and do not — and re-verified live against
+  `grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`
+  (the digest `.github/workflows/ci.yml` pins), started with
+  `ci/tempo/tempo-compare.yaml` unmodified, on
+  `GET /api/metrics/query_range?q=…&start=<now-3600>&end=<now>&step=60s`
+  against an empty store.
+
+- **Why the reference serves all of them.** There is no metrics-specific
+  filter guard in the reference at all: `Compile`
+  (`pkg/traceql/engine.go:31-48` @ v3.0.2) validates the pipeline
+  identically whether or not a `MetricsPipeline` is present, and
+  `CompileMetricsQueryRange` reuses `expr.Pipeline.evaluate` as its
+  second-pass filter. So every refusal below is a **gap**, not a
+  divergence in judgement.
+
+- **Closed by wave 1** (this issue, still open): the `nestedSetParent`
+  root/non-root family — the query a live Grafana sent us — and bare
+  attribute truthiness.
+
+- **The residual, each class with its measured reference status.** Every
+  row is `we 400 / the reference 200`:
+
+  | class id | witness query | our exact 400 body |
+  |---|---|---|
+  | `metrics-filter-field-vs-field-and-arithmetic` | `{ .a = .b } \| rate()`, `{ .a + 1 > 2 } \| rate()`, `{ 2 > .a } \| rate()`, `{ nestedSetParent = -1 } \| rate()`, `{ nestedSetParent != -1 } \| rate()` | `type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters` |
+  | `metrics-filter-trace-level-intrinsics` | `{ trace:duration > 1s } \| rate()` | `type mismatch: trace-level intrinsics are not supported in metrics filters` |
+  | `metrics-filter-absence-checks` | `{ .a = nil } \| rate()` | `type mismatch: absence checks are not supported in metrics filters` |
+  | `metrics-filter-field-negation` | `{ !.a } \| rate()` | `type mismatch: field negation is not supported in metrics filters` |
+  | `metrics-filter-nested-set-numbering-range` | `{ nestedSetParent < 2 } \| rate()`, `{ nestedSetParent = 5 } \| rate()` | `type mismatch: nestedSetParent comparisons inside the numbering range are not supported in metrics filters` |
+  | `metrics-filter-nested-set-left-right` | `{ nestedSetLeft > 1 } \| rate()`, `{ nestedSetLeft > 0 } \| rate()`, `{ nestedSetRight < 100 } \| rate()` | `type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters` |
+  | `metrics-filter-intrinsic-existence-shared-path` | `{ name != nil } \| rate()` | `type mismatch: existence checks are only supported on attributes` |
+
+- **Two of those rows are not what they look like.** `{ nestedSetParent =
+  -1 }` and `{ nestedSetParent != -1 }` are **not** nested-set refusals: a
+  negative literal is not a literal in this grammar, so `-1` parses to
+  `Unary { Neg, Number("1") }` and the query is refused by the
+  operand-shape check one arm earlier, in the field-vs-field/arithmetic
+  class. Spelling the same predicates without a negative literal —
+  `{ nestedSetParent < 0 }` and `{ nestedSetParent >= 1 }` — is served.
+  And `metrics-filter-intrinsic-existence-shared-path` is not a
+  metrics-block class at all: `/api/search` refuses `{ name != nil }`
+  with the identical body, so the rejection comes from a shared path. It
+  is listed because it IS a divergence on this route; it is owned
+  elsewhere.
+
+- **Why each remaining class is a design, not a line.**
+  `metrics-filter-field-vs-field-and-arithmetic` needs a
+  `trace_attrs_idx` self-join or a correlated per-span value read;
+  `metrics-filter-trace-level-intrinsics` needs a trace-wide
+  `GROUP BY trace_id … HAVING` semi-join matching `search_sql`'s root
+  selection; `metrics-filter-absence-checks` is three lines of lowering
+  but our `= nil` **value** semantics already diverge on the search
+  route, so it needs its own entry first; `metrics-filter-field-negation`
+  is a value co-load whose non-boolean case is a reference **500**, which
+  SQL cannot produce; the two nested-set classes need the Euler
+  numbering, which is a per-trace tree walk the single-query metrics
+  pushdown does not build.
+
+- **Where it is enforced.** `crates/pulsus-read/tests/fixtures/metrics_filter_accept.json`
+  carries one probe per witness with both sides' verdicts and the exact
+  bodies; `crates/pulsus-read/tests/traces_metrics_filter_accept.rs`
+  re-derives our column from the tree and the reference's from the pinned
+  container. `crates/pulsus-read/tests/traces_metrics_ledger.rs` asserts
+  that the class ids in this table and the fixture's divergent probes are
+  **the same set**, both directions.
+
+### `traceql-metrics-nestedsetparent-root-window` (issue #458) — **a temporary split between our own two routes**
+
+- **The measurement, with route and window.** Trace `cc…cc`, service
+  `orphan`: root `0300000000000001` at `T`, child `0300000000000002` at
+  `T + 300s`. Route
+  `GET /api/search?q={nestedSetParent<0 && resource.service.name="orphan"}&start=<T+100>&end=<T+400>&limit=10`
+  — a window that **excludes the root** — against
+  `grafana/tempo@sha256:aa8df8d0…` and against PulsusDB at `4193be6`.
+  The reference returns `{"traces":[], …}`. Our **search** route returns
+  the child, `spanID 0300000000000002`.
+
+- **Which side is right: the reference.** Its root sentinel comes from the
+  stored `ParentSpanID`
+  (`tempodb/encoding/vparquet4/nested_set_model.go:11-12,57` @ v3.0.2),
+  not from the query window. A span with a parent is not a root just
+  because its parent fell outside the window. Our `compute_nested_set`
+  (`crates/pulsus-read/src/traces/search_eval.rs`) treats a span whose
+  parent is not in the hydrated window as a forest root.
+
+- **Which of our surfaces is right: the metrics route, after issue #458.**
+  Its lowering is `parent_id = <all-zero>` — the reference's own `IsRoot`
+  identity — so on the metrics route the same window answers the
+  reference's way. The search route is wrong here.
+
+- **The open class this belongs to.** The window-clipping fixture class of
+  `crates/pulsus-read/tests/nestedset_value_differential.rs`, which fails
+  by design today and is #185-closeout work; docs/features.md already
+  records that the suite is env-gated and that no workflow supplies its
+  gate.
+
+- **The split is temporary, and it closes on the SEARCH side.** It ends by
+  the search route converging on the reference — **never** by the metrics
+  route regressing to match search. A new surface should be correct even
+  while an old one is not; the reverse rule would spread every existing
+  defect to everything built after it.
+
+- **Where it is enforced.** `crates/pulsus-read/tests/traces_metrics_ledger.rs`
+  asserts each of the five facts above individually, so the entry cannot
+  be satisfied by existing.

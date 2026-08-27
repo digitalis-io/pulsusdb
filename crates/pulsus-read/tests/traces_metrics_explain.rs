@@ -343,6 +343,44 @@ async fn query_log_like(client: &ChClient, like_fragments: &[&str]) -> Option<Qu
     row
 }
 
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CostRow {
+    read_rows: u64,
+    /// `ProfileEvents['RowsReadByPrewhereReaders']` — the one execution
+    /// counter that can see whether a `PREWHERE` exists at all. Its
+    /// ABSOLUTE value is population- and granule-layout dependent and is
+    /// never asserted (issue #458 plan v5 Delta C: the same query read
+    /// 49,152 for an 8,000-row service and 73,728 for an 800-row one in a
+    /// single corpus, the smaller population reading the larger number).
+    /// Only the identity between two plans and the `!= read_rows`
+    /// presence check are asserted.
+    prewhere_rows: u64,
+    projections: Vec<String>,
+}
+
+/// The most recent `QueryFinish` row whose `query` is **byte-identical**
+/// to `sql`. Issue #458 AC 6 reads execution counters for two plans that
+/// share the `PREWHERE service = 'checkout'` fragment, so a `LIKE` match
+/// could return either one's row; equality cannot.
+async fn query_log_exact(client: &ChClient, sql: &str) -> Option<CostRow> {
+    let literal = sql.replace('\\', "\\\\").replace('\'', "\\'");
+    let query = format!(
+        "SELECT read_rows, ProfileEvents['RowsReadByPrewhereReaders'] AS prewhere_rows, \
+         projections FROM system.query_log WHERE type = 'QueryFinish' AND \
+         current_database = '{DB}' AND query = '{literal}' \
+         ORDER BY event_time_microseconds DESC LIMIT 1"
+    );
+    let mut stream = client
+        .query_stream::<CostRow>(&query, &QuerySettings::new())
+        .await
+        .expect("query_log read");
+    let mut row = None;
+    while let Some(r) = stream.next().await {
+        row = Some(r.expect("decode query_log cost row"));
+    }
+    row
+}
+
 /// One `#[tokio::test]` running every gate in sequence — the corpus is
 /// seeded once.
 #[tokio::test]
@@ -572,6 +610,111 @@ async fn metrics_explain_and_budget_gates() {
         probe.contains("GROUP BY g0") && probe.contains("LIMIT 1001"),
         "the probe counts distinct label-sets under a cap+1 limit:\n{probe}"
     );
+
+    // ---- Issue #458 AC 6: the root filter costs nothing extra --------
+    //
+    // `{ service && nestedSetParent<0 }` must prune exactly as tightly as
+    // `{ service }`: `parent_id` is an unindexed residual `WHERE`
+    // conjunct, so it adds no pruning and — this is the part that can
+    // break — must remove none either.
+    //
+    // **Both plans come from `plan_trace_metrics`, are executed through
+    // `TraceEngine`, and every figure below is read back from the exact
+    // `range_sql()` text those plans emitted.** A test that hand-wrote the
+    // SQL could not observe the planner emitting an anti-semi-join, which
+    // is the only lowering this gate exists to forbid (`{ } EXCEPT
+    // (SELECT … FROM trace_spans …)`-style: measured `read_rows` 8192 →
+    // 208 192 and `CreatingSets` 0 → 1 on this fixture's shape).
+    //
+    // This is a COST oracle, not a truth oracle. This corpus is
+    // all-roots, so the root conjunct selects everything; whether the
+    // planner lowered the *right* predicate is AC 3b's job
+    // (`traces_metrics_nested_set_live.rs`), on a corpus with real
+    // non-roots. A planner returning `{ }`'s SQL for `{ nestedSetParent<0 }`
+    // would pass this gate with a perfect ratio and fail that one.
+    let baseline_plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } | rate()"#,
+        base,
+        now,
+    );
+    let rooted_plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" && nestedSetParent < 0 } | rate()"#,
+        base,
+        now,
+    );
+    assert!(
+        rooted_plan
+            .range_sql()
+            .contains("PREWHERE service = 'checkout'"),
+        "the hoist survives the root conjunct:\n{}",
+        rooted_plan.range_sql()
+    );
+    for (label, plan) in [
+        ("baseline", &baseline_plan),
+        ("root-filtered", &rooted_plan),
+    ] {
+        let raw = explain_raw(&client, plan.range_sql()).await;
+        assert!(
+            raw.contains("service_time"),
+            "{label}: the service_time projection must still be selected:\n{raw}"
+        );
+        assert_eq!(
+            raw.matches("CreatingSets").count(),
+            0,
+            "{label}: the lowering must add no set-building step — an anti-semi-join \
+             against the span table would add one:\n{raw}"
+        );
+        engine
+            .metrics_range(plan)
+            .await
+            .unwrap_or_else(|e| panic!("{label} range executes: {e}"));
+    }
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    let base_cost = query_log_exact(&client, baseline_plan.range_sql())
+        .await
+        .expect("the baseline metric's QueryFinish row must exist");
+    let root_cost = query_log_exact(&client, rooted_plan.range_sql())
+        .await
+        .expect("the root-filtered metric's QueryFinish row must exist");
+    assert_eq!(
+        root_cost.read_rows, base_cost.read_rows,
+        "the root conjunct must not change how many rows are read \
+         (baseline {} vs root-filtered {})",
+        base_cost.read_rows, root_cost.read_rows
+    );
+    assert_eq!(
+        root_cost.prewhere_rows, base_cost.prewhere_rows,
+        "the PREWHERE hoist must survive the root conjunct \
+         (baseline {} vs root-filtered {})",
+        base_cost.prewhere_rows, root_cost.prewhere_rows
+    );
+    for (label, cost) in [("baseline", &base_cost), ("root-filtered", &root_cost)] {
+        assert!(
+            cost.projections.iter().any(|p| p.contains("service_time")),
+            "{label}: query_log.projections must name service_time, got {:?}",
+            cost.projections
+        );
+        // Presence, not magnitude: a plan with no PREWHERE reads its rows
+        // through the main reader only, so the two counters COLLAPSE onto
+        // each other. The ratio between them is a granule-layout property
+        // (measured 1.5 and 1.8 for two populations of one corpus) and is
+        // reported, never asserted.
+        assert_ne!(
+            cost.prewhere_rows, cost.read_rows,
+            "{label}: a PREWHERE must be present — RowsReadByPrewhereReaders \
+             ({}) collapses onto read_rows ({}) when the hoist is dropped",
+            cost.prewhere_rows, cost.read_rows
+        );
+        eprintln!(
+            "issue #458 AC 6 [{label}]: read_rows={} RowsReadByPrewhereReaders={} ratio={:.3} \
+             (reported, not asserted — population- and layout-dependent)",
+            cost.read_rows,
+            cost.prewhere_rows,
+            cost.prewhere_rows as f64 / cost.read_rows as f64
+        );
+    }
 
     // ---- Issue #182 P6b: compare() cross-tab pushes down (Aggregating +
     // the intrinsic/attr union), executes, and its distinct-(key,value)

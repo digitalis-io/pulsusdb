@@ -704,6 +704,33 @@ jobs:
           PULSUSDB_GROUPING_OTLP_URL: "http://localhost:4318"
         run: cargo test -p pulsus-read --test traces_search_grouping_differential
 
+      # Issue #458: the metrics-FILTER accept surface, oracle half. Replays
+      # every probe in crates/pulsus-read/tests/fixtures/metrics_filter_accept.json
+      # against the SAME digest-pinned oracle and asserts every committed
+      # reference verdict (and every rejecting body) still holds. FAIL-CLOSED:
+      # `require_live_gate` panics if this env block is dropped in this job,
+      # so a missing capture cannot report green (the #320 class). The
+      # hermetic half runs in the `ci` job at no container cost.
+      - name: TraceQL metrics-filter accept surface (oracle leg)
+        env:
+          PULSUSDB_TEMPO_DIFF_URL: "http://localhost:13200"
+        run: cargo test -p pulsus-read --test traces_metrics_filter_accept
+
+      # Issue #458: the metrics-filter VALUE differential, ENFORCED. Pushes
+      # one shared corpus (6 traces x 3 spans, exactly one parentless span
+      # per trace) into both systems and asserts that
+      # `{ nestedSetParent < 0 } | count_over_time()` totals 6 and
+      # `{} | count_over_time()` totals 18 on BOTH sides. This is the only
+      # leg that catches an accept-preserving answer corruption of the root
+      # lowering against the reference itself.
+      - name: TraceQL Tempo differential leg (metrics filter values)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_METRICS_FILTER_DIFF_URL: "http://localhost:13200"
+          PULSUSDB_METRICS_FILTER_OTLP_URL: "http://localhost:4318"
+        run: cargo test -p pulsus-read --test traces_metrics_filter_differential
+
       - name: Stop Tempo differential oracle
         if: always()
         run: docker rm -f pulsus-tempo-diff || true
@@ -1547,6 +1574,22 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run traces_metrics_live -p pulsus-read --test traces_metrics_live
+
+      # Issue #458 AC 3b (the TRUTH oracle for the nestedSetParent metrics
+      # lowering): T traces of S spans with exactly one parentless span
+      # each, executed through plan_trace_metrics + TraceEngine, asserting
+      # `{ nestedSetParent < 0 }` totals T, `{ nestedSetParent >= 1 }`
+      # totals S-T and `{}` totals S — on a fixture whose three totals are
+      # pairwise DISTINCT, plus the bare-truthiness answer on unequal
+      # true/false populations. AC 6 in traces_metrics_explain.rs is the
+      # COST oracle and neither substitutes for the other: a planner that
+      # returned `{}`'s SQL would pass that one and fail this one. Reuses
+      # this job's ClickHouse 26.3 container.
+      - name: TraceQL metrics nested-set answer identities (Tier 1)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test traces_metrics_nested_set_live
 
       # Issue #173 AC7 (Tier 1, scale-invariant): EXPLAIN/query_log gates on
       # the service-graph read over the trace_edges ledger — daily-partition

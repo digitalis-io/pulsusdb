@@ -978,6 +978,36 @@ support anyway — sees no difference.
 `2026-08-05-traceql-histogram-series-order` in
 `docs/benchmarks/traces-differential-ledger.md`.
 
+**Which filter constructs the metrics routes serve** (issue #458). The
+`{...}` filter on a metrics query is compiled to a single fully-pushed-down
+SQL predicate, so a construct is served here only when it has an exact
+per-span SQL form. Served: every physical and attribute comparison §4.2
+lists, attribute existence (`!= nil`), boolean statics, **bare attribute
+truthiness** (`{ .flag }`, which is exactly `{ .flag = true }`), and the
+**`nestedSetParent` root/non-root family** — `nestedSetParent < 0`,
+`>= 1`, `= 0`, `!= 0` and every other comparison whose truth is constant
+over the whole non-root domain. The root test lowers to the reference's
+own `IsRoot` identity, an all-zero `parent_id`
+(`tempodb/encoding/vparquet4/nested_set_model.go:11-12,57` @ v3.0.2), so
+it costs one unindexed column comparison and never displaces the
+`resource.service.name` PREWHERE hoist.
+
+Still a clean `400` on the metrics routes, each with its exact body and
+its witness query, in ledger entry
+`traceql-metrics-filter-residual-refusals`: field-vs-field and arithmetic
+comparisons (`{ .a = .b }`, `{ .a + 1 > 2 }`, and — because a negative
+literal parses as a unary negation rather than a literal —
+`{ nestedSetParent = -1 }`, whose served spelling is
+`{ nestedSetParent < 0 }`); trace-level intrinsics
+(`{ trace:duration > 1s }`); absence checks (`{ .a = nil }`); field
+negation (`{ !.a }`); `nestedSetParent` comparisons **inside** the
+numbering range (`{ nestedSetParent < 2 }` — a span whose parent is the
+trace root carries `1` and one two levels down carries `2`, so no
+per-span predicate can answer it); and `nestedSetLeft`/`nestedSetRight`
+in any form (the Euler numbering is a per-trace tree walk). The reference
+serves all of these — there is no metrics-specific filter guard in it at
+all — so they are gaps, and every one is on the search route today.
+
 
 ### 4.5 Service graph
 
