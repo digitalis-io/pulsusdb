@@ -2258,9 +2258,8 @@ clients only display it).
   `docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
   (`/loki/api/v1/status/buildinfo` -> `3.7.4` / `b318f282`), **route
   `/loki/api/v1/query_range`, window `start = NS - 1h` / `end = NS + 1h`,
-  `direction=backward`, `limit=100`**, one pushed line `hello world`
-  under `{app="foo"}`. Values are the hex of the `__error_details__`
-  span, LABEL surface unless the row says ENTRY:
+  `direction=backward`, `limit=100`**. Values are the hex of the
+  `__error_details__` span, LABEL surface unless the row says ENTRY:
 
   | query | reference | PulsusDB |
   |---|---|---|
@@ -2272,6 +2271,23 @@ clients only display it).
   | `… \| line_format` echoing the pair, ENTRY, `bytes` | `efbfbdefbfbd` | `efbfbdefbfbd` |
   | `x{{ "\ufffd" }}y`, ENTRY | `78efbfbd79` | `78efbfbd79` |
   | `label_format foo=` + `{{ "\ufffd" }}` — an ORDINARY label | `20` | `20` |
+
+  **How to re-measure every cell above.** Push ONE line `hello world`
+  under `{app="foo"}` at an instant `NS`, wait for it to be readable,
+  then `GET` the route above with the window, direction and limit named
+  above and one of:
+
+  ```logql
+  {app="foo"} | line_format `<template>`
+  {app="foo"} | line_format `<template>` | line_format `Error: {{.__error__}} - {{.__error_details__}}`
+  {app="foo"} | label_format foo=`{{ "\ufffd" }}`
+  ```
+
+  where `<template>` is the cell's first column; the second shape is what
+  the two ENTRY rows use, and the third is the ordinary-label row. **`NS`
+  itself is not a condition for this table** — it is simply `now`, no
+  value here depends on where it falls, and no compared span contains it.
+  (`streams-split-merge`'s anchor DOES matter, and is stated there.)
 
   The two ENTRY rows differ only in JSON escaping: the reference writes
   `\ufffd` as six ASCII bytes for the `unixToTime` echo and raw UTF-8 for
@@ -2312,8 +2328,28 @@ clients only display it).
   `/loki/api/v1/tail` alias keep their label bytes verbatim. The repair
   rule cannot be scoped that way and is not: it runs in the read
   pipeline, before any encoder, so every route that renders a template
-  carries it. Captured through a real WebSocket frame with a fixed
-  timestamp and a fixed line, so the three columns are byte-comparable:
+  carries it.
+
+  **How to re-measure the tail table below.** Route `/loki/api/v1/tail`
+  (its `/api/logs/v1/tail` sibling is the same handler), against the same
+  digest above. **Anchor:** `NS` is the most recent half-past-the-hour at
+  least 30 s in the past — `NS = (now / 1h) * 1h + 30m`, minus a further
+  `1h` when that lands later than `now - 30s`. **Seed:** ONE line
+  `tailprobe` under `{app="tf1"}`, whose sample timestamp is exactly
+  `NS`. **Window and parameters:** `start = NS - 60s`, `delay_for=5`,
+  `limit=1000`. **Queries**, one per row:
+
+  ```logql
+  {app="tf1"} | label_format k=`{{ "\ufffd" }}`
+  {app="tf1"} | line_format `{{ unixToTime "\xe0\xa0" }}`
+  ```
+
+  Take the FIRST text frame. **The byte counts are the frame prefix up to
+  `],"dropped_entries"`** — the stream array and nothing after it —
+  because `dropped_total` is a running counter and no claim here is about
+  it. A fixed anchor and a fixed line are what make the three columns
+  byte-comparable rather than merely similar; without them two captures
+  differ in their timestamp and no byte count means anything.
 
   | tail case | before (`ececfc2`) | this change | reference |
   |---|---|---|---|
@@ -2372,10 +2408,25 @@ clients only display it).
 - **Reference behaviour, measured** 2026-08-27 on
   `docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
   (`/loki/api/v1/status/buildinfo` -> `3.7.4` / `b318f282`), **route
-  `/loki/api/v1/query_range`**, `direction=backward`, `limit=100`, two
-  seeded streams `{app="c1"}` (three lines) and `{app="c2"}` (one line),
-  a `label_format` giving one of them a literal space and the other a
-  U+FFFD, then `| drop app, service_name, detected_level`:
+  `/loki/api/v1/query_range`**, `direction=backward`, `limit=100`.
+
+  **How to re-measure the table below.** **Anchor:** unlike
+  `template-output-budget`'s table, `NS` here IS a condition — the split
+  boundary is absolute-time aligned, so a window's placement decides
+  which branch of the reference answers. `NS` is the most recent
+  half-past-the-hour at least 60 s in the past — `NS = (now / 1h) * 1h +
+  30m`, minus a further `1h` when that lands later than `now - 60s` —
+  which puts a `±15m` window inside one wall-clock hour. **Seed:** stream
+  `{app="c1"}` carries three lines, at `NS`, `NS+10ns` and `NS+11ns`;
+  stream `{app="c2"}` carries one, at `NS+1ns`. **Query:**
+
+  ```logql
+  {app=~"c1|c2"} | label_format k=`{{ if eq .app "c1" }} {{ else }}{{ "\ufffd" }}{{ end }}` | drop app, service_name, detected_level
+  ```
+
+  Swapping which branch emits the U+FFFD is the ordering check described
+  further down. The `splits` column is read from the reference's own
+  `data.stats.summary.splits`, never assumed.
 
   | window | reference `splits` | reference | PulsusDB |
   |---|---|---|---|

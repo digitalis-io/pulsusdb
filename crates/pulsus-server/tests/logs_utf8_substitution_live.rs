@@ -1315,50 +1315,172 @@ fn ledger_section(key: &str) -> String {
     rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// **The AC-13 helper.** Asserts a ledger entry carries each required
-/// field, and reports **which** ones are missing — never a single
-/// boolean, because a row containing the key and a couple of numbers
-/// satisfies a `contains(key)` check while carrying none of the things
-/// that make it re-measurable.
-fn assert_ledger_fields(key: &str, required: &[(&str, &str)]) {
-    let section = ledger_section(key);
-    let missing: Vec<String> = required
-        .iter()
-        .filter(|(_, needle)| !section.contains(needle))
-        .map(|(field, needle)| format!("  MISSING FIELD {field}: expected {needle:?}"))
-        .collect();
+/// One of the six conditions a recorded measurement needs before anyone
+/// can re-measure it.
+///
+/// **This enum is the fix for a class, not for a row.** Three times on
+/// this issue a ledger row carried a number without what produced it: a
+/// missing ROUTE cost three rounds on #294, a missing WINDOW cost a round
+/// here, and a missing ANCHOR — the tail row's fixed timestamp and line —
+/// cost this one. Each time the row named its values and each time the
+/// guard checked exactly those, so it passed. Requiring the *conditions*
+/// as their own named category, for every row, is what closes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Condition {
+    /// The HTTP route the capture was taken on.
+    Route,
+    /// The request's time bounds, relative to the row's anchor.
+    Window,
+    /// How the anchor instant itself is chosen — load-bearing whenever a
+    /// captured byte depends on where in wall-clock time it falls.
+    Anchor,
+    /// What was pushed: the stream, the line, and the sample timestamps.
+    Seed,
+    /// The complete query text, not the fragment the table's cells show.
+    Query,
+    /// Which reference build the other side of the comparison was.
+    Digest,
+}
+
+/// Every condition a row must answer for. A row cannot answer for fewer:
+/// the guard requires each of these to appear exactly once in the row's
+/// list, so a new row cannot quietly omit the one that happens to be
+/// awkward.
+const ALL_CONDITIONS: &[Condition] = &[
+    Condition::Route,
+    Condition::Window,
+    Condition::Anchor,
+    Condition::Seed,
+    Condition::Query,
+    Condition::Digest,
+];
+
+/// What a row promises about one condition.
+#[derive(Debug, Clone, Copy)]
+enum Given {
+    /// The row states it, and this literal is how the guard finds it.
+    Stated(&'static str),
+    /// The condition genuinely cannot apply to this row, and this is why.
+    /// The reason is asserted to be a reason — a word like `forgotten` or
+    /// `n/a` is not admissible, on the `DELIBERATELY_UNWIRED` precedent.
+    NotApplicable(&'static str),
+}
+
+/// One measurement table in the differential ledger, with the conditions
+/// that reproduce it and the values it records.
+///
+/// A section can hold more than one table — `template-output-budget`
+/// holds a `query_range` one and a `/tail` one, taken on different
+/// routes, with different anchors and different queries — so `row` names
+/// which, and each carries its own conditions.
+struct LedgerRow {
+    key: &'static str,
+    row: &'static str,
+    conditions: &'static [(Condition, Given)],
+    values: &'static [(&'static str, &'static str)],
+}
+
+/// Reasons that are not reasons.
+const INADMISSIBLE: &[&str] = &["forgotten", "n/a", "na", "none", "tbd", "unknown", "-"];
+
+/// **The AC-13 helper, widened to conditions.** Asserts a ledger table
+/// carries every condition that reproduces it AND every value it claims,
+/// and reports **which** are missing — never a single boolean, because a
+/// row containing the key and a couple of numbers satisfies a
+/// `contains(key)` check while carrying none of the things that make it
+/// re-measurable.
+fn assert_ledger_row(r: &LedgerRow) {
+    let problems = check_ledger_row(r);
     assert!(
-        missing.is_empty(),
-        "the `{key}` ledger entry is missing {} of {} required fields:\n{}",
-        missing.len(),
-        required.len(),
-        missing.join("\n")
+        problems.is_empty(),
+        "the `{}` ledger entry's {} table has {} problem(s):\n{}",
+        r.key,
+        r.row,
+        problems.len(),
+        problems.join("\n")
     );
 }
 
-/// The two ledger rows this change owns, each field asserted by name.
-///
-/// **What this test cannot do, stated rather than implied:** it checks the
-/// SHAPE of the rows — that they name a route, a window, a digest, both
-/// measured values and the sentences a reader needs — and it **cannot
-/// tell whether the recorded numbers are true**. The live differential
-/// above is what measures those. A checker that appeared to validate the
-/// table would be worse than none, because it would convert "nobody has
-/// re-measured this" into "something checks this".
-///
-/// Hermetic. It calls the live gate directly because it reaches no gate of
-/// its own: without that, `--test logs_utf8_substitution_live` in a live
-/// CI job with the `env:` block dropped would still exit 0 (issue #320).
-#[test]
-fn both_ledger_rows_carry_every_field_that_makes_them_re_measurable() {
-    pulsus_testkit::require_live_gate(pulsus_testkit::CLICKHOUSE_GATE);
+/// [`assert_ledger_row`]'s detection, split out so the guard's OWN
+/// failure modes can be exercised without a panic — a `catch_unwind`
+/// around them would print three panics into a green run, and around
+/// anything that reaches `require_live_gate` it would re-open the #320
+/// silent pass. The one line `assert_ledger_row` adds on top is covered
+/// by deleting a condition from the shipped ledger and watching the real
+/// test go red.
+fn check_ledger_row(r: &LedgerRow) -> Vec<String> {
+    let section = ledger_section(r.key);
+    let mut problems: Vec<String> = Vec::new();
 
-    assert_ledger_fields(
-        "template-output-budget",
-        &[
-            ("route", "/loki/api/v1/query_range"),
-            ("window", "start = NS - 1h"),
-            ("digest", "sha256:87f0a067"),
+    // 1. Every condition answered for, exactly once. A row that simply
+    //    leaves one out is the defect this whole mechanism exists for, so
+    //    it is a failure and not a silent pass.
+    for want in ALL_CONDITIONS {
+        let n = r.conditions.iter().filter(|(c, _)| c == want).count();
+        if n != 1 {
+            problems.push(format!(
+                "  UNANSWERED CONDITION {want:?}: named {n} times, must be exactly once"
+            ));
+        }
+    }
+
+    // 2. Each stated condition actually present; each exemption a reason.
+    for (c, given) in r.conditions {
+        match given {
+            Given::Stated(needle) => {
+                if !section.contains(needle) {
+                    problems.push(format!("  MISSING CONDITION {c:?}: expected {needle:?}"));
+                }
+            }
+            Given::NotApplicable(why) => {
+                let w = why.trim().to_ascii_lowercase();
+                if w.len() < 20 || INADMISSIBLE.contains(&w.as_str()) {
+                    problems.push(format!(
+                        "  INADMISSIBLE EXEMPTION {c:?}: {why:?} is not a reason"
+                    ));
+                }
+            }
+        }
+    }
+
+    // 3. Each recorded value present.
+    for (field, needle) in r.values {
+        if !section.contains(needle) {
+            problems.push(format!("  MISSING VALUE {field}: expected {needle:?}"));
+        }
+    }
+
+    problems
+}
+
+const LEDGER_ROWS: &[LedgerRow] = &[
+    LedgerRow {
+        key: "template-output-budget",
+        row: "the query_range capture",
+        conditions: &[
+            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
+            (Condition::Window, Given::Stated("start = NS - 1h")),
+            (
+                Condition::Anchor,
+                // Written down rather than left out: the exemption is the
+                // place a defect hides, so the row has to say WHY the
+                // anchor cannot matter here, and it does.
+                Given::NotApplicable(
+                    "NS is simply `now` for this table and no compared span contains it; \
+                     the row says so, and points at streams-split-merge where it DOES matter",
+                ),
+            ),
+            (
+                Condition::Seed,
+                Given::Stated("ONE line `hello world` under `{app=\"foo\"}` at an instant `NS`"),
+            ),
+            (
+                Condition::Query,
+                Given::Stated("is the cell's first column"),
+            ),
+            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+        ],
+        values: &[
             ("the reference's unixToTime label", "`e0a0`"),
             ("the label we serve for it", "`2020`"),
             ("the entry echo both sides carry", "efbfbdefbfbd"),
@@ -1369,36 +1491,74 @@ fn both_ledger_rows_carry_every_field_that_makes_them_re_measurable() {
                 "pkg/util/marshal/query.go:25-32",
             ),
             ("the granularity measurement", "utf8.DecodeRune"),
-            // The tail row. `render_stream_item_into` is shared, the
-            // substitution leaked onto `/loki/api/v1/tail`, and a route
-            // whose bytes moved has to be on the ledger with what it now
-            // serves — a changed divergence with no row is exactly the
-            // defect this issue keeps producing.
-            ("the tail route", "/loki/api/v1/tail"),
-            ("the tail scoping", "scoped to the QUERY response"),
+        ],
+    },
+    LedgerRow {
+        key: "template-output-budget",
+        row: "the /tail capture",
+        conditions: &[
+            (Condition::Route, Given::Stated("/loki/api/v1/tail")),
+            (Condition::Window, Given::Stated("start = NS - 60s")),
             (
-                "the tail label bytes before",
+                Condition::Anchor,
+                Given::Stated("the most recent half-past-the-hour at least 30 s in the past"),
+            ),
+            (
+                Condition::Seed,
+                Given::Stated(
+                    "ONE line `tailprobe` under `{app=\"tf1\"}`, whose sample timestamp is \
+                     exactly `NS`",
+                ),
+            ),
+            (
+                Condition::Query,
+                Given::Stated("{app=\"tf1\"} | line_format `{{ unixToTime \"\\xe0\\xa0\" }}`"),
+            ),
+            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+        ],
+        values: &[
+            ("the scoping", "scoped to the QUERY response"),
+            (
+                "what the byte counts span",
+                "The byte counts are the frame prefix up to `],\"dropped_entries\"`",
+            ),
+            (
+                "the label bytes before",
                 "`\"k\":\"efbfbd\"`, frame served, 114 B",
             ),
-            ("the tail label bytes now", "**byte-identical**, 114 B"),
+            ("the label bytes now", "**byte-identical**, 114 B"),
             (
                 "the reference's own tail refusal",
                 "could not write JSON tail response",
             ),
             (
-                "the tail row the repair moves",
+                "the row the repair moves",
                 "`parse time 'efbfbdefbfbd'`, 343 B",
             ),
         ],
-    );
-
-    assert_ledger_fields(
-        "streams-split-merge",
-        &[
-            ("route", "/loki/api/v1/query_range"),
-            ("the narrow window", "start = NS - 15m"),
+    },
+    LedgerRow {
+        key: "streams-split-merge",
+        row: "the collision capture",
+        conditions: &[
+            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
+            (Condition::Window, Given::Stated("start = NS - 15m")),
+            (
+                Condition::Anchor,
+                Given::Stated("the most recent half-past-the-hour at least 60 s in the past"),
+            ),
+            (
+                Condition::Seed,
+                Given::Stated("three lines, at `NS`, `NS+10ns` and `NS+11ns`"),
+            ),
+            (
+                Condition::Query,
+                Given::Stated("| drop app, service_name, detected_level"),
+            ),
+            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+        ],
+        values: &[
             ("the wide window", "start = NS - 1h"),
-            ("digest", "sha256:87f0a067"),
             ("the unsplit object count", "**two objects**"),
             ("the split object count", "**one merged object**"),
             (
@@ -1421,5 +1581,123 @@ fn both_ledger_rows_carry_every_field_that_makes_them_re_measurable() {
             ),
             ("the withdrawn ordering claim", "That is withdrawn"),
         ],
+    },
+];
+
+/// Every measurement table this change owns, each asserted for the
+/// conditions that reproduce it as well as the values it records.
+///
+/// **What this test cannot do, stated rather than implied:** it checks
+/// that a table names a route, a window, an anchor, a seed, a query, a
+/// digest and its values — and it **cannot tell whether the recorded
+/// numbers are true**. The live differentials above, and the captured
+/// frames in the commit that added the tail row, are what measure those.
+/// A checker that appeared to validate the tables would be worse than
+/// none, because it would convert "nobody has re-measured this" into
+/// "something checks this".
+///
+/// What it CAN now do, and could not before: refuse a table that records
+/// a number without the conditions that produced it. That failure mode
+/// shipped three times on this issue.
+///
+/// Hermetic. It calls the live gate directly because it reaches no gate
+/// of its own: without that, `--test logs_utf8_substitution_live` in a
+/// live CI job with the `env:` block dropped would still exit 0 (#320).
+#[test]
+fn both_ledger_rows_carry_every_field_that_makes_them_re_measurable() {
+    pulsus_testkit::require_live_gate(pulsus_testkit::CLICKHOUSE_GATE);
+    for row in LEDGER_ROWS {
+        assert_ledger_row(row);
+    }
+    eprintln!(
+        "#455 ledger: {} tables, {} conditions each, {} values total",
+        LEDGER_ROWS.len(),
+        ALL_CONDITIONS.len(),
+        LEDGER_ROWS.iter().map(|r| r.values.len()).sum::<usize>()
+    );
+}
+
+/// The guard's own failure modes, on fixtures rather than on the shipped
+/// ledger — a checker whose reporting has never been seen fail is the
+/// shape this issue keeps producing.
+///
+/// Neither `#[should_panic]` nor `catch_unwind`: both are named in
+/// `pulsus_testkit`'s docs as the way a suite absorbs `require_live_gate`
+/// and turns #320's guarantee back into a silent pass, and a
+/// `catch_unwind` here would also print three panics into a green run.
+/// [`check_ledger_row`] returns the problems instead.
+#[test]
+fn the_ledger_guard_reports_an_omitted_condition_and_a_non_reason() {
+    pulsus_testkit::require_live_gate(pulsus_testkit::CLICKHOUSE_GATE);
+
+    let complain = |r: &LedgerRow| -> String {
+        let problems = check_ledger_row(r);
+        assert!(!problems.is_empty(), "the fixture row must fail");
+        problems.join("\n")
+    };
+
+    // A row that names its VALUES and simply leaves a condition out —
+    // which is what the three shipped instances of this defect looked
+    // like.
+    let omitted = LedgerRow {
+        key: "template-output-budget",
+        row: "fixture: no anchor named at all",
+        conditions: &[
+            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
+            (Condition::Window, Given::Stated("start = NS - 1h")),
+            (Condition::Seed, Given::Stated("`hello world`")),
+            (Condition::Query, Given::Stated("line_format")),
+            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+        ],
+        values: &[("a value it does record", "`e0a0`")],
+    };
+    let msg = complain(&omitted);
+    assert!(
+        msg.contains("UNANSWERED CONDITION Anchor: named 0 times"),
+        "an omitted condition must be named: {msg}"
+    );
+
+    // A row that answers every condition but exempts one with a word
+    // instead of a reason.
+    let excused = LedgerRow {
+        key: "template-output-budget",
+        row: "fixture: an exemption that is not a reason",
+        conditions: &[
+            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
+            (Condition::Window, Given::Stated("start = NS - 1h")),
+            (Condition::Anchor, Given::NotApplicable("n/a")),
+            (Condition::Seed, Given::Stated("`hello world`")),
+            (Condition::Query, Given::Stated("line_format")),
+            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+        ],
+        values: &[],
+    };
+    let msg = complain(&excused);
+    assert!(
+        msg.contains("INADMISSIBLE EXEMPTION Anchor"),
+        "an exemption that is not a reason must be named: {msg}"
+    );
+
+    // And a condition that is named but absent from the prose.
+    let absent = LedgerRow {
+        key: "template-output-budget",
+        row: "fixture: a condition claimed but not written down",
+        conditions: &[
+            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
+            (Condition::Window, Given::Stated("start = NS - 1h")),
+            (
+                Condition::Anchor,
+                Given::Stated("an anchor sentence this entry does not contain"),
+            ),
+            (Condition::Seed, Given::Stated("`hello world`")),
+            (Condition::Query, Given::Stated("line_format")),
+            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+        ],
+        values: &[],
+    };
+    let msg = complain(&absent);
+    assert!(
+        msg.contains("MISSING CONDITION Anchor"),
+        "a claimed-but-absent condition must be named: {msg}"
     );
 }
