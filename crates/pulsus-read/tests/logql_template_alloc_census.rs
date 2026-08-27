@@ -435,17 +435,21 @@ static VIA: &[Via] = &[
         other_callers: &[],
     },
     Via {
-        func: "lossy_repaired",
+        func: "lossy_go",
         // Issue #260: `Retained::from_engine` is the third charger — the
         // pipeline boundary where the engine's BYTES become the row's
         // retained `String`, whose repair expansion it charges before
         // allocating (it was free while it lived in a caller's `Vec`).
         chargers: &["lossy_charged", "compile_charged_regex", "from_engine"],
-        other_callers: &[],
+        other_callers: &[(
+            "lossy_go_replaces_one_invalid_byte_with_one_replacement_char",
+            "issue #455: the rule's own unit test, in funcs.rs's `#[cfg(test)]` region — \
+             fixed byte literals of at most 7 bytes, no budget in scope and none needed",
+        )],
     },
     Via {
-        func: "lossy_repaired_into",
-        chargers: &["lossy_repaired"],
+        func: "lossy_go_into",
+        chargers: &["lossy_go"],
         other_callers: &[(
             "render",
             "issue #294: the `unable to parse time '<raw>'` half; the registry \
@@ -1190,21 +1194,14 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "funcs.rs",
-        func: "lossy_repaired",
+        func: "lossy_go",
         callees: &["String::with_capacity"],
         disposition: CHARGED_VIA,
-        why: "ONE allocation of the precomputed repaired length; its callers charge that exact size first (round 6). The walk itself moved to lossy_repaired_into (issue #294)",
+        why: "ONE allocation of the precomputed repaired length; its callers charge that exact size first (round 6). The walk itself moved to lossy_go_into (issue #294); the RULE became Go's per-byte advance in issue #455, which changes the length but not the discipline",
     },
     Pin {
         file: "funcs.rs",
-        func: "lossy_repaired_matches_std_from_utf8_lossy_byte_for_byte",
-        callees: &["String::from_utf8_lossy"],
-        disposition: CONST,
-        why: "test-region equality check over fixed short byte cases (round 6)",
-    },
-    Pin {
-        file: "funcs.rs",
-        func: "lossy_repaired_len",
+        func: "lossy_go_len",
         callees: &["str::from_utf8"],
         disposition: CONST,
         why: "pure length scan, borrows only — no allocation",
@@ -1218,10 +1215,10 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "funcs.rs",
-        func: "lossy_repaired_into",
+        func: "lossy_go_into",
         callees: &[".push", ".push_str", "str::from_utf8"],
         disposition: CHARGED_VIA,
-        why: "issue #294: the repair WALK, appending into a buffer its caller sized and charged (lossy_repaired's precomputed cap, or render's exact rendered_len)",
+        why: "issue #294: the repair WALK, appending into a buffer its caller sized and charged (lossy_go's precomputed cap, or render's exact rendered_len)",
     },
     Pin {
         file: "funcs.rs",
@@ -1819,7 +1816,7 @@ static PINS: &[Pin] = &[
         disposition: CHARGED,
         why: "valid UTF-8 MOVES the engine's already-charged buffer (from_utf8 does not \
               allocate); the invalid path charges the repair EXPANSION before \
-              lossy_repaired allocates it",
+              lossy_go allocates it",
     },
     Pin {
         file: "retained.rs",

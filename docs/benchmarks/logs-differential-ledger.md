@@ -24,6 +24,33 @@ informational cases** — only the oracle comparison is ever downgraded.
 Entries are append-only; re-gating a case removes its `ledger` reference
 but keeps the entry for history.
 
+## Every entry states the conditions that reproduce it — and nothing enforces that
+
+An entry that records a measurement carries the conditions that produced
+it: the **route**, the **window**, the **anchor** (how the instant the
+window is relative to is chosen, whenever a recorded byte depends on
+where in wall-clock time it falls), the **seed** (what was pushed, with
+its sample timestamps), the complete **query** text, and the reference
+**digest**. A number without them is a figure nobody can re-measure, and
+this ledger has shipped that three times: a missing route cost three
+rounds on #294, a missing window cost a round on #455, a missing anchor
+cost another.
+
+**This is a discipline, not a check. Nothing verifies it.** Issue #455
+built four mechanisms to enforce it and every one was defeated inside a
+review round: a flat field list (a neighbouring entry's literal satisfied
+it), a section-scoped search (an invented table name matched everything),
+a table-scoped span (a literal moved into an HTML comment inside the span
+still matched), and a span-scoped exemption reason (the reason was struck
+through and contradicted beside itself, and the original bytes remained).
+Each asked *does this string appear?* when the claim is *does this table
+state this condition?* — and a presence test cannot tell a live claim
+from one that has been hidden, withdrawn or contradicted, because those
+are properties of meaning. A fifth would find a fifth decoy.
+
+So the check is a reader. When you touch an entry that records a
+measurement, re-read its conditions; when you add one, write them.
+
 Out of this ledger's scope by design:
 
 - **The `limit`-oversample under-return divergence is removed (#90).**
@@ -2229,46 +2256,168 @@ clients only display it).
   `500`; the `1<<24` label cap is not tunable, so that row alone carries
   the claim.
 
-- **Two U+FFFD divergences #294 did NOT change, recorded as they stand.**
-  Both are the same cause — `ExecError.msg` is a `String` and
-  `ErrorSlots::details` a `Cow<'a, str>`, so neither can carry a raw
-  invalid byte:
-  - `unixToTime`'s `unable to parse time '%v'` half renders U+FFFD where
-    the reference renders the raw bytes. Its OTHER half is now
-    byte-exact, so the message is half-corrected — stated at the site
-    (`funcs.rs`, `unix_to_time`) as well as here, because a
-    half-corrected message with no note reads as a whole-corrected one.
-  - `bytes`'s `unhandled size name: …` unit renders U+FFFD. Its
-    conversion is charged rather than exact: `humanize.ParseBytes`
-    chooses one of three failure texts by parsing, and each embeds the
-    caller's argument in a RETAINED `__error_details__`, so `bytes`
-    charges the bound `4*len + 64` before converting (review round 1 —
-    before it, a 1 MiB numeric overflow allocated 3,145,761 B and a
-    1 MiB unknown unit 3,145,807 B, both with nothing charged). That is
-    an over-charge of up to 4x on the two arms that embed the argument
-    verbatim, and it moves the same accept surface the boundary table
-    above describes, one quarter as far out. Measured:
-    `{{ bytes (b64dec "MTL/") }}` (3 B, `31 32 FF`) returns HTTP **500**
-    `could not write JSON response: 1:51: parse error: invalid UTF-8
-    rune` from the reference and a served `200` from us. The `500` is
-    the reference's own serialisation refusing a well-formed result:
-    `encodeStream` re-parses the stream labels with Prometheus' lexer
-    (`pkg/util/marshal/query.go:416 @ v3.7.4`) and `marshal.go:60` wraps
-    the rejection. **We never reproduce that `500`** — the
-    "except where they are wrong" case. The reference's other encode
-    path sanitises instead, mapping every `utf8.RuneError` rune to a
-    space (`query.go:25-32`, applied in `NewStreams` at `:92-93`), which
-    is one space per invalid byte and also swallows a genuine U+FFFD;
-    and we do not reproduce that substitution either. Parity controls on the
-    same branch: `MTJ4` (3 B) gives `unhandled size name: x` and `MTIg`
-    (3 B) renders `12` on both sides.
+- **Table `template-output-budget/query_range`. Issue #455 — the
+  substitution, and what is left after it.** This
+  bullet REPLACES the "two U+FFFD divergences #294 did NOT change"
+  account that stood here; that account described a state that no longer
+  ships, and leaving it beside this one would leave a reader to pick.
 
-    **Which encode path a given deployment takes is read, not
-    established** — both were read, one was reproduced here. Matching
-    the substitution rule (and the observers that would see it early)
-    is **#455**, unscheduled; nothing in #294 gates it. The rows above
-    are pinned by
-    `the_two_recorded_utf8_divergences_render_as_they_did_before_this_issue`.
+  Two changes, and they compose. The template layer's invalid-UTF-8
+  repair now follows **Go's** granularity — one U+FFFD per invalid
+  BYTE, `utf8.DecodeRune`'s advance, measured against go1.25.5 as
+  `utf8.DecodeRuneInString("\xe0\xa0'")` -> size `1` — instead of
+  `String::from_utf8_lossy`'s one-per-maximal-invalid-subsequence, a
+  rule with no counterpart anywhere on the reference's path. And the
+  streams response marshaller maps **every U+FFFD rune in a stream LABEL
+  value to one space** (`0x20`), which is what
+  `pkg/util/marshal/query.go:25-32 @ v3.7.4` does with `removeInvalidUtf`
+  ("The rune error replacement is rejected by Prometheus hence replacing
+  them with space"), applied by `bytes.Map` in `NewStreams` at `:92-93`.
+  Log LINE values are not touched, on either side.
+
+  Together they mean **our `__error_details__` label can no longer
+  contain a U+FFFD at all**. Where the reference's own slot already held
+  U+FFFD — the `bytes` family, via `strings.ToLower` — we are now
+  byte-identical to it. Where the reference's slot holds RAW invalid
+  bytes — the `%v` family, `unixToTime` — we cannot be, and that is the
+  divergence recorded below.
+
+  Measured 2026-08-27 on
+  `docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+  (`/loki/api/v1/status/buildinfo` -> `3.7.4` / `b318f282`), **route
+  `/loki/api/v1/query_range`, window `start = NS - 1h` / `end = NS + 1h`,
+  `direction=backward`, `limit=100`**. Values are the hex of the
+  `__error_details__` span, LABEL surface unless the row says ENTRY:
+
+  | query | reference | PulsusDB |
+  |---|---|---|
+  | `{{ bytes "12\xe0\xa0" }}` — tail after `unhandled size name: ` | `2020` | `2020` |
+  | `{{ bytes (b64dec "MTL/") }}` — same tail | `20` | `20` |
+  | `{{ unixToTime "\xe0\xa0" }}` — span between `time '` and `':` | `e0a0` | **`2020`** |
+  | `{{ unixToTime (b64dec "//8=") }}` — same span | `ffff` | **`2020`** |
+  | `… \| line_format` echoing the pair, ENTRY, `unixToTime` | `5c75666666645c7566666664` | `efbfbdefbfbd` |
+  | `… \| line_format` echoing the pair, ENTRY, `bytes` | `efbfbdefbfbd` | `efbfbdefbfbd` |
+  | `x{{ "\ufffd" }}y`, ENTRY | `78efbfbd79` | `78efbfbd79` |
+  | `label_format foo=` + `{{ "\ufffd" }}` — an ORDINARY label | `20` | `20` |
+
+  **How to re-measure every cell above.** Push ONE line `hello world`
+  under `{app="foo"}` at an instant `NS`, wait for it to be readable,
+  then `GET` the route above with the window, direction and limit named
+  above and one of:
+
+  ```logql
+  {app="foo"} | line_format `<template>`
+  {app="foo"} | line_format `<template>` | line_format `Error: {{.__error__}} - {{.__error_details__}}`
+  {app="foo"} | label_format foo=`{{ "\ufffd" }}`
+  ```
+
+  where `<template>` is the cell's first column; the second shape is what
+  the two ENTRY rows use, and the third is the ordinary-label row.
+
+  **`NS` itself is not a condition for this table: it is simply `now`, no
+  value here depends on where it falls, and no compared span contains
+  it.** That is the one anchor exemption in this ledger, and
+  `streams-split-merge`'s anchor DOES matter and is stated there.
+
+  The two ENTRY rows differ only in JSON escaping: the reference writes
+  `\ufffd` as six ASCII bytes for the `unixToTime` echo and raw UTF-8 for
+  the `bytes` one; both decode to two U+FFFD, as ours do.
+
+  **What is left, and it is a type constraint, not a preference.** The
+  `%v` half of `unable to parse time '%v'` reaches the client as raw
+  `e0 a0` from the reference and as two spaces from us. It cannot be
+  matched: the value flows through `ExecError.msg`, a `String`, into
+  `ErrorSlots::details`, a `Cow<'a, str>`, and neither can hold a byte
+  that is not valid UTF-8. Two consequences worth stating rather than
+  burying — our response becomes **valid UTF-8** where the reference's is
+  not, and the **character count now matches** (two spaces against two
+  raw bytes) where under the previous single-U+FFFD rule it did not.
+
+  The reference's `500 could not write JSON response: 1:51: parse error:
+  invalid UTF-8 rune` for `{{ bytes (b64dec "MTL/") }}`, recorded here
+  before with no route, comes from its OTHER stream-encode path:
+  `encodeStream` re-parses the stream labels with Prometheus' lexer
+  (`pkg/util/marshal/query.go:416 @ v3.7.4`) and `marshal.go:60` wraps
+  the rejection. On `/loki/api/v1/query_range` it answers `200`. **We
+  never reproduce the `500`** — a valid query with a well-formed result
+  refused at serialisation by a label lexer that has no business there is
+  the "except where they are wrong" case.
+
+  The `bytes` arm's charge is unchanged and still an over-charge of up to
+  4x on the two arms that embed the argument verbatim
+  (`4*len + 64` before converting; before review round 1 a 1 MiB numeric
+  overflow allocated 3,145,761 B and a 1 MiB unknown unit 3,145,807 B
+  with nothing charged), and it moves the accept surface the boundary
+  table above describes, one quarter as far out.
+
+  **Table `template-output-budget/tail`. The substitution is scoped to
+  the QUERY response, and the repair is
+  not — measured on `/loki/api/v1/tail`, both.** The two changes have
+  different reach and it would be wrong to describe them as one.
+  `render_stream_item_into` is shared with the tail frame encoder, so the
+  caller now names the rule it wants; `/api/logs/v1/tail` and its
+  `/loki/api/v1/tail` alias keep their label bytes verbatim. The repair
+  rule cannot be scoped that way and is not: it runs in the read
+  pipeline, before any encoder, so every route that renders a template
+  carries it.
+
+  **How to re-measure the tail table below.** Route `/loki/api/v1/tail`
+  (its `/api/logs/v1/tail` sibling is the same handler), against
+  `docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+  — spelled out here rather than borrowed from the table above, because a
+  table that leans on its neighbour's conditions is a table that stops
+  being re-measurable the moment the neighbour is edited. **Anchor:** `NS` is the most recent half-past-the-hour at
+  least 30 s in the past — `NS = (now / 1h) * 1h + 30m`, minus a further
+  `1h` when that lands later than `now - 30s`. **Seed:** ONE line
+  `tailprobe` under `{app="tf1"}`, whose sample timestamp is exactly
+  `NS`. **Window and parameters:** `start = NS - 60s`, `delay_for=5`,
+  `limit=1000`. **Queries**, one per row:
+
+  ```logql
+  {app="tf1"} | label_format k=`{{ "\ufffd" }}`
+  {app="tf1"} | line_format `{{ unixToTime "\xe0\xa0" }}`
+  ```
+
+  Take the FIRST text frame. **The byte counts are the frame prefix up to
+  `],"dropped_entries"`** — the stream array and nothing after it —
+  because `dropped_total` is a running counter and no claim here is about
+  it. A fixed anchor and a fixed line are what make the three columns
+  byte-comparable rather than merely similar; without them two captures
+  differ in their timestamp and no byte count means anything.
+
+  | tail case | before (`ececfc2`) | this change | reference |
+  |---|---|---|---|
+  | a U+FFFD in a stream label | `"k":"efbfbd"`, frame served, 114 B | **byte-identical**, 114 B | **no frame**: `101`, then close `1011` `could not write JSON tail response: 1:41: parse error: invalid UTF-8 rune` |
+  | `{{ unixToTime "\xe0\xa0" }}` in `__error_details__` | `parse time 'efbfbd'`, 340 B | `parse time 'efbfbdefbfbd'`, 343 B | `parse time 'e0a0'`, raw bytes |
+
+  The second row moves and the reason is the repair rule alone; it moves
+  the tail label's rune count from one to two, which is the reference's
+  count, exactly as on `query_range`. The residual is the same type
+  constraint.
+
+  The first row is why the substitution stops at the query response.
+  **The reference does not substitute on tail either** — it refuses the
+  frame, with the same Prometheus-lexer rejection its `encodeStream` path
+  raises as a `500`, which is the "except where they are wrong" case we
+  already decline to reproduce. So matching it there would mean either
+  killing a stream or applying a rule whose only evidence comes from a
+  route where the reference runs different code (`NewStreams`). Neither
+  is decidable from what this issue measured; the bytes stay put until
+  something measures them. `dropped_entries` labels in the same frame
+  were already spliced verbatim and still are.
+
+  Held still by `logs_api::encode`'s
+  `tail_frames_keep_their_stream_label_bytes_verbatim`, which asserts
+  both halves on ONE `StreamResult` — verbatim through the tail frame,
+  substituted through the query response — so an encoder that stopped
+  substituting everywhere cannot pass it.
+
+  Pinned by `tests/logql_template_engine.rs`
+  (`the_two_recorded_utf8_divergences_render_as_they_did_before_this_issue`,
+  `unix_to_time_quotes_the_raw_argument_and_repairs_only_the_percent_v_half`)
+  at the render layer, and by
+  `crates/pulsus-server/tests/logs_utf8_substitution_live.rs` at the
+  wire, against the digest above.
 
 - **Why deliberate:** the reference has no bound, so no finite cap can
   match it (the #236 O1 shape); the standing charge-before-allocate
@@ -2283,6 +2432,123 @@ clients only display it).
   `int` still panics with the reference's exact `strings: Repeat
   output length overflow` per line (that surface is bounded and
   correct).
+
+### `streams-split-merge` (issue #455 — the reference is internally inconsistent; we match the branch we structurally resemble)
+
+- **What collides.** Once a U+FFFD in a stream label becomes a space
+  (see `template-output-budget`), two label sets that differed ONLY in
+  that character become identical. What the reference does with the pair
+  depends on how many query splits the request was cut into.
+- **Table `streams-split-merge/collision`. Reference behaviour,
+  measured** 2026-08-27 on
+  `docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+  (`/loki/api/v1/status/buildinfo` -> `3.7.4` / `b318f282`), **route
+  `/loki/api/v1/query_range`**, `direction=backward`, `limit=100`.
+
+  **How to re-measure the table below.** **Anchor:** unlike
+  `template-output-budget`'s table, `NS` here IS a condition — the split
+  boundary is absolute-time aligned, so a window's placement decides
+  which branch of the reference answers. `NS` is the most recent
+  half-past-the-hour at least 60 s in the past — `NS = (now / 1h) * 1h +
+  30m`, minus a further `1h` when that lands later than `now - 60s` —
+  which puts a `±15m` window inside one wall-clock hour. **Seed:** stream
+  `{app="c1"}` carries three lines, at `NS`, `NS+10ns` and `NS+11ns`;
+  stream `{app="c2"}` carries one, at `NS+1ns`. **Query:**
+
+  ```logql
+  {app=~"c1|c2"} | label_format k=`{{ if eq .app "c1" }} {{ else }}{{ "\ufffd" }}{{ end }}` | drop app, service_name, detected_level
+  ```
+
+  Swapping which branch emits the U+FFFD is the ordering check described
+  further down. The `splits` column is read from the reference's own
+  `data.stats.summary.splits`, never assumed.
+
+  | window | reference `splits` | reference | PulsusDB |
+  |---|---|---|---|
+  | `start = NS - 15m` / `end = NS + 15m`, placed inside one wall-clock hour | `0` | **two objects**, both `{"k":" "}` | **two objects**, both `{"k":" "}` |
+  | `start = NS - 1h` / `end = NS + 1h` | `> 0` | **one merged object** `{"k":" "}` carrying all four entries | **two objects**, both `{"k":" "}` |
+
+  **The wide row's count is a `> 0`, not a number, and that is the point
+  of the paragraph below.** Two 1 h cases in ONE run reported `2` and `3`
+  — same width, different placement. Recording either as *the* value
+  would be a figure a reader could not reproduce; what is stable is the
+  branch, and the branch is what both the table and the test assert.
+
+- **The reference is internally inconsistent here.** It emits two objects
+  below its split boundary and one merged object above it, so no single
+  behaviour matches it at every window. **We match its unsplit branch
+  because that is our structural configuration**: `git grep -nE
+  'split_queries_by_interval|split_interval' crates/pulsus-read/src/logql/`
+  returns nothing, our read path has no split step, and our stats object
+  carries no `splits` field at all. The reference's `splits=0` row IS our
+  structural analogue; matching it is matching the reference in the
+  configuration we actually resemble, not choosing a convenient half.
+  Merging instead would require inventing an ordering rule over
+  information the substitution has already destroyed, which is a second
+  implementation rather than parity.
+- **Where the boundary comes from, and why no test may encode it.**
+  `GET /config` on the running container reports
+  `split_queries_by_interval: 1h` — its shipped default, not raised by
+  `ci/logql/config.yaml`. The boundary is **absolute-time aligned, not
+  width-aligned**: a ten-window sweep gave `splits` of
+  `0,0,0,0,0,2,3,5,13,49`, and a later run with a fresh seed gave
+  `splits=2` at `h=15m` where an earlier one gave `0` — same width,
+  different placement. **A test that encoded an `h -> splits` mapping
+  would fail on the clock**, not merely against someone else's config.
+  So `logs_utf8_substitution_live.rs` places its 15-minute windows inside
+  a single wall-clock hour, asserts the `splits` the reference REPORTS for
+  each window it actually sent, and pins no mapping.
+- **What this row is, stated so it is not read as more.** It is prose,
+  and **nothing checks it** — see this ledger's header for the four
+  mechanisms that tried and the reason none can. What DOES measure the
+  numbers is the live differential
+  (`crates/pulsus-server/tests/logs_utf8_substitution_live.rs`), which
+  puts both windows to the reference in one run and compares the answers;
+  it asserts the behaviour, not this table's description of it. A checker
+  that appeared to validate the table would have been worse than none,
+  and for four rounds that is exactly what one was.
+- **Two readings that cannot be told apart, so neither is claimed.** When
+  two label sets collide, "first in pre-substitution sort order wins" and
+  "the substituted value loses" are **indistinguishable by construction**:
+  U+FFFD begins `0xEF` and a space is `0x20`, so a substituted value
+  always sorts AFTER the literal-space one it collides with. The other
+  reading is untested, not wrong, and no code here implements it.
+- **Object order, and a claim withdrawn twice.** Below the boundary the
+  two objects order by the **pre-substitution** label set, and swapping
+  which stream carries the U+FFFD **reverses** them — measured on two
+  fixtures in both directions, on both sides.
+
+  Above the boundary, where the reference merges, an earlier revision of
+  this account claimed the merged block order follows the **original
+  stream label** (`c1` before `c2`, `a2` before `z1`). **That is
+  withdrawn: it is falsified by a probe built to discriminate it.** With
+  a stream `aaa` holding three OLD lines and a stream `zzz` holding one
+  NEWER line, the merged object came back `zzz-new, aaa-3, aaa-2, aaa-1`
+  — `zzz` first, though `aaa` sorts first and holds more entries — and it
+  did not change when the U+FFFD moved between them. What the measurement
+  supports is that the blocks follow **each block's newest entry under
+  the query's `direction`**, and the mechanism (a block-level sort versus
+  per-split concatenation) was **not** separated. We emit two objects at
+  every window, so we reproduce none of this; it is recorded because the
+  previous sentence was wrong and a reader deserves the correction rather
+  than its absence.
+
+  The cause of the earlier error is worth more than the conclusion: it
+  came from **comparing two captures taken against two different
+  fixtures** — one before two lines were added to a stream, one after.
+  Each capture was individually correct, which is why it looked
+  confirmed. **This is the same defect as Q10**, the control query one
+  round earlier whose expected answer had quietly stopped matching its
+  own seed after those two lines were added — caught there, missed here.
+  An expected answer compared against a fixture it no longer matches is
+  invisible until someone runs it. The defence is to re-derive both sides
+  on the same seed in the same run, which is why every case in
+  `logs_utf8_substitution_live.rs` seeds its OWN base, asserts that base
+  in its own response, and is listed in a committed inventory the test
+  checks by set equality.
+- **Why deliberate:** owner ruling, 2026-08-27. Not merging needs no new
+  code, keeps the row we already match byte-identical, and avoids
+  inventing aggregation semantics the reference does not have.
 
 ### `json-nonvalidating-scan-residual` (issue #389, measured residual — the record, not a fix)
 

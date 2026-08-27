@@ -30,6 +30,8 @@
 //! vector/series: the label vector itself) before framing, so wire output
 //! is deterministic and golden fixtures are byte-exact.
 
+use std::borrow::Cow;
+
 use axum::body::{Body, Bytes};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -250,13 +252,118 @@ fn stream_item_estimate(s: &StreamResult) -> usize {
             .sum::<usize>()
 }
 
+/// The streams-response substitution (issue #455): every U+FFFD rune in
+/// a stream's rendered label JSON becomes ONE space (`0x20`).
+///
+/// The reference does this in its streams marshaller —
+/// `pkg/util/marshal/query.go:25-32 @ v3.7.4` defines
+/// `removeInvalidUtf` ("The rune error replacement is rejected by
+/// Prometheus hence replacing them with space"), applied by `bytes.Map`
+/// over `stream.Labels` in `NewStreams` at `:92-93`. Measured on
+/// `docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+/// (`/status/buildinfo` -> `3.7.4`/`b318f282`) at
+/// `/loki/api/v1/query_range`: a `bytes` unit error whose argument holds
+/// `\xe0\xa0` comes back with `20 20` after `unhandled size name: `, and
+/// an ordinary `label_format`-minted U+FFFD comes back as `20` too — the
+/// rule is not special to the error pair.
+///
+/// **Log LINE values are deliberately NOT touched**: the reference maps
+/// `stream.Labels` only, and a line carrying a genuine U+FFFD comes back
+/// as `ef bf bd` on both sides.
+///
+/// Raw invalid BYTES cannot occur here — `StreamResult::labels_json` is a
+/// `String` — so mapping the rune is the whole rule for us.
+///
+/// **Scoped to the QUERY response.** `render_stream_item_into` is shared
+/// with [`tail_frame`], so the caller states which rule it wants
+/// ([`LabelBytes`]) rather than inheriting one. `/api/logs/v1/tail` and
+/// its `/loki/api/v1/tail` alias keep `LabelBytes::Verbatim`: every
+/// measurement on issue #455 — nine plan revisions, four review rounds —
+/// was taken at `/loki/api/v1/query_range`, nothing about the tail
+/// surface was ever established, and matching it needs its own
+/// differential, its own ledger row and its own reachability question.
+/// Unchanged bytes are reversible; a divergence changed on an unmeasured
+/// route is not. Held still by
+/// `tail_frames_keep_their_stream_label_bytes_verbatim` below.
+///
+/// **Placement is load-bearing, and the two ways of getting it wrong are
+/// caught by different tests — established by running them, not by
+/// reading.** This runs at RENDER time, downstream of
+/// `query_response_warned`'s `(labels_json, fingerprint)` sort, so object
+/// order follows the PRE-substitution label set, which is what the
+/// reference's unsplit branch does.
+///
+/// * Moved to the GROUPING key (`push_fanout_entry`'s
+///   `render_labels_json_sorted`) the two colliding streams merge into
+///   one object and the seam interleaves. Caught live by
+///   `logs_utf8_substitution_live::colliding_streams_and_the_split_divergence_agree_with_the_reference`
+///   (measured: `left: 1  right: 2` for Q9 at `h=15m`).
+/// * Moved before the SORT but after grouping, the ordering key collapses.
+///   Caught by `colliding_stream_labels_order_by_the_pre_substitution_label_set`
+///   below, and **not** by the live suite: a fan-out group's fingerprint is
+///   `fnv1a64` of its own pre-substitution `labels_json`
+///   (`logql/detected_probe.rs:85`), so on the real pipeline the tiebreak
+///   carries the same information the key just lost and the order survives.
+///   The hermetic test builds `StreamResult`s with chosen fingerprints,
+///   which is what lets it see the difference.
+///
+/// **Two readings of a collision that cannot be told apart, so neither is
+/// claimed.** When two label sets differ only in a U+FFFD against a
+/// literal space they become identical here, and "first in
+/// pre-substitution sort order wins" and "the substituted value loses"
+/// are *indistinguishable by construction*: U+FFFD begins `0xEF` and a
+/// space is `0x20`, so a substituted value always sorts AFTER the
+/// literal-space one it collides with. The other reading is untested
+/// rather than wrong, and nothing here implements it. Ledgered as
+/// `streams-split-merge`.
+///
+/// Borrows when the input holds no U+FFFD, which is every ordinary
+/// response: an unconditional `replace` adds an allocation per rendered
+/// stream and moves `ac19_render_path_peak_and_allocation_profile`'s
+/// benign profile from `(1, 108045)` to `(2, 108067)`.
+fn space_for_replacement_chars(labels_json: &str) -> Cow<'_, str> {
+    if labels_json.contains(char::REPLACEMENT_CHARACTER) {
+        Cow::Owned(labels_json.replace(char::REPLACEMENT_CHARACTER, " "))
+    } else {
+        Cow::Borrowed(labels_json)
+    }
+}
+
+/// Which rule a caller of [`render_stream_item_into`] wants applied to the
+/// stream's label JSON.
+///
+/// An enum and not a flag, because the two callers are two WIRE SURFACES
+/// with two evidence bases: the query response is measured against the
+/// reference on issue #455, the tail frame is not. Naming the rule at
+/// each call site is what stops the next edit to the shared renderer from
+/// silently moving a surface nobody measured — which is exactly what
+/// happened here, and twice before in the same issue at
+/// `render_labels_json_sorted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelBytes {
+    /// Map every U+FFFD to one space — the query-response rule
+    /// ([`space_for_replacement_chars`], issue #455).
+    SpaceForReplacementChars,
+    /// Splice the label JSON exactly as the engine produced it.
+    Verbatim,
+}
+
 /// Renders one stream item into ONE buffer (issue #312): entry framing,
 /// timestamps and JSON-escaped lines are written in place, so no
 /// per-entry `String` and no whole-item second copy is ever live.
-fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult) {
+///
+/// Two production callers, and they ask for different label bytes —
+/// [`render_stream_item`] (the query response) and [`tail_frame`] (the
+/// WebSocket frame). See [`LabelBytes`].
+fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult, labels: LabelBytes) {
     use std::io::Write;
     out.extend_from_slice(b"{\"stream\":");
-    out.extend_from_slice(s.labels_json.as_bytes());
+    match labels {
+        LabelBytes::SpaceForReplacementChars => {
+            out.extend_from_slice(space_for_replacement_chars(&s.labels_json).as_bytes());
+        }
+        LabelBytes::Verbatim => out.extend_from_slice(s.labels_json.as_bytes()),
+    }
     out.extend_from_slice(b",\"values\":[");
     for (i, (ts, line)) in s.entries.iter().enumerate() {
         if i > 0 {
@@ -273,9 +380,11 @@ fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult) {
     out.extend_from_slice(b"]}");
 }
 
+/// The QUERY response's stream item — the surface issue #455 measured, so
+/// the one that substitutes.
 fn render_stream_item(s: &StreamResult) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(stream_item_estimate(s));
-    render_stream_item_into(&mut out, s);
+    render_stream_item_into(&mut out, s, LabelBytes::SpaceForReplacementChars);
     out
 }
 
@@ -573,7 +682,12 @@ pub(crate) fn tail_frame(
             buf.push(b',');
         }
         // Rendered IN PLACE (issue #312): no per-item `String` copy.
-        render_stream_item_into(&mut buf, s);
+        //
+        // `LabelBytes::Verbatim` (issue #455): the tail frame's label
+        // bytes are UNCHANGED by that issue. Its evidence is entirely
+        // `/loki/api/v1/query_range`; this route was never measured
+        // against the reference, so it keeps what it served before.
+        render_stream_item_into(&mut buf, s, LabelBytes::Verbatim);
     }
     let mut out = String::from_utf8(buf).expect("rendered JSON is UTF-8");
     out.push_str("],\"dropped_entries\":[");
@@ -1120,6 +1234,169 @@ mod tests {
         let body = body_string(query_response(result, None, 0, false)).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["stats"]["pulsus_partial"], true);
+    }
+
+    /// Issue #455 — a U+FFFD in a stream LABEL becomes one space on the
+    /// wire; a U+FFFD in a LOG LINE does not.
+    ///
+    /// Both halves in one response, because a fix that maps the
+    /// replacement character everywhere satisfies the first half alone.
+    /// The reference leaves lines untouched (`NewStreams` maps
+    /// `stream.Labels` only, `pkg/util/marshal/query.go:92-93 @ v3.7.4`),
+    /// and `x<U+FFFD>y` comes back as `78 ef bf bd 79` from both sides.
+    #[tokio::test]
+    async fn stream_labels_map_replacement_chars_to_spaces_and_lines_do_not() {
+        let result = QueryResult::Streams {
+            items: vec![stream(
+                1,
+                "{\"k\":\"\u{FFFD}\u{FFFD}\",\"service_name\":\"a\"}",
+                vec![(1, "x\u{FFFD}y")],
+            )],
+            partial: false,
+        };
+        let body = body_string(query_response(result, None, 0, false)).await;
+        assert!(
+            body.contains("\"stream\":{\"k\":\"  \",\"service_name\":\"a\"}"),
+            "each U+FFFD in a label value is ONE space: {body}"
+        );
+        assert!(
+            body.contains("[\"1\",\"x\u{FFFD}y\"]"),
+            "the log line keeps its U+FFFD: {body}"
+        );
+        // Stated in bytes as well as in characters: two spaces, and the
+        // line's three-byte encoding intact.
+        let raw = body.as_bytes();
+        assert!(
+            raw.windows(2).any(|w| w == b"  "),
+            "two 0x20 bytes in the label: {body}"
+        );
+        assert_eq!(
+            body.matches('\u{FFFD}').count(),
+            1,
+            "exactly one U+FFFD survives, and it is the line's: {body}"
+        );
+    }
+
+    /// Issue #455 — **the tail frame's stream label bytes are UNCHANGED
+    /// by that issue**, and this is what keeps them that way.
+    ///
+    /// `render_stream_item_into` is shared between the query response and
+    /// [`tail_frame`]. The substitution went in at the shared renderer and
+    /// leaked onto `/api/logs/v1/tail` and its `/loki/api/v1/tail` alias —
+    /// measured through a real WebSocket frame, `"k":"<U+FFFD>"` became
+    /// `"k":" "`. Every measurement on #455 is a `query_range`
+    /// measurement; nothing about the tail surface was established, so it
+    /// keeps its own bytes until something measures it.
+    ///
+    /// The two halves are one claim: the SAME `StreamResult` must render
+    /// with a space through the query response and with `ef bf bd`
+    /// through the tail frame. Asserting only the second would pass on an
+    /// encoder that substitutes nowhere.
+    #[test]
+    fn tail_frames_keep_their_stream_label_bytes_verbatim() {
+        let item = stream(
+            1,
+            "{\"k\":\"\u{FFFD}\",\"service_name\":\"a\"}",
+            vec![(1, "line")],
+        );
+
+        let frame = tail_frame(vec![item.clone()], &[], 0);
+        assert!(
+            frame.contains("\"stream\":{\"k\":\"\u{FFFD}\",\"service_name\":\"a\"}"),
+            "the tail frame splices the label JSON verbatim: {frame}"
+        );
+        assert!(
+            !frame.contains("\"k\":\" \""),
+            "the query-response substitution must not reach the tail frame: {frame}"
+        );
+
+        // The same item through the query response DOES substitute, so a
+        // renderer that simply stopped substituting cannot pass this.
+        let rendered = String::from_utf8(render_stream_item(&item)).expect("utf8");
+        assert!(
+            rendered.contains("\"stream\":{\"k\":\" \",\"service_name\":\"a\"}"),
+            "the query response still substitutes: {rendered}"
+        );
+    }
+
+    /// Issue #455 — the substitution BORROWS when there is nothing to
+    /// substitute. Not an optimisation: an unconditional `replace` per
+    /// rendered stream moves the benign profile in
+    /// `ac19_render_path_peak_and_allocation_profile` from `(1, 108045)`
+    /// to `(2, 108067)`.
+    #[test]
+    fn the_label_substitution_borrows_when_there_is_no_replacement_char() {
+        let clean = r#"{"env":"prod","service_name":"checkout"}"#;
+        let got = space_for_replacement_chars(clean);
+        assert!(matches!(got, Cow::Borrowed(_)), "clean input must borrow");
+        assert_eq!(got.as_ptr(), clean.as_ptr(), "and borrow the SAME bytes");
+
+        let dirty = "{\"k\":\"\u{FFFD}\"}";
+        let got = space_for_replacement_chars(dirty);
+        assert!(matches!(got, Cow::Owned(_)), "dirty input must own");
+        assert_eq!(got.as_ref(), r#"{"k":" "}"#);
+    }
+
+    /// Issue #455 — **object order follows the PRE-substitution label
+    /// set.** Two streams whose labels differ only in a U+FFFD against a
+    /// literal space collide after substitution; the reference's unsplit
+    /// branch emits both, ordered by the labels it grouped on, and so do
+    /// we because the substitution runs at render time, downstream of
+    /// `query_response_warned`'s `(labels_json, fingerprint)` sort.
+    ///
+    /// The two halves are the hermetic form of the live Q9/Q9s pair:
+    /// swapping which stream holds the U+FFFD reverses the objects.
+    ///
+    /// **This is the ONLY test that reddens when the substitution moves
+    /// before the sort**, and the fingerprints here are what make that
+    /// possible. On the real pipeline a fan-out group's fingerprint is
+    /// `fnv1a64` of its own pre-substitution `labels_json`
+    /// (`logql/detected_probe.rs:85`), so collapsing the labels leaves the
+    /// tiebreak carrying the same information and the live order does not
+    /// move — measured, not assumed. Choosing fingerprints whose order
+    /// CONTRADICTS the label order is what exposes the collapse:
+    /// with the substitution hoisted above the sort this half reports
+    /// `the literal space sorts before the U+FFFD (0x20 < 0xEF)`.
+    #[tokio::test]
+    async fn colliding_stream_labels_order_by_the_pre_substitution_label_set() {
+        let space = r#"{"k":" "}"#;
+        let repl = "{\"k\":\"\u{FFFD}\"}";
+
+        let order_of = |first_holds_space: bool| {
+            let (a, b) = if first_holds_space {
+                (space, repl)
+            } else {
+                (repl, space)
+            };
+            QueryResult::Streams {
+                items: vec![
+                    stream(2, a, vec![(1, "line-from-c1")]),
+                    stream(1, b, vec![(2, "line-from-c2")]),
+                ],
+                partial: false,
+            }
+        };
+
+        let body = body_string(query_response(order_of(true), None, 0, false)).await;
+        assert_eq!(
+            body.matches(r#"{"k":" "}"#).count(),
+            2,
+            "both objects are emitted, both labelled with a space: {body}"
+        );
+        let c1 = body.find("line-from-c1").expect("c1 present");
+        let c2 = body.find("line-from-c2").expect("c2 present");
+        assert!(
+            c1 < c2,
+            "the literal space sorts before the U+FFFD (0x20 < 0xEF): {body}"
+        );
+
+        let body = body_string(query_response(order_of(false), None, 0, false)).await;
+        let c1 = body.find("line-from-c1").expect("c1 present");
+        let c2 = body.find("line-from-c2").expect("c2 present");
+        assert!(
+            c2 < c1,
+            "swapping which stream holds the U+FFFD REVERSES the objects: {body}"
+        );
     }
 
     #[tokio::test]
