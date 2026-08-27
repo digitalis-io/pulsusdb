@@ -341,18 +341,72 @@ fn the_traces_answer_level_claim_names_only_real_suites() {
         );
     }
 
-    // 3. The nested-set suite's two gate variables are supplied by
-    //    EXACTLY ONE tracked file each — the suite's own source. Any other
-    //    supplier anywhere in the tree (a workflow `env:` block, a
-    //    composite action, a script a `run:` step invokes) falsifies the
-    //    paragraph's "no workflow supplies its gate" and is named here.
+    // 3. The paragraph's claim, checked exactly as it is written: no
+    //    WORKFLOW supplies the gate.
+    //
+    //    This runs BEFORE the broad tracked-tree sweep below, and the order
+    //    is the point. A workflow file is also a tracked file, so with the
+    //    sweep first this assertion could never be the one to fire and
+    //    would be a gate nobody could break — the shape this repo keeps
+    //    losing to. Checked first, it fails on its own terms, and the sweep
+    //    that follows is the wider net for the suppliers a workflow scan
+    //    cannot see (a script a `run:` step invokes, a composite action).
+    let diff_url = ["PULSUSDB_NESTED", "SET_DIFF_URL"].concat();
+    let otlp_url = ["PULSUSDB_NESTED", "SET_OTLP_URL"].concat();
+    let workflows = repo.join(".github/workflows");
+    let mut workflow_suppliers: Vec<String> = Vec::new();
+    let mut workflow_files = 0usize;
+    for entry in std::fs::read_dir(&workflows).expect(".github/workflows is readable") {
+        let path = entry.expect("workflow dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml")
+            && path.extension().and_then(|e| e.to_str()) != Some("yaml")
+        {
+            continue;
+        }
+        workflow_files += 1;
+        let text = std::fs::read_to_string(&path).expect("workflow readable");
+        if text.contains(diff_url.as_str()) || text.contains(otlp_url.as_str()) {
+            workflow_suppliers.push(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unnamed>")
+                    .to_string(),
+            );
+        }
+    }
+    assert!(
+        workflow_files > 0,
+        "no workflow files were read, so this assertion checked nothing"
+    );
+    assert!(
+        workflow_suppliers.is_empty(),
+        "docs/features.md says no workflow supplies the nested-set differential's gate, but \
+         these workflows name one of its variables: {workflow_suppliers:?}"
+    );
+
+    // 4. The nested-set suite's two gate variables are named by a CLOSED
+    //    set of tracked files. Any other mention anywhere in the tree (a
+    //    workflow `env:` block, a composite action, a script a `run:` step
+    //    invokes) falsifies the paragraph's "no workflow supplies its
+    //    gate" and is named here.
+    //
+    //    Two files are sanctioned, not one (issue #458). The suite's own
+    //    source, and the differential ledger, whose
+    //    `traceql-differential-legs-skip-green-on-a-missing-endpoint` entry
+    //    names both variables in full so the wiring hole it records can be
+    //    acted on without going and looking them up. **Documenting a
+    //    variable is not supplying it**, and the distinction is not left to
+    //    the reader: the workflow-scoped assertion below checks the
+    //    paragraph's actual claim directly, so widening this list by one
+    //    documentation file cannot admit a workflow.
     //
     //    Needles built by concatenation so this file is not itself a
     //    match — the precedent is
     //    crates/pulsus-read/tests/detected_labels_cardinality.rs:409-423.
-    let diff_url = ["PULSUSDB_NESTED", "SET_DIFF_URL"].concat();
-    let otlp_url = ["PULSUSDB_NESTED", "SET_OTLP_URL"].concat();
-    let expected = "crates/pulsus-read/tests/nestedset_value_differential.rs";
+    let expected = [
+        "crates/pulsus-read/tests/nestedset_value_differential.rs",
+        "docs/benchmarks/traces-differential-ledger.md",
+    ];
 
     // Every TRACKED file, from git: a directory walk would also read a
     // developer's untracked scratch files. A failure to list is a hard
@@ -398,16 +452,17 @@ fn the_traces_answer_level_claim_names_only_real_suites() {
         scanned > 1_000,
         "the sweep read only {scanned} tracked files"
     );
+    let sanctioned: Vec<String> = expected.iter().map(|p| (*p).to_string()).collect();
     assert_eq!(
-        suppliers_diff,
-        vec![expected.to_string()],
+        suppliers_diff, sanctioned,
         "docs/features.md says no workflow supplies the nested-set differential's gate, but \
-         {diff_url} appears in these tracked files (only the suite's own source may name it)"
+         {diff_url} appears in these tracked files (only the suite's own source and the \
+         differential ledger may name it)"
     );
     assert_eq!(
-        suppliers_otlp,
-        vec![expected.to_string()],
+        suppliers_otlp, sanctioned,
         "docs/features.md says no workflow supplies the nested-set differential's gate, but \
-         {otlp_url} appears in these tracked files (only the suite's own source may name it)"
+         {otlp_url} appears in these tracked files (only the suite's own source and the \
+         differential ledger may name it)"
     );
 }
