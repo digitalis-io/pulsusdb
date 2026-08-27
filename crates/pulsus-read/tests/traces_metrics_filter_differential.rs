@@ -370,6 +370,16 @@ fn now_ns() -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nested_set_root_counts_match_the_reference_on_a_shared_corpus() {
+    // Fail-closed on BOTH endpoint gates as well as the ClickHouse one
+    // (issue #320, and issue #458 review round 3). Without these two
+    // lines the leg has a hole its `schema-it` step cannot see: with
+    // `PULSUS_TEST_CLICKHOUSE=1` still set but the two URL variables
+    // dropped, the `else` arm below would print a skip notice and report
+    // GREEN in the job that exists to run it. `require_live_endpoint_gate`
+    // — not `require_live_gate` — because these values are URLs, and the
+    // boolean helper counts a gate as set only when it is exactly `"1"`.
+    pulsus_testkit::require_live_endpoint_gate("PULSUSDB_METRICS_FILTER_DIFF_URL");
+    pulsus_testkit::require_live_endpoint_gate("PULSUSDB_METRICS_FILTER_OTLP_URL");
     let (Ok(api_base), Ok(otlp_base), true) = (
         std::env::var("PULSUSDB_METRICS_FILTER_DIFF_URL"),
         std::env::var("PULSUSDB_METRICS_FILTER_OTLP_URL"),

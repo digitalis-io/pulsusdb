@@ -276,6 +276,17 @@ mod tests {
     /// range`, and it caps a range at 168h — so that span was anchored at
     /// `startTimeUnixNano = 1` and captured over `start=0&end=604800`.
     ///
+    /// **Capturing these is fiddlier than it looks, and none of it is
+    /// about this repo.** Two things bit, and both cost time:
+    ///
+    /// * A search over a RECENT window can come back `{"traces":[]}` on a
+    ///   freshly written block while `inspectedBytes` climbs — data
+    ///   demonstrably read, nothing matched — so an empty answer is not
+    ///   evidence of an empty store. Poll it; it starts answering.
+    /// * Pushing the epoch-anchored `i64::MAX` fixture in the SAME batch
+    ///   as the recent widths made every recent width unsearchable for
+    ///   minutes. Two pushes into two blocks, not one payload.
+    ///
     /// **Key ORDER is deliberately not compared.** `serde_json` sorts
     /// object keys and the reference emits declaration order; a JSON
     /// object is unordered and the datasource reads `span.durationNanos`
