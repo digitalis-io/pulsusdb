@@ -24,6 +24,33 @@ informational cases** — only the oracle comparison is ever downgraded.
 Entries are append-only; re-gating a case removes its `ledger` reference
 but keeps the entry for history.
 
+## Every entry states the conditions that reproduce it — and nothing enforces that
+
+An entry that records a measurement carries the conditions that produced
+it: the **route**, the **window**, the **anchor** (how the instant the
+window is relative to is chosen, whenever a recorded byte depends on
+where in wall-clock time it falls), the **seed** (what was pushed, with
+its sample timestamps), the complete **query** text, and the reference
+**digest**. A number without them is a figure nobody can re-measure, and
+this ledger has shipped that three times: a missing route cost three
+rounds on #294, a missing window cost a round on #455, a missing anchor
+cost another.
+
+**This is a discipline, not a check. Nothing verifies it.** Issue #455
+built four mechanisms to enforce it and every one was defeated inside a
+review round: a flat field list (a neighbouring entry's literal satisfied
+it), a section-scoped search (an invented table name matched everything),
+a table-scoped span (a literal moved into an HTML comment inside the span
+still matched), and a span-scoped exemption reason (the reason was struck
+through and contradicted beside itself, and the original bytes remained).
+Each asked *does this string appear?* when the claim is *does this table
+state this condition?* — and a presence test cannot tell a live claim
+from one that has been hidden, withdrawn or contradicted, because those
+are properties of meaning. A fifth would find a fifth decoy.
+
+So the check is a reader. When you touch an entry that records a
+measurement, re-read its conditions; when you add one, write them.
+
 Out of this ledger's scope by design:
 
 - **The `limit`-oversample under-return divergence is removed (#90).**
@@ -2471,14 +2498,15 @@ clients only display it).
   So `logs_utf8_substitution_live.rs` places its 15-minute windows inside
   a single wall-clock hour, asserts the `splits` the reference REPORTS for
   each window it actually sent, and pins no mapping.
-- **What this ledger row cannot do, stated so it is not read as more.**
-  It is prose. The shape of the row — that it names a route, both windows,
-  both object counts, this inconsistency sentence, the deliberate-match
-  sentence and the `/config` citation — is asserted field by field by
-  `logs_utf8_substitution_live.rs`. **Whether the numbers in the table are
-  TRUE is not something that checker can tell**; the live differential is
-  what measures them. A checker that appeared to validate the table would
-  be worse than none.
+- **What this row is, stated so it is not read as more.** It is prose,
+  and **nothing checks it** — see this ledger's header for the four
+  mechanisms that tried and the reason none can. What DOES measure the
+  numbers is the live differential
+  (`crates/pulsus-server/tests/logs_utf8_substitution_live.rs`), which
+  puts both windows to the reference in one run and compares the answers;
+  it asserts the behaviour, not this table's description of it. A checker
+  that appeared to validate the table would have been worse than none,
+  and for four rounds that is exactly what one was.
 - **Two readings that cannot be told apart, so neither is claimed.** When
   two label sets collide, "first in pre-substitution sort order wins" and
   "the substituted value loses" are **indistinguishable by construction**:
