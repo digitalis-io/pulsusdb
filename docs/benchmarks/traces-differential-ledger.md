@@ -756,3 +756,44 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Where it is enforced.** `crates/pulsus-read/tests/traces_metrics_ledger.rs`
   asserts each of the five facts above individually, so the entry cannot
   be satisfied by existing.
+
+### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **open wiring risk, recorded not fixed**
+
+- **What.** Three reference-facing differential suites read the URL of the
+  container they compare against with a bare `std::env::var` and take a
+  skip arm when it is absent:
+
+  | suite | endpoint variables |
+  |---|---|
+  | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` |
+  | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` |
+  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_*` |
+
+- **Why it matters.** Each also checks `PULSUS_TEST_CLICKHOUSE`, which IS
+  fail-closed. So with the ClickHouse gate still set and only the URL
+  variables dropped from a `schema-it` step, the suite prints a skip
+  notice and the step reports **green having compared nothing** — the
+  issue #320 failure, inside the legs whose whole purpose is to compare
+  against the reference. Nothing currently detects it: the guard that
+  would (`pulsus_testkit::require_live_endpoint_gate`) is not reached,
+  because the bare `env::var` returns first.
+
+- **Measured, on the suite where it was fixed.** `traces_metrics_filter_differential.rs`
+  had the identical shape and now routes both URLs through
+  `require_live_endpoint_gate`. With the URLs dropped and
+  `PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it` set it fails loudly
+  (`PULSUSDB_METRICS_FILTER_DIFF_URL is not set, but this is CI job
+  "schema-it"…`); before the change the same invocation printed a skip
+  notice and exited `ok`.
+
+- **Why it is not fixed here.** Three suites' gating is a change with its
+  own review surface, none of them is currently failing, and issue #458 is
+  about span durations and metrics filters. It is recorded rather than
+  bundled — but it is a wiring hole, not a divergence, and the failure
+  mode is silence.
+
+- **The fix, when it is scheduled.** Two lines per suite:
+  `pulsus_testkit::require_live_endpoint_gate("<VAR>")` before the
+  `env::var` reads, once per endpoint variable. The endpoint kind exists
+  because these gates carry a URL and the boolean helper counts a gate as
+  set only when it is exactly `"1"`.

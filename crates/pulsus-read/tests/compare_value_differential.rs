@@ -47,6 +47,14 @@
 //!   cargo test -p pulsus-read --test compare_value_differential -- --nocapture
 //! ```
 //!
+//! **Known wiring hole, recorded not fixed** (issue #458): the two
+//! `PULSUSDB_COMPARE_*` URLs below are read with a bare `env::var` and
+//! taken as a skip when absent, while `PULSUS_TEST_CLICKHOUSE` is
+//! fail-closed. Drop only the URLs from this suite's `schema-it` step and
+//! it reports GREEN having compared nothing — ledger entry
+//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
+//! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
+//!
 //! Clean-room: no Tempo/Grafana source, grammar, or test corpus is read —
 //! the fixtures are our own authorship and the Tempo values are read back
 //! as black-box runtime output.
@@ -476,9 +484,7 @@ impl StabilityWait {
     /// empty or failed read neither settles nor resets, it is simply not
     /// yet an answer.
     fn observe(&mut self, read: Option<Counts>) -> Option<Counts> {
-        let Some(map) = read.filter(|m| !m.is_empty()) else {
-            return None;
-        };
+        let map = read.filter(|m| !m.is_empty())?;
         self.run = if self.last.as_ref() == Some(&map) {
             self.run + 1
         } else {
