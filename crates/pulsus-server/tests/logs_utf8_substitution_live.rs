@@ -36,13 +36,35 @@
 //!   cargo test -p pulsus-server --test logs_utf8_substitution_live
 //! ```
 //!
-//! # Where this change does NOT reach, measured rather than assumed
+//! # Where this change does and does not reach, swept rather than assumed
 //!
-//! `space_for_replacement_chars` has exactly one production call site,
-//! `render_stream_item_into` (`git grep -n space_for_replacement_chars`
-//! -> one definition, one call, two test uses), so only the streams
-//! response can move. The two neighbouring endpoints were probed against
-//! the same container on 2026-08-27 to establish that rather than infer
+//! **The sweep is over CALLERS, transitively, and it has to be.** An
+//! earlier revision of this comment said
+//! `space_for_replacement_chars` "has exactly one production call site,
+//! `render_stream_item_into`" — true, and the wrong question. That
+//! renderer has TWO production callers, and the second is `tail_frame`,
+//! so the substitution reached `/api/logs/v1/tail` and its
+//! `/loki/api/v1/tail` alias, a route nothing on this issue ever
+//! measured. It is now scoped: the renderer takes an explicit
+//! `LabelBytes` and the tail frame asks for `Verbatim`, held still by
+//! `logs_api::encode`'s `tail_frames_keep_their_stream_label_bytes_verbatim`
+//! and recorded in the ledger with the captured frames.
+//!
+//! ```text
+//! space_for_replacement_chars  <- render_stream_item_into (only)
+//! render_stream_item_into      <- render_stream_item  -> query_response_warned (substitutes)
+//!                              <- tail_frame          -> logs_api::tail        (verbatim)
+//! ```
+//!
+//! The per-byte REPAIR has a wider reach and is deliberately not scoped:
+//! `lossy_go{,_len,_into}` is called by `lossy_charged`,
+//! `compile_charged_regex`, `UnixToTimeError::{rendered_len,render}` and
+//! `Retained::from_engine`, all in the read pipeline before any encoder,
+//! so it moves every route that renders a template — measured on tail as
+//! well as here, and ledgered.
+//!
+//! The two neighbouring endpoints were probed against the same container
+//! on 2026-08-27 to establish that they are untouched rather than infer
 //! it, and both are unreachable for a different reason:
 //!
 //! * **`/loki/api/v1/detected_labels` with any pipeline stage is
@@ -1347,6 +1369,26 @@ fn both_ledger_rows_carry_every_field_that_makes_them_re_measurable() {
                 "pkg/util/marshal/query.go:25-32",
             ),
             ("the granularity measurement", "utf8.DecodeRune"),
+            // The tail row. `render_stream_item_into` is shared, the
+            // substitution leaked onto `/loki/api/v1/tail`, and a route
+            // whose bytes moved has to be on the ledger with what it now
+            // serves — a changed divergence with no row is exactly the
+            // defect this issue keeps producing.
+            ("the tail route", "/loki/api/v1/tail"),
+            ("the tail scoping", "scoped to the QUERY response"),
+            (
+                "the tail label bytes before",
+                "`\"k\":\"efbfbd\"`, frame served, 114 B",
+            ),
+            ("the tail label bytes now", "**byte-identical**, 114 B"),
+            (
+                "the reference's own tail refusal",
+                "could not write JSON tail response",
+            ),
+            (
+                "the tail row the repair moves",
+                "`parse time 'efbfbdefbfbd'`, 343 B",
+            ),
         ],
     );
 

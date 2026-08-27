@@ -222,17 +222,17 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:85	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:91	-	-	b["0"]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:94	-	-	b[0]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:97	-	-	arr["0"]	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2448	-	-	a	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2449	-	-	o	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2451	-	-	a	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2452	-	-	o	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2470	-	-	o	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:2578	-	-	a.b	accept	accept	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:3915	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:3916	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:3917	-	-	b 1.5	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:3937	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:5859	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:5859	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:5860	-	-	["b]"]	reject	reject	-	-	
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:5860	-	-	["b]"]	reject	reject	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2492	-	-	a	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2493	-	-	o	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2495	-	-	a	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2496	-	-	o	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2514	-	-	o	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:2622	-	-	a.b	accept	accept	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3959	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3960	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3961	-	-	b 1.5	accept	reject	-	-	b26_json_expr.test's eval_fail row, which pins the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:3981	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:5903	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:5903	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:5904	-	-	["b]"]	reject	reject	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:5904	-	-	["b]"]	reject	reject	-	-	

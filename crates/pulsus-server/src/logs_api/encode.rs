@@ -274,12 +274,24 @@ fn stream_item_estimate(s: &StreamResult) -> usize {
 /// Raw invalid BYTES cannot occur here — `StreamResult::labels_json` is a
 /// `String` — so mapping the rune is the whole rule for us.
 ///
+/// **Scoped to the QUERY response.** `render_stream_item_into` is shared
+/// with [`tail_frame`], so the caller states which rule it wants
+/// ([`LabelBytes`]) rather than inheriting one. `/api/logs/v1/tail` and
+/// its `/loki/api/v1/tail` alias keep `LabelBytes::Verbatim`: every
+/// measurement on issue #455 — nine plan revisions, four review rounds —
+/// was taken at `/loki/api/v1/query_range`, nothing about the tail
+/// surface was ever established, and matching it needs its own
+/// differential, its own ledger row and its own reachability question.
+/// Unchanged bytes are reversible; a divergence changed on an unmeasured
+/// route is not. Held still by
+/// `tail_frames_keep_their_stream_label_bytes_verbatim` below.
+///
 /// **Placement is load-bearing, and the two ways of getting it wrong are
 /// caught by different tests — established by running them, not by
-/// reading.** This runs at RENDER time, downstream of the
-/// `(labels_json, fingerprint)` sorts (`query_response_warned`,
-/// `tail_frame`), so object order follows the PRE-substitution label set,
-/// which is what the reference's unsplit branch does.
+/// reading.** This runs at RENDER time, downstream of
+/// `query_response_warned`'s `(labels_json, fingerprint)` sort, so object
+/// order follows the PRE-substitution label set, which is what the
+/// reference's unsplit branch does.
 ///
 /// * Moved to the GROUPING key (`push_fanout_entry`'s
 ///   `render_labels_json_sorted`) the two colliding streams merge into
@@ -317,13 +329,41 @@ fn space_for_replacement_chars(labels_json: &str) -> Cow<'_, str> {
     }
 }
 
+/// Which rule a caller of [`render_stream_item_into`] wants applied to the
+/// stream's label JSON.
+///
+/// An enum and not a flag, because the two callers are two WIRE SURFACES
+/// with two evidence bases: the query response is measured against the
+/// reference on issue #455, the tail frame is not. Naming the rule at
+/// each call site is what stops the next edit to the shared renderer from
+/// silently moving a surface nobody measured — which is exactly what
+/// happened here, and twice before in the same issue at
+/// `render_labels_json_sorted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelBytes {
+    /// Map every U+FFFD to one space — the query-response rule
+    /// ([`space_for_replacement_chars`], issue #455).
+    SpaceForReplacementChars,
+    /// Splice the label JSON exactly as the engine produced it.
+    Verbatim,
+}
+
 /// Renders one stream item into ONE buffer (issue #312): entry framing,
 /// timestamps and JSON-escaped lines are written in place, so no
 /// per-entry `String` and no whole-item second copy is ever live.
-fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult) {
+///
+/// Two production callers, and they ask for different label bytes —
+/// [`render_stream_item`] (the query response) and [`tail_frame`] (the
+/// WebSocket frame). See [`LabelBytes`].
+fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult, labels: LabelBytes) {
     use std::io::Write;
     out.extend_from_slice(b"{\"stream\":");
-    out.extend_from_slice(space_for_replacement_chars(&s.labels_json).as_bytes());
+    match labels {
+        LabelBytes::SpaceForReplacementChars => {
+            out.extend_from_slice(space_for_replacement_chars(&s.labels_json).as_bytes());
+        }
+        LabelBytes::Verbatim => out.extend_from_slice(s.labels_json.as_bytes()),
+    }
     out.extend_from_slice(b",\"values\":[");
     for (i, (ts, line)) in s.entries.iter().enumerate() {
         if i > 0 {
@@ -340,9 +380,11 @@ fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult) {
     out.extend_from_slice(b"]}");
 }
 
+/// The QUERY response's stream item — the surface issue #455 measured, so
+/// the one that substitutes.
 fn render_stream_item(s: &StreamResult) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(stream_item_estimate(s));
-    render_stream_item_into(&mut out, s);
+    render_stream_item_into(&mut out, s, LabelBytes::SpaceForReplacementChars);
     out
 }
 
@@ -640,7 +682,12 @@ pub(crate) fn tail_frame(
             buf.push(b',');
         }
         // Rendered IN PLACE (issue #312): no per-item `String` copy.
-        render_stream_item_into(&mut buf, s);
+        //
+        // `LabelBytes::Verbatim` (issue #455): the tail frame's label
+        // bytes are UNCHANGED by that issue. Its evidence is entirely
+        // `/loki/api/v1/query_range`; this route was never measured
+        // against the reference, so it keeps what it served before.
+        render_stream_item_into(&mut buf, s, LabelBytes::Verbatim);
     }
     let mut out = String::from_utf8(buf).expect("rendered JSON is UTF-8");
     out.push_str("],\"dropped_entries\":[");
@@ -1227,6 +1274,48 @@ mod tests {
             body.matches('\u{FFFD}').count(),
             1,
             "exactly one U+FFFD survives, and it is the line's: {body}"
+        );
+    }
+
+    /// Issue #455 — **the tail frame's stream label bytes are UNCHANGED
+    /// by that issue**, and this is what keeps them that way.
+    ///
+    /// `render_stream_item_into` is shared between the query response and
+    /// [`tail_frame`]. The substitution went in at the shared renderer and
+    /// leaked onto `/api/logs/v1/tail` and its `/loki/api/v1/tail` alias —
+    /// measured through a real WebSocket frame, `"k":"<U+FFFD>"` became
+    /// `"k":" "`. Every measurement on #455 is a `query_range`
+    /// measurement; nothing about the tail surface was established, so it
+    /// keeps its own bytes until something measures it.
+    ///
+    /// The two halves are one claim: the SAME `StreamResult` must render
+    /// with a space through the query response and with `ef bf bd`
+    /// through the tail frame. Asserting only the second would pass on an
+    /// encoder that substitutes nowhere.
+    #[test]
+    fn tail_frames_keep_their_stream_label_bytes_verbatim() {
+        let item = stream(
+            1,
+            "{\"k\":\"\u{FFFD}\",\"service_name\":\"a\"}",
+            vec![(1, "line")],
+        );
+
+        let frame = tail_frame(vec![item.clone()], &[], 0);
+        assert!(
+            frame.contains("\"stream\":{\"k\":\"\u{FFFD}\",\"service_name\":\"a\"}"),
+            "the tail frame splices the label JSON verbatim: {frame}"
+        );
+        assert!(
+            !frame.contains("\"k\":\" \""),
+            "the query-response substitution must not reach the tail frame: {frame}"
+        );
+
+        // The same item through the query response DOES substitute, so a
+        // renderer that simply stopped substituting cannot pass this.
+        let rendered = String::from_utf8(render_stream_item(&item)).expect("utf8");
+        assert!(
+            rendered.contains("\"stream\":{\"k\":\" \",\"service_name\":\"a\"}"),
+            "the query response still substitutes: {rendered}"
         );
     }
 

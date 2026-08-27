@@ -2304,6 +2304,44 @@ clients only display it).
   with nothing charged), and it moves the accept surface the boundary
   table above describes, one quarter as far out.
 
+  **The substitution is scoped to the QUERY response, and the repair is
+  not — measured on `/loki/api/v1/tail`, both.** The two changes have
+  different reach and it would be wrong to describe them as one.
+  `render_stream_item_into` is shared with the tail frame encoder, so the
+  caller now names the rule it wants; `/api/logs/v1/tail` and its
+  `/loki/api/v1/tail` alias keep their label bytes verbatim. The repair
+  rule cannot be scoped that way and is not: it runs in the read
+  pipeline, before any encoder, so every route that renders a template
+  carries it. Captured through a real WebSocket frame with a fixed
+  timestamp and a fixed line, so the three columns are byte-comparable:
+
+  | tail case | before (`ececfc2`) | this change | reference |
+  |---|---|---|---|
+  | a U+FFFD in a stream label | `"k":"efbfbd"`, frame served, 114 B | **byte-identical**, 114 B | **no frame**: `101`, then close `1011` `could not write JSON tail response: 1:41: parse error: invalid UTF-8 rune` |
+  | `{{ unixToTime "\xe0\xa0" }}` in `__error_details__` | `parse time 'efbfbd'`, 340 B | `parse time 'efbfbdefbfbd'`, 343 B | `parse time 'e0a0'`, raw bytes |
+
+  The second row moves and the reason is the repair rule alone; it moves
+  the tail label's rune count from one to two, which is the reference's
+  count, exactly as on `query_range`. The residual is the same type
+  constraint.
+
+  The first row is why the substitution stops at the query response.
+  **The reference does not substitute on tail either** — it refuses the
+  frame, with the same Prometheus-lexer rejection its `encodeStream` path
+  raises as a `500`, which is the "except where they are wrong" case we
+  already decline to reproduce. So matching it there would mean either
+  killing a stream or applying a rule whose only evidence comes from a
+  route where the reference runs different code (`NewStreams`). Neither
+  is decidable from what this issue measured; the bytes stay put until
+  something measures them. `dropped_entries` labels in the same frame
+  were already spliced verbatim and still are.
+
+  Held still by `logs_api::encode`'s
+  `tail_frames_keep_their_stream_label_bytes_verbatim`, which asserts
+  both halves on ONE `StreamResult` — verbatim through the tail frame,
+  substituted through the query response — so an encoder that stopped
+  substituting everywhere cannot pass it.
+
   Pinned by `tests/logql_template_engine.rs`
   (`the_two_recorded_utf8_divergences_render_as_they_did_before_this_issue`,
   `unix_to_time_quotes_the_raw_argument_and_repairs_only_the_percent_v_half`)
@@ -2341,8 +2379,14 @@ clients only display it).
 
   | window | reference `splits` | reference | PulsusDB |
   |---|---|---|---|
-  | `start = NS - 15m` / `end = NS + 15m` | `0` | **two objects**, both `{"k":" "}` | **two objects**, both `{"k":" "}` |
-  | `start = NS - 1h` / `end = NS + 1h` | `3` | **one merged object** `{"k":" "}` carrying all four entries | **two objects**, both `{"k":" "}` |
+  | `start = NS - 15m` / `end = NS + 15m`, placed inside one wall-clock hour | `0` | **two objects**, both `{"k":" "}` | **two objects**, both `{"k":" "}` |
+  | `start = NS - 1h` / `end = NS + 1h` | `> 0` | **one merged object** `{"k":" "}` carrying all four entries | **two objects**, both `{"k":" "}` |
+
+  **The wide row's count is a `> 0`, not a number, and that is the point
+  of the paragraph below.** Two 1 h cases in ONE run reported `2` and `3`
+  — same width, different placement. Recording either as *the* value
+  would be a figure a reader could not reproduce; what is stable is the
+  branch, and the branch is what both the table and the test assert.
 
 - **The reference is internally inconsistent here.** It emits two objects
   below its split boundary and one merged object above it, so no single
