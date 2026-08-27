@@ -1308,10 +1308,23 @@ fn wire_literal_occurs_in_is_delimiter_sensitive() {
 /// (`pkg/tempopb/tempo.proto:139`), so the absence check is scoped to the
 /// `spanSets` sub-object rather than the whole body.
 ///
-/// The widths are the two a `durationMs` field destroys: 2^53 + 1 ns
-/// (`9007199254740993`, which a JSON number rounds to `…992` and a
-/// millisecond integer truncates to `9007199254`) and a sub-millisecond
-/// span (`545000` ns, which renders `0` as milliseconds).
+/// Three widths, each present for a different reason.
+///
+/// **`0` is the width that matters most, and it was missing.** protojson
+/// omits a default-valued scalar, so a zero-width span comes back from the
+/// reference with **no `durationNanos` key at all** — captured against
+/// `grafana/tempo@sha256:aa8df8d0…`:
+/// `{"spanID":"…","name":"fresh-w0","startTimeUnixNano":"…"}`. A
+/// default-valued field is exactly where a hand-written encoder and a
+/// protojson encoder part company, because emitting the zero is the
+/// natural thing to write and is wrong. This suite shipped for one review
+/// round without it, and the unit test beside it pinned our own
+/// `"durationNanos":"0"`, so both were green against a false contract.
+///
+/// `9007199254740993` (2^53 + 1) and `545000` are the widths a
+/// `durationMs` field destroys: a JSON number rounds the first to `…992`
+/// and a millisecond integer truncates it to `9007199254`, and the second
+/// renders `0` as milliseconds.
 ///
 /// Every needle below is a **delimited** byte literal spelled inline —
 /// `"durationNanos":"<digits>"`, closing quote included — so
@@ -1347,6 +1360,14 @@ async fn span_summaries_carry_duration_nanos_as_a_protojson_string_on_the_wire()
         {
             let mut sp = span([0xaa; 16], [0x05; 8], "tiny", start_ns);
             sp.end_time_unix_nano = start_ns + 545_000;
+            sp
+        },
+        {
+            // Zero width: `end == start`. Ingest's `resolve_duration_ns`
+            // stores `0`, and the reference emits no `durationNanos` for
+            // it.
+            let mut sp = span([0xaa; 16], [0x06; 8], "instant", start_ns);
+            sp.end_time_unix_nano = start_ns;
             sp
         },
     ];
@@ -1385,6 +1406,26 @@ async fn span_summaries_carry_duration_nanos_as_a_protojson_string_on_the_wire()
     assert!(
         find_subslice(sets, b"durationMs").is_none(),
         "no span summary may carry durationMs: {span_sets}"
+    );
+
+    // -- 0 ns: the field is ABSENT, not `"0"`. Asserted three ways so the
+    // gate cannot be satisfied by a rename or by a different rendering of
+    // the same zero.
+    let (_body, span_sets) = span_duration_probe(port, "instant");
+    let sets = span_sets.as_bytes();
+    assert!(
+        find_subslice(sets, b"durationNanos").is_none(),
+        "protojson omits a default-valued uint64: a zero-width span carries NO durationNanos \
+         key, which is what the reference returns for it: {span_sets}"
+    );
+    assert!(
+        find_subslice(sets, b"durationMs").is_none(),
+        "no span summary may carry durationMs either: {span_sets}"
+    );
+    assert!(
+        find_subslice(sets, b"\"name\":\"instant\"").is_some(),
+        "the zero-width span itself must still be returned — an absent FIELD is not an absent \
+         SPAN: {span_sets}"
     );
 }
 

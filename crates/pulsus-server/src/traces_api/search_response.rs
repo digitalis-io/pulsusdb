@@ -14,6 +14,18 @@
 //! [`span_json`] emits it as one. The string is load-bearing rather than
 //! cosmetic: a span of 9007199254740993 ns (2^53 + 1) survives it and
 //! would not survive a JSON number.
+//!
+//! **protojson OMITS a default-valued scalar**, so a zero-width span
+//! carries no `durationNanos` key at all — captured, not reasoned:
+//! against `grafana/tempo@sha256:aa8df8d0…` on
+//! `GET /api/search?q={name="fresh-w0"}` the span object comes back as
+//! `{"spanID":"…","name":"fresh-w0","startTimeUnixNano":"…"}` with the
+//! field absent, while a 1 ns span carries `"durationNanos":"1"`.
+//! [`span_json`] reproduces that. Emitting `"durationNanos":"0"` was the
+//! shape this module shipped for one review round, and the tests were
+//! green because they pinned OUR output at that width instead of the
+//! reference's — which is why every width the unit test asserts is now a
+//! captured response fragment.
 
 use serde_json::{Value, json};
 
@@ -35,18 +47,26 @@ fn duration_ms(duration_ns: i64) -> i64 {
 
 /// One `SpanSet.spans[]` entry. `durationNanos` is the reference's
 /// `uint64` (`pkg/tempopb/tempo.proto:160` @ v3.0.2) rendered the way
-/// protojson renders a `uint64` — as a JSON string. `duration_ns` is
-/// non-negative by ingest construction (`otlp_traces::resolve_duration_ns`
-/// clamps `end < start` and `end == 0` to `0`), and deliberately NOT
-/// re-clamped here: a negative value must surface a writer regression, not
-/// be hidden by the renderer.
+/// protojson renders a `uint64`: as a JSON string, and **omitted entirely
+/// when it is zero**, because protojson drops a default-valued scalar.
+/// Zero is the width where a hand-written encoder and a protojson encoder
+/// part company, so it is the one the tests must carry (see the module
+/// doc for the captured bytes).
+///
+/// `duration_ns` is non-negative by ingest construction
+/// (`otlp_traces::resolve_duration_ns` clamps `end < start` and
+/// `end == 0` to `0`), and deliberately NOT re-clamped here: a negative
+/// value must surface a writer regression, not be hidden by the renderer.
+/// A negative therefore renders — it is not zero, so it is not omitted.
 fn span_json(span: &SpanSummary) -> Value {
     let mut obj = json!({
         "spanID": hex(&span.span_id),
         "name": span.name,
         "startTimeUnixNano": span.start_ns.to_string(),
-        "durationNanos": span.duration_ns.to_string(),
     });
+    if span.duration_ns != 0 {
+        obj["durationNanos"] = Value::String(span.duration_ns.to_string());
+    }
     if !span.attributes.is_empty() {
         obj["attributes"] = Value::Array(
             span.attributes
@@ -192,6 +212,10 @@ mod tests {
             "protojson renders a uint64 as a JSON string, not a number"
         );
         assert!(
+            set["spans"][0].get("durationNanos").is_some(),
+            "a non-zero width is present; only zero is omitted"
+        );
+        assert!(
             set["spans"][0].get("durationMs").is_none(),
             "the reference's Span message has no durationMs field; it belongs to \
              TraceSearchMetadata one level up"
@@ -202,28 +226,108 @@ mod tests {
         );
     }
 
-    /// Issue #458 defect A, the widths a millisecond field or a JSON
-    /// number would destroy. `9007199254740993` is `2^53 + 1`: a JSON
-    /// number rounds it to `9007199254740992` and a millisecond integer
-    /// loses nine significant digits. `545000` is sub-millisecond and
-    /// renders `0` as milliseconds.
+    /// Issue #458 defect A: every width is asserted against a span object
+    /// **captured from the reference**, not against one written from our
+    /// own output.
+    ///
+    /// That distinction is the whole point of this test. The first cut of
+    /// it listed six widths and spelled the expected value for each from
+    /// what this module already emitted; at `0` that was
+    /// `"durationNanos":"0"` and the reference emits **no key at all**, so
+    /// the suite was green while the byte-parity contract it exists to
+    /// enforce was false. An expected value taken from the implementation
+    /// cannot fail the way the implementation fails.
+    ///
+    /// **Provenance.** `grafana/tempo@sha256:aa8df8d069f77b82e978464daf551`
+    /// `69bb8d135852ad58700aa96880653c3d8f7` — the digest
+    /// `.github/workflows/ci.yml` pins — started with this repo's
+    /// `ci/tempo/tempo-compare.yaml` unmodified, one OTLP JSON span per
+    /// width pushed to `POST /v1/traces`, then
+    /// `GET /api/search?q={name="<n>"}&start=<now-300>&end=<now+60>&limit=5`.
+    /// The `i64::MAX` row needed a different window: the reference parses
+    /// `end` as a `uint32` of seconds and answers
+    /// `invalid end: strconv.ParseUint: parsing "9223372037": value out of
+    /// range`, and it caps a range at 168h — so that span was anchored at
+    /// `startTimeUnixNano = 1` and captured over `start=0&end=604800`.
+    ///
+    /// **Key ORDER is deliberately not compared.** `serde_json` sorts
+    /// object keys and the reference emits declaration order; a JSON
+    /// object is unordered and the datasource reads `span.durationNanos`
+    /// by key (`src/resultTransformer.ts:942`). What IS compared is the
+    /// key SET — which is how the missing-at-zero case is caught — and
+    /// every value with its JSON type.
     #[test]
-    fn span_duration_nanos_survives_every_representable_width() {
-        for (ns, want) in [
-            (0i64, "0"),
-            (1, "1"),
-            (545_000, "545000"),
-            (42_000_000, "42000000"),
-            (9_007_199_254_740_993, "9007199254740993"),
-            (i64::MAX, "9223372036854775807"),
-        ] {
-            let mut output = sample_output();
-            output.traces[0].spans[0].duration_ns = ns;
-            let v = render(&output);
+    fn every_span_width_renders_the_reference_captured_span_object() {
+        // (duration_ns, the span object the reference returned for it).
+        // Verbatim capture: `spanID`, `name` and `startTimeUnixNano` are
+        // the fixture's own, so the comparison is total rather than
+        // field-by-field.
+        let captures: [(i64, &str); 7] = [
+            (
+                0,
+                r#"{"spanID":"4620000000000000","name":"fresh-w0","startTimeUnixNano":"1787855428000000000"}"#,
+            ),
+            (
+                1,
+                r#"{"spanID":"4620000000000001","name":"fresh-w1","startTimeUnixNano":"1787855429000000000","durationNanos":"1"}"#,
+            ),
+            (
+                545_000,
+                r#"{"spanID":"4620000000000002","name":"fresh-w545000","startTimeUnixNano":"1787855430000000000","durationNanos":"545000"}"#,
+            ),
+            (
+                42_000_000,
+                r#"{"spanID":"4620000000000003","name":"fresh-w42000000","startTimeUnixNano":"1787855431000000000","durationNanos":"42000000"}"#,
+            ),
+            (
+                9_007_199_254_740_993,
+                r#"{"spanID":"4620000000000004","name":"fresh-w2p53p1","startTimeUnixNano":"1787855432000000000","durationNanos":"9007199254740993"}"#,
+            ),
+            (
+                2_500_000_000,
+                r#"{"spanID":"4620000000000005","name":"fresh-wtrace2500","startTimeUnixNano":"1787855433000000000","durationNanos":"2500000000"}"#,
+            ),
+            (
+                i64::MAX,
+                r#"{"spanID":"4600000064000000","name":"width-i64max-only","startTimeUnixNano":"1","durationNanos":"9223372036854775807"}"#,
+            ),
+        ];
+
+        // The capture set must actually contain the discriminating widths;
+        // a future edit that drops one of them fails here rather than
+        // quietly narrowing what this test covers.
+        let widths: Vec<i64> = captures.iter().map(|(ns, _)| *ns).collect();
+        for required in [0, 1, 9_007_199_254_740_993, i64::MAX] {
+            assert!(
+                widths.contains(&required),
+                "the captured set must carry the {required} ns width"
+            );
+        }
+
+        for (duration_ns, captured) in captures {
+            let want: serde_json::Value =
+                serde_json::from_str(captured).expect("the capture is valid JSON");
+            let span_id: Vec<u8> = (0..8)
+                .map(|i| {
+                    let hex = &want["spanID"].as_str().expect("spanID")[i * 2..i * 2 + 2];
+                    u8::from_str_radix(hex, 16).expect("hex byte")
+                })
+                .collect();
+            let got = span_json(&SpanSummary {
+                span_id: span_id.try_into().expect("8 bytes"),
+                name: want["name"].as_str().expect("name").to_string(),
+                start_ns: want["startTimeUnixNano"]
+                    .as_str()
+                    .expect("startTimeUnixNano")
+                    .parse()
+                    .expect("i64 nanos"),
+                duration_ns,
+                attributes: vec![],
+            });
             assert_eq!(
-                v["traces"][0]["spanSets"][0]["spans"][0]["durationNanos"],
-                serde_json::Value::String(want.to_string()),
-                "width {ns} ns"
+                got, want,
+                "{duration_ns} ns: our span object must be the reference's, key set and all \
+                 (a JSON string is not a JSON number, and an ABSENT key is not a zero one)"
             );
         }
     }
