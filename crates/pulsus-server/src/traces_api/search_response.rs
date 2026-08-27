@@ -41,6 +41,14 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Trace-level milliseconds only — `TraceSearchMetadata.durationMs`
 /// (`pkg/tempopb/tempo.proto:139` @ v3.0.2). A span never carries this.
+///
+/// **Not truncated to `uint32`.** The reference computes
+/// `uint32(spanset.DurationNanos / 1_000_000)` (`engine.go:295`), so any
+/// trace longer than ~49.7 days wraps: measured on the pinned container,
+/// a 2^53 + 1 ns trace comes back `durationMs: 417264662` and an
+/// `i64::MAX` one `2077252342`, against our 9007199254 and 9223372036854.
+/// That wrap is the reference being wrong and is deliberately not copied
+/// (recorded on issue #458 as out of scope, with both numbers).
 fn duration_ms(duration_ns: i64) -> i64 {
     duration_ns / 1_000_000
 }
@@ -107,6 +115,20 @@ fn group_json(group: &SpanSetGroup) -> Value {
     })
 }
 
+/// One `traces[]` entry. `durationMs` follows the SAME protojson
+/// default-omission rule as the span level (issue #458, review round 2):
+/// it is dropped when it is zero, and it is zero for every SUB-MILLISECOND
+/// trace, not only for a zero-width one. Captured against
+/// `grafana/tempo@sha256:aa8df8d0…`: `0`, `1` and `545000` ns all come
+/// back with **no `durationMs` key**, while `42000000` ns comes back
+/// `"durationMs":42`. The unit is what the omission tests, so the test is
+/// on `duration_ms(...)`, never on `duration_ns`.
+///
+/// The one place this can still part company with the reference is a
+/// trace whose millisecond count is an exact multiple of 2^32 (~49.7
+/// days): the reference's `uint32` wraps that to `0` and omits the field,
+/// and we emit the true value. That is a consequence of NOT copying the
+/// overflow, and it is the better answer.
 fn trace_json(trace: &TraceSearchResult) -> Value {
     // Issue #193: when a `by()` grouping is active (`groups` is `Some`),
     // emit one spanSet per group carrying typed `attributes`; otherwise
@@ -119,14 +141,18 @@ fn trace_json(trace: &TraceSearchResult) -> Value {
             "spans": trace.spans.iter().map(span_json).collect::<Vec<_>>(),
         })],
     };
-    json!({
+    let mut obj = json!({
         "traceID": hex(&trace.trace_id),
         "rootServiceName": trace.root.service,
         "rootTraceName": trace.root.name,
         "startTimeUnixNano": trace.root.start_ns.to_string(),
-        "durationMs": duration_ms(trace.root.duration_ns),
         "spanSets": span_sets,
-    })
+    });
+    let ms = duration_ms(trace.root.duration_ns);
+    if ms != 0 {
+        obj["durationMs"] = Value::from(ms);
+    }
+    obj
 }
 
 /// The full documented response envelope — `traces` in the engine's
@@ -332,18 +358,129 @@ mod tests {
         }
     }
 
-    /// Issue #458: the TRACE level is unchanged and must stay
-    /// `durationMs` — integer milliseconds from the root span's duration
-    /// (`pkg/tempopb/tempo.proto:139` @ v3.0.2). This is the field the
-    /// issue records as already correct.
+    /// Issue #458 review round 2: the TRACE level follows the **same**
+    /// protojson default-omission rule as the span level, and every width
+    /// here is a trace object **captured from the reference**.
+    ///
+    /// This test replaces one that asserted `durationMs == 2500` and
+    /// nothing else. That assertion was true and useless: it was chosen
+    /// because the issue recorded the trace level as correct, and the
+    /// widths that would have shown otherwise — every SUB-MILLISECOND one
+    /// — were never tried. The reference omits `durationMs` for `0`, `1`
+    /// and `545000` ns alike, because the field is MILLISECONDS and all
+    /// three of those round to zero. The unit is what the omission tests.
+    ///
+    /// **Provenance.** Same container and route as
+    /// [`every_span_width_renders_the_reference_captured_span_object`].
+    /// `spanSet` (the deprecated singular) and `serviceStats` are removed
+    /// from each capture before comparison: we do not emit either, which
+    /// is a separately recorded gap and not this issue's to close.
+    /// `spanSets` is removed from BOTH sides — its contents are span
+    /// objects, and those are the other test's subject.
+    ///
+    /// **Where we deliberately differ, and it is pinned rather than
+    /// skipped.** The reference truncates to `uint32`
+    /// (`engine.go:295`), so a trace over ~49.7 days wraps. Two captured
+    /// widths wrap and their values are asserted on BOTH sides, so the
+    /// divergence cannot drift unnoticed:
+    /// 2^53 + 1 ns is `417264662` there and `9007199254` here, and
+    /// `i64::MAX` is `2077252342` there and `9223372036854` here.
     #[test]
-    fn the_trace_level_keeps_integer_millisecond_duration_ms() {
-        let v = render(&sample_output());
-        assert_eq!(v["traces"][0]["durationMs"], 2500);
-        assert!(
-            v["traces"][0].get("durationNanos").is_none(),
-            "the trace level has no durationNanos in the reference"
-        );
+    fn every_trace_width_renders_the_reference_captured_trace_object() {
+        let captures: [(i64, &str); 7] = [
+            (
+                0,
+                r#"{"traceID":"46300000000000000000000000000000","rootServiceName":"rev458c-w0","rootTraceName":"tl-w0","startTimeUnixNano":"1787856404000000000"}"#,
+            ),
+            (
+                1,
+                r#"{"traceID":"46300000000000000000000000000001","rootServiceName":"rev458c-w1","rootTraceName":"tl-w1","startTimeUnixNano":"1787856405000000000"}"#,
+            ),
+            (
+                545_000,
+                r#"{"traceID":"46300000000000000000000000000002","rootServiceName":"rev458c-w545000","rootTraceName":"tl-w545000","startTimeUnixNano":"1787856406000000000"}"#,
+            ),
+            (
+                42_000_000,
+                r#"{"traceID":"46300000000000000000000000000003","rootServiceName":"rev458c-w42000000","rootTraceName":"tl-w42000000","startTimeUnixNano":"1787856407000000000","durationMs":42}"#,
+            ),
+            (
+                9_007_199_254_740_993,
+                r#"{"traceID":"46300000000000000000000000000004","rootServiceName":"rev458c-w2p53p1","rootTraceName":"tl-w2p53p1","startTimeUnixNano":"1787856408000000000","durationMs":417264662}"#,
+            ),
+            (
+                2_500_000_000,
+                r#"{"traceID":"46300000000000000000000000000005","rootServiceName":"rev458c-w2500ms","rootTraceName":"tl-w2500ms","startTimeUnixNano":"1787856409000000000","durationMs":2500}"#,
+            ),
+            (
+                9_223_372_036_854_775_807,
+                r#"{"traceID":"46300000000000000000000064000000","rootServiceName":"rev458c-i64max","rootTraceName":"tl-i64max","startTimeUnixNano":"1","durationMs":2077252342}"#,
+            ),
+        ];
+        // The set must keep the widths that discriminate: a zero, a
+        // sub-millisecond non-zero (the case that makes this about
+        // MILLISECONDS rather than nanoseconds), and a whole-millisecond
+        // one.
+        let widths: Vec<i64> = captures.iter().map(|(ns, _)| *ns).collect();
+        for required in [0, 545_000, 42_000_000, i64::MAX] {
+            assert!(
+                widths.contains(&required),
+                "the captured set must carry the {required} ns width"
+            );
+        }
+
+        for (duration_ns, captured) in captures {
+            let want: serde_json::Value =
+                serde_json::from_str(captured).expect("the capture is valid JSON");
+            let trace_id: Vec<u8> = (0..16)
+                .map(|i| {
+                    let hex = &want["traceID"].as_str().expect("traceID")[i * 2..i * 2 + 2];
+                    u8::from_str_radix(hex, 16).expect("hex byte")
+                })
+                .collect();
+            let mut got = trace_json(&TraceSearchResult {
+                trace_id: trace_id.try_into().expect("16 bytes"),
+                root: RootSummary {
+                    service: want["rootServiceName"].as_str().expect("svc").to_string(),
+                    name: want["rootTraceName"].as_str().expect("name").to_string(),
+                    start_ns: want["startTimeUnixNano"]
+                        .as_str()
+                        .expect("startTimeUnixNano")
+                        .parse()
+                        .expect("i64 nanos"),
+                    duration_ns,
+                },
+                matched: 1,
+                spans: vec![],
+                groups: None,
+            });
+            got.as_object_mut().expect("object").remove("spanSets");
+
+            let ours_ms = duration_ns / 1_000_000;
+            let wraps = ours_ms > i64::from(u32::MAX);
+            if wraps {
+                // The `uint32` overflow: the VALUES differ by design, so
+                // assert both, plus that the key is present on both sides.
+                let theirs = want["durationMs"].as_i64().expect("reference durationMs");
+                assert_eq!(
+                    theirs,
+                    ours_ms % (i64::from(u32::MAX) + 1), // 2^32
+                    "{duration_ns} ns: the reference's value must be our value wrapped to uint32 \
+                     — if it is not, the divergence is no longer the overflow we recorded"
+                );
+                assert_eq!(
+                    got["durationMs"].as_i64(),
+                    Some(ours_ms),
+                    "{duration_ns} ns: we emit the UNWRAPPED value on purpose"
+                );
+            } else {
+                assert_eq!(
+                    got, want,
+                    "{duration_ns} ns: our trace object must be the reference's, key set and all \
+                     — durationMs is MILLISECONDS, so every sub-millisecond width omits it"
+                );
+            }
+        }
     }
 
     #[test]
