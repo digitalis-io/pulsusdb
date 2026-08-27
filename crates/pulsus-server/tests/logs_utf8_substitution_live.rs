@@ -1356,13 +1356,24 @@ const ALL_CONDITIONS: &[Condition] = &[
 ];
 
 /// What a row promises about one condition.
+///
+/// Both arms carry literals the guard looks for **inside the row's own
+/// table span**, never anywhere in the section — see [`table_span`].
 #[derive(Debug, Clone, Copy)]
 enum Given {
-    /// The row states it, and this literal is how the guard finds it.
-    Stated(&'static str),
-    /// The condition genuinely cannot apply to this row, and this is why.
-    /// The reason is asserted to be a reason — a word like `forgotten` or
-    /// `n/a` is not admissible, on the `DELIBERATELY_UNWIRED` precedent.
+    /// The row states it. EVERY literal must be present: a table that
+    /// sends two queries names both, and deleting either is a table that
+    /// no longer describes what was measured.
+    Stated(&'static [&'static str]),
+    /// The condition genuinely cannot apply, and the row SAYS SO in the
+    /// ledger — this literal is that sentence.
+    ///
+    /// It is checked twice: it must appear in the table's span, so
+    /// editing the prose to say the opposite reddens; and it must be a
+    /// reason, so a word like `forgotten` or `n/a` is refused on the
+    /// `DELIBERATELY_UNWIRED` precedent. A code-local string alone was
+    /// the second false-green here — it let the ledger assert the
+    /// OPPOSITE of the exemption while the guard stayed green.
     NotApplicable(&'static str),
 }
 
@@ -1373,6 +1384,14 @@ enum Given {
 /// holds a `query_range` one and a `/tail` one, taken on different
 /// routes, with different anchors and different queries — so `row` names
 /// which, and each carries its own conditions.
+///
+/// **`row` is a LOCATOR, not a label.** The ledger opens each table with
+/// ``**Table `<row>`.**`` and the guard searches only from there to the
+/// next such marker. An earlier revision of this file kept `row` in the
+/// panic text alone and searched the whole section by `key`, which let an
+/// invented table name pass and let a literal deleted from its own table
+/// be found in a neighbouring one — the same blind spot as the flat list
+/// it replaced, one layer along.
 struct LedgerRow {
     key: &'static str,
     row: &'static str,
@@ -1408,9 +1427,44 @@ fn assert_ledger_row(r: &LedgerRow) {
 /// silent pass. The one line `assert_ledger_row` adds on top is covered
 /// by deleting a condition from the shipped ledger and watching the real
 /// test go red.
+/// The span of `section` belonging to the table `row` names: from its
+/// ``**Table `<row>`.**`` marker to the next `**Table ` marker, or the
+/// end of the section.
+///
+/// `None` when the marker is absent, which is how an invented table name
+/// fails instead of silently matching the whole section.
+fn table_span<'a>(section: &'a str, row: &str) -> Option<&'a str> {
+    let marker = format!("**Table `{row}`.");
+    let start = section.find(&marker)?;
+    let rest = &section[start + marker.len()..];
+    let end = rest.find("**Table `").unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
 fn check_ledger_row(r: &LedgerRow) -> Vec<String> {
     let section = ledger_section(r.key);
     let mut problems: Vec<String> = Vec::new();
+
+    // 0. The table has to exist. Everything below searches ITS span, so
+    //    without this the guard would answer questions about a table the
+    //    ledger does not contain.
+    let Some(span) = table_span(&section, r.row) else {
+        return vec![format!(
+            "  NO SUCH TABLE {:?}: the `{}` entry has no ``**Table `{}`.**`` marker \
+             (markers present: {:?})",
+            r.row,
+            r.key,
+            r.row,
+            section
+                .match_indices("**Table `")
+                .map(|(i, _)| section[i + 9..]
+                    .split('`')
+                    .next()
+                    .unwrap_or("<unterminated>")
+                    .to_string())
+                .collect::<Vec<_>>()
+        )];
+    };
 
     // 1. Every condition answered for, exactly once. A row that simply
     //    leaves one out is the defect this whole mechanism exists for, so
@@ -1424,12 +1478,15 @@ fn check_ledger_row(r: &LedgerRow) -> Vec<String> {
         }
     }
 
-    // 2. Each stated condition actually present; each exemption a reason.
+    // 2. Each stated condition present IN THIS TABLE'S SPAN; each
+    //    exemption both stated in the ledger and an actual reason.
     for (c, given) in r.conditions {
         match given {
-            Given::Stated(needle) => {
-                if !section.contains(needle) {
-                    problems.push(format!("  MISSING CONDITION {c:?}: expected {needle:?}"));
+            Given::Stated(needles) => {
+                for needle in *needles {
+                    if !span.contains(needle) {
+                        problems.push(format!("  MISSING CONDITION {c:?}: expected {needle:?}"));
+                    }
                 }
             }
             Given::NotApplicable(why) => {
@@ -1439,13 +1496,19 @@ fn check_ledger_row(r: &LedgerRow) -> Vec<String> {
                         "  INADMISSIBLE EXEMPTION {c:?}: {why:?} is not a reason"
                     ));
                 }
+                if !span.contains(why) {
+                    problems.push(format!(
+                        "  UNSTATED EXEMPTION {c:?}: the ledger must carry the reason \
+                         verbatim, expected {why:?}"
+                    ));
+                }
             }
         }
     }
 
-    // 3. Each recorded value present.
+    // 3. Each recorded value present IN THIS TABLE'S SPAN.
     for (field, needle) in r.values {
-        if !section.contains(needle) {
+        if !span.contains(needle) {
             problems.push(format!("  MISSING VALUE {field}: expected {needle:?}"));
         }
     }
@@ -1456,29 +1519,32 @@ fn check_ledger_row(r: &LedgerRow) -> Vec<String> {
 const LEDGER_ROWS: &[LedgerRow] = &[
     LedgerRow {
         key: "template-output-budget",
-        row: "the query_range capture",
+        row: "template-output-budget/query_range",
         conditions: &[
-            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
-            (Condition::Window, Given::Stated("start = NS - 1h")),
+            (
+                Condition::Route,
+                Given::Stated(&["/loki/api/v1/query_range"]),
+            ),
+            (Condition::Window, Given::Stated(&["start = NS - 1h"])),
             (
                 Condition::Anchor,
                 // Written down rather than left out: the exemption is the
                 // place a defect hides, so the row has to say WHY the
                 // anchor cannot matter here, and it does.
                 Given::NotApplicable(
-                    "NS is simply `now` for this table and no compared span contains it; \
-                     the row says so, and points at streams-split-merge where it DOES matter",
+                    "`NS` itself is not a condition for this table: it is simply `now`, no \
+                     value here depends on where it falls, and no compared span contains it.",
                 ),
             ),
             (
                 Condition::Seed,
-                Given::Stated("ONE line `hello world` under `{app=\"foo\"}` at an instant `NS`"),
+                Given::Stated(&["ONE line `hello world` under `{app=\"foo\"}` at an instant `NS`"]),
             ),
             (
                 Condition::Query,
-                Given::Stated("is the cell's first column"),
+                Given::Stated(&["is the cell's first column"]),
             ),
-            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+            (Condition::Digest, Given::Stated(&["sha256:87f0a067"])),
         ],
         values: &[
             ("the reference's unixToTime label", "`e0a0`"),
@@ -1495,26 +1561,32 @@ const LEDGER_ROWS: &[LedgerRow] = &[
     },
     LedgerRow {
         key: "template-output-budget",
-        row: "the /tail capture",
+        row: "template-output-budget/tail",
         conditions: &[
-            (Condition::Route, Given::Stated("/loki/api/v1/tail")),
-            (Condition::Window, Given::Stated("start = NS - 60s")),
+            (Condition::Route, Given::Stated(&["/loki/api/v1/tail"])),
+            (Condition::Window, Given::Stated(&["start = NS - 60s"])),
             (
                 Condition::Anchor,
-                Given::Stated("the most recent half-past-the-hour at least 30 s in the past"),
+                Given::Stated(&["the most recent half-past-the-hour at least 30 s in the past"]),
             ),
             (
                 Condition::Seed,
-                Given::Stated(
+                Given::Stated(&[
                     "ONE line `tailprobe` under `{app=\"tf1\"}`, whose sample timestamp is \
                      exactly `NS`",
-                ),
+                ]),
             ),
             (
                 Condition::Query,
-                Given::Stated("{app=\"tf1\"} | line_format `{{ unixToTime \"\\xe0\\xa0\" }}`"),
+                // BOTH, because the table has two rows and each sends its
+                // own: naming one let the other be deleted while the
+                // guard stayed green.
+                Given::Stated(&[
+                    "{app=\"tf1\"} | label_format k=`{{ \"\\ufffd\" }}`",
+                    "{app=\"tf1\"} | line_format `{{ unixToTime \"\\xe0\\xa0\" }}`",
+                ]),
             ),
-            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+            (Condition::Digest, Given::Stated(&["sha256:87f0a067"])),
         ],
         values: &[
             ("the scoping", "scoped to the QUERY response"),
@@ -1539,23 +1611,26 @@ const LEDGER_ROWS: &[LedgerRow] = &[
     },
     LedgerRow {
         key: "streams-split-merge",
-        row: "the collision capture",
+        row: "streams-split-merge/collision",
         conditions: &[
-            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
-            (Condition::Window, Given::Stated("start = NS - 15m")),
+            (
+                Condition::Route,
+                Given::Stated(&["/loki/api/v1/query_range"]),
+            ),
+            (Condition::Window, Given::Stated(&["start = NS - 15m"])),
             (
                 Condition::Anchor,
-                Given::Stated("the most recent half-past-the-hour at least 60 s in the past"),
+                Given::Stated(&["the most recent half-past-the-hour at least 60 s in the past"]),
             ),
             (
                 Condition::Seed,
-                Given::Stated("three lines, at `NS`, `NS+10ns` and `NS+11ns`"),
+                Given::Stated(&["three lines, at `NS`, `NS+10ns` and `NS+11ns`"]),
             ),
             (
                 Condition::Query,
-                Given::Stated("| drop app, service_name, detected_level"),
+                Given::Stated(&["| drop app, service_name, detected_level"]),
             ),
-            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+            (Condition::Digest, Given::Stated(&["sha256:87f0a067"])),
         ],
         values: &[
             ("the wide window", "start = NS - 1h"),
@@ -1621,10 +1696,20 @@ fn both_ledger_rows_carry_every_field_that_makes_them_re_measurable() {
 /// ledger — a checker whose reporting has never been seen fail is the
 /// shape this issue keeps producing.
 ///
+/// Six cases. The first three are the ones the guard caught when it was
+/// written; **the last three are the false-greens it did not**, and each
+/// is here because a review demonstrated it passing:
+///
+/// * an invented table name matched the whole section and passed;
+/// * a literal deleted from its own table was still found in a
+///   neighbouring one, so the deletion passed;
+/// * a `NotApplicable` reason lived only in this file, so the ledger
+///   could be edited to assert the OPPOSITE and the guard stayed green.
+///
 /// Neither `#[should_panic]` nor `catch_unwind`: both are named in
 /// `pulsus_testkit`'s docs as the way a suite absorbs `require_live_gate`
 /// and turns #320's guarantee back into a silent pass, and a
-/// `catch_unwind` here would also print three panics into a green run.
+/// `catch_unwind` here would also print panics into a green run.
 /// [`check_ledger_row`] returns the problems instead.
 #[test]
 fn the_ledger_guard_reports_an_omitted_condition_and_a_non_reason() {
@@ -1632,22 +1717,30 @@ fn the_ledger_guard_reports_an_omitted_condition_and_a_non_reason() {
 
     let complain = |r: &LedgerRow| -> String {
         let problems = check_ledger_row(r);
-        assert!(!problems.is_empty(), "the fixture row must fail");
+        assert!(
+            !problems.is_empty(),
+            "the fixture row {:?} must fail",
+            r.row
+        );
         problems.join("\n")
     };
-
-    // A row that names its VALUES and simply leaves a condition out —
-    // which is what the three shipped instances of this defect looked
-    // like.
+    // Fixtures locate a REAL table, so what they exercise is the check
+    // under test and not the missing-marker path.
+    const QR: &str = "template-output-budget/query_range";
+    // 1. A row that names its VALUES and simply leaves a condition out —
+    //    what all three shipped instances of this defect looked like.
     let omitted = LedgerRow {
         key: "template-output-budget",
-        row: "fixture: no anchor named at all",
+        row: QR,
         conditions: &[
-            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
-            (Condition::Window, Given::Stated("start = NS - 1h")),
-            (Condition::Seed, Given::Stated("`hello world`")),
-            (Condition::Query, Given::Stated("line_format")),
-            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+            (
+                Condition::Route,
+                Given::Stated(&["/loki/api/v1/query_range"]),
+            ),
+            (Condition::Window, Given::Stated(&["start = NS - 1h"])),
+            (Condition::Seed, Given::Stated(&["`hello world`"])),
+            (Condition::Query, Given::Stated(&["line_format"])),
+            (Condition::Digest, Given::Stated(&["sha256:87f0a067"])),
         ],
         values: &[("a value it does record", "`e0a0`")],
     };
@@ -1657,18 +1750,21 @@ fn the_ledger_guard_reports_an_omitted_condition_and_a_non_reason() {
         "an omitted condition must be named: {msg}"
     );
 
-    // A row that answers every condition but exempts one with a word
-    // instead of a reason.
+    // 2. Every condition answered, but one exempted with a word instead
+    //    of a reason.
     let excused = LedgerRow {
         key: "template-output-budget",
-        row: "fixture: an exemption that is not a reason",
+        row: QR,
         conditions: &[
-            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
-            (Condition::Window, Given::Stated("start = NS - 1h")),
+            (
+                Condition::Route,
+                Given::Stated(&["/loki/api/v1/query_range"]),
+            ),
+            (Condition::Window, Given::Stated(&["start = NS - 1h"])),
             (Condition::Anchor, Given::NotApplicable("n/a")),
-            (Condition::Seed, Given::Stated("`hello world`")),
-            (Condition::Query, Given::Stated("line_format")),
-            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+            (Condition::Seed, Given::Stated(&["`hello world`"])),
+            (Condition::Query, Given::Stated(&["line_format"])),
+            (Condition::Digest, Given::Stated(&["sha256:87f0a067"])),
         ],
         values: &[],
     };
@@ -1678,20 +1774,23 @@ fn the_ledger_guard_reports_an_omitted_condition_and_a_non_reason() {
         "an exemption that is not a reason must be named: {msg}"
     );
 
-    // And a condition that is named but absent from the prose.
+    // 3. A condition claimed but absent from the prose.
     let absent = LedgerRow {
         key: "template-output-budget",
-        row: "fixture: a condition claimed but not written down",
+        row: QR,
         conditions: &[
-            (Condition::Route, Given::Stated("/loki/api/v1/query_range")),
-            (Condition::Window, Given::Stated("start = NS - 1h")),
+            (
+                Condition::Route,
+                Given::Stated(&["/loki/api/v1/query_range"]),
+            ),
+            (Condition::Window, Given::Stated(&["start = NS - 1h"])),
             (
                 Condition::Anchor,
-                Given::Stated("an anchor sentence this entry does not contain"),
+                Given::Stated(&["an anchor sentence this entry does not contain"]),
             ),
-            (Condition::Seed, Given::Stated("`hello world`")),
-            (Condition::Query, Given::Stated("line_format")),
-            (Condition::Digest, Given::Stated("sha256:87f0a067")),
+            (Condition::Seed, Given::Stated(&["`hello world`"])),
+            (Condition::Query, Given::Stated(&["line_format"])),
+            (Condition::Digest, Given::Stated(&["sha256:87f0a067"])),
         ],
         values: &[],
     };
@@ -1699,5 +1798,94 @@ fn the_ledger_guard_reports_an_omitted_condition_and_a_non_reason() {
     assert!(
         msg.contains("MISSING CONDITION Anchor"),
         "a claimed-but-absent condition must be named: {msg}"
+    );
+
+    // 4. FALSE-GREEN 1 — an invented table name. This passed: the check
+    //    searched the whole section by `key` and `row` was decoration.
+    let invented = LedgerRow {
+        key: "template-output-budget",
+        row: "a table that does not exist in the ledger",
+        conditions: LEDGER_ROWS[1].conditions,
+        values: LEDGER_ROWS[1].values,
+    };
+    let msg = complain(&invented);
+    assert!(
+        msg.contains("NO SUCH TABLE"),
+        "a table name the ledger does not carry must be named: {msg}"
+    );
+    assert!(
+        msg.contains("template-output-budget/tail"),
+        "and the message must list the markers that DO exist: {msg}"
+    );
+
+    // 5. FALSE-GREEN 2 — a literal that lives in a NEIGHBOURING table of
+    //    the same section. `start = NS - 60s` is the tail table's window
+    //    and appears nowhere in the query_range table, so a query_range
+    //    row claiming it must fail. Whole-section matching passed this,
+    //    which is why deleting a query from its own table stayed green.
+    let leaked = LedgerRow {
+        key: "template-output-budget",
+        row: QR,
+        conditions: &[
+            (
+                Condition::Route,
+                Given::Stated(&["/loki/api/v1/query_range"]),
+            ),
+            // the tail table's window, claimed by the query_range table
+            (Condition::Window, Given::Stated(&["start = NS - 60s"])),
+            (
+                Condition::Anchor,
+                Given::NotApplicable(
+                    "`NS` itself is not a condition for this table: it is simply `now`, no \
+                     value here depends on where it falls, and no compared span contains it.",
+                ),
+            ),
+            (Condition::Seed, Given::Stated(&["`hello world`"])),
+            (Condition::Query, Given::Stated(&["line_format"])),
+            (Condition::Digest, Given::Stated(&["sha256:87f0a067"])),
+        ],
+        values: &[],
+    };
+    let msg = complain(&leaked);
+    assert!(
+        msg.contains("MISSING CONDITION Window") && msg.contains("start = NS - 60s"),
+        "a literal belonging to a NEIGHBOURING table must not satisfy this one: {msg}"
+    );
+    // The same literal IS in the section — which is exactly why the old
+    // whole-section check passed it. Asserted, so this fixture cannot
+    // quietly become a test of a literal that is simply absent.
+    assert!(
+        ledger_section("template-output-budget").contains("start = NS - 60s"),
+        "the fixture is only meaningful while the tail table still states its window"
+    );
+
+    // 6. FALSE-GREEN 3 — an exemption whose reason is not in the ledger.
+    //    The reason used to be a code-local string, so the ledger could
+    //    assert the opposite and the guard stayed green.
+    let unstated = LedgerRow {
+        key: "template-output-budget",
+        row: QR,
+        conditions: &[
+            (
+                Condition::Route,
+                Given::Stated(&["/loki/api/v1/query_range"]),
+            ),
+            (Condition::Window, Given::Stated(&["start = NS - 1h"])),
+            (
+                Condition::Anchor,
+                Given::NotApplicable(
+                    "the anchor cannot matter here, and this sentence is nowhere in the ledger",
+                ),
+            ),
+            (Condition::Seed, Given::Stated(&["`hello world`"])),
+            (Condition::Query, Given::Stated(&["line_format"])),
+            (Condition::Digest, Given::Stated(&["sha256:87f0a067"])),
+        ],
+        values: &[],
+    };
+    let msg = complain(&unstated);
+    assert!(
+        msg.contains("UNSTATED EXEMPTION Anchor"),
+        "an exemption the ledger does not carry must be named: {msg}"
     );
 }

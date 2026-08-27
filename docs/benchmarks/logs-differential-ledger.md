@@ -2229,7 +2229,8 @@ clients only display it).
   `500`; the `1<<24` label cap is not tunable, so that row alone carries
   the claim.
 
-- **Issue #455 — the substitution, and what is left after it.** This
+- **Table `template-output-budget/query_range`. Issue #455 — the
+  substitution, and what is left after it.** This
   bullet REPLACES the "two U+FFFD divergences #294 did NOT change"
   account that stood here; that account described a state that no longer
   ships, and leaving it beside this one would leave a reader to pick.
@@ -2284,10 +2285,12 @@ clients only display it).
   ```
 
   where `<template>` is the cell's first column; the second shape is what
-  the two ENTRY rows use, and the third is the ordinary-label row. **`NS`
-  itself is not a condition for this table** — it is simply `now`, no
-  value here depends on where it falls, and no compared span contains it.
-  (`streams-split-merge`'s anchor DOES matter, and is stated there.)
+  the two ENTRY rows use, and the third is the ordinary-label row.
+
+  **`NS` itself is not a condition for this table: it is simply `now`, no
+  value here depends on where it falls, and no compared span contains
+  it.** That is the one anchor exemption in this ledger, and
+  `streams-split-merge`'s anchor DOES matter and is stated there.
 
   The two ENTRY rows differ only in JSON escaping: the reference writes
   `\ufffd` as six ASCII bytes for the `unixToTime` echo and raw UTF-8 for
@@ -2320,7 +2323,8 @@ clients only display it).
   with nothing charged), and it moves the accept surface the boundary
   table above describes, one quarter as far out.
 
-  **The substitution is scoped to the QUERY response, and the repair is
+  **Table `template-output-budget/tail`. The substitution is scoped to
+  the QUERY response, and the repair is
   not — measured on `/loki/api/v1/tail`, both.** The two changes have
   different reach and it would be wrong to describe them as one.
   `render_stream_item_into` is shared with the tail frame encoder, so the
@@ -2331,8 +2335,11 @@ clients only display it).
   carries it.
 
   **How to re-measure the tail table below.** Route `/loki/api/v1/tail`
-  (its `/api/logs/v1/tail` sibling is the same handler), against the same
-  digest above. **Anchor:** `NS` is the most recent half-past-the-hour at
+  (its `/api/logs/v1/tail` sibling is the same handler), against
+  `docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
+  — spelled out here rather than borrowed from the table above, because a
+  table that leans on its neighbour's conditions is a table that stops
+  being re-measurable the moment the neighbour is edited. **Anchor:** `NS` is the most recent half-past-the-hour at
   least 30 s in the past — `NS = (now / 1h) * 1h + 30m`, minus a further
   `1h` when that lands later than `now - 30s`. **Seed:** ONE line
   `tailprobe` under `{app="tf1"}`, whose sample timestamp is exactly
@@ -2405,7 +2412,8 @@ clients only display it).
   (see `template-output-budget`), two label sets that differed ONLY in
   that character become identical. What the reference does with the pair
   depends on how many query splits the request was cut into.
-- **Reference behaviour, measured** 2026-08-27 on
+- **Table `streams-split-merge/collision`. Reference behaviour,
+  measured** 2026-08-27 on
   `docker.io/grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`
   (`/loki/api/v1/status/buildinfo` -> `3.7.4` / `b318f282`), **route
   `/loki/api/v1/query_range`**, `direction=backward`, `limit=100`.
