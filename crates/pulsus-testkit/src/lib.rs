@@ -171,12 +171,55 @@ impl fmt::Display for LiveGate {
     }
 }
 
+/// What a gate variable's VALUE has to look like for the gate to count as
+/// set. The two kinds exist because two kinds of gate exist, and one
+/// rule cannot serve both (issue #458 review round 3).
+///
+/// The distinction is not cosmetic: widening the single rule to
+/// "non-empty" so that a URL would pass would silently reclassify
+/// `PULSUS_TEST_CLICKHOUSE=0` from a skip into a run, across every suite
+/// in the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateValue {
+    /// `=1` and nothing else. `0`, `true`, `yes` and the empty string are
+    /// all "not set". Every gate in this repo but one is this kind.
+    Boolean,
+    /// Any non-blank value. For a gate whose value IS the thing the suite
+    /// needs — an endpoint URL — there is no boolean spelling to demand,
+    /// and demanding one would mean carrying a second variable whose only
+    /// job is to say "the first one is set", which can then disagree with
+    /// it.
+    Endpoint,
+}
+
+impl GateValue {
+    fn is_set(self, gate: Option<&str>) -> bool {
+        match (self, gate) {
+            (GateValue::Boolean, g) => g == Some("1"),
+            (GateValue::Endpoint, Some(v)) => !v.trim().is_empty(),
+            (GateValue::Endpoint, None) => false,
+        }
+    }
+}
+
 /// The classification, as a pure function of the two environment readings
 /// — the whole decision, testable without mutating process environment
 /// (`std::env::set_var` is `unsafe` in edition 2024 and racy under a
 /// threaded harness besides).
-fn classify(var: &str, gate: Option<&str>, github_job: Option<&str>) -> LiveGate {
-    if gate == Some("1") {
+///
+/// The `kind` parameter changes ONLY which values count as set; the
+/// job-discriminator half below is shared, which is the point of putting
+/// them in one function rather than two. Adding [`GateValue::Endpoint`]
+/// therefore cannot alter any existing caller's behaviour: the entry
+/// points they use still pass [`GateValue::Boolean`], and that arm's
+/// predicate is the same `gate == Some("1")` it always was.
+fn classify_kind(
+    kind: GateValue,
+    var: &str,
+    gate: Option<&str>,
+    github_job: Option<&str>,
+) -> LiveGate {
+    if kind.is_set(gate) {
         return LiveGate::Run;
     }
     match github_job {
@@ -188,11 +231,31 @@ fn classify(var: &str, gate: Option<&str>, github_job: Option<&str>) -> LiveGate
     }
 }
 
-/// Classify the current process against gate variable `var`.
+/// The boolean classification — unchanged, and the one every `=1` gate in
+/// the workspace takes.
+fn classify(var: &str, gate: Option<&str>, github_job: Option<&str>) -> LiveGate {
+    classify_kind(GateValue::Boolean, var, gate, github_job)
+}
+
+/// Classify the current process against boolean gate variable `var`.
 pub fn live_gate(var: &str) -> LiveGate {
     let gate = std::env::var(var).ok();
     let job = std::env::var(GITHUB_JOB).ok();
     classify(var, gate.as_deref(), job.as_deref())
+}
+
+/// Classify the current process against an ENDPOINT gate variable — one
+/// whose value is the address the suite talks to (e.g.
+/// `PULSUSDB_TEMPO_DIFF_URL=http://localhost:13200`) rather than a `1`.
+///
+/// Same fail-closed guarantee as [`live_gate`], and the same
+/// `HERMETIC_CI_JOBS` discriminator: an absent endpoint in a live CI job
+/// is a wiring failure, not a skip (issue #320). Only the "is it set"
+/// test differs, because a URL is not a `1`.
+pub fn live_endpoint_gate(var: &str) -> LiveGate {
+    let gate = std::env::var(var).ok();
+    let job = std::env::var(GITHUB_JOB).ok();
+    classify_kind(GateValue::Endpoint, var, gate.as_deref(), job.as_deref())
 }
 
 /// The running test binary's name, for the panic message — the operator
@@ -230,13 +293,33 @@ fn suite_name() -> String {
 ///
 /// Returns the classification so a caller can reuse it.
 pub fn require_live_gate(var: &str) -> LiveGate {
-    let gate = live_gate(var);
+    panic_if_missing(var, live_gate(var))
+}
+
+/// [`require_live_gate`] for an ENDPOINT gate — one whose value is the
+/// address the suite talks to rather than a `1`. Same guarantee, same
+/// message; only "is it set" differs. See [`live_endpoint_gate`].
+///
+/// Routing a URL-valued gate through [`require_live_gate`] instead is the
+/// defect this exists to stop, and it is not a quiet one: the boolean
+/// rule reads the URL as "not `1`", so the guard panics saying the
+/// variable is not set while the `env:` block is right there in the same
+/// log (issue #458 review round 3, `schema-it` red).
+pub fn require_live_endpoint_gate(var: &str) -> LiveGate {
+    panic_if_missing(var, live_endpoint_gate(var))
+}
+
+/// The shared fail-closed panic. One message for both kinds, so the two
+/// entry points cannot drift into saying different things about the same
+/// wiring failure.
+fn panic_if_missing(var: &str, gate: LiveGate) -> LiveGate {
     if let LiveGate::MissingInLiveCiJob { job, .. } = &gate {
         panic!(
-            "{var} is not set, but this is CI job {job:?}, which exists to provide ClickHouse — \
-             the `{}` suite would have skipped silently and reported green. Restore the `env:` \
-             block on this suite's step in .github/workflows/ci.yml, or add {job:?} to \
-             pulsus_testkit::HERMETIC_CI_JOBS if it is genuinely a hermetic lane (issue #320).",
+            "{var} is not set, but this is CI job {job:?}, which exists to provide the live \
+             dependency — the `{}` suite would have skipped silently and reported green. \
+             Restore the `env:` block on this suite's step in .github/workflows/ci.yml, or add \
+             {job:?} to pulsus_testkit::HERMETIC_CI_JOBS if it is genuinely a hermetic lane \
+             (issue #320).",
             suite_name()
         );
     }
@@ -247,6 +330,11 @@ pub fn require_live_gate(var: &str) -> LiveGate {
 /// gate is missing in a live CI job.
 pub fn live_gate_enabled(var: &str) -> bool {
     require_live_gate(var).is_running()
+}
+
+/// [`live_gate_enabled`] for an ENDPOINT gate. See [`live_endpoint_gate`].
+pub fn live_endpoint_gate_enabled(var: &str) -> bool {
+    require_live_endpoint_gate(var).is_running()
 }
 
 /// [`live_gate_enabled`] for the common [`CLICKHOUSE_GATE`].
@@ -492,6 +580,121 @@ mod tests {
             classify(VAR, Some(""), Some("schema-it")),
             LiveGate::MissingInLiveCiJob { .. }
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Endpoint gates (issue #458 review round 3). A gate whose VALUE is
+    // the address the suite talks to needs the same #320 guarantee, and
+    // cannot get it from the boolean rule: `http://localhost:13200` is
+    // not `1`, so the boolean rule reads a fully-wired step as unwired
+    // and panics saying the variable is not set.
+    //
+    // All four states are asserted for the endpoint kind, and the fourth
+    // — present-but-not-`1` under its own job — is the one the boolean
+    // rule gets wrong.
+    // ------------------------------------------------------------------
+
+    const URL_VAR: &str = "PULSUSDB_TEMPO_DIFF_URL";
+    const URL: &str = "http://localhost:13200";
+
+    /// State 1: present and valid → runs, in any job.
+    #[test]
+    fn an_endpoint_gate_with_a_url_runs() {
+        for job in [None, Some("ci"), Some("schema-it")] {
+            assert_eq!(
+                classify_kind(GateValue::Endpoint, URL_VAR, Some(URL), job),
+                LiveGate::Run,
+                "job {job:?}"
+            );
+        }
+    }
+
+    /// State 2: absent under its own job → fails loudly.
+    #[test]
+    fn an_absent_endpoint_gate_in_a_live_ci_job_is_a_wiring_failure() {
+        assert_eq!(
+            classify_kind(GateValue::Endpoint, URL_VAR, None, Some("schema-it")),
+            LiveGate::MissingInLiveCiJob {
+                job: "schema-it".to_string(),
+                var: URL_VAR.to_string(),
+            }
+        );
+        // A blank or whitespace-only value is absent, not present: an
+        // `env:` block that expanded to nothing must not be read as
+        // wiring.
+        for blank in ["", "   ", "\t"] {
+            assert!(
+                matches!(
+                    classify_kind(GateValue::Endpoint, URL_VAR, Some(blank), Some("schema-it")),
+                    LiveGate::MissingInLiveCiJob { .. }
+                ),
+                "{blank:?}"
+            );
+        }
+    }
+
+    /// State 3: absent under a hermetic job (and on a laptop) → skips.
+    #[test]
+    fn an_absent_endpoint_gate_outside_a_live_ci_job_skips_cleanly() {
+        assert_eq!(
+            classify_kind(GateValue::Endpoint, URL_VAR, None, Some("ci")),
+            LiveGate::SkipUngated
+        );
+        assert_eq!(
+            classify_kind(GateValue::Endpoint, URL_VAR, None, None),
+            LiveGate::SkipUngated
+        );
+    }
+
+    /// State 4 — the one the boolean rule gets wrong. A present,
+    /// non-`"1"` value under a live job RUNS. Asserted beside what the
+    /// boolean rule does with the same input, so the difference between
+    /// the two kinds is visible in one place rather than inferred.
+    #[test]
+    fn a_present_non_one_endpoint_value_runs_where_the_boolean_rule_would_panic() {
+        assert_eq!(
+            classify_kind(GateValue::Endpoint, URL_VAR, Some(URL), Some("schema-it")),
+            LiveGate::Run
+        );
+        assert_eq!(
+            classify_kind(GateValue::Boolean, URL_VAR, Some(URL), Some("schema-it")),
+            LiveGate::MissingInLiveCiJob {
+                job: "schema-it".to_string(),
+                var: URL_VAR.to_string(),
+            },
+            "this is the CI failure that motivated the split: a URL is not a 1"
+        );
+    }
+
+    /// The two kinds differ ONLY in which values count as set. Adding the
+    /// endpoint kind must not have moved the boolean kind, and this is
+    /// the assertion that says so rather than the reader trusting the
+    /// refactor: every existing gate value, both kinds, side by side.
+    #[test]
+    fn the_endpoint_kind_did_not_move_the_boolean_kind() {
+        for (value, boolean_runs, endpoint_runs) in [
+            (Some("1"), true, true),
+            (Some("0"), false, true),
+            (Some("true"), false, true),
+            (Some(""), false, false),
+            (Some(URL), false, true),
+            (None, false, false),
+        ] {
+            assert_eq!(
+                classify_kind(GateValue::Boolean, VAR, value, None).is_running(),
+                boolean_runs,
+                "boolean {value:?}"
+            );
+            assert_eq!(
+                classify_kind(GateValue::Endpoint, VAR, value, None).is_running(),
+                endpoint_runs,
+                "endpoint {value:?}"
+            );
+        }
+        // And the boolean entry point still goes through the boolean
+        // rule: `classify` is what every existing caller reaches.
+        assert_eq!(classify(VAR, Some("0"), None), LiveGate::SkipUngated);
+        assert_eq!(classify(VAR, Some(URL), None), LiveGate::SkipUngated);
     }
 
     /// The message names the variable that was missing, so a suite gated

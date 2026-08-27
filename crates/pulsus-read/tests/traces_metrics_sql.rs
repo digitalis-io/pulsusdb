@@ -177,6 +177,67 @@ const CASES: &[Case] = &[
         q: r#"{ resource.service.name = "checkout" } | compare({ span.http.status_code = "500" })"#,
         distributed: false,
     },
+    Case {
+        // Issue #458: the root-span filter the datasource's root-span rate
+        // panel generates. `nestedSetParent < 0` is TRUE for the root
+        // sentinel `-1` and constant-FALSE over the whole non-root domain
+        // (`[1, ∞)`), so it lowers to the reference's own `IsRoot`
+        // identity — one `FixedString(8)` column comparison, no join, no
+        // subquery (`nested_set_model.go:11-12,57` @ v3.0.2).
+        name: "nested_set_root_rate",
+        q: "{ nestedSetParent < 0 } | rate()",
+        distributed: false,
+    },
+    Case {
+        // The non-root half of the family: `>= 1` is FALSE for the root
+        // sentinel `-1` and constant-TRUE over the whole non-root domain,
+        // so it lowers to the negation of the root identity.
+        //
+        // The spelling is `>= 1` rather than `!= -1` because a NEGATIVE
+        // literal is not a literal in this grammar: `-1` parses to
+        // `Unary { Neg, Literal(Number("1")) }`, so `{ nestedSetParent !=
+        // -1 }` never reaches the nested-set leaf at all — it is refused
+        // one arm earlier by the operand-shape check, which is the
+        // wave-2 `field-vs-field and arithmetic comparisons` class
+        // (issue #458, still open). `>= 1` pins the same rendered
+        // outcome through the path wave 1 owns.
+        name: "nested_set_nonroot_rate",
+        q: "{ nestedSetParent >= 1 } | rate()",
+        distributed: false,
+    },
+    Case {
+        // `= 0` is false everywhere in the domain — a constant-`0` filter,
+        // the same fold `{ false }` takes.
+        name: "nested_set_constant_false",
+        q: "{ nestedSetParent = 0 } | rate()",
+        distributed: false,
+    },
+    Case {
+        // `!= 0` is true everywhere — the constant-`1` match-all filter.
+        name: "nested_set_constant_true",
+        q: "{ nestedSetParent != 0 } | rate()",
+        distributed: false,
+    },
+    Case {
+        // Issue #458 AC 5/AC 6: the hoist keeps the service equality in
+        // PREWHERE (selecting `service_time`) and the root test lands in
+        // the residual WHERE. **Placement is a text property and this
+        // golden is the only HERMETIC oracle for it** — `EXPLAIN SYNTAX`
+        // and `system.query_log.query` also preserve the spelling, but
+        // both need a live server.
+        name: "service_and_nested_set_root",
+        q: r#"{ resource.service.name = "checkout" && nestedSetParent < 0 } | rate()"#,
+        distributed: false,
+    },
+    Case {
+        // Issue #458: bare attribute truthiness. `{ .flag }` IS
+        // `.flag = true`, so it renders the ordinary index-served
+        // attribute semi-join against the stored `'true'` text — the
+        // literal `val = 'true'` is the byte an inverted lowering moves.
+        name: "bare_attr_truthiness",
+        q: "{ .flag } | rate()",
+        distributed: false,
+    },
 ];
 
 fn plan_for(case: &Case) -> TraceMetricsPlan {
@@ -306,6 +367,80 @@ fn worked_example_pins_the_documented_fragments() {
     assert!(instant.starts_with("SELECT uniqExact(trace_id, span_id) AS n\n"));
     assert!(!instant.contains("GROUP BY"));
     assert_eq!(plan.snapped_end_ms(), 1_700_010_840_000);
+}
+
+/// Issue #458 AC 5: the nested-set root lowering's exact bytes, and the
+/// PREWHERE **placement** the golden composite freezes.
+///
+/// Placement is a text property. `EXPLAIN SYNTAX` and
+/// `system.query_log.query` also preserve it, but both need a live
+/// server; this is the only **required hermetic** oracle for which
+/// conjunct sits inside the `PREWHERE`. The execution counters cannot
+/// see it: moving the root test into the `PREWHERE` alongside the
+/// service equality leaves the projection, Parts, Granules,
+/// `query_log.projections`, `read_rows` and
+/// `RowsReadByPrewhereReaders` all identical (measured, issue #458 plan
+/// v4 Delta C part 2).
+#[test]
+fn the_nested_set_root_lowering_pins_its_sql_and_its_prewhere_placement() {
+    let case = |name: &str| CASES.iter().find(|c| c.name == name).expect("case exists");
+    const ROOT_SQL: &str = "parent_id = toFixedString(unhex('0000000000000000'), 8)";
+
+    // The reference's own `IsRoot` identity: one FixedString(8) column
+    // comparison. No join, no subquery, nothing for a cost gate to catch
+    // later (`nested_set_model.go:11-12,57` @ v3.0.2).
+    let root = plan_for(case("nested_set_root_rate"))
+        .range_sql()
+        .to_string();
+    assert!(root.contains(&format!("AND {ROOT_SQL}")), "{root}");
+    assert!(!root.contains("IN (SELECT"), "no semi-join: {root}");
+    assert!(!root.contains("JOIN"), "no join: {root}");
+
+    let nonroot = plan_for(case("nested_set_nonroot_rate"))
+        .range_sql()
+        .to_string();
+    assert!(
+        nonroot.contains(&format!("AND NOT ({ROOT_SQL})")),
+        "{nonroot}"
+    );
+
+    // The two constant folds render the same `1`/`0` the `{ }` match-all
+    // and `{ false }` render.
+    assert!(
+        plan_for(case("nested_set_constant_true"))
+            .range_sql()
+            .contains("\n  AND 1\n"),
+        "{}",
+        plan_for(case("nested_set_constant_true")).range_sql()
+    );
+    assert!(
+        plan_for(case("nested_set_constant_false"))
+            .range_sql()
+            .contains("\n  AND 0\n"),
+        "{}",
+        plan_for(case("nested_set_constant_false")).range_sql()
+    );
+
+    // Placement: the service equality is the ONLY thing in the PREWHERE,
+    // and the root test is a residual WHERE conjunct on an unindexed
+    // column that must not displace it.
+    let hoisted = plan_for(case("service_and_nested_set_root"))
+        .range_sql()
+        .to_string();
+    assert!(
+        hoisted.contains("PREWHERE service = 'checkout'\nWHERE timestamp_ns"),
+        "the PREWHERE carries the service equality and nothing else: {hoisted}"
+    );
+    assert!(
+        hoisted.contains(&format!("AND {ROOT_SQL}\nGROUP BY t")),
+        "the root test is the residual WHERE conjunct: {hoisted}"
+    );
+
+    // Bare truthiness is plain equality against the stored boolean text.
+    let flag = plan_for(case("bare_attr_truthiness"))
+        .range_sql()
+        .to_string();
+    assert!(flag.contains("key = 'flag' AND val = 'true'"), "{flag}");
 }
 
 #[test]

@@ -1,0 +1,366 @@
+{
+  "DIVERGENCE_COUNT": 14,
+  "capture": {
+    "reference_image": "grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7",
+    "reference_config": "ci/tempo/tempo-compare.yaml (unmodified)",
+    "route": "GET /api/metrics/query_range",
+    "window": "start=<now-3600>&end=<now>&step=60s, empty store",
+    "note": "Every `reference` verdict below was captured live from that image on that route and window. An accepting reference response carries no pinned body: the 200 envelope is `{\"series\":[],\"metrics\":{\"completedJobs\":N,\"totalJobs\":N}}` and the job counts are not a property of the query. Every rejecting body IS pinned, on both sides."
+  },
+  "limits": {
+    "what_this_cannot_see": "A refusal turned into MATCH-ALL keeps its `accept` disposition and passes this suite unchanged. That is exactly the break that motivated issue #458 and nothing here can catch it \u2014 `traces_metrics_nested_set_live.rs` (AC 3b) and the golden SQL in `traces_metrics_sql.rs` (AC 5) are the criteria that can."
+  },
+  "probes": [
+    {
+      "query": "{ nestedSetParent < 0 } | rate()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "the query the Grafana root-span rate panel generates; wave 1 serves it"
+    },
+    {
+      "query": "{ nestedSetParent < 0 } | rate() by(resource.service.name)",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "the same filter under a by() grouping"
+    },
+    {
+      "query": "{ .a =~ \".*\" && nestedSetParent < 0 } | rate()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "the nested-set leaf under an And beside a leaf that lowers on its own"
+    },
+    {
+      "query": "{ nestedSetParent = -1 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
+      "why": "a NEGATIVE literal is not a literal in this grammar: -1 parses to Unary{Neg, Number(1)}, so this never reaches the nested-set leaf \u2014 it is the operand-shape refusal, wave 2"
+    },
+    {
+      "query": "{ nestedSetParent != -1 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
+      "why": "same operand shape as the row above"
+    },
+    {
+      "query": "{ nestedSetParent >= 1 } | rate()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "the non-root half of the family, spelled without a negative literal"
+    },
+    {
+      "query": "{ nestedSetParent = 0 } | rate()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "constant-false over the whole domain: renders the constant 0"
+    },
+    {
+      "query": "{ nestedSetParent != 0 } | rate()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "constant-true over the whole domain: renders the constant 1"
+    },
+    {
+      "query": "{ nestedSetParent < 2 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: nestedSetParent comparisons inside the numbering range are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-nested-set-numbering-range",
+      "why": "looks decidable and is not \u2014 a span whose parent is the root carries 1 (true) while one two levels down carries 2 (false); the reference answers it because it STORES the number"
+    },
+    {
+      "query": "{ nestedSetParent = 5 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: nestedSetParent comparisons inside the numbering range are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-nested-set-numbering-range",
+      "why": "well inside the refusing region"
+    },
+    {
+      "query": "{ nestedSetLeft > 1 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-nested-set-left-right",
+      "why": "the Euler numbering is a per-trace tree walk with no SQL form"
+    },
+    {
+      "query": "{ nestedSetLeft > 0 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-nested-set-left-right",
+      "why": "the adversarial spelling: with the field guard deleted this one PLANS (and answers wrongly, dropping every root) instead of erroring, which > 1 and < 100 do not"
+    },
+    {
+      "query": "{ nestedSetRight < 100 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: nestedSetLeft and nestedSetRight are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-nested-set-left-right",
+      "why": "same class, the other field"
+    },
+    {
+      "query": "{ .flag } | count_over_time()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "bare attribute truthiness; no client sends this, it rides along because the block was open"
+    },
+    {
+      "query": "{ .a && .b } | count_over_time()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "two bare-truthiness leaves under an And"
+    },
+    {
+      "query": "{ true && .flag } | count_over_time()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "a bare-truthiness leaf beside a boolean static"
+    },
+    {
+      "query": "{ .zz } | count_over_time()",
+      "ours": {
+        "verdict": "accept",
+        "body": null
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": null,
+      "why": "an absent key is no match, not a refusal"
+    },
+    {
+      "query": "{ name } | count_over_time()",
+      "ours": {
+        "verdict": "reject",
+        "body": "span filter field expressions must resolve to a boolean: { name }"
+      },
+      "reference": {
+        "verdict": "reject",
+        "body": "compiling query: span filter field expressions must resolve to a boolean: { name }"
+      },
+      "divergence": null,
+      "why": "a bare INTRINSIC is not truthiness: both sides reject with the same rule; the bodies differ only by the reference's route prefix"
+    },
+    {
+      "query": "{ .a = .b } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
+      "why": "needs a trace_attrs_idx self-join or a correlated per-span value read \u2014 wave 2"
+    },
+    {
+      "query": "{ .a + 1 > 2 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
+      "why": "arithmetic operand, same site"
+    },
+    {
+      "query": "{ 2 > .a } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: field-vs-field and arithmetic comparisons are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-field-vs-field-and-arithmetic",
+      "why": "literal on the left, same site"
+    },
+    {
+      "query": "{ trace:duration > 1s } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: trace-level intrinsics are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-trace-level-intrinsics",
+      "why": "needs a trace-wide GROUP BY ... HAVING semi-join matching search_sql's root selection \u2014 wave 2"
+    },
+    {
+      "query": "{ .a = nil } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: absence checks are not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-absence-checks",
+      "why": "the lowering is three lines, but our `= nil` VALUE semantics already diverge on the search route, so it needs a ledger entry first \u2014 wave 2"
+    },
+    {
+      "query": "{ !.a } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: field negation is not supported in metrics filters"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-field-negation",
+      "why": "a value co-load whose non-boolean case is a reference 500, which SQL cannot produce \u2014 wave 2"
+    },
+    {
+      "query": "{ name != nil } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "type mismatch: existence checks are only supported on attributes"
+      },
+      "reference": {
+        "verdict": "accept",
+        "body": null
+      },
+      "divergence": "metrics-filter-intrinsic-existence-shared-path",
+      "why": "NOT a metrics-block defect: /api/search refuses it identically, so the rejection comes from a shared path. Recorded here because it is a divergence on this route; owned elsewhere"
+    },
+    {
+      "query": "{ childCount > 2 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "unexpected identifier \"childCount\" at byte 2: expected an intrinsic (name, duration, status, kind) or a scoped attribute (span., resource., or the unscoped . form)"
+      },
+      "reference": {
+        "verdict": "reject",
+        "body": "parse error at line 1, col 3: syntax error: unexpected childCount"
+      },
+      "divergence": null,
+      "why": "the reference CANNOT EXPRESS it: enum_attributes.go:286-291 @ v3.0.2 maps only nestedSetLeft/Right/Parent and the span:-scoped spelling, so bare childCount is not a token"
+    },
+    {
+      "query": "{ 1 } | rate()",
+      "ours": {
+        "verdict": "reject",
+        "body": "span filter field expressions must resolve to a boolean: { 1 }"
+      },
+      "reference": {
+        "verdict": "reject",
+        "body": "compiling query: span filter field expressions must resolve to a boolean: { 1 }"
+      },
+      "divergence": null,
+      "why": "a non-boolean static at predicate position: same rule, same status, both sides"
+    }
+  ]
+}

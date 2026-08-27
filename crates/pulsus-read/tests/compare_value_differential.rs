@@ -47,6 +47,14 @@
 //!   cargo test -p pulsus-read --test compare_value_differential -- --nocapture
 //! ```
 //!
+//! **Known wiring hole, recorded not fixed** (issue #458): the two
+//! `PULSUSDB_COMPARE_*` URLs below are read with a bare `env::var` and
+//! taken as a skip when absent, while `PULSUS_TEST_CLICKHOUSE` is
+//! fail-closed. Drop only the URLs from this suite's `schema-it` step and
+//! it reports GREEN having compared nothing — ledger entry
+//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
+//! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
+//!
 //! Clean-room: no Tempo/Grafana source, grammar, or test corpus is read —
 //! the fixtures are our own authorship and the Tempo values are read back
 //! as black-box runtime output.
@@ -410,25 +418,94 @@ fn otlp_push(otlp_base: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
 /// (see [`tempo_query_once`]) yields the same totals a single bucket would.
 const TEMPO_STEP_S: i64 = 60;
 
-/// Polls Tempo's metrics API until `compare()` returns the corpus's
-/// baseline/selection counts for the three keys.
+/// How many consecutive IDENTICAL non-empty reads count as flushed.
 ///
-/// Because the corpus is anchored in the PAST and `window` ends in the past,
-/// every bucket this query touches is already finalised, so the FIRST
-/// non-empty response carries the COMPLETE counts — the poll loop exists only
-/// to wait out Tempo's flush of the freshly-pushed spans (~seconds), not to
-/// wait for any future wall-clock boundary. The budget is a generous safety
-/// net.
+/// Three reads two seconds apart span more than one block-cut period
+/// (`max_block_duration: 2s`, `flush_check_period: 1s` in
+/// `ci/tempo/tempo-compare.yaml`), so a batch that is still landing shows a
+/// different map in at least one of them.
+///
+/// The poll budget in [`tempo_counts`] grew from 60 attempts to 90 when
+/// this landed — waiting for the answer to settle costs at most two extra
+/// reads over waiting for it to appear, and the budget is a safety net
+/// rather than an expected duration. On a machine where the partial view
+/// never reproduces at all, a clean live run still took **four** reference
+/// requests before settling, so the extra headroom is not theoretical.
+const STABLE_READS: usize = 3;
+
+/// Polls Tempo's metrics API until `compare()` returns a STABLE view of the
+/// corpus.
+///
+/// **Not the first non-empty response.** This function used to take that,
+/// and its doc used to say the first non-empty response necessarily carries
+/// the COMPLETE counts, because the corpus is past-anchored and every bucket
+/// the query touches is already finalised. **That claim is false, and it was
+/// measured false** (issue #458): the corpus arrives as one OTLP batch and
+/// Tempo cuts live-store blocks on a timer, so an already-finalised BUCKET
+/// can still be read before every span in it has been flushed. The sibling
+/// suite `traces_metrics_filter_differential.rs` measured an 18-span corpus
+/// reading back as **10** on its first non-zero poll, and this suite has
+/// reddened `schema-it` the same way **four times over a month** — CI runs
+/// 30258308527, 30610626381, 31510222855 and 33110647702, 2026-07-27 to
+/// 2026-08-27, every one of them on attempt 1 and with the IDENTICAL
+/// five-cell divergence: the reference returned a view missing the whole T3
+/// trace (`rootName "idle"`, `rootServiceName "batch"`,
+/// `instrumentation:name "otel-idle"` and `instrumentation:version "2.1.0"`
+/// all absent) with `statusMessage ""` counted 1 against the corpus's 2.
+/// Each went green on a re-run with nothing changed. The flake predates the
+/// change that finally chased it down; it was found four times and
+/// re-run past four times.
+///
+/// Past-anchoring is still necessary — it is what stops the poll waiting on
+/// a future wall-clock bucket boundary, which is the flake this suite fixed
+/// earlier — it is just not sufficient. What the loop waits out is the
+/// FLUSH, and a flush is done when the answer stops moving.
 fn tempo_counts(api_base: &str, window: (i64, i64)) -> Counts {
-    for _ in 0..60 {
-        if let Some(map) = tempo_query_once(api_base, window)
-            && !map.is_empty()
-        {
-            return map;
+    let mut wait = StabilityWait::default();
+    for _ in 0..90 {
+        if let Some(settled) = wait.observe(tempo_query_once(api_base, window)) {
+            return settled;
         }
         std::thread::sleep(Duration::from_secs(2));
     }
-    panic!("Tempo never returned compare() counts within the poll budget");
+    panic!(
+        "Tempo never returned a STABLE non-empty compare() view within the poll budget \
+         (last observation {:?})",
+        wait.last
+    );
+}
+
+/// The stability rule, separated from the polling so it can be exercised
+/// against a SCRIPTED sequence of reads.
+///
+/// A timing fix nobody has watched fail is not a fix, and this failure is by
+/// nature hard to summon on demand — it did not reproduce on a developer
+/// machine across several attempts (240-span batches, corpora spread over
+/// ten minutes of blocks, polling from t=0 at 50 ms), while it happened in
+/// CI. So the reproduction is scripted from the numbers CI actually
+/// produced, in [`the_wait_absorbs_the_partial_view_that_reddened_ci`], and
+/// it is deterministic.
+#[derive(Default)]
+struct StabilityWait {
+    last: Option<Counts>,
+    run: usize,
+}
+
+impl StabilityWait {
+    /// Feeds one poll result. Returns `Some(counts)` only once the SAME
+    /// non-empty map has been observed [`STABLE_READS`] times running; an
+    /// empty or failed read neither settles nor resets, it is simply not
+    /// yet an answer.
+    fn observe(&mut self, read: Option<Counts>) -> Option<Counts> {
+        let map = read.filter(|m| !m.is_empty())?;
+        self.run = if self.last.as_ref() == Some(&map) {
+            self.run + 1
+        } else {
+            1
+        };
+        self.last = Some(map);
+        (self.run >= STABLE_READS).then(|| self.last.clone().expect("just set"))
+    }
 }
 
 fn tempo_query_once(api_base: &str, window: (i64, i64)) -> Option<Counts> {
@@ -532,10 +609,16 @@ async fn compare_value_differential() {
     // ending 120s in the FUTURE, so the value-bearing bucket only finalised
     // ~120s+ later — racing the poll budget and intermittently red-ing main.
     // With `base` in the past, EVERY bucket covering the corpus is already
-    // finalised by the time the test queries, so the first non-empty poll
-    // returns COMPLETE counts within a few seconds of Tempo flushing the push
-    // (observed ~3s locally), deterministically. 90s stays well inside Tempo's
-    // ~15m `query_backend_after` live_store window, so live_store serves it.
+    // finalised by the time the test queries, so no read waits on a future
+    // wall-clock boundary. 90s stays well inside Tempo's ~15m
+    // `query_backend_after` live_store window, so live_store serves it.
+    //
+    // What past-anchoring does NOT buy is a complete FIRST read: a
+    // finalised bucket can still be queried before every span of the push
+    // has flushed into it. This comment used to claim the opposite — that
+    // the first non-empty poll returns complete counts "deterministically"
+    // — and that claim is false; see `tempo_counts`, which waits for the
+    // answer to stop moving, and the four CI failures it lists.
     let base = now_ns() - 90 * sec;
     // Both reads use this window; it brackets the corpus and, crucially, ENDS
     // in the past (`base+60s`) so every Tempo bucket it touches is complete.
@@ -563,7 +646,9 @@ async fn compare_value_differential() {
     );
     let pulsus = pulsus_counts(&engine, window).await;
 
-    // Tempo readback (past-anchored, already-complete buckets; see tempo_counts).
+    // Tempo readback: past-anchored so no bucket is still forming, then
+    // waited until the answer STOPS MOVING (see `tempo_counts` — the
+    // first non-empty read is not necessarily a complete one).
     let tempo = tempo_counts(&api_base, window);
 
     eprintln!("pulsus compare() counts: {pulsus:#?}");
@@ -589,5 +674,122 @@ async fn compare_value_differential() {
          name/version verbatim from the per-span scope columns (#192) — a residual divergence \
          here is a NEW mismatch, not the known empty-message case.",
         mism.join("\n  ")
+    );
+}
+
+/// Issue #458: the partial view that reddened `schema-it`, replayed, and
+/// the wait absorbing it.
+///
+/// **The reproduction is the real numbers**, and they are the same numbers
+/// four separate times: CI runs 30258308527, 30610626381, 31510222855 and
+/// 33110647702 (2026-07-27 to 2026-08-27) each failed on attempt 1 with the
+/// reference returning a view missing the whole T3 trace —
+/// `("baseline","rootName","idle")` absent where the corpus has one,
+/// likewise its `rootServiceName`, `instrumentation:name` and
+/// `instrumentation:version` — and `("baseline","statusMessage","")`
+/// counted **1** against the corpus's **2**. Each passed on a re-run with
+/// nothing changed. `partial` below is that response; `complete` is the
+/// corpus.
+///
+/// That the divergence is identical across a month is what says this is one
+/// mechanism rather than four coincidences, and it is why the fixture can
+/// be a single scripted pair.
+///
+/// The old rule — take the first non-empty read — returns `partial`, and
+/// the value-parity assertion at the end of the differential then reports a
+/// divergence that is really a flush race. The wait does not: `partial`
+/// never repeats three times, because the flush moves on.
+///
+/// Hermetic: no container, no ClickHouse. It rides the `ci` job, so the
+/// rule stays checked even in a lane where the differential itself skips.
+#[test]
+fn the_wait_absorbs_the_partial_view_that_reddened_ci() {
+    // Gated binary: a lost `env:` block in a live job must redden rather
+    // than silently skip this file (issue #320) — the same guard the
+    // hermetic half of `traces_api_live.rs` carries.
+    pulsus_testkit::require_live_gate(pulsus_testkit::CLICKHOUSE_GATE);
+
+    fn counts(cells: &[(&str, &str, &str, i64)]) -> Counts {
+        cells
+            .iter()
+            .map(|(meta, key, val, n)| ((meta.to_string(), key.to_string(), val.to_string()), *n))
+            .collect()
+    }
+
+    // The response CI actually got: T3 absent, statusMessage "" at 1.
+    let partial = counts(&[
+        ("baseline", "statusMessage", "", 1),
+        ("baseline", "rootName", "frontend", 1),
+        ("selection", "statusMessage", "boom", 1),
+    ]);
+    // The same read one flush later, plus T3.
+    let complete = counts(&[
+        ("baseline", "statusMessage", "", 2),
+        ("baseline", "rootName", "frontend", 1),
+        ("baseline", "rootName", "idle", 1),
+        ("baseline", "rootServiceName", "batch", 1),
+        ("baseline", "instrumentation:name", "otel-idle", 1),
+        ("baseline", "instrumentation:version", "2.1.0", 1),
+        ("selection", "statusMessage", "boom", 1),
+    ]);
+    assert_ne!(
+        partial, complete,
+        "the fixture must actually be a partial view, or this test proves nothing"
+    );
+
+    // The CI sequence: nothing, nothing, the partial view, then the
+    // complete one from there on.
+    let sequence = [
+        None,
+        None,
+        Some(partial.clone()),
+        Some(complete.clone()),
+        Some(complete.clone()),
+        Some(complete.clone()),
+    ];
+
+    // What the OLD rule would have done — take the first non-empty read.
+    let first_non_empty = sequence
+        .iter()
+        .flatten()
+        .find(|m| !m.is_empty())
+        .expect("the sequence has a non-empty read");
+    assert_eq!(
+        *first_non_empty, partial,
+        "the first non-empty read is the partial one — this is the bug being fixed"
+    );
+
+    // What the wait does.
+    let mut wait = StabilityWait::default();
+    let mut settled_at = None;
+    for (i, read) in sequence.iter().enumerate() {
+        if let Some(got) = wait.observe(read.clone()) {
+            settled_at = Some((i, got));
+            break;
+        }
+    }
+    let (index, settled) = settled_at.expect("the wait must settle within the scripted sequence");
+    assert_eq!(
+        settled, complete,
+        "the wait must return the COMPLETE view, never the partial one"
+    );
+    assert_eq!(
+        index, 5,
+        "it must settle on the THIRD identical read (index 5), not earlier — settling sooner \
+         would mean a single repeat was accepted as stable"
+    );
+
+    // And the property the number 3 is there for: two identical reads are
+    // not enough, because a batch can pause mid-flush for one interval.
+    let mut two_only = StabilityWait::default();
+    assert!(two_only.observe(Some(partial.clone())).is_none());
+    assert!(
+        two_only.observe(Some(partial.clone())).is_none(),
+        "two identical reads must not settle"
+    );
+    assert_eq!(
+        two_only.observe(Some(partial.clone())),
+        Some(partial),
+        "three do"
     );
 }

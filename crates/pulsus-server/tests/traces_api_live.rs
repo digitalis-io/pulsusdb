@@ -63,6 +63,8 @@ const ALIAS_PORT: u16 = 31_191;
 const ZIPKIN_PORT: u16 = 31_192;
 /// The issue #237 ns→seconds wire-byte suite's own spawn.
 const ULP_PORT: u16 = 31_193;
+/// The issue #458 span-duration wire-field suite's own spawn.
+const SPAN_DURATION_PORT: u16 = 31_208;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,
@@ -1296,4 +1298,206 @@ fn wire_literal_occurs_in_is_delimiter_sensitive() {
             assert!(lit.occurs_in(&inside), "{ns}");
         }
     }
+}
+
+/// Issue #458 defect A, at the wire: a span summary carries
+/// `durationNanos` as the reference's protojson `uint64` — a JSON
+/// **string** of nanoseconds (`pkg/tempopb/tempo.proto:160`,
+/// `pkg/traceql/engine.go:311` @ v3.0.2) — and carries no `durationMs`
+/// anywhere inside `spanSets`. The trace level carries `durationMs`
+/// (`pkg/tempopb/tempo.proto:139`) when it is non-zero, so the absence
+/// check is scoped to the `spanSets` sub-object rather than the whole
+/// body, and the trace level's own disposition is asserted separately per
+/// width.
+///
+/// Three widths, each present for a different reason.
+///
+/// **`0` is the width that matters most, and it was missing.** protojson
+/// omits a default-valued scalar, so a zero-width span comes back from the
+/// reference with **no `durationNanos` key at all** — captured against
+/// `grafana/tempo@sha256:aa8df8d0…`:
+/// `{"spanID":"…","name":"fresh-w0","startTimeUnixNano":"…"}`. A
+/// default-valued field is exactly where a hand-written encoder and a
+/// protojson encoder part company, because emitting the zero is the
+/// natural thing to write and is wrong. This suite shipped for one review
+/// round without it, and the unit test beside it pinned our own
+/// `"durationNanos":"0"`, so both were green against a false contract.
+///
+/// `9007199254740993` (2^53 + 1) and `545000` are the widths a
+/// `durationMs` field destroys: a JSON number rounds the first to `…992`
+/// and a millisecond integer truncates it to `9007199254`, and the second
+/// renders `0` as milliseconds.
+///
+/// Every needle below is a **delimited** byte literal spelled inline —
+/// `"durationNanos":"<digits>"`, closing quote included — so
+/// `9007199254740992` cannot satisfy the 2^53 + 1 assertion and a longer
+/// digit string cannot satisfy the `545000` one. Spelling them inline
+/// rather than building them from a variable is also what keeps the
+/// issue #237 wire-literal scanner (`metrics_response.rs`, Rule D) able
+/// to see that the search is guarded.
+#[tokio::test(flavor = "multi_thread")]
+async fn span_summaries_carry_duration_nanos_as_a_protojson_string_on_the_wire() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-server/tests/traces_api_live.rs for setup)"
+        );
+        return;
+    }
+
+    let port = SPAN_DURATION_PORT;
+    let _guard = spawn_ready(
+        port,
+        &pulsus_testkit::test_db("pulsus_traces_span_duration_it_live"),
+    );
+
+    // The file's fixture instant; window math below is in unix SECONDS.
+    let start_ns: u64 = 3_100_000_000_000_000_200;
+    // ONE SINGLE-SPAN TRACE PER WIDTH — the shape the reference captures
+    // used. Sharing one trace id would make every trace's root the widest
+    // span, so the trace-level assertions below would all be about that
+    // one width and the sub-millisecond case could not be tested at all.
+    let spans = vec![
+        {
+            let mut sp = span([0xa1; 16], [0x04; 8], "huge", start_ns);
+            sp.end_time_unix_nano = start_ns + 9_007_199_254_740_993;
+            sp
+        },
+        {
+            let mut sp = span([0xa2; 16], [0x05; 8], "tiny", start_ns);
+            sp.end_time_unix_nano = start_ns + 545_000;
+            sp
+        },
+        {
+            // Zero width: `end == start`. Ingest's `resolve_duration_ns`
+            // stores `0`, and the reference emits no `durationNanos` for
+            // it.
+            let mut sp = span([0xa3; 16], [0x06; 8], "instant", start_ns);
+            sp.end_time_unix_nano = start_ns;
+            sp
+        },
+    ];
+    ingest(port, spans, "seed issue #458 span durations");
+
+    // -- 2^53 + 1 ns: a JSON number would round it, a millisecond integer
+    // would truncate it to nine fewer significant digits.
+    let (body, span_sets) =
+        span_duration_probe(port, "huge", &"a1".repeat(16), Some(9_007_199_254));
+    let sets = span_sets.as_bytes();
+    assert!(
+        find_subslice(&body, b"\"durationNanos\":\"9007199254740993\"").is_some(),
+        "the raw body must carry the exact delimited field token, got {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        find_subslice(sets, b"\"durationNanos\":\"9007199254740993\"").is_some(),
+        "the field must sit inside spanSets: {span_sets}"
+    );
+    assert!(
+        find_subslice(sets, b"durationMs").is_none(),
+        "no span summary may carry durationMs: {span_sets}"
+    );
+
+    // -- 545 000 ns: sub-millisecond. The span keeps its exact nanoseconds
+    // and the TRACE level omits `durationMs` entirely, because 545 000 ns
+    // is 0 ms and protojson drops a default-valued uint32. This is the
+    // width that shows the trace-level rule is about MILLISECONDS, not
+    // about a zero-width trace.
+    let (body, span_sets) = span_duration_probe(port, "tiny", &"a2".repeat(16), None);
+    let sets = span_sets.as_bytes();
+    assert!(
+        find_subslice(&body, b"\"durationNanos\":\"545000\"").is_some(),
+        "the raw body must carry the exact delimited field token, got {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        find_subslice(sets, b"\"durationNanos\":\"545000\"").is_some(),
+        "the field must sit inside spanSets: {span_sets}"
+    );
+    assert!(
+        find_subslice(sets, b"durationMs").is_none(),
+        "no span summary may carry durationMs: {span_sets}"
+    );
+
+    // -- 0 ns: the field is ABSENT, not `"0"`. Asserted three ways so the
+    // gate cannot be satisfied by a rename or by a different rendering of
+    // the same zero.
+    let (_body, span_sets) = span_duration_probe(port, "instant", &"a3".repeat(16), None);
+    let sets = span_sets.as_bytes();
+    assert!(
+        find_subslice(sets, b"durationNanos").is_none(),
+        "protojson omits a default-valued uint64: a zero-width span carries NO durationNanos \
+         key, which is what the reference returns for it: {span_sets}"
+    );
+    assert!(
+        find_subslice(sets, b"durationMs").is_none(),
+        "no span summary may carry durationMs either: {span_sets}"
+    );
+    assert!(
+        find_subslice(sets, b"\"name\":\"instant\"").is_some(),
+        "the zero-width span itself must still be returned — an absent FIELD is not an absent \
+         SPAN: {span_sets}"
+    );
+}
+
+/// Searches for one seeded span by name and returns `(raw response bytes,
+/// the re-encoded `spanSets` sub-object)`. The trace level legitimately
+/// may carry `durationMs`, so the absence check its callers run has to be
+/// scoped to `spanSets` rather than to the whole body. `trace_duration_ms`
+/// is the trace level's expected disposition: `Some(ms)` when the field
+/// must be present with that value, `None` when the millisecond count is
+/// zero and the field must be absent.
+fn span_duration_probe(
+    port: u16,
+    name: &str,
+    trace_hex: &str,
+    trace_duration_ms: Option<i64>,
+) -> (Vec<u8>, String) {
+    let q = format!("%7B%20name%20%3D%20%22{name}%22%20%7D");
+    let path = format!("/api/traces/v1/search?q={q}&start=3099999000&end=3100001000&limit=5");
+    let ctx = format!("search {name}");
+    let res = get(port, &path, &[], &ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(&ctx);
+    let all = json["traces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: traces array, body {json}"));
+    // Selected by TRACE ID, not by position or by count. The throwaway
+    // database is keyed on the suite name, so a re-run of this test on the
+    // same ClickHouse finds the previous run's traces too; picking by id
+    // makes the assertions below deterministic under that accumulation
+    // instead of depending on the store being empty.
+    let traces: Vec<&serde_json::Value> = all
+        .iter()
+        .filter(|t| t["traceID"].as_str() == Some(trace_hex))
+        .collect();
+    assert_eq!(
+        traces.len(),
+        1,
+        "{ctx}: exactly one trace with id {trace_hex}, body {json}"
+    );
+    // The TRACE level keeps `durationMs`, in MILLISECONDS, under the same
+    // protojson omission rule (issue #458 review round 2): present when
+    // the millisecond count is non-zero, absent when it is — which
+    // includes every SUB-MILLISECOND trace, not only a zero-width one.
+    match trace_duration_ms {
+        Some(want) => assert_eq!(
+            traces[0]["durationMs"].as_i64(),
+            Some(want),
+            "{ctx}: the trace level must carry durationMs = {want}, body {json}"
+        ),
+        None => assert!(
+            traces[0].get("durationMs").is_none(),
+            "{ctx}: a sub-millisecond trace rounds to 0 ms, and the reference omits a \
+             default-valued uint32 — the key must be ABSENT, body {json}"
+        ),
+    }
+    let span_sets = serde_json::to_string(&traces[0]["spanSets"])
+        .unwrap_or_else(|e| panic!("{ctx}: re-encode spanSets: {e}"));
+    (res.body, span_sets)
 }

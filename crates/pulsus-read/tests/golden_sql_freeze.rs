@@ -1,4 +1,4 @@
-//! Issue #335 Stage C: the 66 SQL goldens' whole-corpus content freeze —
+//! Issue #335 Stage C: the SQL goldens' whole-corpus content freeze —
 //! the mechanism that makes "this change edits zero SQL goldens" a fact a
 //! reviewer can check **from the diff**, instead of a claim to be taken on
 //! trust.
@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 20)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 26)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -136,7 +136,17 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 2
 ///
 /// Corpus 66 -> 69 entries; `quantile_over_time_multi.sql` and the other
 /// 65 pre-existing goldens are byte-identical.
-const PINNED_SQL_CORPUS: u64 = 0x95d7_42ba_d76c_0200;
+///
+/// 69 -> 75 (issue #458): six ADDED `traces_metrics` goldens —
+/// `nested_set_root_rate`, `nested_set_nonroot_rate`,
+/// `nested_set_constant_true`, `nested_set_constant_false`,
+/// `service_and_nested_set_root` and `bare_attr_truthiness` — for the two
+/// metrics-filter lowerings that issue adds. **No pre-existing golden
+/// moved:** the new lowerings are reached only where the old code
+/// returned `Err`, so `git diff --stat crates/pulsus-read/tests/golden/`
+/// shows additions and nothing else. The digest moves because the corpus
+/// grew, not because any frozen byte changed.
+const PINNED_SQL_CORPUS: u64 = 0xb796_bd56_2036_29a2;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -268,7 +278,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 69, "the frozen SQL corpus is 49 + 20 = 69 entries");
+    assert_eq!(total, 75, "the frozen SQL corpus is 49 + 26 = 75 entries");
 }
 
 #[test]
@@ -313,7 +323,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     }
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 69 frozen SQL goldens changed. This is not a constant to refresh: it means the \
+        "the 75 frozen SQL goldens changed. This is not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
          PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \
