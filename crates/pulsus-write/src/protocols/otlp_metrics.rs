@@ -1006,6 +1006,23 @@ fn build_attribute_labels(
         builder
     };
 
+    // `PromoteResourceAttributes` would be merged HERE, between the
+    // attribute fold and `job`/`instance` (`helper.go:132-139 @ v3.13.0`).
+    // Issue #461 puts that setting out of scope and exposes no knob, so
+    // this port omits the branch — but the omission is not the same shape
+    // as the reference's default, and the difference is worth writing down
+    // before someone adds the knob:
+    //
+    // * The reference does **not** switch the branch off. `NewPromoteResource    //   Attributes` always returns a non-nil pointer (`metrics_to_prw.go:351-364`),
+    //   so `if settings.PromoteResourceAttributes != nil` is always true and
+    //   the branch runs with an empty selector, promoting nothing. "Off" and
+    //   "runs and does nothing" are observationally identical only while the
+    //   selector is empty.
+    // * Its merge rule is **not** the one below. Promoted labels are set only
+    //   `if c.builder.Get(l.Name) == ""` — they yield to a label the data
+    //   point already carries — whereas `job`/`instance` overwrite
+    //   unconditionally (`helper.go:141-146`). Reusing this loop for them
+    //   would silently invert that.
     for (name, value) in resource_pairs {
         builder.set_label(name, value);
     }

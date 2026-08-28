@@ -86,10 +86,16 @@ the same reasoning as saturate-versus-wrap: a wrong value a client cannot
 detect loses to a refusal it can. A caller can only predict us where a row
 exists, which is why all four have one.
 
-The four `native`/`dual`-only and reference-rejecting conditions are pinned
-by `cases.json`'s `divergence-*` cases, which carry the reference's
-captured status, `Content-Type`, body and stored series alongside our own
-required answer. The exponential-histogram cases declare
+Four of the eight conditions are pinned by `cases.json`'s `divergence-*`
+cases, which carry the reference's captured status, `Content-Type`, body
+and stored series alongside our own required answer. **They are not all of
+one shape**, and the split matters: `divergence-value-less-number-point`
+and `divergence-inconsistent-classic-histogram` run under the default
+`classic` mode and the reference answers them `200`, storing something we
+refuse; `divergence-exp-histogram-scale-below-minimum` and
+`divergence-native-histogram-validation-failure` run under `native` and the
+reference answers `500`, discarding the batch we keep. Two accept-shaped,
+two atomic-shaped. The exponential-histogram cases declare
 `exp_histogram_mode: native` as part of the case: `to_native_histogram` has
 **one non-test production call site**
 (`crates/pulsus-write/src/protocols/otlp_metrics.rs`, inside
@@ -109,7 +115,11 @@ wrong three times running here.
   descriptor and attaches it to **every** `Append`. PulsusDB writes one
   `metric_metadata` row per family per request because that table is a
   `ReplacingMergeTree(updated_ns)` keyed by family name (docs/schemas.md
-  §2.1); the reference has no such table to be parity with.
+  §2.1). Stated positively, the reference's own metadata store is the
+  per-series metadata the appender carries, surfaced at `/api/v1/metadata`
+  and keyed by metric name at query time — a different structure reached by
+  a different write, which is why the two are not comparable row for row
+  rather than because one side is missing something.
 - **The reference's metadata surface exists and is not populated from this
   route.** `/api/v1/metadata` answers
   `{"status":"success","data":{}}` for OTLP-ingested metrics (measured), so

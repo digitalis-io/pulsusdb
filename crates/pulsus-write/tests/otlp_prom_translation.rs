@@ -412,10 +412,14 @@ fn every_captured_reference_answer_records_its_content_type() {
 
 /// Four conditions where PulsusDB and the reference disagree **by design**,
 /// each pinned on both sides so the divergence cannot drift unnoticed.
-/// Three of them the reference accepts — storing a value nobody sent, or an
-/// internally inconsistent histogram — and one it refuses request-atomically
-/// where we reject a single point and keep the batch. Ledgered under
-/// `otlp-request-partial-success-faults` and its sibling rows.
+/// **Two shapes, two cases each.** The reference *accepts* the value-less
+/// number point and the inconsistent classic histogram — storing a value
+/// nobody sent, and a histogram whose buckets cannot sum to its count —
+/// under the default `classic` mode. It *refuses* the below-minimum
+/// exponential scale and the failing native-histogram validation
+/// request-atomically, under `native`, discarding the batch we keep. All
+/// four are ledgered under `otlp-delta-partial-success`, the per-point
+/// class row, whose **Fault classification** table places them.
 ///
 /// The `reference` half of each case is captured from the running container
 /// by `capture_cases_json`; the `pulsusdb` half is authored, because it is
@@ -1167,6 +1171,135 @@ fn the_job_composite_follows_the_references_sequence_in_every_case() {
              opposite directions. Present: {slash_forms:?}"
         );
     }
+}
+
+/// A resource emits **two** series, and they are built from **different**
+/// attribute sets: `target_info` from the resource's attributes, the metric
+/// series from the data point's. A case that checks only one of them cannot
+/// see that difference.
+///
+/// Measured contrast: a **derived** `instance` reaches both, because it is
+/// `Set` on every label set the resource produces; a **caller-supplied**
+/// resource `instance` reaches only `target_info`, because resource
+/// attributes are not promoted onto metric series at all. Asserting only
+/// `target_info` would call both cases a pass.
+#[test]
+fn a_caller_supplied_instance_reaches_target_info_but_not_the_metric_series() {
+    let doc = load_cases();
+    let case = |id: &str| -> Value {
+        doc["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .unwrap_or_else(|| panic!("case {id} is missing"))
+            .clone()
+    };
+
+    // Derived: `service.instance.id` -> `instance`, on BOTH series.
+    let derived = case("derived-instance-reaches-both-series");
+    let attrs: BTreeMap<String, String> = resource_attrs(&derived).into_iter().collect();
+    let expected = attrs
+        .get("service.instance.id")
+        .expect("the case must carry service.instance.id");
+    let target = captured_target_info(&derived);
+    assert_eq!(target.len(), 1);
+    assert_eq!(target[0].get("instance"), Some(expected), "target_info");
+    let metric = captured_metric_labels(&derived);
+    assert!(!metric.is_empty(), "the case must emit a metric series");
+    for labels in &metric {
+        assert_eq!(
+            labels.get("instance"),
+            Some(expected),
+            "a DERIVED instance is Set on the metric series too"
+        );
+    }
+
+    // Caller-supplied on the resource: `target_info` only.
+    let caller = case("caller-instance-reaches-only-target-info");
+    let attrs: BTreeMap<String, String> = resource_attrs(&caller).into_iter().collect();
+    assert!(
+        !attrs.contains_key("service.instance.id"),
+        "the antecedent is that no service.instance.id is present"
+    );
+    let expected = attrs
+        .get("instance")
+        .expect("the case must send its own instance");
+    let target = captured_target_info(&caller);
+    assert_eq!(target.len(), 1);
+    assert_eq!(
+        target[0].get("instance"),
+        Some(expected),
+        "the caller's instance survives onto target_info"
+    );
+    let metric = captured_metric_labels(&caller);
+    assert!(!metric.is_empty(), "the case must emit a metric series");
+    for labels in &metric {
+        assert!(
+            !labels.contains_key("instance"),
+            "...but NOT onto the metric series, which is built from data-point \
+             attributes: got {labels:?}"
+        );
+    }
+}
+
+/// `target_info`'s emission has **two conjunctive gates**, and the first
+/// counts **keys present** on the raw resource minus the three identifying
+/// ones (`helper.go:509-519 @ v3.13.0`) — not labels that survive the
+/// build. An empty-valued attribute is a key, so it carries a resource
+/// **past** the first gate and is then dropped when the labels are built.
+///
+/// The consequence is a state the reference's own comment calls not useful
+/// and which it produces anyway: **a `target_info` carrying only `job`**.
+/// The pair differs only in whether that empty-valued key exists.
+#[test]
+fn target_info_eligibility_counts_raw_keys_not_surviving_labels() {
+    let doc = load_cases();
+    let p = find_pair(&doc, "target-info-empty-attr-gate");
+
+    // Base: only identifying keys, so the first gate blocks outright.
+    let base_attrs = resource_attrs(p.base);
+    let identifying_present = base_attrs
+        .iter()
+        .filter(|(k, _)| IDENTIFYING.contains(&k.as_str()))
+        .count();
+    assert_eq!(
+        base_attrs.len(),
+        identifying_present,
+        "the base must carry nothing but identifying keys"
+    );
+    assert!(
+        captured_target_info(p.base).is_empty(),
+        "no non-identifying key means no target_info at all"
+    );
+
+    // Variant: one more key, whose VALUE is empty. Past the first gate,
+    // then dropped by the label build.
+    let variant_attrs = resource_attrs(p.variant);
+    let empty: Vec<&(String, String)> =
+        variant_attrs.iter().filter(|(_, v)| v.is_empty()).collect();
+    assert_eq!(
+        empty.len(),
+        1,
+        "the variant differs by exactly one empty-valued key"
+    );
+    let target = captured_target_info(p.variant);
+    assert_eq!(
+        target.len(),
+        1,
+        "an empty-valued KEY is still a key, so the resource clears the first gate"
+    );
+    assert!(
+        !target[0].contains_key(&sanitize(&empty[0].0)),
+        "...and its label is then dropped, because the value is empty"
+    );
+    let expected_job =
+        reference_job(&variant_attrs.iter().cloned().collect()).expect("the variant derives a job");
+    assert_eq!(
+        target[0],
+        BTreeMap::from([("job".to_string(), expected_job)]),
+        "target_info can carry ONLY job — not useful, and emitted anyway"
+    );
 }
 
 /// The two carve-outs on the `job`/`instance` derivation, each stated

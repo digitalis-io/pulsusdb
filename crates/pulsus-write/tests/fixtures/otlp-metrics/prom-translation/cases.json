@@ -6393,6 +6393,290 @@
         "series": [
           {
             "labels": {
+              "job": "sca",
+              "otel_scope_name": "sa",
+              "otel_scope_version": "1.0"
+            },
+            "metric_name": "sca_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-scope-attributes-absent",
+      "pair": "scope-attributes:base",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "sca"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sca.a",
+                    "unit": ""
+                  }
+                ],
+                "scope": {
+                  "name": "sa",
+                  "version": "1.0"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "scope-not-promoted"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "sca",
+              "otel_scope_name": "sa",
+              "otel_scope_scope_extra": "x",
+              "otel_scope_version": "1.0"
+            },
+            "metric_name": "sca_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-scope-attributes-present",
+      "pair": "scope-attributes:variant",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "sca"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sca.a",
+                    "unit": ""
+                  }
+                ],
+                "scope": {
+                  "attributes": [
+                    {
+                      "key": "scope.extra",
+                      "value": {
+                        "stringValue": "x"
+                      }
+                    }
+                  ],
+                  "name": "sa",
+                  "version": "1.0"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "scope-not-promoted"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "scg",
+              "otel_scope_k": "v",
+              "otel_scope_name": "sg",
+              "otel_scope_version": "9.9"
+            },
+            "metric_name": "scg_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-scope-name-present",
+      "pair": "scope-name-gates-all:base",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "scg"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "scg.a",
+                    "unit": ""
+                  }
+                ],
+                "scope": {
+                  "attributes": [
+                    {
+                      "key": "k",
+                      "value": {
+                        "stringValue": "v"
+                      }
+                    }
+                  ],
+                  "name": "sg",
+                  "version": "9.9"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "scope-not-promoted"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "scg"
+            },
+            "metric_name": "scg_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-scope-name-empty",
+      "pair": "scope-name-gates-all:variant",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "scg"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "scg.a",
+                    "unit": ""
+                  }
+                ],
+                "scope": {
+                  "attributes": [
+                    {
+                      "key": "k",
+                      "value": {
+                        "stringValue": "v"
+                      }
+                    }
+                  ],
+                  "name": "",
+                  "version": "9.9"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "scope-not-promoted"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
               "job": "psc"
             },
             "metric_name": "sc_metric",
@@ -8000,6 +8284,284 @@
       "strategy": "UnderscoreEscapingWithSuffixes",
       "tags": [
         "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "x86",
+              "instance": "pod-7"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "instance": "pod-7"
+            },
+            "metric_name": "is_d",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "derived-instance-reaches-both-series",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.instance.id",
+                  "value": {
+                    "stringValue": "pod-7"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "x86"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "is.d",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "x86",
+              "instance": "CALLER-INSTANCE"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {},
+            "metric_name": "is_c",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "caller-instance-reaches-only-target-info",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "instance",
+                  "value": {
+                    "stringValue": "CALLER-INSTANCE"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "x86"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "is.c",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "svcG"
+            },
+            "metric_name": "ga_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-target-info-gate-no-extra-key",
+      "pair": "target-info-empty-attr-gate:base",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "svcG"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "ga.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "svcG"
+            },
+            "metric_name": "ga_a",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "svcG"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-target-info-gate-empty-extra-key",
+      "pair": "target-info-empty-attr-gate:variant",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "svcG"
+                  }
+                },
+                {
+                  "key": "extra",
+                  "value": {
+                    "stringValue": ""
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "ga.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
         "target-info"
       ]
     },

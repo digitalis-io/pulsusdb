@@ -147,6 +147,16 @@ fn workspace_rust_files() -> Vec<PathBuf> {
 }
 
 /// The `.set("<key>"` occurrences in a source text, as keys.
+///
+/// **This is a textual scan of every `.rs` file in the workspace, so it
+/// cannot tell a `QuerySettings::set` from any other method called `set`
+/// with a literal first argument.** Issue #461 hit exactly that: a label
+/// builder's `set("a", "1")` in a unit test read as three ClickHouse
+/// settings and reddened this suite. The right fix was on the other side
+/// (that method is now `set_label`), not a fake entry in
+/// [`INJECTED_SETTINGS`] — an invented key here would make the live test
+/// below assert against a setting nothing injects. If this fires again for
+/// an unrelated `set`, rename that method rather than widening this list.
 fn set_keys_in(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut rest = text;
