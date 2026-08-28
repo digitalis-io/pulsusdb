@@ -87,7 +87,18 @@ fn strategy_of(case: &Value) -> OtlpTranslationStrategy {
 
 fn settings_of(case: &Value) -> MetricIngestSettings {
     MetricIngestSettings {
-        exp_histogram_mode: ExpHistogramMode::Classic,
+        // Part of the case, not implicit (plan v10 Δ36): the OTLP
+        // exponential-histogram scale floor lives on the `native`/`dual`
+        // path only — `to_native_histogram` has one non-test production
+        // call site, inside `emit_native_exponential_histogram` — so a
+        // scale fixture left on the default `classic` mode cannot reach its
+        // own rejection.
+        exp_histogram_mode: match case["exp_histogram_mode"].as_str().unwrap_or("classic") {
+            "classic" => ExpHistogramMode::Classic,
+            "native" => ExpHistogramMode::Native,
+            "dual" => ExpHistogramMode::Dual,
+            other => panic!("case {} has unknown mode {other:?}", case["id"]),
+        },
         translation_strategy: strategy_of(case),
         promote_scope_metadata: case["promote_scope_metadata"]
             .as_bool()
@@ -303,6 +314,15 @@ async fn reference_rejections_are_whole_request_400() {
             Some(500),
             "case {id}: the captured reference status"
         );
+        // The envelopes differ in KIND, not just in status: the reference
+        // writes a bare `text/plain` body where we write a protobuf
+        // `google.rpc.Status`. The ledger's `otlp-name-reject-status-400`
+        // row says so, so the corpus has to have recorded it.
+        assert_eq!(
+            expect["reference_content_type"].as_str(),
+            Some("text/plain; charset=utf-8"),
+            "case {id}: the captured reference Content-Type"
+        );
         let required = expect["message"].as_str().expect("expect.message");
 
         let sink = CountingSink::default();
@@ -347,6 +367,142 @@ async fn an_accepted_case_still_reaches_the_sink_through_the_same_route() {
     let admitted = sink.admitted.lock().expect("sink lock");
     assert_eq!(admitted.len(), 1);
     assert!(!admitted[0].samples.is_empty());
+}
+
+/// Every `diverge` case's `Content-Type` is recorded, so the two envelope
+/// kinds are evidence rather than assertion: a reference `200` carries no
+/// body and no `Content-Type`, a reference rejection carries
+/// `text/plain; charset=utf-8`.
+#[test]
+fn every_captured_reference_answer_records_its_content_type() {
+    let doc = load_cases();
+    for case in doc["cases"].as_array().expect("cases") {
+        let id = case["id"].as_str().expect("id");
+        let expect = &case["expect"];
+        let (status, content_type) = match expect["kind"].as_str().expect("kind") {
+            "accept" => (200, &expect["reference_content_type"]),
+            "reject" => (
+                expect["reference_status"].as_i64().expect("status"),
+                &expect["reference_content_type"],
+            ),
+            "diverge" => (
+                expect["reference"]["status"].as_i64().expect("status"),
+                &expect["reference"]["content_type"],
+            ),
+            other => panic!("case {id}: unknown expect kind {other:?}"),
+        };
+        if status == 200 {
+            assert!(
+                content_type.is_null(),
+                "case {id}: the reference's 200 carries no body and no Content-Type, got \
+                 {content_type}"
+            );
+        } else {
+            assert_eq!(
+                content_type.as_str(),
+                Some("text/plain; charset=utf-8"),
+                "case {id}: a reference rejection is plain text, never an OTLP envelope"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// AC20 — the ledgered divergences, both sides recorded
+
+/// Four conditions where PulsusDB and the reference disagree **by design**,
+/// each pinned on both sides so the divergence cannot drift unnoticed.
+/// Three of them the reference accepts — storing a value nobody sent, or an
+/// internally inconsistent histogram — and one it refuses request-atomically
+/// where we reject a single point and keep the batch. Ledgered under
+/// `otlp-request-partial-success-faults` and its sibling rows.
+///
+/// The `reference` half of each case is captured from the running container
+/// by `capture_cases_json`; the `pulsusdb` half is authored, because it is
+/// our own required answer and no reference can supply it.
+#[test]
+fn ledgered_divergences_match_the_recorded_answers() {
+    let doc = load_cases();
+    let ledger = std::fs::read_to_string(LEDGER).expect("read ledger");
+    let mut checked = 0usize;
+    for case in doc["cases"].as_array().expect("cases") {
+        let expect = &case["expect"];
+        if expect["kind"] != "diverge" {
+            continue;
+        }
+        checked += 1;
+        let id = case["id"].as_str().expect("id");
+
+        // The row this divergence belongs to must exist.
+        let row = expect["ledger"].as_str().expect("expect.ledger");
+        assert!(
+            ledger.contains(&format!("`{row}`")),
+            "case {id}: no ledger row `{row}`"
+        );
+
+        // Our side.
+        let parsed = parse_case(case).unwrap_or_else(|e| panic!("case {id}: parse failed: {e}"));
+        let required = &expect["pulsusdb"];
+        assert_eq!(
+            parsed.rejected,
+            required["rejected_data_points"].as_u64().expect("count"),
+            "case {id}: rejected_data_points"
+        );
+        if let Some(message) = required["message"].as_str() {
+            assert_eq!(
+                parsed.rejected_message.as_deref(),
+                Some(message),
+                "case {id}: partial-success message"
+            );
+        }
+        let mut ours: Vec<String> = parsed
+            .series
+            .iter()
+            .map(|s| {
+                let labels: Vec<String> =
+                    s.labels.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
+                format!("{}{{{}}}", s.metric_name, labels.join(", "))
+            })
+            .collect();
+        ours.sort();
+        let mut wanted: Vec<String> = required["series"]
+            .as_array()
+            .expect("series")
+            .iter()
+            .map(|s| {
+                let labels: Vec<String> = s["labels"]
+                    .as_object()
+                    .expect("labels")
+                    .iter()
+                    .map(|(k, v)| format!("{k}={:?}", v.as_str().expect("value")))
+                    .collect();
+                format!(
+                    "{}{{{}}}",
+                    s["metric_name"].as_str().expect("name"),
+                    labels.join(", ")
+                )
+            })
+            .collect();
+        wanted.sort();
+        assert_eq!(ours, wanted, "case {id}: the series PulsusDB stores");
+
+        // The reference's side must actually differ from ours, or the case
+        // is not a divergence and does not belong here.
+        let reference = &expect["reference"];
+        let their_series = reference["series"]
+            .as_array()
+            .expect("reference series")
+            .len();
+        let differs = reference["status"].as_i64() != Some(200) || their_series != wanted.len();
+        assert!(
+            differs,
+            "case {id}: the reference agrees with us, so this is not a divergence"
+        );
+    }
+    assert_eq!(
+        checked, 4,
+        "the ledger names four conditions where we and the reference differ on a fault"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -844,7 +1000,7 @@ fn cases_json_tags_cover_every_named_transformation() {
 /// Minimal HTTP/1.1 over a bare `TcpStream` — the idiom this repo already
 /// uses for live suites (`pulsus-server/tests/prom_api_live.rs`), so the
 /// harness adds no dependency.
-fn http(endpoint: &str, method: &str, path: &str, body: Option<&[u8]>) -> (u16, Vec<u8>) {
+fn http(endpoint: &str, method: &str, path: &str, body: Option<&[u8]>) -> HttpResponse {
     let mut stream =
         TcpStream::connect(endpoint).unwrap_or_else(|e| panic!("connect {endpoint}: {e}"));
     stream
@@ -881,7 +1037,32 @@ fn http(endpoint: &str, method: &str, path: &str, body: Option<&[u8]>) -> (u16, 
     {
         body = dechunk(&body);
     }
-    (status, body)
+    // `Content-Type` is load-bearing evidence, not decoration: the ledger
+    // claims the reference answers its rejections `text/plain;
+    // charset=utf-8` rather than an OTLP protobuf envelope, and a claim
+    // nothing records is a claim nothing checks.
+    let content_type = head
+        .lines()
+        .find(|line| {
+            line.split(':')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("content-type"))
+        })
+        .and_then(|line| line.split_once(':'))
+        .map(|(_, value)| value.trim().to_string());
+    HttpResponse {
+        status,
+        content_type,
+        body,
+    }
+}
+
+/// A captured HTTP response: status, `Content-Type` (absent on the
+/// reference's `200`s, which carry no body) and body bytes.
+struct HttpResponse {
+    status: u16,
+    content_type: Option<String>,
+    body: Vec<u8>,
 }
 
 /// Un-chunks a `Transfer-Encoding: chunked` body.
@@ -963,32 +1144,49 @@ fn capture_cases_json() {
             panic!("no capture endpoint configured for case {}", case["id"]);
         };
         if build_info.is_none() {
-            let (_, body) = http(&endpoint, "GET", "/api/v1/status/buildinfo", None);
-            build_info = Some(serde_json::from_slice(&body).expect("buildinfo"));
+            let info = http(&endpoint, "GET", "/api/v1/status/buildinfo", None);
+            build_info = Some(serde_json::from_slice(&info.body).expect("buildinfo"));
         }
         let ts_s = anchor_s + index as u64;
         let mut payload = case["payload"].clone();
         restamp(&mut payload, ts_s * 1_000_000_000);
         let body = serde_json::to_vec(&payload).expect("payload");
-        let (status, response) = http(&endpoint, "POST", "/api/v1/otlp/v1/metrics", Some(&body));
+        let pushed = http(&endpoint, "POST", "/api/v1/otlp/v1/metrics", Some(&body));
 
-        if status != 200 {
-            let text = String::from_utf8_lossy(&response).to_string();
-            case["expect"] = json!({
-                "kind": "reject",
-                "reference_status": status,
-                "reference_body": text,
+        // A `diverge` case keeps its authored `pulsusdb` half — that half is
+        // OUR required answer, not something the reference can tell us —
+        // and only its `reference` half is (re)captured.
+        let is_diverge = case["expect"]["kind"] == json!("diverge");
+
+        if pushed.status != 200 {
+            let text = String::from_utf8_lossy(&pushed.body).to_string();
+            let reference = json!({
+                "status": pushed.status,
+                "content_type": pushed.content_type,
+                "body": text,
                 "message": text.trim_end_matches('\n'),
+                "series": [],
             });
+            if is_diverge {
+                case["expect"]["reference"] = reference;
+            } else {
+                case["expect"] = json!({
+                    "kind": "reject",
+                    "reference_status": pushed.status,
+                    "reference_content_type": pushed.content_type,
+                    "reference_body": text,
+                    "message": text.trim_end_matches('\n'),
+                });
+            }
             continue;
         }
 
         let path = format!(
             "/api/v1/series?match%5B%5D=%7B__name__%3D~%22.%2B%22%7D&start={ts_s}&end={ts_s}"
         );
-        let (series_status, series_body) = http(&endpoint, "GET", &path, None);
-        assert_eq!(series_status, 200, "series read for {}", case["id"]);
-        let series: Value = serde_json::from_slice(&series_body).expect("series json");
+        let read = http(&endpoint, "GET", &path, None);
+        assert_eq!(read.status, 200, "series read for {}", case["id"]);
+        let series: Value = serde_json::from_slice(&read.body).expect("series json");
         let mut names: Vec<String> = series["data"]
             .as_array()
             .expect("series data")
@@ -1004,9 +1202,9 @@ fn capture_cases_json() {
         for name in &names {
             let query = format!("last_over_time({{__name__=\"{name}\"}}[1ms])");
             let path = format!("/api/v1/query?query={}&time={ts_s}", urlencode(&query));
-            let (status, body) = http(&endpoint, "GET", &path, None);
-            assert_eq!(status, 200, "value read for {name}");
-            let answer: Value = serde_json::from_slice(&body).expect("query json");
+            let answered = http(&endpoint, "GET", &path, None);
+            assert_eq!(answered.status, 200, "value read for {name}");
+            let answer: Value = serde_json::from_slice(&answered.body).expect("query json");
             for result in answer["data"]["result"].as_array().expect("result") {
                 let mut labels: BTreeMap<String, String> = result["metric"]
                     .as_object()
@@ -1044,7 +1242,21 @@ fn capture_cases_json() {
             }));
         }
         captured.sort_by_key(|c| c.to_string());
-        case["expect"] = json!({ "kind": "accept", "series": captured });
+        if is_diverge {
+            case["expect"]["reference"] = json!({
+                "status": pushed.status,
+                "content_type": pushed.content_type,
+                "body": String::from_utf8_lossy(&pushed.body).to_string(),
+                "message": Value::Null,
+                "series": captured,
+            });
+        } else {
+            case["expect"] = json!({
+                "kind": "accept",
+                "reference_content_type": pushed.content_type,
+                "series": captured,
+            });
+        }
     }
 
     doc["captured_from"] = json!({
@@ -1194,6 +1406,26 @@ const LEDGER_ROWS: &[LedgerRow] = &[
         required: &["code: 3", "text/plain; charset=utf-8", "#259"],
     },
     LedgerRow {
+        id: "`otlp-request-atomic-faults`",
+        limit: "—",
+        our_route: "`POST /v1/metrics`",
+        our_status: "`400`",
+        their_route: "`POST /api/v1/otlp/v1/metrics`",
+        their_status: "`500`",
+        required: &[
+            "shape or naming",
+            "MAX_EXPANDED_BYTES",
+            "codec.go:1011",
+            "decodeReadLimit = 32 * 1024 * 1024",
+            "decompressed",
+            "write_otlp_handler.go:132-138",
+            ":177-189",
+            // Each model names the other, so neither can be read as the
+            // only one this route has.
+            "otlp-delta-partial-success",
+        ],
+    },
+    LedgerRow {
         id: "`otlp-delta-partial-success`",
         limit: "—",
         our_route: "`POST /v1/metrics`",
@@ -1208,6 +1440,27 @@ const LEDGER_ROWS: &[LedgerRow] = &[
             "invalid temporality and type combination for metric",
             "metrics_to_prw.go:224-233",
             "ok_gauge",
+            // The one reference mechanism, cited, and both sibling rows
+            // that reach it named (plan v7 Δ29).
+            "write_otlp_handler.go:132-138",
+            ":177-189",
+            "otlp-request-atomic-faults",
+            "otlp-reference-admission-window",
+        ],
+    },
+    LedgerRow {
+        id: "`otlp-float-native-histogram-collision`",
+        limit: "—",
+        our_route: "`POST /v1/metrics`",
+        our_status: "`200`",
+        their_route: "`POST /api/v1/otlp/v1/metrics`",
+        their_status: "`200`",
+        required: &[
+            "same translated series identity",
+            "first arrival",
+            "duplicate sample for timestamp\\n",
+            "overrides not allowed: existing is a histogram, new value",
+            "helper.go:472",
         ],
     },
     LedgerRow {
@@ -1256,7 +1509,14 @@ const LEDGER_ROWS: &[LedgerRow] = &[
         required: &[
             "head-relative",
             "out of order sample",
-            "one `out of bounds\\n` line per rejected emitted series",
+            "one line per rejected emitted series",
+            // Two bodies for one status: a gate pinning either alone
+            // misreports the other.
+            "out of bounds\\n",
+            "out of bounds: timestamp is too far in the future\\n",
+            "write_otlp_handler.go:132-138",
+            ":177-189",
+            "otlp-delta-partial-success",
         ],
     },
     LedgerRow {
@@ -1278,8 +1538,20 @@ fn retired_ledger_id() -> String {
     ["otlp", "metric", "name", "reject", "status", "400"].join("-")
 }
 
+/// The `## Divergences` table only — the file carries a second table (the
+/// fault classification) with different columns, and a whole-file scan
+/// would silently mix them.
 fn ledger_table() -> (Vec<String>, Vec<Vec<String>>) {
     let text = std::fs::read_to_string(LEDGER).unwrap_or_else(|e| panic!("read {LEDGER}: {e}"));
+    let start = text
+        .find("## Divergences")
+        .expect("the ledger must carry a `## Divergences` section");
+    let rest = &text[start + 3..];
+    let end = rest
+        .find("\n## ")
+        .map(|i| start + 3 + i)
+        .unwrap_or(text.len());
+    let text = &text[start..end];
     let mut header: Vec<String> = Vec::new();
     let mut rows: Vec<Vec<String>> = Vec::new();
     for line in text.lines() {
@@ -1393,6 +1665,139 @@ fn every_divergence_has_a_ledger_row() {
     assert!(
         api.contains("metrics-differential-ledger.md"),
         "docs/api.md §3.5 must point at the ledger the row moved into"
+    );
+}
+
+/// The eight fault conditions and the class each belongs to. The counts
+/// `4 accept / 4 atomic / 0 unique` are **derived** from this map by the
+/// test below, never asserted beside it: the two failures this inventory
+/// has already had were the total drifting from the list, and then the
+/// bucket assignment drifting from the list. A gate that reads the list
+/// cannot drift from the list.
+const FAULT_CLASSES: &[(&str, &str)] = &[
+    ("value-less-number-point", "accept"),
+    ("inconsistent-classic-histogram", "accept"),
+    ("u64-bucket-overflow", "accept"),
+    ("float-native-histogram-collision", "accept"),
+    ("out-of-domain-timestamp", "atomic"),
+    ("exp-histogram-scale-below-minimum", "atomic"),
+    ("native-histogram-validation-failure", "atomic"),
+    ("delta-temporality", "atomic"),
+];
+
+/// AC11's classification half: the ledger's **Fault classification** table
+/// must name exactly these eight conditions in exactly these classes.
+///
+/// A sum-only check cannot express this. `3/4/1` and `0/8/0` both sum to
+/// eight, and so does a swap that moves two conditions between classes
+/// while preserving the totals — all three were inventories this file has
+/// actually carried. Asserting the per-condition map and deriving the
+/// counts from it rejects all of them.
+#[test]
+fn the_ledgers_fault_classification_is_exact() {
+    let text = std::fs::read_to_string(LEDGER).expect("read ledger");
+    let start = text
+        .find("## Fault classification")
+        .expect("the ledger must carry a `## Fault classification` section");
+    let section = &text[start..];
+    let end = section[3..]
+        .find("\n## ")
+        .map(|i| i + 3)
+        .unwrap_or(section.len());
+    let section = &section[..end];
+
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    for line in section.lines().filter(|l| l.starts_with("| `")) {
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        let condition = cells[0].trim_matches('`').to_string();
+        let class = cells[1].to_string();
+        assert!(
+            found.insert(condition.clone(), class).is_none(),
+            "the classification table repeats {condition}"
+        );
+    }
+
+    let expected: BTreeMap<String, String> = FAULT_CLASSES
+        .iter()
+        .map(|(c, k)| ((*c).to_string(), (*k).to_string()))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the ledger's fault classification must match the inventory condition for condition"
+    );
+
+    // Counts derived from the map, never supplied beside it.
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for class in found.values() {
+        *counts.entry(class.as_str()).or_default() += 1;
+    }
+    assert_eq!(counts.get("accept"), Some(&4), "accept-where-we-differ");
+    assert_eq!(counts.get("atomic"), Some(&4), "reject-atomically");
+    assert_eq!(
+        counts.get("unique"),
+        None,
+        "nothing in this inventory is ours alone; an entry here means a \
+         `the reference has no equivalent` claim came back"
+    );
+    assert_eq!(found.len(), 8);
+}
+
+/// AC19: `docs/api.md` §1.1 publishes the rule that decides which of the
+/// two admission models a fault meets, **with its reason**.
+///
+/// Each clause is required in the same sentence as its own status and
+/// without the other status, so documentation that states the reason while
+/// attaching the statuses to the wrong clauses — a contract exactly
+/// backwards — fails. The reason's load-bearing phrases are required too,
+/// because a version carrying only the two clauses would otherwise pass and
+/// the reason is the whole point of publishing the rule.
+#[test]
+fn api_md_documents_the_fault_model() {
+    let api = std::fs::read_to_string(API_MD).expect("read docs/api.md");
+    let start = api
+        .find("### 1.1 OTLP (primary)")
+        .expect("docs/api.md must carry §1.1");
+    let end = api[start..]
+        .find("### 1.2 ")
+        .map(|i| start + i)
+        .unwrap_or(api.len());
+    let section = &api[start..end];
+
+    let sentences: Vec<&str> = section.lines().flat_map(|line| line.split(". ")).collect();
+    assert!(
+        sentences.iter().any(|s| s.contains("shape or naming")
+            && s.contains("whole-request")
+            && s.contains("`400`")
+            && !s.contains("`200`")),
+        "§1.1 must say, in one sentence, that a shape-or-naming fault is whole-request and `400`"
+    );
+    assert!(
+        sentences.iter().any(|s| s.contains("one data point's data")
+            && s.contains("per-point")
+            && s.contains("`200`")
+            && !s.contains("`400`")),
+        "§1.1 must say, in one sentence, that a data fault is per-point and `200`"
+    );
+    for phrase in [
+        "series identity",
+        "nothing to partially accept",
+        "independently valid",
+    ] {
+        assert!(
+            section.contains(phrase),
+            "§1.1 must carry the rule's reason; missing {phrase:?}"
+        );
+    }
+
+    // And the obsolete model must be gone: metrics no longer flatten
+    // resource attributes into `service_name`.
+    assert!(
+        !section.contains("for logs and metrics, attribute keys are normalized"),
+        "§1.1 still documents the pre-#461 label model for metrics"
+    );
+    assert!(
+        section.contains("target_info") && section.contains("`job`"),
+        "§1.1 must document the model that replaced it"
     );
 }
 
