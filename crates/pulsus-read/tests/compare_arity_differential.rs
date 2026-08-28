@@ -473,10 +473,16 @@ fn tempo_query_once(
     Some(map)
 }
 
-/// Polls the reference until its answer STOPS MOVING — the settle rule and
-/// the wall-clock loop both come from `pulsus_testkit`, shared with
-/// `compare_value_differential.rs` so the two suites cannot drift. The
-/// emptiness decision stays here: an empty count map is not an answer.
+/// Reads one settled reference answer for `query`.
+///
+/// The settle rule and the wall-clock loop come from `pulsus_testkit`,
+/// shared with `compare_value_differential.rs` so the two suites cannot
+/// drift. The emptiness decision stays here: an empty count map is not an
+/// answer.
+///
+/// **This is called only AFTER [`await_complete_corpus`] has proved the
+/// fixture is fully loaded**, and that ordering is the whole design — see
+/// that function for why settling alone is not a readiness oracle.
 fn tempo_counts(api_base: &str, query: &str, window: (i64, i64), keys: &[&str]) -> Counts {
     pulsus_testkit::settle_by(
         Instant::now() + Duration::from_secs(SETTLE_BUDGET_S),
@@ -484,6 +490,92 @@ fn tempo_counts(api_base: &str, query: &str, window: (i64, i64), keys: &[&str]) 
         &format!("reference compare() view for {query:?}"),
         || tempo_query_once(api_base, query, window, keys).filter(|m| !m.is_empty()),
     )
+}
+
+/// Blocks until the reference holds the WHOLE of one corpus, judged by an
+/// answer whose value is known in advance.
+///
+/// **Why settling is not enough, measured.** "The same non-empty payload
+/// three times running" proves the view stopped changing; it does not
+/// prove the fixture finished loading, because **three stable reads of a
+/// partial view are still three stable reads**. Across 15 clean runs of
+/// this suite before this gate existed, 13 passed and 2 failed with the
+/// reference's B1 view having settled PARTIAL — once at `m00..m07` with
+/// `selection_total = 36`, once at `m00..m06` with `28` — while a later
+/// query in the same run returned the full 78. The stability rule was
+/// measuring the wrong property.
+///
+/// **What this measures instead.** Completeness here has a known answer:
+/// the corpus is ours, so its total and its distinct-value count are
+/// constants. So the gate asserts the answer rather than the absence of
+/// change. The probe is:
+///
+///   * **service-scoped** — `{resource.service.name="<per-run service>"}`,
+///     so another suite's spans in a shared reference container cannot
+///     satisfy it (and, symmetrically, cannot break it: the base suite's
+///     polluted run was seen carrying THIS suite's labels, so the
+///     contamination runs both ways);
+///   * **untrimmed** — `topN` is set above the corpus's distinct-value
+///     count, so a `topN` trim can never be mistaken for a missing span;
+///   * checked on **both** numbers, the `*_total` denominator AND the
+///     distinct present-value count, because either alone admits a
+///     partial view that happens to match the other.
+///
+/// It still runs through the shared [`pulsus_testkit::settle_by`], so the
+/// completeness predicate is ANDed with three identical reads rather than
+/// replacing them. That is redundant by construction — no span arrives
+/// after the total is reached — and it costs four seconds, which is worth
+/// paying to keep one settle implementation in the workspace.
+fn await_complete_corpus(
+    api_base: &str,
+    service: &str,
+    key: &str,
+    window: (i64, i64),
+    want_total: i64,
+    want_values: usize,
+) {
+    // `topN` far above the distinct-value count: this probe must never
+    // trim, or a trimmed view would read as an incomplete one.
+    let query =
+        format!(r#"{{resource.service.name="{service}"}} | compare({{status=error}}, 1000)"#);
+    let keys = [key];
+    pulsus_testkit::settle_by(
+        Instant::now() + Duration::from_secs(SETTLE_BUDGET_S),
+        Duration::from_secs(2),
+        &format!(
+            "reference corpus {service:?} to load completely ({key}:              selection_total {want_total}, {want_values} distinct values)"
+        ),
+        || {
+            let counts = tempo_query_once(api_base, &query, window, &keys)?;
+            let total = counts
+                .get(&(
+                    "selection_total".to_string(),
+                    key.to_string(),
+                    "nil".to_string(),
+                ))
+                .copied()
+                .unwrap_or(0);
+            let values = counts
+                .keys()
+                .filter(|(meta, k, _)| meta == "selection" && k == key)
+                .count();
+            let complete = total == want_total && values == want_values;
+            if !complete {
+                // `settle_by`'s timeout message can only name its last
+                // SETTLED observation, which is `None` here by
+                // construction — so the progression is logged as it
+                // happens. Bounded: one line per 2 s poll, inside a 180 s
+                // deadline. This is the line that would have named the
+                // two stable-partial views (36 and 28) directly.
+                eprintln!(
+                    "[readiness] {service}: {key} selection_total={total}/{want_total} \
+                     values={values}/{want_values} — not loaded yet"
+                );
+            }
+            complete.then_some(counts)
+        },
+    );
+    eprintln!("[readiness] {service}: complete ({want_total}, {want_values} values)");
 }
 
 fn label_str(labels: &[serde_json::Value], key: &str) -> Option<String> {
@@ -720,6 +812,15 @@ async fn compare_arity_differential() {
             trimmed: vec![("baseline", "span.idx", 0), ("selection", "span.idx", 0)],
         },
     ];
+
+    // ---- READINESS, before any row is evaluated. ----------------------
+    // Not "the answer stopped changing" — "the answer is the one we know
+    // this corpus has". See `await_complete_corpus`: a partial reference
+    // view settles just as readily as a complete one, and did so twice in
+    // fifteen runs before this gate existed. Both corpora are gated,
+    // because B5 reads the second one.
+    await_complete_corpus(&api_base, &svc_e, "statusMessage", window, 78, 12);
+    await_complete_corpus(&api_base, &svc_b, "span.idx", window, 10, 10);
 
     let mut faults: Vec<String> = Vec::new();
     for row in &rows {
