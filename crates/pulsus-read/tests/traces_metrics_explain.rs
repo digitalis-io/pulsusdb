@@ -761,7 +761,7 @@ async fn metrics_explain_and_budget_gates() {
     let base_narrow = extract_compare_base_scan(narrow_cross);
     let (full_sel, full_total) =
         table_primary_key_granules(&explain_raw(&client, &base_full).await, "trace_spans");
-    let (narrow_sel, _) =
+    let (narrow_sel, narrow_total) =
         table_primary_key_granules(&explain_raw(&client, &base_narrow).await, "trace_spans");
     assert!(
         full_sel > 0 && full_sel <= full_total,
@@ -774,6 +774,86 @@ async fn metrics_explain_and_budget_gates() {
          (narrow {narrow_sel} vs full {full_sel}/{full_total}) — the roots LEFT JOIN must not \
          degrade it to a window-independent full scan"
     );
+    // ---- Issue #460 AC 7: the four-argument compare()'s selection window
+    // is a SELECT-list conjunct, so it cannot touch granule pruning. Over
+    // the SAME narrow request window as `narrow_cross` above, the base
+    // trace_spans scan must select the SAME granules — and still prune
+    // strictly harder than the whole-corpus window.
+    //
+    // **What each half below catches, established by breaking it rather
+    // than by reading.** Two defects are possible and they are not the
+    // same defect:
+    //
+    //   (a) the window MOVED out of `is_sel` into `WHERE` — caught by the
+    //       positive `is_sel` assertion immediately below;
+    //   (b) the window ADDED to `WHERE` while `is_sel` keeps it — this is
+    //       the one that silently turns a repartition into a FILTER, and
+    //       it is caught by the negative assertion after it.
+    //
+    // The granule-equality assertion at the end catches NEITHER on this
+    // corpus: measured, defect (b) leaves the selected/total granule
+    // counts unchanged (5/5 both ways), because this fixture's layout does
+    // not prune further at that predicate. It is kept because it is the
+    // scale-invariant statement of the property and would catch a pruning
+    // regression from a different cause — but it is not what stands
+    // between us and a window in `WHERE`. What stands between us and (b)
+    // in terms of the ANSWER is `compare_arity_differential`'s B4 and B5,
+    // both of which redden (measured). -----------------------------------
+    let windowed = plan_for(
+        &engine,
+        &format!(
+            r#"{{}} | compare({{ span.http.status_code = "500" }}, 3, {}, {})"#,
+            now - 20 * 60 * NS_PER_S,
+            now - 10 * 60 * NS_PER_S
+        ),
+        now - 30 * 60 * NS_PER_S,
+        now,
+    );
+    let (windowed_cross, _) = windowed
+        .compare_range()
+        .expect("windowed compare range SQL");
+    assert!(
+        windowed_cross.contains(&format!(
+            "AND timestamp_ns > {} AND timestamp_ns <= {}) AS is_sel",
+            now - 20 * 60 * NS_PER_S,
+            now - 10 * 60 * NS_PER_S
+        )),
+        "the selection window renders as a conjunct on the is_sel SELECT-list expression:\n\
+         {windowed_cross}"
+    );
+    // (b): the window must appear NOWHERE in a filter position. It
+    // repartitions the population into baseline/selection; a copy of it in
+    // `PREWHERE`/`WHERE` would DROP the spans the reference merely moves
+    // to `baseline`, and every total would change.
+    let base_windowed = extract_compare_base_scan(windowed_cross);
+    for line in base_windowed.lines() {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("WHERE") || trimmed.starts_with("PREWHERE")) {
+            continue;
+        }
+        assert!(
+            !line.contains(&format!("timestamp_ns > {}", now - 20 * 60 * NS_PER_S)),
+            "the selection window reached a filter position — it must repartition the \
+             population, never filter it:\n{line}"
+        );
+    }
+    let (windowed_sel, windowed_total) =
+        table_primary_key_granules(&explain_raw(&client, &base_windowed).await, "trace_spans");
+    assert_eq!(
+        (windowed_sel, windowed_total),
+        (narrow_sel, narrow_total),
+        "the selection window must not change granule pruning: the four-argument form selected \
+         {windowed_sel}/{windowed_total} granules where the one-argument form over the SAME \
+         request window selected {narrow_sel}/{narrow_total}. A window predicate that reached \
+         WHERE or PREWHERE would move this — and would also drop the spans the reference merely \
+         re-partitions into baseline"
+    );
+    assert!(
+        windowed_sel < full_sel,
+        "the windowed compare base scan must still prune strictly harder on a narrow request \
+         window ({windowed_sel} vs {full_sel}/{full_total})"
+    );
+
     let cmp_res = engine
         .metrics_range(&cmp_plan)
         .await

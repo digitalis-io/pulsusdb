@@ -405,9 +405,18 @@ struct ClosedMeaningProbe {
 /// three of its four probes are still planner 400s against a reference
 /// 2xx. The class row carries `wire_status: "open"` saying so. Read these
 /// constants as "the grammar agrees", never as "these queries work".
+///
+/// Issue #460 closes **D17** — `compare()`'s two other reference
+/// productions (`expr.y:325-326`). Its two probes flip diverge→agree, so
+/// `AGREE` 266 + 2 = 268 and `DIVERGE` 40 − 2 = 38; `TOTAL` is unchanged
+/// at 306 and no probe moved the other way. Unlike D7, D17 closes on the
+/// WIRE too — both probes plan (`wire_baseline.json`, `pulsus_wire`
+/// reject→accept) — and the engine honours `topN` and the
+/// `(start, end]` selection window rather than merely parsing them, so
+/// this closure is not a scoreboard move.
 const TOTAL: usize = 306;
-const AGREE: usize = 266;
-const DIVERGE: usize = 40;
+const AGREE: usize = 268;
+const DIVERGE: usize = 38;
 const MEANING: usize = 6;
 const CLOSED_MEANING: usize = 7;
 
@@ -1813,8 +1822,11 @@ const TIER_HISTOGRAM: [(&str, usize); 4] = [
     // class a client actually emits is the one that got fixed first, which
     // is the ranking doing its job rather than an empty bucket.
     ("r1-client-emitted", 0),
-    // Stage D2 closed D16, r2's other six.
-    ("r2-skeleton-inserted", 2),
+    // Stage D2 closed D16, r2's other six; issue #460 closed D17, r2's
+    // last two — a closed probe drops its reachability record, so the
+    // tier empties. r2 at 0 is the ranking doing its job: the tiers that
+    // say a client can reach the construct are the ones that got fixed.
+    ("r2-skeleton-inserted", 0),
     ("r3-highlighted-only", 17),
     ("r4-no-traceql-surface-path", 21),
 ];
@@ -1872,7 +1884,13 @@ fn the_reachability_tier_histogram_is_pinned() {
 /// the FNV-1a prime and must not be "fixed".
 #[test]
 fn the_reachability_classification_is_frozen_against_a_silent_swap() {
-    const REACHABILITY_DIGEST: u64 = 0xb72d_4863_e6e9_59f8;
+    // Issue #460 re-pins this: closing D17 drops its two probes'
+    // reachability records from the 0x01 feed and moves its class row's
+    // `stage`/`status` in the 0x02 feed. No anchor, capture or other
+    // class moved, and no probe changed TIER — the two simply stopped
+    // being classified, because a probe carries a reachability record
+    // exactly while it diverges.
+    const REACHABILITY_DIGEST: u64 = 0xa0f6_b493_ab42_d8d9;
     let m = matrix();
     let r: Reachability = fixture("reachability.json");
 

@@ -80,6 +80,21 @@
 //!     variants because the reference words them differently and the
 //!     order between them is observable; one reference check, split the
 //!     way `invalid-regex`/`invalid-regex-operand` already are.
+//! 12. `compare()`'s `topN` argument is positive
+//!     ([`ValidateError::CompareTopNNotPositive`]).
+//! 13. `compare()`'s selection-window timestamps are positive unix
+//!     nanoseconds ([`ValidateError::CompareTimestampsNotPositive`]) —
+//!     with `(0, 0)` explicitly legal, meaning "no window".
+//! 14. That window's `end` is strictly after its `start`
+//!     ([`ValidateError::CompareEndNotAfterStart`]).
+//!
+//! Rules 12-14 arrived with issue #460, which added the reference's
+//! other two `compare()` productions (`expr.y:324-326`). They were
+//! UNREACHABLE before it for the same reason rules 9-10 were before
+//! Stage B: the arguments they judge could not be parsed. All three fire
+//! in the reference's own statement order
+//! (`engine_metrics_compare.go:319-340`), and both orderings are
+//! observable and measured.
 //!
 //! Rules 9 and 10, and the widening of rules 1 and 2 past comparison,
 //! arrived with the issue #335 Stage B grammar collapse. Rule 11
@@ -239,6 +254,41 @@ pub enum ValidateError {
     /// `ast_validate.go:43-48` — `compare()` combines with nothing.
     #[error("compare() cannot be combined with any other pipeline stage")]
     CompareWithSecondStage,
+    /// `engine_metrics_compare.go:325-327` — `compare()`'s `topN`
+    /// argument is positive. Measured against the pinned digest, 400
+    /// `compare() top number of values must be integer greater than 0`:
+    /// `compare({status=error}, 0)`, `compare({status=error}, 0, 0, 0)`,
+    /// `compare({status=error}, 0, 5, 4)` and
+    /// `compare({status=error}, 0, <ns>, <ns>)`. 200s: `…, 10`,
+    /// `…, 3`, `…, 9223372036854775807`.
+    ///
+    /// **Checked FIRST**, before either timestamp rule — and the order is
+    /// observable: `compare({status=error}, 0, 5, 4)` violates this rule
+    /// AND [`ValidateError::CompareEndNotAfterStart`], and the reference
+    /// reports this one (measured).
+    #[error("compare() top number of values must be integer greater than 0")]
+    CompareTopNNotPositive,
+    /// `engine_metrics_compare.go:333-335` — a selection window's two
+    /// timestamps are positive unix nanoseconds.
+    ///
+    /// **`(0, 0)` is LEGAL and must be accepted**: it is the reference's
+    /// own default and an explicit spelling the Grafana Traces Drilldown
+    /// Comparison tab emits, and `validate()` returns `nil` early for it
+    /// (`:329-331`). Measured 200: `compare({status=error}, 10, 0, 0)`.
+    /// Measured 400 with this message: `…, 10, 0, <ns>` and
+    /// `…, 10, <ns>, 0`.
+    ///
+    /// Checked BEFORE [`ValidateError::CompareEndNotAfterStart`], and the
+    /// order is observable: `compare({status=error}, 5, 0, 4)` reports
+    /// this message even though `4 > 0` (measured).
+    #[error("compare() timestamps must be positive integer unix nanoseconds")]
+    CompareTimestampsNotPositive,
+    /// `engine_metrics_compare.go:336-338` — a selection window's `end`
+    /// is strictly after its `start`. Measured 400 with this message:
+    /// `compare({status=error}, 10, 5, 4)` and
+    /// `…, 10, 1787904155000000000, 1787900555000000000`.
+    #[error("compare() end timestamp must be greater than start timestamp")]
+    CompareEndNotAfterStart,
 }
 
 impl ValidateError {
@@ -260,6 +310,9 @@ impl ValidateError {
             ValidateError::TooManyGroupBys { .. } => "too-many-group-bys",
             ValidateError::NonPositiveLimit { .. } => "non-positive-limit",
             ValidateError::CompareWithSecondStage => "compare-second-stage",
+            ValidateError::CompareTopNNotPositive => "compare-topn-not-positive",
+            ValidateError::CompareTimestampsNotPositive => "compare-timestamps-not-positive",
+            ValidateError::CompareEndNotAfterStart => "compare-end-not-after-start",
         }
     }
 }
@@ -311,6 +364,23 @@ pub const VALIDATE_RULES: &[(&str, &str)] = &[
     ),
     ("non-positive-limit", "ast_metrics.go:396-401"),
     ("compare-second-stage", "ast_validate.go:43-48"),
+    // Issue #460: `MetricsCompare.validate` is reached through
+    // `RootExpr.validate` (`ast_validate.go:21-50`), so these three are
+    // Validate-family rules and belong here rather than in the planner.
+    // The three fire in the order they are listed, which is the
+    // reference's statement order and is observable (see each variant).
+    (
+        "compare-topn-not-positive",
+        "engine_metrics_compare.go:325-327",
+    ),
+    (
+        "compare-timestamps-not-positive",
+        "engine_metrics_compare.go:333-335",
+    ),
+    (
+        "compare-end-not-after-start",
+        "engine_metrics_compare.go:336-338",
+    ),
 ];
 
 /// The reference's semantic validation over a parsed [`Query`] — pure,
@@ -560,7 +630,36 @@ fn validate_stage(stage: &PipelineStage) -> Result<(), ValidateError> {
                 Ok(())
             }
         },
-        PipelineStage::Compare { selection, .. } => validate_filter(selection),
+        PipelineStage::Compare {
+            selection,
+            top_n,
+            start_ns,
+            end_ns,
+            ..
+        } => {
+            // Rules 12-14 (issue #460), in the reference's own statement
+            // order (`engine_metrics_compare.go:319-340`). The inner
+            // filter is validated FIRST — `validate()` opens with
+            // `m.f.validate()` at `:320-323`.
+            validate_filter(selection)?;
+            if *top_n <= 0 {
+                return Err(ValidateError::CompareTopNNotPositive);
+            }
+            // `(0, 0)` means "no selection window" and returns early —
+            // the reference's own default, and the spelling the Traces
+            // Drilldown Comparison tab emits when no time range is
+            // selected. A naive positivity check rejects a 200.
+            if *start_ns == 0 && *end_ns == 0 {
+                return Ok(());
+            }
+            if *start_ns <= 0 || *end_ns <= 0 {
+                return Err(ValidateError::CompareTimestampsNotPositive);
+            }
+            if *end_ns <= *start_ns {
+                return Err(ValidateError::CompareEndNotAfterStart);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1107,6 +1206,104 @@ mod tests {
         }
     }
 
+    /// Issue #460 — `compare()`'s three argument rules, their byte-exact
+    /// reference messages, and the ORDER they fire in.
+    ///
+    /// Every row is a live capture against the pinned container
+    /// (`grafana/tempo@sha256:aa8df8d0…`, `GET /api/metrics/query_range`),
+    /// message text included. Ours carries the route's own
+    /// `invalid TraceQL query: ` prefix where the reference's metrics
+    /// route says `compiling query: `; that asymmetry is pre-existing and
+    /// precedented (`topk(0)`), so only the message BODY is compared.
+    #[test]
+    fn the_three_compare_argument_rules_fire_in_the_reference_order() {
+        use ValidateError as E;
+        // A8-A12: one rule violated at a time.
+        for (q, want) in [
+            ("{} | compare({status=error}, 0)", E::CompareTopNNotPositive),
+            (
+                "{} | compare({status=error}, 10, 0, 1787904155000000000)",
+                E::CompareTimestampsNotPositive,
+            ),
+            (
+                "{} | compare({status=error}, 10, 1787900555000000000, 0)",
+                E::CompareTimestampsNotPositive,
+            ),
+            (
+                "{} | compare({status=error}, 10, 5, 4)",
+                E::CompareEndNotAfterStart,
+            ),
+            (
+                "{} | compare({status=error}, 10, 1787904155000000000, 1787900555000000000)",
+                E::CompareEndNotAfterStart,
+            ),
+        ] {
+            assert_eq!(v(q).unwrap_err(), want, "{q}");
+        }
+
+        // A19 and its siblings: TWO rules violated at once, so the answer
+        // is the ORDER. Captured, not inferred — the reference reports the
+        // topN message for all three of the first group even though the
+        // window is also invalid, and reports the timestamps message for
+        // `(5, 0, 4)` even though `4 > 0`.
+        for (q, want) in [
+            (
+                "{} | compare({status=error}, 0, 5, 4)",
+                E::CompareTopNNotPositive,
+            ),
+            (
+                "{} | compare({status=error}, 0, 0, 0)",
+                E::CompareTopNNotPositive,
+            ),
+            (
+                "{} | compare({status=error}, 0, 1787900555000000000, 1787904155000000000)",
+                E::CompareTopNNotPositive,
+            ),
+            (
+                "{} | compare({status=error}, 5, 0, 4)",
+                E::CompareTimestampsNotPositive,
+            ),
+        ] {
+            assert_eq!(v(q).unwrap_err(), want, "{q}");
+        }
+
+        // The reference's messages, byte for byte
+        // (`engine_metrics_compare.go:325-337`).
+        assert_eq!(
+            E::CompareTopNNotPositive.to_string(),
+            "compare() top number of values must be integer greater than 0"
+        );
+        assert_eq!(
+            E::CompareTimestampsNotPositive.to_string(),
+            "compare() timestamps must be positive integer unix nanoseconds"
+        );
+        assert_eq!(
+            E::CompareEndNotAfterStart.to_string(),
+            "compare() end timestamp must be greater than start timestamp"
+        );
+
+        // A1-A7: the accepts. `(0, 0)` is the reference's own default AND
+        // an explicit spelling it answers 200 — a naive positivity check
+        // rejects a query the Drilldown Comparison tab generates.
+        for q in [
+            "{} | compare({status=error})",
+            "{} | compare({status=error}, 10)",
+            "{} | compare({status=error}, 3)",
+            "{} | compare({status=error}, 10, 0, 0)",
+            "{} | compare({status=error}, 9223372036854775807)",
+            "{} | compare({status=error}, 10, 1787900555000000000, 1787904155000000000)",
+        ] {
+            assert!(v(q).is_ok(), "{q:?} is a reference 200 and must validate");
+        }
+
+        // The inner filter is validated FIRST (`validate()` opens with
+        // `m.f.validate()`), so a bad selection outranks a bad topN.
+        assert!(matches!(
+            v("{} | compare({ status > ok }, 0)"),
+            Err(E::IllegalOperator { .. })
+        ));
+    }
+
     /// The nil-spelling conflation is RETIRED (issue #335 Stage B): this
     /// pins the DISTINCTION, where its predecessor pinned the conflation.
     ///
@@ -1201,6 +1398,9 @@ mod tests {
                 expr: String::new(),
             },
             ValidateError::CompareWithSecondStage,
+            ValidateError::CompareTopNNotPositive,
+            ValidateError::CompareTimestampsNotPositive,
+            ValidateError::CompareEndNotAfterStart,
         ];
         assert_eq!(instances.len(), VALIDATE_RULES.len());
         for e in &instances {
@@ -1432,11 +1632,6 @@ mod tests {
             // Scalar expressions and filters (ast_validate.go:151-162).
             (r#"{} | avg(duration) = "x""#, "non-numeric scalar operand"),
             (r#"{} | count() =~ "x""#, "regex scalar filter on a string"),
-            // compare() extra arguments (engine_metrics_compare.go:
-            // 319-341: topN/start/end). NOTE the reference ACCEPTS
-            // `compare({…}, 10)` — we are stricter here, which is a
-            // pre-existing divergence, not a check we mirror.
-            ("{} | compare({ .a = 1 }, 10)", "compare() topN argument"),
             // parent. scope (ast_validate.go:250-267) — also tier 1: the
             // AttrScope match in validate_field_expr has no variant for
             // it.

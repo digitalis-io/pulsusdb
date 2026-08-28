@@ -40,7 +40,7 @@ Probe	-	-	-	-	<A> x <a>	accept	accept	200	-	case_distinguishes_names
 Probe	-	-	-	-	<_> x <a>	accept	accept	200	-	unnamed_then_named
 Probe	-	-	-	-	<a> x <_>	accept	accept	200	-	named_then_unnamed
 Probe	-	-	-	-	<__> x <_>	accept	accept	200	-	double_underscore_then_unnamed
-Site	Literal	.github/workflows/ci.yml:965	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
+Site	Literal	.github/workflows/ci.yml:982	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
 Site	Literal	crates/pulsus-logql/src/ast.rs:249	-	-	<p>	accept	accept	-	-	
 Site	Literal	crates/pulsus-logql/tests/case_folding.rs:277	-	-	<a>	accept	accept	-	-	
 Site	Literal	crates/pulsus-logql/tests/case_folding.rs:278	-	-	<a>	accept	accept	-	-	

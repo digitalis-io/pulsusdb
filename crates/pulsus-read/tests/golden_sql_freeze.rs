@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 26)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 27)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -146,7 +146,18 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 2
 /// returned `Err`, so `git diff --stat crates/pulsus-read/tests/golden/`
 /// shows additions and nothing else. The digest moves because the corpus
 /// grew, not because any frozen byte changed.
-const PINNED_SQL_CORPUS: u64 = 0xb796_bd56_2036_29a2;
+///
+/// 75 -> 76 (issue #460): ONE added `traces_metrics` golden,
+/// `compare_status_window.sql` — the four-argument
+/// `compare(f, topN, start, end)` the Traces Drilldown Comparison tab
+/// generates. **No pre-existing golden moved, and `compare_status.sql`
+/// specifically did not**: the `(start, end]` conjunct renders only when
+/// the query carries a window, so the one-argument form's `is_sel` string
+/// is byte-identical to before. That byte-identity is the check, not a
+/// hope — `git diff --stat crates/pulsus-read/tests/golden/` shows one
+/// addition and no modification, and this digest would move if it did
+/// not. The digest moves because the corpus grew.
+const PINNED_SQL_CORPUS: u64 = 0xbe0b_7a21_b436_ac7b;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -278,7 +289,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 75, "the frozen SQL corpus is 49 + 26 = 75 entries");
+    assert_eq!(total, 76, "the frozen SQL corpus is 49 + 27 = 76 entries");
 }
 
 #[test]

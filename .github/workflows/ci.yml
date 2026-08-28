@@ -690,6 +690,23 @@ jobs:
           PULSUSDB_COMPARE_OTLP_URL: "http://localhost:4318"
         run: cargo test -p pulsus-read --test compare_value_differential
 
+      # Issue #460: the compare() ARITY value differential, ENFORCED
+      # (non-skipped). Same digest-pinned oracle and same ClickHouse. Gates
+      # what the ARGUMENTS do rather than which values a fixed query emits:
+      # that `topN` (reference default 10, so it bites on the one-argument
+      # form too) trims each attribute per side, that trimmed values are
+      # dropped rather than folded into the `key=nil` complement or the
+      # `*_total` denominators, and that the `(start, end]` selection
+      # window REPARTITIONS the population into baseline/selection instead
+      # of filtering it (both totals still sum to the whole corpus).
+      - name: TraceQL Tempo differential leg (compare arities)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_COMPARE_DIFF_URL: "http://localhost:13200"
+          PULSUSDB_COMPARE_OTLP_URL: "http://localhost:4318"
+        run: cargo test -p pulsus-read --test compare_arity_differential
+
       # Issue #193: the by()/coalesce() grouped-response VALUE differential,
       # ENFORCED (non-skipped). Reuses the SAME digest-pinned tempo v3.0.2
       # oracle: pushes fixture spans to :4318, then asserts grouped /

@@ -43,7 +43,7 @@ Query {
                     },
                 ),
             },
-            top_n: 10,
+            top_n: 3,
             start_ns: 0,
             end_ns: 0,
             hints: [],

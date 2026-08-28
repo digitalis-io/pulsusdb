@@ -139,6 +139,11 @@ pub struct TraceMetricsPlan {
     /// range and instant forms (`PlanKind::Compare` only).
     compare_range: Option<(String, String)>,
     compare_instant: Option<(String, String)>,
+    /// `compare()`'s `topN` (issue #460) — the per-key-per-side
+    /// rank-and-keep the engine applies to the cross-tab's rows. The AST
+    /// value is validated `> 0`; a value above `usize::MAX` saturates,
+    /// which trims nothing and is exactly what an enormous `topN` means.
+    compare_top_n: usize,
     step_s: i64,
     window: SnappedWindow,
     distributed: bool,
@@ -204,6 +209,13 @@ impl TraceMetricsPlan {
         self.compare_instant
             .as_ref()
             .map(|(c, t)| (c.as_str(), t.as_str()))
+    }
+
+    /// `compare()`'s `topN` — how many distinct values the engine keeps
+    /// per attribute PER SIDE (issue #460). Meaningless for a non-compare
+    /// plan, where it carries the reference's default.
+    pub fn compare_top_n(&self) -> usize {
+        self.compare_top_n
     }
 
     /// The distinct-by-key series-cardinality probe SQL (grouped queries
@@ -402,6 +414,7 @@ pub fn plan_trace_metrics(
             bucket_expr: &range_bucket,
             cap: ctx.max_series,
             fixed_series,
+            sel_window: analysis.compare_window,
         });
         let instant_bucket = (window.end_ns / 1_000_000).to_string();
         let i = metrics_sql::metrics_compare_sql(&metrics_sql::CompareSqlInput {
@@ -413,6 +426,7 @@ pub fn plan_trace_metrics(
             bucket_expr: &instant_bucket,
             cap: ctx.max_series,
             fixed_series,
+            sel_window: analysis.compare_window,
         });
         (
             Some((r.cross_tab, r.totals)),
@@ -450,6 +464,7 @@ pub fn plan_trace_metrics(
         result_filter: analysis.result_filter,
         compare_range,
         compare_instant,
+        compare_top_n: analysis.compare_top_n,
         step_s: params.step_s,
         window,
         distributed: ctx.distributed,
@@ -507,6 +522,11 @@ pub const WELL_KNOWN_COMPARE_KEYS: &[&str] = &[
     "span.url.route",
 ];
 
+/// [`pulsus_traceql::COMPARE_DEFAULT_TOP_N`] as a `usize` — the value a
+/// non-compare plan carries in its `compare_top_n` field, so that field
+/// is never a meaningless zero.
+const COMPARE_DEFAULT_TOP_N_USIZE: usize = pulsus_traceql::COMPARE_DEFAULT_TOP_N as usize;
+
 /// The default per-bucket exemplar sample size when `with(exemplars=true)`
 /// carries no explicit count. Bounded (see [`MAX_EXEMPLARS_PER_BUCKET`]).
 pub const DEFAULT_EXEMPLARS_PER_BUCKET: u32 = 1;
@@ -530,6 +550,11 @@ struct PipelineAnalysis {
     /// The `compare({selection})` inner filter (cloned), if the pipeline is
     /// a compare stage.
     compare_selection: Option<pulsus_traceql::SpansetFilter>,
+    /// `compare()`'s `topN` argument (issue #460), saturated into `usize`.
+    compare_top_n: usize,
+    /// `compare()`'s `(start, end]` selection window in unix nanoseconds,
+    /// `None` when the query carries the `(0, 0)` no-window default.
+    compare_window: Option<(i64, i64)>,
 }
 
 /// Analyzes the metrics pipeline: a first-stage metric function (with
@@ -538,7 +563,16 @@ struct PipelineAnalysis {
 fn analyze_pipeline(query: &Query) -> Result<PipelineAnalysis, PlanError> {
     // compare() is a standalone metrics stage with its own shape; it
     // accepts `with(...)` hints (e.g. exemplars).
-    if let [PipelineStage::Compare { selection, hints }] = query.pipeline.as_slice() {
+    if let [
+        PipelineStage::Compare {
+            selection,
+            top_n,
+            start_ns,
+            end_ns,
+            hints,
+        },
+    ] = query.pipeline.as_slice()
+    {
         return Ok(PipelineAnalysis {
             kind: PlanKind::Compare,
             metric_name: "compare",
@@ -548,6 +582,16 @@ fn analyze_pipeline(query: &Query) -> Result<PipelineAnalysis, PlanError> {
             exemplar_k: resolve_hints(hints)?,
             result_filter: None,
             compare_selection: Some((**selection).clone()),
+            // `validate` guarantees `> 0`; the saturating cast means an
+            // enormous topN trims nothing rather than wrapping to zero
+            // and trimming everything.
+            compare_top_n: usize::try_from(*top_n).unwrap_or(usize::MAX),
+            // `(0, 0)` is the reference's "no selection window", and it
+            // is also an explicitly legal spelling — both map to `None`,
+            // which renders `is_sel` byte-identically to the pre-#460
+            // string. `validate` has already rejected every other
+            // non-positive combination.
+            compare_window: (*start_ns != 0 || *end_ns != 0).then_some((*start_ns, *end_ns)),
         });
     }
     let (stage, reduce) = match query.pipeline.as_slice() {
@@ -591,6 +635,10 @@ fn analyze_pipeline(query: &Query) -> Result<PipelineAnalysis, PlanError> {
         exemplar_k,
         result_filter,
         compare_selection: None,
+        // Not a compare plan; the reference's default is carried so the
+        // field is never a meaningless zero.
+        compare_top_n: COMPARE_DEFAULT_TOP_N_USIZE,
+        compare_window: None,
     })
 }
 

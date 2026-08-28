@@ -1,8 +1,8 @@
 {
   "language": "TraceQL",
   "target": "Tempo v3.0.2",
-  "sha256": "1a1543124d187227f9ca9bb45fae10cf3b6d46d445893cdbb0729781fd1fd102",
-  "construct_count": 123,
+  "sha256": "1f0957fcf6f7060e59581b25a74e4289687e39859af330b5c6ae23dd9a23d735",
+  "construct_count": 125,
   "category_counts": {
     "arithmetic": 7,
     "attribute-scopes": 11,
@@ -10,7 +10,7 @@
     "event-link-instrumentation-intrinsics": 6,
     "hints": 4,
     "logical-existence": 7,
-    "metrics-first-stage": 10,
+    "metrics-first-stage": 12,
     "metrics-second-stage": 3,
     "nested-set-intrinsics": 3,
     "pipeline-stages": 9,

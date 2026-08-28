@@ -180,12 +180,10 @@
       "id": "D17",
       "title": "compare()'s optional numeric arguments",
       "reference": "Three arities (expr.y:324-326): compare(f), compare(f, topN) and compare(f, topN, start, end), defaulting 10, 0, 0.",
-      "pulsus": "Only the one-argument form parses; a comma after the spanset filter is a positioned parse error.",
+      "pulsus": "All three arities parse; topN and the (start, end] selection window are honoured by the engine, not merely accepted (issue #460).",
       "impact": "accept-surface",
-      "status": "open",
-      "subject_kind": "positional",
-      "subject_atoms": [],
-      "stage": "held"
+      "status": "closed",
+      "closed_by": 460
     },
     {
       "id": "D18",
@@ -2067,28 +2065,18 @@
     {
       "query": "{ .a = 1 } | compare({ .b = 2 }, 10)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D17",
-      "reachability": "r2-skeleton-inserted",
-      "reachability_evidence": {
-        "kind": "insertion",
-        "anchor": "ds.compare-insertion"
-      },
-      "owning_issue": 335
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 460,
+      "closed_class": "D17"
     },
     {
       "query": "{ .a = 1 } | compare({ .b = 2 }, 10, 0, 0)",
       "reference": "accept",
-      "pulsus": "reject",
-      "verdict": "diverge",
-      "class": "D17",
-      "reachability": "r2-skeleton-inserted",
-      "reachability_evidence": {
-        "kind": "insertion",
-        "anchor": "ds.compare-insertion"
-      },
-      "owning_issue": 335
+      "pulsus": "accept",
+      "verdict": "agree",
+      "closed_by": 460,
+      "closed_class": "D17"
     },
     {
       "query": "{ .a = 1 } | avg(.b) > -1s",

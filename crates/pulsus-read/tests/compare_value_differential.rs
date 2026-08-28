@@ -61,7 +61,7 @@
 
 use std::collections::BTreeMap;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
@@ -418,20 +418,20 @@ fn otlp_push(otlp_base: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
 /// (see [`tempo_query_once`]) yields the same totals a single bucket would.
 const TEMPO_STEP_S: i64 = 60;
 
-/// How many consecutive IDENTICAL non-empty reads count as flushed.
+/// The WALL-CLOCK budget for the settle poll (issue #460), replacing the
+/// old `for _ in 0..90` counter.
 ///
-/// Three reads two seconds apart span more than one block-cut period
-/// (`max_block_duration: 2s`, `flush_check_period: 1s` in
-/// `ci/tempo/tempo-compare.yaml`), so a batch that is still landing shows a
-/// different map in at least one of them.
+/// A poll count is not a bound: each iteration costs `curl --max-time 20`
+/// PLUS the 2 s sleep, so 90 iterations is `90 x 22 s` = 33 minutes. A CI
+/// step that sits for half an hour before failing reads as a hang, gets
+/// killed, and the panic message the design relies on is never seen. The
+/// true worst case here is 180 s plus one in-flight poll (<= 22 s).
 ///
-/// The poll budget in [`tempo_counts`] grew from 60 attempts to 90 when
-/// this landed — waiting for the answer to settle costs at most two extra
-/// reads over waiting for it to appear, and the budget is a safety net
-/// rather than an expected duration. On a machine where the partial view
-/// never reproduces at all, a clean live run still took **four** reference
-/// requests before settling, so the extra headroom is not theoretical.
-const STABLE_READS: usize = 3;
+/// 180 s preserves the old sleep budget's evident intent while making the
+/// number mean what it says. Observed settle latency on this corpus shape
+/// is 4-15 polls (roughly 8-30 s), so the deadline is a backstop rather
+/// than a tuning parameter.
+const SETTLE_BUDGET_S: u64 = 180;
 
 /// Polls Tempo's metrics API until `compare()` returns a STABLE view of the
 /// corpus.
@@ -452,60 +452,28 @@ const STABLE_READS: usize = 3;
 /// trace (`rootName "idle"`, `rootServiceName "batch"`,
 /// `instrumentation:name "otel-idle"` and `instrumentation:version "2.1.0"`
 /// all absent) with `statusMessage ""` counted 1 against the corpus's 2.
-/// Each went green on a re-run with nothing changed. The flake predates the
-/// change that finally chased it down; it was found four times and
-/// re-run past four times.
+/// Two of the four (30610626381, 33110647702) were re-run and passed on
+/// attempt 2 with nothing changed; the other two were never re-run.
+/// Partial views are attested by all four; the re-run behaviour by two.
+/// The flake predates the change that finally chased it down.
 ///
 /// Past-anchoring is still necessary — it is what stops the poll waiting on
 /// a future wall-clock bucket boundary, which is the flake this suite fixed
 /// earlier — it is just not sufficient. What the loop waits out is the
 /// FLUSH, and a flush is done when the answer stops moving.
-fn tempo_counts(api_base: &str, window: (i64, i64)) -> Counts {
-    let mut wait = StabilityWait::default();
-    for _ in 0..90 {
-        if let Some(settled) = wait.observe(tempo_query_once(api_base, window)) {
-            return settled;
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    }
-    panic!(
-        "Tempo never returned a STABLE non-empty compare() view within the poll budget \
-         (last observation {:?})",
-        wait.last
-    );
-}
-
-/// The stability rule, separated from the polling so it can be exercised
-/// against a SCRIPTED sequence of reads.
 ///
-/// A timing fix nobody has watched fail is not a fix, and this failure is by
-/// nature hard to summon on demand — it did not reproduce on a developer
-/// machine across several attempts (240-span batches, corpora spread over
-/// ten minutes of blocks, polling from t=0 at 50 ms), while it happened in
-/// CI. So the reproduction is scripted from the numbers CI actually
-/// produced, in [`the_wait_absorbs_the_partial_view_that_reddened_ci`], and
-/// it is deterministic.
-#[derive(Default)]
-struct StabilityWait {
-    last: Option<Counts>,
-    run: usize,
-}
-
-impl StabilityWait {
-    /// Feeds one poll result. Returns `Some(counts)` only once the SAME
-    /// non-empty map has been observed [`STABLE_READS`] times running; an
-    /// empty or failed read neither settles nor resets, it is simply not
-    /// yet an answer.
-    fn observe(&mut self, read: Option<Counts>) -> Option<Counts> {
-        let map = read.filter(|m| !m.is_empty())?;
-        self.run = if self.last.as_ref() == Some(&map) {
-            self.run + 1
-        } else {
-            1
-        };
-        self.last = Some(map);
-        (self.run >= STABLE_READS).then(|| self.last.clone().expect("just set"))
-    }
+/// The rule and the loop both live in `pulsus_testkit` (issue #460), so
+/// this suite and `compare_arity_differential.rs` cannot drift apart on
+/// either. The emptiness decision stays HERE, at the call site, because
+/// it is this suite's domain knowledge: an empty count map is not an
+/// answer.
+fn tempo_counts(api_base: &str, window: (i64, i64)) -> Counts {
+    pulsus_testkit::settle_by(
+        Instant::now() + Duration::from_secs(SETTLE_BUDGET_S),
+        Duration::from_secs(2),
+        "Tempo compare() value view",
+        || tempo_query_once(api_base, window).filter(|m| !m.is_empty()),
+    )
 }
 
 fn tempo_query_once(api_base: &str, window: (i64, i64)) -> Option<Counts> {
@@ -738,7 +706,11 @@ fn the_wait_absorbs_the_partial_view_that_reddened_ci() {
     );
 
     // The CI sequence: nothing, nothing, the partial view, then the
-    // complete one from there on.
+    // complete one from there on. Since issue #460 the emptiness decision
+    // lives at the CALL SITE, so the scripted reads go through the same
+    // `.filter(|m| !m.is_empty())` the live poll uses — otherwise this
+    // test would exercise a different composition from production.
+    let empty = Counts::new();
     let sequence = [
         None,
         None,
@@ -760,15 +732,14 @@ fn the_wait_absorbs_the_partial_view_that_reddened_ci() {
     );
 
     // What the wait does.
-    let mut wait = StabilityWait::default();
-    let mut settled_at = None;
-    for (i, read) in sequence.iter().enumerate() {
-        if let Some(got) = wait.observe(read.clone()) {
-            settled_at = Some((i, got));
-            break;
-        }
-    }
-    let (index, settled) = settled_at.expect("the wait must settle within the scripted sequence");
+    let settle = |seq: &[Option<Counts>]| -> Option<(usize, Counts)> {
+        let mut wait = pulsus_testkit::StabilityWait::default();
+        seq.iter().enumerate().find_map(|(i, read)| {
+            wait.observe(read.clone().filter(|m: &Counts| !m.is_empty()))
+                .map(|got| (i, got))
+        })
+    };
+    let (index, settled) = settle(&sequence).expect("the wait must settle within the sequence");
     assert_eq!(
         settled, complete,
         "the wait must return the COMPLETE view, never the partial one"
@@ -779,9 +750,41 @@ fn the_wait_absorbs_the_partial_view_that_reddened_ci() {
          would mean a single repeat was accepted as stable"
     );
 
+    // Issue #460: an EMPTY read arriving MID-RUN neither settles the run
+    // nor resets it. The committed sequence above never contained an empty
+    // map and both its `None`s arrived before any run had started, so it
+    // could not establish this — the property was asserted for two rounds
+    // and tested by nothing.
+    let mid_run_empty = [
+        Some(complete.clone()), // run -> 1
+        Some(complete.clone()), // run -> 2
+        Some(empty.clone()),    // the case the old sequence never had
+        Some(complete.clone()), // run -> 3 iff the empty neither settled nor reset
+    ];
+    assert_eq!(
+        settle(&mid_run_empty).map(|(i, _)| i),
+        Some(3),
+        "an empty read arriving mid-run must PRESERVE the run: settling earlier would mean the \
+         empty read settled something, later that it reset the run"
+    );
+    // The control: an empty read between two identical ones does not let
+    // three arrive any sooner.
+    let control = [
+        Some(complete.clone()),
+        Some(empty.clone()),
+        Some(complete.clone()),
+        Some(complete.clone()),
+    ];
+    assert_eq!(
+        settle(&control).map(|(i, _)| i),
+        Some(3),
+        "the control: the empty read contributes nothing, so the third COMPLETE read is what \
+         settles"
+    );
+
     // And the property the number 3 is there for: two identical reads are
     // not enough, because a batch can pause mid-flush for one interval.
-    let mut two_only = StabilityWait::default();
+    let mut two_only = pulsus_testkit::StabilityWait::default();
     assert!(two_only.observe(Some(partial.clone())).is_none());
     assert!(
         two_only.observe(Some(partial.clone())).is_none(),
@@ -791,5 +794,10 @@ fn the_wait_absorbs_the_partial_view_that_reddened_ci() {
         two_only.observe(Some(partial.clone())),
         Some(partial),
         "three do"
+    );
+    assert_eq!(
+        pulsus_testkit::STABLE_READS,
+        3,
+        "the assertions above are written against three consecutive identical reads"
     );
 }

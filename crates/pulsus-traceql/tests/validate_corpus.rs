@@ -502,6 +502,9 @@ fn vector_error_variants_are_real_rule_ids() {
         }
         .rule_id(),
         ValidateError::CompareWithSecondStage.rule_id(),
+        ValidateError::CompareTopNNotPositive.rule_id(),
+        ValidateError::CompareTimestampsNotPositive.rule_id(),
+        ValidateError::CompareEndNotAfterStart.rule_id(),
     ]
     .into_iter()
     .collect();

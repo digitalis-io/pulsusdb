@@ -1021,6 +1021,83 @@
    "pulsus": "accept",
    "unknown_class": "compiled-too-big",
    "divergence": "traceql-validate-re2-unknown-residual"
+  },
+  {
+   "id": "c-topn-r1",
+   "check": "compare-topn-not-positive",
+   "query": "{} | compare({ .a = 1 }, 0)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "compare-topn-not-positive"
+  },
+  {
+   "id": "c-topn-r2",
+   "check": "compare-topn-not-positive",
+   "query": "{} | compare({ .a = 1 }, 0, 5, 4)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "compare-topn-not-positive"
+  },
+  {
+   "id": "c-topn-a1",
+   "check": "compare-topn-not-positive",
+   "query": "{} | compare({ .a = 1 }, 3)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "c-ts-r1",
+   "check": "compare-timestamps-not-positive",
+   "query": "{} | compare({ .a = 1 }, 10, 0, 1787904155000000000)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "compare-timestamps-not-positive"
+  },
+  {
+   "id": "c-ts-r2",
+   "check": "compare-timestamps-not-positive",
+   "query": "{} | compare({ .a = 1 }, 5, 0, 4)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "compare-timestamps-not-positive"
+  },
+  {
+   "id": "c-ts-a1",
+   "check": "compare-timestamps-not-positive",
+   "query": "{} | compare({ .a = 1 }, 10, 0, 0)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
+  },
+  {
+   "id": "c-end-r1",
+   "check": "compare-end-not-after-start",
+   "query": "{} | compare({ .a = 1 }, 10, 5, 4)",
+   "route": "search-query",
+   "tempo_status": 400,
+   "tempo": "reject",
+   "pulsus": "reject",
+   "error_variant": "compare-end-not-after-start"
+  },
+  {
+   "id": "c-end-a1",
+   "check": "compare-end-not-after-start",
+   "query": "{} | compare({ .a = 1 }, 10, 1787900555000000000, 1787904155000000000)",
+   "route": "search-query",
+   "tempo_status": 200,
+   "tempo": "accept",
+   "pulsus": "accept"
   }
  ]
 }

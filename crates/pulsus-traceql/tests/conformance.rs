@@ -595,8 +595,12 @@ fn differential_categories_are_pinned() {
     // SpanKindValue variant and `minInt`/`maxInt` resolve in
     // `static_value_of` — so each flipped to `supported` with its own
     // corpus case: 119, and the interim set is empty again.
+    // Issue #460 adds `metrics.compare.topn` and `metrics.compare.window`
+    // — the reference's other two `compare()` productions
+    // (`expr.y:325-326`), both `supported` with corpus evidence and both
+    // measured `accept` against the pinned oracle: 119 + 2 = 121.
     assert_eq!(
-        supported, 119,
+        supported, 121,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(
