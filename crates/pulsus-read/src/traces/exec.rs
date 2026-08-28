@@ -707,7 +707,7 @@ impl TraceEngine {
             let (cross_tab, totals) = plan
                 .compare_range()
                 .expect("compare plan carries range SQL");
-            return self.frame_compare(cross_tab, totals).await;
+            return self.frame_compare(cross_tab, totals, plan.compare_top_n()).await;
         }
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(plan.range_sql());
@@ -921,10 +921,41 @@ impl TraceEngine {
     /// data-driven-when-present here with no per-key branch, and only remain
     /// well-known-`nil` when fully absent (`instrumentation:name`/
     /// `instrumentation:version` still always `nil` pending #179).
+    ///
+    /// # `top_n` (issue #460)
+    ///
+    /// `compare()`'s second argument, defaulting to **10** in the
+    /// reference's own grammar (`expr.y:324`), so it bites on the
+    /// one-argument form too. Per attribute AND per side independently,
+    /// that side's distinct values are ranked by the sum of their counts
+    /// over the whole window and only the top `top_n` are emitted
+    /// (`engine_metrics_compare.go:231-253` — `addValues` builds a
+    /// per-side `topN` and calls `top.get(m.topN, …)`, whose key is
+    /// `Σ values`). Trimmed values are **dropped, not folded**: they stay
+    /// in `key_bucket_sum`, so the `key=nil` complement and the `*_total`
+    /// denominators are unchanged.
+    ///
+    /// Ties are broken here by ascending value string. The reference's
+    /// order under a tie is `sort.Slice`, which is not stable, so its own
+    /// survivors are arbitrary (measured twice, two different arbitrary
+    /// sets); ours is deterministic, which is a deliberate refinement —
+    /// ledger `traceql-compare-topn-tie-order`.
+    ///
+    /// The reference also emits a `__meta_error="__too_many_values__"`
+    /// series when a key exceeds `topN` (`:255-261`), with `Values: nil`.
+    /// It is **unreachable on the wire** — `SeriesSet.ToProto` drops
+    /// zero-sample series (`engine_metrics.go:379-382`) — and measured
+    /// absent from the container's body at `topN=1` and `topN=3`.
+    /// Emitting one would be a divergence, so we do not.
+    ///
+    /// Cost: the ranking runs over rows [`Self::enforce_series_cap`] has
+    /// already bounded to `reader.traceql_max_series` distinct
+    /// `(key, value)` pairs, with no extra query and no extra round trip.
     async fn frame_compare(
         &self,
         cross_tab_sql: &str,
         totals_sql: &str,
+        top_n: usize,
     ) -> Result<TraceMetricsResult, ReadError> {
         let settings = metrics_settings(&self.config);
         // (key, value) -> [(t, base_n, sel_n)]; (key, t) -> Σ present.
@@ -974,26 +1005,69 @@ impl TraceEngine {
                 MetricLabel::str(key, val),
             ]
         };
+        // The per-key-per-side rank-and-keep buffers, reused across keys so
+        // the ranking allocates once rather than once per attribute. Both
+        // are bounded by the probe-capped distinct-pair count.
+        let mut rank_base: Vec<(u64, &str)> = Vec::new();
+        let mut rank_sel: Vec<(u64, &str)> = Vec::new();
         for key in &keys {
-            // Present values: one baseline + one selection series each.
+            // topN (issue #460): rank this key's present values on EACH
+            // side by that side's window sum, keep the top `top_n`.
+            rank_base.clear();
+            rank_sel.clear();
             for ((k, val), rows) in per_kv.range((key.clone(), String::new())..) {
                 if k != key {
                     break;
                 }
-                let base: Vec<(i64, f64)> = rows.iter().map(|(t, b, _)| (*t, *b as f64)).collect();
-                let sel: Vec<(i64, f64)> = rows.iter().map(|(t, _, s)| (*t, *s as f64)).collect();
-                series.push(TraceMetricSeries {
-                    labels: meta("baseline", key, val),
-                    samples: base,
-                    exemplars: vec![],
-                });
-                series.push(TraceMetricSeries {
-                    labels: meta("selection", key, val),
-                    samples: sel,
-                    exemplars: vec![],
-                });
+                let (bsum, ssum) = rows
+                    .iter()
+                    .fold((0u64, 0u64), |(b, s), (_, rb, rs)| (b + rb, s + rs));
+                rank_base.push((bsum, val.as_str()));
+                rank_sel.push((ssum, val.as_str()));
             }
-            // `key=nil` complement + the `*_total` denominators, per bucket.
+            // Descending by sum, then ascending by value — the tie order
+            // is ours and deterministic (see the doc comment).
+            let keep = |ranked: &mut Vec<(u64, &str)>| -> BTreeSet<String> {
+                ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+                ranked
+                    .iter()
+                    .take(top_n)
+                    .map(|(_, v)| (*v).to_string())
+                    .collect()
+            };
+            let keep_base = keep(&mut rank_base);
+            let keep_sel = keep(&mut rank_sel);
+
+            // Present values: one baseline + one selection series each,
+            // emitted only for that side's kept set.
+            for ((k, val), rows) in per_kv.range((key.clone(), String::new())..) {
+                if k != key {
+                    break;
+                }
+                if keep_base.contains(val) {
+                    let base: Vec<(i64, f64)> =
+                        rows.iter().map(|(t, b, _)| (*t, *b as f64)).collect();
+                    series.push(TraceMetricSeries {
+                        labels: meta("baseline", key, val),
+                        samples: base,
+                        exemplars: vec![],
+                    });
+                }
+                if keep_sel.contains(val) {
+                    let sel: Vec<(i64, f64)> =
+                        rows.iter().map(|(t, _, s)| (*t, *s as f64)).collect();
+                    series.push(TraceMetricSeries {
+                        labels: meta("selection", key, val),
+                        samples: sel,
+                        exemplars: vec![],
+                    });
+                }
+            }
+            // `key=nil` complement + the `*_total` denominators, per
+            // bucket. Built from the UNTRIMMED `key_bucket_sum`: a value
+            // topN dropped is gone, never folded into the complement or
+            // the denominator (`selection_total` stays the whole
+            // population, which is what the reference returns).
             let mut base_nil = Vec::new();
             let mut sel_nil = Vec::new();
             let mut base_total = Vec::new();
@@ -1140,7 +1214,7 @@ impl TraceEngine {
             let (cross_tab, totals) = plan
                 .compare_instant()
                 .expect("compare plan carries instant SQL");
-            return self.frame_compare(cross_tab, totals).await;
+            return self.frame_compare(cross_tab, totals, plan.compare_top_n()).await;
         }
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(plan.instant_sql());

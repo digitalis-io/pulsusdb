@@ -178,6 +178,20 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // Issue #460: the four-argument form Grafana Traces Drilldown's
+        // Comparison tab generates once a time selection is dragged. The
+        // `(start, end]` window is a conjunct on the `is_sel` SELECT-list
+        // expression and appears NOWHERE in `PREWHERE`/`WHERE` — the
+        // window repartitions the population into baseline/selection, it
+        // does not filter it (`engine_metrics_compare.go:100-112`
+        // @ v3.0.2). Diffing this golden against `compare_status.sql`
+        // shows the whole change: one conjunct, in one place, and the
+        // totals/probe SQL untouched.
+        name: "compare_status_window",
+        q: r#"{ resource.service.name = "checkout" } | compare({ span.http.status_code = "500" }, 3, 1700000005000000000, 1700000008000000000)"#,
+        distributed: false,
+    },
+    Case {
         // Issue #458: the root-span filter the datasource's root-span rate
         // panel generates. `nestedSetParent < 0` is TRUE for the root
         // sentinel `-1` and constant-FALSE over the whole non-root domain

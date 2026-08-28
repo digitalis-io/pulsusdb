@@ -969,6 +969,21 @@ pub struct CompareSqlInput<'a> {
     pub cap: u64,
     /// The fixed well-known-attribute series count folded into the cap.
     pub fixed_series: u64,
+    /// The `compare(f, n, start, end)` selection window, unix nanoseconds,
+    /// half-open as `(start, end]` — lower bound EXCLUSIVE, upper bound
+    /// INCLUSIVE (`engine_metrics_compare.go:100-112` @ v3.0.2:
+    /// `spanStartTime > uint64(m.start) && spanStartTime <= uint64(m.end)`).
+    ///
+    /// The window REPARTITIONS, it does not filter: a span the outer
+    /// filter and the request window admit but the selection window
+    /// excludes is still counted — it simply lands in `baseline`. That is
+    /// why it renders as a conjunct on the `is_sel` SELECT-list
+    /// expression and never as a `WHERE`/`PREWHERE` predicate; moving it
+    /// into the filter would drop those spans and change every total.
+    ///
+    /// `None` renders `is_sel` byte-identically to the pre-#460 string
+    /// (pinned by `golden/traces_metrics/compare_status.sql`).
+    pub sel_window: Option<(i64, i64)>,
 }
 
 /// Builds the compare() SQL trio. The cross-tab enumerates the present
@@ -988,12 +1003,22 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
         bucket_expr,
         cap,
         fixed_series,
+        sel_window,
     } = *input;
+    // `(start, end]` on the span's own start time, ANDed into the
+    // selection predicate — never into the filter. See
+    // [`CompareSqlInput::sel_window`].
+    let is_sel = match sel_window {
+        Some((start_ns, end_ns)) => format!(
+            "(({inner_bool}) AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns})"
+        ),
+        None => format!("({inner_bool})"),
+    };
     let mut raw = format!(
         "SELECT {bucket_expr} AS t, trace_id, span_id, name AS i_name, kind AS i_kind, \
          status_code AS i_status, service AS i_service, status_message AS i_status_message, \
          scope_name AS i_scope_name, scope_version AS i_scope_version, \
-         ({inner_bool}) AS is_sel\n    FROM {spans_table}\n    "
+         {is_sel} AS is_sel\n    FROM {spans_table}\n    "
     );
     push_prewhere_where_indented(&mut raw, outer, window);
     // Replay-dedup: one row per (t, trace_id, span_id) so at-least-once

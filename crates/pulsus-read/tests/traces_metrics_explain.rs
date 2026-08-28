@@ -774,6 +774,53 @@ async fn metrics_explain_and_budget_gates() {
          (narrow {narrow_sel} vs full {full_sel}/{full_total}) — the roots LEFT JOIN must not \
          degrade it to a window-independent full scan"
     );
+    // ---- Issue #460 AC 7: the four-argument compare()'s selection window
+    // is a SELECT-list conjunct, so it cannot touch granule pruning. Over
+    // the SAME narrow request window as `narrow_cross` above, the base
+    // trace_spans scan must select the SAME granules — and still prune
+    // strictly harder than the whole-corpus window. A window predicate
+    // moved into WHERE/PREWHERE would change the first number and this
+    // fails. ------------------------------------------------------------
+    let windowed = plan_for(
+        &engine,
+        &format!(
+            r#"{{}} | compare({{ span.http.status_code = "500" }}, 3, {}, {})"#,
+            now - 20 * 60 * NS_PER_S,
+            now - 10 * 60 * NS_PER_S
+        ),
+        now - 30 * 60 * NS_PER_S,
+        now,
+    );
+    let (windowed_cross, _) = windowed
+        .compare_range()
+        .expect("windowed compare range SQL");
+    assert!(
+        windowed_cross.contains(&format!(
+            "AND timestamp_ns > {} AND timestamp_ns <= {}) AS is_sel",
+            now - 20 * 60 * NS_PER_S,
+            now - 10 * 60 * NS_PER_S
+        )),
+        "the selection window renders as a conjunct on the is_sel SELECT-list expression:\n\
+         {windowed_cross}"
+    );
+    let base_windowed = extract_compare_base_scan(windowed_cross);
+    let (windowed_sel, windowed_total) =
+        table_primary_key_granules(&explain_raw(&client, &base_windowed).await, "trace_spans");
+    assert_eq!(
+        (windowed_sel, windowed_total),
+        (narrow_sel, full_total),
+        "the selection window must not change granule pruning: the four-argument form selected \
+         {windowed_sel}/{windowed_total} granules where the one-argument form over the same \
+         request window selected {narrow_sel}/{full_total}. A window predicate that reached \
+         WHERE or PREWHERE would move this — and would also drop the spans the reference merely \
+         re-partitions into baseline"
+    );
+    assert!(
+        windowed_sel < full_sel,
+        "the windowed compare base scan must still prune strictly harder on a narrow request \
+         window ({windowed_sel} vs {full_sel}/{full_total})"
+    );
+
     let cmp_res = engine
         .metrics_range(&cmp_plan)
         .await
