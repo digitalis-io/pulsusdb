@@ -366,11 +366,38 @@ pub struct RootSummary {
     pub duration_ns: i64,
 }
 
-/// One returned trace: root metadata + the matched spanset summaries.
+/// A winner trace's root-span summary plus its trace-wide time envelope
+/// (issue #464), both derived in ONE pass over the same trace-wide,
+/// window-free, uncapped `root_sql` rows — so the envelope is
+/// full-trace-exact for the same reason the root is, and costs no extra
+/// query, no extra round trip and no second walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceContext {
+    pub root: RootSummary,
+    /// `min(timestamp_ns)` over every span of the trace.
+    pub trace_start_ns: i64,
+    /// `max(timestamp_ns + duration_ns) - min(timestamp_ns)`.
+    pub trace_duration_ns: i64,
+}
+
+/// One returned trace: root metadata + the trace-wide envelope + the
+/// matched spanset summaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceSearchResult {
     pub trace_id: [u8; 16],
+    /// The ROOT SPAN's own metadata. `service`/`name` are the reference's
+    /// `rootServiceName`/`rootTraceName`; `start_ns`/`duration_ns` are the
+    /// root span's own and are NOT what the trace level reports.
     pub root: RootSummary,
+    /// The reference's `startTimeUnixNano` = `Spanset.StartTimeUnixNanos`
+    /// = `traceStart` (`tempodb/encoding/vparquet4/schema.go:558` @
+    /// v3.0.2), filled from the spanset at `pkg/traceql/engine.go:294`.
+    pub trace_start_ns: i64,
+    /// The reference's `durationMs` before the millisecond divide =
+    /// `Spanset.DurationNanos` = `traceEnd - traceStart`
+    /// (`tempodb/encoding/vparquet4/schema.go:560` @ v3.0.2), filled at
+    /// `pkg/traceql/engine.go:295`.
+    pub trace_duration_ns: i64,
     /// Total exactly-matched spans (pre-`spss` cap).
     pub matched: u32,
     /// `spss`-capped matched-span summaries, ascending `(start_ns, span_id)`.
@@ -389,8 +416,19 @@ pub struct TraceSearchResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchOutput {
     pub traces: Vec<TraceSearchResult>,
+    /// Any internal bound engaged before natural exhaustion. Not a wire
+    /// field: the response renderer turns it into the reference's own
+    /// incompleteness signal, `completedJobs < totalJobs` (issue #464).
     pub partial: bool,
+    /// `traces.len()`. Not a wire field either (issue #464 retired the
+    /// invented `metrics.returned`); it stays because the read-path bench
+    /// reports it from this struct.
     pub returned: u32,
+    /// The request's own `limit`, echoed back to the caller of this
+    /// crate. **No longer serialized** — `metrics.limit` was invented and
+    /// issue #464 removed it, since a caller already holds its own
+    /// request parameter. The field stays because it is part of this
+    /// crate's public result type and the search bench reads it.
     pub limit: u32,
 }
 
@@ -1898,10 +1936,13 @@ impl TraceEngine {
         )?;
         let mut traces: Vec<TraceSearchResult> = Vec::with_capacity(winners.len());
         for w in winners {
-            let root = match roots.get(&w.trace_id) {
-                Some(root) => {
-                    budget.charge(root.service.len() + root.name.len())?;
-                    root.clone()
+            // Charge-before-materialize in BOTH branches (the module's
+            // standing invariant), which is why only the fallback's
+            // CONSTRUCTION moved into a function, not the branch itself.
+            let ctx = match roots.get(&w.trace_id) {
+                Some(ctx) => {
+                    budget.charge(ctx.root.service.len() + ctx.root.name.len())?;
+                    ctx.clone()
                 }
                 // A winner whose root read returned nothing (TTL race —
                 // pathological) falls back to its matched-span metadata
@@ -1909,17 +1950,14 @@ impl TraceEngine {
                 None => {
                     let name_len = w.spans.first().map(|s| s.name.len()).unwrap_or(0);
                     budget.charge(name_len)?;
-                    RootSummary {
-                        service: String::new(),
-                        name: w.spans.first().map(|s| s.name.clone()).unwrap_or_default(),
-                        start_ns: w.spans.first().map(|s| s.start_ns).unwrap_or(w.sort_key),
-                        duration_ns: 0,
-                    }
+                    fallback_trace_context(&w.spans, w.sort_key)
                 }
             };
             traces.push(TraceSearchResult {
                 trace_id: w.trace_id,
-                root,
+                root: ctx.root,
+                trace_start_ns: ctx.trace_start_ns,
+                trace_duration_ns: ctx.trace_duration_ns,
                 matched: w.matched,
                 spans: w.spans,
                 groups: w.groups,
@@ -2702,56 +2740,130 @@ fn charge_explain(
     Ok(())
 }
 
-/// The retained cost of the winners' root map — per entry the map key,
-/// the summary struct, its string payloads, and the container-overhead
+/// The retained cost of the winners' context map — per entry the map key,
+/// the [`TraceContext`] struct (the root summary PLUS the two envelope
+/// `i64`s, issue #464), its string payloads, and the container-overhead
 /// envelope. Charged after [`pick_roots`] and held for the rest of the
-/// request (the summaries move into the returned [`TraceSearchResult`]s).
-fn roots_retained_bytes(roots: &HashMap<[u8; 16], RootSummary>) -> usize {
+/// request (the contexts move into the returned [`TraceSearchResult`]s).
+fn roots_retained_bytes(roots: &HashMap<[u8; 16], TraceContext>) -> usize {
     roots
         .values()
-        .map(|root| {
+        .map(|ctx| {
             std::mem::size_of::<[u8; 16]>()
-                + std::mem::size_of::<RootSummary>()
+                + std::mem::size_of::<TraceContext>()
                 + RETAINED_ENTRY_OVERHEAD
-                + root.service.len()
-                + root.name.len()
+                + ctx.root.service.len()
+                + ctx.root.name.len()
         })
         .sum()
 }
 
-/// Picks each trace's root from its trace-wide root-hydration rows:
+/// Picks each trace's root from its trace-wide root-hydration rows —
 /// `parent_id` all-zero (earliest such span under `(ts, span_id)`), else
-/// the timestamp-earliest span of the full trace.
-fn pick_roots(rows: Vec<RootRow>) -> HashMap<[u8; 16], RootSummary> {
-    let mut best: HashMap<[u8; 16], (bool, i64, [u8; 8], RootSummary)> = HashMap::new();
+/// the timestamp-earliest span of the full trace — and folds the trace's
+/// time envelope over the SAME rows in the SAME pass (issue #464).
+///
+/// The envelope folds over **every** row, whether or not that row wins the
+/// root contest: `min(timestamp_ns)` and `max(timestamp_ns + duration_ns)`
+/// over the whole trace, emitted as a WIDTH (`end - start`), because the
+/// reference's `Spanset.DurationNanos` is `traceEnd - traceStart`
+/// (`tempodb/encoding/vparquet4/schema.go:558-560` @ v3.0.2) and not an
+/// end instant. Root selection is unchanged, term for term.
+fn pick_roots(rows: Vec<RootRow>) -> HashMap<[u8; 16], TraceContext> {
+    /// [`pick_roots`]' per-trace accumulator: the root contest's running
+    /// winner, plus the envelope's running `(start, end)`.
+    struct RootPick {
+        is_root: bool,
+        start_ns: i64,
+        span_id: [u8; 8],
+        summary: RootSummary,
+        envelope_start_ns: i64,
+        envelope_end_ns: i64,
+    }
+
+    let mut best: HashMap<[u8; 16], RootPick> = HashMap::new();
     for row in rows {
         let is_root = row.parent_id == [0u8; 8];
-        let summary = RootSummary {
-            service: row.service,
-            name: row.name,
+        let span_start = row.timestamp_ns;
+        // `saturating_add` rather than `+`: a stored width is
+        // non-negative by ingest construction, but a corrupt row must not
+        // panic a read.
+        let span_end = row.timestamp_ns.saturating_add(row.duration_ns);
+        let candidate = RootPick {
+            is_root,
             start_ns: row.timestamp_ns,
-            duration_ns: row.duration_ns,
+            span_id: row.span_id,
+            summary: RootSummary {
+                service: row.service,
+                name: row.name,
+                start_ns: row.timestamp_ns,
+                duration_ns: row.duration_ns,
+            },
+            envelope_start_ns: span_start,
+            envelope_end_ns: span_end,
         };
-        let candidate = (is_root, row.timestamp_ns, row.span_id, summary);
         match best.get_mut(&row.trace_id) {
             None => {
                 best.insert(row.trace_id, candidate);
             }
             Some(current) => {
+                // The envelope sees EVERY span; the root contest is
+                // decided separately and does not gate it.
+                current.envelope_start_ns = current.envelope_start_ns.min(span_start);
+                current.envelope_end_ns = current.envelope_end_ns.max(span_end);
                 // A true root always beats a non-root; within the same
                 // class, earlier (ts, span_id) wins.
-                let better = (candidate.0 && !current.0)
-                    || (candidate.0 == current.0
-                        && (candidate.1, candidate.2) < (current.1, current.2));
+                let better = (candidate.is_root && !current.is_root)
+                    || (candidate.is_root == current.is_root
+                        && (candidate.start_ns, candidate.span_id)
+                            < (current.start_ns, current.span_id));
                 if better {
-                    *current = candidate;
+                    current.is_root = candidate.is_root;
+                    current.start_ns = candidate.start_ns;
+                    current.span_id = candidate.span_id;
+                    current.summary = candidate.summary;
                 }
             }
         }
     }
     best.into_iter()
-        .map(|(trace_id, (_, _, _, summary))| (trace_id, summary))
+        .map(|(trace_id, pick)| {
+            (
+                trace_id,
+                TraceContext {
+                    root: pick.summary,
+                    trace_start_ns: pick.envelope_start_ns,
+                    trace_duration_ns: pick.envelope_end_ns.saturating_sub(pick.envelope_start_ns),
+                },
+            )
+        })
         .collect()
+}
+
+/// The context for a winner whose trace-wide root read returned NOTHING (a
+/// TTL race — pathological): its matched-span metadata rather than a
+/// silently dropped trace.
+///
+/// **Pure and separate from the assembly loop so both fallback fields are
+/// unit-testable without an engine** — the assembly branch is reachable
+/// only from a live read that loses its rows between phases, so without
+/// this split nothing in the suite pins the values (issue #464).
+///
+/// The width is **zero**, never the matched span's own: no row survives to
+/// tell us the trace's extent, and a non-zero width here would be
+/// invented.
+fn fallback_trace_context(spans: &[SpanSummary], sort_key: i64) -> TraceContext {
+    let start_ns = spans.first().map(|s| s.start_ns).unwrap_or(sort_key);
+    TraceContext {
+        root: RootSummary {
+            service: String::new(),
+            name: spans.first().map(|s| s.name.clone()).unwrap_or_default(),
+            start_ns,
+            duration_ns: 0,
+        },
+        trace_start_ns: start_ns,
+        trace_duration_ns: 0,
+    }
 }
 
 #[cfg(test)]
@@ -3853,16 +3965,29 @@ mod tests {
             retained,
             "after the transfer, exactly the retained roots bytes stay charged"
         );
-        // The retained charge covers the map entry, struct, strings, and
-        // container overhead per entry.
-        let root = &roots[&tid(1)];
+        // The retained charge is EXACTLY the per-entry map key +
+        // `TraceContext` struct + string payloads + container overhead,
+        // summed over the map — issue #464 replaced a `>=` bound that
+        // could not see an undercharge, because a bound computed from the
+        // same `size_of` the accounting used moved with it.
         assert!(
-            retained
-                >= std::mem::size_of::<[u8; 16]>()
-                    + std::mem::size_of::<RootSummary>()
+            std::mem::size_of::<TraceContext>()
+                >= std::mem::size_of::<RootSummary>() + 2 * std::mem::size_of::<i64>(),
+            "TraceContext is the root summary PLUS the two envelope i64s"
+        );
+        let expected: usize = roots
+            .values()
+            .map(|ctx| {
+                std::mem::size_of::<[u8; 16]>()
+                    + std::mem::size_of::<TraceContext>()
                     + RETAINED_ENTRY_OVERHEAD
-                    + root.service.len()
-                    + root.name.len()
+                    + ctx.root.service.len()
+                    + ctx.root.name.len()
+            })
+            .sum();
+        assert_eq!(
+            retained, expected,
+            "the retained charge must be computed from TraceContext (root summary PLUS the two envelope i64s), not from RootSummary"
         );
     }
 
@@ -3907,7 +4032,7 @@ mod tests {
             duration_ns: 5,
         };
         let roots = pick_roots(vec![row(10, 2, 9, "early-child"), row(20, 1, 0, "root")]);
-        assert_eq!(roots[&tid(1)].name, "root");
+        assert_eq!(roots[&tid(1)].root.name, "root");
     }
 
     #[test]
@@ -3926,7 +4051,130 @@ mod tests {
             duration_ns: 5,
         };
         let roots = pick_roots(vec![row(20, 2, "later"), row(10, 1, "earliest")]);
-        assert_eq!(roots[&tid(1)].name, "earliest");
+        assert_eq!(roots[&tid(1)].root.name, "earliest");
+    }
+
+    /// Issue #464: the trace-level envelope is folded over EVERY span of
+    /// the trace-wide root read, in the same pass that picks the root, and
+    /// it is a WIDTH.
+    ///
+    /// The base instant is deliberately non-zero, so reporting the
+    /// envelope's END instead of its width is distinguishable from
+    /// reporting the width; with `B == 0` the two are the same number and
+    /// this test could not tell them apart.
+    ///
+    /// The root here is neither the earliest span nor the widest, so the
+    /// envelope cannot be satisfied by the root's own window: the root
+    /// starts 1_000 ns after the trace does and is 42 ns wide, while the
+    /// trace runs from `B` to `B + 10_000`.
+    #[test]
+    fn pick_roots_folds_the_trace_envelope_over_every_span_as_a_width() {
+        const B: i64 = 1_700_000_000_000_000_000;
+        let row = |ts: i64, dur: i64, span: u8, parent: u8, name: &str| RootRow {
+            trace_id: tid(1),
+            span_id: {
+                let mut id = [0u8; 8];
+                id[7] = span;
+                id
+            },
+            parent_id: {
+                let mut id = [0u8; 8];
+                id[7] = parent;
+                id
+            },
+            service: "svc".to_string(),
+            name: name.to_string(),
+            timestamp_ns: ts,
+            duration_ns: dur,
+        };
+        let roots = pick_roots(vec![
+            row(B + 1_000, 42, 1, 0, "root"),
+            row(B, 0, 2, 1, "earliest-child"),
+            row(B + 1_000, 9_000, 3, 1, "latest-ending-child"),
+        ]);
+        let ctx = &roots[&tid(1)];
+        assert_eq!(
+            ctx.trace_start_ns, B,
+            "the envelope starts at the EARLIEST span, not the root"
+        );
+        assert_eq!(
+            ctx.trace_duration_ns, 10_000,
+            "the envelope is a WIDTH: (B + 1_000 + 9_000) - B, not the root's 42 and not the \
+             envelope's end"
+        );
+        // Root selection is untouched: the all-zero parent still wins, and
+        // its OWN window is still the root span's.
+        assert_eq!(ctx.root.name, "root");
+        assert_eq!(ctx.root.start_ns, B + 1_000);
+        assert_eq!(ctx.root.duration_ns, 42);
+    }
+
+    /// Issue #464, the single-span control: the root IS the trace, so the
+    /// trace-level rule and the root-span rule agree. It cannot
+    /// discriminate the two — that is
+    /// [`pick_roots_folds_the_trace_envelope_over_every_span_as_a_width`]'s
+    /// job — and it is kept so the width formula is pinned where there is
+    /// nothing to fold. The base is non-zero here too, so reporting the
+    /// envelope's END instead of its width still fails.
+    #[test]
+    fn pick_roots_reports_a_single_span_trace_as_that_span_s_own_window() {
+        const B: i64 = 1_700_000_000_000_000_000;
+        let only = pick_roots(vec![RootRow {
+            trace_id: tid(1),
+            span_id: [1u8; 8],
+            parent_id: [0u8; 8],
+            service: "svc".to_string(),
+            name: "alone".to_string(),
+            timestamp_ns: B + 5,
+            duration_ns: 7,
+        }]);
+        let ctx = &only[&tid(1)];
+        assert_eq!(ctx.root.name, "alone");
+        assert_eq!(ctx.trace_start_ns, B + 5);
+        assert_eq!(
+            ctx.trace_duration_ns, 7,
+            "the envelope is a WIDTH: (B + 5 + 7) - (B + 5), not the envelope's end"
+        );
+    }
+
+    /// Issue #464: the TTL-race fallback — a winner whose trace-wide root
+    /// read returned nothing. The assembly branch it serves is reachable
+    /// only from a live read that loses its rows between phases, so the
+    /// construction is a pure function precisely so both envelope fields
+    /// can be pinned here without an engine.
+    #[test]
+    fn the_ttl_race_fallback_reports_the_matched_span_start_and_a_zero_width() {
+        let matched = SpanSummary {
+            span_id: [7u8; 8],
+            name: "matched".to_string(),
+            start_ns: 1_700_000_000_000_000_000,
+            duration_ns: 7_777,
+            attributes: vec![],
+        };
+        let ctx = fallback_trace_context(std::slice::from_ref(&matched), 42);
+        assert_eq!(ctx.root.service, "");
+        assert_eq!(ctx.root.name, "matched");
+        assert_eq!(ctx.root.start_ns, matched.start_ns);
+        assert_eq!(ctx.root.duration_ns, 0);
+        assert_eq!(
+            ctx.trace_start_ns, matched.start_ns,
+            "with no root row, the matched span's own start is the only instant we have"
+        );
+        assert_eq!(
+            ctx.trace_duration_ns, 0,
+            "and to a ZERO width — a non-zero fallback width would be invented, and the span's \
+             own 7_777 ns is NOT the trace's"
+        );
+
+        // No matched spans at all: the heap sort key is the only instant
+        // left, and the width is still zero.
+        let empty = fallback_trace_context(&[], 99);
+        assert_eq!(empty.root.service, "");
+        assert_eq!(empty.root.name, "");
+        assert_eq!(empty.root.start_ns, 99);
+        assert_eq!(empty.root.duration_ns, 0);
+        assert_eq!(empty.trace_start_ns, 99);
+        assert_eq!(empty.trace_duration_ns, 0);
     }
 
     fn hyd_row(trace: u8, span: u8) -> HydrationRow {

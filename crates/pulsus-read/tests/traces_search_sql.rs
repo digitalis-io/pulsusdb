@@ -681,7 +681,10 @@ fn shipped_shapes_and_limits_are_documented() {
     }
     // api.md §4.2: the public contracts.
     for needle in [
-        "\"partial\":<bool>,\"limit\":<n>,\"returned\":<n>",
+        // Issue #464: the retired invented block was
+        // `{"partial":<bool>,"limit":<n>,"returned":<n>}`; the shipped
+        // one is `tempopb.SearchMetrics`'s jobs pair.
+        "\"completedJobs\":<n>,\"totalJobs\":<n>",
         "**Ordering contract:**",
         "trace_id` ascending as the tiebreak",
         // The §4.2 budget-rejection row. Issue #384 removed the

@@ -844,3 +844,76 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (`crates/pulsus-read/tests/compare_arity_differential.rs`) uses a fixture
   where every value has a **distinct** count, so tie order never enters a
   parity assertion.
+
+### `traceql-search-metrics-completed-jobs` (issue #464) — **a repurposing, not a new field**
+
+- **What.** On `GET /api/traces/v1/search` and its `GET /api/search`
+  alias, the `metrics` block carries `completedJobs`/`totalJobs` as `1`/`1`
+  on a complete result and `0`/`1` on a truncated one, with the zero
+  `completedJobs` **omitted** the way protojson omits a default-valued
+  scalar. PulsusDB runs one search plan, so those are the only two values
+  the pair ever takes. The reference reports real shard-job counts there,
+  and also populates `inspectedBytes` on every response plus
+  `totalBlocks`/`totalBlockBytes` once backend blocks exist. Measured on
+  the pinned container (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`,
+  this repo's `ci/tempo/tempo-compare.yaml` unmodified), same corpus, two
+  store states:
+
+  | store state | reference `metrics`, verbatim |
+  |---|---|
+  | fresh push, live-store only | `{"inspectedBytes":"21443","completedJobs":3,"totalJobs":3}` |
+  | later, a completed block exists | `{"inspectedBytes":"21443","totalBlocks":1,"completedJobs":1,"totalJobs":1,"totalBlockBytes":"31127"}` |
+
+  Ours, both branches: `{"completedJobs":1,"totalJobs":1}` and
+  `{"totalJobs":1}`.
+
+- **Why.** `tempopb.SearchResponse` has **no partiality field**.
+  `PartialStatus` (`pkg/tempopb/tempo.proto:383-386` @ v3.0.2) is on
+  `TraceByIDResponse`, `QueryRangeResponse` and `QueryInstantResponse`, and
+  deliberately not on `SearchResponse`, so the jobs pair is the only
+  incompleteness signal this route carries
+  (`modules/frontend/combiner/response_metrics.go:19-38`,
+  `modules/frontend/combiner/search.go:126-135`). Our previous answer —
+  an invented `metrics.partial` — was worse than a repurposing: Grafana's
+  Tempo datasource decodes a search response with `jsonpb.Unmarshal`
+  (`pkg/tempo/search.go:95` @ `v13.1.5-11-g3c7375b`), unknown fields
+  rejected, so one invented key returned an error instead of results.
+
+  The two signals are not equivalent in kind. Ours is **exact and
+  deterministic**: it is `true` for exactly the three partiality sources
+  the engine records. The reference's is **racy and one-sided** — measured
+  over 10 repetitions each, a 12-hour window over 5 traces, `limit=1`
+  (truncated) gave `completedJobs < totalJobs` in 6 of 10 reps and equality
+  in 4, while `limit=20` (complete) gave equality in 10 of 10. So on the
+  reference, inequality implies "stopped early" and equality implies
+  nothing.
+
+- **What a consumer sees, named to the route.** On the **default Traces
+  frame** of `GET /api/search` a truncated result shows no indicator at
+  all, on either system: the datasource builds that frame from
+  `response.Traces` alone (`pkg/tempo/search.go:178-281`) and reads no
+  field of the metrics block. The **visible** exception is raw table mode,
+  which is an ordinary `/api/search` screen — `tableType: raw` is routed
+  from the same HTTP response (`search.go:104-121`) into
+  `transformRawSearchResponse`, whose `json.MarshalIndent(response)`
+  (`:508-519`) puts the literal `{"completedJobs":1,"totalJobs":1}` or
+  `{"totalJobs":1}` into the "Raw response" cell. The **streaming** search
+  path renders the pair as a progress gauge (`src/streaming.ts:289-320`),
+  but PulsusDB mounts no streaming search route
+  (`crates/pulsus-server/src/traces_api/mod.rs:96-123`), so that reading is
+  unreachable for us.
+
+- **What a consumer loses.** A client reading the pair as "shards
+  outstanding" over-reads our `{"totalJobs":1}` when the truncation was a
+  single trace's spanset overflow rather than an unfinished shard. The
+  divergence is one-directional: we never report completeness we do not
+  have.
+
+- **How it is gated.** `crates/pulsus-server/src/traces_api/search_response.rs`'s
+  `the_metrics_block_is_the_reference_jobs_pair_on_both_partiality_branches`
+  and `every_metrics_key_is_a_tempopb_search_metrics_field` pin the whole
+  object and the key set per branch;
+  `crates/pulsus-server/tests/traces_search_live.rs` asserts the real wire
+  bytes against `test/fixtures/traces/search_metrics.json`, and
+  `e2e/src/traces.rs` feeds the same two committed blocks to the
+  differential's validity gate.
