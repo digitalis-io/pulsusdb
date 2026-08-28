@@ -74,7 +74,8 @@
 //! precedent.
 
 use crate::ast::{
-    AggregateOp, ArithOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, HintValue,
+    AggregateOp, ArithOp, AttrScope, BoolOp, COMPARE_DEFAULT_TOP_N, ComparisonOp, Field,
+    FieldExpr, FieldOp, HintValue,
     Intrinsic, MetricFn, MetricHint, MetricStage, PipelineStage, Query, SecondStage, SpanKindValue,
     SpansetExpr, SpansetFilter, StatusValue, StructuralModifier, StructuralOp, UNARY_BINDING_POWER,
     UnaryOp, Value,
@@ -958,20 +959,88 @@ fn parse_coalesce_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
     })
 }
 
-/// `Compare := "compare" "(" SpansetFilter ")"` (issue #182): the
-/// `metrics.compare` construct. Its argument is a `{ … }` spanset filter
-/// (the selection), not a field. The inner filter carries its own
+/// The three `compare()` productions (issue #460), transcribed from
+/// `pkg/traceql/expr.y:324-326` @ v3.0.2:
+///
+/// ```text
+/// | COMPARE OPEN_PARENS spansetFilter CLOSE_PARENS                                   { newMetricsCompare($3, 10, 0, 0) }
+/// | COMPARE OPEN_PARENS spansetFilter COMMA INTEGER CLOSE_PARENS                     { newMetricsCompare($3, $5, 0, 0) }
+/// | COMPARE OPEN_PARENS spansetFilter COMMA INTEGER COMMA INTEGER COMMA INTEGER CLOSE_PARENS { newMetricsCompare($3, $5, $7, $9) }
+/// ```
+///
+/// `Compare := "compare" "(" SpansetFilter [ "," Integer [ "," Integer
+/// "," Integer ] ] ")"`. The first argument is a `{ … }` spanset filter
+/// (the selection), not a field; the inner filter carries its own
 /// (fresh, bounded) recursion budget.
+///
+/// **There is no three-argument form and the extra arguments are
+/// `INTEGER`, not numbers.** `compare(f, 10, <ns>)` and `compare(f, 10.5)`
+/// are both parse errors in the reference (measured against the pinned
+/// container) and both are positioned parse errors here.
 fn parse_compare(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
     cursor.expect(&TokenKind::LParen, "'('")?;
     let mut inner_nodes = 0usize;
     let selection = parse_spanset_filter(cursor, 0, &mut inner_nodes)?;
+    let mut top_n = COMPARE_DEFAULT_TOP_N;
+    let (mut start_ns, mut end_ns) = (0i64, 0i64);
+    if matches!(cursor.peek().kind, TokenKind::Comma) {
+        cursor.advance();
+        top_n = parse_compare_integer(cursor)?;
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            start_ns = parse_compare_integer(cursor)?;
+            // The third argument NEVER stands alone: a `compare(f, n, s)`
+            // is a positioned error at its `)`, exactly as the reference's
+            // grammar has no such production.
+            cursor.expect(&TokenKind::Comma, "','")?;
+            end_ns = parse_compare_integer(cursor)?;
+        }
+    }
     cursor.expect(&TokenKind::RParen, "')'")?;
     let hints = parse_optional_with(cursor)?;
     Ok(PipelineStage::Compare {
         selection: Box::new(selection),
+        top_n,
+        start_ns,
+        end_ns,
         hints,
     })
+}
+
+/// One `INTEGER` argument of `compare()` — the reference's own terminal.
+///
+/// **`i64`, not `u64`**, because the reference resolves the terminal with
+/// `strconv.Atoi` (Go `int`): `9223372036854775807` is accepted and
+/// `9223372036854775808` is `strconv.Atoi: … value out of range`, a parse
+/// error. Both measured. A `u64` parse would accept the second.
+///
+/// A negative literal is not an `INTEGER` in either grammar — `-1` lexes
+/// as `Minus` then `Number`, so it never reaches this function.
+fn parse_compare_integer(cursor: &mut Cursor<'_>) -> Result<i64, TraceQlError> {
+    const EXPECTED: &str = "a whole number (compare(f, topN[, start, end]))";
+    let tok = cursor.peek().clone();
+    match &tok.kind {
+        TokenKind::Number(raw) => {
+            let n = raw
+                .parse::<i64>()
+                .map_err(|_| TraceQlError::UnexpectedToken {
+                    found: format!("number {raw:?}"),
+                    expected: EXPECTED.to_string(),
+                    span: tok.span,
+                })?;
+            cursor.advance();
+            Ok(n)
+        }
+        TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
+            expected: EXPECTED.to_string(),
+            span: tok.span,
+        }),
+        _ => Err(TraceQlError::UnexpectedToken {
+            found: describe(&tok.kind),
+            expected: EXPECTED.to_string(),
+            span: tok.span,
+        }),
+    }
 }
 
 /// Whether `name` is a first-stage TraceQL metrics function (issue
@@ -2725,8 +2794,18 @@ mod tests {
     fn compare_parses_to_a_compare_stage_with_its_selection() {
         let parsed = parse(r#"{} | compare({ span.http.status_code = "500" })"#).unwrap();
         match &parsed.pipeline[..] {
-            [PipelineStage::Compare { selection, hints }] => {
+            [
+                PipelineStage::Compare {
+                    selection,
+                    top_n,
+                    start_ns,
+                    end_ns,
+                    hints,
+                },
+            ] => {
                 assert!(selection.body.is_some(), "the selection filter is captured");
+                // The one-argument production's defaults (`expr.y:324`).
+                assert_eq!((*top_n, *start_ns, *end_ns), (COMPARE_DEFAULT_TOP_N, 0, 0));
                 assert!(hints.is_empty());
             }
             other => panic!("expected a compare stage, got {other:?}"),
@@ -2739,6 +2818,96 @@ mod tests {
             other => panic!("expected compare with hints, got {other:?}"),
         }
         assert_eq!(parse(&with_ex.to_string()).unwrap(), with_ex, "round-trips");
+    }
+
+    /// Issue #460 — the reference's three `compare()` productions
+    /// (`expr.y:324-326` @ v3.0.2) and nothing else. Every string below
+    /// was issued live against the pinned container
+    /// (`grafana/tempo@sha256:aa8df8d0…`) on
+    /// `GET /api/metrics/query_range`; the accept/reject column is what
+    /// it answered, not what the grammar was read to imply.
+    #[test]
+    fn compare_parses_all_three_reference_arities_and_no_fourth() {
+        // A1-A7: the accepts, with the argument values they must carry.
+        for (q, want) in [
+            (
+                "{} | compare({status=error})",
+                (COMPARE_DEFAULT_TOP_N, 0i64, 0i64),
+            ),
+            ("{} | compare({status=error}, 10)", (10, 0, 0)),
+            ("{} | compare({status=error}, 3)", (3, 0, 0)),
+            (
+                "{} | compare({status=error}, 10, 1787900555000000000, 1787904155000000000)",
+                (10, 1_787_900_555_000_000_000, 1_787_904_155_000_000_000),
+            ),
+            // A5: the generated spelling, with no spaces.
+            (
+                "{} | compare({status=error},10,1787900555000000000,1787904155000000000)",
+                (10, 1_787_900_555_000_000_000, 1_787_904_155_000_000_000),
+            ),
+            // A6: the explicit no-window spelling — a reference 200.
+            ("{} | compare({status=error}, 10, 0, 0)", (10, 0, 0)),
+            // A7: `strconv.Atoi`'s upper bound.
+            (
+                "{} | compare({status=error}, 9223372036854775807)",
+                (i64::MAX, 0, 0),
+            ),
+        ] {
+            let parsed = parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            match &parsed.pipeline[..] {
+                [
+                    PipelineStage::Compare {
+                        top_n,
+                        start_ns,
+                        end_ns,
+                        ..
+                    },
+                ] => assert_eq!((*top_n, *start_ns, *end_ns), want, "{q}"),
+                other => panic!("{q}: expected a compare stage, got {other:?}"),
+            }
+            // Every accepted arity round-trips through `Display`.
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{q} round-trips");
+        }
+
+        // A13-A17: the rejects. Each is a POSITIONED parse error, and the
+        // position is asserted — "some error" would pass on a parser that
+        // rejected for the wrong reason.
+        for (q, byte, found) in [
+            // A13: three arguments. There is no such production; the
+            // error lands on the `)` where the fourth comma belongs.
+            (
+                "{} | compare({status=error}, 10, 1787900555000000000)",
+                52,
+                "')'",
+            ),
+            // A14: five arguments — the fifth comma.
+            (
+                "{} | compare({status=error}, 10, 1787900555000000000, 1787904155000000000, 5)",
+                73,
+                "','",
+            ),
+            // A15: a FLOAT where the grammar wants INTEGER.
+            ("{} | compare({status=error}, 10.5)", 29, "number \"10.5\""),
+            // A16: a negative literal is not an INTEGER in either grammar.
+            ("{} | compare({status=error}, -1)", 29, "'-'"),
+            // A17: above `strconv.Atoi`'s range — this is why `top_n` is
+            // `i64` and not `u64`.
+            (
+                "{} | compare({status=error}, 9223372036854775808)",
+                29,
+                "number \"9223372036854775808\"",
+            ),
+        ] {
+            match parse(q) {
+                Err(TraceQlError::UnexpectedToken {
+                    found: got, span, ..
+                }) => {
+                    assert_eq!(got, found, "{q}");
+                    assert_eq!(span.start, byte, "{q}: wrong error position");
+                }
+                other => panic!("{q}: expected a positioned parse error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

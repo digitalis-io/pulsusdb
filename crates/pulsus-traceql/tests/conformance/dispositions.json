@@ -843,6 +843,22 @@
       "tempo": "accept"
     },
     {
+      "construct": "metrics.compare.topn",
+      "status": "supported",
+      "evidence": [
+        "accept/metrics_compare_topn"
+      ],
+      "tempo": "accept"
+    },
+    {
+      "construct": "metrics.compare.window",
+      "status": "supported",
+      "evidence": [
+        "accept/metrics_compare_window"
+      ],
+      "tempo": "accept"
+    },
+    {
       "construct": "metrics.by",
       "status": "supported",
       "evidence": [

@@ -287,6 +287,15 @@ impl FieldOp {
 /// The prefix binding power of `!`/`-` — between `+ -` and `* / %`.
 pub const UNARY_BINDING_POWER: u8 = 4;
 
+/// `compare()`'s default `topN` — the reference's own literal in the
+/// one- and two-argument productions (`pkg/traceql/expr.y:324-325`
+/// @ v3.0.2: `newMetricsCompare($3, 10, 0, 0)`).
+///
+/// It is NOT decoration: with more than ten distinct values on a side the
+/// default already trims the answer, so a `compare(f)` that ignores it
+/// returns more series than the reference does (issue #460).
+pub const COMPARE_DEFAULT_TOP_N: i64 = 10;
+
 impl fmt::Display for FieldOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -851,13 +860,32 @@ pub enum PipelineStage {
     /// #182): reduces the series set a first-stage metric produced. Only
     /// valid after a metrics stage; the metrics planner enforces that.
     MetricSecondStage(SecondStage),
-    /// `compare({ selection })` (issue #182): a standalone metrics
-    /// function that partitions the outer spanset into a `selection` (the
-    /// inner filter) and a `baseline` (everything) and emits per-attribute
-    /// meta-series. Its argument is a spanset filter, not a field; it
-    /// accepts trailing `with(...)` hints (e.g. `with(exemplars=…)`).
+    /// `compare({ selection }[, topN[, start, end]])` (issues #182,
+    /// #460): a standalone metrics function that partitions the outer
+    /// spanset into a `selection` (the inner filter) and a `baseline`
+    /// (everything else) and emits per-attribute meta-series. Its first
+    /// argument is a spanset filter, not a field; it accepts trailing
+    /// `with(...)` hints (e.g. `with(exemplars=…)`).
+    ///
+    /// The reference has exactly three productions and no others
+    /// (`pkg/traceql/expr.y:324-326` @ v3.0.2): one, two and four
+    /// arguments, defaulting `(10, 0, 0)`. A three-argument form is a
+    /// reference parse error and is one here too.
     Compare {
         selection: Box<SpansetFilter>,
+        /// Argument 2. Reference default [`COMPARE_DEFAULT_TOP_N`]
+        /// (`expr.y:324`). Always `> 0` after `validate`; `i64` because
+        /// the reference parses it with `strconv.Atoi`, so
+        /// `9223372036854775807` is accepted and `…808` is a parse
+        /// error (both measured against the pinned container).
+        top_n: i64,
+        /// Arguments 3 and 4, unix nanoseconds. `(0, 0)` means "no
+        /// selection window": it is the reference's own default AND an
+        /// explicitly legal spelling — `compare(f, 10, 0, 0)` is a 200
+        /// (`engine_metrics_compare.go:327-329` returns `nil` early
+        /// when both are zero).
+        start_ns: i64,
+        end_ns: i64,
         hints: Vec<MetricHint>,
     },
 }
@@ -888,8 +916,22 @@ impl fmt::Display for PipelineStage {
             PipelineStage::Coalesce => write!(f, "coalesce()"),
             PipelineStage::Metric(stage) => write!(f, "{stage}"),
             PipelineStage::MetricSecondStage(stage) => write!(f, "{stage}"),
-            PipelineStage::Compare { selection, hints } => {
-                write!(f, "compare({selection})")?;
+            PipelineStage::Compare {
+                selection,
+                top_n,
+                start_ns,
+                end_ns,
+                hints,
+            } => {
+                // The SHORTEST spelling that reparses to the same node.
+                // (The reference's own `String()` at
+                // `engine_metrics_compare.go:342` drops all three
+                // arguments and closes with `}` — a bug we do not copy.)
+                match (*top_n, *start_ns, *end_ns) {
+                    (COMPARE_DEFAULT_TOP_N, 0, 0) => write!(f, "compare({selection})")?,
+                    (n, 0, 0) => write!(f, "compare({selection}, {n})")?,
+                    (n, s, e) => write!(f, "compare({selection}, {n}, {s}, {e})")?,
+                }
                 if !hints.is_empty() {
                     write!(f, " with(")?;
                     for (i, hint) in hints.iter().enumerate() {
@@ -1435,26 +1477,48 @@ mod tests {
             "topk(10)"
         );
         // Compare stage + result-comparison filter round-trip.
+        let compare_stage = |top_n: i64, start_ns: i64, end_ns: i64| PipelineStage::Compare {
+            selection: Box::new(SpansetFilter {
+                body: Some(FieldExpr::Binary {
+                    op: FieldOp::Cmp(ComparisonOp::Eq),
+                    lhs: Box::new(FieldExpr::Field(Field::Attribute {
+                        scope: AttrScope::Span,
+                        key: "http.status_code".to_string(),
+                    })),
+                    rhs: Box::new(FieldExpr::Literal(Value::Number("500".to_string()))),
+                }),
+            }),
+            top_n,
+            start_ns,
+            end_ns,
+            hints: vec![],
+        };
         let compare = Query {
             spanset: SpansetExpr::Filter(SpansetFilter { body: None }),
-            pipeline: vec![PipelineStage::Compare {
-                selection: Box::new(SpansetFilter {
-                    body: Some(FieldExpr::Binary {
-                        op: FieldOp::Cmp(ComparisonOp::Eq),
-                        lhs: Box::new(FieldExpr::Field(Field::Attribute {
-                            scope: AttrScope::Span,
-                            key: "http.status_code".to_string(),
-                        })),
-                        rhs: Box::new(FieldExpr::Literal(Value::Number("500".to_string()))),
-                    }),
-                }),
-                hints: vec![],
-            }],
+            pipeline: vec![compare_stage(COMPARE_DEFAULT_TOP_N, 0, 0)],
             hints: vec![],
         };
         assert_eq!(
             compare.to_string(),
             "{} | compare({ span.http.status_code = 500 })"
+        );
+        // Issue #460: the shortest spelling that reparses to the same
+        // node. The default `(10, 0, 0)` renders as the one-argument
+        // form, a non-default topN with no window as the two-argument
+        // form, and anything else as the four-argument form.
+        assert_eq!(
+            compare_stage(3, 0, 0).to_string(),
+            "compare({ span.http.status_code = 500 }, 3)"
+        );
+        assert_eq!(
+            compare_stage(COMPARE_DEFAULT_TOP_N, 5, 9).to_string(),
+            "compare({ span.http.status_code = 500 }, 10, 5, 9)"
+        );
+        // `(0, 0)` is a legal EXPLICIT window spelling; it renders as the
+        // shorter form because it means exactly "no window".
+        assert_eq!(
+            compare_stage(COMPARE_DEFAULT_TOP_N, 0, 0).to_string(),
+            "compare({ span.http.status_code = 500 })"
         );
         let rc = MetricStage {
             func: MetricFn::Rate,

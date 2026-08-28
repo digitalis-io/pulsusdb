@@ -76,6 +76,8 @@ accept/metrics_avg_over_time
 accept/metrics_bottomk
 accept/metrics_by_service
 accept/metrics_compare
+accept/metrics_compare_topn
+accept/metrics_compare_window
 accept/metrics_count_over_time
 accept/metrics_histogram_over_time
 accept/metrics_max_over_time
@@ -157,6 +159,8 @@ reject/field_chain_over_limit
 reject/intrinsic_colon_space_before
 reject/kind_invalid_keyword
 reject/lone_amp
+reject/metrics_compare_float_topn
+reject/metrics_compare_three_args
 reject/missing_rbrace
 reject/missing_value
 reject/select_empty
