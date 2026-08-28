@@ -904,7 +904,13 @@ impl LabelBuilder {
 
     /// `Builder.Set`, whose empty-value case is `Del`
     /// (`labels_common.go:187-192`).
-    fn set(&mut self, name: &str, value: &str) {
+    ///
+    /// Named `set_label` rather than `set` on purpose: `pulsus-clickhouse`'s
+    /// `injected_settings.rs` re-derives the workspace's injected
+    /// ClickHouse settings by scanning every `.rs` file for the literal
+    /// `.set("…"`, so a builder method called `set` with a literal label
+    /// name in a test reads as a ClickHouse setting and breaks that gate.
+    fn set_label(&mut self, name: &str, value: &str) {
         if value.is_empty() {
             if let Some(index) = self.add_index.remove(name) {
                 // Tombstone, not `Vec::remove`: see the type's doc comment.
@@ -990,21 +996,21 @@ fn build_attribute_labels(
                 .map_err(LogsIngestError::InvalidLabelName)?;
             let existing = builder.get(&final_key);
             if existing.is_empty() {
-                builder.set(&final_key, &value);
+                builder.set_label(&final_key, &value);
             } else {
                 *collisions += 1;
                 let merged = format!("{existing};{value}");
-                builder.set(&final_key, &merged);
+                builder.set_label(&final_key, &merged);
             }
         }
         builder
     };
 
     for (name, value) in resource_pairs {
-        builder.set(name, value);
+        builder.set_label(name, value);
     }
     for (name, value) in scope_pairs {
-        builder.set(name, value);
+        builder.set_label(name, value);
     }
 
     Ok(builder.labels())
@@ -3032,13 +3038,13 @@ mod tests {
     #[test]
     fn deleting_an_override_tombstones_rather_than_shifting_the_vector() {
         let mut builder = LabelBuilder::reset(Vec::new());
-        builder.set("a", "1");
-        builder.set("b", "2");
-        builder.set("c", "3");
+        builder.set_label("a", "1");
+        builder.set_label("b", "2");
+        builder.set_label("c", "3");
         assert_eq!(builder.add.len(), 3);
         assert_eq!(builder.add_index.get("c"), Some(&2));
 
-        builder.set("a", ""); // `Set` with an empty value is `Del`.
+        builder.set_label("a", ""); // `Set` with an empty value is `Del`.
 
         assert_eq!(
             builder.add.len(),
@@ -3050,7 +3056,7 @@ mod tests {
             Some(&2),
             "no index behind the hole may be rewritten"
         );
-        assert!(builder.add_index.get("a").is_none());
+        assert!(!builder.add_index.contains_key("a"));
         assert_eq!(builder.get("a"), "");
         assert_eq!(builder.get("c"), "3");
         assert_eq!(
@@ -3068,10 +3074,10 @@ mod tests {
     #[test]
     fn setting_a_deleted_name_again_makes_it_live() {
         let mut builder = LabelBuilder::reset(Vec::new());
-        builder.set("a", "1");
-        builder.set("a", "");
+        builder.set_label("a", "1");
+        builder.set_label("a", "");
         assert_eq!(builder.get("a"), "");
-        builder.set("a", "2");
+        builder.set_label("a", "2");
         assert_eq!(builder.get("a"), "2");
         assert_eq!(builder.labels(), vec![("a".to_string(), "2".to_string())]);
     }
