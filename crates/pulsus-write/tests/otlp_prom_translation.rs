@@ -532,6 +532,22 @@ fn resource_attrs(case: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// The resource attributes as a lookup, **first entry wins**.
+///
+/// `pcommon.Map.Get` returns the first match, which is why a resource
+/// carrying two `service.name` entries derives `job` from the FIRST one
+/// (measured). `Iterator::collect` into a `BTreeMap` keeps the **last**,
+/// silently inverting that — a latent defect in these helpers that no case
+/// reached until `pair-target-info-two-service-name-entries` was captured.
+/// Every helper below goes through this rather than collecting directly.
+fn resource_attr_map(case: &Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (key, value) in resource_attrs(case) {
+        out.entry(key).or_insert(value);
+    }
+    out
+}
+
 /// A case's data-point attributes for its first metric, in wire order.
 fn datapoint_attrs(case: &Value) -> Vec<(String, String)> {
     let metric = &case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
@@ -846,7 +862,7 @@ fn cases_json_binds_every_named_transformation() {
                 "the base resource has no service.name"
             );
         }
-        let attrs: BTreeMap<String, String> = resource_attrs(p.variant).into_iter().collect();
+        let attrs = resource_attr_map(p.variant);
         let expected = attrs.get("service.name").expect("variant has service.name");
         for labels in captured_metric_labels(p.variant) {
             assert_eq!(labels.get("job"), Some(expected));
@@ -855,7 +871,7 @@ fn cases_json_binds_every_named_transformation() {
     {
         let p = find_pair(&doc, "job-namespace");
         for case in [p.base, p.variant] {
-            let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+            let attrs = resource_attr_map(case);
             let name = attrs.get("service.name").expect("service.name");
             let expected = match attrs.get("service.namespace") {
                 Some(ns) => format!("{ns}/{name}"),
@@ -875,7 +891,7 @@ fn cases_json_binds_every_named_transformation() {
         for labels in captured_metric_labels(p.base) {
             assert!(!labels.contains_key("instance"));
         }
-        let attrs: BTreeMap<String, String> = resource_attrs(p.variant).into_iter().collect();
+        let attrs = resource_attr_map(p.variant);
         let expected = attrs
             .get("service.instance.id")
             .expect("variant has service.instance.id");
@@ -945,7 +961,7 @@ fn cases_json_binds_every_named_transformation() {
         let target = captured_target_info(p.variant);
         assert_eq!(target.len(), 1, "exactly one target_info series");
         let identifying = ["service.name", "service.namespace", "service.instance.id"];
-        let attrs: BTreeMap<String, String> = resource_attrs(p.variant).into_iter().collect();
+        let attrs = resource_attr_map(p.variant);
         let mut expected: BTreeMap<String, String> = attrs
             .iter()
             .filter(|(k, _)| !identifying.contains(&k.as_str()))
@@ -1038,7 +1054,7 @@ fn caller_supplied_job_and_instance_survive_when_the_derivation_is_empty() {
             .iter()
             .find(|c| c["id"] == json!(id))
             .unwrap_or_else(|| panic!("case {id} is missing"));
-        let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+        let attrs = resource_attr_map(case);
         // The antecedent is that the DERIVATION comes back empty, which is
         // weaker than "no service attribute at all": an empty
         // `service.name`, or a namespace with no name, reach it too.
@@ -1136,7 +1152,7 @@ fn the_job_composite_follows_the_references_sequence_in_every_case() {
             continue;
         }
         let id = case["id"].as_str().expect("id");
-        let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+        let attrs = resource_attr_map(case);
         let Some(expected) = reference_job(&attrs) else {
             continue;
         };
@@ -1198,7 +1214,7 @@ fn a_caller_supplied_instance_reaches_target_info_but_not_the_metric_series() {
 
     // Derived: `service.instance.id` -> `instance`, on BOTH series.
     let derived = case("derived-instance-reaches-both-series");
-    let attrs: BTreeMap<String, String> = resource_attrs(&derived).into_iter().collect();
+    let attrs = resource_attr_map(&derived);
     let expected = attrs
         .get("service.instance.id")
         .expect("the case must carry service.instance.id");
@@ -1217,7 +1233,7 @@ fn a_caller_supplied_instance_reaches_target_info_but_not_the_metric_series() {
 
     // Caller-supplied on the resource: `target_info` only.
     let caller = case("caller-instance-reaches-only-target-info");
-    let attrs: BTreeMap<String, String> = resource_attrs(&caller).into_iter().collect();
+    let attrs = resource_attr_map(&caller);
     assert!(
         !attrs.contains_key("service.instance.id"),
         "the antecedent is that no service.instance.id is present"
@@ -1294,7 +1310,7 @@ fn target_info_eligibility_counts_raw_keys_not_surviving_labels() {
         "...and its label is then dropped, because the value is empty"
     );
     let expected_job =
-        reference_job(&variant_attrs.iter().cloned().collect()).expect("the variant derives a job");
+        reference_job(&resource_attr_map(p.variant)).expect("the variant derives a job");
     assert_eq!(
         target[0],
         BTreeMap::from([("job".to_string(), expected_job)]),
@@ -1329,7 +1345,7 @@ fn identifying_attributes_are_consumed_and_empty_values_are_dropped() {
 
     // (1) Consumed, not emitted — and derived from this case's own input.
     let consumed = case("identifying-resource-attributes-are-consumed-not-emitted");
-    let attrs: BTreeMap<String, String> = resource_attrs(&consumed).into_iter().collect();
+    let attrs = resource_attr_map(&consumed);
     let target = captured_target_info(&consumed);
     assert_eq!(target.len(), 1);
     for key in ["service.name", "service.namespace", "service.instance.id"] {
