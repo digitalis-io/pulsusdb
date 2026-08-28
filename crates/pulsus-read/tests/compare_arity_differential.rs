@@ -543,7 +543,9 @@ fn await_complete_corpus(
         Instant::now() + Duration::from_secs(SETTLE_BUDGET_S),
         Duration::from_secs(2),
         &format!(
-            "reference corpus {service:?} to load completely ({key}:              selection_total {want_total}, {want_values} distinct values)"
+            "reference corpus {service:?} to load completely ({key}: selection_total \
+             {want_total}, {want_values} distinct values) — the per-poll progression is on \
+             stderr above, since a settle timeout can only report its last SETTLED observation"
         ),
         || {
             let counts = tempo_query_once(api_base, &query, window, &keys)?;
