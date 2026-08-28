@@ -1,13 +1,30 @@
 //! OTLP metrics parser (issue #27 architect plan + amendment, docs/
 //! architecture.md §4): a pure `bytes -> ExportMetricsServiceRequest ->
-//! ParsedMetrics` pipeline with no I/O. Resource + scope attributes flatten
-//! through the same canonical label model the OTLP logs receiver uses
-//! (`pulsus_model::LabelSet::from_normalized` -> `metric_fingerprint`, issue
-//! #4/#8's precedent) — fingerprints derive *only* via `pulsus-model`, never
-//! re-derived here. `__name__` is never placed in a [`LabelSet`]: the metric
-//! name travels only as `MetricPoint`/`SeriesRef`'s first-class
-//! `metric_name` column (docs/architecture.md §2.3), and
-//! `metric_fingerprint` excludes it anyway.
+//! ParsedMetrics` pipeline with no I/O.
+//!
+//! **Naming and labelling follow Prometheus v3.13.0's OTLP receiver**
+//! (issue #461), not the wire verbatim: metric names go through
+//! [`MetricNamer`], attribute keys through [`LabelNamer`], resource
+//! attributes become `job`/`instance` plus a `target_info` series rather
+//! than per-sample labels, and the instrumentation scope is promoted only
+//! behind `PULSUS_OTLP_PROMOTE_SCOPE_METADATA`. The label-set build is a
+//! port of `createAttributes`
+//! (`storage/remote/otlptranslator/prometheusremotewrite/helper.go:77-195 @
+//! v3.13.0`) down to its collision-merge and empty-value-delete rules; see
+//! [`build_attribute_labels`]. Keys are final by the time they reach
+//! `pulsus-model`, so this module calls
+//! [`LabelSet::from_verbatim`] — **not** `from_normalized`, whose
+//! canonicalize-and-pick-a-winner rule (issue #4, frozen) is the logs and
+//! traces rule and would re-resolve collisions the reference has already
+//! merged with `;`.
+//!
+//! Fingerprints derive *only* via `pulsus-model`, never re-derived here.
+//! `__name__` is never placed in a [`LabelSet`]: the metric name travels
+//! only as `MetricPoint`/`SeriesRef`'s first-class `metric_name` column
+//! (docs/architecture.md §2.3), and `metric_fingerprint` excludes it
+//! anyway. An OTLP attribute literally named `__name__` is dropped on its
+//! RAW key before sanitization, exactly as `reservedLabelNames` does
+//! (`helper.go:68-70, :96`).
 //!
 //! Gauge/Sum flatten to one series per data point; Histogram/
 //! ExponentialHistogram flatten to cumulative `<name>_bucket{le}`/`_sum`/
@@ -17,15 +34,16 @@
 //! the architect plan.
 //!
 //! **Expansion budget (issue #62):** the per-`ScopeMetrics` base label pairs
-//! (resource ⊕ scope identity ⊕ scope attrs) are cloned into a fresh owned
-//! `LabelSet` for every emitted sample — gauge/sum one per data point,
-//! histogram/summary one per bucket/quantile — so a body inside the 64 MiB
-//! decompressed cap can fan a small resource out to gigabytes of label-pair
-//! materialization. [`parse`] guards this with [`MAX_EXPANDED_BYTES`]: an
-//! allocation-free, wire-length-based estimate accumulated and checked
-//! **before** each materialization site (per-scope before
-//! [`build_scope_pairs`], per-exponential-histogram before
-//! [`exponential_bucket_pairs`], per-sample before [`LabelSet::from_normalized`]),
+//! (`job`/`instance` ⊕ any promoted `otel_scope_*` labels) are cloned into
+//! a fresh owned `LabelSet` for every emitted sample — gauge/sum one per
+//! data point, histogram/summary one per bucket/quantile — so a body inside
+//! the 64 MiB decompressed cap can fan a small resource out to gigabytes of
+//! label-pair materialization. [`parse`] guards this with
+//! [`MAX_EXPANDED_BYTES`]: an allocation-free, wire-length-based estimate
+//! accumulated and checked **before** each materialization site (per-scope
+//! before the base pairs are built, per-exponential-histogram before
+//! [`exponential_bucket_pairs`], per-sample before [`LabelSet::from_verbatim`],
+//! and once per `ResourceMetrics` before `target_info`'s own labels),
 //! failing the whole request atomically with
 //! [`LogsIngestError::OversizeMessage`] (HTTP 400 / `google.rpc.Status.code =
 //! 3`) the moment the running total exceeds the budget — never a partial
@@ -35,7 +53,7 @@
 //! output-name construction is fingerprint-critical and never truncated.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
@@ -45,9 +63,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
     AggregationTemporality, DataPointFlags, ExponentialHistogramDataPoint, HistogramDataPoint,
     Metric, NumberDataPoint, ScopeMetrics, SummaryDataPoint, metric, number_data_point,
 };
-use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
-use pulsus_config::ExpHistogramMode;
+use pulsus_config::{ExpHistogramMode, OtlpTranslationStrategy};
 use pulsus_model::{Date, Fingerprint, LabelSet, STALE_NAN_BITS, metric_fingerprint};
 
 use crate::error::LogsIngestError;
@@ -55,6 +72,9 @@ use crate::ingest::metrics::{
     HistogramPoint, MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef,
 };
 use crate::protocols::otlp_exp_histogram::to_native_histogram;
+use crate::protocols::prom_metric_name::{
+    IDENTIFYING_RESOURCE_ATTRS, LabelNamer, MetricKind, MetricNamer, UnitNamer, job_and_instance,
+};
 
 /// The per-request cap on [`parse`]'s **estimated expanded output bytes**
 /// (see the module doc's "Expansion budget" section). Own constant, same
@@ -93,6 +113,30 @@ const EXP_BUCKET_PAIR_BYTES: usize = 16;
 /// the classic path charges its per-sample series containers via
 /// [`SAMPLE_ROW_OVERHEAD`] before `emit_sample` materializes them.
 const HIST_DEDUP_KEY_BYTES: usize = 48;
+
+/// The per-`ResourceMetrics` cap on emitted `target_info` samples (issue
+/// #461). The reference emits one sample every `lookback/2` (150 s at the
+/// default 5-minute lookback) across the resource's whole accepted
+/// timestamp span and has no bound at all, so a single `ResourceMetrics`
+/// whose points straddle the admitted `Date` domain (1970-01-01 …
+/// 2106-02-06) would generate ≈28.6 M samples from one small resource.
+/// 4096 × 150 s ≈ 7.1 days — one default `PULSUS_RETENTION_DAYS` window —
+/// so no legitimate batch reaches it. Exceeding it is an
+/// [`LogsIngestError::OversizeMessage`] whole-request 400, never a silent
+/// truncation. Ledgered as `otlp-target-info-sample-cap`.
+const MAX_TARGET_INFO_SAMPLES: usize = 4096;
+
+/// The reference's resource-attribute carrier series
+/// (`otlptranslator@v1.0.0/constants.go:388`, `helper.go:61`).
+const TARGET_INFO_METRIC_NAME: &str = "target_info";
+
+/// `target_info`'s fixed help text (`helper.go:531-537 @ v3.13.0`).
+const TARGET_INFO_HELP: &str = "Target metadata";
+
+/// The reference's `defaultLookbackDelta` in milliseconds
+/// (`helper.go:62`, 5 minutes) — the fallback when the configured PromQL
+/// lookback is zero, so the `target_info` cadence is `lookback / 2`.
+const DEFAULT_LOOKBACK_MS: i64 = 300_000;
 
 /// The maximum per-byte expansion `serde_json` string escaping can produce
 /// (a control byte renders as its 6-byte `\uXXXX` escape) — the worst-case
@@ -156,24 +200,20 @@ fn attrs_budget_charge(attrs: &[KeyValue]) -> usize {
         .fold(0usize, |acc, kv| acc.saturating_add(attr_budget_charge(kv)))
 }
 
-/// The per-scope base label charge: `Σ attr_budget_charge(resource attrs)`
-/// plus the scope-identity key/value lengths (only when the scope is
-/// present) plus `Σ attr_budget_charge(scope attrs)` — the byte cost of the
-/// base pairs [`build_scope_pairs`] materializes once per scope and every
-/// sample in it clones. Allocation-free; identical inputs to
-/// [`build_scope_pairs`].
-fn scope_base_charge(resource: Option<&Resource>, scope_metrics: &ScopeMetrics) -> usize {
-    let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    let mut charge = attrs_budget_charge(resource_attrs);
-    if let Some(scope) = scope_metrics.scope.as_ref() {
-        charge = charge
-            .saturating_add("otel_scope_name".len())
-            .saturating_add(scope.name.len())
-            .saturating_add("otel_scope_version".len())
-            .saturating_add(scope.version.len())
-            .saturating_add(attrs_budget_charge(&scope.attributes));
-    }
-    charge
+/// `Σ (key + value)` over already-final label pairs — the byte cost of the
+/// base pairs every sample in a scope clones. Allocation-free.
+///
+/// Issue #461 narrowed what this covers. Before, a sample cloned the whole
+/// resource attribute set; now it clones only `job`/`instance` and, when
+/// `promote_scope_metadata` is on, the `otel_scope_*` labels. The resource
+/// attributes are charged **once per `ResourceMetrics`** instead, just
+/// before `target_info` materializes them (see [`emit_target_info`]) —
+/// keeping every allocation charged without pricing a 1 MiB resource
+/// attribute into every sample that no longer carries it.
+fn pairs_charge(pairs: &[(String, String)]) -> usize {
+    pairs.iter().fold(0usize, |acc, (k, v)| {
+        acc.saturating_add(k.len()).saturating_add(v.len())
+    })
 }
 
 /// Adds `amount` to the running expansion estimate and fails the whole
@@ -190,6 +230,51 @@ fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIn
         });
     }
     Ok(())
+}
+
+/// Everything [`parse`] needs from `Config`, bundled into one value so a
+/// new knob does not grow every call site (the same rationale
+/// [`ScopeBase`]/[`DataPointContext`] already document).
+#[derive(Debug, Clone, Copy)]
+pub struct MetricIngestSettings {
+    /// `PULSUS_METRICS_EXP_HISTOGRAM_MODE` (issue #120).
+    pub exp_histogram_mode: ExpHistogramMode,
+    /// `PULSUS_OTLP_TRANSLATION_STRATEGY` (issue #461).
+    pub translation_strategy: OtlpTranslationStrategy,
+    /// `PULSUS_OTLP_PROMOTE_SCOPE_METADATA` (issue #461).
+    pub promote_scope_metadata: bool,
+    /// The PromQL lookback in milliseconds (`PULSUS_PROMQL_LOOKBACK`).
+    /// `target_info` samples are emitted every `lookback / 2`
+    /// (`helper.go:560-567 @ v3.13.0`); `0` means the reference's
+    /// `defaultLookbackDelta`, i.e. a 150 000 ms interval.
+    pub promql_lookback_ms: i64,
+}
+
+impl Default for MetricIngestSettings {
+    /// The reference's own OTLP defaults, plus this crate's pre-existing
+    /// `Classic` exponential-histogram mode.
+    fn default() -> Self {
+        MetricIngestSettings {
+            exp_histogram_mode: ExpHistogramMode::Classic,
+            translation_strategy: OtlpTranslationStrategy::default(),
+            promote_scope_metadata: false,
+            promql_lookback_ms: DEFAULT_LOOKBACK_MS,
+        }
+    }
+}
+
+impl MetricIngestSettings {
+    /// The `target_info` sample interval in milliseconds: `lookback / 2`,
+    /// floored at 1 ms so the emission loop always makes progress
+    /// (`helper.go:564-567`).
+    fn target_info_interval_ms(&self) -> i64 {
+        let lookback = if self.promql_lookback_ms <= 0 {
+            DEFAULT_LOOKBACK_MS
+        } else {
+            self.promql_lookback_ms
+        };
+        (lookback / 2).max(1)
+    }
 }
 
 /// Decodes a (decompressed) OTLP `/v1/metrics` request body. The sole
@@ -220,21 +305,29 @@ pub fn decode_json(body: &[u8]) -> Result<ExportMetricsServiceRequest, LogsInges
 }
 
 /// Parses a decoded `ExportMetricsServiceRequest` into normalized rows.
-/// Pure: a function of `req` and `now_ns` only, no I/O, no clock reads —
-/// the caller (the ingest handler) is the only clock/IO boundary. `now_ns`
-/// becomes every metadata row's `updated_ns` (the `ReplacingMergeTree`
-/// version column, issue #26 amendment).
+/// Pure: a function of `req`, `now_ns` and `settings` only, no I/O, no
+/// clock reads — the caller (the ingest handler) is the only clock/IO
+/// boundary. `now_ns` becomes every metadata row's `updated_ns` (the
+/// `ReplacingMergeTree` version column, issue #26 amendment).
 ///
-/// `Err` iff the request's estimated expanded output exceeds
-/// [`MAX_EXPANDED_BYTES`] (see the module doc's "Expansion budget" section)
-/// — a whole-request, atomic structural failure, exactly like a decode
-/// error; everything else (bad timestamps, count mismatches, delta
-/// temporality) stays a per-point/per-metric partial-success rejection
-/// inside the `Ok`.
+/// `Err` (a whole-request, atomic 400/`code = 3` failure — never a partial
+/// write) iff:
+///
+/// - the request's estimated expanded output exceeds
+///   [`MAX_EXPANDED_BYTES`], or a `ResourceMetrics` would need more than
+///   [`MAX_TARGET_INFO_SAMPLES`] `target_info` samples; or
+/// - a metric name or an attribute key fails to normalize (issue #461).
+///   The reference answers those `500` with a bare `text/plain` body;
+///   PulsusDB answers `400`/`code = 3` with the identical message, the
+///   `#259` precedent applied verbatim and ledgered as
+///   `otlp-name-reject-status-400`.
+///
+/// Everything else (bad timestamps, count mismatches, delta temporality)
+/// stays a per-point/per-metric partial-success rejection inside the `Ok`.
 pub fn parse(
     req: &ExportMetricsServiceRequest,
     now_ns: i64,
-    mode: ExpHistogramMode,
+    settings: MetricIngestSettings,
 ) -> Result<ParsedMetrics, LogsIngestError> {
     // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
     // maliciously deep attribute tree before any value is rendered or a
@@ -242,38 +335,77 @@ pub fn parse(
     // below can never overflow the stack.
     crate::protocols::otlp_depth::ensure_metrics_anyvalue_depth(req)?;
 
+    let metric_namer = MetricNamer::from_strategy(settings.translation_strategy);
+    let label_namer = LabelNamer::from_strategy(settings.translation_strategy);
+    // The reference builds metadata units with `UnitNamer{}` — i.e.
+    // `UTF8Allowed: false` — under every strategy (`metrics_to_prw.go:181`).
+    let unit_namer = UnitNamer {
+        utf8_allowed: false,
+    };
+
     let mut out = ParsedMetrics::default();
     let mut expanded_bytes: usize = 0;
     // Dedups `SeriesRef` registration within this request by `(metric_name,
     // fingerprint)` (architect plan: "a labels carrier, not a per-sample
     // registration").
     let mut seen_series: HashSet<(Arc<str>, Fingerprint)> = HashSet::new();
-    // Dedups `MetricMetadata` within this request by base family name
+    // Dedups `MetricMetadata` within this request by TRANSLATED family name
     // (architect plan: "one MetricMetadata ... per Metric descriptor,
-    // deduped within-request by base name").
+    // deduped within-request by base name"). Ours, not the reference's —
+    // `metric_metadata` is a `ReplacingMergeTree(updated_ns)` keyed by
+    // family name (docs/schemas.md §2.1), so one row per family per request
+    // is the correct write and the reference has no equivalent table.
+    // Consequence of translation: two distinct OTLP names can now collapse
+    // to one family (`a.b` and `a_b` both -> `a_b`), and the first
+    // descriptor's `help`/`unit` is kept for both.
     let mut seen_metadata: HashSet<Arc<str>> = HashSet::new();
+    // `seenTargetInfo` (`helper.go:569-585`): dedups `target_info` samples
+    // by `(labels, timestamp)` across every `ResourceMetrics` in the batch.
+    let mut seen_target_info: HashSet<(Fingerprint, i64)> = HashSet::new();
 
     for resource_metrics in &req.resource_metrics {
+        let resource_attrs = resource_metrics
+            .resource
+            .as_ref()
+            .map(|r| r.attributes.as_slice())
+            .unwrap_or(&[]);
+        // `setResourceContext` (`metrics_to_prw.go:408-441`): `job` and
+        // `instance` are derived once per `ResourceMetrics` and are NOT
+        // gated by the translation strategy.
+        let (job, instance) = job_and_instance(resource_attrs);
+        let mut resource_pairs: Vec<(String, String)> = Vec::with_capacity(2);
+        if let Some(job) = job {
+            resource_pairs.push(("job".to_string(), job));
+        }
+        if let Some(instance) = instance {
+            resource_pairs.push(("instance".to_string(), instance));
+        }
+
+        // The accepted-point span for this resource's `target_info`, taken
+        // over the samples actually emitted below (see `emit_target_info`).
+        let samples_before = out.samples.len();
+        let hist_samples_before = out.hist_samples.len();
+
         for scope_metrics in &resource_metrics.scope_metrics {
-            // Charge the per-scope base rendering BEFORE materializing it
-            // (`build_scope_pairs`' once-per-scope allocation, incl.
-            // zero-data-point scopes) — mirrors otlp_traces' pre-render
-            // service charge. The same `base_charge` is threaded down and
-            // re-charged per sample (each sample clones the base pairs).
-            let base_charge = scope_base_charge(resource_metrics.resource.as_ref(), scope_metrics);
+            // `setScopeContext` (`metrics_to_prw.go:446-475`): off by
+            // default, and inert for an unnamed scope even when on.
+            let scope_pairs =
+                build_scope_pairs(scope_metrics, &label_namer, settings.promote_scope_metadata)?;
+
+            // Charge the per-scope base rendering BEFORE materializing it —
+            // mirrors otlp_traces' pre-render service charge. The same
+            // `base_charge` is threaded down and re-charged per sample (each
+            // sample clones the base pairs).
+            let base_charge =
+                pairs_charge(&resource_pairs).saturating_add(pairs_charge(&scope_pairs));
             charge_budget(&mut expanded_bytes, base_charge)?;
 
-            // Base label pairs (resource ⊕ scope identity ⊕ scope attrs),
-            // computed once per `ScopeMetrics` (architect plan) and reused,
-            // unresolved, across every data point in it — the actual
-            // `LabelSet`/collision count is only ever produced once the
-            // final per-data-point pair set (base ⊕ dp attrs ⊕ synthetic
-            // le/quantile) is known, in `emit_sample`.
-            let base_pairs = build_scope_pairs(resource_metrics.resource.as_ref(), scope_metrics);
             let base = ScopeBase {
-                pairs: &base_pairs,
+                resource_pairs: &resource_pairs,
+                scope_pairs: &scope_pairs,
                 charge: base_charge,
-                mode,
+                settings,
+                label_namer,
             };
 
             for metric in &scope_metrics.metrics {
@@ -284,9 +416,32 @@ pub fn parse(
                     &mut seen_metadata,
                     metric,
                     &base,
-                    now_ns,
+                    &Namers {
+                        metric: &metric_namer,
+                        unit: &unit_namer,
+                        now_ns,
+                    },
                 )?;
             }
+        }
+
+        // `target_info` (`helper.go:498-605`), emitted per `ResourceMetrics`
+        // AFTER its metrics and only when at least one data point of that
+        // resource was accepted.
+        if let Some((earliest, latest)) = accepted_span(&out, samples_before, hist_samples_before) {
+            emit_target_info(
+                &mut out,
+                &mut expanded_bytes,
+                &mut seen_series,
+                &mut seen_metadata,
+                &mut seen_target_info,
+                resource_attrs,
+                &resource_pairs,
+                label_namer,
+                settings,
+                (earliest, latest),
+                now_ns,
+            )?;
         }
     }
 
@@ -302,6 +457,49 @@ pub fn parse(
     dedup_histogram_wins(&mut out, &mut expanded_bytes)?;
 
     Ok(out)
+}
+
+/// The min/max `unix_milli` over the samples this `ResourceMetrics` just
+/// contributed — the accepted-data-point span `target_info` is emitted
+/// across.
+///
+/// **Divergence, ledgered as `otlp-target-info-span-accepted-points-only`.**
+/// The reference computes the span with `findMinAndMaxTimestamps`
+/// (`metrics_to_prw.go:217`) over *every* data point of the resource,
+/// including ones it later rejects. We use only accepted points, because a
+/// data point our `Date` domain refuses (see [`resolve_timestamp_ms`])
+/// could otherwise place a `target_info` sample outside the storable range
+/// — a partition our own schema cannot hold. Only reachable on payloads we
+/// already reject and the reference does not.
+fn accepted_span(
+    out: &ParsedMetrics,
+    samples_before: usize,
+    hist_samples_before: usize,
+) -> Option<(i64, i64)> {
+    let timestamps = out.samples[samples_before..]
+        .iter()
+        .map(|s| s.unix_milli)
+        .chain(
+            out.hist_samples[hist_samples_before..]
+                .iter()
+                .map(|h| h.unix_milli),
+        );
+    timestamps.fold(None, |acc: Option<(i64, i64)>, ms| match acc {
+        None => Some((ms, ms)),
+        Some((min, max)) => Some((min.min(ms), max.max(ms))),
+    })
+}
+
+/// The per-request constants [`parse_metric`] needs: the two namers, and
+/// the ingest timestamp every metadata row is versioned by. Bundled so
+/// `parse_metric` stays within clippy's argument threshold, the same
+/// rationale [`ScopeBase`]/[`DataPointContext`] already document.
+struct Namers<'a> {
+    metric: &'a MetricNamer,
+    unit: &'a UnitNamer,
+    /// `now_ns`: every `MetricMetadata`'s `updated_ns` (the
+    /// `ReplacingMergeTree` version column, issue #26 amendment).
+    now_ns: i64,
 }
 
 /// Drops any float sample whose `(metric_name, fingerprint, unix_milli)`
@@ -350,11 +548,16 @@ fn dedup_histogram_wins(
 }
 
 /// Dispatches one `Metric` descriptor to its type-specific handler
-/// (architect plan's per-type mapping table), after registering its
-/// (deduped, base-named) [`MetricMetadata`] row. A `Metric` with no `data`
-/// oneof set carries no data points and is silently skipped — the OTLP
-/// wire format allows this at the message-shape level even though it is
-/// not a meaningful export.
+/// (architect plan's per-type mapping table), after translating its name
+/// and registering its (deduped) [`MetricMetadata`] row. A `Metric` with
+/// no `data` oneof set carries no data points and is silently skipped —
+/// the OTLP wire format allows this at the message-shape level even though
+/// it is not a meaningful export.
+///
+/// The name is built by [`MetricNamer`] (issue #461), so a monotonic Sum
+/// gains `_total`, a unit gains its suffix, and a dotted OTLP name becomes
+/// a Prometheus-legal identifier. A name that cannot normalize fails the
+/// **whole request** — see [`parse`].
 fn parse_metric(
     out: &mut ParsedMetrics,
     expanded_bytes: &mut usize,
@@ -362,12 +565,34 @@ fn parse_metric(
     seen_metadata: &mut HashSet<Arc<str>>,
     metric: &Metric,
     base: &ScopeBase<'_>,
-    now_ns: i64,
+    namers: &Namers<'_>,
 ) -> Result<(), LogsIngestError> {
     let Some(data) = metric.data.as_ref() else {
         return Ok(());
     };
-    let name: Arc<str> = Arc::from(metric.name.as_str());
+
+    // `TranslatorMetricFromOtelMetric` (`metrics_to_prw.go:132-155`).
+    let kind = match data {
+        metric::Data::Gauge(_) => MetricKind::Gauge,
+        metric::Data::Sum(sum) => {
+            if sum.is_monotonic {
+                MetricKind::MonotonicCounter
+            } else {
+                MetricKind::NonMonotonicCounter
+            }
+        }
+        metric::Data::Histogram(_) => MetricKind::Histogram,
+        metric::Data::ExponentialHistogram(_) => MetricKind::ExponentialHistogram,
+        metric::Data::Summary(_) => MetricKind::Summary,
+    };
+
+    let name: Arc<str> = Arc::from(
+        namers
+            .metric
+            .build(&metric.name, &metric.unit, kind)
+            .map_err(LogsIngestError::InvalidMetricName)?
+            .as_str(),
+    );
 
     let metric_type = match data {
         metric::Data::Gauge(_) => "gauge",
@@ -387,8 +612,11 @@ fn parse_metric(
             metric_name: Arc::clone(&name),
             metric_type: metric_type.to_string(),
             help: metric.description.clone(),
-            unit: metric.unit.clone(),
-            updated_ns: now_ns,
+            // `unitNamer.Build(metric.Unit())` (`metrics_to_prw.go:244`) —
+            // the metadata unit is translated too, so `s` is stored as
+            // `seconds`.
+            unit: namers.unit.build(&metric.unit),
+            updated_ns: namers.now_ns,
         });
     }
 
@@ -447,7 +675,7 @@ fn parse_metric(
             // `Dual` emits the native row THEN the classic flatten (disjoint
             // fingerprints — base name vs `_bucket`/`_sum`/`_count`).
             for dp in &exp.data_points {
-                match base.mode {
+                match base.settings.exp_histogram_mode {
                     ExpHistogramMode::Classic => {
                         emit_exponential_histogram_point(
                             out,
@@ -515,8 +743,12 @@ fn reject_whole_metric(out: &mut ParsedMetrics, metric_name: &str, data_point_co
     if out.rejected_message.is_none() {
         // Lazy + truncated (issue #62): the embedded name is untrusted
         // wire content, kept only for the first rejection.
+        // The wording is published by
+        // docs/benchmarks/metrics-differential-ledger.md
+        // (`otlp-delta-partial-success`), so it names what the client must
+        // do rather than a milestone that has since shipped.
         out.rejected_message = Some(format!(
-            "metric {}: delta temporality unsupported until M7",
+            "metric {}: delta temporality is not ingested; send cumulative",
             diag_snippet(metric_name, DIAG_SNIPPET_MAX_BYTES)
         ));
     }
@@ -538,23 +770,240 @@ fn reject_point(out: &mut ParsedMetrics, message: impl FnOnce() -> String) {
 /// so the per-type handlers stay within clippy's default argument threshold,
 /// mirroring [`DataPointContext`]'s own bundling rationale.
 struct ScopeBase<'a> {
-    pairs: &'a [(String, String)],
+    /// `job`/`instance`, already final, in the order the reference `Set`s
+    /// them (`helper.go:140-146`) — after the attribute fold, so a data
+    /// point attribute named `job` loses.
+    resource_pairs: &'a [(String, String)],
+    /// The promoted `otel_scope_*` labels, empty unless
+    /// `promote_scope_metadata` is on and the scope is named. `Set` after
+    /// `job`/`instance` (`helper.go:154-162`); an empty value is a delete,
+    /// so an absent version or schema URL stores nothing.
+    scope_pairs: &'a [(String, String)],
     charge: usize,
-    /// The request's exp-histogram storage mode (issue #120), carried here
-    /// (constant per request) so `parse_metric` stays within clippy's
-    /// argument threshold rather than threading a separate parameter.
-    mode: ExpHistogramMode,
+    settings: MetricIngestSettings,
+    label_namer: LabelNamer,
+}
+
+/// `setScopeContext` (`metrics_to_prw.go:446-475 @ v3.13.0`): the
+/// `otel_scope_*` labels for one `ScopeMetrics`, or empty when scope
+/// promotion is off or the scope has no name. Scope attribute keys are
+/// sanitized **with the `otel_scope_` prefix already attached**
+/// (`:461`), so a key that fails to normalize fails the whole request.
+fn build_scope_pairs(
+    scope_metrics: &ScopeMetrics,
+    label_namer: &LabelNamer,
+    promote_scope_metadata: bool,
+) -> Result<Vec<(String, String)>, LogsIngestError> {
+    let Some(scope) = scope_metrics.scope.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if !promote_scope_metadata || scope.name.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pairs = Vec::with_capacity(scope.attributes.len() + 3);
+    for kv in &scope.attributes {
+        let name = label_namer
+            .build(&format!("otel_scope_{}", kv.key))
+            .map_err(LogsIngestError::InvalidLabelName)?;
+        pairs.push((name, any_value_to_string(kv.value.as_ref())));
+    }
+    pairs.push(("otel_scope_name".to_string(), scope.name.clone()));
+    pairs.push(("otel_scope_version".to_string(), scope.version.clone()));
+    pairs.push((
+        "otel_scope_schema_url".to_string(),
+        scope_metrics.schema_url.clone(),
+    ));
+    Ok(pairs)
+}
+
+/// A port of Go's `labels.Builder` (`model/labels/labels_common.go` +
+/// `labels.go` @ `v3.13.0`) restricted to the operations
+/// `createAttributes` uses: `Reset`, `Get`, `Set` (whose empty-value case
+/// is `Del`) and `Labels`.
+///
+/// Modelling it faithfully rather than with a plain map matters for one
+/// observable case the reference exhibits: `Reset` records every base
+/// label with an empty value as deleted, so `{a.b="", a_b="keep"}` stores
+/// `a_b="keep"` while `{a.b="keep", a_b=""}` stores `a_b="keep;"` — the
+/// trailing semicolon survives because the merge happens before the
+/// delete is evaluated.
+///
+/// Go scans its `add`/`del` slices linearly, which is right for the handful
+/// of labels a real data point carries. This port indexes both instead: a
+/// 64 MiB body can legitimately decode to a data point with a very large
+/// attribute list, and the fold below performs a `get` and a `set` per
+/// attribute, so linear scans would make one pathological data point
+/// quadratic. The index changes no semantics — `add` holds unique names by
+/// construction (`Set` replaces in place) and `del` is a membership test.
+#[derive(Debug, Default)]
+struct LabelBuilder {
+    base: Vec<(String, String)>,
+    del: BTreeSet<String>,
+    add: Vec<(String, String)>,
+    /// `name -> index into `add``, so `get`/`set` are `O(log n)`.
+    add_index: BTreeMap<String, usize>,
+}
+
+impl LabelBuilder {
+    /// `Builder.Reset(base)`: adopt `base` and mark every empty-valued
+    /// entry deleted.
+    fn reset(base: Vec<(String, String)>) -> Self {
+        let del = base
+            .iter()
+            .filter(|(_, value)| value.is_empty())
+            .map(|(name, _)| name.clone())
+            .collect();
+        LabelBuilder {
+            base,
+            del,
+            add: Vec::new(),
+            add_index: BTreeMap::new(),
+        }
+    }
+
+    /// `Builder.Get`: `add` first (because `Set` does not clear `del`),
+    /// then `del`, then `base`. Absent is `""`.
+    fn get(&self, name: &str) -> &str {
+        if let Some(&index) = self.add_index.get(name) {
+            return &self.add[index].1;
+        }
+        if self.del.contains(name) {
+            return "";
+        }
+        self.base
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    }
+
+    /// `Builder.Set`, whose empty-value case is `Del`
+    /// (`labels_common.go:187-192`).
+    fn set(&mut self, name: &str, value: &str) {
+        if value.is_empty() {
+            if let Some(index) = self.add_index.remove(name) {
+                self.add.remove(index);
+                // Every later entry shifted down by one.
+                for slot in self.add_index.values_mut() {
+                    if *slot > index {
+                        *slot -= 1;
+                    }
+                }
+            }
+            self.del.insert(name.to_string());
+            return;
+        }
+        if let Some(&index) = self.add_index.get(name) {
+            self.add[index].1 = value.to_string();
+            return;
+        }
+        self.add_index.insert(name.to_string(), self.add.len());
+        self.add.push((name.to_string(), value.to_string()));
+    }
+
+    /// `Builder.Labels`: base entries that are neither deleted nor
+    /// overridden, then everything added. Sorting is left to
+    /// [`LabelSet::from_verbatim`], which sorts anyway.
+    fn labels(self) -> Vec<(String, String)> {
+        let LabelBuilder {
+            base,
+            del,
+            add,
+            add_index,
+        } = self;
+        let mut out: Vec<(String, String)> = base
+            .into_iter()
+            .filter(|(name, _)| !del.contains(name) && !add_index.contains_key(name))
+            .collect();
+        out.extend(add);
+        out
+    }
+}
+
+/// A port of `createAttributes`
+/// (`prometheusremotewrite/helper.go:77-195 @ v3.13.0`): the label set one
+/// data point (or one `target_info` series) carries.
+///
+/// 1. Collect `(raw_key, rendered_value)` for every attribute whose **raw**
+///    key is not in `ignore` — the filter runs before sanitization
+///    (`:96`), so an attribute named `__name__` is dropped and one named
+///    `__name.__` is not.
+/// 2. Sort by raw key, byte-wise. Rust's sort is stable, so equal raw keys
+///    keep wire order; Go's `ScratchBuilder.Sort` is `slices.SortFunc`,
+///    unstable above 12 elements, so its own order there is unspecified.
+///    Ledgered as `otlp-duplicate-attribute-key-order`.
+/// 3. Fold into the builder under the sanitized key, joining a collision
+///    with `;` (`:112-129`). Under a UTF-8-allowing strategy this whole
+///    step is skipped (`:104-106`): raw keys are used verbatim, no label
+///    name is validated, and nothing is merged.
+/// 4. `Set` `job`/`instance`, then the promoted scope labels — plain
+///    overwrites, so a data-point attribute named `job` loses.
+///
+/// `Err` on a label name that cannot normalize: a whole-request failure.
+fn build_attribute_labels(
+    attributes: &[KeyValue],
+    ignore: &[&str],
+    label_namer: &LabelNamer,
+    resource_pairs: &[(String, String)],
+    scope_pairs: &[(String, String)],
+    collisions: &mut u64,
+) -> Result<Vec<(String, String)>, LogsIngestError> {
+    let mut sorted: Vec<(&str, String)> = attributes
+        .iter()
+        .filter(|kv| !ignore.contains(&kv.key.as_str()))
+        .map(|kv| (kv.key.as_str(), any_value_to_string(kv.value.as_ref())))
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut builder = if label_namer.utf8_allowed {
+        LabelBuilder::reset(
+            sorted
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        )
+    } else {
+        let mut builder = LabelBuilder::reset(Vec::new());
+        for (raw, value) in sorted {
+            let final_key = label_namer
+                .build(raw)
+                .map_err(LogsIngestError::InvalidLabelName)?;
+            let existing = builder.get(&final_key);
+            if existing.is_empty() {
+                builder.set(&final_key, &value);
+            } else {
+                *collisions += 1;
+                let merged = format!("{existing};{value}");
+                builder.set(&final_key, &merged);
+            }
+        }
+        builder
+    };
+
+    for (name, value) in resource_pairs {
+        builder.set(name, value);
+    }
+    for (name, value) in scope_pairs {
+        builder.set(name, value);
+    }
+
+    Ok(builder.labels())
 }
 
 /// The per-data-point context every `emit_sample` call within one data
-/// point's handler shares: the scope's base label pairs, this data point's
-/// own attributes, and its resolved timestamp — bundled to keep
-/// `emit_sample`'s own argument count within clippy's default threshold
-/// rather than re-threading three unchanging arguments through every call
-/// site in a histogram/exponential-histogram/summary data point.
-struct DataPointContext<'a> {
-    base_pairs: &'a [(String, String)],
-    dp_attributes: &'a [KeyValue],
+/// point's handler shares: the data point's already-resolved label set, its
+/// timestamp, and the budget charges — bundled to keep `emit_sample`'s own
+/// argument count within clippy's default threshold rather than re-threading
+/// unchanging arguments through every call site in a histogram/
+/// exponential-histogram/summary data point.
+///
+/// The label set is built **once per data point**, matching the reference
+/// (`baseLabels` in `helper.go`'s histogram/summary paths), so a label-name
+/// rejection is decided once and a histogram's buckets do not re-sanitize
+/// the same keys.
+struct DataPointContext {
+    base_labels: Vec<(String, String)>,
     unix_milli: i64,
     /// The per-scope base label charge (issue #62), re-charged per sample
     /// (each sample clones the base pairs into its own `LabelSet`). O(1) to
@@ -565,20 +1014,50 @@ struct DataPointContext<'a> {
     dp_attr_charge: usize,
 }
 
-impl<'a> DataPointContext<'a> {
+impl DataPointContext {
     /// Builds the per-data-point context from the scope's [`ScopeBase`] and
     /// this data point's attributes/timestamp, charging the data point's own
     /// attributes once here (issue #62) rather than per sample.
-    fn new(base: &ScopeBase<'a>, dp_attributes: &'a [KeyValue], unix_milli: i64) -> Self {
-        DataPointContext {
-            base_pairs: base.pairs,
+    fn new(
+        out: &mut ParsedMetrics,
+        expanded_bytes: &mut usize,
+        base: &ScopeBase<'_>,
+        dp_attributes: &[KeyValue],
+        unix_milli: i64,
+    ) -> Result<Self, LogsIngestError> {
+        // Charged BEFORE `build_attribute_labels` materializes anything
+        // (issue #62's charge-before-allocate discipline): the label set is
+        // built once per data point, so a data point with a pathological
+        // attribute list must abort here rather than after its sanitized
+        // keys and merged values are already on the heap. Re-read O(1) per
+        // sample below.
+        let dp_attr_charge = attrs_budget_charge(dp_attributes);
+        charge_budget(expanded_bytes, dp_attr_charge)?;
+
+        let mut collisions = 0u64;
+        let base_labels = build_attribute_labels(
             dp_attributes,
+            RESERVED_ATTRIBUTE_KEYS,
+            &base.label_namer,
+            base.resource_pairs,
+            base.scope_pairs,
+            &mut collisions,
+        )?;
+        out.collisions += collisions;
+        Ok(DataPointContext {
+            base_labels,
             unix_milli,
             base_charge: base.charge,
-            dp_attr_charge: attrs_budget_charge(dp_attributes),
-        }
+            dp_attr_charge,
+        })
     }
 }
+
+/// `reservedLabelNames` (`helper.go:68-70 @ v3.13.0`): attribute keys the
+/// receiver drops because the corresponding label is set separately. The
+/// metric name is a first-class column here, so `__name__` never becomes a
+/// label at all.
+const RESERVED_ATTRIBUTE_KEYS: &[&str] = &[pulsus_model::METRIC_NAME_LABEL];
 
 /// Gauge/Sum mapping (architect plan table): one sample named `{name}`,
 /// labeled by the data point's own attributes (chained onto the scope's
@@ -613,7 +1092,7 @@ fn emit_number_point(
         return Ok(());
     };
     let value = stale_or(dp.flags, raw_value);
-    let ctx = DataPointContext::new(base, &dp.attributes, unix_milli);
+    let ctx = DataPointContext::new(out, expanded_bytes, base, &dp.attributes, unix_milli)?;
     emit_sample(out, expanded_bytes, seen_series, name, &ctx, None, value)
 }
 
@@ -655,7 +1134,7 @@ fn emit_histogram_point(
             return Ok(());
         }
     };
-    let ctx = DataPointContext::new(base, &dp.attributes, unix_milli);
+    let ctx = DataPointContext::new(out, expanded_bytes, base, &dp.attributes, unix_milli)?;
     let bucket_name: Arc<str> = Arc::from(format!("{name}_bucket").as_str());
 
     if dp.bucket_counts.is_empty() {
@@ -787,7 +1266,7 @@ fn emit_exponential_histogram_point(
             return Ok(());
         }
     };
-    let ctx = DataPointContext::new(base, &dp.attributes, unix_milli);
+    let ctx = DataPointContext::new(out, expanded_bytes, base, &dp.attributes, unix_milli)?;
 
     // Charge the intermediate `(bound, count)` Vec BEFORE building it
     // (issue #62). Bounded/non-multiplicative (one entry per wire bucket
@@ -1004,12 +1483,11 @@ fn emit_native_exponential_histogram(
         return Ok(());
     }
 
-    // One sample per data point, labeled by the scope base pairs ⊕ this data
-    // point's own attributes (no synthetic `le`/`quantile` — the native form
-    // carries no per-bucket label).
-    let pairs = base.pairs.iter().cloned().chain(attr_pairs(&dp.attributes));
-    let (labels, collisions) = LabelSet::from_normalized(pairs);
-    out.collisions += collisions as u64;
+    // One sample per data point, labeled exactly as a float sample of the
+    // same data point would be (no synthetic `le`/`quantile` — the native
+    // form carries no per-bucket label).
+    let ctx = DataPointContext::new(out, expanded_bytes, base, &dp.attributes, unix_milli)?;
+    let labels = LabelSet::from_verbatim(ctx.base_labels);
     let fingerprint = metric_fingerprint(&labels);
 
     if seen_series.insert((Arc::clone(name), fingerprint)) {
@@ -1135,7 +1613,7 @@ fn emit_summary_point(
             return Ok(());
         }
     };
-    let ctx = DataPointContext::new(base, &dp.attributes, unix_milli);
+    let ctx = DataPointContext::new(out, expanded_bytes, base, &dp.attributes, unix_milli)?;
 
     for qv in &dp.quantile_values {
         emit_sample(
@@ -1172,17 +1650,21 @@ fn emit_summary_point(
     Ok(())
 }
 
-/// Builds one sample's final `LabelSet` (base pairs ⊕ this data point's
-/// attributes ⊕ an optional synthetic `le`/`quantile` pair, all fed as ONE
-/// iterator to [`LabelSet::from_normalized`] — architect plan: "no source
-/// precedence override"), fingerprints it, registers the `(metric_name,
-/// fingerprint)` series (deduped) and pushes the sample.
+/// Builds one sample's final `LabelSet` (the data point's already-resolved
+/// labels ⊕ an optional synthetic `le`/`quantile` pair), fingerprints it,
+/// registers the `(metric_name, fingerprint)` series (deduped) and pushes
+/// the sample.
+///
+/// The extra pair is `Set` **without** sanitization, exactly as `addLabels`
+/// does (`helper.go:485-495 @ v3.13.0`) — `le` and `quantile` are already
+/// valid label names, and the reference does not re-run the namer over
+/// them.
 fn emit_sample(
     out: &mut ParsedMetrics,
     expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
     metric_name: Arc<str>,
-    ctx: &DataPointContext<'_>,
+    ctx: &DataPointContext,
     extra: Option<(&str, String)>,
     value: f64,
 ) -> Result<(), LogsIngestError> {
@@ -1191,21 +1673,25 @@ fn emit_sample(
     // pairs it clones (`base_charge`, O(1) read — no re-walk), its own
     // attributes (`dp_attr_charge`), and the optional synthetic
     // `le`/`quantile` pair. Allocation-free; a pathological fan-out aborts
-    // here before `from_normalized` clones a single pair set.
+    // here before a single pair set is cloned.
     let extra_len = extra.as_ref().map(|(k, v)| k.len() + v.len()).unwrap_or(0);
     charge_budget(
         expanded_bytes,
         SAMPLE_ROW_OVERHEAD + ctx.base_charge + ctx.dp_attr_charge + extra_len,
     )?;
 
-    let pairs = ctx
-        .base_pairs
-        .iter()
-        .cloned()
-        .chain(attr_pairs(ctx.dp_attributes))
-        .chain(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
-    let (labels, collisions) = LabelSet::from_normalized(pairs);
-    out.collisions += collisions as u64;
+    let mut pairs = ctx.base_labels.clone();
+    if let Some((key, value)) = extra {
+        match pairs.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = value,
+            None => pairs.push((key.to_string(), value)),
+        }
+    }
+    // Keys are already final (sanitized, merged and deduplicated by
+    // `build_attribute_labels`), so the canonicalize-and-pick-a-winner rule
+    // of `from_normalized` must NOT run here — it would re-resolve
+    // collisions the reference has already merged with `;`.
+    let labels = LabelSet::from_verbatim(pairs);
     let fingerprint = metric_fingerprint(&labels);
 
     if seen_series.insert((Arc::clone(&metric_name), fingerprint)) {
@@ -1224,54 +1710,158 @@ fn emit_sample(
     Ok(())
 }
 
-/// Flattens `resource.attributes ⊕ otel_scope_name/version ⊕
-/// scope.attributes` into raw `(key, value)` pairs — the base set every
-/// data point in this `ScopeMetrics` chains its own attributes onto before
-/// calling [`LabelSet::from_normalized`] (mirrors `otlp_logs`'s
-/// `build_scope_labels`, but returns unresolved pairs rather than an
-/// already-built `LabelSet`+fingerprint, since metrics resolve the final
-/// label set per data point, not once per scope). `otel_scope_name`/
-/// `otel_scope_version` are emitted only when `scope_metrics.scope` is
-/// present (same rule as logs, issue #8 task-manager resolution).
-fn build_scope_pairs(
-    resource: Option<&Resource>,
-    scope_metrics: &ScopeMetrics,
-) -> Vec<(String, String)> {
-    let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    let scope = scope_metrics.scope.as_ref();
-    let scope_identity = scope.into_iter().flat_map(|s| {
-        [
-            ("otel_scope_name".to_string(), s.name.clone()),
-            ("otel_scope_version".to_string(), s.version.clone()),
-        ]
-    });
-    let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
+/// `addResourceTargetInfo` (`helper.go:498-605 @ v3.13.0`): the resource
+/// attributes the metric series no longer carry, published as their own
+/// `target_info` series.
+///
+/// Skipped when the resource carries nothing but the three identifying
+/// attributes (`:509-519`) and when neither `job` nor `instance` was
+/// derived (`:548-558`). One sample of value `1` at `earliest`, then every
+/// `interval` while strictly before `latest`, then one at `latest`
+/// (`:574-604`) — so a zero-width span emits exactly one.
+///
+/// Two deliberate departures from the reference, both ledgered:
+/// [`MAX_TARGET_INFO_SAMPLES`] bounds the emission, and the span is taken
+/// over accepted data points only (see [`accepted_span`]).
+#[allow(clippy::too_many_arguments)]
+fn emit_target_info(
+    out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
+    seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
+    seen_metadata: &mut HashSet<Arc<str>>,
+    seen_target_info: &mut HashSet<(Fingerprint, i64)>,
+    resource_attrs: &[KeyValue],
+    resource_pairs: &[(String, String)],
+    label_namer: LabelNamer,
+    settings: MetricIngestSettings,
+    span: (i64, i64),
+    now_ns: i64,
+) -> Result<(), LogsIngestError> {
+    // "If we only have job + instance, then target_info isn't useful"
+    // (`helper.go:509-519`). Counted the reference's way: total attributes
+    // minus the identifying ones that are present.
+    let identifying_present = IDENTIFYING_RESOURCE_ATTRS
+        .iter()
+        .filter(|key| resource_attrs.iter().any(|kv| kv.key == **key))
+        .count();
+    if resource_attrs.len() <= identifying_present {
+        return Ok(());
+    }
 
-    attr_pairs(resource_attrs)
-        .chain(scope_identity)
-        .chain(attr_pairs(scope_attrs))
-        .collect()
+    // The whole resource attribute set is charged exactly once here, right
+    // before it is materialized — the charge a sample used to carry before
+    // issue #461 stopped cloning resource attributes into every sample.
+    charge_budget(expanded_bytes, attrs_budget_charge(resource_attrs))?;
+
+    // `target_info` is resource-level and carries no scope labels
+    // (`helper.go:539-544`), so the scope pairs are deliberately empty.
+    let mut collisions = 0u64;
+    let pairs = build_attribute_labels(
+        resource_attrs,
+        IDENTIFYING_RESOURCE_ATTRS,
+        &label_namer,
+        resource_pairs,
+        &[],
+        &mut collisions,
+    )?;
+    out.collisions += collisions;
+
+    let has_identifier = pairs
+        .iter()
+        .any(|(name, _)| name == "job" || name == "instance");
+    if !has_identifier {
+        return Ok(());
+    }
+
+    let (earliest, latest) = span;
+    let interval = settings.target_info_interval_ms();
+    // The loop emits at `earliest`, `earliest + interval`, … while strictly
+    // before `latest`; the final sample lands on `latest`.
+    let before_latest = if latest > earliest {
+        ((latest - earliest - 1) / interval) + 1
+    } else {
+        0
+    };
+    let sample_count = usize::try_from(before_latest)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1);
+    if sample_count > MAX_TARGET_INFO_SAMPLES {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "target_info samples for one ResourceMetrics",
+            limit: MAX_TARGET_INFO_SAMPLES,
+            actual: sample_count,
+        });
+    }
+
+    let labels = LabelSet::from_verbatim(pairs);
+    charge_budget(
+        expanded_bytes,
+        sample_count.saturating_mul(SAMPLE_ROW_OVERHEAD.saturating_add(labels_byte_len(&labels))),
+    )?;
+
+    let name: Arc<str> = Arc::from(TARGET_INFO_METRIC_NAME);
+    if seen_metadata.insert(Arc::clone(&name)) {
+        out.metadata.push(MetricMetadata {
+            metric_name: Arc::clone(&name),
+            metric_type: "gauge".to_string(),
+            help: TARGET_INFO_HELP.to_string(),
+            unit: String::new(),
+            updated_ns: now_ns,
+        });
+    }
+
+    let fingerprint = metric_fingerprint(&labels);
+    if seen_series.insert((Arc::clone(&name), fingerprint)) {
+        out.series.push(SeriesRef {
+            metric_name: Arc::clone(&name),
+            fingerprint,
+            labels,
+        });
+    }
+
+    let mut unix_milli = earliest;
+    while unix_milli < latest {
+        if seen_target_info.insert((fingerprint, unix_milli)) {
+            out.samples.push(MetricPoint {
+                metric_name: Arc::clone(&name),
+                fingerprint,
+                unix_milli,
+                value: 1.0,
+            });
+        }
+        unix_milli = unix_milli.saturating_add(interval);
+    }
+    if seen_target_info.insert((fingerprint, latest)) {
+        out.samples.push(MetricPoint {
+            metric_name: name,
+            fingerprint,
+            unix_milli: latest,
+            value: 1.0,
+        });
+    }
+    Ok(())
 }
 
-/// Renders a `KeyValue` list to `(key, value)` label pairs — value
-/// rendering mirrors `otlp_logs::any_value_to_string` byte-for-byte
-/// (duplicated here rather than shared: `otlp_logs.rs` is a frozen,
-/// out-of-scope file for this issue, the same precedent
-/// `otlp_logs::base64_encode`'s own doc comment already establishes for
-/// this crate).
-fn attr_pairs(attrs: &[KeyValue]) -> impl Iterator<Item = (String, String)> + '_ {
-    attrs
-        .iter()
-        .map(|kv| (kv.key.clone(), any_value_to_string(kv.value.as_ref())))
+/// `Σ (key + value)` over a built [`LabelSet`] — the per-`target_info`
+/// sample label cost, charged before those samples are materialized.
+fn labels_byte_len(labels: &LabelSet) -> usize {
+    labels.iter().fold(0usize, |acc, (k, v)| {
+        acc.saturating_add(k.len()).saturating_add(v.len())
+    })
 }
 
 /// Renders an OTLP attribute's `AnyValue` to its stored label-value form:
 /// a string value verbatim; a scalar (bool/int/double) via `Display`; an
 /// array/kvlist via `serde_json`; bytes as base64. Absent (`None`) or an
-/// entirely unspecified `AnyValue` both render as `""`. See this module's
-/// doc comment on [`attr_pairs`] for why this duplicates
-/// `otlp_logs::any_value_to_string`.
-fn any_value_to_string(value: Option<&AnyValue>) -> String {
+/// entirely unspecified `AnyValue` both render as `""`.
+///
+/// Duplicated from `otlp_logs::any_value_to_string` rather than shared:
+/// `otlp_logs.rs` is a frozen, out-of-scope file for this parser, the same
+/// precedent `otlp_logs::base64_encode`'s own doc comment already
+/// establishes for this crate. `pub(crate)` so
+/// [`crate::protocols::prom_metric_name::job_and_instance`] renders
+/// `service.name` the identical way.
+pub(crate) fn any_value_to_string(value: Option<&AnyValue>) -> String {
     let Some(value) = value.and_then(|v| v.value.as_ref()) else {
         return String::new();
     };
@@ -1465,13 +2055,22 @@ mod tests {
     /// Test shim (issue #120): every pre-A4 test asserts the default
     /// `Classic` mode, so this local `parse` shadows the glob-imported
     /// [`super::parse`] to keep those call sites byte-identical. The
-    /// native/dual/collision tests below call `super::parse` with an
-    /// explicit [`ExpHistogramMode`].
+    /// native/dual/collision tests below call `super::parse` with explicit
+    /// [`MetricIngestSettings`].
     fn parse(
         req: &ExportMetricsServiceRequest,
         now_ns: i64,
     ) -> Result<ParsedMetrics, LogsIngestError> {
-        super::parse(req, now_ns, ExpHistogramMode::Classic)
+        super::parse(req, now_ns, MetricIngestSettings::default())
+    }
+
+    /// The reference OTLP defaults with one exponential-histogram mode
+    /// substituted (issue #120's axis, unchanged by issue #461).
+    fn hist_settings(exp_histogram_mode: ExpHistogramMode) -> MetricIngestSettings {
+        MetricIngestSettings {
+            exp_histogram_mode,
+            ..MetricIngestSettings::default()
+        }
     }
 
     fn kv(key: &str, value: Value) -> KeyValue {
@@ -1505,11 +2104,17 @@ mod tests {
         }])
     }
 
+    /// A unit-LESS gauge: issue #461's namer appends `_ratio` to a
+    /// `unit == "1"` gauge and a unit token to every other unit, so this
+    /// helper carries no unit and its names survive translation verbatim.
+    /// The suffix rules have their own coverage in
+    /// `protocols::prom_metric_name` and in the captured corpus
+    /// (`tests/otlp_prom_translation.rs`).
     fn gauge_metric(name: &str, dp: NumberDataPoint) -> Metric {
         Metric {
             name: name.to_string(),
             description: "a gauge".to_string(),
-            unit: "1".to_string(),
+            unit: String::new(),
             metadata: vec![],
             data: Some(metric::Data::Gauge(Gauge {
                 data_points: vec![dp],
@@ -1640,11 +2245,13 @@ mod tests {
         };
         let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 2);
-        assert!(
-            out.rejected_message
-                .as_ref()
-                .unwrap()
-                .contains("requests_total")
+        // The exact bytes: they are published by
+        // docs/benchmarks/metrics-differential-ledger.md's
+        // `otlp-delta-partial-success` row, so the row and the wire cannot
+        // drift apart unnoticed.
+        assert_eq!(
+            out.rejected_message.as_deref(),
+            Some("metric requests_total: delta temporality is not ingested; send cumulative")
         );
         assert!(out.samples.is_empty());
         // Metadata is still registered (type is knowable independent of
@@ -1738,8 +2345,16 @@ mod tests {
 
     // -- label normalization / fingerprint identity --------------------
 
+    /// Issue #461 replaced the logs convention on this path. A resource
+    /// `service.name` no longer becomes a `service_name` label at all: it
+    /// becomes `job` (`metrics_to_prw.go:420-426 @ v3.13.0`), and every
+    /// other resource attribute leaves the metric series entirely for
+    /// `target_info`. The pre-#461 twin of this test asserted that
+    /// `service.name` and `service_name` fingerprint identically; under the
+    /// reference's rule they must NOT, because only the first is
+    /// identifying.
     #[test]
-    fn dotted_and_underscored_service_name_fingerprint_identically() {
+    fn resource_service_name_becomes_job_and_is_not_promoted_as_a_label() {
         let resource_dot = Resource {
             attributes: vec![kv("service.name", Value::StringValue("checkout".into()))],
             dropped_attributes_count: 0,
@@ -1766,7 +2381,33 @@ mod tests {
             0,
         )
         .expect("within the expansion budget");
-        assert_eq!(
+
+        let dot_series = out_dot
+            .series
+            .iter()
+            .find(|s| &*s.metric_name == "up")
+            .expect("the gauge series");
+        assert_eq!(dot_series.labels.get("job"), Some("checkout"));
+        assert_eq!(dot_series.labels.get("service_name"), None);
+
+        // A non-identifying `service_name` attribute is not promoted
+        // either — it reaches `target_info` and nothing else.
+        let underscore_series = out_underscore
+            .series
+            .iter()
+            .find(|s| &*s.metric_name == "up")
+            .expect("the gauge series");
+        assert_eq!(underscore_series.labels.iter().count(), 0);
+        let target = out_underscore
+            .series
+            .iter()
+            .find(|s| &*s.metric_name == "target_info");
+        assert!(
+            target.is_none(),
+            "no job and no instance means no target_info"
+        );
+
+        assert_ne!(
             out_dot.samples[0].fingerprint,
             out_underscore.samples[0].fingerprint
         );
@@ -1786,34 +2427,44 @@ mod tests {
     }
 
     #[test]
-    fn scope_identity_labels_present_only_when_scope_is_present() {
-        let with_scope = ScopeMetrics {
+    /// Issue #461: scope metadata is promoted only behind
+    /// `PULSUS_OTLP_PROMOTE_SCOPE_METADATA`, which is off by default —
+    /// matching `metrics_to_prw.go:446-450 @ v3.13.0`, where an unset
+    /// `PromoteScopeMetadata` clears the scope label cache outright. Before
+    /// #461 we emitted `otel_scope_name`/`otel_scope_version`
+    /// unconditionally.
+    fn scope_identity_labels_are_absent_unless_scope_promotion_is_enabled() {
+        let scoped = |metrics: Vec<Metric>| ScopeMetrics {
             scope: Some(InstrumentationScope {
                 name: "my-scope".to_string(),
                 version: "1.0.0".to_string(),
                 attributes: vec![],
                 dropped_attributes_count: 0,
             }),
-            metrics: vec![gauge_metric("up", number_dp(1, 1.0, vec![]))],
+            metrics,
             schema_url: String::new(),
         };
-        let out = parse(
-            &request(vec![ResourceMetrics {
-                resource: None,
-                scope_metrics: vec![with_scope],
-                schema_url: String::new(),
-            }]),
+        let req = request(vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![scoped(vec![gauge_metric("up", number_dp(1, 1.0, vec![]))])],
+            schema_url: String::new(),
+        }]);
+
+        let off = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(off.series[0].labels.get("otel_scope_name"), None);
+        assert_eq!(off.series[0].labels.get("otel_scope_version"), None);
+
+        let on = super::parse(
+            &req,
             0,
+            MetricIngestSettings {
+                promote_scope_metadata: true,
+                ..MetricIngestSettings::default()
+            },
         )
         .expect("within the expansion budget");
-        assert_eq!(
-            out.series[0].labels.get("otel_scope_name"),
-            Some("my-scope")
-        );
-        assert_eq!(
-            out.series[0].labels.get("otel_scope_version"),
-            Some("1.0.0")
-        );
+        assert_eq!(on.series[0].labels.get("otel_scope_name"), Some("my-scope"));
+        assert_eq!(on.series[0].labels.get("otel_scope_version"), Some("1.0.0"));
     }
 
     // -- histogram ------------------------------------------------------
@@ -2329,24 +2980,223 @@ mod tests {
         assert_eq!(out.samples.len(), 2);
     }
 
+    /// Issue #461 narrowed where a collision can arise: resource and scope
+    /// attributes no longer become per-sample labels, so the only source is
+    /// two data-point attribute keys that sanitize alike. The reference
+    /// merges them with `;` rather than picking a winner, and each fold is
+    /// counted.
     #[test]
-    fn label_collisions_are_counted_from_resource_and_scope_and_datapoint_attrs() {
-        let resource = Resource {
-            attributes: vec![kv("env", Value::StringValue("from_resource".into()))],
-            dropped_attributes_count: 0,
-            entity_refs: vec![],
-        };
+    fn label_collisions_are_counted_and_merged_across_datapoint_attrs() {
         let dp = number_dp(
             1,
             1.0,
-            vec![kv("env", Value::StringValue("from_dp".into()))],
+            vec![
+                kv("a.b", Value::StringValue("dot".into())),
+                kv("a_b", Value::StringValue("under".into())),
+                kv("a-b", Value::StringValue("dash".into())),
+            ],
         );
-        let out = parse(
-            &one_metric_request(Some(resource), gauge_metric("up", dp)),
+        let out = parse(&one_metric_request(None, gauge_metric("up", dp)), 0)
+            .expect("within the expansion budget");
+        assert_eq!(out.collisions, 2, "two folds onto one sanitized key");
+        assert_eq!(out.series[0].labels.get("a_b"), Some("dash;dot;under"));
+    }
+
+    // -- target_info (issue #461) ----------------------------------------
+
+    /// A resource carrying a non-identifying attribute plus a `job`.
+    fn target_info_resource() -> Resource {
+        Resource {
+            attributes: vec![
+                kv("service.name", Value::StringValue("svc".into())),
+                kv("k8s.pod.name", Value::StringValue("pod-a".into())),
+            ],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }
+    }
+
+    /// One gauge whose data points sit at the given millisecond offsets
+    /// from `base_ms`.
+    fn spanning_request(base_ms: i64, offsets_ms: &[i64]) -> ExportMetricsServiceRequest {
+        let data_points: Vec<NumberDataPoint> = offsets_ms
+            .iter()
+            .map(|offset| {
+                number_dp(
+                    ((base_ms + offset) as u64) * 1_000_000,
+                    *offset as f64,
+                    vec![],
+                )
+            })
+            .collect();
+        one_metric_request(
+            Some(target_info_resource()),
+            Metric {
+                name: "span".to_string(),
+                description: String::new(),
+                unit: String::new(),
+                metadata: vec![],
+                data: Some(metric::Data::Gauge(Gauge { data_points })),
+            },
+        )
+    }
+
+    fn target_info_timestamps(out: &ParsedMetrics) -> Vec<i64> {
+        let mut ts: Vec<i64> = out
+            .samples
+            .iter()
+            .filter(|s| &*s.metric_name == "target_info")
+            .map(|s| s.unix_milli)
+            .collect();
+        ts.sort_unstable();
+        ts
+    }
+
+    /// `helper.go:560-604 @ v3.13.0`: a sample at `earliest`, then every
+    /// `lookback / 2` while strictly before `latest`, then one at `latest`.
+    /// At the default 5-minute lookback the interval is 150 s, so a 400 s
+    /// span emits four samples and a zero-width span emits exactly one.
+    #[test]
+    fn target_info_sample_cadence_matches_the_reference() {
+        const BASE: i64 = 1_700_000_000_000;
+        let out =
+            parse(&spanning_request(BASE, &[0, 400_000]), 0).expect("within the expansion budget");
+        assert_eq!(
+            target_info_timestamps(&out),
+            vec![BASE, BASE + 150_000, BASE + 300_000, BASE + 400_000]
+        );
+
+        let single = parse(&spanning_request(BASE, &[0]), 0).expect("within the expansion budget");
+        assert_eq!(target_info_timestamps(&single), vec![BASE]);
+
+        // Value 1, metadata `gauge` / `Target metadata`, no unit.
+        let metadata = single
+            .metadata
+            .iter()
+            .find(|m| &*m.metric_name == "target_info")
+            .expect("target_info metadata is registered");
+        assert_eq!(metadata.metric_type, "gauge");
+        assert_eq!(metadata.help, "Target metadata");
+        assert_eq!(metadata.unit, "");
+        assert!(
+            single
+                .samples
+                .iter()
+                .filter(|s| &*s.metric_name == "target_info")
+                .all(|s| s.value == 1.0)
+        );
+    }
+
+    /// The interval follows the configured PromQL lookback, and a lookback
+    /// of `0` falls back to the reference's `defaultLookbackDelta`
+    /// (`helper.go:564-566`).
+    #[test]
+    fn target_info_interval_follows_the_configured_lookback() {
+        const BASE: i64 = 1_700_000_000_000;
+        let req = spanning_request(BASE, &[0, 400_000]);
+        let out = super::parse(
+            &req,
             0,
+            MetricIngestSettings {
+                promql_lookback_ms: 100_000,
+                ..MetricIngestSettings::default()
+            },
         )
         .expect("within the expansion budget");
-        assert_eq!(out.collisions, 1);
+        assert_eq!(
+            target_info_timestamps(&out),
+            vec![
+                BASE,
+                BASE + 50_000,
+                BASE + 100_000,
+                BASE + 150_000,
+                BASE + 200_000,
+                BASE + 250_000,
+                BASE + 300_000,
+                BASE + 350_000,
+                BASE + 400_000,
+            ]
+        );
+        let fallback = super::parse(
+            &req,
+            0,
+            MetricIngestSettings {
+                promql_lookback_ms: 0,
+                ..MetricIngestSettings::default()
+            },
+        )
+        .expect("within the expansion budget");
+        assert_eq!(
+            target_info_timestamps(&fallback),
+            vec![BASE, BASE + 150_000, BASE + 300_000, BASE + 400_000]
+        );
+    }
+
+    /// [`MAX_TARGET_INFO_SAMPLES`] is a whole-request refusal, never a
+    /// truncation: a span needing 4097 samples fails and `ParsedMetrics` is
+    /// never returned. The reference has no such bound — ledgered as
+    /// `otlp-target-info-sample-cap`.
+    #[test]
+    fn target_info_over_the_sample_cap_is_a_whole_request_400() {
+        const BASE: i64 = 1_700_000_000_000;
+        const INTERVAL_MS: i64 = 150_000;
+        // The loop emits `ceil(span / interval)` samples plus the final
+        // one, so `4096 * interval` is exactly at the cap and one more
+        // millisecond is over it.
+        let at_cap = parse(&spanning_request(BASE, &[0, 4095 * INTERVAL_MS]), 0)
+            .expect("at the cap the request is accepted");
+        assert_eq!(
+            target_info_timestamps(&at_cap).len(),
+            MAX_TARGET_INFO_SAMPLES
+        );
+
+        let err = parse(&spanning_request(BASE, &[0, 4095 * INTERVAL_MS + 1]), 0)
+            .expect_err("one sample over the cap fails the whole request");
+        let LogsIngestError::OversizeMessage {
+            field,
+            limit,
+            actual,
+        } = err
+        else {
+            panic!("unexpected error: {err}");
+        };
+        assert_eq!(field, "target_info samples for one ResourceMetrics");
+        assert_eq!(limit, MAX_TARGET_INFO_SAMPLES);
+        assert_eq!(actual, MAX_TARGET_INFO_SAMPLES + 1);
+    }
+
+    /// The span is taken over ACCEPTED data points only — a divergence from
+    /// `findMinAndMaxTimestamps`, which runs before validation
+    /// (`metrics_to_prw.go:217`). A point our `Date` domain refuses must
+    /// not drag a `target_info` sample outside the storable range.
+    /// Ledgered as `otlp-target-info-span-accepted-points-only`.
+    #[test]
+    fn target_info_span_ignores_rejected_data_points() {
+        const BASE: i64 = 1_700_000_000_000;
+        // The second point's day is past 2106-02-06, so `parse` rejects it
+        // into partial success.
+        let out = parse(&spanning_request(BASE, &[0, 5_000_000_000_000]), 0)
+            .expect("the rejected point is a partial success, not a failure");
+        assert_eq!(out.rejected, 1);
+        assert_eq!(target_info_timestamps(&out), vec![BASE]);
+    }
+
+    /// `target_info` is deduplicated by `(labels, timestamp)` across the
+    /// whole batch (`helper.go:569-585`), so two `ResourceMetrics` with the
+    /// same resource at the same instant produce one sample, not two.
+    #[test]
+    fn target_info_is_deduplicated_across_resource_metrics() {
+        const BASE: i64 = 1_700_000_000_000;
+        let one = || ResourceMetrics {
+            resource: Some(target_info_resource()),
+            scope_metrics: vec![scope_metrics(vec![gauge_metric(
+                "span",
+                number_dp((BASE as u64) * 1_000_000, 1.0, vec![]),
+            )])],
+            schema_url: String::new(),
+        };
+        let out = parse(&request(vec![one(), one()]), 0).expect("within the expansion budget");
+        assert_eq!(target_info_timestamps(&out), vec![BASE]);
     }
 
     // -- expansion budget (issue #62) -------------------------------------
@@ -2360,12 +3210,14 @@ mod tests {
     #[test]
     fn expansion_budget_rejects_pathological_fan_out() {
         const MIB: usize = 1024 * 1024;
-        // One ~1 MiB resource attribute, cloned into every data point's
-        // LabelSet — the per-sample charge (~1 MiB) trips the budget within
-        // a few hundred data points. Derived from the constant so a retune
-        // cannot silently weaken this.
+        // One ~1 MiB `service.name`, which issue #461 turns into the `job`
+        // label that every data point's LabelSet clones — the per-sample
+        // charge (~1 MiB) trips the budget within a few hundred data
+        // points. Derived from the constant so a retune cannot silently
+        // weaken this. (A plain resource attribute is no longer cloned per
+        // sample; it is charged once, before `target_info`.)
         let resource = Resource {
-            attributes: vec![kv("big.attr", Value::StringValue("v".repeat(MIB)))],
+            attributes: vec![kv("service.name", Value::StringValue("v".repeat(MIB)))],
             dropped_attributes_count: 0,
             entity_refs: vec![],
         };
@@ -2398,15 +3250,16 @@ mod tests {
         );
     }
 
-    /// The per-scope base rendering is charged BEFORE `build_scope_pairs`
-    /// (issue #62), so a request with many big-resource scopes and ZERO data
-    /// points — no per-sample charge site anywhere — still trips on the
+    /// The per-scope base rendering is charged BEFORE the base pairs are
+    /// materialized (issue #62), so a request with many big-`job` scopes
+    /// and ZERO data points — no per-sample charge site anywhere, and no
+    /// accepted point so no `target_info` either — still trips on the
     /// accumulated per-scope base charges alone.
     #[test]
     fn expansion_budget_charges_base_rendering_before_scope_pairs() {
         const MIB: usize = 1024 * 1024;
         let resource = Resource {
-            attributes: vec![kv("big.attr", Value::StringValue("v".repeat(MIB)))],
+            attributes: vec![kv("service.name", Value::StringValue("v".repeat(MIB)))],
             dropped_attributes_count: 0,
             entity_refs: vec![],
         };
@@ -2576,8 +3429,12 @@ mod tests {
 
     #[test]
     fn native_mode_stores_a_histogram_sample_and_no_flatten_floats() {
-        let out = super::parse(&native_exp_request(), 0, ExpHistogramMode::Native)
-            .expect("within the expansion budget");
+        let out = super::parse(
+            &native_exp_request(),
+            0,
+            hist_settings(ExpHistogramMode::Native),
+        )
+        .expect("within the expansion budget");
         assert_eq!(out.hist_samples.len(), 1, "one native histogram sample");
         assert!(
             out.samples.is_empty(),
@@ -2610,7 +3467,7 @@ mod tests {
             ..exp_histogram_dp()
         };
         let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
-        let out = super::parse(&req, 0, ExpHistogramMode::Native)
+        let out = super::parse(&req, 0, hist_settings(ExpHistogramMode::Native))
             .expect("a rejected point is partial success, not a whole-request error");
         assert_eq!(out.rejected, 1);
         assert!(out.hist_samples.is_empty());
@@ -2619,8 +3476,12 @@ mod tests {
 
     #[test]
     fn classic_mode_leaves_the_flatten_floats_unchanged_and_writes_no_hist_samples() {
-        let classic = super::parse(&native_exp_request(), 0, ExpHistogramMode::Classic)
-            .expect("within the expansion budget");
+        let classic = super::parse(
+            &native_exp_request(),
+            0,
+            hist_settings(ExpHistogramMode::Classic),
+        )
+        .expect("within the expansion budget");
         assert!(
             classic.hist_samples.is_empty(),
             "classic mode never populates hist_samples"
@@ -2648,8 +3509,12 @@ mod tests {
 
     #[test]
     fn dual_mode_emits_both_classic_floats_and_one_native_row() {
-        let out = super::parse(&native_exp_request(), 0, ExpHistogramMode::Dual)
-            .expect("within the expansion budget");
+        let out = super::parse(
+            &native_exp_request(),
+            0,
+            hist_settings(ExpHistogramMode::Dual),
+        )
+        .expect("within the expansion budget");
         assert_eq!(
             out.hist_samples.len(),
             1,
@@ -2686,7 +3551,7 @@ mod tests {
             ..exp_histogram_dp()
         };
         let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
-        let out = super::parse(&req, 0, ExpHistogramMode::Native)
+        let out = super::parse(&req, 0, hist_settings(ExpHistogramMode::Native))
             .expect("a rejected data point is partial success, not a whole-request error");
         assert_eq!(out.rejected, 1);
         assert!(out.hist_samples.is_empty(), "no partial write");
@@ -2707,7 +3572,8 @@ mod tests {
             ..exp_histogram_dp()
         };
         let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
-        let out = super::parse(&req, 0, ExpHistogramMode::Native).expect("partial success");
+        let out = super::parse(&req, 0, hist_settings(ExpHistogramMode::Native))
+            .expect("partial success");
         assert_eq!(out.rejected, 1);
         assert!(out.hist_samples.is_empty());
     }
@@ -2739,7 +3605,8 @@ mod tests {
             scope_metrics: vec![scope_metrics(vec![gauge, exp])],
             schema_url: String::new(),
         }]);
-        let out = super::parse(&req, 0, ExpHistogramMode::Native).expect("within budget");
+        let out =
+            super::parse(&req, 0, hist_settings(ExpHistogramMode::Native)).expect("within budget");
         assert_eq!(out.hist_samples.len(), 1, "the histogram is kept");
         assert!(
             out.samples.is_empty(),
@@ -2766,8 +3633,12 @@ mod tests {
     #[test]
     fn dedup_histogram_wins_charges_its_key_set_against_the_budget() {
         // A real HistogramPoint plus a float that collides on (name, fp, ms).
-        let parsed = super::parse(&native_exp_request(), 0, ExpHistogramMode::Native)
-            .expect("within budget");
+        let parsed = super::parse(
+            &native_exp_request(),
+            0,
+            hist_settings(ExpHistogramMode::Native),
+        )
+        .expect("within budget");
         let h = parsed.hist_samples[0].clone();
         let float = MetricPoint {
             metric_name: Arc::clone(&h.metric_name),
@@ -2821,7 +3692,8 @@ mod tests {
             ..exp_histogram_dp()
         };
         let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
-        let out = super::parse(&req, 0, ExpHistogramMode::Native).expect("within budget");
+        let out =
+            super::parse(&req, 0, hist_settings(ExpHistogramMode::Native)).expect("within budget");
         assert_eq!(out.hist_samples.len(), 1);
         let h = &out.hist_samples[0].histogram;
         assert_eq!(h.count, 0, "stale marker carries no observations");

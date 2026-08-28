@@ -29,8 +29,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 
-use pulsus_config::ExpHistogramMode;
 use pulsus_model::STALE_NAN_BITS;
+use pulsus_write::protocols::otlp_metrics::MetricIngestSettings;
 use pulsus_write::protocols::otlp_metrics::{decode, parse as parse_with_mode};
 use pulsus_write::{LogsIngestError, ParsedMetrics};
 
@@ -38,7 +38,7 @@ use pulsus_write::{LogsIngestError, ParsedMetrics};
 /// exp-histogram mode, so a thin `parse` wrapper keeps every call site
 /// unchanged after the `parse` signature gained a `mode` argument.
 fn parse(req: &ExportMetricsServiceRequest, now_ns: i64) -> Result<ParsedMetrics, LogsIngestError> {
-    parse_with_mode(req, now_ns, ExpHistogramMode::Classic)
+    parse_with_mode(req, now_ns, MetricIngestSettings::default())
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -511,8 +511,14 @@ fn regenerate_fixtures() {
 // Tests.
 // ---------------------------------------------------------------------
 
+/// The fixture's name is already Prometheus-shaped, so translation is a
+/// fixed point on it — `normalizeName` tokenizes `cpu_usage_ratio`,
+/// `removeItem`s the existing `ratio` token and re-appends it. What issue
+/// #461 DID change here is the labels (`service.name` becomes `job`, not
+/// `service_name`) and the metadata unit (`1` translates to the empty
+/// string, `unitMap["1"] = ""`, `metric_namer.go:66`).
 #[test]
-fn gauge_flattens_to_one_sample_named_verbatim() {
+fn gauge_flattens_to_one_sample_with_a_derived_job_label() {
     let bytes = read_fixture("gauge.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
     let out = parse(&req, 0).expect("within the expansion budget");
@@ -521,11 +527,12 @@ fn gauge_flattens_to_one_sample_named_verbatim() {
     assert_eq!(&*out.samples[0].metric_name, "cpu_usage_ratio");
     assert_eq!(out.samples[0].value, 0.75);
     assert_eq!(out.samples[0].unix_milli, 1_700_000_000_000);
-    assert_eq!(out.series[0].labels.get("service_name"), Some("checkout"));
+    assert_eq!(out.series[0].labels.get("job"), Some("checkout"));
+    assert_eq!(out.series[0].labels.get("service_name"), None);
     assert_eq!(out.metadata.len(), 1);
     assert_eq!(out.metadata[0].metric_type, "gauge");
     assert_eq!(out.metadata[0].help, "fraction of CPU in use");
-    assert_eq!(out.metadata[0].unit, "1");
+    assert_eq!(out.metadata[0].unit, "");
 }
 
 #[test]
@@ -829,8 +836,16 @@ fn no_recorded_value_flag_emits_the_canonical_stale_nan_bit_pattern() {
     assert_eq!(out.samples[0].value.to_bits(), STALE_NAN_BITS);
 }
 
+/// Issue #461 replaced this fixture pair's contract rather than its bytes.
+/// `service.name` is an IDENTIFYING resource attribute: it becomes `job`
+/// (`metrics_to_prw.go:420-426 @ v3.13.0`). `service_name` is an ordinary
+/// resource attribute, so it is not promoted onto the metric series at all
+/// — and, being the resource's only attribute, it does not even produce a
+/// `target_info` (no `job`, no `instance`, `helper.go:548-558`). The two
+/// forms must therefore fingerprint DIFFERENTLY, which is the opposite of
+/// what the pre-#461 twin of this test asserted.
 #[test]
-fn dotted_and_underscored_service_name_fingerprint_identically() {
+fn dotted_service_name_becomes_job_while_the_underscored_form_is_not_promoted() {
     let dot_bytes = read_fixture("fingerprint_dot.bin");
     let underscore_bytes = read_fixture("fingerprint_underscore.bin");
     let dot_req = decode(&dot_bytes).expect("valid request");
@@ -839,9 +854,16 @@ fn dotted_and_underscored_service_name_fingerprint_identically() {
     let dot_out = parse(&dot_req, 0).expect("within the expansion budget");
     let underscore_out = parse(&underscore_req, 0).expect("within the expansion budget");
 
+    assert_eq!(dot_out.series[0].labels.get("job"), Some("checkout"));
+    assert_eq!(underscore_out.series[0].labels.iter().count(), 0);
     assert_eq!(
+        underscore_out.series.len(),
+        1,
+        "no target_info without an identifier"
+    );
+    assert_ne!(
         dot_out.samples[0].fingerprint, underscore_out.samples[0].fingerprint,
-        "a series has one identity regardless of service.name vs service_name transport form"
+        "only service.name is identifying; service_name is an ordinary attribute"
     );
 }
 

@@ -42,7 +42,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use http_body_util::BodyExt;
 use prost::Message;
-use pulsus_config::ExpHistogramMode;
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -59,6 +58,7 @@ use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
 use crate::ingest::traces::TraceSink;
 use crate::ingest::{Backpressure, LogSink};
+use crate::protocols::otlp_metrics::MetricIngestSettings;
 use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write, zipkin};
 
 /// `X-Pulsus-Async` request header (docs/api.md "Request headers"): `1`
@@ -189,7 +189,7 @@ pub async fn ingest_metrics(
     sink: &dyn MetricSink,
     headers: HeaderMap,
     body: Body,
-    mode: ExpHistogramMode,
+    settings: MetricIngestSettings,
 ) -> Response {
     let now_ns = now_unix_nanos();
 
@@ -205,10 +205,11 @@ pub async fn ingest_metrics(
 
     // Fallible, unlike the logs parse: the metrics parser's expansion
     // budget (`otlp_metrics::MAX_EXPANDED_BYTES`, a structural whole-request
-    // bound, issue #62) surfaces here as the same 400/`code = 3`
-    // classification a decode failure gets. `mode` (issue #120) selects the
-    // OTLP exponential-histogram storage path.
-    let parsed = match otlp_metrics::parse(&request, now_ns, mode) {
+    // bound, issue #62) and its name/label normalization rejections (issue
+    // #461) surface here as the same 400/`code = 3` classification a decode
+    // failure gets. `settings` carries the exponential-histogram storage
+    // path (issue #120) and the OTLP translation knobs (issue #461).
+    let parsed = match otlp_metrics::parse(&request, now_ns, settings) {
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
@@ -237,10 +238,17 @@ pub async fn metrics<S>(State(sink): State<Arc<S>>, headers: HeaderMap, body: Bo
 where
     S: MetricSink + 'static,
 {
-    // This crate's own generic mount point carries no `Config`; it defaults
-    // to `Classic` (current behavior). The server threads the configured
-    // mode through `pulsus_write::ingest_metrics` directly.
-    ingest_metrics(sink.as_ref(), headers, body, ExpHistogramMode::Classic).await
+    // This crate's own generic mount point carries no `Config`; it uses the
+    // defaults (`Classic` exponential histograms, the reference's OTLP
+    // translation defaults). The server threads the configured settings
+    // through `pulsus_write::ingest_metrics` directly.
+    ingest_metrics(
+        sink.as_ref(),
+        headers,
+        body,
+        MetricIngestSettings::default(),
+    )
+    .await
 }
 
 /// `POST /v1/traces` (issue #54): the traces analog of [`ingest`] —
@@ -829,6 +837,9 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         // Loki-push receiver answers for the identical input (issue #259) —
         // the rationale, with the reference line numbers, is on the variant.
         | LogsIngestError::InvalidLabelName(_)
+        // Same class, same rationale, on the OTLP metrics receiver
+        // (issue #461) — see `LogsIngestError::InvalidMetricName`.
+        | LogsIngestError::InvalidMetricName(_)
         | LogsIngestError::ZipkinDecode(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
@@ -1861,14 +1872,15 @@ mod tests {
         use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
         use opentelemetry_proto::tonic::resource::v1::Resource;
 
-        // One ~1 MiB resource attribute is cloned into every data point's
-        // LabelSet, so the per-sample charge (~1 MiB) trips the 256 MiB
-        // budget within a few hundred of the many data points. Derived from
-        // the constant so a budget retune cannot silently weaken this.
+        // One ~1 MiB `service.name` becomes the `job` label that every data
+        // point's LabelSet clones (issue #461), so the per-sample charge
+        // (~1 MiB) trips the 256 MiB budget within a few hundred of the
+        // many data points. Derived from the constant so a budget retune
+        // cannot silently weaken this.
         let big_value = "v".repeat(1024 * 1024);
         let resource = Resource {
             attributes: vec![KeyValue {
-                key: "big.attr".to_string(),
+                key: "service.name".to_string(),
                 value: Some(AnyValue {
                     value: Some(Value::StringValue(big_value)),
                 }),

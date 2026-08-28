@@ -41,7 +41,7 @@ change.
 
 | File | Covers |
 |------|--------|
-| `gauge.bin` | a `Gauge` data point flattens to one sample named verbatim; resource `service.name` normalizes into the `service_name` label; metadata type `gauge`, `help`/`unit` forwarded from the descriptor. |
+| `gauge.bin` | a `Gauge` data point flattens to one sample; resource `service.name` becomes the derived `job` label (issue #461, `metrics_to_prw.go:420-426 @ v3.13.0`) and is NOT stored as `service_name`; metadata type `gauge`, `help` forwarded from the descriptor, `unit` translated (`1` -> `""`). |
 | `sum_counter.bin` | a monotonic, cumulative `Sum` data point flattens to one sample; metadata type `counter` (monotonic Sum, not `gauge`). |
 | `histogram.bin` | a classic `Histogram` data point flattens to cumulative `_bucket{le}` series (exact `le` labels, monotonic non-decreasing), `_sum`, `_count`; `_bucket{le="+Inf"}` equals `_count` by construction. |
 | `histogram_count_mismatch.bin` | a `Histogram` data point whose `bucket_counts` sum (10) disagrees with the reported `count` (99) — rejected wholesale into partial success, zero samples emitted (architect plan amendment invariant). |
@@ -53,5 +53,5 @@ change.
 | `delta_temporality.bin` | a `Sum` with `AGGREGATION_TEMPORALITY_DELTA` — the whole metric (all its data points) is rejected into partial success, naming the metric; delta->cumulative conversion is out of scope until M7. |
 | `zero_timestamp.bin` | one `Gauge` data point with `time_unix_nano == 0` alongside one valid data point — the malformed point is rejected (partial success), the valid one still parses. |
 | `stale_nan.bin` | a `Gauge` data point flagged `NoRecordedValueMask` — the sample's value is the canonical stale-NaN bit pattern (`pulsus_model::STALE_NAN_BITS`), asserted via `.to_bits()`. |
-| `fingerprint_dot.bin` / `fingerprint_underscore.bin` | the same logical resource attribute (`service.name` vs `service_name`) — a series has one identity (identical fingerprint) regardless of transport form (AC: "normalized before fingerprinting"). |
+| `fingerprint_dot.bin` / `fingerprint_underscore.bin` | `service.name` vs `service_name` as the resource's only attribute. Since issue #461 these fingerprint DIFFERENTLY: only `service.name` is identifying (it becomes `job`), while `service_name` is an ordinary resource attribute that is not promoted onto the metric series at all — and produces no `target_info` either, having yielded neither `job` nor `instance`. |
 | `malformed.bin` | truncated protobuf -> whole-request decode error (maps to HTTP 400 / `google.rpc.Status.code = 3` at the handler). |

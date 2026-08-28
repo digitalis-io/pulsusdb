@@ -75,6 +75,19 @@ pub struct Config {
     /// float series; `native` stores the sparse native histogram in
     /// `metric_hist_samples`; `dual` emits both (disjoint fingerprints).
     pub exp_histogram_mode: ExpHistogramMode,
+    /// `PULSUS_OTLP_TRANSLATION_STRATEGY` (issue #461): how OTLP metric and
+    /// label names are rewritten on `POST /v1/metrics`. Mirrors Prometheus
+    /// v3.13.0's `otlp.translation_strategy`
+    /// (`otlptranslator@v1.0.0/strategy.go:248-315`) value-for-value; the
+    /// default is the reference's own default
+    /// (`config.DefaultOTLPConfig`, `config/config.go` @ `v3.13.0`).
+    pub otlp_translation_strategy: OtlpTranslationStrategy,
+    /// `PULSUS_OTLP_PROMOTE_SCOPE_METADATA` (issue #461): when `true`, the
+    /// instrumentation scope's name/version/schema URL and its attributes
+    /// are promoted onto every metric series as `otel_scope_*` labels
+    /// (`metrics_to_prw.go:446-475` @ `v3.13.0`). Off by default, matching
+    /// the reference.
+    pub otlp_promote_scope_metadata: bool,
     // Nested subsystem objects
     pub clickhouse: ClickHouseConfig,
     pub writer: WriterConfig,
@@ -108,6 +121,8 @@ impl Default for Config {
             availability_zone: None,
             az_detect: AzDetect::default(),
             exp_histogram_mode: ExpHistogramMode::default(),
+            otlp_translation_strategy: OtlpTranslationStrategy::default(),
+            otlp_promote_scope_metadata: false,
             clickhouse: ClickHouseConfig::default(),
             writer: WriterConfig::default(),
             reader: ReaderConfig::default(),
@@ -715,6 +730,101 @@ impl std::fmt::Display for ExpHistogramMode {
             ExpHistogramMode::Classic => "classic",
             ExpHistogramMode::Native => "native",
             ExpHistogramMode::Dual => "dual",
+        })
+    }
+}
+
+/// `PULSUS_OTLP_TRANSLATION_STRATEGY` (docs/configuration.md §5, issue
+/// #461): the OTLP metric/label naming strategy applied by
+/// `POST /v1/metrics`. The four values, their spellings and their
+/// semantics are Prometheus v3.13.0's
+/// (`otlptranslator@v1.0.0/strategy.go:254-289`); the default is the
+/// reference's own default, `UnderscoreEscapingWithSuffixes`.
+///
+/// Note that `job`/`instance` synthesis and `target_info` emission are NOT
+/// gated by this setting in the reference — they happen under every
+/// strategy, including `NoTranslation`
+/// (`metrics_to_prw.go:420-430`, `helper.go:498-605` @ `v3.13.0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OtlpTranslationStrategy {
+    /// Names pass through unescaped; unit/type suffixes are still added.
+    #[serde(rename = "NoUTF8EscapingWithSuffixes")]
+    NoUtf8EscapingWithSuffixes,
+    /// The reference default: escape non-alphanumeric characters to `_`
+    /// and append unit/type suffixes.
+    #[default]
+    #[serde(rename = "UnderscoreEscapingWithSuffixes")]
+    UnderscoreEscapingWithSuffixes,
+    /// Escape, but append no unit/type suffixes.
+    #[serde(rename = "UnderscoreEscapingWithoutSuffixes")]
+    UnderscoreEscapingWithoutSuffixes,
+    /// Store OTLP names verbatim: no escaping, no suffixes.
+    #[serde(rename = "NoTranslation")]
+    NoTranslation,
+}
+
+impl OtlpTranslationStrategy {
+    /// `true` when metric and label names must be escaped
+    /// (`strategy.go:293-302` @ `otlptranslator@v1.0.0`).
+    pub fn should_escape(self) -> bool {
+        matches!(
+            self,
+            OtlpTranslationStrategy::UnderscoreEscapingWithSuffixes
+                | OtlpTranslationStrategy::UnderscoreEscapingWithoutSuffixes
+        )
+    }
+
+    /// `true` when unit/type suffixes are appended to metric names
+    /// (`strategy.go:306-315` @ `otlptranslator@v1.0.0`).
+    pub fn should_add_suffixes(self) -> bool {
+        matches!(
+            self,
+            OtlpTranslationStrategy::UnderscoreEscapingWithSuffixes
+                | OtlpTranslationStrategy::NoUtf8EscapingWithSuffixes
+        )
+    }
+}
+
+impl std::str::FromStr for OtlpTranslationStrategy {
+    type Err = String;
+
+    /// Accepts exactly the four reference spellings, case-sensitive — a
+    /// value copied from a Prometheus `otlp:` block must mean the same
+    /// thing here.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "NoUTF8EscapingWithSuffixes" => Ok(OtlpTranslationStrategy::NoUtf8EscapingWithSuffixes),
+            "UnderscoreEscapingWithSuffixes" => {
+                Ok(OtlpTranslationStrategy::UnderscoreEscapingWithSuffixes)
+            }
+            "UnderscoreEscapingWithoutSuffixes" => {
+                Ok(OtlpTranslationStrategy::UnderscoreEscapingWithoutSuffixes)
+            }
+            "NoTranslation" => Ok(OtlpTranslationStrategy::NoTranslation),
+            _ => Err(
+                "one of: NoUTF8EscapingWithSuffixes, UnderscoreEscapingWithSuffixes, \
+                      UnderscoreEscapingWithoutSuffixes, NoTranslation"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for OtlpTranslationStrategy {
+    /// Renders the reference spelling, round-tripping with [`FromStr`]
+    /// (`FromStr::from_str(&s.to_string()) == Ok(s)`).
+    ///
+    /// [`FromStr`]: std::str::FromStr
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OtlpTranslationStrategy::NoUtf8EscapingWithSuffixes => "NoUTF8EscapingWithSuffixes",
+            OtlpTranslationStrategy::UnderscoreEscapingWithSuffixes => {
+                "UnderscoreEscapingWithSuffixes"
+            }
+            OtlpTranslationStrategy::UnderscoreEscapingWithoutSuffixes => {
+                "UnderscoreEscapingWithoutSuffixes"
+            }
+            OtlpTranslationStrategy::NoTranslation => "NoTranslation",
         })
     }
 }
