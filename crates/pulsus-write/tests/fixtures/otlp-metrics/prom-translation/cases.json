@@ -7182,6 +7182,491 @@
     {
       "exp_histogram_mode": "classic",
       "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "ppc64",
+              "job": "CALLER-JOB"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {},
+            "metric_name": "cje_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "caller-job-survives-with-empty-service-name",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "job",
+                  "value": {
+                    "stringValue": "CALLER-JOB"
+                  }
+                },
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "cje.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "ppc64",
+              "job": "CALLER-JOB"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {},
+            "metric_name": "cjn_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "caller-job-survives-with-namespace-but-no-service-name",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "job",
+                  "value": {
+                    "stringValue": "CALLER-JOB"
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": "nsonly"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "cjn.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "riscv64",
+              "instance": "CALLER-INSTANCE"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {},
+            "metric_name": "cie_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "caller-instance-survives-with-empty-service-instance-id",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "instance",
+                  "value": {
+                    "stringValue": "CALLER-INSTANCE"
+                  }
+                },
+                {
+                  "key": "service.instance.id",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "riscv64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "cie.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "mips",
+              "instance": "instC",
+              "job": "nsC/svcC"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "instance": "instC",
+              "job": "nsC/svcC"
+            },
+            "metric_name": "idc_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "identifying-resource-attributes-are-consumed-not-emitted",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "svcC"
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": "nsC"
+                  }
+                },
+                {
+                  "key": "service.instance.id",
+                  "value": {
+                    "stringValue": "instC"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "mips"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "idc.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info",
+        "resource-attrs-not-promoted"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "mips",
+              "job": "dpsvc"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "dpsvc",
+              "service_name": "FROM-DP"
+            },
+            "metric_name": "dps_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "datapoint-service-name-attribute-is-an-ordinary-label",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "dpsvc"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "mips"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [
+                            {
+                              "key": "service.name",
+                              "value": {
+                                "stringValue": "FROM-DP"
+                              }
+                            }
+                          ],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "dps.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "label-sanitization",
+        "job-instance"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "edrop",
+              "k8s_pod_name": "p9"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "edrop"
+            },
+            "metric_name": "edr_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "empty-valued-resource-attribute-is-dropped",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "edrop"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "k8s.pod.name",
+                  "value": {
+                    "stringValue": "p9"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "edr.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "empty-value-delete",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
         "kind": "diverge",
         "ledger": "otlp-delta-partial-success",
         "pulsusdb": {

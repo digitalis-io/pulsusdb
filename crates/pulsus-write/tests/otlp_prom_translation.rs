@@ -1035,9 +1035,23 @@ fn caller_supplied_job_and_instance_survive_when_the_derivation_is_empty() {
             .find(|c| c["id"] == json!(id))
             .unwrap_or_else(|| panic!("case {id} is missing"));
         let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+        // The antecedent is that the DERIVATION comes back empty, which is
+        // weaker than "no service attribute at all": an empty
+        // `service.name`, or a namespace with no name, reach it too.
+        let derived = if label == "job" {
+            attrs
+                .get("service.name")
+                .map(|name| match attrs.get("service.namespace") {
+                    Some(namespace) => format!("{namespace}/{name}"),
+                    None => name.clone(),
+                })
+        } else {
+            attrs.get("service.instance.id").cloned()
+        };
         assert!(
-            !attrs.contains_key("service.name") && !attrs.contains_key("service.instance.id"),
-            "case {id}: the antecedent is that NEITHER service source is present"
+            derived.as_ref().is_none_or(|v| v.is_empty()),
+            "case {id}: the antecedent is that the {label} derivation is empty, but it \
+             produced {derived:?}"
         );
         let target = captured_target_info(case);
         assert_eq!(
@@ -1076,6 +1090,113 @@ fn caller_supplied_job_and_instance_survive_when_the_derivation_is_empty() {
         "with service.name present the derivation overwrites the caller's own job"
     );
 }
+
+/// The two carve-outs on the `job`/`instance` derivation, each stated
+/// narrowly because both were stated too broadly first.
+///
+/// 1. **The three identifying attributes are consumed, not emitted.**
+///    `service.namespace`/`service.name`/`service.instance.id` become
+///    `job`/`instance` and are passed as `ignoreAttrs` to `target_info`'s
+///    own label build (`helper.go:504-508`), so they never appear under
+///    their own names. The carve-out is about **resource** attributes: a
+///    DATA-POINT attribute of the same name is an ordinary label, because
+///    `reservedLabelNames` is `["__name__"]` alone (`helper.go:68-70`).
+/// 2. **An empty-valued attribute is dropped entirely**, on the resource
+///    side as well as the data-point side — not stored as an empty string.
+#[test]
+fn identifying_attributes_are_consumed_and_empty_values_are_dropped() {
+    let doc = load_cases();
+    let case = |id: &str| -> Value {
+        doc["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .unwrap_or_else(|| panic!("case {id} is missing"))
+            .clone()
+    };
+
+    // (1) Consumed, not emitted — and derived from this case's own input.
+    let consumed = case("identifying-resource-attributes-are-consumed-not-emitted");
+    let attrs: BTreeMap<String, String> = resource_attrs(&consumed).into_iter().collect();
+    let target = captured_target_info(&consumed);
+    assert_eq!(target.len(), 1);
+    for key in ["service.name", "service.namespace", "service.instance.id"] {
+        assert!(
+            attrs.contains_key(key),
+            "the case must actually carry {key}, or it proves nothing"
+        );
+        assert!(
+            !target[0].contains_key(&sanitize(key)),
+            "{key} must be consumed into job/instance, not emitted as {}",
+            sanitize(key)
+        );
+    }
+    let name = attrs.get("service.name").expect("service.name");
+    let namespace = attrs.get("service.namespace").expect("service.namespace");
+    assert_eq!(
+        target[0].get("job"),
+        Some(&format!("{namespace}/{name}")),
+        "the consumed attributes must reappear as the derived job"
+    );
+    assert_eq!(target[0].get("instance"), attrs.get("service.instance.id"));
+
+    // ...but the same name sent as a DATA-POINT attribute is an ordinary
+    // label, and coexists with the derived `job`.
+    let dp = case("datapoint-service-name-attribute-is-an-ordinary-label");
+    let dp_value = datapoint_attrs(&dp)
+        .into_iter()
+        .find(|(k, _)| k == "service.name")
+        .map(|(_, v)| v)
+        .expect("the case must send service.name as a data-point attribute");
+    for labels in captured_metric_labels(&dp) {
+        assert_eq!(
+            labels.get("service_name"),
+            Some(&dp_value),
+            "a data-point service.name is an ordinary label"
+        );
+        assert_eq!(
+            labels.get("job").map(String::as_str),
+            resource_attrs(&dp)
+                .iter()
+                .find(|(k, _)| k == "service.name")
+                .map(|(_, v)| v.as_str()),
+            "and it does not disturb the job derived from the resource"
+        );
+    }
+
+    // (2) Empty-valued resource attributes are absent, not empty strings.
+    let dropped = case("empty-valued-resource-attribute-is-dropped");
+    let empty_keys: Vec<String> = resource_attrs(&dropped)
+        .into_iter()
+        .filter(|(_, v)| v.is_empty())
+        .map(|(k, _)| k)
+        .collect();
+    assert!(
+        !empty_keys.is_empty(),
+        "the case must carry an empty-valued resource attribute"
+    );
+    let target = captured_target_info(&dropped);
+    assert_eq!(target.len(), 1);
+    for key in &empty_keys {
+        assert!(
+            !target[0].contains_key(&sanitize(key)),
+            "{key} is empty-valued and must be dropped entirely, not stored as \"\""
+        );
+    }
+    // The non-empty siblings are still there, so the case is not passing
+    // by storing nothing at all.
+    for (key, value) in resource_attrs(&dropped) {
+        if value.is_empty() || IDENTIFYING.contains(&key.as_str()) {
+            continue;
+        }
+        assert_eq!(target[0].get(&sanitize(&key)), Some(&value));
+    }
+}
+
+/// The three attributes the reference consumes into `job`/`instance`
+/// (`helper.go:504-508 @ v3.13.0`).
+const IDENTIFYING: &[&str] = &["service.name", "service.namespace", "service.instance.id"];
 
 /// A companion completeness gate: every id in [`TRANSFORMATIONS`] is
 /// exercised by at least one tagged case, so a later edit cannot drop one
