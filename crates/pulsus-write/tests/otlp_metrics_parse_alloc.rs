@@ -141,8 +141,9 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
     black_box(&out);
 
     // Post-#62 the valid path measured ~41.0 allocations/sample on this
-    // fixture and toolchain. **Issue #461 lowered it to 27.05** (measured:
-    // `27051 allocations over 1000 samples`): the four resource attributes
+    // fixture and toolchain. **Issue #461 lowered it to 30.06** (measured:
+    // `30056 allocations over 1000 samples`, three consecutive runs, all
+    // 30056): the four resource attributes
     // are no longer cloned into every sample's `LabelSet` — they are
     // charged and materialized once per `ResourceMetrics`, for
     // `target_info` — so each sample now carries only its two data-point
@@ -200,9 +201,9 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
 
     // The abort materializes ≈ 250 samples before tripping; each builds its
     // data point's label set and clones the ~1 MiB `job` pair into an owned
-    // `LabelSet`, so the whole aborted parse measures **6637** allocations
-    // on this toolchain (measured three consecutive runs, all 6637). Issue
-    // #461 raised the per-sample cost from ~16 to ~26 allocations: the
+    // `LabelSet`, so the whole aborted parse measures **7402** allocations
+    // on this toolchain (measured three consecutive runs, all 7402). Issue
+    // #461 raised the per-sample cost from ~16 to ~29 allocations: the
     // `createAttributes` port sorts the data point's attributes, sanitizes
     // each key into an owned `String`, and merges through a builder before
     // `LabelSet::from_verbatim` groups the result — where the pre-#461 path
@@ -211,7 +212,7 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
     // per data point and only the finished pairs are cloned per sample), and
     // it buys the reference's collision-merge and empty-value-delete rules.
     //
-    // Bound at 10000 (~1.5x the measured value) — comfortably above the
+    // Bound at 10000 (~1.35x the measured value) — comfortably above the
     // abort prefix, yet ORDERS of magnitude below the ~100k-sample full
     // materialization the budget prevents (which would be >= 100k
     // allocations). This is the charge-before-allocate proof: materialization
