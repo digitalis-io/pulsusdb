@@ -839,9 +839,16 @@ fn build_scope_pairs(
 /// tombstone instead of removing from the vector**. The tombstone is the
 /// load-bearing part: removing from a `Vec` is `O(n)` and every stored
 /// index behind the hole then has to be rewritten, which made `n` promoted
-/// labels followed by `n` empty-valued collisions quadratic — measured
-/// 28.1 / 102.8 / 363.6 ms at n = 1000 / 2000 / 4000 before this change,
-/// and 0.9 / 1.7 / 3.3 ms after. Semantics are unchanged: `add_index` still
+/// labels followed by `n` empty-valued collisions quadratic. Measured on a
+/// debug build, milliseconds, at `n` = 1000 / 2000 / 4000 / 8000, median
+/// of three runs each (`examples/` probe, deleted after use):
+///
+/// ```text
+/// Vec::remove   16.3   62.7  214.6  829.3   ratio 3.8, 3.4, 3.9 -> quadratic
+/// tombstone       4.1    9.7   19.4   42.5   ratio 2.4, 2.0, 2.2 -> linear
+/// ```
+///
+/// Semantics are unchanged: `add_index` still
 /// holds exactly the live names, so `get` and `Labels()` cannot see a
 /// tombstone, and `Set` after `Del` appends a fresh live slot exactly as
 /// Go's append does.
@@ -3012,6 +3019,116 @@ mod tests {
             .expect("within the expansion budget");
         assert_eq!(out.collisions, 2, "two folds onto one sanitized key");
         assert_eq!(out.series[0].labels.get("a_b"), Some("dash;dot;under"));
+    }
+
+    // -- the label builder (issue #461 code review) ----------------------
+
+    /// A delete must **tombstone** its slot, never `Vec::remove` it. The
+    /// assertion is scale-invariant on purpose — no wall-clock in CI — but
+    /// it is exactly the property that makes `n` deletes linear instead of
+    /// quadratic: nothing behind the hole moves, so no stored index has to
+    /// be rewritten. Measured cost of getting this wrong is in
+    /// [`LabelBuilder`]'s doc comment.
+    #[test]
+    fn deleting_an_override_tombstones_rather_than_shifting_the_vector() {
+        let mut builder = LabelBuilder::reset(Vec::new());
+        builder.set("a", "1");
+        builder.set("b", "2");
+        builder.set("c", "3");
+        assert_eq!(builder.add.len(), 3);
+        assert_eq!(builder.add_index.get("c"), Some(&2));
+
+        builder.set("a", ""); // `Set` with an empty value is `Del`.
+
+        assert_eq!(
+            builder.add.len(),
+            3,
+            "the vector must not shrink — a delete leaves a tombstone"
+        );
+        assert_eq!(
+            builder.add_index.get("c"),
+            Some(&2),
+            "no index behind the hole may be rewritten"
+        );
+        assert!(builder.add_index.get("a").is_none());
+        assert_eq!(builder.get("a"), "");
+        assert_eq!(builder.get("c"), "3");
+        assert_eq!(
+            builder.labels(),
+            vec![
+                ("b".to_string(), "2".to_string()),
+                ("c".to_string(), "3".to_string())
+            ],
+            "a tombstone is invisible to Labels()"
+        );
+    }
+
+    /// `Set` after `Del` re-adds a live slot, as Go's append does — the
+    /// tombstone must not make the name permanently deleted.
+    #[test]
+    fn setting_a_deleted_name_again_makes_it_live() {
+        let mut builder = LabelBuilder::reset(Vec::new());
+        builder.set("a", "1");
+        builder.set("a", "");
+        assert_eq!(builder.get("a"), "");
+        builder.set("a", "2");
+        assert_eq!(builder.get("a"), "2");
+        assert_eq!(builder.labels(), vec![("a".to_string(), "2".to_string())]);
+    }
+
+    /// The semantics the tombstone must preserve, at a scale where the
+    /// quadratic form was measurable: `n` promoted scope labels followed by
+    /// `n` empty-valued collisions leave none of them, and the scope
+    /// identity labels survive.
+    #[test]
+    fn many_promoted_labels_deleted_by_empty_collisions_resolve_correctly() {
+        const N: usize = 500;
+        let mut attributes = Vec::with_capacity(N * 2);
+        for i in 0..N {
+            attributes.push(kv(&format!("a.{i:06}"), Value::StringValue("v".into())));
+        }
+        for i in 0..N {
+            attributes.push(kv(&format!("a_{i:06}"), Value::StringValue(String::new())));
+        }
+        let req = request(vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", Value::StringValue("quad".into()))],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: "s".to_string(),
+                    version: "1".to_string(),
+                    attributes,
+                    dropped_attributes_count: 0,
+                }),
+                metrics: vec![gauge_metric("q", number_dp(1, 1.0, vec![]))],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }]);
+
+        let out = super::parse(
+            &req,
+            0,
+            MetricIngestSettings {
+                promote_scope_metadata: true,
+                ..MetricIngestSettings::default()
+            },
+        )
+        .expect("within the expansion budget");
+
+        let labels: Vec<(&str, &str)> = out.series[0].labels.iter().collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("job", "quad"),
+                ("otel_scope_name", "s"),
+                ("otel_scope_version", "1")
+            ],
+            "every promoted label is deleted by its empty-valued collision"
+        );
     }
 
     // -- target_info (issue #461) ----------------------------------------
