@@ -235,3 +235,234 @@ fn ledger_entry_d_carries_the_range_over_acceptance_as_well() {
         "entry (d) must state the direction of the divergence"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #278 (AC11) — the four traces suites `docs/features.md` names as
+// the ANSWER-LEVEL comparison against the reference.
+// ---------------------------------------------------------------------
+
+/// The four suites the TraceQL-coverage paragraph names, with the
+/// disposition it claims for each. `enforced` is the CI claim: `true`
+/// means the paragraph says a workflow runs it with its gate supplied.
+const TRACES_ANSWER_LEVEL_SUITES: &[(&str, bool)] = &[
+    ("compare_value_differential.rs", true),
+    ("traces_search_grouping_differential.rs", true),
+    ("nestedset_value_differential.rs", false),
+    ("traces_log2_reference.rs", false),
+];
+
+/// The `docs/features.md` paragraph carrying the `interim == 0` clause and
+/// the sentence this test guards — sliced out, so the assertions below
+/// cannot be satisfied by text sitting elsewhere in the document.
+fn traces_coverage_paragraph() -> String {
+    let text = std::fs::read_to_string(repo_root().join("docs/features.md"))
+        .expect("docs/features.md is readable");
+    let at = text
+        .find("**TraceQL conformance carries no tracked interim constructs")
+        .expect("the interim == 0 clause exists in docs/features.md");
+    // A markdown paragraph: up to the next blank line.
+    let start = text[..at].rfind("\n\n").map(|i| i + 2).unwrap_or(0);
+    let end = text[at..]
+        .find("\n\n")
+        .map(|i| at + i)
+        .unwrap_or(text.len());
+    text[start..end].to_string()
+}
+
+/// Issue #278 AC11: the sentence `docs/features.md` gained about
+/// answer-level traces comparison names four real suites, and its two
+/// **wiring** claims are true of the tree.
+///
+/// # What this checks, and what it deliberately cannot
+///
+/// It checks the wiring claims, not the disposition claim. Nothing in CI
+/// can assert "fails today by design" without running a red suite in CI,
+/// which is precisely what we are not doing; that assertion rests on the
+/// #278 transcript and on the #185 reference in the paragraph itself.
+///
+/// The third assertion is a **set equality**, not an absence grep. The
+/// earlier form asserted the string `nestedset` appeared nowhere under
+/// `.github/` — which passes while a workflow supplies either
+/// `PULSUSDB_NESTEDSET_*` variable, because that spelling is upper case.
+/// The set form names the offending path instead. (The two variable names
+/// are never written out in this file: it sweeps the whole tracked tree
+/// including itself, so a literal here would make it a second match and
+/// the test would fail on its own source. They are assembled from halves
+/// below.)
+///
+/// **Related mechanism, not duplicated here.**
+/// `crates/pulsus-testkit/tests/gated_suite_inventory.rs` already carries
+/// `nestedset_value_differential` in its `DELIBERATELY_UNWIRED` list and
+/// already reddens both ways on "has a `--test` step". This test asserts
+/// the thing that check cannot see: that the GATE VARIABLES are never
+/// supplied.
+///
+/// **Coupling, deliberate.** If #185 lands and wires the suite in, this
+/// test reddens — which is the correct signal, because the docs sentence
+/// must then be updated.
+#[test]
+fn the_traces_answer_level_claim_names_only_real_suites() {
+    let paragraph = traces_coverage_paragraph();
+    let repo = repo_root();
+
+    // 1. Every suite the paragraph names exists under
+    //    crates/pulsus-read/tests/.
+    for (name, _) in TRACES_ANSWER_LEVEL_SUITES {
+        assert!(
+            paragraph.contains(name),
+            "the TraceQL coverage paragraph no longer names {name} — this test guards a \
+             sentence that is not there"
+        );
+        assert!(
+            repo.join("crates/pulsus-read/tests").join(name).is_file(),
+            "docs/features.md names {name} as an answer-level traces gate, but \
+             crates/pulsus-read/tests/{name} does not exist"
+        );
+    }
+
+    // 2. The two the paragraph calls CI-enforced appear as `run:` steps —
+    //    asserted on the test-binary selector in the `run:` line, not on
+    //    the step's `name:`, because the former is what selects the suite.
+    let workflow = std::fs::read_to_string(repo.join(".github/workflows/ci.yml"))
+        .expect(".github/workflows/ci.yml is readable");
+    for (name, enforced) in TRACES_ANSWER_LEVEL_SUITES {
+        if !enforced {
+            continue;
+        }
+        let binary = name.trim_end_matches(".rs");
+        let needle = format!("--test {binary}");
+        let on_a_run_line = workflow
+            .lines()
+            .any(|l| l.contains(&needle) && l.trim_start().starts_with("run:"));
+        assert!(
+            on_a_run_line,
+            "docs/features.md calls {name} CI-enforced, but no `run:` line in \
+             .github/workflows/ci.yml selects it with `{needle}`"
+        );
+    }
+
+    // 3. The paragraph's claim, checked exactly as it is written: no
+    //    WORKFLOW supplies the gate.
+    //
+    //    This runs BEFORE the broad tracked-tree sweep below, and the order
+    //    is the point. A workflow file is also a tracked file, so with the
+    //    sweep first this assertion could never be the one to fire and
+    //    would be a gate nobody could break — the shape this repo keeps
+    //    losing to. Checked first, it fails on its own terms, and the sweep
+    //    that follows is the wider net for the suppliers a workflow scan
+    //    cannot see (a script a `run:` step invokes, a composite action).
+    let diff_url = ["PULSUSDB_NESTED", "SET_DIFF_URL"].concat();
+    let otlp_url = ["PULSUSDB_NESTED", "SET_OTLP_URL"].concat();
+    let workflows = repo.join(".github/workflows");
+    let mut workflow_suppliers: Vec<String> = Vec::new();
+    let mut workflow_files = 0usize;
+    for entry in std::fs::read_dir(&workflows).expect(".github/workflows is readable") {
+        let path = entry.expect("workflow dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml")
+            && path.extension().and_then(|e| e.to_str()) != Some("yaml")
+        {
+            continue;
+        }
+        workflow_files += 1;
+        let text = std::fs::read_to_string(&path).expect("workflow readable");
+        if text.contains(diff_url.as_str()) || text.contains(otlp_url.as_str()) {
+            workflow_suppliers.push(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unnamed>")
+                    .to_string(),
+            );
+        }
+    }
+    assert!(
+        workflow_files > 0,
+        "no workflow files were read, so this assertion checked nothing"
+    );
+    assert!(
+        workflow_suppliers.is_empty(),
+        "docs/features.md says no workflow supplies the nested-set differential's gate, but \
+         these workflows name one of its variables: {workflow_suppliers:?}"
+    );
+
+    // 4. The nested-set suite's two gate variables are named by a CLOSED
+    //    set of tracked files. Any other mention anywhere in the tree (a
+    //    workflow `env:` block, a composite action, a script a `run:` step
+    //    invokes) falsifies the paragraph's "no workflow supplies its
+    //    gate" and is named here.
+    //
+    //    Two files are sanctioned, not one (issue #458). The suite's own
+    //    source, and the differential ledger, whose
+    //    `traceql-differential-legs-skip-green-on-a-missing-endpoint` entry
+    //    names both variables in full so the wiring hole it records can be
+    //    acted on without going and looking them up. **Documenting a
+    //    variable is not supplying it**, and the distinction is not left to
+    //    the reader: the workflow-scoped assertion below checks the
+    //    paragraph's actual claim directly, so widening this list by one
+    //    documentation file cannot admit a workflow.
+    //
+    //    Needles built by concatenation so this file is not itself a
+    //    match — the precedent is
+    //    crates/pulsus-read/tests/detected_labels_cardinality.rs:409-423.
+    let expected = [
+        "crates/pulsus-read/tests/nestedset_value_differential.rs",
+        "docs/benchmarks/traces-differential-ledger.md",
+    ];
+
+    // Every TRACKED file, from git: a directory walk would also read a
+    // developer's untracked scratch files. A failure to list is a hard
+    // failure, never a quiet empty sweep.
+    let listing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["ls-files", "-z"])
+        .output()
+        .expect("git ls-files must run: this gate's domain is the tracked tree");
+    assert!(
+        listing.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let mut unreadable: Vec<String> = Vec::new();
+    let mut suppliers_diff: Vec<String> = Vec::new();
+    let mut suppliers_otlp: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for rel in String::from_utf8_lossy(&listing.stdout).split('\0') {
+        if rel.is_empty() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(repo.join(rel)) else {
+            unreadable.push(rel.to_string());
+            continue;
+        };
+        scanned += 1;
+        let text = String::from_utf8_lossy(&bytes);
+        if text.contains(diff_url.as_str()) {
+            suppliers_diff.push(rel.to_string());
+        }
+        if text.contains(otlp_url.as_str()) {
+            suppliers_otlp.push(rel.to_string());
+        }
+    }
+    assert!(
+        unreadable.is_empty(),
+        "git listed paths this sweep could not open, so its domain is not the tracked tree: \
+         {unreadable:?}"
+    );
+    assert!(
+        scanned > 1_000,
+        "the sweep read only {scanned} tracked files"
+    );
+    let sanctioned: Vec<String> = expected.iter().map(|p| (*p).to_string()).collect();
+    assert_eq!(
+        suppliers_diff, sanctioned,
+        "docs/features.md says no workflow supplies the nested-set differential's gate, but \
+         {diff_url} appears in these tracked files (only the suite's own source and the \
+         differential ledger may name it)"
+    );
+    assert_eq!(
+        suppliers_otlp, sanctioned,
+        "docs/features.md says no workflow supplies the nested-set differential's gate, but \
+         {otlp_url} appears in these tracked files (only the suite's own source and the \
+         differential ledger may name it)"
+    );
+}

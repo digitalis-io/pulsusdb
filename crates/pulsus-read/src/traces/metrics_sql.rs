@@ -33,7 +33,9 @@ use pulsus_traceql::{AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp,
 
 use crate::logql::escape;
 
-use super::filter::{self, AttrProbe, LeafEval, PlanError, ValuePred};
+use super::filter::{
+    self, AttrProbe, CompiledLeaf, LeafEval, NestedSetField, PlanError, ValuePred,
+};
 use super::search_sql::{byte_cap_expr, date_literal, root_ordering_tuple};
 
 /// The snapped, left-closed/right-open metrics evaluation window
@@ -227,60 +229,7 @@ fn render_expr(
                 ));
             };
             let leaf = filter::compile_leaf(field, *op, value)?;
-            match &leaf.eval {
-                // Issue #282: the renderers below validate every regex as
-                // they escape it, so the two separate pre-render
-                // validators this arm used to call are gone — one act, no
-                // second opinion to drift from the emitted SQL.
-                LeafEval::Physical(p) => filter::physical_sql(p),
-                LeafEval::Attr { probe, negated } => {
-                    semi_join_sql(probe, *negated, attrs_table, window)
-                }
-                // Nested-set intrinsics (issue #181) are query-time
-                // structural properties with no SQL column — unsupported
-                // on the metrics filter path (a clean 400, tracked as a
-                // follow-up). Search remains the surface for nested-set.
-                LeafEval::NestedSet { .. } => Err(PlanError::TypeMismatch(
-                    "nested-set intrinsics are not supported in metrics filters".to_string(),
-                )),
-                // Trace-level intrinsics (issue #184) resolve from the
-                // search engine's per-trace co-load — no per-span SQL
-                // column exists on the metrics filter path (a clean 400,
-                // mirroring nested-set; search remains their surface).
-                LeafEval::TraceCtx(_) => Err(PlanError::TypeMismatch(
-                    "trace-level intrinsics are not supported in metrics filters".to_string(),
-                )),
-                // `compile_leaf` never yields a field-vs-field or arithmetic
-                // leaf (those come via the `FieldCompare`/`ArithCompare` AST
-                // arms) — keep the match exhaustive.
-                LeafEval::BoolTruth { .. } => Err(PlanError::TypeMismatch(
-                    "bare field truthiness is not supported in metrics filters".to_string(),
-                )),
-                LeafEval::FieldCompare { .. } => Err(PlanError::TypeMismatch(
-                    "field-vs-field comparisons are not supported in metrics filters".to_string(),
-                )),
-                LeafEval::Arith { .. } => Err(PlanError::TypeMismatch(
-                    "arithmetic comparisons are not supported in metrics filters".to_string(),
-                )),
-                // Issue #351: `compile_leaf` never yields either of these
-                // — a static fold is handled above, before the leaf is
-                // compiled, and a boolean-operand comparison is a
-                // different AST shape. Kept for exhaustiveness.
-                LeafEval::Const(_) => Err(PlanError::TypeMismatch(
-                    "static comparisons are folded before leaf compilation".to_string(),
-                )),
-                LeafEval::BoolCompare { .. } => Err(PlanError::TypeMismatch(
-                    "boolean-operand comparisons are not supported in metrics filters".to_string(),
-                )),
-                // Issue #351: the multi-valued event/link comparison
-                // resolves from a per-batch SET co-load only the search
-                // engine performs — the same reason nested-set and the
-                // trace-level intrinsics are refused here. Search remains
-                // their surface.
-                LeafEval::EventSetCompare { .. } => Err(PlanError::TypeMismatch(
-                    "event/link comparisons are not supported in metrics filters".to_string(),
-                )),
-            }
+            lower_leaf(&leaf, attrs_table, window)
         }
         // Attribute existence (issue #185 `existence.*`): a key-only
         // membership semi-join. `resource.service.name != nil` and the
@@ -317,10 +266,30 @@ fn render_expr(
         FieldExpr::Exists { negated: true, .. } => Err(PlanError::TypeMismatch(
             "absence checks are not supported in metrics filters".to_string(),
         )),
-        // Bare fields (truthiness), bare literals and unary negation are
-        // search-surface constructs; the metrics filter path does not
-        // support them (clean 400s, mirroring the nested-set rejection).
-        FieldExpr::Field(_) => Err(PlanError::TypeMismatch(
+        // Issue #458: `{ .a }` IS `.a = true` — plain equality against the
+        // boolean literal, which `filter::compile_leaf` already lowers to
+        // the ordinary index-served attribute semi-join, so this arm
+        // inherits that lowering rather than inventing one. `filter.rs`'s
+        // `LeafEval::BoolTruth` doc records the measured asymmetry that
+        // makes this sound: `{ .a }` is equality and only `{ !.a }` demands
+        // a boolean operand (the reference answers `{ .a }` 200 with no
+        // match against a string-valued `a`, and `{ !.a }` **500**).
+        //
+        // **No client sends this; it is included because the block is
+        // open.** The refusal that a live client hit is the nested-set one
+        // below; this one was found by enumerating the block against the
+        // reference and costs three lines inside a `match` already being
+        // changed.
+        FieldExpr::Field(field @ Field::Attribute { .. }) => {
+            let leaf = filter::compile_leaf(field, ComparisonOp::Eq, &Value::Bool(true))?;
+            lower_leaf(&leaf, attrs_table, window)
+        }
+        // A bare INTRINSIC at predicate position (`{ name }`) never reaches
+        // here: `pulsus_traceql::validate` rejects it with the reference's
+        // own rule, message and 400 (`span filter field expressions must
+        // resolve to a boolean`). Kept as a clean refusal for the
+        // AST-constructed path.
+        FieldExpr::Field(Field::Intrinsic(_)) => Err(PlanError::TypeMismatch(
             "bare field truthiness is not supported in metrics filters".to_string(),
         )),
         // Issue #351: `{ true }` is the corpus's canonical "match
@@ -367,6 +336,137 @@ fn render_expr(
             Ok(format!("({l} {sym} {r})"))
         }
     }
+}
+
+/// Lowers ONE compiled leaf to its metrics SQL fragment. Extracted from
+/// `render_expr`'s comparison arm (issue #458) so the bare-truthiness
+/// arm reaches the same dispatch — one leaf lowering, not two that can
+/// drift.
+///
+/// The six `LeafEval` variants that are not lowered here are
+/// **unreachable from `filter::compile_leaf`**, which constructs only
+/// `Physical`, `Attr`, `NestedSet` and `TraceCtx`. That claim is a gate,
+/// not a reading: `dead_leaf_eval_variants_are_unreachable_from_compile_leaf`
+/// below enumerates the whole `Field × ComparisonOp × Value` product with
+/// exhaustive matches, so adding a variant to any of those enums fails to
+/// compile rather than silently narrowing the checked domain.
+fn lower_leaf(
+    leaf: &CompiledLeaf,
+    attrs_table: &str,
+    window: SnappedWindow,
+) -> Result<String, PlanError> {
+    match &leaf.eval {
+        // Issue #282: the renderers below validate every regex as they
+        // escape it, so the two separate pre-render validators this arm
+        // used to call are gone — one act, no second opinion to drift
+        // from the emitted SQL.
+        LeafEval::Physical(p) => filter::physical_sql(p),
+        LeafEval::Attr { probe, negated } => semi_join_sql(probe, *negated, attrs_table, window),
+        // Issue #458: the root/non-root region of `nestedSetParent` has an
+        // exact per-span SQL form; everything else in the family keeps a
+        // clean 400 (see `nested_set_metrics_sql`).
+        LeafEval::NestedSet { field, op, value } => nested_set_metrics_sql(*field, *op, *value),
+        // Trace-level intrinsics (issue #184) resolve from the search
+        // engine's per-trace co-load — no per-span SQL column exists on
+        // the metrics filter path (a clean 400; search remains their
+        // surface). Wave 2 of issue #458 owns this one.
+        LeafEval::TraceCtx(_) => Err(PlanError::TypeMismatch(
+            "trace-level intrinsics are not supported in metrics filters".to_string(),
+        )),
+        // Issue #458 collapsed six separately-worded refusals into this
+        // one arm. Every variant it covers is unreachable from
+        // `filter::compile_leaf` (gated, see the doc comment above), so
+        // the wording no longer pretends to describe a query a user can
+        // write.
+        LeafEval::BoolTruth { .. }
+        | LeafEval::FieldCompare { .. }
+        | LeafEval::Arith { .. }
+        | LeafEval::Const(_)
+        | LeafEval::BoolCompare { .. }
+        | LeafEval::EventSetCompare { .. } => Err(PlanError::TypeMismatch(
+            "unsupported metrics filter leaf".to_string(),
+        )),
+    }
+}
+
+/// The `nestedSetParent == -1` root sentinel, as a per-span SQL predicate.
+///
+/// The reference materialises the nested-set numbering per span at block
+/// write time and assigns the root sentinel `-1` from `span.IsRoot()`
+/// alone — an empty `ParentSpanID`
+/// (`tempodb/encoding/vparquet4/nested_set_model.go:11-12,57` @ v3.0.2).
+/// Our writer stores the same "no parent" convention as the all-zero
+/// `parent_id` (`otlp_traces.rs`), so the root test is one
+/// `FixedString(8)` column comparison — no join, no subquery, no window
+/// dependence, and nothing for the planner to hoist away from the
+/// `service_time` PREWHERE.
+fn is_root_sql() -> String {
+    format!("parent_id = {}", filter::ZERO_PARENT_SQL)
+}
+
+/// Whether `x OP value` is CONSTANT over the whole non-root domain.
+///
+/// `nestedSetParent` takes values in `{-1} ∪ [1, ∞)`: `-1` for a root
+/// (`nested_set_model.go:11-12` @ v3.0.2) and otherwise the parent's Euler
+/// `left`, which is at least 1 and whose exact value is not computable in
+/// SQL. A comparison is therefore decidable per span iff its truth value
+/// does not depend on WHICH non-root value the span carries. `None` = not
+/// decidable = the comparison keeps its 400.
+///
+/// Non-finite values never reach here through `filter::compile_leaf`
+/// (`parse_num` rejects them first), but the function is total anyway:
+/// with `v = NaN` every comparison against `1.0` is false, so every arm
+/// yields `None` — a conservative refusal, never a wrong lowering.
+fn nonroot_constant(op: ComparisonOp, v: f64) -> Option<bool> {
+    match op {
+        // x == v is constant-false over x >= 1 iff v < 1.
+        ComparisonOp::Eq => (v < 1.0).then_some(false),
+        ComparisonOp::Neq => (v < 1.0).then_some(true),
+        // x < v is constant-false over x >= 1 iff v <= 1.
+        ComparisonOp::Lt => (v <= 1.0).then_some(false),
+        ComparisonOp::Lte => (v < 1.0).then_some(false),
+        ComparisonOp::Gt => (v < 1.0).then_some(true),
+        ComparisonOp::Gte => (v <= 1.0).then_some(true),
+        // `compile_leaf` rejects these first, at `compile_nested_set_leaf`
+        // (`filter.rs`), with `nested-set intrinsics do not support regex
+        // operators` — this arm is the total-function tail, not a
+        // reachable refusal.
+        ComparisonOp::Re | ComparisonOp::Nre => None,
+    }
+}
+
+/// `nestedSetLeft`/`nestedSetRight` have no SQL form at all (the Euler
+/// numbering is a per-trace tree walk over the hydrated forest, which the
+/// single-query metrics pushdown does not build); `nestedSetParent` lowers
+/// when and only when [`nonroot_constant`] decides.
+///
+/// The root-side truth comes from the search engine's OWN comparator
+/// (`search_eval::cmp_f64`) applied to the sentinel, so the metrics and
+/// search answers cannot drift by a re-spelled operator.
+fn nested_set_metrics_sql(
+    field: NestedSetField,
+    op: ComparisonOp,
+    value: f64,
+) -> Result<String, PlanError> {
+    if field != NestedSetField::Parent {
+        return Err(PlanError::TypeMismatch(
+            "nestedSetLeft and nestedSetRight are not supported in metrics filters".to_string(),
+        ));
+    }
+    let root_true = super::search_eval::cmp_f64(op, -1.0, value);
+    let Some(nonroot_true) = nonroot_constant(op, value) else {
+        return Err(PlanError::TypeMismatch(
+            "nestedSetParent comparisons inside the numbering range are not supported in \
+             metrics filters"
+                .to_string(),
+        ));
+    };
+    Ok(match (root_true, nonroot_true) {
+        (true, true) => static_bool_sql(true),
+        (false, false) => static_bool_sql(false),
+        (true, false) => is_root_sql(),
+        (false, true) => format!("NOT ({})", is_root_sql()),
+    })
 }
 
 /// One attribute leaf's index-served membership semi-join, confined to
@@ -1028,7 +1128,7 @@ fn push_prewhere_where_indented(sql: &mut String, filter: &FilterSql, window: Sn
 
 #[cfg(test)]
 mod tests {
-    use pulsus_traceql::parse;
+    use pulsus_traceql::{Intrinsic, SpanKindValue, StatusValue, parse};
 
     use super::*;
 
@@ -1271,5 +1371,278 @@ mod tests {
         assert!(sql.starts_with("SELECT uniqExact(trace_id, span_id) AS n\nFROM trace_spans\n"));
         assert!(!sql.contains("GROUP BY"));
         assert!(!sql.contains("toStartOfInterval"));
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #458 AC 8: the six `LeafEval` variants `lower_leaf` refuses in
+    // one collapsed arm are UNREACHABLE from `filter::compile_leaf`.
+    //
+    // Before this gate that claim was a reading of 25 `match` arms — the
+    // "claimed domain vs checked domain" shape: a statement about a whole
+    // product space, verified by inspecting part of it. Here it is the
+    // literal product `Field × ComparisonOp × Value`, enumerated from
+    // exhaustive `match`es so that **adding a variant to any of those
+    // enums fails to compile** rather than silently shrinking the domain
+    // this test claims to cover.
+    //
+    // What it does NOT cover, stated so nobody credits it with more: the
+    // enumeration is over TYPES. A `compile_leaf` arm that dispatched on a
+    // particular attribute KEY or a particular string VALUE would have
+    // only its representative probed. That gap is real and unclosed.
+    // ------------------------------------------------------------------
+
+    /// Every `Intrinsic` variant. Exhaustive `match`, no wildcard: a new
+    /// intrinsic is a compile error here, not a silently unprobed arm.
+    fn intrinsic_ordinal(i: Intrinsic) -> usize {
+        match i {
+            Intrinsic::Name => 0,
+            Intrinsic::Duration => 1,
+            Intrinsic::Status => 2,
+            Intrinsic::Kind => 3,
+            Intrinsic::NestedSetParent => 4,
+            Intrinsic::NestedSetLeft => 5,
+            Intrinsic::NestedSetRight => 6,
+            Intrinsic::StatusMessage => 7,
+            Intrinsic::ChildCount => 8,
+            Intrinsic::SpanId => 9,
+            Intrinsic::ParentId => 10,
+            Intrinsic::TraceId => 11,
+            Intrinsic::TraceDuration => 12,
+            Intrinsic::RootName => 13,
+            Intrinsic::RootServiceName => 14,
+            Intrinsic::InstrumentationName => 15,
+            Intrinsic::InstrumentationVersion => 16,
+            Intrinsic::EventName => 17,
+            Intrinsic::EventTimeSinceStart => 18,
+            Intrinsic::LinkSpanId => 19,
+            Intrinsic::LinkTraceId => 20,
+        }
+    }
+
+    const ALL_INTRINSICS: [Intrinsic; 21] = [
+        Intrinsic::Name,
+        Intrinsic::Duration,
+        Intrinsic::Status,
+        Intrinsic::Kind,
+        Intrinsic::NestedSetParent,
+        Intrinsic::NestedSetLeft,
+        Intrinsic::NestedSetRight,
+        Intrinsic::StatusMessage,
+        Intrinsic::ChildCount,
+        Intrinsic::SpanId,
+        Intrinsic::ParentId,
+        Intrinsic::TraceId,
+        Intrinsic::TraceDuration,
+        Intrinsic::RootName,
+        Intrinsic::RootServiceName,
+        Intrinsic::InstrumentationName,
+        Intrinsic::InstrumentationVersion,
+        Intrinsic::EventName,
+        Intrinsic::EventTimeSinceStart,
+        Intrinsic::LinkSpanId,
+        Intrinsic::LinkTraceId,
+    ];
+
+    /// Every `AttrScope` variant. Exhaustive, no wildcard.
+    fn scope_ordinal(s: AttrScope) -> usize {
+        match s {
+            AttrScope::Span => 0,
+            AttrScope::Resource => 1,
+            AttrScope::Unscoped => 2,
+            AttrScope::Instrumentation => 3,
+            AttrScope::Event => 4,
+            AttrScope::Link => 5,
+        }
+    }
+
+    const ALL_SCOPES: [AttrScope; 6] = [
+        AttrScope::Span,
+        AttrScope::Resource,
+        AttrScope::Unscoped,
+        AttrScope::Instrumentation,
+        AttrScope::Event,
+        AttrScope::Link,
+    ];
+
+    /// Every `ComparisonOp` variant. Exhaustive, no wildcard.
+    fn op_ordinal(op: ComparisonOp) -> usize {
+        match op {
+            ComparisonOp::Eq => 0,
+            ComparisonOp::Neq => 1,
+            ComparisonOp::Gt => 2,
+            ComparisonOp::Gte => 3,
+            ComparisonOp::Lt => 4,
+            ComparisonOp::Lte => 5,
+            ComparisonOp::Re => 6,
+            ComparisonOp::Nre => 7,
+        }
+    }
+
+    const ALL_OPS: [ComparisonOp; 8] = [
+        ComparisonOp::Eq,
+        ComparisonOp::Neq,
+        ComparisonOp::Gt,
+        ComparisonOp::Gte,
+        ComparisonOp::Lt,
+        ComparisonOp::Lte,
+        ComparisonOp::Re,
+        ComparisonOp::Nre,
+    ];
+
+    /// Every `Value` variant, by discriminant. Exhaustive, no wildcard.
+    fn value_ordinal(v: &Value) -> usize {
+        match v {
+            Value::String(_) => 0,
+            Value::Number(_) => 1,
+            Value::Duration(_) => 2,
+            Value::Bool(_) => 3,
+            Value::Status(_) => 4,
+            Value::Kind(_) => 5,
+        }
+    }
+
+    /// Every `Field` variant, by discriminant. Exhaustive, no wildcard —
+    /// a third `Field` shape would be a compile error here.
+    fn field_ordinal(f: &Field) -> usize {
+        match f {
+            Field::Intrinsic(_) => 0,
+            Field::Attribute { .. } => 1,
+        }
+    }
+
+    /// `Duration` cannot be constructed from outside `pulsus-traceql`
+    /// (`from_nanos` is crate-private), so the representative comes from
+    /// the parser — the same route a real query takes.
+    fn parsed_duration_value() -> Value {
+        let FieldExpr::Binary { rhs, .. } = body("{ duration > 1s }") else {
+            panic!("the fixture query is a binary comparison");
+        };
+        let FieldExpr::Literal(v @ Value::Duration(_)) = *rhs else {
+            panic!("the fixture query's rhs is a duration literal");
+        };
+        v
+    }
+
+    fn all_values() -> Vec<Value> {
+        vec![
+            Value::String("x".to_string()),
+            Value::Number("1".to_string()),
+            parsed_duration_value(),
+            Value::Bool(true),
+            Value::Status(StatusValue::Error),
+            Value::Kind(SpanKindValue::Server),
+        ]
+    }
+
+    fn all_fields() -> Vec<Field> {
+        let mut out: Vec<Field> = ALL_INTRINSICS
+            .iter()
+            .copied()
+            .map(Field::Intrinsic)
+            .collect();
+        out.extend(ALL_SCOPES.iter().map(|scope| Field::Attribute {
+            scope: *scope,
+            key: "a".to_string(),
+        }));
+        out
+    }
+
+    /// The three const arrays feed every variant the exhaustive ordinal
+    /// matches know about — the gap the compiler alone cannot close.
+    #[test]
+    fn the_enumerated_arrays_cover_every_variant_of_their_enums() {
+        fn covered<T: Copy>(items: &[T], ordinal: impl Fn(T) -> usize) -> Vec<usize> {
+            let mut v: Vec<usize> = items.iter().copied().map(ordinal).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        }
+        assert_eq!(
+            covered(&ALL_INTRINSICS, intrinsic_ordinal),
+            (0..ALL_INTRINSICS.len()).collect::<Vec<_>>(),
+            "ALL_INTRINSICS must list every Intrinsic variant exactly once"
+        );
+        assert_eq!(
+            covered(&ALL_SCOPES, scope_ordinal),
+            (0..ALL_SCOPES.len()).collect::<Vec<_>>(),
+            "ALL_SCOPES must list every AttrScope variant exactly once"
+        );
+        assert_eq!(
+            covered(&ALL_OPS, op_ordinal),
+            (0..ALL_OPS.len()).collect::<Vec<_>>(),
+            "ALL_OPS must list every ComparisonOp variant exactly once"
+        );
+        let values = all_values();
+        let mut seen: Vec<usize> = values.iter().map(value_ordinal).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            (0..values.len()).collect::<Vec<_>>(),
+            "all_values() must carry one representative of every Value variant"
+        );
+        let mut field_shapes: Vec<usize> = all_fields().iter().map(field_ordinal).collect();
+        field_shapes.sort_unstable();
+        field_shapes.dedup();
+        assert_eq!(
+            field_shapes,
+            vec![0, 1],
+            "all_fields() must carry both Field shapes"
+        );
+    }
+
+    #[test]
+    fn dead_leaf_eval_variants_are_unreachable_from_compile_leaf() {
+        let values = all_values();
+        let fields = all_fields();
+        let mut probed = 0usize;
+        let mut reached = 0usize;
+        let mut escapes = Vec::new();
+        for field in &fields {
+            for op in ALL_OPS {
+                for value in &values {
+                    probed += 1;
+                    let Ok(leaf) = filter::compile_leaf(field, op, value) else {
+                        continue;
+                    };
+                    reached += 1;
+                    // Exhaustive over `LeafEval`, no wildcard: a new
+                    // variant is a compile error, so this classification
+                    // cannot silently admit one.
+                    let dead = match &leaf.eval {
+                        LeafEval::Physical(_)
+                        | LeafEval::Attr { .. }
+                        | LeafEval::NestedSet { .. }
+                        | LeafEval::TraceCtx(_) => false,
+                        LeafEval::BoolTruth { .. } => true,
+                        LeafEval::FieldCompare { .. } => true,
+                        LeafEval::Arith { .. } => true,
+                        LeafEval::Const(_) => true,
+                        LeafEval::BoolCompare { .. } => true,
+                        LeafEval::EventSetCompare { .. } => true,
+                    };
+                    if dead {
+                        escapes.push(format!("{field} {op} {value} => {:?}", leaf.eval));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            probed,
+            fields.len() * ALL_OPS.len() * values.len(),
+            "the product must be enumerated in full"
+        );
+        assert!(
+            escapes.is_empty(),
+            "compile_leaf constructed a LeafEval variant `lower_leaf` treats as unreachable, in \
+             {} of {probed} probes:\n{}",
+            escapes.len(),
+            escapes.join("\n")
+        );
+        // A gate that reached nothing would pass vacuously.
+        assert!(
+            reached > 0,
+            "no probe compiled at all — the enumeration proves nothing"
+        );
     }
 }

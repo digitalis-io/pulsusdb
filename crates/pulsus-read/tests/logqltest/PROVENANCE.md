@@ -95,8 +95,8 @@ enumerated by reason, not absorbed; the per-reason breakdown is
 **It serves only the last few hours.** A push older than that returns
 `204` and is then invisible — a success that answers nothing, which reads
 exactly like a replay finding a mismatch. The measured table is in
-`INGESTION_WINDOW`, and `slots_fit_inside_the_measured_ingestion_window`
-asserts the slice's slots stay inside it arithmetically.
+`INGESTION_WINDOW`, and `the_placement_fits_the_measured_served_horizon`
+asserts the slice's placement stays inside it arithmetically.
 
 **It injects `detected_level`** when `discover_log_levels` is on, which it
 is in `ci/logql/config.yaml`. The corpus was captured with it off, so the
@@ -1230,17 +1230,24 @@ mechanically by
 because a row whose filter excludes nothing is exactly the row that
 passed on the blind path and measured nothing.
 
-### The replay slot budget this file spent
+### The replay slot budget this file spent (the fixed-slot scheme, retired)
+
+**This section is a record of a mechanism that no longer exists, kept in
+the past tense rather than deleted.** The ceiling described below was hit
+twice, and that record is the argument for having removed it; the section
+that follows describes what replaced it. Its capacity figures are the
+retired scheme's and are no longer counted against any constant.
 
 Eight reachable rows pushed `SLOT_SECS * REACHABLE` past `FIRST_SLOT_AGE`,
 and `SLOT_SECS`'s lower bound (`2 × the widest reachable case`) was
 already exactly spent, so `FIRST_SLOT_AGE` had to move. It did, and the
-cost is the nightly leg's own wall-clock headroom before the OLDEST slot
-ages out of `INGESTION_WINDOW` mid-run. That failure mode used to surface
+cost was the nightly leg's own wall-clock headroom before the OLDEST slot
+aged out of `INGESTION_WINDOW` mid-run. That failure mode used to surface
 as "N of the replayed rows disagree with the reference", sending the
 reader after captures that are fine; it is now named at the point of
 failure by an end-of-run re-query of slot 0's sentinel, opening
-`PRECONDITION FAILURE, NOT A CORPUS FAILURE`. What remains free is
+`PRECONDITION FAILURE, NOT A CORPUS FAILURE` — the one part of this
+paragraph that survives unchanged. What remained free was
 `REMAINING_SLOTS`, recomputed from the three constants and asserted, not
 stated.
 
@@ -1267,20 +1274,93 @@ next: **free slots and run margin are the same resource.** The ceiling is
 `MAX_REACHABLE_ROWS`, computed in `logqltest_replay.rs` as
 `(SERVED_HORIZON - SLOT_SECS - RUN_MARGIN) / SLOT_SECS`, and checked at
 compile time against `REACHABLE` rather than written down. The leg
-occupies 231/234 of it — **98.7% occupied, three rows from the wall.**
+occupied 231/234 of it — **98.7% occupied, three rows from the wall.**
 
 That is not `SERVED_HORIZON / SLOT_SECS`, which is 240 slots and ignores
 both the slot the oldest case occupies and the wall clock the run needs
 after placing it. This paragraph said 240 slots when the horizon work
 first landed, which reads as 96% occupancy and invites someone to add
 rows into space that does not exist; #278's round-1 review caught the
-figure and round 2 caught that its replacement was still TYPED. **Every
-capacity figure quoted above is now counted** against the constants that
-produce it, by
+figure and round 2 caught that its replacement was still TYPED. Every
+capacity figure quoted above WAS counted against the constants that
+produced it, by
 `logqltest_replay.rs::the_quoted_capacity_figures_are_counted_so_a_stale_one_cannot_compile`,
-which reads this file as well as its own source — so a quotation here
-that drifts reddens rather than compiling.
+which reads this file as well as its own source. Those constants are gone
+and these figures are now history, so that test no longer counts them; it
+counts the successor scheme's, named in the next section.
 
-The remaining lever is `SLOT_SECS`, bounded below by twice the widest
-reachable case and exactly spent — so the next addition that does not fit
-needs a narrower widest case, not a larger `FIRST_SLOT_AGE`.
+The remaining lever was `SLOT_SECS`, bounded below by twice the widest
+reachable case and exactly spent — so, the paragraph concluded, the next
+addition that did not fit needed a narrower widest case, not a larger
+`FIRST_SLOT_AGE`.
+
+**Three rows from the wall was three rows from the wall.** Issue #388's
+sixteen reachable rows landed on top of these eight and the merged tree
+did not compile: `REACHABLE` came out at 247 against a ceiling of 234,
+thirteen over, with `cargo build --tests -p pulsus-read` reporting the
+compile-time ceiling assertion first and the `234_usize - 247_usize`
+underflow in `REMAINING_SLOTS` second. Both fire; the ordering is stated
+here because a previous account of it had them the other way round. That
+is what the next section replaced, and the conclusion quoted just above
+is the sentence it falsified: rows were never the scarce resource.
+
+### The replay placement, and why the fixed slot went (issue #388)
+
+**How `REACHABLE` reached 247, since `logqltest_replay.rs` may not spell
+it out.** The merge base had 223. Issue #278 added 8 reachable rows and
+issue #388 added 16, and the two shares are disjoint — different corpus
+files, different rows — so the merged figure is `223 + 8 + 16 = 247`.
+That is the whole reason the rebase conflict could not be resolved by
+picking a side: either parent alone gives a figure that is wrong by the
+other's contribution and looks entirely plausible.
+
+Sixteen more reachable rows arrived and there was nothing left to give:
+the fixed slot could not shrink and the ceiling was three rows away, so
+what changed was the UNIT the budget is kept in. **The scarce resource is
+seconds of corpus span, not rows.**
+
+Each reachable case now takes its own sample span plus a gap of
+`max(MIN_GAP_SECS, that span)`, laid out end to end by
+`logqltest_replay.rs::place`. A single-entry case — 146 of the 247 are
+one — costs `MIN_GAP_SECS` and nothing more, where the fixed slot billed
+it at the widest case's rate. Measured over the corpus: the cases' own
+spans sum to 885 s and their gaps to 4940 s, so the placement occupies
+5825 s of a 9400 s budget (`SERVED_HORIZON - RUN_MARGIN - MIN_GAP_SECS`).
+That is **5825/9400 s**, i.e. **62.0% occupied**, with 3575 s free —
+about **178 more zero-span rows** before anything has to be narrowed.
+
+Three things follow, and each is a check rather than a sentence:
+
+* **`FIRST_SLOT_AGE` is no longer a lever.** It is derived from
+  `PLACED_SPAN_SECS`, and the layout test asserts it equals the total
+  `place()` MEASURES over the live corpus — not merely the constant
+  beside it, which a hand-typed age would also satisfy. The oldest
+  entry's survival budget is `SERVED_HORIZON - FIRST_SLOT_AGE` = **3775
+  s**, against 240 s under the previous setting and 0 s at the value this
+  issue's own branch had reached before the rebase reverted it.
+* **The separation floor is carried over unweakened.** The retired rule
+  was `2 × widest ≤ SLOT_SECS`; with `SLOT_SECS = 2 × MIN_GAP_SECS` that
+  is exactly `widest ≤ MIN_GAP_SECS`, which the layout test asserts from
+  the corpus. Per case the realised gap is `max(MIN_GAP_SECS, span)`,
+  which is at least the case's own span again.
+* **The budget that is CHECKED and the timestamps that are PUSHED come
+  from one function.** `place()` has exactly two callers — the layout
+  test and the live leg — where the fixed slot had two separate
+  expressions that agreed only by inspection. The live leg also asserts
+  the total against `PLACED_SPAN_SECS` before it pushes anything, because
+  the layout test is a different test and may not have run.
+
+`PLACED_SPAN_SECS` is a committed measurement of a walked corpus, exactly
+as `REACHABLE` is: any corpus edit that moves a load span reddens the
+layout test with the new figure in the message. Commit what the test
+prints. Never edit a corpus row to make the constant match.
+
+### The `bNN` prefix, and why nothing was renamed (issue #388)
+
+Issue #388's two files are `b25_pattern_expr_reject.test` and
+`b26_json_expr.test`, and both prefixes were already in use. Neither file
+was renamed. The `bNN` prefix is a human batch label with **no machine
+meaning** — discovery is `read_dir` plus a sort on the full file name and
+nothing parses the prefix — and duplicates are already normal: six
+families duplicate on disk today. The rule, the current list and the test
+that recomputes it from disk live in `corpus/README.md`.

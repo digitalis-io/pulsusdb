@@ -49,6 +49,14 @@
 //! Clean-room: no Tempo/Grafana source, grammar, or test corpus is read —
 //! the fixtures are our own authorship and the Tempo values are read back
 //! as black-box runtime output.
+//!
+//! **Known wiring hole, recorded not fixed** (issue #458): this suite's
+//! endpoint URL variables are read with a bare `env::var` and taken as a
+//! skip when absent, while `PULSUS_TEST_CLICKHOUSE` is fail-closed. Drop
+//! only the URLs from a live step and it reports GREEN having compared
+//! nothing — ledger entry
+//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
+//! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;

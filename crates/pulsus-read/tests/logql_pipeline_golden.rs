@@ -428,9 +428,25 @@ fn json_expression_resolves_a_span_without_recursing() {
 /// Issue #72 review round 1, finding 2: malformed extraction paths are
 /// compile-time `PipelineInvalid` material, never silently normalized
 /// into reading a different field.
+///
+/// **Issue #394 (folded into #388) widened the refused set and, in the
+/// other direction, widened the ACCEPTED one.** The shapes below the
+/// first blank group are the ones `parse_json_path` served and the
+/// reference's own sub-grammar refuses; nothing was removed from the
+/// original list. The accept-side control gains `b[ 0 ]`, which
+/// `parse_json_path` REFUSED and the reference serves — whitespace is
+/// skipped between every token (`jsonexpr/lexer.go:47-49 @ v3.7.4`).
+/// The full matrix is `logql_json_expr_matrix.rs`; this is the
+/// golden-file end of it.
 #[test]
 fn malformed_json_extraction_paths_are_named_compile_errors() {
-    for expr in ["a..b", "a.", "a.[0]", ".a", "a[", "a[b]", ""] {
+    for expr in [
+        // The original list.
+        "a..b", "a.", "a.[0]", ".a", "a[", "a[b]", "",
+        // Refused since #394: an identifier ends at any character
+        // outside `[A-Za-z0-9_]`, and what follows must still parse.
+        "a b", "a-c", "a/c", "a:c", "a,c", "a!", "a]", "a.0", "0a", "é",
+    ] {
         let query = format!(r#"{{a="b"}} | json x="{expr}""#);
         let err = compile_err(&query);
         assert!(
@@ -438,8 +454,14 @@ fn malformed_json_extraction_paths_are_named_compile_errors() {
             "expr {expr:?}: {err}"
         );
     }
-    // The valid shapes still compile.
-    for expr in ["a.b.c", "servers[0]", r#"req.hdr[\"User-Agent\"]"#] {
+    // The valid shapes still compile — including the whitespace form
+    // this change ADDED to the accepted set.
+    for expr in [
+        "a.b.c",
+        "servers[0]",
+        r#"req.hdr[\"User-Agent\"]"#,
+        "b[ 0 ]",
+    ] {
         let query = format!(r#"{{a="b"}} | json x="{expr}""#);
         compiled(&query);
     }

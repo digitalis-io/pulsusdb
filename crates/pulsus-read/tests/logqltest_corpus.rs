@@ -58,17 +58,93 @@ fn count_eval_directives(text: &str) -> usize {
 /// The floor is the count on disk, raised by each batch that adds a file
 /// (issue #249: 39 -> 40 with `b25_structured_metadata.test`; issue #278:
 /// 40 -> 43, which is 42 files that were already on disk under a floor
-/// nobody had raised, plus `b26_line_filter_pushdown.test`). A deletion
-/// drops the count below the floor and fails here — which is the half of
-/// the anti-drop guarantee that disk discovery cannot give on its own.
+/// nobody had raised, plus `b26_line_filter_pushdown.test`; issue #388:
+/// 43 -> 45, with `b25_pattern_expr_reject.test` and `b26_json_expr.test`).
+/// A deletion drops the count below the floor and fails here — which is the
+/// half of the anti-drop guarantee that disk discovery cannot give on its
+/// own.
+///
+/// **A count alone is satisfiable by an EMPTY replacement file** (issue
+/// #388, review round 6): delete a corpus file, `touch` one with the same
+/// or any other name, and the floor is met while the rows are gone. So the
+/// floor is paired here with a per-file minimum — every discovered file
+/// must carry at least one `eval*` directive. That is deliberately weak
+/// (one directive, not the file's own count) because the exact per-file
+/// figure is already checked, against the runner's own output, by
+/// [`corpus_is_fully_green_and_exercises_every_directive`]; what is added
+/// here is only the floor's missing half.
 #[test]
 fn corpus_dir_is_populated() {
     let files = corpus_files();
     assert!(
-        files.len() >= 43,
-        "expected at least the 43 committed .test files, found {} — a file was \
+        files.len() >= 45,
+        "expected at least the 45 committed .test files, found {} — a file was \
          deleted, or the batch that added one did not raise this floor: {files:?}",
         files.len()
+    );
+    let empty: Vec<&String> = files
+        .iter()
+        .filter(|n| {
+            let text = driver::read_file(&driver::corpus_dir().join(n));
+            count_eval_directives(&text) == 0
+        })
+        .collect();
+    assert!(
+        empty.is_empty(),
+        "these corpus files carry no `eval*` directive at all: {empty:?}. The floor counts \
+         FILES, so an empty replacement meets it while the rows it replaced are gone."
+    );
+}
+
+/// The `bNN` prefix is a human batch label with NO machine meaning, and the
+/// corpus README says so — with the duplicated prefixes listed, computed
+/// here from disk rather than typed there.
+///
+/// **Why a computed relation and not a `contains` of one name** (the #447
+/// shape). A check that the README mentions `b25` would pass while five of
+/// the six duplicate families went unmentioned, and would keep passing as
+/// new ones appeared. The whole sentence is built from `read_dir` and must
+/// appear in the README exactly once, so the list cannot rot in either
+/// direction: a new duplicate family reddens this, and so does a stale
+/// entry for a family that stopped duplicating.
+///
+/// The `.md` file is invisible to corpus discovery — [`corpus_files`] and
+/// `logqltest_replay.rs::classify` both filter on the `.test` extension —
+/// which is what makes it safe to keep the note in that directory.
+#[test]
+fn the_corpus_readme_lists_every_duplicated_batch_prefix() {
+    const README: &str = include_str!("logqltest/corpus/README.md");
+
+    let mut counts: std::collections::BTreeMap<u32, usize> = Default::default();
+    for name in corpus_files() {
+        let Some(rest) = name.strip_prefix('b') else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || !rest[digits.len()..].starts_with('_') {
+            continue;
+        }
+        *counts
+            .entry(digits.parse().expect("digits parse"))
+            .or_default() += 1;
+    }
+    let dups: Vec<String> = counts
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(p, _)| format!("b{p}"))
+        .collect();
+    assert!(
+        dups.len() > 1,
+        "expected several duplicated batch prefixes on disk, found {dups:?} — if duplicates \
+         really have stopped, the README's rule needs rewriting, not this test relaxing"
+    );
+    let sentence = format!("Duplicated prefixes on disk today: {}.", dups.join(", "));
+    let got = README.matches(sentence.as_str()).count();
+    assert_eq!(
+        got, 1,
+        "the corpus README must state, exactly once:\n  {sentence}\nIt states it {got} \
+         time(s). The list is computed from `read_dir` here, so a prefix that started or \
+         stopped duplicating moves it."
     );
 }
 

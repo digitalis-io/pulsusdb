@@ -39,7 +39,13 @@
 //!
 //! The divergent classes are NOT rigged to pass and NOT silently skipped:
 //! a gated run today fails loudly on classes 2 and 3 with the two #185
-//! resolution paths named. Because it is env-gated, fast CI never runs it.
+//! resolution paths named. No workflow supplies its gate: the `ci` job's
+//! aggregate `--workspace` run does execute this binary, where it
+//! self-skips green, so CI never observes a result. (Issue #278 measured
+//! the claim this sentence replaced — that being env-gated kept fast CI
+//! from running the binary at all — and found it false:
+//! `ci/nextest.toml`'s `[profile.ci]` sets no `default-filter`, so
+//! `--workspace` selects every test binary.)
 //!
 //! **#185 activation.** #185 flips this leg to a BLOCKING close condition.
 //! It cannot close at 100% parity until classes 2 and 3 are resolved by
@@ -64,6 +70,14 @@
 //! Clean-room: no Tempo/Grafana source, grammar, or test corpus is read —
 //! the fixtures are our own authorship and the Tempo values are read back
 //! as black-box runtime output.
+//!
+//! **Known wiring hole, recorded not fixed** (issue #458): this suite's
+//! endpoint URL variables are read with a bare `env::var` and taken as a
+//! skip when absent, while `PULSUS_TEST_CLICKHOUSE` is fail-closed. Drop
+//! only the URLs from a live step and it reports GREEN having compared
+//! nothing — ledger entry
+//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
+//! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
 
 use std::collections::BTreeMap;
 use std::process::Command;

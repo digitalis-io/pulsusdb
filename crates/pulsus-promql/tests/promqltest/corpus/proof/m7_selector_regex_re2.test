@@ -1,0 +1,92 @@
+# Issue #278 proof corpus — SELECTOR-REGEX MATCHER SEMANTICS.
+#
+# The promqltest store stands in for the ClickHouse fetch layer, and until
+# this file existed its matcher compiled `regex::Regex::new(&format!(
+# "^(?:{pattern})$"))` — a second, private implementation of matcher
+# semantics that disagreed with Prometheus AND with our own production
+# engine, which compiles `pulsus_re2::compile_user_regex_anchored(
+# &pulsus_re2::re2_pattern_to_rust(p))` (crates/pulsus-read/src/metrics/
+# labels.rs:274 and :620). The harness was therefore LESS correct than the
+# code it validates: it would have rejected a Prometheus-captured
+# expectation and green-lit a wrong one.
+#
+# Every eval row below is a bare vector selector carrying exactly ONE
+# non-__name__ regex matcher, so `plan()` files it under
+# `SelectorSpec::matchers` and the store's matcher loop is the only thing
+# that can exclude a series — no aggregation, no function, no __name__
+# regex, nothing that could make an answer come out right for another
+# reason.
+#
+# PROVENANCE OF THE EXPECTATIONS. Captured from `prom/prometheus:v3.13.0`,
+# image digest
+#   sha256:0e698e35e50d1ddc2d11a4a55b089fe62eb71358a5c204dfafd21bdf8ffe04b8
+# which self-reports at /api/v1/status/buildinfo: version 3.13.0, revision
+# 40af9c2cdc0eda00f3622e867a27f6359f7295f3 — the same commit
+# corpus/upstream-manifest.json pins (`prometheus_sha`). Capture route: the
+# fixture below was served as a static text-exposition endpoint, scraped by
+# that container, and the answers read back through GET /api/v1/query.
+# Captured 2026-08-24.
+#
+# WHY THESE VALUES. Each is a fragment-level trap for one Perl class as the
+# Rust `regex` crate reads it and RE2 does not:
+#
+#   U+00B5 MICRO SIGN          Unicode \w, NOT ASCII \w
+#   U+0663 ARABIC-INDIC THREE  Unicode \d, NOT ASCII \d
+#   U+00A0 NO-BREAK SPACE      Unicode \s, NOT RE2 \s (which is [\t\n\f\r ])
+#   a{,3}                      RE2 reads the literal text `a{,3}`; the Rust
+#                              crate rejects the pattern outright, which
+#                              aborted the WHOLE file, not just one row
+#
+# RE2's ASCII class definitions: re2/parse.cc kPerlDigit/kPerlSpace/
+# kPerlWord, mirrored in crates/pulsus-re2/src/re2_syntax.rs.
+#
+# A ninth reference value, `a<U+000B>b` (VERTICAL TAB — Unicode \s but not
+# RE2 \s), is deliberately absent: an invisible control byte makes an
+# unreviewable diff. It is a Rust unit test instead,
+# promqltest/store.rs::tests::a_vertical_tab_is_not_re2_whitespace. The
+# reference capture carried it, so the `!~` row's answer is seven series
+# there and the six below here.
+
+load 1m
+	p278{lbl="aµb"}	1
+	p278{lbl="a٣b"}	2
+	p278{lbl="a b"}	3
+	p278{lbl="ab"}	5
+	p278{lbl="a{,3}"}	6
+	p278{lbl="awb"}	7
+	p278{lbl="a3b"}	8
+	p278{lbl="a b"}	9
+
+# ASCII \w only: the letter `w` and the digit `3` match; U+00B5 and
+# U+0663 do not, though both are Unicode \w.
+eval instant at 0 p278{lbl=~"a\\wb"}
+	p278{lbl="awb"} 7
+	p278{lbl="a3b"} 8
+
+# ASCII \d only: U+0663 ARABIC-INDIC DIGIT THREE is a Unicode digit
+# and must NOT match.
+eval instant at 0 p278{lbl=~"a\\db"}
+	p278{lbl="a3b"} 8
+
+# RE2 \s is [\t\n\f\r ] — five characters. U+00A0 NO-BREAK SPACE is
+# Unicode whitespace and must NOT match; only the U+0020 series does.
+eval instant at 0 p278{lbl=~"a\\sb"}
+	p278{lbl="a b"} 9
+
+# `{,3}` is not a well-formed repetition, so RE2 takes it as the
+# literal text `a{,3}`. Under the old matcher this row did not merely
+# fail — `Regex::new` returned Err, the driver's fetch errored and the
+# whole file aborted.
+eval instant at 0 p278{lbl=~"a{,3}"}
+	p278{lbl="a{,3}"} 6
+
+# The negation, so an over-matching \w is caught from the other side
+# too: a matcher that wrongly INCLUDED U+00B5/U+0663 above would
+# wrongly EXCLUDE them here.
+eval instant at 0 p278{lbl!~"a\\wb"}
+	p278{lbl="aµb"} 1
+	p278{lbl="a٣b"} 2
+	p278{lbl="a b"} 3
+	p278{lbl="ab"} 5
+	p278{lbl="a{,3}"} 6
+	p278{lbl="a b"} 9

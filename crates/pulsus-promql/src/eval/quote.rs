@@ -108,28 +108,141 @@ pub fn go_quote(s: &str) -> String {
 /// escaped; every other byte (printable ASCII incl. DEL `0x7f`) passes
 /// through verbatim. Verified byte-for-byte against go1.25.5
 /// `time.ParseDuration(...).Error()`.
+///
+/// Issue #294: this is now the `&str` face of [`go_time_quote_bytes`].
+/// A `&str` is valid UTF-8 by type, so the byte walk's invalid-byte arm
+/// is unreachable from here and the two agree by construction — the
+/// pinned goldens below therefore exercise the byte walk as well.
 pub fn go_time_quote(s: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(s.len() + 2);
+    go_time_quote_bytes(s.as_bytes())
+}
+
+/// Go `time`'s internal `quote` over RAW BYTES (issue #294).
+///
+/// `time.ParseDuration`'s argument in Go is a `string`, which may hold
+/// arbitrary bytes; `quote` walks it with `for i, c := range s`, so an
+/// invalid byte decodes to `(utf8.RuneError, 1)` and is escaped ALONE as
+/// `\xNN`. Repairing the input to U+FFFD before quoting — which is what
+/// PulsusDB did before #294 — turns one `\xff` into `\xef\xbf\xbd`, a
+/// user-visible divergence in `__error_details__`.
+///
+/// Go computes an explicit `width` (`format.go` @ go1.25.5): 1 for a
+/// decode error, 3 when the three bytes really are a genuine U+FFFD,
+/// and `len(string(c))` otherwise. That is exactly the decoded size in
+/// every case — a genuine U+FFFD decodes with size 3, and a decode
+/// error's bytes cannot spell U+FFFD (they would have decoded) — so the
+/// walk below escapes `size` bytes and needs no special case.
+pub fn go_time_quote_bytes(s: &[u8]) -> String {
+    let mut out = String::with_capacity(go_time_quote_bytes_len(s));
+    go_time_quote_bytes_into(&mut out, s);
+    out
+}
+
+/// [`go_time_quote_bytes`] appended in place — the form the LogQL
+/// template's duration errors use so the whole message is ONE
+/// allocation of its exact final length (issue #294 AC-9b:
+/// `allocated == charged == err.len()`).
+pub fn go_time_quote_bytes_into(out: &mut String, s: &[u8]) {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
     out.push('"');
-    let mut buf = [0u8; 4];
-    for c in s.chars() {
-        let r = c as u32;
-        // Go's `c >= utf8.RuneSelf || c < ' '` — escape non-ASCII and
-        // C0 controls; printable ASCII (incl. DEL 0x7f) passes through.
-        if !(0x20..0x80).contains(&r) {
-            for &b in c.encode_utf8(&mut buf).as_bytes() {
-                let _ = write!(out, "\\x{b:02x}");
+    let mut i = 0;
+    while i < s.len() {
+        let (r, size) = decode_rune(s, i);
+        let ru = r as u32;
+        // Go's `c >= utf8.RuneSelf || c < ' '`.
+        if !(0x20..0x80).contains(&ru) {
+            for &b in &s[i..i + size] {
+                out.push('\\');
+                out.push('x');
+                out.push(HEX[(b >> 4) as usize]);
+                out.push(HEX[(b & 0x0F) as usize]);
             }
         } else {
-            if c == '"' || c == '\\' {
+            if r == '"' || r == '\\' {
                 out.push('\\');
             }
-            out.push(c);
+            out.push(r);
         }
+        i += size;
     }
     out.push('"');
-    out
+}
+
+/// The byte length [`go_time_quote_bytes`] would produce, without
+/// allocating.
+///
+/// **An INDEPENDENT transcription of the same rule, not a second
+/// consumer of one walk** (issue #294, review round 4): a shared walk
+/// feeding both a writer and a counter cannot catch a walk that emits
+/// the wrong thing, because both sides see the same wrong thing. This
+/// counts from the rule directly, with its own decode. Its oracle is
+/// [`go_time_quote_bytes`] (the exhaustive sweep in
+/// `pulsus-read/tests/logql_quote_len_gate.rs`); `go_time_quote_bytes`'s
+/// oracle is the container-captured LogQL corpus. Neither reads the
+/// other's source.
+pub fn go_time_quote_bytes_len(s: &[u8]) -> usize {
+    // The two surrounding quote characters.
+    let mut n = 2;
+    let mut i = 0;
+    while i < s.len() {
+        // Own decode: Go's `range` step — an invalid byte advances one.
+        let b = s[i];
+        let want = match b {
+            0x00..=0x7F => 1,
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 0,
+        };
+        let size = if want == 0 || i + want > s.len() {
+            1
+        } else if std::str::from_utf8(&s[i..i + want]).is_ok() {
+            want
+        } else {
+            1
+        };
+        n += if size > 1 {
+            // A multi-byte rune is either >= 0x80 (escaped per byte) or
+            // a decode error (one byte, handled below) — never a
+            // pass-through.
+            4 * size
+        } else if !(0x20..0x80).contains(&b) {
+            // A lone invalid byte, or an ASCII C0 control.
+            4
+        } else if b == b'"' || b == b'\\' {
+            2
+        } else {
+            1
+        };
+        i += size;
+    }
+    n
+}
+
+/// Decodes the rune at `s[i]` the way Go's `for range` over a string
+/// does: an invalid encoding yields `(U+FFFD, 1)`.
+fn decode_rune(s: &[u8], i: usize) -> (char, usize) {
+    let rest = &s[i..];
+    let want = match rest[0] {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return ('\u{FFFD}', 1),
+    };
+    if want > rest.len() {
+        return ('\u{FFFD}', 1);
+    }
+    match std::str::from_utf8(&rest[..want]) {
+        Ok(t) => (
+            t.chars().next().unwrap_or('\u{FFFD}'),
+            // `t` holds exactly one rune.
+            want,
+        ),
+        Err(_) => ('\u{FFFD}', 1),
+    }
 }
 
 // go1.25.5 src/strconv/isprint.go, transcribed verbatim (see the module

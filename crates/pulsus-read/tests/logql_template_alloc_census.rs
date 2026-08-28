@@ -435,13 +435,27 @@ static VIA: &[Via] = &[
         other_callers: &[],
     },
     Via {
-        func: "lossy_repaired",
+        func: "lossy_go",
         // Issue #260: `Retained::from_engine` is the third charger — the
         // pipeline boundary where the engine's BYTES become the row's
         // retained `String`, whose repair expansion it charges before
         // allocating (it was free while it lived in a caller's `Vec`).
         chargers: &["lossy_charged", "compile_charged_regex", "from_engine"],
-        other_callers: &[],
+        other_callers: &[(
+            "lossy_go_replaces_one_invalid_byte_with_one_replacement_char",
+            "issue #455: the rule's own unit test, in funcs.rs's `#[cfg(test)]` region — \
+             fixed byte literals of at most 7 bytes, no budget in scope and none needed",
+        )],
+    },
+    Via {
+        func: "lossy_go_into",
+        chargers: &["lossy_go"],
+        other_callers: &[(
+            "render",
+            "issue #294: the `unable to parse time '<raw>'` half; the registry \
+             closure charges render's EXACT rendered_len before calling it, and a \
+             failed charge returns, so render is control-flow unreachable after it",
+        )],
     },
     Via {
         func: "go_json_sanitize",
@@ -476,6 +490,21 @@ static VIA: &[Via] = &[
                 "quote_bytes_ascii",
                 "%+q of error/short texts, under fmt_q's charge on the \
                  render path",
+            ),
+        ],
+    },
+    Via {
+        func: "quote_with_into",
+        chargers: &[],
+        other_callers: &[
+            (
+                "quote_with",
+                "the allocating face; its own VIA entry carries the charge evidence",
+            ),
+            (
+                "quote_bytes_into",
+                "issue #294: unixToTime's error appends its strconv-quoted half into a \
+                 buffer whose EXACT final length the registry closure charged first",
             ),
         ],
     },
@@ -963,10 +992,17 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "funcs.rs",
-        func: "f!bytes",
-        callees: &[".into_owned", ".to_string"],
-        disposition: TRANSIENT,
-        why: "one lossy copy freed by return; float result; error text bounded",
+        func: "cast_to_f64",
+        callees: &["str::from_utf8"],
+        disposition: CONST,
+        why: "issue #294: borrows — invalid UTF-8 returns 0.0 without repairing (go_parse_float rejects any string holding U+FFFD, so the repair could only cost a copy)",
+    },
+    Pin {
+        file: "funcs.rs",
+        func: "cast_to_i64",
+        callees: &["str::from_utf8"],
+        disposition: CONST,
+        why: "issue #294: borrows — invalid UTF-8 returns 0 without repairing (go_parse_int_base0 rejects any string holding U+FFFD)",
     },
     Pin {
         file: "funcs.rs",
@@ -981,20 +1017,6 @@ static PINS: &[Pin] = &[
         callees: &[".to_string"],
         disposition: CONST,
         why: "one integer; error text",
-    },
-    Pin {
-        file: "funcs.rs",
-        func: "f!duration",
-        callees: &[".into_owned"],
-        disposition: TRANSIENT,
-        why: "one copy freed by return; float result; ParseDuration errors ≤ ~4× input",
-    },
-    Pin {
-        file: "funcs.rs",
-        func: "f!duration_seconds",
-        callees: &[".into_owned"],
-        disposition: TRANSIENT,
-        why: "as f!duration",
     },
     Pin {
         file: "funcs.rs",
@@ -1034,9 +1056,9 @@ static PINS: &[Pin] = &[
     Pin {
         file: "funcs.rs",
         func: "f!toDateInZone",
-        callees: &[".into_owned", ".to_vec"],
-        disposition: TRANSIENT,
-        why: "layout/value copies freed by return; Time result",
+        callees: &["str::from_utf8"],
+        disposition: CONST,
+        why: "issue #294: all three arguments are BORROWED (parse_in_location already takes byte slices, and an invalid-UTF-8 zone falls back to the same location its U+FFFD repair resolved to) — str::from_utf8 allocates nothing",
     },
     Pin {
         file: "funcs.rs",
@@ -1082,13 +1104,6 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "funcs.rs",
-        func: "f!unixToTime",
-        callees: &[".into_owned"],
-        disposition: TRANSIENT,
-        why: "one copy freed by return; Time result",
-    },
-    Pin {
-        file: "funcs.rs",
         func: "from_json",
         callees: &["serde_json::from_slice"],
         disposition: CHARGED,
@@ -1100,13 +1115,6 @@ static PINS: &[Pin] = &[
         callees: &[".extend_from_slice", "Vec::with_capacity"],
         disposition: CHARGED_VIA,
         why: "≤ 3× input (U+FFFD substitution), under from_json's 35× charge",
-    },
-    Pin {
-        file: "funcs.rs",
-        func: "go_parse_duration",
-        callees: &[".into_owned", "String::from_utf8_lossy", "format!"],
-        disposition: TRANSIENT,
-        why: "lossy copy + error texts ≤ ~4× input, freed; scalar result",
     },
     Pin {
         file: "funcs.rs",
@@ -1186,33 +1194,14 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "funcs.rs",
-        func: "lossy",
-        callees: &["String::from_utf8_lossy"],
-        disposition: TRANSIENT,
-        why: "borrowed Cow; ≤ 3× input only for invalid UTF-8 replacement, freed by the caller",
-    },
-    Pin {
-        file: "funcs.rs",
-        func: "lossy_repaired",
-        callees: &[
-            ".push",
-            ".push_str",
-            "String::with_capacity",
-            "str::from_utf8",
-        ],
+        func: "lossy_go",
+        callees: &["String::with_capacity"],
         disposition: CHARGED_VIA,
-        why: "ONE allocation of the precomputed repaired length; its callers charge that exact size first (round 6)",
+        why: "ONE allocation of the precomputed repaired length; its callers charge that exact size first (round 6). The walk itself moved to lossy_go_into (issue #294); the RULE became Go's per-byte advance in issue #455, which changes the length but not the discipline",
     },
     Pin {
         file: "funcs.rs",
-        func: "lossy_repaired_matches_std_from_utf8_lossy_byte_for_byte",
-        callees: &["String::from_utf8_lossy"],
-        disposition: CONST,
-        why: "test-region equality check over fixed short byte cases (round 6)",
-    },
-    Pin {
-        file: "funcs.rs",
-        func: "lossy_repaired_len",
+        func: "lossy_go_len",
         callees: &["str::from_utf8"],
         disposition: CONST,
         why: "pure length scan, borrows only — no allocation",
@@ -1223,6 +1212,13 @@ static PINS: &[Pin] = &[
         callees: &["str::from_utf8"],
         disposition: CHARGED,
         why: "reserves the ≤3× U+FFFD expansion BEFORE from_utf8_lossy's owned branch (round 4); the validity probe borrows",
+    },
+    Pin {
+        file: "funcs.rs",
+        func: "lossy_go_into",
+        callees: &[".push", ".push_str", "str::from_utf8"],
+        disposition: CHARGED_VIA,
+        why: "issue #294: the repair WALK, appending into a buffer its caller sized and charged (lossy_go's precomputed cap, or render's exact rendered_len)",
     },
     Pin {
         file: "funcs.rs",
@@ -1247,6 +1243,13 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "funcs.rs",
+        func: "render",
+        callees: &[".push_str", "String::with_capacity"],
+        disposition: ERROR_PATH,
+        why: "issue #294: ONE allocation of the EXACT rendered length of a duration/unixToTime parse failure, and the registry closure charges that length first — a failed charge returns, so this is control-flow unreachable after it. The gate asserts charged == allocated == err.len() for all six shapes. NOTE: this key merges DurationParseError::render and UnixToTimeError::render (the census keys by bare name); both are the same one-allocation shape",
+    },
+    Pin {
+        file: "funcs.rs",
         func: "registry_names",
         callees: &[".collect"],
         disposition: CONST,
@@ -1262,9 +1265,9 @@ static PINS: &[Pin] = &[
     Pin {
         file: "funcs.rs",
         func: "unix_to_time",
-        callees: &["format!"],
-        disposition: ERROR_PATH,
-        why: "error texts ≤ ~11× input via strconv quote of a short epoch string",
+        callees: &["str::from_utf8"],
+        disposition: CONST,
+        why: "issue #294: allocates NOTHING — it borrows the raw epoch and returns a Copy UnixToTimeError; the text is built by render, whose exact length the caller charges first",
     },
     // ---------------------------------------------------------- gofmt.rs
     Pin {
@@ -1509,6 +1512,13 @@ static PINS: &[Pin] = &[
     },
     Pin {
         file: "gofmt.rs",
+        func: "quote_bytes_len",
+        callees: &["str::from_utf8"],
+        disposition: CONST,
+        why: "issue #294: pure length scan, borrows only — no allocation",
+    },
+    Pin {
+        file: "gofmt.rs",
         func: "quote_rune",
         callees: &[".push", "String::with_capacity"],
         disposition: CONST,
@@ -1517,9 +1527,16 @@ static PINS: &[Pin] = &[
     Pin {
         file: "gofmt.rs",
         func: "quote_with",
-        callees: &[".push", "String::with_capacity", "str::from_utf8", "write!"],
+        callees: &["String::with_capacity"],
         disposition: CHARGED_VIA,
         why: "≤ 10× input, under fmt_q's charge; other callers quote short error/parse texts",
+    },
+    Pin {
+        file: "gofmt.rs",
+        func: "quote_with_into",
+        callees: &[".push", "str::from_utf8", "write!"],
+        disposition: CHARGED_VIA,
+        why: "issue #294: the quoting WALK, lifted unchanged out of quote_with so unixToTime's error can append its quoted half in place; ≤ 10× input, under the same charges quote_with's callers already pay",
     },
     Pin {
         file: "gofmt.rs",
@@ -1799,7 +1816,7 @@ static PINS: &[Pin] = &[
         disposition: CHARGED,
         why: "valid UTF-8 MOVES the engine's already-charged buffer (from_utf8 does not \
               allocate); the invalid path charges the repair EXPANSION before \
-              lossy_repaired allocates it",
+              lossy_go allocates it",
     },
     Pin {
         file: "retained.rs",
@@ -2321,6 +2338,44 @@ fn every_template_allocation_site_is_classified() {
             assert!(!why.is_empty(), "VIA {}: empty why for {caller}", via.func);
         }
     }
+    // --- issue #294 AC-4: no uncharged conversion of caller bytes -------
+    // The nine call sites #294 removed were all one of two spellings,
+    // and the SUBJECT of this check is the std callee rather than our
+    // helper's name — a rename of the helper survives the rename, so
+    // renaming `lossy` to `repair` cannot pass it (the std call moves
+    // with the body, and the new enclosing function is itself a
+    // NEW/CHANGED census entry).
+    //
+    // Checked against the DISCOVERED sets, not the pinned ones, so
+    // deleting a pin does not silence it.
+    {
+        const CONVERTED_CALLER_BYTES: [&str; 9] = [
+            "cast_to_f64",
+            "cast_to_i64",
+            "f!bytes",
+            "f!duration",
+            "f!duration_seconds",
+            "f!toDateInZone",
+            "f!unixToTime",
+            "go_parse_duration",
+            "unix_to_time",
+        ];
+        for func in CONVERTED_CALLER_BYTES {
+            let discovered = found.get(&("funcs.rs".to_string(), func.to_string()));
+            for banned in ["String::from_utf8_lossy", ".into_owned"] {
+                if discovered.is_some_and(|c| c.contains(banned)) {
+                    let _ = writeln!(
+                        errors,
+                        "funcs.rs::{func} calls {banned} again — issue #294 removed the \
+                         uncharged conversion of caller bytes at all nine sites; a \
+                         conversion here must go through lossy_charged (charged) or \
+                         disappear (borrowed)"
+                    );
+                }
+            }
+        }
+    }
+
     // --- exact site-set equality (both directions) ----------------------
     // Functions with NO vocabulary hits need no pin; drop empty pins
     // from the comparison the same way (they document zero-alloc fns).

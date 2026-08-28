@@ -183,9 +183,9 @@ impl Retained {
             Ok(s) => Ok(Retained(s)),
             Err(e) => {
                 let raw = e.as_bytes();
-                let need = super::funcs::lossy_repaired_len(raw);
+                let need = super::funcs::lossy_go_len(raw);
                 budget.charge_retained(need.saturating_sub(raw.len()))?;
-                Ok(Retained(super::funcs::lossy_repaired(raw, need)))
+                Ok(Retained(super::funcs::lossy_go(raw, need)))
             }
         }
     }

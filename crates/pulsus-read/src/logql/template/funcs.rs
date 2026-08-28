@@ -9,6 +9,15 @@
 //! Function-call failures return `Err(msg)`; the evaluator wraps them as
 //! `error calling <name>: <msg>` exactly like Go's `evalCall`+`safeCall`
 //! (panics recovered into the same shape).
+//!
+//! **Invalid UTF-8 in an argument is repaired at Go's granularity, not
+//! Rust's** (issue #455). [`lossy_go_len`]/[`lossy_go`]/[`lossy_go_into`]
+//! mirror `utf8.DecodeRune`'s ONE-byte advance on invalid input, so a
+//! truncated multi-byte sequence becomes one U+FFFD per byte.
+//! `String::from_utf8_lossy` would emit one per maximal invalid
+//! subsequence, a rule with no counterpart on the reference's path — the
+//! names say `_go` so no call site can read a promise of std's
+//! semantics into them.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -215,11 +224,7 @@ fn bytes_of<'v>(v: &'v Value<'_>) -> &'v [u8] {
     }
 }
 
-fn lossy(v: &[u8]) -> Cow<'_, str> {
-    String::from_utf8_lossy(v)
-}
-
-/// [`lossy`]'s charged twin (review rounds 4+6): invalid UTF-8 forces
+/// The charged conversion of caller bytes (review rounds 4+6): invalid UTF-8 forces
 /// the owned branch, whose EXACT repaired length is precomputed,
 /// charged, and then allocated ONCE — never `from_utf8_lossy`'s
 /// grow-doubling buffer, so there is no growth worst case to bound.
@@ -235,63 +240,84 @@ fn lossy_charged<'v>(ctx: &FuncCtx<'_, '_>, v: &'v [u8]) -> Result<Cow<'v, str>,
             // grow-double to 4× (cumulatively requesting up to 7×), so
             // no constant ceiling is a provable bound; a single
             // allocation of a computed size has no worst case.
-            let need = lossy_repaired_len(v);
+            let need = lossy_go_len(v);
             ctx.charge(need)?;
-            Ok(Cow::Owned(lossy_repaired(v, need)))
+            Ok(Cow::Owned(lossy_go(v, need)))
         }
     }
 }
 
-/// The exact byte length of `String::from_utf8_lossy(v)` — same
-/// substitution granularity as std (one U+FFFD per maximal invalid
-/// sequence, per `Utf8Error::error_len`), computed without allocating.
-pub(super) fn lossy_repaired_len(v: &[u8]) -> usize {
+/// The exact byte length of [`lossy_go`], computed without allocating.
+///
+/// **Go's granularity, not std's** (issue #455). Go's `utf8.DecodeRune`
+/// advances exactly ONE byte on invalid input — measured against
+/// go1.25.5, `utf8.DecodeRuneInString("\xe0\xa0'")` returns size `1` —
+/// so every rune-walking construct on the reference's path emits one
+/// U+FFFD PER INVALID BYTE: `strings.Map`/`strings.ToLower`,
+/// `bytes.Map`, `encoding/json`'s `unquoteBytes` (the rule
+/// [`go_json_sanitize`] already reproduces at its own site).
+/// `String::from_utf8_lossy` emits one per MAXIMAL invalid subsequence
+/// instead, and that rule has no counterpart anywhere the reference
+/// reaches, so the two disagree for every truncated multi-byte sequence:
+/// `\xe0\xa0` is two replacements here and one under std.
+pub(super) fn lossy_go_len(v: &[u8]) -> usize {
     let mut rest = v;
     let mut len = 0usize;
     loop {
         match std::str::from_utf8(rest) {
             Ok(s) => return len + s.len(),
             Err(e) => {
+                // ALWAYS `valid_up_to() + 1`; `error_len()` is
+                // deliberately not consulted — consulting it is std's
+                // maximal-subpart rule, which is the divergence.
                 len += e.valid_up_to() + '\u{FFFD}'.len_utf8();
-                match e.error_len() {
-                    Some(bad) => rest = &rest[e.valid_up_to() + bad..],
-                    // Truncated trailing sequence: one replacement, done.
-                    None => return len,
-                }
+                rest = &rest[e.valid_up_to() + 1..];
             }
         }
     }
 }
 
-/// Builds the lossy repair in ONE allocation of exactly `cap` bytes
-/// (byte-identical to `String::from_utf8_lossy(v)` — pinned by a unit
-/// test below, including the truncated-tail and interleaved cases).
-pub(super) fn lossy_repaired(v: &[u8], cap: usize) -> String {
+/// Builds the Go-granularity repair in ONE allocation of exactly `cap`
+/// bytes, `cap` being [`lossy_go_len`]'s answer for the same input.
+/// Deliberately NOT `String::from_utf8_lossy` — see [`lossy_go_len`] —
+/// and the codepoint counts are pinned by the unit test below.
+pub(super) fn lossy_go(v: &[u8], cap: usize) -> String {
     let mut out = String::with_capacity(cap);
+    lossy_go_into(&mut out, v);
+    // Length only — an equality debug_assert against a second walk would
+    // re-appear in the allocation gate; byte equality against
+    // `lossy_go_len` is what this asserts, and the RULE is pinned by the
+    // unit test below.
+    debug_assert_eq!(out.len(), cap);
+    out
+}
+
+/// [`lossy_go`] appended in place (issue #294): the `unixToTime`
+/// error message embeds the repaired argument AND its `strconv.Quote`,
+/// and the whole message must be ONE allocation of its exact final
+/// length (AC-9b) — building either half as a temporary doubles the
+/// allocation the charge accounts for (measured: 4,194,375 allocated
+/// against 2,097,221 charged).
+pub(super) fn lossy_go_into(out: &mut String, v: &[u8]) {
     let mut rest = v;
     loop {
         match std::str::from_utf8(rest) {
             Ok(s) => {
                 out.push_str(s);
-                break;
+                return;
             }
             Err(e) => {
                 let (valid, tail) = rest.split_at(e.valid_up_to());
                 out.push_str(std::str::from_utf8(valid).expect("validated by valid_up_to"));
                 out.push('\u{FFFD}');
-                match e.error_len() {
-                    Some(bad) => rest = &tail[bad..],
-                    None => break,
-                }
+                // One byte, always (issue #455): Go's `utf8.DecodeRune`
+                // advance. `error_len()` is not consulted here either —
+                // the two walks must agree with `lossy_go_len` or the
+                // `debug_assert_eq!` above fires.
+                rest = &tail[1..];
             }
         }
     }
-    // Length only — an equality debug_assert against
-    // `String::from_utf8_lossy` would re-run the grow-doubling path in
-    // debug builds and re-appear in the allocation gate; byte equality
-    // is pinned by the unit test below instead.
-    debug_assert_eq!(out.len(), cap);
-    out
 }
 
 /// Go float→int64 conversion semantics (amd64 `cvttsd2si`): truncate
@@ -429,11 +455,20 @@ pub fn cast_to_i64(v: &Value<'_>) -> i64 {
         Value::Nil => 0,
         Value::Month(n) | Value::Weekday(n) | Value::Duration(n) => *n,
         Value::Str(s) => {
-            let text = lossy(s);
+            // Issue #294: BORROW the bytes; never repair them first.
+            // A lossy repair inserts at least one U+FFFD, and
+            // `go_parse_int_base0` requires the WHOLE string to parse —
+            // U+FFFD is not a digit, sign, base prefix or underscore —
+            // so every input the repair could reach falls through to
+            // `unwrap_or(0)`, the same value this arm returns. The copy
+            // was pure cost: 3 MiB per 1 MiB argument, uncharged.
+            let Ok(text) = std::str::from_utf8(s) else {
+                return 0;
+            };
             if text.is_empty() {
                 return 0;
             }
-            go_parse_int_base0(&trim_decimal(&text)).unwrap_or(0)
+            go_parse_int_base0(&trim_decimal(text)).unwrap_or(0)
         }
         _ => 0,
     }
@@ -455,11 +490,16 @@ pub fn cast_to_f64(v: &Value<'_>) -> f64 {
         Value::Nil => 0.0,
         Value::Month(n) | Value::Weekday(n) | Value::Duration(n) => *n as f64,
         Value::Str(s) => {
-            let text = lossy(s);
+            // Issue #294, as `cast_to_i64`: `go_parse_float` rejects any
+            // string containing U+FFFD, so repairing before parsing can
+            // only produce the same `0.0` at the cost of a copy.
+            let Ok(text) = std::str::from_utf8(s) else {
+                return 0.0;
+            };
             if text.is_empty() {
                 return 0.0;
             }
-            go_parse_float(&text).unwrap_or(0.0)
+            go_parse_float(text).unwrap_or(0.0)
         }
         _ => 0.0,
     }
@@ -604,19 +644,68 @@ pub static REGISTRY: [FuncDef; 67] = [
         c.charge(3 * bytes_of(&a[0]).len() + 4)?;
         Ok(str_val(query_escape(bytes_of(&a[0]))))
     }),
-    f!("bytes", [Str], None, |_c, a| {
-        let raw = lossy(bytes_of(&a[0])).into_owned();
-        crate::logql::pipeline::convert_bytes_value(&raw)
-            .map(Value::Float)
-            .map_err(|e| e.to_string())
+    f!("bytes", [Str], None, |c, a| {
+        // Issue #294: the U+FFFD repair is KEPT here (see the ledger's
+        // `template-output-budget` entry) but moved onto the charged
+        // path — valid UTF-8 now borrows and charges nothing, invalid
+        // UTF-8 charges its exact repaired length before allocating it.
+        let raw = lossy_charged(c, bytes_of(&a[0]))?;
+        // Issue #294 review round 1: `lossy_charged` alone left the
+        // VALID-UTF-8 branch uncharged, and the conversion below is
+        // where this function's cost actually is. Each of
+        // `humanize.ParseBytes`'s three failure arms builds text from a
+        // DIFFERENT caller-derived string — not from the argument in
+        // every case — and each is RETAINED into `__error_details__`
+        // (`vendor/github.com/dustin/go-humanize/bytes.go @ v3.7.4`):
+        //
+        //   :128-130 bad numeric prefix -> `strconv.ParseFloat`'s OWN
+        //       `*strconv.NumError`, which embeds `num`, the
+        //       comma-stripped numeric PREFIX. That prefix is `[0-9.,]`
+        //       only, so Go-quoting it adds 2         -> len + 47
+        //   :142    unknown unit -> `unhandled size name: <extra>`,
+        //       where `extra` is the trimmed, Unicode-LOWERCASED
+        //       SUFFIX, which case mapping can expand -> 4*len + 20
+        //   :137    overflow -> `too large: <s>`, the ORIGINAL
+        //       argument verbatim                     -> len + 11
+        //
+        // Every one of the three is bounded by the argument's length
+        // (four times it for the case-mapped suffix), so `4*len + 64`
+        // bounds whichever fires, and it also exceeds the conversion's
+        // own two transient copies (the comma-stripped prefix and the
+        // lowercased suffix, ~2x len together). Measured uncharged
+        // before this: 3,145,761 B for a 1 MiB numeric overflow,
+        // 3,145,807 B for a 1 MiB unknown unit. Unlike
+        // `duration`/`unixToTime` this is a BOUND rather than the exact
+        // rendered length: WHICH arm fires is decided by the parse, and
+        // computing the exact length first would need a second
+        // transcription of `bytes_parse_error`'s three arms with no
+        // independent oracle. The over-charge is ledgered.
+        c.charge(4usize.saturating_mul(raw.len()).saturating_add(64))?;
+        crate::logql::pipeline::convert_bytes_value(&raw).map(Value::Float)
     }),
-    f!("duration", [Str], None, |_c, a| {
-        let raw = lossy(bytes_of(&a[0])).into_owned();
-        go_parse_duration(&raw).map(|d| Value::Float(duration_seconds_f64(d)))
+    f!("duration", [Str], None, |c, a| {
+        // Issue #294: parse the RAW bytes — Go's `time.ParseDuration`
+        // takes a `string` that may hold arbitrary bytes and quotes
+        // them per byte, so repairing first both allocated a full copy
+        // of the argument and rendered `\xef\xbf\xbd` where the
+        // reference renders `\xff`. The charge is the only thing
+        // between the (allocation-free, `Copy`) error and its text.
+        match go_parse_duration(bytes_of(&a[0])) {
+            Ok(d) => Ok(Value::Float(duration_seconds_f64(d))),
+            Err(e) => {
+                c.charge(e.rendered_len())?;
+                Err(e.render())
+            }
+        }
     }),
-    f!("duration_seconds", [Str], None, |_c, a| {
-        let raw = lossy(bytes_of(&a[0])).into_owned();
-        go_parse_duration(&raw).map(|d| Value::Float(duration_seconds_f64(d)))
+    f!("duration_seconds", [Str], None, |c, a| {
+        match go_parse_duration(bytes_of(&a[0])) {
+            Ok(d) => Ok(Value::Float(duration_seconds_f64(d))),
+            Err(e) => {
+                c.charge(e.rendered_len())?;
+                Err(e.render())
+            }
+        }
     }),
     f!("unixEpochMillis", [Time], None, |_c, a| Ok(string_val(
         time_arg(a, 0).unix_milli().to_string()
@@ -625,17 +714,30 @@ pub static REGISTRY: [FuncDef; 67] = [
         time_arg(a, 0).unix_nano().to_string()
     ))),
     f!("toDateInZone", [Str, Str, Str], None, |c, a| {
-        let layout = bytes_of(&a[0]).to_vec();
-        let zone = lossy(bytes_of(&a[1])).into_owned();
-        let val = bytes_of(&a[2]).to_vec();
-        let loc = timefns::load_location(&zone, c.env());
-        let t = super::golayout::parse_in_location(&layout, &val, &loc, c.env())
+        // Issue #294: `parse_in_location` already takes byte slices, so
+        // the layout/value copies were pure cost. An invalid-UTF-8 zone
+        // cannot name a location: `load_location` falls back to UTC for
+        // ANY unknown name, which is exactly what the U+FFFD-repaired
+        // form resolved to, so the answer is unchanged.
+        let loc = match std::str::from_utf8(bytes_of(&a[1])) {
+            Ok(zone) => timefns::load_location(zone, c.env()),
+            Err(_) => timefns::load_location("", c.env()),
+        };
+        let t = super::golayout::parse_in_location(bytes_of(&a[0]), bytes_of(&a[2]), &loc, c.env())
             .unwrap_or_else(|_| GoTime::zero());
         Ok(Value::Time(t))
     }),
-    f!("unixToTime", [Str], None, |_c, a| {
-        let epoch = lossy(bytes_of(&a[0])).into_owned();
-        unix_to_time(&epoch).map(Value::Time)
+    f!("unixToTime", [Str], None, |c, a| {
+        // Issue #294: raw bytes in, `Copy` error out, charge before the
+        // text is rendered. Half of the message is byte-exact with the
+        // reference and half is not — see `unix_to_time`.
+        match unix_to_time(bytes_of(&a[0])) {
+            Ok(t) => Ok(Value::Time(t)),
+            Err(e) => {
+                c.charge(e.rendered_len())?;
+                Err(e.render())
+            }
+        }
     }),
     f!("alignLeft", [Int, Str], None, |c, a| Ok(str_val(align(
         c,
@@ -1570,37 +1672,124 @@ fn decode_quad(q: &[u8; 4]) -> [u8; 3] {
 // unixToTime / fromJson / regex / sprig date coercion
 // ---------------------------------------------------------------------
 
-/// `unixToTime` (`fmt.go:136-163`).
-fn unix_to_time(epoch: &str) -> Result<GoTime, String> {
-    let l = epoch.len();
-    let parsed: Result<i64, String> = {
-        let ok = {
-            let (body, neg_ok) = match epoch.strip_prefix('-') {
-                Some(rest) => (rest, true),
-                None => (epoch.strip_prefix('+').unwrap_or(epoch), true),
-            };
-            let _ = neg_ok;
-            !body.is_empty() && body.chars().all(|c| c.is_ascii_digit())
+/// `unixToTime`'s failure (`fmt.go:137-162 @ v3.7.4`), WITHOUT the
+/// rendered text.
+///
+/// **`Copy` is the seal, not a convenience** (issue #294): a variant
+/// owning a `String` or a `Vec` would not compile as `Copy`, so "this
+/// error allocates nothing at construction" is enforced by the type
+/// rather than by remembering. Every field borrows the caller's
+/// argument; constructing `Err(e)` is a discriminant and a fat pointer
+/// on the stack. The only allocating call is [`Self::render`], and the
+/// registry closure reaches it only after `c.charge(...)?` has
+/// succeeded — a failed charge returns, so `render()` is
+/// CONTROL-FLOW unreachable, not merely textually later.
+///
+/// The seal's strength rests on the current absence of `unsafe` in
+/// `src/logql/template/` (`git grep -n unsafe -- \
+/// crates/pulsus-read/src/logql/template/` finds none), not on a
+/// language guarantee; `forbid(unsafe_code)` is unavailable
+/// workspace-wide because the allocation suites install a `GlobalAlloc`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum UnixToTimeError<'a> {
+    /// `strconv.ParseInt` rejected the digits.
+    Syntax { epoch: &'a [u8] },
+    /// The digits parsed but overflowed `int64`.
+    Range { epoch: &'a [u8] },
+    /// Parsed, but `len(epoch)` is not 5/10/13/16/19 — Go wraps a NIL
+    /// error here, which `%w` renders `%!w(<nil>)`.
+    BadLength { epoch: &'a [u8] },
+}
+
+const U_PREFIX: &str = "unable to parse time '";
+const U_MID: &str = "': ";
+const U_PARSING: &str = "strconv.ParseInt: parsing ";
+const U_SYNTAX: &str = ": invalid syntax";
+const U_RANGE: &str = ": value out of range";
+const U_NIL: &str = "%!w(<nil>)";
+
+impl UnixToTimeError<'_> {
+    fn epoch(&self) -> &[u8] {
+        match self {
+            UnixToTimeError::Syntax { epoch }
+            | UnixToTimeError::Range { epoch }
+            | UnixToTimeError::BadLength { epoch } => epoch,
+        }
+    }
+
+    /// The exact rendered length, computed without allocating.
+    pub(crate) fn rendered_len(&self) -> usize {
+        let epoch = self.epoch();
+        let tail = match self {
+            UnixToTimeError::Syntax { .. } => {
+                U_PARSING.len() + gofmt::quote_bytes_len(epoch, '"') + U_SYNTAX.len()
+            }
+            UnixToTimeError::Range { .. } => {
+                U_PARSING.len() + gofmt::quote_bytes_len(epoch, '"') + U_RANGE.len()
+            }
+            UnixToTimeError::BadLength { .. } => U_NIL.len(),
         };
-        if !ok {
-            Err(format!(
-                "strconv.ParseInt: parsing {}: invalid syntax",
-                gofmt::quote_bytes(epoch.as_bytes(), '"')
-            ))
-        } else {
-            epoch.parse::<i64>().map_err(|_| {
-                format!(
-                    "strconv.ParseInt: parsing {}: value out of range",
-                    gofmt::quote_bytes(epoch.as_bytes(), '"')
-                )
-            })
+        U_PREFIX.len() + lossy_go_len(epoch) + U_MID.len() + tail
+    }
+
+    /// ONE `String::with_capacity(rendered_len())`, written in place.
+    pub(crate) fn render(&self) -> String {
+        let want = self.rendered_len();
+        let mut out = String::with_capacity(want);
+        let epoch = self.epoch();
+        out.push_str(U_PREFIX);
+        lossy_go_into(&mut out, epoch);
+        out.push_str(U_MID);
+        match self {
+            UnixToTimeError::Syntax { .. } | UnixToTimeError::Range { .. } => {
+                out.push_str(U_PARSING);
+                gofmt::quote_bytes_into(&mut out, epoch, '"');
+                out.push_str(match self {
+                    UnixToTimeError::Range { .. } => U_RANGE,
+                    _ => U_SYNTAX,
+                });
+            }
+            UnixToTimeError::BadLength { .. } => out.push_str(U_NIL),
         }
+        debug_assert_eq!(out.len(), want);
+        out
+    }
+}
+
+/// `unixToTime` (`fmt.go:137-162 @ v3.7.4`).
+///
+/// **Half of this function's message is byte-exact with the reference
+/// and half is not, and the reason is a TYPE, not a choice.** Go writes
+/// the epoch twice — `fmt.Errorf("unable to parse time '%v': %w", epoch,
+/// err)` — raw through `%v`, and `strconv`-quoted inside the wrapped
+/// `*strconv.NumError`. Since issue #294 the QUOTED half goes through
+/// [`gofmt::quote_bytes`] over the RAW argument and is byte-exact: an
+/// invalid byte renders `\xff`, exactly as `grafana/loki:3.7.4`
+/// returns it. The RAW half cannot be: it flows into `ExecError.msg`, a
+/// `String`, and from there into `ErrorSlots::details`, a
+/// `Cow<'a, str>`; neither can hold invalid UTF-8. That half therefore
+/// carries the U+FFFD-repaired form. Widening those types is the only
+/// way to close it and is not in scope here. Ledgered under
+/// `template-output-budget`.
+fn unix_to_time(epoch: &[u8]) -> Result<GoTime, UnixToTimeError<'_>> {
+    // Go computes `l := len(epoch)` over the RAW string. It is read
+    // only after `ParseInt` succeeds — i.e. only for an all-ASCII-digit
+    // (optionally signed) epoch, where the raw and repaired lengths are
+    // equal — so moving to bytes leaves the length arm unchanged.
+    let l = epoch.len();
+    let body = match epoch.split_first() {
+        Some((b'-' | b'+', rest)) => rest,
+        _ => epoch,
     };
-    let i = match parsed {
-        Ok(i) => i,
-        Err(inner) => {
-            return Err(format!("unable to parse time '{epoch}': {inner}"));
-        }
+    if body.is_empty() || !body.iter().all(u8::is_ascii_digit) {
+        return Err(UnixToTimeError::Syntax { epoch });
+    }
+    let Ok(text) = std::str::from_utf8(epoch) else {
+        // Unreachable: every byte just passed an ASCII check.
+        return Err(UnixToTimeError::Syntax { epoch });
+    };
+    let Ok(i) = text.parse::<i64>() else {
+        return Err(UnixToTimeError::Range { epoch });
     };
     match l {
         5 => Ok(GoTime::from_unix(i * 86_400, 0)),
@@ -1608,7 +1797,7 @@ fn unix_to_time(epoch: &str) -> Result<GoTime, String> {
         13 => Ok(GoTime::from_unix_ns(i.wrapping_mul(1_000_000))),
         16 => Ok(GoTime::from_unix_ns(i.wrapping_mul(1000))),
         19 => Ok(GoTime::from_unix_ns(i)),
-        _ => Err(format!("unable to parse time '{epoch}': %!w(<nil>)")),
+        _ => Err(UnixToTimeError::BadLength { epoch }),
     }
 }
 
@@ -1799,9 +1988,9 @@ fn compile_charged_regex(ctx: &FuncCtx<'_, '_>, pattern: &[u8]) -> Result<regex:
         Err(_) => {
             // Round 6: exact repaired length, one allocation, charged
             // first — same as `lossy_charged` (no growth to bound).
-            let need = lossy_repaired_len(pattern);
+            let need = lossy_go_len(pattern);
             ctx.charge(need)?;
-            lossy_repaired(pattern, need)
+            lossy_go(pattern, need)
         }
     };
     if let Some(re) = ctx.regex_cache.get(&text) {
@@ -1859,11 +2048,79 @@ fn duration_seconds_f64(d: i64) -> f64 {
     sec as f64 + nsec as f64 / 1e9
 }
 
+/// `time.ParseDuration`'s failure (`src/time/format.go` @ go1.25.5),
+/// WITHOUT the rendered text.
+///
+/// **`Copy` is the seal, not a convenience** (issue #294): a variant
+/// owning a `String` or a `Vec` would not compile as `Copy`, so "this
+/// error allocates nothing at construction" is enforced by the type
+/// rather than by remembering. Every field borrows the caller's
+/// argument. The only allocating call is [`Self::render`], which the
+/// registry closure reaches only after `c.charge(...)?` has succeeded —
+/// a failed charge returns, so `render()` is CONTROL-FLOW unreachable,
+/// not merely textually later. See [`UnixToTimeError`] for the limit of
+/// what the `Copy` seal rests on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DurationParseError<'a> {
+    Invalid { orig: &'a [u8] },
+    MissingUnit { orig: &'a [u8] },
+    UnknownUnit { unit: &'a [u8], orig: &'a [u8] },
+}
+
+const D_INVALID: &str = "time: invalid duration ";
+const D_MISSING: &str = "time: missing unit in duration ";
+const D_UNKNOWN: &str = "time: unknown unit ";
+const D_IN_DURATION: &str = " in duration ";
+
+impl DurationParseError<'_> {
+    /// The exact rendered length, computed without allocating.
+    pub(crate) fn rendered_len(&self) -> usize {
+        use pulsus_promql::eval::quote::go_time_quote_bytes_len as qlen;
+        match self {
+            DurationParseError::Invalid { orig } => D_INVALID.len() + qlen(orig),
+            DurationParseError::MissingUnit { orig } => D_MISSING.len() + qlen(orig),
+            DurationParseError::UnknownUnit { unit, orig } => {
+                D_UNKNOWN.len() + qlen(unit) + D_IN_DURATION.len() + qlen(orig)
+            }
+        }
+    }
+
+    /// ONE `String::with_capacity(rendered_len())`, written in place.
+    pub(crate) fn render(&self) -> String {
+        use pulsus_promql::eval::quote::go_time_quote_bytes_into as qinto;
+        let want = self.rendered_len();
+        let mut out = String::with_capacity(want);
+        match self {
+            DurationParseError::Invalid { orig } => {
+                out.push_str(D_INVALID);
+                qinto(&mut out, orig);
+            }
+            DurationParseError::MissingUnit { orig } => {
+                out.push_str(D_MISSING);
+                qinto(&mut out, orig);
+            }
+            DurationParseError::UnknownUnit { unit, orig } => {
+                out.push_str(D_UNKNOWN);
+                qinto(&mut out, unit);
+                out.push_str(D_IN_DURATION);
+                qinto(&mut out, orig);
+            }
+        }
+        debug_assert_eq!(out.len(), want);
+        out
+    }
+}
+
 /// `time.ParseDuration` with Go's exact error texts (time-quote form).
-pub(crate) fn go_parse_duration(orig: &str) -> Result<i64, String> {
-    use pulsus_promql::eval::quote::go_time_quote;
-    let invalid = || format!("time: invalid duration {}", go_time_quote(orig));
-    let mut s = orig.as_bytes();
+///
+/// Issue #294: the argument is RAW BYTES. Go's `ParseDuration` takes a
+/// `string` — which may hold anything — and its `quote` escapes an
+/// invalid byte alone as `\xNN`; repairing the input to U+FFFD first
+/// both copied the whole argument and produced `\xef\xbf\xbd` where
+/// the reference produces `\xff`.
+pub(crate) fn go_parse_duration(orig: &[u8]) -> Result<i64, DurationParseError<'_>> {
+    let invalid = || DurationParseError::Invalid { orig };
+    let mut s = orig;
     let mut d: u64 = 0;
     let mut neg = false;
     if let Some(&c) = s.first()
@@ -1941,10 +2198,7 @@ pub(crate) fn go_parse_duration(orig: &str) -> Result<i64, String> {
             i += 1;
         }
         if i == 0 {
-            return Err(format!(
-                "time: missing unit in duration {}",
-                go_time_quote(orig)
-            ));
+            return Err(DurationParseError::MissingUnit { orig });
         }
         let u = &s[..i];
         s = &s[i..];
@@ -1957,14 +2211,7 @@ pub(crate) fn go_parse_duration(orig: &str) -> Result<i64, String> {
             b"s" => 1_000_000_000,
             b"m" => 60_000_000_000,
             b"h" => 3_600_000_000_000,
-            _ => {
-                let u_str = String::from_utf8_lossy(u).into_owned();
-                return Err(format!(
-                    "time: unknown unit {} in duration {}",
-                    go_time_quote(&u_str),
-                    go_time_quote(orig)
-                ));
-            }
+            _ => return Err(DurationParseError::UnknownUnit { unit: u, orig }),
         };
         if v > (1 << 63) / unit {
             return Err(invalid());
@@ -1992,51 +2239,105 @@ pub(crate) fn go_parse_duration(orig: &str) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lossy_repaired, lossy_repaired_len};
+    use super::{lossy_go, lossy_go_len};
 
-    /// Round 6: the single-allocation repair must be byte-identical to
-    /// `String::from_utf8_lossy` (std's maximal-subpart substitution
-    /// granularity — NOT the Go per-byte rule `go_json_sanitize`
-    /// implements for fromJson), and `lossy_repaired_len` must be its
-    /// exact length, across the awkward shapes: truncated tails,
-    /// invalid continuations, overlong encodings, interleaved runs.
+    /// Issue #455 — the repair mints **one U+FFFD per invalid BYTE**,
+    /// which is Go's granularity, and NOT one per maximal invalid
+    /// subsequence, which is `String::from_utf8_lossy`'s.
+    ///
+    /// The table carries both counts on purpose. Rows where they DIFFER
+    /// (truncated multi-byte sequences) fail if the `error_len()` advance
+    /// is restored; rows where they AGREE (lone continuation bytes,
+    /// overlongs, invalid leads followed by a non-continuation) fail if
+    /// the walk stops advancing at all. A table of only one kind would
+    /// pass against the other rule.
+    ///
+    /// Counts are CODEPOINTS, never a message byte length and never an
+    /// allocation count: those are properties of how the code is spelled,
+    /// and pinning them here is how this file acquired a test that
+    /// pinned the wrong rule in the first place.
     #[test]
-    fn lossy_repaired_matches_std_from_utf8_lossy_byte_for_byte() {
-        let cases: &[&[u8]] = &[
-            b"",
-            b"plain ascii",
-            "caf\u{e9} \u{1F600}".as_bytes(),
-            &[0xFF],
-            &[0xFF; 7],
-            b"a\xFFb\xFFc",
-            b"\xC2",                   // truncated 2-byte tail
-            b"\xE0\xA0",               // truncated 3-byte tail
-            b"\xF0\x9F\x92",           // truncated 4-byte tail
-            b"a\xF0\x28b",             // invalid continuation mid-stream
-            b"\xC0\xAF",               // overlong encoding (2-byte)
-            b"\xE0\x80\x80",           // overlong encoding (3-byte)
-            b"\xF0\x80\x80\x80",       // overlong encoding (4-byte)
-            b"\xF4\x90\x80\x80",       // above U+10FFFF (first out of range)
-            b"\xF5\x80\x80\x80",       // above U+10FFFF (lead byte 0xF5)
-            b"\xED\xA0\x80",           // surrogate range
-            b"x\xF0\x9F\x92\x96y\xFF", // valid 4-byte + trailing invalid
+    fn lossy_go_replaces_one_invalid_byte_with_one_replacement_char() {
+        // (input, U+FFFD this rule mints, U+FFFD std's rule would mint)
+        let cases: &[(&[u8], usize, usize)] = &[
+            // -- the two rules DISAGREE: truncated multi-byte sequences --
+            (b"\xE0\xA0", 2, 1),     // AC-1 case 1 (Q2/Q3's payload)
+            (b"12\xE0\xA0", 2, 1),   // AC-1's shape inside Q1/Q4's `bytes` argument
+            (b"\xF0\x9F\x98", 3, 1), // AC-1 case 3
+            (b"\xC2", 1, 1),         // truncated 2-byte tail: one byte either way
+            (b"\xF0\x9F\x92", 3, 1), // truncated 4-byte tail
+            // -- the two rules AGREE ------------------------------------
+            (b"\xFF\xFF", 2, 2), // AC-1 case 2 (Q8's payload)
+            (b"", 0, 0),
+            (b"plain ascii", 0, 0),
+            ("caf\u{e9} \u{1F600}".as_bytes(), 0, 0),
+            (&[0xFF], 1, 1),
+            (b"a\xFFb\xFFc", 2, 2),
+            (b"a\xF0\x28b", 1, 1),       // invalid lead, non-continuation next
+            (b"\xC0\xAF", 2, 2),         // overlong (2-byte)
+            (b"\xE0\x80\x80", 3, 3),     // overlong (3-byte)
+            (b"\xF0\x80\x80\x80", 4, 4), // overlong (4-byte)
+            (b"\xF4\x90\x80\x80", 4, 4), // above U+10FFFF
+            (b"\xF5\x80\x80\x80", 4, 4), // above U+10FFFF (lead byte 0xF5)
+            (b"\xED\xA0\x80", 3, 3),     // surrogate range
+            (b"x\xF0\x9F\x92\x96y\xFF", 1, 1), // valid 4-byte + trailing invalid
         ];
-        for v in cases {
-            let expected = String::from_utf8_lossy(v);
-            let need = lossy_repaired_len(v);
-            assert_eq!(need, expected.len(), "{v:X?}");
-            assert_eq!(lossy_repaired(v, need), expected.as_ref(), "{v:X?}");
+        let mut disagreeing = 0usize;
+        let mut agreeing = 0usize;
+        for (v, go_count, std_count) in cases {
+            let need = lossy_go_len(v);
+            let repaired = lossy_go(v, need);
+            assert_eq!(
+                repaired.len(),
+                need,
+                "the length scan and the walk must agree: {v:X?}"
+            );
+            assert_eq!(
+                repaired.chars().filter(|c| *c == '\u{FFFD}').count(),
+                *go_count,
+                "one U+FFFD per invalid BYTE (Go's `utf8.DecodeRune` advance): {v:X?} -> {repaired:?}"
+            );
+            if go_count == std_count {
+                agreeing += 1;
+            } else {
+                disagreeing += 1;
+            }
         }
-        // Every lone continuation byte, bare and mid-stream: std
-        // distinguishes continuation bytes from lead bytes when it
-        // picks the maximal-subpart boundary, so a byte-equality claim
-        // must cover the whole 0x80..=0xBF range, not one exemplar.
+        assert!(
+            disagreeing >= 3 && agreeing >= 3,
+            "the table must contain rows of BOTH kinds or it passes against either rule \
+             (disagreeing={disagreeing}, agreeing={agreeing})"
+        );
+
+        // Valid content around the replacements survives byte-for-byte —
+        // a rule that swallowed it would still satisfy the counts above.
+        assert_eq!(lossy_go(b"\xE0\xA0", 6), "\u{FFFD}\u{FFFD}");
+        assert_eq!(lossy_go(b"\xFF\xFF", 6), "\u{FFFD}\u{FFFD}");
+        assert_eq!(lossy_go(b"\xF0\x9F\x98", 9), "\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(lossy_go(b"a\xF0\x28b", 6), "a\u{FFFD}(b");
+        assert_eq!(
+            lossy_go(b"12\xE0\xA0", 8),
+            "12\u{FFFD}\u{FFFD}",
+            "the digits `bytes` strips before the unit are untouched"
+        );
+
+        // Every lone continuation byte, bare and mid-stream: one per
+        // byte, so a walk that resynchronised on a run would fail here.
         for b in 0x80u8..=0xBF {
-            for v in [&[b][..], &[b'a', b, b'z'][..], &[b, b][..]] {
-                let expected = String::from_utf8_lossy(v);
-                let need = lossy_repaired_len(v);
-                assert_eq!(need, expected.len(), "{v:X?}");
-                assert_eq!(lossy_repaired(v, need), expected.as_ref(), "{v:X?}");
+            for (v, want) in [
+                (&[b][..], 1usize),
+                (&[b'a', b, b'z'][..], 1),
+                (&[b, b][..], 2),
+                (&[b, b, b][..], 3),
+            ] {
+                let need = lossy_go_len(v);
+                let repaired = lossy_go(v, need);
+                assert_eq!(repaired.len(), need, "{v:X?}");
+                assert_eq!(
+                    repaired.chars().filter(|c| *c == '\u{FFFD}').count(),
+                    want,
+                    "{v:X?} -> {repaired:?}"
+                );
             }
         }
     }

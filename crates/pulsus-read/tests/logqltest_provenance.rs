@@ -1975,7 +1975,20 @@ fn check_f_quoted_template_corpus_counts_match_the_corpus() {
 /// rows are all `captured`: its `eval` controls and its `eval_fail` rows
 /// were each measured on `pulsus-c400-loki` (the pinned digest) at the
 /// query text committed in the file, on the date its header records.
-const CAPTURED: usize = 1_449;
+///
+/// Issue #388 added `b25_pattern_expr_reject.test` and
+/// `b26_json_expr.test`, whose rows all sit under their files'
+/// `captured` default: every status and every label value was measured
+/// on `pulsus-c388-loki` (the same pinned digest) at the query text
+/// committed in each file. The files are separate for the reason their
+/// headers give — a pattern rejection is raised at `ParseExpr` and is
+/// window-independent, a json rejection at `Stage()` and is not; the
+/// json file's capture depended on the window ending at `now`, the
+/// pattern file's did not.
+/// Issue #294 added `t6_errors_edges.test`'s raw-byte `duration` /
+/// `duration_seconds` failure rows, captured 2026-08-26 on the same
+/// pinned digest under that file's `captured` default.
+const CAPTURED: usize = 1_513;
 /// Issue #343 added `b19_offset.test`: hand-derived from the semantics
 /// measured on that issue, over a fixture authored here rather than taken
 /// from the container, so they are `derived` and not `captured`. Its
@@ -1996,9 +2009,10 @@ const DERIVED: usize = 31;
 const DIVERGENCE: usize = 30;
 const PORTED: usize = 30;
 /// Issue #249 grew this by `b25_structured_metadata.test`'s rows, issue
-/// #277 by `b21_variant_series_cap.test`'s, and issue #400's second
-/// stage by `b25_re2_reject_parity.test`'s.
-const TOTAL: usize = 1_540;
+/// #277 by `b21_variant_series_cap.test`'s, issue #400's second stage by
+/// `b25_re2_reject_parity.test`'s, and issue #388 by the rows of
+/// `b25_pattern_expr_reject.test` and `b26_json_expr.test`.
+const TOTAL: usize = 1_604;
 // corpus-counts: end (provenance-corpus-constants)
 
 // ---------------------------------------------------------------------

@@ -38,7 +38,8 @@
 //! a hand-maintained subset (nor the tautological `registered ==
 //! executed`, whose two sides one loop populated): EVERY shape now
 //! carries a declared [`ShapeClass`] — `OrderingRequired` /
-//! `DominanceOnly(reason)` / `ScalarError` / `HarnessBlind(reason)` —
+//! `DominanceOnly(reason)` / `ScalarErrorOrdering` / `ScalarError` /
+//! `DeclaredException(reason)` —
 //! at its construction site.
 //! Omitting a class is a missing-field COMPILE error; a registry
 //! function absent from the [`Func`] partition fails the runtime
@@ -56,16 +57,85 @@
 //! FAILS (it never reached its leg), and a shape that reaches the leg
 //! while declared exempt FAILS (its declaration is stale).
 //!
-//! **Round 8 — the declared exception.** Exactly two shapes,
-//! `regexReplaceAll/invalid-pattern` and
-//! `regexReplaceAllLiteral/invalid-pattern`, are declared
-//! [`ShapeClass::HarnessBlind`]: their branch CAN cross the ordering
-//! trigger, but it allocates and then returns `Err`, and the ordering
-//! leg re-runs only shapes returning a retainable `Ok` — so no probe
-//! size reaches it. That is a limit of this instrument, not of the
-//! branch, so it gets its own state instead of a `DominanceOnly`
-//! reason that would assert something false. Charge ordering on
-//! allocate-then-error branches is filed as #294.
+//! **Issue #294 — the ordering leg admits on ALLOCATION, not on a
+//! retainable `Ok`.** Until #294 the leg re-ran a shape only when it
+//! returned a retainable `Ok`, so **every branch that allocated and
+//! then returned a scalar or an error was outside the gate at any
+//! size** — charge-after-allocate there was undetectable however large
+//! the copy. The allocation happened either way, and that is what the
+//! leg measures, so admission is now `alloc >= 4 * SLACK` alone.
+//! Widening it on `df4bdbd` turned **31 shapes across 22 registry
+//! functions** red, all one mechanism: caller bytes converted or copied
+//! inside a template function with no charge covering the copy. Those
+//! 31 are sealed by name in [`WERE_RED_ON_DF4BDBD`] — a count with no
+//! membership list drifts silently.
+//!
+//! The widening splits the old `ScalarError` class in two, because it
+//! used to mean "no retainable output" and now has to distinguish
+//! "below the trigger" from "above it":
+//! [`ShapeClass::ScalarErrorOrdering`] is a scalar/error shape that
+//! MUST reach the leg, [`ShapeClass::ScalarError`] one that must not.
+//!
+//! **Round 8's declared exception, corrected (#294).** The two
+//! `invalid-pattern` shapes were declared a blindness-of-this-harness
+//! exception, on the ground that their branch "allocates and then
+//! returns `Err`". Both halves of that are false on `df4bdbd`: the
+//! branch returns `Ok(string)` with 4,198,096 B charged, and the
+//! widened leg admits error results anyway. The state is renamed
+//! [`ShapeClass::DeclaredException`] — the NAME was half the claim —
+//! and its reason rewritten to the measured one (see
+//! [`DE_INVALID_PATTERN`]). The superseded reason is not deleted but
+//! restated there, because the trail of a false claim being caught is
+//! itself the record.
+//!
+//! **Issue #294 review round 1 — a probe can reach the SIZE and still
+//! miss the BRANCH.** `bytes/error-unparseable` passes a 1 MiB argument
+//! and allocates 136 B, because a leading `x` puts
+//! `humanize.ParseBytes` on its cheapest arm. The criterion was
+//! satisfiable through a weak representative while the guarded path
+//! allocated 3,145,761 B under a 65,536-byte remainder. Two shapes were
+//! added to drive the other two arms.
+//!
+//! The rest of the shape set was then swept the same way, and the sweep
+//! is worth recording because it is not the same question as "is the
+//! probe short":
+//!
+//! - **Parameter positions never probed at size.** Measured over every
+//!   registry function: `Replace`/`replace`'s REPLACEMENT (added here —
+//!   4,194,308 allocated against 4,194,308 charged, 96 B under a
+//!   near-exhausted budget); `Trim*`/`trimAll`'s cutset (4 B — the
+//!   cutset is scanned, never copied); `contains`/`hasPrefix`/
+//!   `hasSuffix`'s needle (0 B, bool result); `round`'s `Any` and
+//!   `toDate`'s value (0 B — both borrow); and the regex PATTERN of
+//!   `regexReplaceAll`/`regexReplaceAllLiteral`/`count`, which is the
+//!   declared exception below and must not be probed larger (#291).
+//! - **Branches an at-size probe does not reach.** One remains, and it
+//!   is NOT covered by anything here: `go_parse_int_base0` /
+//!   `go_parse_float` strip underscores into a fresh `String`, and no
+//!   shape passes an underscore-bearing argument. Measured directly at
+//!   a 1,048,577-byte argument of `1_1_…1`: **2,097,144 B allocated,
+//!   0 charged, under a 65,536-byte remainder**, for both `int` and
+//!   `float64`, result `Ok(int)` / `Ok(float64)`. It is a TRANSIENT —
+//!   scalar result, freed by return, ≤ ~2x the input — which is the
+//!   class the ledger declares uncharged.
+//!
+//!   Closing it takes one of two changes, and neither belongs to #294.
+//!   **Either** give the two casts a charging form at their call
+//!   sites: every production caller lives in
+//!   `src/logql/template/funcs.rs` — the arithmetic and coercion
+//!   registry closures, which hold a `FuncCtx`, plus `cast_to_int`,
+//!   itself called only from one of them — so the budget can be
+//!   threaded to all of them. **Or** reimplement the
+//!   underscore-skipping parse so it never copies, which means
+//!   rewriting a `strconv.ParseInt(s, 0, 0)` port whose behaviour the
+//!   corpus pins and whose oracle would have to be re-established.
+//!   That second half is what makes this a separate piece of work.
+//!
+//!   **Adding the shape would ship a red gate, so it is not added:
+//!   this paragraph is a stated limit of the instrument, not a check.**
+//!   Per the #294 ruling it is RECORDED, not scheduled — no issue is
+//!   filed, and the measurement lives here so the next reader finds it
+//!   with its reproduction rather than re-deriving it.
 //!
 //! This is the gate that catches the fifth amplification class the
 //! round-1 census could not judge: an existing site labelled
@@ -75,6 +145,19 @@
 //! Single `#[test]`, own binary: the counting allocator is
 //! process-global (the alloc-gate flake rule: byte ceilings, never
 //! exact counts).
+//!
+//! **One exception, and the condition it comes with** (issue #294). The
+//! AC-9b block near the end of this file DOES assert an exact byte
+//! count, because the property it holds is an EQUALITY —
+//! `charged == allocated == err.len()` — and a ceiling cannot express
+//! one. It is admissible only because it RE-SAMPLES: the global counter
+//! was measured to add spurious bytes about once in 4,000 measurements,
+//! so the equality is required to hold on at least one of three samples
+//! instead of on a single one. Every sample still demands the exact
+//! equality, so no persistent excess is forgiven at any magnitude —
+//! this is a persistence test, not a tolerance. **An exact count
+//! asserted from ONE sample is still the flake the rule above is
+//! about**; see that block's own comment for the measurements.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
@@ -137,6 +220,21 @@ fn big_str() -> Value<'static> {
 
 fn s(text: &str) -> Value<'static> {
     Value::Str(Cow::Owned(text.as_bytes().to_vec()))
+}
+
+/// A 1 MiB run of ASCII digits — a VALID-UTF-8 argument that parses as a
+/// number and then overflows.
+fn big_digits() -> Value<'static> {
+    Value::Str(Cow::Owned(vec![b'9'; BIG]))
+}
+
+/// `1` followed by a 1 MiB unit suffix — drives `humanize.ParseBytes`'s
+/// `unhandled size name:` arm, whose text embeds the whole
+/// (Unicode-lowercased) suffix.
+fn big_unit() -> Value<'static> {
+    let mut v = vec![b'1'];
+    v.extend(std::iter::repeat_n(b'X', BIG));
+    Value::Str(Cow::Owned(v))
 }
 
 /// A 1 MiB invalid-UTF-8 string (alternate `0xFF`).
@@ -343,30 +441,37 @@ enum ShapeClass {
     /// the measured reason. Its PRESENCE in `reached` fails (the
     /// declaration is stale — promote it to `OrderingRequired`).
     DominanceOnly(&'static str),
-    /// Scalar or error result: no retainable bytes exist, so the
-    /// ordering leg does not apply by construction — verified, not
-    /// trusted (a retainable `Ok` from such a shape fails the gate).
+    /// **Issue #294.** Scalar-or-error result whose allocation meets
+    /// the ordering trigger: the shape MUST reach the leg, and must NOT
+    /// return a retainable `Ok` (that would make it `OrderingRequired`
+    /// instead). This is the class the pre-#294 predicate could not
+    /// express — it admitted on `Ok(retainable)`, so these shapes were
+    /// outside the gate at every probe size.
+    ScalarErrorOrdering,
+    /// Scalar or error result BELOW the ordering trigger: the leg does
+    /// not apply — verified, not trusted in either direction (a
+    /// retainable `Ok` from such a shape fails the gate, and so does
+    /// reaching the leg, which means the declaration is stale and the
+    /// shape is `ScalarErrorOrdering`).
     ScalarError,
-    /// **Declared exception (round 8).** The branch CAN cross the
-    /// ordering trigger, and THIS HARNESS cannot observe it — so
-    /// neither `OrderingRequired` (the shape can never reach the leg)
-    /// nor `DominanceOnly` (whose reason asserts a branch limit that
-    /// does not exist here) is a true statement about it.
+    /// **Declared exception (round 8, reason corrected by #294).** A
+    /// shape probed below the ordering trigger for a reason that is
+    /// neither a branch limit nor this harness's blindness.
     ///
     /// Deliberately a separate state rather than a carefully-worded
     /// `DominanceOnly`: the two are different KINDS of claim — one is
-    /// about the branch, this one is about the instrument — and the
+    /// about the branch, this one is about the probe — and the
     /// reason-header rule below binds `DominanceOnly` reasons to branch
-    /// relations. The reason string must name the tracking issue for
-    /// the harness gap.
+    /// relations. The reason string must name its tracking issue.
     ///
-    /// Excluded from `required` (the leg is unreachable for it), but
-    /// NOT trusted in the other direction: if such a shape ever DOES
-    /// reach the leg, the harness was not blind and the declaration
-    /// fails as stale.
-    HarnessBlind(&'static str),
+    /// Excluded from `required`, but NOT trusted in the other
+    /// direction: if such a shape DOES reach the leg, the declaration
+    /// is stale and fails, exactly like a stale `DominanceOnly`.
+    DeclaredException(&'static str),
 }
-use ShapeClass::{DominanceOnly, HarnessBlind, OrderingRequired, ScalarError};
+use ShapeClass::{
+    DeclaredException, DominanceOnly, OrderingRequired, ScalarError, ScalarErrorOrdering,
+};
 
 /// Whether [`invalidate_utf8`] derives a `+invalid-utf8` variant from
 /// a shape (it does iff some `Str` argument is ≥ 4 KiB) and the
@@ -413,9 +518,9 @@ struct FnSpec {
 /// (`align*/truncate` and `trunc/negative-tail` were fitted to
 /// 200,000-byte probes and hid exactly that).
 ///
-/// A branch that can cross the trigger but which this harness cannot
-/// observe has NO such reason to state and does not belong here: it is
-/// [`ShapeClass::HarnessBlind`], whose reasons live below.
+/// A shape held below the trigger by its PROBE rather than by a branch
+/// limit has no such reason to state and does not belong here: it is
+/// [`ShapeClass::DeclaredException`], whose reasons live below.
 const R_EMPTY: &str = "the shape is DEFINITIONALLY the all-zero-length-inputs probe: its \
      output is empty/constant-size at the only arguments that make it \
      this shape, far below the 256 KiB ordering trigger";
@@ -426,37 +531,95 @@ const R_SMALL: &str = "this shape's output is pinned EMPTY by its defining argum
      by the function's other shapes";
 const R_CONST: &str = "constant-size decimal rendering of a timestamp, \
      orders of magnitude below the ordering trigger";
-/// [`ShapeClass::HarnessBlind`] reasons — the ONLY one, round 8.
+/// [`ShapeClass::DeclaredException`] reasons — the ONLY one.
 ///
-/// `compile_regex`'s invalid-UTF-8 repair arm is NOT branch-limited:
-/// a large enough invalid pattern repairs to well past the 256 KiB
-/// trigger, and only then does the compiled program exceed the 1 MiB
-/// `size_limit`. Its round-7 `DominanceOnly` reason asserted the
-/// opposite and was wrong: what stops the coverage is the instrument,
-/// not the branch. The ordering leg re-runs only shapes that returned a
-/// RETAINABLE `Ok`, so a branch that allocates and then errors cannot
-/// enter it at ANY probe size — enlarging this shape's pattern would
-/// move it from "too small to trigger" to "errors before the rerun",
-/// never into the leg.
+/// **Round 8's reason was false, and #294 measured it.** It said the
+/// branch "allocates and then returns `Err`, and the ordering leg
+/// re-runs only shapes returning a retainable `Ok`". Both halves are
+/// wrong on `df4bdbd`: #291's fix made `compile_charged_regex` charge
+/// every conversion and the compile estimate BEFORE allocating, so the
+/// shape returns `Ok(string)` with 4,198,096 B charged — and since #294
+/// the leg admits on allocation, so an error result would no longer
+/// exclude it either.
+///
+/// What actually keeps this shape out of the leg is its 128-byte probe:
+/// 213,501 B allocated, just under the 262,144-byte trigger. Probing at
+/// size is NOT the fix, because at a 2 KiB invalid pattern the leg
+/// allocates 250,200 B under a 64 KiB remainder —
+/// `pulsus_re2::regex_compile_transient_bound_with` PARSES the pattern
+/// to compute the estimate, and that parse is the argument to the very
+/// `ctx.charge(...)` meant to cover it. That is a defect in the bound
+/// #291 shipped, reopened on **#291** with the measurement; choosing a
+/// probe size that stays green would be fitting the probe to dodge it.
 ///
 /// The `invalid-repl` / `+invalid-utf8` haystack shapes do NOT cover
 /// this site: they charge through `lossy_charged`, a different call
-/// site from the pattern conversion's `lossy_repaired*`.
+/// site from the pattern conversion's `lossy_go*`.
+const DE_INVALID_PATTERN: &str = "measured on df4bdbd: this shape returns Ok(string) with 4,198,096 B \
+     charged — `compile_charged_regex` charges every conversion and the \
+     compile estimate before allocating, so the round-8 claim that the \
+     branch allocates and then returns Err is FALSE, and since #294 the \
+     ordering leg admits on ALLOCATION so an Err result would not \
+     exclude it either. What excludes it is the 128-byte probe: 213,501 B \
+     allocated, just under the 262,144-byte trigger. Probing at size is \
+     NOT a fix here — at a 2 KiB invalid pattern the leg allocates \
+     250,200 B under a 64 KiB remainder, because \
+     `pulsus_re2::regex_compile_transient_bound_with` PARSES the pattern \
+     to compute the estimate and that parse is the argument to the very \
+     `ctx.charge(...)` meant to cover it (~61x the repaired length; \
+     59,769,176 B at a 512 KiB pattern). That is one compile whose own \
+     estimator is unaccounted, reopened at #291. Choosing a probe size \
+     that stays green would be fitting the probe to dodge it";
+
+/// The 31 shapes that were RED under the widened predicate on
+/// `df4bdbd` (issue #294) — the membership seal for the count.
 ///
-/// Ordering coverage for allocate-then-error branches needs a
-/// different instrument (bounded transient, not charge-before-allocate
-/// on retained bytes) and is filed as **#294**, which carries the
-/// acceptance criteria; **#291** (regex compilation allocating ~630x
-/// the pattern) is the worst case already on file. This is a declared
-/// exception, not a covered shape.
-const HB_INVALID_PATTERN: &str = "the invalid-PATTERN repair CAN cross the 256 KiB ordering trigger \
-     (a large invalid pattern repairs to ~2x its length before the compiled \
-     program hits the 1 MiB size_limit), so no branch limit exempts it — but \
-     the branch allocates and then returns Err, and the ordering leg re-runs \
-     only shapes returning a retainable Ok, so this harness cannot observe it \
-     at ANY probe size; allocate-then-error charge ordering is filed as #294 \
-     (#291 is the worst case on file). The invalid-repl shapes cover a \
-     DIFFERENT charge site (lossy_charged), not this one";
+/// A count with no membership list drifts silently: "31 shapes" can
+/// stay true while the set behind it changes. Every name here must be a
+/// shape this file CONSTRUCTS (a typo, a rename or a dropped shape
+/// fails below), and the whole gate must be green, so none of them may
+/// appear in `failures`.
+///
+/// All 31 are one mechanism — caller bytes converted or copied inside a
+/// template function with no charge covering the copy — at nine call
+/// sites that
+/// `git grep -n 'lossy(\|bytes_of(&a\[[0-9]\])\.to_vec()' \
+/// crates/pulsus-read/src/logql/template/funcs.rs`
+/// enumerated on `df4bdbd`. Deleting `fn lossy` is what proves that
+/// list complete: a missed site no longer compiles.
+const WERE_RED_ON_DF4BDBD: [&str; 31] = [
+    "add/happy+invalid-utf8",
+    "addf/happy+invalid-utf8",
+    "bytes/error-unparseable",
+    "bytes/error-unparseable+invalid-utf8",
+    "ceil/happy+invalid-utf8",
+    "div/happy+invalid-utf8",
+    "divf/happy+invalid-utf8",
+    "duration/error-unparseable",
+    "duration/error-unparseable+invalid-utf8",
+    "duration_seconds/error-unparseable",
+    "duration_seconds/error-unparseable+invalid-utf8",
+    "float64/happy+invalid-utf8",
+    "floor/happy+invalid-utf8",
+    "int/happy+invalid-utf8",
+    "max/happy+invalid-utf8",
+    "maxf/happy+invalid-utf8",
+    "min/happy+invalid-utf8",
+    "minf/happy+invalid-utf8",
+    "mod/happy+invalid-utf8",
+    "mul/happy+invalid-utf8",
+    "mulf/happy+invalid-utf8",
+    "sub/happy+invalid-utf8",
+    "subf/happy+invalid-utf8",
+    "toDateInZone/big-layout",
+    "toDateInZone/big-layout+invalid-utf8",
+    "toDateInZone/big-value",
+    "toDateInZone/big-value+invalid-utf8",
+    "toDateInZone/big-zone",
+    "toDateInZone/big-zone+invalid-utf8",
+    "unixToTime/error-unparseable",
+    "unixToTime/error-unparseable+invalid-utf8",
+];
 
 /// The partition's DOMAIN: one variant per registry function.
 ///
@@ -814,6 +977,18 @@ impl Func {
                         decl: or_d,
                         args: vec![big_str(), s(""), s("-"), Value::int(-1)],
                     },
+                    // Issue #294 review round 1: the REPLACEMENT is the
+                    // multiplying position and no shape passed a big one
+                    // (a small haystack keeps the product inside the
+                    // budget). `go_replace` charges `len + n*len(new)`
+                    // before `Vec::with_capacity`: 4,194,308 allocated
+                    // against 4,194,308 charged, 96 B under a
+                    // near-exhausted budget.
+                    ExtraShape {
+                        name: "big-new",
+                        decl: or_d,
+                        args: vec![s("xxxx"), s("x"), big_str(), Value::int(-1)],
+                    },
                 ],
             },
             Func::ReplaceSprig => FnSpec {
@@ -834,6 +1009,12 @@ impl Func {
                         name: "empty-needle",
                         decl: or_d,
                         args: vec![s(""), s("-"), big_str()],
+                    },
+                    // The sprig argument order of `Replace/big-new`.
+                    ExtraShape {
+                        name: "big-new",
+                        decl: or_d,
+                        args: vec![s("x"), big_str(), s("xxxx")],
                     },
                 ],
             },
@@ -863,14 +1044,13 @@ impl Func {
                     },
                     // 128-byte invalid pattern: exercises the pattern
                     // conversion under dominance (and is too small to
-                    // derive a +invalid-utf8 variant). Round 8: the
-                    // ONLY `HarnessBlind` shapes — this branch can
-                    // cross the ordering trigger, but it errors on the
-                    // way and the leg admits retainable-Ok shapes only,
-                    // so no probe size reaches it. See #294.
+                    // derive a +invalid-utf8 variant). The ONLY
+                    // `DeclaredException` shapes — held below the
+                    // trigger by the PROBE, for the measured reason in
+                    // `DE_INVALID_PATTERN` (#291).
                     ExtraShape {
                         name: "invalid-pattern",
-                        decl: d(HarnessBlind(HB_INVALID_PATTERN), NotDerived),
+                        decl: d(DeclaredException(DE_INVALID_PATTERN), NotDerived),
                         args: vec![invalid_pattern(), s("xxxx"), s("YY")],
                     },
                     // Invalid REPLACEMENT bytes: the lossy conversion
@@ -894,8 +1074,11 @@ impl Func {
                     },
                 ],
             },
+            // The invalid-byte variant charges its repair through
+            // `lossy_charged` and allocates 2.1 MB doing it — an
+            // `Ok(int)`, so the pre-#294 leg never saw it.
             Func::Count => FnSpec {
-                happy: d(ScalarError, Derived(ScalarError)),
+                happy: d(ScalarError, Derived(ScalarErrorOrdering)),
                 empty: d(ScalarError, NotDerived),
                 extra: vec![
                     ExtraShape {
@@ -913,7 +1096,7 @@ impl Func {
             // The derived variant's first corrupted `%` escape errors —
             // the variant changes class.
             Func::Urldecode => FnSpec {
-                happy: d(OrderingRequired, Derived(ScalarError)),
+                happy: d(OrderingRequired, Derived(ScalarErrorOrdering)),
                 empty: empty_do,
                 extra: vec![ExtraShape {
                     name: "error-bad-escape",
@@ -925,12 +1108,59 @@ impl Func {
                     },
                 }],
             },
-            Func::BytesFn | Func::Duration | Func::DurationSeconds | Func::UnixToTime => FnSpec {
+            // Issue #294: `bytes` keeps its U+FFFD repair (the ledger's
+            // `template-output-budget` entry says why) but pays for it
+            // — `lossy_charged` borrows valid UTF-8 (136 B allocated,
+            // below the trigger) and charges the exact repaired length
+            // before allocating it on the invalid variant, which is
+            // what puts that variant into the ordering leg.
+            Func::BytesFn => FnSpec {
+                happy: d(ScalarError, NotDerived),
+                empty: d(ScalarError, NotDerived),
+                extra: vec![
+                    ExtraShape {
+                        name: "error-unparseable",
+                        decl: d(ScalarError, Derived(ScalarErrorOrdering)),
+                        args: vec![big_str()],
+                    },
+                    // Issue #294 review round 1. `error-unparseable`
+                    // reaches this function at 1 MiB and still allocates
+                    // only 136 B, because a leading `x` puts it on
+                    // `humanize.ParseBytes`'s CHEAPEST arm — an empty
+                    // numeric prefix, quoted, and out. The criterion
+                    // passed on a weak representative while the guarded
+                    // path was broken. These two shapes drive the other
+                    // two arms, each of which embeds the whole argument
+                    // in a RETAINED `__error_details__`: measured
+                    // 3,145,761 B and 3,145,807 B allocated against 0
+                    // charged before the fix.
+                    ExtraShape {
+                        name: "error-too-large",
+                        decl: d(ScalarErrorOrdering, Derived(ScalarErrorOrdering)),
+                        args: vec![big_digits()],
+                    },
+                    ExtraShape {
+                        name: "error-unknown-unit",
+                        decl: d(ScalarErrorOrdering, Derived(ScalarErrorOrdering)),
+                        args: vec![big_unit()],
+                    },
+                ],
+            },
+            // Issue #294: the three functions whose ERROR TEXT embeds
+            // the caller's argument. Before the fix each copied its
+            // argument before parsing (3.1 MB / 12.6 MB / 24.6 MB at a
+            // 1 MiB argument, nothing charged) and the result was an
+            // `Err`, so the pre-widening leg could not see any of it.
+            // Now the exact text length is charged first, so under a
+            // near-exhausted budget the call breaches at the charge and
+            // returns before rendering. The exactness of that charge is
+            // the `charged == allocated == err.len()` block at the end.
+            Func::Duration | Func::DurationSeconds | Func::UnixToTime => FnSpec {
                 happy: d(ScalarError, NotDerived),
                 empty: d(ScalarError, NotDerived),
                 extra: vec![ExtraShape {
                     name: "error-unparseable",
-                    decl: d(ScalarError, Derived(ScalarError)),
+                    decl: d(ScalarErrorOrdering, Derived(ScalarErrorOrdering)),
                     args: vec![big_str()],
                 }],
             },
@@ -940,13 +1170,52 @@ impl Func {
                 extra: vec![],
             },
             // Scalar (time/float) results from small fixed arguments.
-            Func::ToDateInZone | Func::ToDate | Func::Now | Func::TimestampFn | Func::Round => {
-                FnSpec {
-                    happy: d(ScalarError, NotDerived),
-                    empty: d(ScalarError, NotDerived),
-                    extra: vec![],
-                }
-            }
+            Func::Now | Func::TimestampFn | Func::Round => FnSpec {
+                happy: d(ScalarError, NotDerived),
+                empty: d(ScalarError, NotDerived),
+                extra: vec![],
+            },
+            // Issue #294: `toDateInZone` copied ALL THREE arguments
+            // (`.to_vec()` on layout and value, a lossy repair of the
+            // zone) while the gate probed it with three tiny literals —
+            // a scalar `Time` result, so the pre-#294 leg could not have
+            // seen it even at size. Each argument gets its own at-size
+            // shape; `parse_in_location` takes byte slices, so nothing
+            // is copied now and all six sit far below the trigger.
+            Func::ToDateInZone => FnSpec {
+                happy: d(ScalarError, NotDerived),
+                empty: d(ScalarError, NotDerived),
+                extra: vec![
+                    ExtraShape {
+                        name: "big-layout",
+                        decl: d(ScalarError, Derived(ScalarError)),
+                        args: vec![big_str(), s("UTC"), s("2024-05-06")],
+                    },
+                    ExtraShape {
+                        name: "big-zone",
+                        decl: d(ScalarError, Derived(ScalarError)),
+                        args: vec![s("2006-01-02"), big_str(), s("2024-05-06")],
+                    },
+                    ExtraShape {
+                        name: "big-value",
+                        decl: d(ScalarError, Derived(ScalarError)),
+                        args: vec![s("2006-01-02"), s("UTC"), big_str()],
+                    },
+                ],
+            },
+            // The CONTROL for `toDateInZone`: `toDate` reaches the same
+            // layout parser and allocates 0 at a 1 MiB layout because it
+            // borrows. It is here to record that difference, not because
+            // it is a site.
+            Func::ToDate => FnSpec {
+                happy: d(ScalarError, NotDerived),
+                empty: d(ScalarError, NotDerived),
+                extra: vec![ExtraShape {
+                    name: "big-layout",
+                    decl: d(ScalarError, Derived(ScalarError)),
+                    args: vec![big_str(), s("2024-05-06")],
+                }],
+            },
             // No arguments: both shapes return the 1 MiB line.
             Func::LineFn => FnSpec {
                 happy: d(OrderingRequired, NotDerived),
@@ -1122,7 +1391,7 @@ impl Func {
                     },
                     ExtraShape {
                         name: "invalid-utf8-string",
-                        decl: d(OrderingRequired, Derived(ScalarError)),
+                        decl: d(OrderingRequired, Derived(ScalarErrorOrdering)),
                         args: {
                             let mut j = b"{\"x\":\"".to_vec();
                             j.extend(std::iter::repeat_n(0xFF, BIG / 2));
@@ -1295,13 +1564,17 @@ fn every_registry_function_charge_dominates_its_allocations() {
                 ));
             }
             let retainable_ok = matches!(&result, Ok(v) if is_retainable(v));
-            // `ScalarError` is verified, not trusted: a retainable Ok
-            // from a shape declared scalar/error means the declaration
-            // (and thus its ordering exemption) is wrong.
-            if matches!(class, ScalarError) && retainable_ok {
+            // The two scalar/error classes are verified, not trusted: a
+            // retainable Ok from either means the declaration (and the
+            // reasoning behind it) is wrong.
+            if matches!(class, ScalarError | ScalarErrorOrdering) && retainable_ok {
                 failures.push(format!(
-                    "{full_name}: declared ScalarError but returned a retainable Ok({}) \
+                    "{full_name}: declared {} but returned a retainable Ok({}) \
                      — reclassify as OrderingRequired or DominanceOnly",
+                    match class {
+                        ScalarErrorOrdering => "ScalarErrorOrdering",
+                        _ => "ScalarError",
+                    },
                     match &result {
                         Ok(v) => v.type_name().to_string(),
                         Err(_) => unreachable!("retainable_ok implies Ok"),
@@ -1310,13 +1583,21 @@ fn every_registry_function_charge_dominates_its_allocations() {
             }
             drop(result);
             // --- the ORDERING leg (charge BEFORE allocate) -------------
-            // Rerun retainable shapes that allocated big under a nearly
+            // Rerun EVERY shape that allocated big under a nearly
             // exhausted budget: correct ordering breaches at the charge
             // and returns before the copy, so allocation stays tiny; a
             // charge moved AFTER its allocation leaves the big copy on
             // the counter. (This is what a post-hoc charged-vs-allocated
             // comparison can never see.)
-            if retainable_ok && alloc >= 4 * SLACK {
+            //
+            // **Issue #294 — the one-line widening.** This admission
+            // used to read `retainable_ok && alloc >= 4 * SLACK`. The
+            // `retainable_ok` conjunct put every allocate-then-scalar
+            // and allocate-then-error branch outside the gate at ANY
+            // probe size; the allocation happened either way, and the
+            // allocation is what this leg measures. Removing it turned
+            // 31 shapes red on `df4bdbd` ([`WERE_RED_ON_DF4BDBD`]).
+            if alloc >= 4 * SLACK {
                 reached.insert(full_name);
                 let gate = GateEnv {
                     env: env.clone(),
@@ -1359,40 +1640,46 @@ fn every_registry_function_charge_dominates_its_allocations() {
     // or reclassify it WITH a reason. A shape that reached the leg
     // while declared exempt has a stale declaration — promote it.
     //
-    // Round 8: `HarnessBlind` is excluded from `required` for the
-    // reason it carries — the leg admits retainable-`Ok` shapes only,
-    // so an allocate-then-error branch cannot enter it at any probe
-    // size (#294). It is NOT trusted in the other direction: reaching
-    // the leg disproves the blindness claim and fails, exactly like a
-    // stale `DominanceOnly`.
+    // Issue #294: `required` is now BOTH ordering classes —
+    // `OrderingRequired` (retainable) and `ScalarErrorOrdering`
+    // (scalar/error above the trigger). `DeclaredException` is excluded
+    // for the reason it carries, and NOT trusted in the other
+    // direction: reaching the leg makes the declaration stale and
+    // fails, exactly like a stale `DominanceOnly`.
     let required: std::collections::BTreeSet<String> = declared
         .iter()
-        .filter(|(_, c)| matches!(c, OrderingRequired))
+        .filter(|(_, c)| matches!(c, OrderingRequired | ScalarErrorOrdering))
         .map(|(n, _)| n.clone())
         .collect();
     for missing in required.difference(&reached) {
         failures.push(format!(
             "{missing}: declared OrderingRequired but never reached the ordering leg \
              — the shape errored or shrank upstream; fix the shape or reclassify it \
-             (DominanceOnly with the measured BRANCH limit, or HarnessBlind if the \
-             branch can cross the trigger but this harness cannot observe it)"
+             (DominanceOnly with the measured BRANCH limit, ScalarError if it now \
+             falls below the trigger, or DeclaredException if the PROBE holds it \
+             below one)"
         ));
     }
     for stale in reached.difference(&required) {
         let declared_as = match declared.get(stale.as_str()) {
-            Some(DominanceOnly(reason)) => format!("DominanceOnly (stale reason: {reason})"),
-            Some(ScalarError) => "ScalarError".to_string(),
-            Some(HarnessBlind(reason)) => format!(
-                "HarnessBlind (the declared exception is stale — this harness DID \
-                 observe the branch: {reason})"
+            Some(DominanceOnly(reason)) => {
+                format!("DominanceOnly (stale reason: {reason}) — promote it to OrderingRequired")
+            }
+            Some(ScalarError) => "ScalarError (it now allocates past the ordering \
+                 trigger — promote it to ScalarErrorOrdering)"
+                .to_string(),
+            Some(DeclaredException(reason)) => format!(
+                "DeclaredException (the declaration is stale — the shape DID reach \
+                 the leg: {reason})"
             ),
-            // `required` contains every OrderingRequired declaration,
-            // and `reached` only ever holds declared shapes.
-            Some(OrderingRequired) | None => unreachable!("stale is reached \\ required"),
+            // `required` contains every ordering declaration, and
+            // `reached` only ever holds declared shapes.
+            Some(OrderingRequired | ScalarErrorOrdering) | None => {
+                unreachable!("stale is reached \\ required")
+            }
         };
         failures.push(format!(
-            "{stale}: reached the ordering leg but is declared {declared_as} — promote \
-             it to OrderingRequired"
+            "{stale}: reached the ordering leg but is declared {declared_as}"
         ));
     }
 
@@ -1612,6 +1899,180 @@ fn every_registry_function_charge_dominates_its_allocations() {
              like every other user-pattern compile (issue #291 review finding 1)",
             text.len()
         );
+    }
+
+    // --- issue #294: the membership seal for the 31 -------------------
+    // Every name in `WERE_RED_ON_DF4BDBD` must be a shape this file
+    // constructs. A typo, a rename or a dropped shape fails here rather
+    // than silently shrinking the set the count stands for.
+    {
+        let sealed: std::collections::BTreeSet<&str> =
+            WERE_RED_ON_DF4BDBD.iter().copied().collect();
+        assert_eq!(
+            sealed.len(),
+            WERE_RED_ON_DF4BDBD.len(),
+            "WERE_RED_ON_DF4BDBD has duplicate entries"
+        );
+        let missing: Vec<&str> = sealed
+            .iter()
+            .copied()
+            .filter(|n| !declared.contains_key(*n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "WERE_RED_ON_DF4BDBD names shapes this file does not construct: {missing:?} \
+             — the count and the set it stands for have drifted apart (#294)"
+        );
+        // None of them may be among the failures: the whole point of
+        // the change is that all 31 are green.
+        let joined = failures.join("\n");
+        let still_red: Vec<&str> = sealed
+            .iter()
+            .copied()
+            .filter(|n| {
+                let (func, shape) = n.split_once('/').expect("shape names are fn/shape");
+                joined.contains(&format!("{func} [{shape}]")) || joined.contains(*n)
+            })
+            .collect();
+        assert!(
+            still_red.is_empty(),
+            "shapes #294 fixed are red again: {still_red:?}\n{joined}"
+        );
+    }
+
+    // --- issue #294 AC-9b: the error text is charged EXACTLY ----------
+    // For every shape whose error message embeds the caller's argument,
+    // `charged == allocated == err.len()` — an EQUALITY, not a bound.
+    // It is a relation, not a magnitude: change the message prefix and
+    // both sides move together, so it cannot be satisfied by fitting a
+    // constant.
+    //
+    // The break is observed, not hypothetical: building `render()`'s
+    // halves as temporaries before appending them gives
+    // `alloc=4,194,375 charged=2,097,221` on
+    // `unixToTime/error-unparseable+invalid-utf8`'s smaller sibling.
+    //
+    // **Why the measurement is re-sampled, and why that is not a
+    // weakening** (issue #294 review round 2). This file's own header
+    // states the rule: "the counting allocator is process-global (the
+    // alloc-gate flake rule: byte ceilings, never exact counts)". The
+    // equality below asserts an exact count, and it therefore broke that
+    // rule — nobody noticed until it reddened CI once.
+    //
+    // The two sides are not alike. Note first what the loop actually
+    // does, because it is easy to describe wrongly: ALL THREE values are
+    // recomputed on every sample. Each sample builds a fresh `GateEnv`
+    // and `RenderBudget`, calls the function again, and reads
+    // `err.len()` off the `String` that sample returned; nothing is
+    // carried across samples. What differs is which value is TREATED as
+    // noisy:
+    //
+    //   * `charged` comes from THAT sample's own `RenderBudget` and
+    //     `err.len()` from the `String` it returned. Both are
+    //     deterministic functions of the argument, so they are expected
+    //     to come out IDENTICAL on every sample; the re-sample is not
+    //     there for them. (Nothing here ENFORCES that identity — it is
+    //     a property of the code, and the printed sample list below is
+    //     where a violation of it would show.)
+    //   * `alloc` is a difference of two reads of `BYTES`, a
+    //     PROCESS-GLOBAL cumulative counter. It occasionally counts
+    //     bytes this call did not allocate, and it is the only value
+    //     the re-sample exists for.
+    //
+    // Measured: replaying `unixToTime`'s invalid-UTF-8 measurement 4,000
+    // times in one process gave ONE deviation, `charged` exact and
+    // `alloc` high by a few hundred bytes — about 1 in 4,000
+    // measurements, so about 1 in 670 runs of this gate, which is the
+    // rate at which it was seen to fail. **The excess is a random draw,
+    // not a constant**: separate runs of that replay observed 594 B and
+    // 758 B, and the CI failure that started this was 758 B. What is
+    // stable is the RATE and the fact that only `alloc` moves. The
+    // magnitude is hundreds of bytes against a 4,718,661-byte error
+    // text; the render is a single `String::with_capacity` whose length
+    // a `debug_assert_eq!` already pins, so a capacity shortfall would
+    // grow by megabytes, not by hundreds of bytes.
+    //
+    // So the pass condition is still the EXACT equality — what is
+    // tolerated is INSTRUMENT NOISE, not a range of real behaviour. Up
+    // to three samples are taken and the equality must hold on at least
+    // one. A real defect deviates on EVERY call and by megabytes: the
+    // temporaries break above is `+2,097,154 B` every time, three orders
+    // of magnitude clear of the few-hundred-byte artefact, so it fails
+    // all three samples deterministically. Three artefacts in a row is
+    // about 1 in 6e10.
+    //
+    // `bytes` is deliberately NOT here: since review round 1 it charges
+    // a BOUND (`4*len + 64`) covering both the U+FFFD repair it keeps
+    // and `humanize.ParseBytes`'s three failure texts, because the arm
+    // is chosen by the parse and the exact length is not knowable before
+    // it. Its relation is a bound, not this equality; the two
+    // `bytes/error-*` shapes above are what hold it.
+    {
+        let line = vec![b'L'; 16];
+        let regex_cache: HashMap<String, regex::Regex> = HashMap::new();
+        for (name, arg) in [
+            ("duration", big_str()),
+            ("duration", invalid_big_str()),
+            ("duration_seconds", big_str()),
+            ("duration_seconds", invalid_big_str()),
+            ("unixToTime", big_str()),
+            ("unixToTime", invalid_big_str()),
+        ] {
+            let def = REGISTRY
+                .iter()
+                .find(|d| d.name == name)
+                .expect("registered");
+            let args = vec![arg];
+            let invalid = std::str::from_utf8(match &args[0] {
+                Value::Str(b) => b.as_ref(),
+                _ => unreachable!("the probe passes a Str"),
+            })
+            .is_err();
+            // Up to SAMPLES measurements; the equality must hold on at
+            // least one. Everything is recomputed per sample; see the
+            // comment above the block for why `alloc` is the only value
+            // treated as noisy.
+            const SAMPLES: usize = 3;
+            let mut seen: Vec<(u64, u64, usize)> = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let gate = GateEnv {
+                    env: env.clone(),
+                    budget: RenderBudget::default(),
+                };
+                let ctx = FuncCtx {
+                    print_env: &gate,
+                    line: &line,
+                    ts_ns: 1_700_000_000_000_000_000,
+                    regex_cache: &regex_cache,
+                    budget: &gate.budget,
+                    _marker: std::marker::PhantomData,
+                };
+                let before = BYTES.load(Ordering::Relaxed);
+                let result = (def.call)(&ctx, &args);
+                let alloc = BYTES.load(Ordering::Relaxed).saturating_sub(before);
+                let charged = gate.budget.charged_bytes();
+                let err = result.expect_err("premise: the probe argument must not parse");
+                seen.push((alloc, charged, err.len()));
+                if alloc == err.len() as u64 && charged == err.len() as u64 {
+                    break;
+                }
+            }
+            let held = seen
+                .iter()
+                .any(|&(alloc, charged, len)| alloc == len as u64 && charged == len as u64);
+            assert!(
+                held,
+                "{name}{}: the charge must be the EXACT rendered length and the render \
+                 must be ONE allocation of it (#294 AC-9b), and it did not hold on any \
+                 of {} samples — (allocated, charged, err.len()) = {seen:?}. Every \
+                 sample deviating is a REAL defect, not the instrument: the measured \
+                 artefact rate is ~1 in 4,000 measurements, so three in a row is ~1 in \
+                 6e10, while a charge-after-allocate or a materialised temporary \
+                 deviates on every call by megabytes",
+                if invalid { " (invalid utf-8)" } else { "" },
+                seen.len()
+            );
+        }
     }
 
     assert!(

@@ -704,6 +704,33 @@ jobs:
           PULSUSDB_GROUPING_OTLP_URL: "http://localhost:4318"
         run: cargo test -p pulsus-read --test traces_search_grouping_differential
 
+      # Issue #458: the metrics-FILTER accept surface, oracle half. Replays
+      # every probe in crates/pulsus-read/tests/fixtures/metrics_filter_accept.json
+      # against the SAME digest-pinned oracle and asserts every committed
+      # reference verdict (and every rejecting body) still holds. FAIL-CLOSED:
+      # `require_live_gate` panics if this env block is dropped in this job,
+      # so a missing capture cannot report green (the #320 class). The
+      # hermetic half runs in the `ci` job at no container cost.
+      - name: TraceQL metrics-filter accept surface (oracle leg)
+        env:
+          PULSUSDB_TEMPO_DIFF_URL: "http://localhost:13200"
+        run: cargo test -p pulsus-read --test traces_metrics_filter_accept
+
+      # Issue #458: the metrics-filter VALUE differential, ENFORCED. Pushes
+      # one shared corpus (6 traces x 3 spans, exactly one parentless span
+      # per trace) into both systems and asserts that
+      # `{ nestedSetParent < 0 } | count_over_time()` totals 6 and
+      # `{} | count_over_time()` totals 18 on BOTH sides. This is the only
+      # leg that catches an accept-preserving answer corruption of the root
+      # lowering against the reference itself.
+      - name: TraceQL Tempo differential leg (metrics filter values)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_METRICS_FILTER_DIFF_URL: "http://localhost:13200"
+          PULSUSDB_METRICS_FILTER_OTLP_URL: "http://localhost:4318"
+        run: cargo test -p pulsus-read --test traces_metrics_filter_differential
+
       - name: Stop Tempo differential oracle
         if: always()
         run: docker rm -f pulsus-tempo-diff || true
@@ -848,6 +875,38 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: ci/test-summary.sh run logs_variants_warnings_live -p pulsus-server --test logs_variants_warnings_live
 
+      # Issue #455: the invalid-UTF-8 substitution differential. Spawns
+      # the real `pulsusdb` binary against this job's ClickHouse 26.3 on
+      # 19123 with PULSUS_COMPAT_ENDPOINTS on, pushes the SAME seed to
+      # both stores over /loki/api/v1/push, then compares the
+      # `__error_details__` label and the log line at
+      # /loki/api/v1/query_range against this container — VALUES, not
+      # just HTTP status.
+      #
+      # It asserts both the parity rows (the `bytes` family, where the
+      # reference's own slot already held U+FFFD, is now byte-identical on
+      # the label AND the entry) and the one that stays divergent (the
+      # `%v` family, where the reference serves raw invalid bytes a
+      # `Cow<'a, str>` cannot hold). Its second leg covers the streams
+      # collision: two label sets that become identical after the
+      # substitution, at a window the reference does not split and one it
+      # does, plus a second ordering fixture and a parse rejection.
+      #
+      # MUST STAY ABOVE "Stop LogQL differential oracle" — it needs the
+      # container that step removes. It pushes, so it runs after the
+      # status-only legs above. Both halves are gated: the PulsusDB half
+      # on PULSUS_TEST_CLICKHOUSE, the differential half additionally on
+      # PULSUSDB_LOGQL_DIFF_URL, so the hermetic `ci` job runs the same
+      # binary with both off and skips — while its ledger-shape test calls
+      # the live gate directly, so a lost `env:` block here fails loudly
+      # instead of reporting green (issue #320).
+      - name: LogQL differential leg (invalid-UTF-8 substitution, issue #455)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: ci/test-summary.sh run logs_utf8_substitution_live -p pulsus-server --test logs_utf8_substitution_live
+
       # Issue #392: the identifier rune set — general category `L`, plus
       # `Nd` in non-leading position, which is Go `text/scanner`'s default
       # `isIdentRune` and therefore the reference's rule
@@ -902,6 +961,45 @@ jobs:
         env:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-read --test logql_logfmt_expr_matrix
+
+      # Issue #388: the `| pattern "…"` argument sub-grammar
+      # (pkg/logql/log/pattern/ @ v3.7.4) x every position the stage can
+      # occupy. Put to this same container and compared against the
+      # verdicts AND the reference's own inner error text committed in
+      # the test.
+      #
+      # The window ends at `now` here too, but for this leg that is NOT
+      # load-bearing and the test says so by asserting the opposite
+      # property: a pattern rejection is raised inside ParseExpr
+      # (syntax/ast.go:730-741), so it is 400 in EVERY window, and
+      # `live_the_pattern_rule_is_window_independent` re-measures every
+      # point over a 24 h-stale window with the json and logfmt rules
+      # beside it as controls. Status only, no pushes. The hermetic half
+      # (PulsusDB's own verdict at parse -> plan -> compile, the
+      # `5d91ef1` rule replayed over the same matrix, the rule-table and
+      # tree-sweep checks) runs in the `ci` job with the gate off.
+      - name: LogQL differential leg (pattern sub-grammar matrix, issue #388)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_pattern_expr_matrix
+
+      # Issue #394, folded into #388: the `| json <id>="<expr>"`
+      # extraction-expression sub-grammar (pkg/logql/log/jsonexpr/ @
+      # v3.7.4 — a DIFFERENT grammar from logfmt's, so no harness is
+      # shared) x every position. Compared against the committed verdicts
+      # and the reference's inner error text.
+      #
+      # The window ends at `now` and here it IS load-bearing, exactly as
+      # in the logfmt leg: this rejection is a Stage() error and the
+      # reference answers 200 for it once the window's end is older than
+      # query_ingesters_within, so a stale window would score the whole
+      # sub-grammar as accepted. `live_the_json_rule_is_window_dependent`
+      # measures that, with the pattern rule beside it as the control.
+      # Status only, no pushes.
+      - name: LogQL differential leg (json expression matrix, issue #388)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-read --test logql_json_expr_matrix
 
       # Issue #246: the regex accept/reject surface — every LogQL
       # construct that carries a user regex x the pattern classes where
@@ -1477,6 +1575,22 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run traces_metrics_live -p pulsus-read --test traces_metrics_live
 
+      # Issue #458 AC 3b (the TRUTH oracle for the nestedSetParent metrics
+      # lowering): T traces of S spans with exactly one parentless span
+      # each, executed through plan_trace_metrics + TraceEngine, asserting
+      # `{ nestedSetParent < 0 }` totals T, `{ nestedSetParent >= 1 }`
+      # totals S-T and `{}` totals S — on a fixture whose three totals are
+      # pairwise DISTINCT, plus the bare-truthiness answer on unequal
+      # true/false populations. AC 6 in traces_metrics_explain.rs is the
+      # COST oracle and neither substitutes for the other: a planner that
+      # returned `{}`'s SQL would pass that one and fail this one. Reuses
+      # this job's ClickHouse 26.3 container.
+      - name: TraceQL metrics nested-set answer identities (Tier 1)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test traces_metrics_nested_set_live
+
       # Issue #173 AC7 (Tier 1, scale-invariant): EXPLAIN/query_log gates on
       # the service-graph read over the trace_edges ledger — daily-partition
       # MinMax prune (narrow < full parts + read_rows ratio), leading-side
@@ -1935,6 +2049,44 @@ jobs:
           cargo test -p pulsus-read --test logql_post_agg_witness -- \
             --ignored --nocapture --test-threads=1 \
             zz_large_scale_cell_stays_inside_the_model
+
+  # Issue #262 (AC 7): the ONLY gate that measures the shipped
+  # configuration — release frames on a pinned 2 MiB stack (tokio's worker
+  # default), for each of the fifteen shapes whose abort floors were
+  # measured for that issue. Each shape is a pair: it must survive
+  # `parse -> plan -> evaluate` at `MAX_EXPR_DEPTH`, and the same shape at
+  # depth 4,000 must overflow, so the positive leg cannot pass because
+  # frames got smaller rather than because the cap holds.
+  #
+  # Nightly/dispatch only, and the reason is not budget: there is no
+  # `--release` leg anywhere else in this file, and in a DEBUG build the
+  # positive legs abort at depth 250 (debug's worst-shape floor is 70), so
+  # this cannot ride the `ci` job. A PR can therefore go green without the
+  # production margin having been measured — stated here rather than
+  # papered over with a debug-profile gate that would prove nothing about
+  # a 2 MiB release binary.
+  promql-depth-stack-release:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+
+      - name: PromQL depth-cap pinned-stack gate (release, 2 MiB)
+        env:
+          CARGO_INCREMENTAL: "0"
+          PULSUS_PROMQL_DEPTH_STACK: "1"
+        run: |
+          cargo test --release -p pulsus-promql --test promql_depth_stack -- \
+            --nocapture --test-threads=1
 
   # Issue #16, docs/schemas.md §9's two-tier model, Tier 1 distributed leg:
   # captures per-shard system.query_log + EXPLAIN PIPELINE evidence for the

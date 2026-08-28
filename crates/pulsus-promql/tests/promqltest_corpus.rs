@@ -44,6 +44,7 @@ const PROOF_FILES: &[&str] = &[
     "m6_08g_sparse_subquery_union.test",
     "m7_a7_ordered_rangevector_nhcb.test",
     "m7_context_functions.test",
+    "m7_selector_regex_re2.test",
 ];
 
 fn proof_dir() -> std::path::PathBuf {
@@ -853,6 +854,778 @@ fn fetch_concurrent_writers_in_one_process_do_not_corrupt_the_cache() {
             entry.sha256,
             "{} cache bytes must verify against the manifest",
             entry.name
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #278: the two guards on the driver's own honesty — a census of the
+// regexes it compiles, and a machine-checked substitution inventory.
+// ---------------------------------------------------------------------------
+
+/// The workspace root, from this crate's manifest directory.
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+/// Every `.rs` file under `tests/promqltest/`, recursively, sorted by
+/// workspace-relative path.
+fn driver_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("driver dir is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = repo_root();
+    let mut paths = Vec::new();
+    walk(&driver::base_dir(), &mut paths);
+    let mut files: Vec<(String, String)> = paths
+        .into_iter()
+        .map(|p| {
+            let rel = p
+                .strip_prefix(&root)
+                .expect("driver sources live under the workspace root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&p).expect("driver source is readable");
+            (rel, text)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Issue #278: the pinned inventory of every site under
+/// `tests/promqltest/` that compiles a regex.
+///
+/// After the fix the driver compiles exactly three, and every one is a
+/// **directive oracle** — a pattern the `.test` grammar itself supplies to
+/// match an expected error or annotation string, never a user selector
+/// pattern. A user selector pattern has exactly one compile site,
+/// `store.rs::compile_selector_regex`, and it routes through
+/// `pulsus_re2::compile_user_regex_anchored(&pulsus_re2::re2_pattern_to_rust(..))`
+/// — the same expression production uses at
+/// `crates/pulsus-read/src/metrics/labels.rs:274` and `:620`.
+///
+/// **What this cannot do:** it pins a list of call sites, not their
+/// purpose. It cannot tell a future reader whether a newly added
+/// `Regex::new` is a directive oracle or a second matcher semantics. What
+/// it buys is that adding one is a deliberate, reviewed edit rather than a
+/// silent one.
+const DIRECTIVE_ORACLE_REGEX_SITES: &[(&str, &str)] = &[
+    (
+        "crates/pulsus-promql/tests/promqltest/grammar.rs",
+        "`expect fail regex:`/`expected_fail_regexp` — the oracle's own \
+         `regexp.Compile` of the pattern the directive carries \
+         (test.go:543-547)",
+    ),
+    (
+        "crates/pulsus-promql/tests/promqltest/runner.rs",
+        "`expected_fail_regexp` matched against the engine's error text",
+    ),
+    (
+        "crates/pulsus-promql/tests/promqltest/runner.rs",
+        "`AnnotationMatch::Regex` — the directive's annotation pattern",
+    ),
+];
+
+#[test]
+fn the_driver_compiles_no_user_regex_of_its_own() {
+    let mut found: Vec<(String, usize, String)> = Vec::new();
+    for (rel, text) in driver_sources() {
+        for (i, line) in text.lines().enumerate() {
+            if line.contains("Regex::new") || line.contains("RegexBuilder") {
+                // Skip prose: a doc comment or a `//` comment naming the
+                // construct is not a compile site. (The store's own
+                // header explains what it used to do.)
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                found.push((rel.clone(), i + 1, line.trim().to_string()));
+            }
+        }
+    }
+    let got: Vec<&str> = found.iter().map(|(f, _, _)| f.as_str()).collect();
+    let want: Vec<&str> = DIRECTIVE_ORACLE_REGEX_SITES
+        .iter()
+        .map(|(f, _)| *f)
+        .collect();
+    assert_eq!(
+        got,
+        want,
+        "the driver's regex-compile census moved. Every site under \
+         tests/promqltest/ must be a DIRECTIVE ORACLE — a pattern the .test \
+         grammar supplies to match error/annotation text — never a user \
+         selector pattern, which has exactly one compile site \
+         (store.rs::compile_selector_regex, routed through pulsus_re2 like \
+         production). Found:\n{}",
+        found
+            .iter()
+            .map(|(f, l, s)| format!("  {f}:{l}  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC10 — the substitution inventory in `promqltest/store.rs`'s header.
+// ---------------------------------------------------------------------------
+
+const INVENTORY_BEGIN: &str = "// --- SUBSTITUTION INVENTORY BEGIN ---";
+const INVENTORY_END: &str = "// --- SUBSTITUTION INVENTORY END ---";
+
+/// One parsed inventory row: its stage cell and its annotation cell, both
+/// as written.
+#[derive(Debug)]
+struct InventoryRow {
+    line: usize,
+    stage: String,
+    cell: String,
+}
+
+/// Strips the `//!` / `//` comment prefix off one header line.
+fn uncomment(line: &str) -> &str {
+    let t = line.trim_start();
+    t.strip_prefix("//!")
+        .or_else(|| t.strip_prefix("//"))
+        .unwrap_or(t)
+        .trim()
+}
+
+/// Parses the marker-delimited table out of `store.rs`, dropping the
+/// header row and the `|---|---|` separator.
+fn parse_inventory(text: &str) -> Vec<InventoryRow> {
+    let begin = text
+        .lines()
+        .position(|l| l.contains(INVENTORY_BEGIN))
+        .unwrap_or_else(|| panic!("store.rs must carry the marker {INVENTORY_BEGIN:?}"));
+    let end = text
+        .lines()
+        .position(|l| l.contains(INVENTORY_END))
+        .unwrap_or_else(|| panic!("store.rs must carry the marker {INVENTORY_END:?}"));
+    assert!(
+        begin < end,
+        "the inventory END marker must follow the BEGIN marker"
+    );
+    let mut rows = Vec::new();
+    for (offset, line) in text.lines().enumerate().take(end).skip(begin + 1) {
+        let body = uncomment(line);
+        if !body.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = body.trim_matches('|').split('|').map(str::trim).collect();
+        if cells.len() != 2 {
+            panic!(
+                "store.rs:{} — an inventory row must have exactly two cells, got {}: {body:?}",
+                offset + 1,
+                cells.len()
+            );
+        }
+        // The markdown header row and its separator.
+        if cells[1] == "annotation" || cells.iter().all(|c| c.chars().all(|ch| ch == '-')) {
+            continue;
+        }
+        rows.push(InventoryRow {
+            line: offset + 1,
+            stage: cells[0].to_string(),
+            cell: cells[1].to_string(),
+        });
+    }
+    rows
+}
+
+/// Pass A step 1-5: every path-shaped token in `cell`, with its citation
+/// suffix and its line locator stripped.
+///
+/// See the boundary comment on
+/// [`the_substitution_inventory_annotates_every_row`] for what "path
+/// shaped" buys and what it misses.
+fn path_tokens(cell: &str) -> Vec<String> {
+    fn is_run(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '-')
+    }
+    fn is_ident(seg: &str) -> bool {
+        let mut chars = seg.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    let mut out = Vec::new();
+    for run in cell.split(|c: char| !is_run(c)) {
+        if run.is_empty() {
+            continue;
+        }
+        // 2. strip a trailing citation suffix — one or more `::<ident>`.
+        let mut token = run;
+        while let Some((head, tail)) = token.rsplit_once("::") {
+            if is_ident(tail) {
+                token = head;
+            } else {
+                break;
+            }
+        }
+        // 3. strip a trailing line locator `:<digits>` or
+        //    `:<digits>-<digits>`. Discarded, never checked.
+        if let Some((head, tail)) = token.rsplit_once(':') {
+            let locator = match tail.split_once('-') {
+                Some((a, b)) => {
+                    !a.is_empty()
+                        && !b.is_empty()
+                        && a.chars().all(|c| c.is_ascii_digit())
+                        && b.chars().all(|c| c.is_ascii_digit())
+                }
+                None => !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()),
+            };
+            if locator {
+                token = head;
+            }
+        }
+        // 4. strip any remaining trailing `.`, `,` or `:`.
+        let token = token.trim_end_matches(['.', ',', ':']);
+        // 5. path shape: contains `/`, every segment is
+        //    `[A-Za-z0-9_.-]+`, and the basename's extension is 1-5 ASCII
+        //    letters.
+        if !token.contains('/') {
+            continue;
+        }
+        let segments: Vec<&str> = token.split('/').collect();
+        if segments.len() < 2
+            || segments.iter().any(|s| {
+                s.is_empty()
+                    || !s
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            })
+        {
+            continue;
+        }
+        let base = segments[segments.len() - 1];
+        let Some((_, ext)) = base.rsplit_once('.') else {
+            continue;
+        };
+        if ext.is_empty() || ext.len() > 5 || !ext.chars().all(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        out.push(token.to_string());
+    }
+    out
+}
+
+/// Pass B check 5a/5b over one `.rs` citation: the non-final segments are
+/// declared modules, the final segment is a declared function, and that
+/// function carries a test attribute.
+fn check_rs_citation(row: &InventoryRow, path: &str, segments: &[&str], text: &str) {
+    let lines: Vec<&str> = text.lines().collect();
+    // A `//`, `///` or `//!` line is prose: a doc comment mentioning
+    // `fn foo()` must not satisfy either check.
+    fn is_code(line: &str) -> bool {
+        !line.trim_start().starts_with("//")
+    }
+    fn declares(line: &str, needle: &str, tail_ok: fn(&str) -> bool) -> bool {
+        is_code(line)
+            && line
+                .find(needle)
+                .is_some_and(|at| tail_ok(&line[at + needle.len()..]))
+    }
+    for seg in &segments[..segments.len() - 1] {
+        let needle = format!("mod {seg}");
+        let declared = lines.iter().any(|l| {
+            declares(l, &needle, |after| {
+                after.starts_with(char::is_whitespace) || after.starts_with('{')
+            })
+        });
+        assert!(
+            declared,
+            "store.rs:{} — inventory row {:?} cites {path}::…::{seg}…, but {path} declares no \
+             module {seg}",
+            row.line, row.stage
+        );
+    }
+    let last = segments[segments.len() - 1];
+    let needle = format!("fn {last}");
+    let fn_line = lines.iter().position(|l| {
+        declares(l, &needle, |after| {
+            after.starts_with('(') || after.starts_with('<')
+        })
+    });
+    let Some(idx) = fn_line else {
+        panic!(
+            "store.rs:{} — inventory row {:?} cites {path}::{last}, but {path} declares no \
+             function {last}. A citation must name the test that covers the stage.",
+            row.line, row.stage
+        );
+    };
+    // 5b: walk UPWARD from the `fn` line, skipping blanks, comments and
+    // other attributes. The walk stops at the first line that is none of
+    // those, so a neighbour's attribute can never be credited here.
+    let mut i = idx;
+    let mut attr = None;
+    while i > 0 {
+        i -= 1;
+        let l = lines[i].trim();
+        if l.is_empty() || l.starts_with("//") {
+            continue;
+        }
+        if l.starts_with("#[") {
+            if l == "#[test]" || l.starts_with("#[tokio::test") {
+                attr = Some(l.to_string());
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    assert!(
+        attr.is_some(),
+        "store.rs:{} — inventory row {:?} cites {path}::{last}, which is a function but not a \
+         test (no #[test] / #[tokio::test] above its declaration at {path}:{}) — cite the test \
+         that covers this stage",
+        row.line,
+        row.stage,
+        idx + 1
+    );
+}
+
+/// # What this proves, what it does not, and who does
+///
+/// **Proves, over the WHOLE cell — annotation and `Limit:` qualifier
+/// alike:** every path token in it names a file that exists on disk.
+///
+/// **Proves, over the annotation half only:** each `Covered by:` citation
+/// that names a `.rs` file resolves to a function declared in that file
+/// which carries a test attribute (`#[test]` or `#[tokio::test]`). A
+/// citation naming a non-`.rs` file is checked for existence only, since
+/// such a file declares no functions.
+///
+/// **Does not prove — four things, named here rather than left to be
+/// found:**
+///
+/// 1. **That a named test exercises the stage its row claims.** This
+///    check reads names; it never reads assertions. A cited test can
+///    exist, be a test, and run green while asserting nothing the row is
+///    about.
+/// 2. **That a line number is right.** `model.rs:456` is verified as far
+///    as `model.rs` existing — the `:456` is stripped and discarded. A
+///    checked path is not a checked line.
+/// 3. **That "declared" means what the compiler means.** The
+///    implementation is a text scan, so a `fn` inside a string literal or
+///    an inactive `cfg` block would satisfy it.
+/// 4. **That every path is seen.** A path is recognised by shape: it must
+///    contain `/` and end in a basename whose extension is one to five
+///    ASCII letters. A path shaped otherwise is invisible to this check.
+///
+/// **Who proves (1):** the reviewer, by reading each cited test against
+/// its row's claim. That is not a gap waiting for a further check — it is
+/// where the static half stops. Issue #278 round 3 is the worked example:
+/// `live_metric_hist_writer.rs`'s exponential round-trip satisfied every
+/// check here while its row claimed the 13 `metric_hist_samples` value
+/// columns and the test asserted six, leaving the zero-threshold,
+/// zero-count, negative and custom-value fields at defaults and
+/// unasserted. No citation check could have seen that; a human reading
+/// the test against the sentence did.
+///
+/// # This check is closed
+///
+/// Ruled on issue #278 (2026-08-24). It was found one notch loose in
+/// three consecutive rounds — a fabricated path, then an invented
+/// function, then a real function that was not a test — and its last
+/// change removed the exemption that had left `Limit:` prose unchecked.
+/// It is now closed to CHANGE, not merely to tightening: **any later
+/// finding about this check, of any kind, is recorded against this
+/// paragraph and does not fail a review.** Item 3 above is the first such
+/// record, made by the round-4 reviewer. Five rounds is where a
+/// bookkeeping tripwire stops earning its keep, and the one-line
+/// production fix it guards was verified in round 1 and has not moved
+/// since.
+#[test]
+fn the_substitution_inventory_annotates_every_row() {
+    let store = driver::base_dir().join("store.rs");
+    let text = std::fs::read_to_string(&store).expect("store.rs is readable");
+    let rows = parse_inventory(&text);
+    assert!(
+        rows.len() >= 16,
+        "inventory parser found too few rows: {} — the markers are in place but the table \
+         between them did not parse, so this test would otherwise pass over nothing",
+        rows.len()
+    );
+
+    let root = repo_root();
+    let mut source_cache: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
+    for row in &rows {
+        // --- Pass A: path existence over the WHOLE cell, both halves.
+        for token in path_tokens(&row.cell) {
+            assert!(
+                root.join(&token).is_file(),
+                "store.rs:{} — inventory row {:?} names the path {token:?}, which is not a file \
+                 in the workspace (Pass A checks every path token in the cell, including inside \
+                 a `Limit:` qualifier)",
+                row.line,
+                row.stage
+            );
+        }
+
+        // --- Pass B: the citation grammar, annotation half only.
+        let annotation = row.cell.split("<br>").next().unwrap_or("").trim();
+        if annotation == "Nothing substituted" || annotation == "No suite covers this stage" {
+            continue;
+        }
+        let Some(refs) = annotation.strip_prefix("Covered by: ") else {
+            panic!(
+                "store.rs:{} — inventory row {:?} carries the annotation {annotation:?}. It must \
+                 be exactly `Nothing substituted`, exactly `No suite covers this stage`, or begin \
+                 `Covered by: ` followed by at least one citation.",
+                row.line, row.stage
+            );
+        };
+        let refs: Vec<&str> = refs
+            .split(',')
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .collect();
+        assert!(
+            !refs.is_empty(),
+            "store.rs:{} — inventory row {:?} says `Covered by:` and then names nothing",
+            row.line,
+            row.stage
+        );
+        for r in refs {
+            let mut segments: Vec<&str> = r.split("::").collect();
+            let path = segments.remove(0);
+            // Rule 1 (a special case of Pass A, restated so the failure
+            // names the citation rather than a bare token).
+            assert!(
+                root.join(path).is_file(),
+                "store.rs:{} — inventory row {:?} cites {r:?}, whose path {path:?} is not a file \
+                 in the workspace",
+                row.line,
+                row.stage
+            );
+            // Rule 2: a `.rs` citation must name the test.
+            if path.ends_with(".rs") {
+                assert!(
+                    !segments.is_empty(),
+                    "store.rs:{} — inventory row {:?} cites the bare Rust file {path:?}; a Rust \
+                     file citation must name the test that covers the stage",
+                    row.line,
+                    row.stage
+                );
+            } else {
+                // Rule 3: a `::`-bearing ref must be a `.rs` file.
+                assert!(
+                    segments.is_empty(),
+                    "store.rs:{} — inventory row {:?} cites {r:?}, but {path:?} is not a Rust \
+                     file and declares no functions",
+                    row.line,
+                    row.stage
+                );
+                continue;
+            }
+            // Rule 4: every segment is a bare identifier.
+            for seg in &segments {
+                let mut chars = seg.chars();
+                let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+                assert!(
+                    ok,
+                    "store.rs:{} — inventory row {:?} cites {r:?}, whose segment {seg:?} is not \
+                     a bare identifier",
+                    row.line, row.stage
+                );
+            }
+            // Checks 5a/5b.
+            let src = source_cache.entry(path.to_string()).or_insert_with(|| {
+                std::fs::read_to_string(root.join(path)).expect("cited Rust file is readable")
+            });
+            check_rs_citation(row, path, &segments, src);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #262 (AC 8) — CI cannot wander into the debug window
+// ---------------------------------------------------------------------
+
+/// The `eval`-family directives, as a first-whitespace-token set. Used by
+/// BOTH the census (pin 2) and the query extractor (pin 3) — see
+/// `corpus_expression_depths_match_their_pinned_artifact`'s doc for
+/// exactly how far that shared constant limits the independence claim.
+const EVAL_DIRECTIVE_FAMILY: &[&str] = &[
+    "eval",
+    "eval_ordered",
+    "eval_fail",
+    "eval_warn",
+    "eval_info",
+];
+
+/// Counts directives by a deliberately dumber rule than the extractor's:
+/// the first whitespace token of each line, and nothing else. It never
+/// looks at the rest of the line, so an extractor that mislocates or
+/// drops a query cannot move this number with it.
+fn directive_census(text: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut census = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        if let Some(first) = line.split_ascii_whitespace().next()
+            && EVAL_DIRECTIVE_FAMILY.contains(&first)
+        {
+            *census.entry(first.to_string()).or_insert(0) += 1;
+        }
+    }
+    census
+}
+
+/// Every `eval`-family query in `text`, extracted the way
+/// `promqltest/grammar.rs::parse_eval` locates one: `instant [at <dur>]`
+/// or `range from <dur> to <dur> step <dur>`, then the rest of the line.
+/// A directive line whose query it cannot locate is returned in the
+/// second element, and pin 3 requires that to be empty.
+fn extract_eval_queries(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut queries = Vec::new();
+    let mut unlocatable = Vec::new();
+    for line in text.lines() {
+        let Some(first) = line.split_ascii_whitespace().next() else {
+            continue;
+        };
+        if !EVAL_DIRECTIVE_FAMILY.contains(&first) {
+            continue;
+        }
+        let rest = line[first.len()..].trim_start();
+        let query = if let Some(rest) = rest.strip_prefix("instant") {
+            let rest = rest.trim_start();
+            match rest.strip_prefix("at ") {
+                Some(rest) => rest
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .map(|(_, q)| q.trim().to_string()),
+                None => Some(rest.trim().to_string()),
+            }
+        } else if let Some(rest) = rest.strip_prefix("range") {
+            // from <dur> to <dur> step <dur> <query...>
+            let rest = rest.trim_start();
+            let mut it = rest.splitn(7, char::is_whitespace);
+            let head: Vec<&str> = (&mut it).take(6).collect();
+            match (head.len(), it.next()) {
+                (6, Some(q)) => Some(q.trim().to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match query {
+            Some(q) if !q.is_empty() => queries.push(q),
+            _ => unlocatable.push(line.to_string()),
+        }
+    }
+    (queries, unlocatable)
+}
+
+/// The depth of a parsed expression — a **census-local** iterative walk.
+///
+/// The production walk (`pulsus_promql::limits::depth_and_capacity`) is
+/// `pub(crate)` by design: there is exactly one walk in that crate and no
+/// copy for a refactor to let drift. This is a second opinion computed in
+/// the test, over the same arm set; if it ever drifts from production's,
+/// the pinned histograms below move and this test reddens.
+fn expr_depth(expr: &promql_parser::parser::Expr) -> usize {
+    use promql_parser::parser::Expr;
+    let mut work: Vec<(&Expr, usize)> = vec![(expr, 1)];
+    let mut max_depth = 0usize;
+    while let Some((node, depth)) = work.pop() {
+        max_depth = max_depth.max(depth);
+        let child = depth + 1;
+        match node {
+            Expr::Aggregate(agg) => {
+                work.push((agg.expr.as_ref(), child));
+                if let Some(param) = &agg.param {
+                    work.push((param.as_ref(), child));
+                }
+            }
+            Expr::Unary(u) => work.push((u.expr.as_ref(), child)),
+            Expr::Binary(b) => {
+                work.push((b.lhs.as_ref(), child));
+                work.push((b.rhs.as_ref(), child));
+            }
+            Expr::Paren(p) => work.push((p.expr.as_ref(), child)),
+            Expr::Subquery(sq) => work.push((sq.expr.as_ref(), child)),
+            Expr::Call(c) => work.extend(c.args.args.iter().map(|b| (b.as_ref(), child))),
+            Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::VectorSelector(_)
+            | Expr::MatrixSelector(_)
+            | Expr::Extension(_) => {}
+        }
+    }
+    max_depth
+}
+
+/// **AC 8 (issue #262).** The depth cap is 250 and CI builds in **debug**,
+/// whose worst-shape abort floor is **70** — so a debug build is
+/// unprotected in the depth window 71-250, and nothing reaches that
+/// window unless we write it. This is the tripwire that makes "nothing
+/// reaches it" a check rather than a belief.
+///
+/// It pins the **artifact** the number is computed from, not a bound: an
+/// extractor that quietly skips input satisfies `max_depth <= 32`
+/// perfectly, which is the one thing a bound cannot see going wrong.
+///
+/// **On the word "independent".** The census is independent of the
+/// extractor's *slicing*, not of its *detection*: both decide "is this
+/// line a directive" by first-token membership in
+/// [`EVAL_DIRECTIVE_FAMILY`]. What protects the census counts is that
+/// they are **pinned literals**, not that they are independently
+/// computed.
+///
+/// Every pin here is exact rather than a bound, deliberately: the
+/// upstream corpus is byte-frozen by `upstream-manifest.json` and the
+/// proof corpus's file list is pinned by
+/// `proof_corpus_files_match_the_directory`, so both change only by a
+/// deliberate act — and that act must update these numbers in the same
+/// commit.
+#[test]
+fn corpus_expression_depths_match_their_pinned_artifact() {
+    let (_manifest, upstream) = load_upstream_verified();
+    let proof: Vec<(String, String)> = PROOF_FILES
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                driver::read_file(&proof_dir().join(name)),
+            )
+        })
+        .collect();
+
+    // Pin 1 — file count.
+    assert_eq!(upstream.len(), 21, "upstream .test files");
+    assert_eq!(proof.len(), 21, "in-repo proof .test files");
+
+    for (corpus, files, want_census, want_histogram, want_unparsed) in [
+        (
+            "upstream",
+            upstream
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>(),
+            vec![("eval", 2_180usize), ("eval_fail", 3)],
+            vec![
+                (1usize, 137usize),
+                (2, 1_531),
+                (3, 352),
+                (4, 110),
+                (5, 38),
+                (6, 11),
+                (8, 2),
+                (10, 2),
+            ],
+            Vec::<&str>::new(),
+        ),
+        (
+            "proof",
+            proof.clone(),
+            vec![("eval", 450), ("eval_fail", 27), ("eval_ordered", 17)],
+            vec![(1, 68), (2, 328), (3, 58), (4, 24), (5, 6), (6, 4), (7, 1)],
+            vec![
+                "info(n1, n1)",
+                "metric1_total offset 9.5e10",
+                "rate(metric1_total[-1])",
+                "rate(metric1_total[5s%0d])",
+                "rate(metric1_total[5s/0d])",
+            ],
+        ),
+    ] {
+        let mut census: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut queries: Vec<(String, String)> = Vec::new();
+        let mut unlocatable: Vec<String> = Vec::new();
+        for (name, text) in &files {
+            for (directive, count) in directive_census(text) {
+                *census.entry(directive).or_insert(0) += count;
+            }
+            let (found, missed) = extract_eval_queries(text);
+            queries.extend(found.into_iter().map(|q| (name.clone(), q)));
+            unlocatable.extend(missed);
+        }
+
+        // Pin 2 — the directive census, by the dumber rule.
+        let want_census: std::collections::BTreeMap<String, usize> = want_census
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        assert_eq!(census, want_census, "{corpus} directive census");
+        let census_total: usize = census.values().sum();
+
+        // Pin 3 — extracted == census, so a directive whose query the
+        // extractor cannot locate fails loudly instead of vanishing.
+        assert!(
+            unlocatable.is_empty(),
+            "{corpus}: {} directive lines had no locatable query: {unlocatable:?}",
+            unlocatable.len()
+        );
+        assert_eq!(
+            queries.len(),
+            census_total,
+            "{corpus}: extracted {} queries against a census of {census_total}",
+            queries.len()
+        );
+
+        // Pins 4 and 5 — the full depth histogram, and the unparsed
+        // list, both literal.
+        let mut histogram: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        let mut unparsed: Vec<String> = Vec::new();
+        let mut deepest: Option<(usize, String, String)> = None;
+        for (file, query) in &queries {
+            match promql_parser::parser::parse(query) {
+                Ok(expr) => {
+                    let depth = expr_depth(&expr);
+                    *histogram.entry(depth).or_insert(0) += 1;
+                    if deepest.as_ref().is_none_or(|(d, _, _)| depth > *d) {
+                        deepest = Some((depth, file.clone(), query.clone()));
+                    }
+                }
+                Err(_) => unparsed.push(query.clone()),
+            }
+        }
+        unparsed.sort();
+        unparsed.dedup();
+
+        let want_histogram: std::collections::BTreeMap<usize, usize> =
+            want_histogram.into_iter().collect();
+        assert_eq!(histogram, want_histogram, "{corpus} depth histogram");
+        assert_eq!(
+            unparsed,
+            want_unparsed
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            "{corpus} unparsed queries"
+        );
+        assert_eq!(
+            histogram.values().sum::<usize>() + unparsed.len(),
+            census_total,
+            "{corpus}: every extracted query is either parsed or listed unparsed"
+        );
+
+        // Pin 6 — the tripwire. 32 is deliberately NOT the cap: it fires
+        // long before the debug floor (70) or `MAX_EXPR_DEPTH` (250), so
+        // a corpus refresh that deepens materially forces a human
+        // decision instead of a silent divergence.
+        let max_depth = histogram.keys().copied().max().unwrap_or(0);
+        assert!(
+            max_depth <= 32,
+            "{corpus}: deepest expression is {max_depth} (tripwire 32, \
+             debug abort floor 70, MAX_EXPR_DEPTH {}); deepest: {:?}",
+            pulsus_promql::MAX_EXPR_DEPTH,
+            deepest
         );
     }
 }

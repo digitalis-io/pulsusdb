@@ -36,6 +36,12 @@ thiserror.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+# Issue #262 implementation review: `tests/promql_depth_stack.rs` is
+# gated on its own env var, and an absent gate must be a SKIP on a laptop
+# and a LOUD FAILURE in the CI job that exists to run it — otherwise the
+# only gate measuring the shipped configuration reports green having
+# executed nothing (issue #320's whole subject).
+pulsus-testkit = { path = "../pulsus-testkit" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
