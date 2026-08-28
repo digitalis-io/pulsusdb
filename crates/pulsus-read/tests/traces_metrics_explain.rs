@@ -761,7 +761,7 @@ async fn metrics_explain_and_budget_gates() {
     let base_narrow = extract_compare_base_scan(narrow_cross);
     let (full_sel, full_total) =
         table_primary_key_granules(&explain_raw(&client, &base_full).await, "trace_spans");
-    let (narrow_sel, _) =
+    let (narrow_sel, narrow_total) =
         table_primary_key_granules(&explain_raw(&client, &base_narrow).await, "trace_spans");
     assert!(
         full_sel > 0 && full_sel <= full_total,
@@ -808,10 +808,10 @@ async fn metrics_explain_and_budget_gates() {
         table_primary_key_granules(&explain_raw(&client, &base_windowed).await, "trace_spans");
     assert_eq!(
         (windowed_sel, windowed_total),
-        (narrow_sel, full_total),
+        (narrow_sel, narrow_total),
         "the selection window must not change granule pruning: the four-argument form selected \
-         {windowed_sel}/{windowed_total} granules where the one-argument form over the same \
-         request window selected {narrow_sel}/{full_total}. A window predicate that reached \
+         {windowed_sel}/{windowed_total} granules where the one-argument form over the SAME \
+         request window selected {narrow_sel}/{narrow_total}. A window predicate that reached \
          WHERE or PREWHERE would move this — and would also drop the spans the reference merely \
          re-partitions into baseline"
     );
