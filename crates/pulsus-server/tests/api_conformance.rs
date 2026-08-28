@@ -816,11 +816,18 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 serde_json::json!([]),
                 "{ctx}: empty DB must return an empty traces array, body {json}"
             );
-            assert_eq!(json["metrics"]["partial"], false, "{ctx}: body {json}");
-            assert_eq!(json["metrics"]["returned"], 0, "{ctx}: body {json}");
-            assert!(
-                json["metrics"]["limit"].is_u64(),
-                "{ctx}: metrics.limit must be an integer, body {json}"
+            // Issue #464: the WHOLE block, not three keys of it.
+            // `metrics` is `tempopb.SearchMetrics`
+            // (`pkg/tempopb/tempo.proto:164-172` @ v3.0.2) and nothing
+            // else — Grafana's Tempo datasource rejects the entire
+            // response over one unknown field
+            // (`pkg/tempo/search.go:95`), so a per-key assertion cannot
+            // express the contract. An empty result is a COMPLETE result,
+            // so `completedJobs` is present.
+            assert_eq!(
+                json["metrics"],
+                serde_json::json!({"completedJobs": 1, "totalJobs": 1}),
+                "{ctx}: metrics must be exactly the tempopb.SearchMetrics jobs pair, body {json}"
             );
         }
         (Surface::TracesMetrics, path) => {

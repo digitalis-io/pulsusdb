@@ -416,6 +416,41 @@ fn trace_order(json: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// One of the two committed `metrics` blocks from
+/// `test/fixtures/traces/search_metrics.json` (issue #464). `branch` is
+/// `"complete"` or `"partial"`.
+///
+/// The fixture is read from BOTH sides — this suite asserts real wire
+/// bytes against it, and `e2e/src/traces.rs` feeds the same two blocks to
+/// the validity gate that has to classify them — so the wire and the
+/// gate's input cannot drift apart.
+fn metrics_shape(branch: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/traces/search_metrics.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let fixture: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+    let block = fixture
+        .get(branch)
+        .unwrap_or_else(|| panic!("{} has no {branch:?} block", path.display()));
+    block.clone()
+}
+
+/// The response's WHOLE `metrics` block must be the committed block for
+/// `branch` — not a key of it. `metrics` is `tempopb.SearchMetrics`
+/// (`pkg/tempopb/tempo.proto:164-172` @ v3.0.2) and nothing else, and
+/// Grafana's Tempo datasource rejects the entire response over one
+/// unknown field (`pkg/tempo/search.go:95` @ `v13.1.5-11-g3c7375b`), so a
+/// per-key assertion cannot express the contract.
+fn assert_metrics_block(json: &serde_json::Value, branch: &str, ctx: &str) {
+    assert_eq!(
+        json["metrics"],
+        metrics_shape(branch),
+        "{ctx}: metrics must be the committed {branch} block, body {json}"
+    );
+}
+
 fn ids(ns: &[u8]) -> BTreeSet<String> {
     ns.iter().map(|n| hex(&tid(*n))).collect()
 }
@@ -428,7 +463,7 @@ fn assert_set(port: u16, q: &str, start_s: i64, end_s: i64, expected: &[u8], ctx
         ids(expected),
         "{ctx}: exact trace-ID set for {q}\nbody: {json}"
     );
-    assert_eq!(json["metrics"]["partial"], false, "{ctx}: not partial");
+    assert_metrics_block(&json, "complete", ctx);
 }
 
 fn now_s() -> i64 {
@@ -448,6 +483,22 @@ fn ts(base_s: i64, off_s: i64) -> u64 {
 }
 
 const MS: u64 = 1_000_000;
+
+/// T16's span layout, in seconds-from-`base` and milliseconds. Shared by
+/// the SEEDING and by case (n)'s assertions (issue #464), so editing the
+/// layout is seen by the check rather than silently disarming it.
+///
+/// The child ends **after** the root: root `[-300 s, +100 s]`, child
+/// `[+150 s, +150.010 s]`. Under the old layout (child at `+35 s`) the
+/// child sat entirely inside the root, so the trace's envelope and the
+/// root span's window were the same 400000 ms and this case could not
+/// tell the two rules apart — measured on the pinned reference, both
+/// layouts, `durationMs` came back 450010 for this one and 400000 for
+/// the old one.
+const T16_ROOT_START_OFF: i64 = -300;
+const T16_ROOT_DUR_MS: i64 = 400_000;
+const T16_CHILD_START_OFF: i64 = 150;
+const T16_CHILD_DUR_MS: i64 = 10;
 
 // ---------------------------------------------------------------------
 // Spawn A: full semantics (AC3).
@@ -710,8 +761,8 @@ async fn search_semantics_against_real_clickhouse() {
                 sid(1),
                 None,
                 "root-op",
-                ts(base, -300),
-                400_000 * MS,
+                ts(base, T16_ROOT_START_OFF),
+                T16_ROOT_DUR_MS as u64 * MS,
                 vec![],
             ),
             span(
@@ -719,8 +770,8 @@ async fn search_semantics_against_real_clickhouse() {
                 sid(2),
                 Some(sid(1)),
                 "child",
-                ts(base, 35),
-                10 * MS,
+                ts(base, T16_CHILD_START_OFF),
+                T16_CHILD_DUR_MS as u64 * MS,
                 vec![],
             ),
         ],
@@ -1058,10 +1109,35 @@ async fn search_semantics_against_real_clickhouse() {
         trace["rootTraceName"], "root-op",
         "the out-of-window root supplies the metadata, body {json}"
     );
+    // Issue #464: the trace level is the trace's ENVELOPE. The corpus
+    // relation is asserted FIRST, so a narrowed corpus fails on the
+    // relation rather than on a number that would pass under both rules.
+    let t16_child_end_ms = T16_CHILD_START_OFF * 1_000 + T16_CHILD_DUR_MS;
+    let t16_root_end_ms = T16_ROOT_START_OFF * 1_000 + T16_ROOT_DUR_MS;
+    assert!(
+        t16_child_end_ms > t16_root_end_ms,
+        "T16 must keep a child that ends AFTER its root ({}s vs {}s); if it stops doing so, this case no longer discriminates the trace envelope from the root span and the durationMs assertion BELOW passes under both rules",
+        t16_child_end_ms / 1_000,
+        t16_root_end_ms / 1_000
+    );
     assert_eq!(
         trace["startTimeUnixNano"],
-        ts(base, -300).to_string(),
-        "root start comes from the full trace, body {json}"
+        ts(base, T16_ROOT_START_OFF).to_string(),
+        "the trace's earliest span start comes from the full trace, not from the window, body          {json}"
+    );
+    // 450010 is the REFERENCE's answer for this layout, captured from the
+    // pinned container; the layout that produces it is re-derived here so
+    // a layout edit cannot leave a stale capture behind. The root span's
+    // own width is 400000, which is what the pre-#464 rule reported.
+    assert_eq!(
+        t16_child_end_ms - T16_ROOT_START_OFF * 1_000,
+        450_010,
+        "the captured reference value and T16's layout must agree"
+    );
+    assert_eq!(
+        trace["durationMs"].as_i64(),
+        Some(450_010),
+        "durationMs is the TRACE's envelope in milliseconds — max(span end) - min(span start),          not the root span's own {T16_ROOT_DUR_MS}, body {json}"
     );
 
     // -- (o) public ordering: max matched ts DESC, trace_id ASC; ties are
@@ -1089,8 +1165,8 @@ async fn search_semantics_against_real_clickhouse() {
     let res = search(port, "{}", w1 + 100, w1 + 200, "", "empty window");
     let json = res.json("empty window");
     assert_eq!(json["traces"], serde_json::json!([]));
-    assert_eq!(json["metrics"]["partial"], false);
-    assert_eq!(json["metrics"]["returned"], 0);
+    // An empty result is a COMPLETE result (issue #464).
+    assert_metrics_block(&json, "complete", "empty window");
 }
 
 // ---------------------------------------------------------------------
@@ -1164,8 +1240,7 @@ async fn candidate_cap_partial_and_boundary_semantics() {
     let ctx = "over-cap";
     let res = search(port, r#"{ name = "cap" }"#, base, base + 60, "", ctx);
     let json = res.json(ctx);
-    assert_eq!(json["metrics"]["partial"], true, "{ctx}: body {json}");
-    assert_eq!(json["metrics"]["returned"], 3, "{ctx}: body {json}");
+    assert_metrics_block(&json, "partial", ctx);
     assert_eq!(
         trace_order(&json),
         vec![hex(&tid(110)), hex(&tid(105)), hex(&tid(104))],
@@ -1187,7 +1262,7 @@ async fn candidate_cap_partial_and_boundary_semantics() {
         ctx,
     );
     let json = res.json(ctx);
-    assert_eq!(json["metrics"]["partial"], true, "{ctx}: body {json}");
+    assert_metrics_block(&json, "partial", ctx);
     assert_eq!(
         trace_order(&json),
         vec![hex(&tid(105)), hex(&tid(104))],
@@ -1198,7 +1273,7 @@ async fn candidate_cap_partial_and_boundary_semantics() {
     let ctx = "sub-cap";
     let res = search(port, r#"{ name = "cap" }"#, base + 4, base + 6, "", ctx);
     let json = res.json(ctx);
-    assert_eq!(json["metrics"]["partial"], false, "{ctx}: body {json}");
+    assert_metrics_block(&json, "complete", ctx);
     assert_eq!(trace_set(&json), ids(&[104, 105]), "{ctx}");
 
     // Exactly-at-cap boundary: a window holding exactly 3 matching
@@ -1208,10 +1283,8 @@ async fn candidate_cap_partial_and_boundary_semantics() {
     let ctx = "exactly-at-cap";
     let res = search(port, r#"{ name = "cap" }"#, base + 3, base + 6, "", ctx);
     let json = res.json(ctx);
-    assert_eq!(
-        json["metrics"]["partial"], false,
-        "{ctx}: exhausting exactly at the cap is not partial, body {json}"
-    );
+    // Exhausting exactly at the cap is not partial: the complete block.
+    assert_metrics_block(&json, "complete", ctx);
     assert_eq!(trace_set(&json), ids(&[103, 104, 105]), "{ctx}");
 
     // Ceiling and threshold engaging in the SAME iteration (code review
@@ -1252,11 +1325,9 @@ async fn candidate_cap_partial_and_boundary_semantics() {
         ctx,
     );
     let json = res.json(ctx);
-    assert_eq!(
-        json["metrics"]["partial"], true,
-        "{ctx}: the consumption ceiling engaged with a lookahead candidate present — \
-         threshold eligibility must not mask it, body {json}"
-    );
+    // The consumption ceiling engaged with a lookahead candidate
+    // present — threshold eligibility must not mask it.
+    assert_metrics_block(&json, "partial", ctx);
     assert_eq!(
         trace_order(&json),
         vec![hex(&tid(123))],

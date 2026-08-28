@@ -30,9 +30,10 @@ pub use traces::{
     PlanError as TracePlanError, RETAINED_ENTRY_OVERHEAD, RootSummary, SERVICE_GRAPH_MAX_EDGES,
     SearchCtx, SearchOutput, SearchParams, SearchPlan, ServiceGraph, SpanFilterCtx, SpanSetGroup,
     SpanSummary, StoredSpan, TAG_NAMES_MAX, TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES,
-    TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValues, TraceEngine,
-    TraceMetricSeries, TraceMetricsPlan, TraceMetricsResult, TraceReadConfig, TraceSearchResult,
-    canonical_double_bits, compile_span_filter, plan_search, plan_trace_metrics, service_graph_sql,
+    TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValues, TraceContext,
+    TraceEngine, TraceMetricSeries, TraceMetricsPlan, TraceMetricsResult, TraceReadConfig,
+    TraceSearchResult, canonical_double_bits, compile_span_filter, plan_search, plan_trace_metrics,
+    service_graph_sql,
 };
 
 #[cfg(test)]
