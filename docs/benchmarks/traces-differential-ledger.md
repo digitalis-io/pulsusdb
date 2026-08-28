@@ -797,3 +797,50 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `env::var` reads, once per endpoint variable. The endpoint kind exists
   because these gates carry a URL and the boolean helper counts a gate as
   set only when it is exactly `"1"`.
+
+### `traceql-compare-topn-tie-order` (issue #460) — **a deliberate refinement: our tie order is deterministic where the reference's is arbitrary**
+
+- **What.** `compare(f[, topN[, start, end]])` keeps, per attribute and per
+  side, that side's `topN` values ranked by the sum of their counts over
+  the window. When two values have the **same** sum, which of them
+  survives is not defined by the reference: `topN.get` sorts with
+  `sort.Slice` (`pkg/traceql/engine_metrics_compare.go:548-563`, the `sort.Slice` at `:557-559`, @ v3.0.2),
+  which is explicitly not a stable sort, so equal-sum entries come out in
+  an order that depends on the input permutation and on Go's pivot
+  choices. PulsusDB breaks the tie by **ascending value string**, so our
+  answer is the same on every run and on every machine.
+
+- **Measured, twice, on the reference.** Two corpora built for issue #460
+  with all counts equal:
+
+  | corpus | `topN` | reference survivors |
+  |---|---|---|
+  | 14 values, 1 span each | 2 | `i0`, `i1` |
+  | 12 values, 1 span each | 10 | everything except `m05` and `m09` |
+
+  Neither set is derivable from the values or the counts. There is nothing
+  here to match.
+
+- **Why this is a refinement and not a divergence to fix.** Matching an
+  unstable sort would mean reproducing Go's `pdqsort` pivot selection,
+  which is an implementation detail with no specification and no wire
+  contract. Determinism is strictly more useful to a dashboard: the same
+  query twice gives the same bars.
+
+- **Consumer impact.** A user comparing two systems on a corpus where
+  several values tie at the topN boundary can see a different *subset* of
+  equal-count values. The **cardinality** is the same on both systems, the
+  totals are the same, and every value above the boundary is the same. In
+  Grafana Traces Drilldown's Comparison tab, `computeHighestDifference`
+  ranks attributes on the largest |Selection − Baseline| across their
+  rows, so an exchanged pair of equal-count values leaves the ordering
+  unchanged.
+
+- **How it is gated.** `crates/pulsus-read/src/traces/exec.rs`'s
+  `the_topn_keep_is_cardinality_only_under_a_tie` asserts
+  `n_kept == min(top_n, distinct)` and that our kept set does not depend
+  on input order — and asserts **nothing** about which member survives.
+  The live differential
+  (`crates/pulsus-read/tests/compare_arity_differential.rs`) uses a fixture
+  where every value has a **distinct** count, so tie order never enters a
+  parity assertion.

@@ -70,7 +70,7 @@ const MS: i64 = 1_000_000;
 /// sibling suite records: a single whole-window bucket can land its right
 /// edge in the future and read back empty. `compare()` counts are additive
 /// across disjoint buckets, and `topN` ranks on the SUM of a value's
-/// counts over the whole query (`engine_metrics_compare.go:528-545`), so
+/// counts over the whole query (`engine_metrics_compare.go:535-563`), so
 /// summing per-step samples yields the same totals AND the same top-N set
 /// a single bucket would.
 const TEMPO_STEP_S: i64 = 60;
@@ -777,6 +777,25 @@ async fn compare_arity_differential() {
     }
 
     // ---- B6: `__meta_error` is unreachable, on BOTH systems. -----------
+    //
+    // **The scope of the source-level half, stated where the literal
+    // lives.** No PRODUCTION source in this workspace may carry the label
+    // name. That is:
+    //
+    //     git grep -c '__meta_error' -- crates/ ':(exclude,glob)crates/*/tests/**'
+    //
+    // which exits 1 (verified against this tree, and verified to MATCH
+    // after planting the literal in `crates/pulsus-read/src/traces/
+    // metrics_plan.rs` and in `crates/pulsus-server/build.rs` — a pathspec
+    // that matches nothing proves nothing, so it was checked against a
+    // violation before being written down). Its domain is every tracked
+    // file of every crate under `crates/`, minus that crate's `tests/`
+    // tree — the single carve-out, needed because THIS file must name the
+    // label to assert its absence. Outside the domain, by name: `xtask/`,
+    // `e2e/`, `vendor/` — a dev tool, a CI harness and a vendored PromQL
+    // parser, none of which links into `pulsus-server` -> `pulsus-read`.
+    // The opt-OUT form is deliberate: an opt-in list of production
+    // locations fails open the day a crate lays sources somewhere new.
     // The reference's raw job emits a `__meta_error="__too_many_values__"`
     // series when a key exceeds topN, with `Values: nil` — and
     // `SeriesSet.ToProto` drops zero-sample series, so it never reaches

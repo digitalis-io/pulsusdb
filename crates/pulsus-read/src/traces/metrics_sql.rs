@@ -971,7 +971,7 @@ pub struct CompareSqlInput<'a> {
     pub fixed_series: u64,
     /// The `compare(f, n, start, end)` selection window, unix nanoseconds,
     /// half-open as `(start, end]` — lower bound EXCLUSIVE, upper bound
-    /// INCLUSIVE (`engine_metrics_compare.go:100-112` @ v3.0.2:
+    /// INCLUSIVE (`engine_metrics_compare.go:98-110` @ v3.0.2:
     /// `spanStartTime > uint64(m.start) && spanStartTime <= uint64(m.end)`).
     ///
     /// The window REPARTITIONS, it does not filter: a span the outer

@@ -929,7 +929,7 @@ impl TraceEngine {
     /// one-argument form too. Per attribute AND per side independently,
     /// that side's distinct values are ranked by the sum of their counts
     /// over the whole window and only the top `top_n` are emitted
-    /// (`engine_metrics_compare.go:231-253` — `addValues` builds a
+    /// (`engine_metrics_compare.go:234-256` — `addValues` builds a
     /// per-side `topN` and calls `top.get(m.topN, …)`, whose key is
     /// `Σ values`). Trimmed values are **dropped, not folded**: they stay
     /// in `key_bucket_sum`, so the `key=nil` complement and the `*_total`
@@ -941,12 +941,25 @@ impl TraceEngine {
     /// sets); ours is deterministic, which is a deliberate refinement —
     /// ledger `traceql-compare-topn-tie-order`.
     ///
-    /// The reference also emits a `__meta_error="__too_many_values__"`
-    /// series when a key exceeds `topN` (`:255-261`), with `Values: nil`.
-    /// It is **unreachable on the wire** — `SeriesSet.ToProto` drops
-    /// zero-sample series (`engine_metrics.go:379-382`) — and measured
-    /// absent from the container's body at `topN=1` and `topN=3`.
-    /// Emitting one would be a divergence, so we do not.
+    /// # The error series we deliberately do NOT emit
+    ///
+    /// When a key exceeds `topN` the reference's raw job also emits a
+    /// series labelled with its `internalLabelErrorTooManyValues`
+    /// (`engine_metrics_compare.go:28,252-267` @ v3.0.2), carrying
+    /// `Values: nil`. It is **unreachable on the wire**:
+    /// `SeriesSet.ToProto` drops zero-sample series
+    /// (`engine_metrics.go:380-383`), and it is measured absent from the
+    /// container's response body at `topN` 1 and 3. Emitting one here
+    /// would therefore be a divergence from what a user actually sees, so
+    /// this function emits none.
+    ///
+    /// **That is checkable, and the check's own scope is the point.** The
+    /// label name appears in no production source in this workspace; the
+    /// exact command, its domain and its one carve-out are recorded beside
+    /// the assertion that consumes them, in
+    /// `crates/pulsus-read/tests/compare_arity_differential.rs` — which is
+    /// the one file that must name the label, in order to assert its
+    /// absence from a rendered body.
     ///
     /// Cost: the ranking runs over rows [`Self::enforce_series_cap`] has
     /// already bounded to `reader.traceql_max_series` distinct
@@ -1025,18 +1038,8 @@ impl TraceEngine {
                 rank_base.push((bsum, val.as_str()));
                 rank_sel.push((ssum, val.as_str()));
             }
-            // Descending by sum, then ascending by value — the tie order
-            // is ours and deterministic (see the doc comment).
-            let keep = |ranked: &mut Vec<(u64, &str)>| -> BTreeSet<String> {
-                ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-                ranked
-                    .iter()
-                    .take(top_n)
-                    .map(|(_, v)| (*v).to_string())
-                    .collect()
-            };
-            let keep_base = keep(&mut rank_base);
-            let keep_sel = keep(&mut rank_sel);
+            let keep_base = keep_top_n(&mut rank_base, top_n);
+            let keep_sel = keep_top_n(&mut rank_sel, top_n);
 
             // Present values: one baseline + one selection series each,
             // emitted only for that side's kept set.
@@ -2325,6 +2328,32 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
 /// itself is *not* shard-local — buckets exist on every shard; the
 /// coordinator merges per-bucket partial states, bounded by the point
 /// cap × shards. Scale evidence routes to #25.)
+/// `compare()`'s per-attribute-per-side rank-and-keep (issue #460).
+///
+/// `ranked` holds one `(window sum, value)` entry per distinct value on
+/// ONE side of ONE attribute. It is ranked descending by sum and the top
+/// `top_n` values are returned. The ranking key is the reference's:
+/// `topN.add` sums a value's per-bucket counts and `topN.get` sorts
+/// descending (`engine_metrics_compare.go:535-563` @ v3.0.2).
+///
+/// **Ties are broken by ascending value string, and that tie order is
+/// OURS.** The reference sorts with `sort.Slice`, which is not stable, so
+/// among equal sums its survivors are arbitrary — measured twice on issue
+/// #460, two different arbitrary sets from the same input shape.
+/// Determinism is a deliberate refinement, ledgered as
+/// `traceql-compare-topn-tie-order`; no test may assert WHICH member of a
+/// tie survives, only how many do.
+///
+/// Sorts in place so the caller can reuse one buffer across attributes.
+fn keep_top_n(ranked: &mut [(u64, &str)], top_n: usize) -> BTreeSet<String> {
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    ranked
+        .iter()
+        .take(top_n)
+        .map(|(_, v)| (*v).to_string())
+        .collect()
+}
+
 fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
     // `max_query_size` is already present, inherited from `search_settings`
     // — set again here (idempotent, `QuerySettings::set` overrides rather
@@ -2780,6 +2809,53 @@ mod tests {
     /// surface-wide ceiling and the generator's tighter one can never be
     /// confused for one another in an assertion.
     const TEST_READ_MEM: u64 = 7_654_321;
+
+    /// Issue #460 AC 9 — under a TIE, only the CARDINALITY is a
+    /// specification.
+    ///
+    /// The reference's own survivors among equal counts are arbitrary
+    /// (`sort.Slice` is not stable; measured twice, two different sets),
+    /// so nothing here asserts which value lives. What is asserted is
+    /// `n_kept == min(top_n, distinct)` — and, separately, that OUR
+    /// choice is deterministic across runs, which is the refinement the
+    /// ledger records rather than a parity claim.
+    #[test]
+    fn the_topn_keep_is_cardinality_only_under_a_tie() {
+        let vals: Vec<String> = (0..12).map(|i| format!("v{i:02}")).collect();
+        let ranked: Vec<(u64, &str)> = vals.iter().map(|v| (7u64, v.as_str())).collect();
+        for top_n in [1usize, 3, 10, 11, 12, 13, 100] {
+            let mut buf = ranked.clone();
+            let kept = keep_top_n(&mut buf, top_n);
+            assert_eq!(
+                kept.len(),
+                top_n.min(vals.len()),
+                "top_n {top_n} over 12 equal-count values must keep min(top_n, 12)"
+            );
+            // Deterministic, not merely stable-looking: the same input
+            // gives the same set, from an INDEPENDENTLY shuffled buffer.
+            let mut shuffled: Vec<(u64, &str)> = ranked.iter().rev().copied().collect();
+            assert_eq!(
+                keep_top_n(&mut shuffled, top_n),
+                kept,
+                "top_n {top_n}: the kept set must not depend on input order"
+            );
+        }
+
+        // With DISTINCT sums the set itself is specified, and that is what
+        // the live differential's tie-free fixture relies on.
+        let mut distinct: Vec<(u64, &str)> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64 + 1, v.as_str()))
+            .collect();
+        assert_eq!(
+            keep_top_n(&mut distinct, 3),
+            ["v09", "v10", "v11"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>()
+        );
+    }
 
     #[test]
     fn trace_read_config_is_cloneable_and_debuggable() {

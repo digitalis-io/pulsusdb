@@ -93,7 +93,7 @@
 //! UNREACHABLE before it for the same reason rules 9-10 were before
 //! Stage B: the arguments they judge could not be parsed. All three fire
 //! in the reference's own statement order
-//! (`engine_metrics_compare.go:319-339`), and both orderings are
+//! (`engine_metrics_compare.go:319-340`), and both orderings are
 //! observable and measured.
 //!
 //! Rules 9 and 10, and the widening of rules 1 and 2 past comparison,
@@ -254,7 +254,7 @@ pub enum ValidateError {
     /// `ast_validate.go:43-48` — `compare()` combines with nothing.
     #[error("compare() cannot be combined with any other pipeline stage")]
     CompareWithSecondStage,
-    /// `engine_metrics_compare.go:323-325` — `compare()`'s `topN`
+    /// `engine_metrics_compare.go:325-327` — `compare()`'s `topN`
     /// argument is positive. Measured against the pinned digest, 400
     /// `compare() top number of values must be integer greater than 0`:
     /// `compare({status=error}, 0)`, `compare({status=error}, 0, 0, 0)`,
@@ -274,7 +274,7 @@ pub enum ValidateError {
     /// **`(0, 0)` is LEGAL and must be accepted**: it is the reference's
     /// own default and an explicit spelling the Grafana Traces Drilldown
     /// Comparison tab emits, and `validate()` returns `nil` early for it
-    /// (`:327-329`). Measured 200: `compare({status=error}, 10, 0, 0)`.
+    /// (`:329-331`). Measured 200: `compare({status=error}, 10, 0, 0)`.
     /// Measured 400 with this message: `…, 10, 0, <ns>` and
     /// `…, 10, <ns>, 0`.
     ///
@@ -371,7 +371,7 @@ pub const VALIDATE_RULES: &[(&str, &str)] = &[
     // reference's statement order and is observable (see each variant).
     (
         "compare-topn-not-positive",
-        "engine_metrics_compare.go:323-325",
+        "engine_metrics_compare.go:325-327",
     ),
     (
         "compare-timestamps-not-positive",
@@ -638,7 +638,7 @@ fn validate_stage(stage: &PipelineStage) -> Result<(), ValidateError> {
             ..
         } => {
             // Rules 12-14 (issue #460), in the reference's own statement
-            // order (`engine_metrics_compare.go:319-339`). The inner
+            // order (`engine_metrics_compare.go:319-340`). The inner
             // filter is validated FIRST — `validate()` opens with
             // `m.f.validate()` at `:320-323`.
             validate_filter(selection)?;
@@ -1268,7 +1268,7 @@ mod tests {
         }
 
         // The reference's messages, byte for byte
-        // (`engine_metrics_compare.go:323-338`).
+        // (`engine_metrics_compare.go:325-337`).
         assert_eq!(
             E::CompareTopNNotPositive.to_string(),
             "compare() top number of values must be integer greater than 0"

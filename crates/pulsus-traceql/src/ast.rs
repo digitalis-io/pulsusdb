@@ -882,7 +882,7 @@ pub enum PipelineStage {
         /// Arguments 3 and 4, unix nanoseconds. `(0, 0)` means "no
         /// selection window": it is the reference's own default AND an
         /// explicitly legal spelling — `compare(f, 10, 0, 0)` is a 200
-        /// (`engine_metrics_compare.go:327-329` returns `nil` early
+        /// (`engine_metrics_compare.go:329-331` returns `nil` early
         /// when both are zero).
         start_ns: i64,
         end_ns: i64,

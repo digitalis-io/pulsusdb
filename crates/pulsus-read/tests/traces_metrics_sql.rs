@@ -183,7 +183,7 @@ const CASES: &[Case] = &[
         // `(start, end]` window is a conjunct on the `is_sel` SELECT-list
         // expression and appears NOWHERE in `PREWHERE`/`WHERE` — the
         // window repartitions the population into baseline/selection, it
-        // does not filter it (`engine_metrics_compare.go:100-112`
+        // does not filter it (`engine_metrics_compare.go:98-110`
         // @ v3.0.2). Diffing this golden against `compare_status.sql`
         // shows the whole change: one conjunct, in one place, and the
         // totals/probe SQL untouched.
