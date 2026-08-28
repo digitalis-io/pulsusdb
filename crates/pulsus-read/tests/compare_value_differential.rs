@@ -756,10 +756,10 @@ fn the_wait_absorbs_the_partial_view_that_reddened_ci() {
     // could not establish this — the property was asserted for two rounds
     // and tested by nothing.
     let mid_run_empty = [
-        Some(complete.clone()),  // run -> 1
-        Some(complete.clone()),  // run -> 2
-        Some(empty.clone()),     // the case the old sequence never had
-        Some(complete.clone()),  // run -> 3 iff the empty neither settled nor reset
+        Some(complete.clone()), // run -> 1
+        Some(complete.clone()), // run -> 2
+        Some(empty.clone()),    // the case the old sequence never had
+        Some(complete.clone()), // run -> 3 iff the empty neither settled nor reset
     ];
     assert_eq!(
         settle(&mid_run_empty).map(|(i, _)| i),

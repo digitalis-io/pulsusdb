@@ -74,11 +74,10 @@
 //! precedent.
 
 use crate::ast::{
-    AggregateOp, ArithOp, AttrScope, BoolOp, COMPARE_DEFAULT_TOP_N, ComparisonOp, Field,
-    FieldExpr, FieldOp, HintValue,
-    Intrinsic, MetricFn, MetricHint, MetricStage, PipelineStage, Query, SecondStage, SpanKindValue,
-    SpansetExpr, SpansetFilter, StatusValue, StructuralModifier, StructuralOp, UNARY_BINDING_POWER,
-    UnaryOp, Value,
+    AggregateOp, ArithOp, AttrScope, BoolOp, COMPARE_DEFAULT_TOP_N, ComparisonOp, Field, FieldExpr,
+    FieldOp, HintValue, Intrinsic, MetricFn, MetricHint, MetricStage, PipelineStage, Query,
+    SecondStage, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, StructuralModifier,
+    StructuralOp, UNARY_BINDING_POWER, UnaryOp, Value,
 };
 use crate::duration;
 use crate::error::{MAX_DEPTH, TraceQlError};
@@ -2866,7 +2865,11 @@ mod tests {
                 other => panic!("{q}: expected a compare stage, got {other:?}"),
             }
             // Every accepted arity round-trips through `Display`.
-            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{q} round-trips");
+            assert_eq!(
+                parse(&parsed.to_string()).unwrap(),
+                parsed,
+                "{q} round-trips"
+            );
         }
 
         // A13-A17: the rejects. Each is a POSITIONED parse error, and the

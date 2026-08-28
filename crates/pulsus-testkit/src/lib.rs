@@ -575,10 +575,7 @@ pub struct StabilityWait<T> {
 // would bound `settle_by` for nothing — an empty wait holds no payload).
 impl<T> Default for StabilityWait<T> {
     fn default() -> Self {
-        Self {
-            last: None,
-            run: 0,
-        }
+        Self { last: None, run: 0 }
     }
 }
 

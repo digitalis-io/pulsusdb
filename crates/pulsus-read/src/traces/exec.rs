@@ -707,7 +707,9 @@ impl TraceEngine {
             let (cross_tab, totals) = plan
                 .compare_range()
                 .expect("compare plan carries range SQL");
-            return self.frame_compare(cross_tab, totals, plan.compare_top_n()).await;
+            return self
+                .frame_compare(cross_tab, totals, plan.compare_top_n())
+                .await;
         }
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(plan.range_sql());
@@ -1217,7 +1219,9 @@ impl TraceEngine {
             let (cross_tab, totals) = plan
                 .compare_instant()
                 .expect("compare plan carries instant SQL");
-            return self.frame_compare(cross_tab, totals, plan.compare_top_n()).await;
+            return self
+                .frame_compare(cross_tab, totals, plan.compare_top_n())
+                .await;
         }
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(plan.instant_sql());

@@ -1009,9 +1009,9 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     // selection predicate — never into the filter. See
     // [`CompareSqlInput::sel_window`].
     let is_sel = match sel_window {
-        Some((start_ns, end_ns)) => format!(
-            "(({inner_bool}) AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns})"
-        ),
+        Some((start_ns, end_ns)) => {
+            format!("(({inner_bool}) AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns})")
+        }
         None => format!("({inner_bool})"),
     };
     let mut raw = format!(

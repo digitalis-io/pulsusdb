@@ -427,8 +427,14 @@ fn tempo_body(api_base: &str, query: &str, window: (i64, i64)) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn tempo_query_once(api_base: &str, query: &str, window: (i64, i64), keys: &[&str]) -> Option<Counts> {
-    let body: serde_json::Value = serde_json::from_str(&tempo_body(api_base, query, window)).ok()?;
+fn tempo_query_once(
+    api_base: &str,
+    query: &str,
+    window: (i64, i64),
+    keys: &[&str],
+) -> Option<Counts> {
+    let body: serde_json::Value =
+        serde_json::from_str(&tempo_body(api_base, query, window)).ok()?;
     let series = body.get("series")?.as_array()?;
     let mut map = Counts::new();
     for s in series {
@@ -711,10 +717,7 @@ async fn compare_arity_differential() {
                 ("selection", "span.idx", "i7", 1),
                 ("selection_total", "span.idx", "nil", 3),
             ]),
-            trimmed: vec![
-                ("baseline", "span.idx", 0),
-                ("selection", "span.idx", 0),
-            ],
+            trimmed: vec![("baseline", "span.idx", 0), ("selection", "span.idx", 0)],
         },
     ];
 
@@ -762,7 +765,11 @@ async fn compare_arity_differential() {
                 .map(|(_, n)| *n)
                 .sum();
             let total = pulsus
-                .get(&(format!("{meta}_total"), (*key).to_string(), "nil".to_string()))
+                .get(&(
+                    format!("{meta}_total"),
+                    (*key).to_string(),
+                    "nil".to_string(),
+                ))
                 .copied()
                 .unwrap_or(0);
             if rendered + trimmed != total {
