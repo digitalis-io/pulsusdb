@@ -527,6 +527,113 @@ fn check_identifier(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The live-poll settle rule (issue #460, lifted from issue #458's fix)
+// ---------------------------------------------------------------------------
+
+/// Consecutive IDENTICAL non-empty reads required before a live poll is
+/// considered settled.
+///
+/// Three reads two seconds apart span more than one Tempo block-cut
+/// period (`max_block_duration: 2s`, `flush_check_period: 1s` in
+/// `ci/tempo/tempo-compare.yaml`), so a batch that is still landing shows
+/// a different payload in at least one of them. **Two is not enough**: a
+/// batch can pause mid-flush for one interval, which is why the rule is
+/// three and why `StabilityWait`'s own test scripts that case.
+///
+/// ONE definition, so two suites cannot drift apart on it.
+pub const STABLE_READS: usize = 3;
+
+/// The stability rule for a live poll: an answer is settled only once the
+/// SAME payload has been observed [`STABLE_READS`] times running.
+///
+/// **Not the first non-empty response.** A reference's live store cuts
+/// blocks on a timer, so an already-finalised time bucket can be read
+/// before every span in it has flushed — a partial view that reddened
+/// `schema-it` four times over a month (CI runs 30258308527,
+/// 30610626381, 31510222855, 33110647702, every one on attempt 1 with an
+/// identical five-cell divergence). Two of the four (30610626381,
+/// 33110647702) were re-run and passed on attempt 2 with nothing changed;
+/// the other two were never re-run. Partial views are attested by all
+/// four; the re-run behaviour by two.
+///
+/// A `None` read — a failed poll OR one the caller judged empty —
+/// neither settles a run nor resets one in progress.
+///
+/// **The emptiness decision belongs to the CALLER**, not to this type: it
+/// is domain knowledge (an empty count map is not an answer; an empty
+/// list might be), so a caller passes
+/// `read.filter(|payload| !payload.is_empty())`.
+#[derive(Debug)]
+pub struct StabilityWait<T> {
+    last: Option<T>,
+    run: usize,
+}
+
+// Hand-written rather than derived: `#[derive(Default)]` would require
+// `T: Default`, which a payload type has no reason to satisfy (and which
+// would bound `settle_by` for nothing — an empty wait holds no payload).
+impl<T> Default for StabilityWait<T> {
+    fn default() -> Self {
+        Self {
+            last: None,
+            run: 0,
+        }
+    }
+}
+
+impl<T: Clone + PartialEq> StabilityWait<T> {
+    /// Feeds one poll result. Returns `Some(payload)` only once the same
+    /// payload has been observed [`STABLE_READS`] times running.
+    pub fn observe(&mut self, read: Option<T>) -> Option<T> {
+        let payload = read?;
+        self.run = if self.last.as_ref() == Some(&payload) {
+            self.run + 1
+        } else {
+            1
+        };
+        self.last = Some(payload);
+        (self.run >= STABLE_READS).then(|| self.last.clone().expect("just set"))
+    }
+
+    /// The most recent observation, for a timeout message that says what
+    /// the poll was actually seeing.
+    pub fn last(&self) -> Option<&T> {
+        self.last.as_ref()
+    }
+}
+
+/// Polls `read` until [`StabilityWait`] settles, or `deadline` passes.
+///
+/// **The deadline is WALL CLOCK, checked before each poll**, so the worst
+/// case is `deadline` plus one in-flight poll — NOT
+/// `polls x (request timeout + interval)`. A poll-count budget with a
+/// 20 s request timeout and a 2 s sleep is a 22 s worst case per
+/// iteration, and 90 of those is 33 minutes: a CI step that sits for half
+/// an hour before failing reads as a hang, gets killed, and the panic
+/// message this function exists to print is never seen.
+///
+/// Panics on timeout, naming the last observation.
+pub fn settle_by<T: Clone + PartialEq + std::fmt::Debug>(
+    deadline: std::time::Instant,
+    interval: std::time::Duration,
+    what: &str,
+    mut read: impl FnMut() -> Option<T>,
+) -> T {
+    let mut wait = StabilityWait::default();
+    while std::time::Instant::now() < deadline {
+        if let Some(settled) = wait.observe(read()) {
+            return settled;
+        }
+        std::thread::sleep(interval);
+    }
+    panic!(
+        "{what}: never returned a STABLE non-empty view before the deadline \
+         (last observation {:?})",
+        wait.last()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
