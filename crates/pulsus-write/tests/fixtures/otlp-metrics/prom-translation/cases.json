@@ -7421,6 +7421,596 @@
         "series": [
           {
             "labels": {
+              "host_arch": "ppc64",
+              "job": "CALLER-JOB"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {},
+            "metric_name": "cjo_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-empty-name-namespace-absent",
+      "pair": "empty-name-namespace:base",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "job",
+                  "value": {
+                    "stringValue": "CALLER-JOB"
+                  }
+                },
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "cjo.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "ppc64",
+              "job": "nsX/"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "nsX/"
+            },
+            "metric_name": "cjo_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-empty-name-namespace-present",
+      "pair": "empty-name-namespace:variant",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "job",
+                  "value": {
+                    "stringValue": "CALLER-JOB"
+                  }
+                },
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": "nsX"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "cjo.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "ppc64",
+              "job": "nsY/"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "nsY/"
+            },
+            "metric_name": "djo_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "datapoint-job-overridden-by-empty-service-name-with-namespace",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": "nsY"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [
+                            {
+                              "key": "job",
+                              "value": {
+                                "stringValue": "DP-JOB"
+                              }
+                            }
+                          ],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "djo.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "ppc64",
+              "job": "svc"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "svc"
+            },
+            "metric_name": "lsb_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-leading-slash-no-namespace-key",
+      "pair": "leading-slash:base",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "job",
+                  "value": {
+                    "stringValue": "CALLER-JOB"
+                  }
+                },
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "svc"
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "lsb.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "ppc64",
+              "job": "/svc"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "/svc"
+            },
+            "metric_name": "lsb_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-leading-slash-empty-namespace-key",
+      "pair": "leading-slash:variant",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "job",
+                  "value": {
+                    "stringValue": "CALLER-JOB"
+                  }
+                },
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "svc"
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "lsb.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "ppc64",
+              "job": "/svc"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "/svc"
+            },
+            "metric_name": "lsd_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "datapoint-job-overridden-by-empty-namespace-leading-slash",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "svc"
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [
+                            {
+                              "key": "job",
+                              "value": {
+                                "stringValue": "DP-JOB"
+                              }
+                            }
+                          ],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "lsd.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "host_arch": "ppc64",
+              "job": "/"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "/"
+            },
+            "metric_name": "lse_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "caller-job-overridden-when-both-service-parts-are-empty",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "job",
+                  "value": {
+                    "stringValue": "CALLER-JOB"
+                  }
+                },
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": ""
+                  }
+                },
+                {
+                  "key": "host.arch",
+                  "value": {
+                    "stringValue": "ppc64"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "lse.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
               "host_arch": "mips",
               "instance": "instC",
               "job": "nsC/svcC"

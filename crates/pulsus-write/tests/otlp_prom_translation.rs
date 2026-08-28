@@ -29,7 +29,7 @@
 //! the fixed [`REFERENCE_TS_MS`] afterwards, recording each expected sample
 //! as an **offset** from it. Ledgered as `otlp-reference-admission-window`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -1089,6 +1089,84 @@ fn caller_supplied_job_and_instance_survive_when_the_derivation_is_empty() {
         Some("svcB"),
         "with service.name present the derivation overwrites the caller's own job"
     );
+}
+
+/// The reference's `job` sequence, transcribed rather than paraphrased
+/// (`metrics_to_prw.go:420-426 @ v3.13.0`):
+///
+/// 1. **key presence** on `service.name` — absent means no `job` at all;
+/// 2. **prepend** `service.namespace` **whenever that key is present**,
+///    whatever either value holds, giving `<namespace>/<name>`;
+/// 3. **non-empty test on the composite**, not on `service.name`.
+///
+/// Paraphrasing step 3 as "`service.name` present and non-empty" fails
+/// steps 2 and 3 in opposite directions: it would let a caller's `job`
+/// through for `{name: "", namespace: "ns"}` (reference: `"ns/"`), and it
+/// would accept `{name: "svc", namespace: ""}` as `"svc"` (reference:
+/// `"/svc"`). Both are captured below.
+fn reference_job(attrs: &BTreeMap<String, String>) -> Option<String> {
+    let name = attrs.get("service.name")?;
+    let composite = match attrs.get("service.namespace") {
+        Some(namespace) => format!("{namespace}/{name}"),
+        None => name.clone(),
+    };
+    Some(composite).filter(|v| !v.is_empty())
+}
+
+/// Corpus-wide: wherever the reference's sequence yields a non-empty
+/// composite, **every** stored `job` in that case equals it — on the metric
+/// series and on `target_info` alike, and whatever the caller sent.
+///
+/// This is deliberately not a list of named cases. The rule is a function
+/// of each case's own resource attributes, so it is asserted against every
+/// accepting case in the corpus at once; a case added later that breaks it
+/// fails without anyone remembering to extend a list.
+#[test]
+fn the_job_composite_follows_the_references_sequence_in_every_case() {
+    let doc = load_cases();
+    let mut asserted = 0usize;
+    let mut slash_forms: BTreeSet<String> = BTreeSet::new();
+
+    for case in doc["cases"].as_array().expect("cases") {
+        if case["expect"]["kind"] != "accept" {
+            continue;
+        }
+        let id = case["id"].as_str().expect("id");
+        let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+        let Some(expected) = reference_job(&attrs) else {
+            continue;
+        };
+        asserted += 1;
+        if expected.contains('/') {
+            slash_forms.insert(expected.clone());
+        }
+        for (name, labels) in captured_series(case) {
+            if let Some(stored) = labels.get("job") {
+                assert_eq!(
+                    stored, &expected,
+                    "case {id}: {name} stores job={stored:?}, but the reference's sequence \
+                     over this case's own resource attributes yields {expected:?}"
+                );
+            }
+        }
+    }
+
+    assert!(
+        asserted >= 20,
+        "only {asserted} cases exercise a non-empty job composite — the corpus-wide \
+         assertion has stopped covering anything"
+    );
+
+    // The three composite shapes a paraphrase gets wrong, each reached by a
+    // different antecedent, all present.
+    for form in ["nsX/", "/svc", "/"] {
+        assert!(
+            slash_forms.contains(form),
+            "no case yields the composite {form:?}; the corpus must carry the trailing-slash, \
+             leading-slash and both-empty forms, since a paraphrased guard fails them in \
+             opposite directions. Present: {slash_forms:?}"
+        );
+    }
 }
 
 /// The two carve-outs on the `job`/`instance` derivation, each stated
