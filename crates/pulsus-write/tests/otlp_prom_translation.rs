@@ -969,6 +969,114 @@ fn cases_json_binds_every_named_transformation() {
     }
 }
 
+/// **The `job`/`instance` override is conditional, and the condition is
+/// whether the derivation produced a value at all.**
+///
+/// `createAttributes` sets each label only inside `if
+/// c.resourceLabels.jobLabel != ""` / `if … instanceLabel != ""`
+/// (`helper.go:141-146 @ v3.13.0`), so with no `service.name` and no
+/// `service.instance.id` on the resource there is no `Set` to perform and a
+/// caller's own `job`/`instance` survives into the series identity.
+///
+/// Nobody on either side had pushed that antecedent until the round-12 plan
+/// review: every earlier statement that a caller cannot supply its own
+/// `job` was true only while `service.name` was present. Both legs are
+/// captured from the running reference in `cases.json`; this test states
+/// the rule, and the corpus replay proves we produce the same answers.
+#[test]
+fn caller_supplied_job_and_instance_survive_when_the_derivation_is_empty() {
+    let doc = load_cases();
+
+    // (a) On the metric series, via a data-point attribute. Each pair
+    // differs in exactly one input — whether the resource carries the
+    // service attribute the derivation reads — and `find_pair` enforces
+    // that, so the pair cannot pass by dragging a second change along.
+    for (pair_id, label, caller_value, derived_value) in [
+        ("job-override", "job", "DP-JOB", "svcp"),
+        ("instance-override", "instance", "DP-INST", "pod-x"),
+    ] {
+        let p = find_pair(&doc, pair_id);
+        for labels in captured_metric_labels(p.base) {
+            assert_eq!(
+                labels.get(label).map(String::as_str),
+                Some(caller_value),
+                "pair {pair_id}: with no service source the caller's {label} must survive"
+            );
+        }
+        for labels in captured_metric_labels(p.variant) {
+            assert_eq!(
+                labels.get(label).map(String::as_str),
+                Some(derived_value),
+                "pair {pair_id}: with a service source the derivation must overwrite"
+            );
+        }
+    }
+
+    // (b) On `target_info`, via a resource attribute — and the caller's
+    // label is what makes the resource ELIGIBLE for a `target_info` at all,
+    // since eligibility is "the built label set carries job or instance"
+    // (`helper.go:548-558`), not "a service attribute was present".
+    for (id, label, value) in [
+        (
+            "caller-job-survives-without-service-name",
+            "job",
+            "CALLER-JOB",
+        ),
+        (
+            "caller-instance-survives-without-service-instance-id",
+            "instance",
+            "CALLER-INSTANCE",
+        ),
+    ] {
+        let case = doc["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .unwrap_or_else(|| panic!("case {id} is missing"));
+        let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+        assert!(
+            !attrs.contains_key("service.name") && !attrs.contains_key("service.instance.id"),
+            "case {id}: the antecedent is that NEITHER service source is present"
+        );
+        let target = captured_target_info(case);
+        assert_eq!(
+            target.len(),
+            1,
+            "case {id}: the caller's {label} makes it eligible"
+        );
+        assert_eq!(
+            target[0].get(label).map(String::as_str),
+            Some(value),
+            "case {id}: the caller's {label} must survive onto target_info"
+        );
+        // The metric series carries nothing: resource attributes are not
+        // promoted, and there was no derivation to add.
+        for labels in captured_metric_labels(case) {
+            assert!(
+                labels.is_empty(),
+                "case {id}: a resource attribute must not reach the metric series"
+            );
+        }
+    }
+
+    // (c) And the override still wins when the derivation DOES produce a
+    // value, even on `target_info` — the caller's resource `job` is gone.
+    let overridden = doc["cases"]
+        .as_array()
+        .expect("cases")
+        .iter()
+        .find(|c| c["id"] == json!("resource-job-overridden-when-service-name-is-present"))
+        .expect("case resource-job-overridden-when-service-name-is-present is missing");
+    let target = captured_target_info(overridden);
+    assert_eq!(target.len(), 1);
+    assert_eq!(
+        target[0].get("job").map(String::as_str),
+        Some("svcB"),
+        "with service.name present the derivation overwrites the caller's own job"
+    );
+}
+
 /// A companion completeness gate: every id in [`TRANSFORMATIONS`] is
 /// exercised by at least one tagged case, so a later edit cannot drop one
 /// silently.
