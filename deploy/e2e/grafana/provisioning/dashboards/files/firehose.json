@@ -38,7 +38,7 @@
       "title": "Avg CPU utilization (fleet)",
       "datasource": { "type": "prometheus", "uid": "pulsus-prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
-      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
@@ -53,7 +53,7 @@
       "title": "Avg memory utilization (fleet)",
       "datasource": { "type": "prometheus", "uid": "pulsus-prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
-      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
@@ -116,7 +116,7 @@
       "title": "CPU utilization by host (top 10)",
       "datasource": { "type": "prometheus", "uid": "pulsus-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
@@ -132,7 +132,7 @@
       "title": "Memory utilization by host (top 10)",
       "datasource": { "type": "prometheus", "uid": "pulsus-prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "percent" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
