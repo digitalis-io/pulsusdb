@@ -2977,19 +2977,30 @@ mod tests {
                 true,
             ),
         ];
+        // COLLECTED, not asserted eagerly. A mutation's signature is the
+        // set of cases it moves and WHICH half of each it moves — the
+        // echo or the arity — and a loop that stops at the first case
+        // reports a prefix of it. Under a trimming parser, for instance,
+        // case 8 moves on the echo alone while 7, 9 and 10 move on the
+        // arity too, and only the whole set separates that from a
+        // separator change.
+        let mut failed: Vec<String> = Vec::new();
         for (id, sent, echoed, wants) in cases {
             let flags = encoding_flags(&hdr(sent));
-            assert_eq!(
-                flags,
-                echoed.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
-                "{id}: echoed tokens"
-            );
-            assert_eq!(
-                wants_categorize_labels(&flags),
-                *wants,
-                "{id}: the categorise decision"
-            );
+            let want_echo: Vec<String> = echoed.iter().map(|s| (*s).to_string()).collect();
+            if flags != want_echo {
+                failed.push(format!("{id}:E"));
+                eprintln!("c463 header FAIL {id}:E sent={sent:?} got={flags:?} want={want_echo:?}");
+            }
+            if wants_categorize_labels(&flags) != *wants {
+                failed.push(format!("{id}:A"));
+                eprintln!("c463 header FAIL {id}:A sent={sent:?} want={wants}");
+            }
         }
+        assert!(
+            failed.is_empty(),
+            "the header parser disagrees with the measured wire cases; signature: {failed:?}"
+        );
     }
 
     /// H3's leading whitespace never reaches this parser in production —
