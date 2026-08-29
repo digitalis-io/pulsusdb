@@ -917,3 +917,109 @@ when we are asking it to slow down, so we keep `429`; recorded as
   bytes against `test/fixtures/traces/search_metrics.json`, and
   `e2e/src/traces.rs` feeds the same two committed blocks to the
   differential's validity gate.
+
+### `traceql-metrics-instant-empty-window-series` (issue #464, wave 2) — **an empty answer, spelled two ways, on `GET /api/metrics/query`**
+
+- **Route.** `GET /api/metrics/query` (and its `/api/traces/v1/metrics/query`
+  and `/tempo/api/metrics/query` spellings) — the **instant** form only. The
+  range form is a different message and is not described by this row.
+
+- **What.** For a TraceQL metrics query whose window matches no spans, the
+  two systems disagree in two separate ways, and only one of them is
+  semantic. Measured 2026-08-29 against the pinned reference
+  (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`,
+  the digest `.github/workflows/ci.yml:648` pins, run with this repo's
+  `ci/tempo/tempo-compare.yaml` unmodified) and against PulsusDB at
+  `820e138`, same OTLP/JSON corpus pushed to both — 10 spans
+  `resource.service.name="w2a"` and 4 `"w2b"` — with the filter
+  `{resource.service.name="nope-w2"}`, which matches nothing:
+
+  | `q` | reference | PulsusDB |
+  |---|---|---|
+  | `\| count_over_time()` | `{"series":[{"labels":[{"key":"__name__","value":{"stringValue":"count_over_time"}}]}],"metrics":{"completedJobs":1,"totalJobs":1}}` | **byte-identical** |
+  | `\| rate()` | one `__name__="rate"` series, `value` omitted | **byte-identical** |
+  | `\| count_over_time() by (resource.service.name)` | `{"metrics":{"completedJobs":1,"totalJobs":1}}` | `{"series":[],"metrics":{…}}` |
+  | `\| max_over_time(duration)` | `{"metrics":{"completedJobs":1,"totalJobs":1}}` | one `__name__="max_over_time"` series, `value` omitted |
+  | `\| quantile_over_time(duration, 0.5)` | `{"metrics":{"completedJobs":1,"totalJobs":1}}` | one `p=0.5` series, `value` omitted |
+  | `\| histogram_over_time(duration)` | `{"metrics":{"completedJobs":1,"totalJobs":1}}` | `{"series":[],"metrics":{…}}` |
+
+  Against a store with **no spans at all** the reference answers every one
+  of the six with `{"metrics":{"completedJobs":1,"totalJobs":1}}`, including
+  the ungrouped `count_over_time()`/`rate()` on which the two agree once any
+  span exists; PulsusDB's six answers are unchanged from the table above.
+
+- **Two mechanisms, deliberately recorded together and not split.**
+
+  1. **Shape — `"series":[]` versus an absent `series` key.** protojson
+     omits an empty repeated field, so the reference emits no `series` key;
+     `serde` emits `"series":[]`. Both strict-decode as
+     `tempopb.QueryInstantResponse` to zero series (verified with
+     `jsonpb.Unmarshal` against the reference checkout's generated
+     `tempopb`), so no client can tell them apart after decoding. This is
+     the same mechanism as the range route's existing `"series":[]`, which
+     `crates/pulsus-server/tests/api_conformance.rs` pins — it is one
+     cross-route mechanism, and closing it on the instant route alone would
+     create an asymmetry between our own two routes.
+  2. **Semantics — a zero where the reference reports no-data.** For an
+     ungrouped **aggregation** or **quantile** over an empty window we emit
+     one series whose zero `value` is protojson-omitted, where the reference
+     emits no series. Our `PlanKind::Agg` instant arm folds an absent row to
+     `0.0` (`crates/pulsus-read/src/traces/exec.rs:1337-1349`, "an empty
+     aggregate window is a 0-valued sample"), and the reference drops a
+     series with no samples
+     (`modules/frontend/metrics_query_handler.go:193-196` @ v3.0.2). This is
+     the half a consumer can act on wrongly.
+
+- **What a consumer sees.** An alert rule reading
+  `max_over_time(duration)` through Grafana's Tempo datasource — which
+  reaches this route by construction under Unified Alerting
+  (`src/traceql/TempoQueryBuilderOptions.tsx:39,49-51` @ `v13.2.0`) —
+  receives a series carrying a numeric zero from PulsusDB where Tempo
+  returns no series. A rule written as "alert when the value drops below X"
+  therefore fires on our no-data where it would stay silent on Tempo's.
+  The reverse never happens: we never withhold a series the reference
+  emits. `docs/api.md` §4.4 states the rule for readers in as many words —
+  an absent `value` is a numeric zero, never no-data, and an empty `series`
+  list is the only no-data signal — and
+  `crates/pulsus-read/tests/traces_metrics_sql.rs`'s
+  `shipped_metrics_shapes_and_limits_are_documented` pins that sentence.
+
+- **Disposition.** Recorded, **not fixed**, and pre-existing: before wave 2
+  the same series came back carrying a `samples[]` array, so wave 2 changed
+  the envelope and nothing about which series exist or what they hold.
+  Whether either half becomes an issue is deferred — mechanism 1 should be
+  settled as one cross-route change alongside the range route's identical
+  `"series":[]`, not on this route alone.
+
+### `traceql-parse-error-body-differs-by-route` (issue #464, wave 2) — **a reference-side fact, recorded so the next comparison uses the right endpoint**
+
+- **Route.** Three of them, which is the entire point of the row.
+
+- **What.** The reference does not have *one* malformed-query body. For the
+  same query `q=%7B` (a bare `{`), measured 2026-08-29 against the pinned
+  container named in the entry above, all three answering `400`:
+
+  | route | reference body, verbatim |
+  |---|---|
+  | `GET /api/metrics/query` | `compiling query: parse error at line 1, col 2: syntax error: unexpected $end` |
+  | `GET /api/metrics/query_range` | `parse error at line 1, col 2: syntax error: unexpected $end` |
+  | `GET /api/search` | `invalid TraceQL query: parse error at line 1, col 2: syntax error: unexpected $end` |
+
+  Same parser, same message tail, three different prefixes: one, none, and a
+  third.
+
+- **Why this is a ledger row rather than a note.** A recorded claim of the
+  form "the reference's parse-error body is X" is true on one of these
+  routes and false on the other two, and the next person to check it will
+  reach for whichever endpoint they happen to try — so the claim goes stale
+  invisibly, without anything failing. The row therefore names the route in
+  the row itself. It was found exactly that way: a plan cell carried the
+  `/api/search` prefix against the `/api/metrics/query` row.
+
+- **PulsusDB's side, unchanged.** We answer `400` with
+  `content-type: text/plain; charset=utf-8` and our own message —
+  `unexpected end of query at byte 1: expected a field, a literal, or '('`
+  — on all three routes, carrying the byte offset the reference does not
+  (`docs/api.md` §4.2, issue #384). Nothing here is a behaviour change and
+  nothing is proposed: the row exists so that the *next* comparison is made
+  against the right endpoint.

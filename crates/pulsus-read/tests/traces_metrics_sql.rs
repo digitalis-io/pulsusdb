@@ -524,6 +524,20 @@ fn shipped_metrics_shapes_and_limits_are_documented() {
         // named a field the wire no longer carries. The sentence is the pin.
         "is rejected **statically before execution** with `422`",
         "left-closed",
+        // Issue #464 wave 2 review: §4.4 carried an empty-window sentence
+        // that contradicted the instant-body paragraph above it and said
+        // the opposite of what the route does, and nothing failed. The
+        // measured contract — ungrouped forms return one series whose zero
+        // `value` is omitted, grouped forms and `histogram_over_time`
+        // return an empty list — is a claim an alert author acts on, so it
+        // gets a needle rather than staying unchecked prose.
+        "an absent `value` is a numeric zero, never no-data",
+        // The summary sentence above is not the claim. Planted: inverting
+        // the enumeration to "the ungrouped forms return no series at all"
+        // — the exact wrong text the review found — left the summary
+        // needle green. These two pin the halves an alert author reads.
+        "return exactly one labelled series whose zero `value` is omitted",
+        "`histogram_over_time(duration)` return an empty `series` list",
     ] {
         assert!(
             api.contains(needle),
