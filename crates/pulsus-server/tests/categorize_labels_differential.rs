@@ -1818,6 +1818,11 @@ fn pulsus_answers_every_captured_probe_the_same_way() {
     let base_ns = now_ns() - 60_000_000_000;
     push(&base_url, &push_body(&nonce, base_ns));
 
+    // COLLECTED, not asserted eagerly: the plan's break table names a
+    // SET of probes per edit, and a replay that stops at the first can
+    // only report a prefix of it — "drop the rename" reds four probes,
+    // and which four is what tells it apart from an edit that reds one.
+    let mut disagreed: Vec<&str> = Vec::new();
     let mut compared = 0usize;
     for p in query_probes() {
         if p.side == Side::ReferenceOnly {
@@ -1880,11 +1885,13 @@ fn pulsus_answers_every_captured_probe_the_same_way() {
             compared += 1;
             continue;
         }
-        assert_eq!(
-            &ours, committed,
-            "{}: PulsusDB answers differently from the captured reference",
-            p.id
-        );
+        if &ours != committed {
+            disagreed.push(p.id);
+            eprintln!(
+                "c463 replay FAIL {}\n  ours: {ours}\n  ref : {committed}",
+                p.id
+            );
+        }
         compared += 1;
     }
     // 37 query probes, minus the one the reference alone can answer.
@@ -1895,6 +1902,10 @@ fn pulsus_answers_every_captured_probe_the_same_way() {
     assert_eq!(
         compared, replayable,
         "expected every replayable query probe ({replayable}), compared {compared}"
+    );
+    assert!(
+        disagreed.is_empty(),
+        "PulsusDB answers differently from the captured reference; signature: {disagreed:?}"
     );
     eprintln!("#463 replay: {compared} query probes agree with the captured reference");
 }
