@@ -1150,10 +1150,21 @@ jobs:
             sleep 2
           done
 
+      # SCOPED to the one test that talks to the reference. The suite's
+      # binary also holds four live-DATABASE tests, and running the whole
+      # binary here executed them in a job whose live-database gate this
+      # step does not set — the workspace's fail-closed gate caught it and
+      # reddened four tests rather than letting them skip and report
+      # green. Each step now runs exactly its own leg, and the two gates
+      # are complementary: this one supplies the endpoint and selects the
+      # endpoint test, the replay step below supplies the database and
+      # deselects this test.
       - name: LogQL categorize-labels capture drift leg (issue #463)
         env:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13101"
-        run: cargo test -p pulsus-server --test categorize_labels_differential -- --test-threads=1
+        run: |
+          cargo test -p pulsus-server --test categorize_labels_differential -- \
+            --test-threads=1 --exact the_committed_capture_matches_the_live_reference
 
       - name: LogQL categorize-labels reference diagnostics (on failure only)
         if: failure()
@@ -1556,11 +1567,20 @@ jobs:
       # by one body of code and cannot be probed differently. It also
       # holds the route-alias parity check, both surfaces, both header
       # settings.
+      # The endpoint test is DESELECTED here: this job has no reference
+      # container by this point, and its gate is fail-closed, so leaving
+      # it selected would panic rather than skip. Its own step, on the
+      # differential-oracle job above, is where it runs. Everything else
+      # in the binary — the four live-database tests and the hermetic
+      # ones — runs here.
       - name: Live categorize-labels replay (issue #463)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: ci/test-summary.sh run categorize_labels_differential -p pulsus-server --test categorize_labels_differential
+        run: |
+          ci/test-summary.sh run categorize_labels_differential \
+            -p pulsus-server --test categorize_labels_differential \
+            -E 'not test(=the_committed_capture_matches_the_live_reference)'
 
       # Issue #32: spawns the real `pulsusdb` binary and drives `/api/v1/*`
       # (discovery incl. matcher-only `match[]`, instant query,

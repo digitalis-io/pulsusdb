@@ -1434,7 +1434,23 @@ fn capture_reference(base_url: &str, host: &str, port: u16, nonce: &str) -> Vec<
     out
 }
 
+/// The reference endpoint, behind the workspace's FAIL-CLOSED gate.
+///
+/// `live_endpoint_gate_enabled`, not a bare `env::var`: an endpoint gate
+/// that merely returns `None` when its variable is missing turns a lost
+/// `env:` block into a suite that skips and reports green — which is the
+/// exact failure this project has now been protected from twice, and the
+/// second time was this suite's own CI step. The gate panics instead,
+/// naming the job and the variable, and stays a clean skip on a
+/// developer machine and in the hermetic lane.
+///
+/// It is the ENDPOINT form deliberately. The boolean helper reads a URL
+/// as "not `1`" and would panic saying the variable is unset with the
+/// `env:` block right there in the log.
 fn diff_url() -> Option<(String, String, u16)> {
+    if !pulsus_testkit::live_endpoint_gate_enabled("PULSUSDB_LOGQL_DIFF_URL") {
+        return None;
+    }
     let url = std::env::var("PULSUSDB_LOGQL_DIFF_URL").ok()?;
     let rest = url.strip_prefix("http://").unwrap_or(&url);
     let (host, port) = rest.split_once(':')?;
@@ -1751,9 +1767,20 @@ fn every_captured_probe_satisfies_its_class() {
 // Gated on `PULSUS_TEST_CLICKHOUSE`.
 // ---------------------------------------------------------------------
 
-/// The fixed listener port this suite binds. Declared once, in the
-/// reserved 31000-31999 band the port-uniqueness guard scans.
-const PULSUS_PORT: u16 = 31_460;
+// The fixed listener ports this suite binds — ONE PER TEST, in the
+// reserved 31000-31999 band the port-uniqueness guard scans.
+//
+// **Not one shared port.** Every test here spawns its own server, and
+// the CI step runs this binary through nextest, which gives each test
+// its own PROCESS and runs them in parallel. A single shared port
+// survives `--test-threads=1` locally and fails in CI with
+// `Address already in use`, which is what happened the first time this
+// step was written; the failure then surfaces as an unrelated-looking
+// assertion on the first request the unstarted server never answered.
+const REPLAY_PORT: u16 = 31_460;
+const ALIAS_PORT: u16 = 31_461;
+const TAIL_PORT: u16 = 31_462;
+const ECHO_PORT: u16 = 31_463;
 
 struct ChildGuard(std::process::Child);
 
@@ -1768,11 +1795,11 @@ impl Drop for ChildGuard {
 /// `/loki/api/v1/push`, `/loki/api/v1/query_range`, `/loki/api/v1/query`
 /// and `/loki/api/v1/tail` are all reachable — the driver above talks to
 /// exactly those paths, so both stores are probed by one body of code.
-fn spawn_pulsus(db: &str) -> ChildGuard {
+fn spawn_pulsus(db: &str, port: u16) -> ChildGuard {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     command
         .env("PULSUS_HOST", "127.0.0.1")
-        .env("PULSUS_PORT", PULSUS_PORT.to_string())
+        .env("PULSUS_PORT", port.to_string())
         .env("PULSUS_COMPAT_ENDPOINTS", "1")
         .env(
             "CLICKHOUSE_SERVER",
@@ -1786,7 +1813,7 @@ fn spawn_pulsus(db: &str) -> ChildGuard {
     let guard = ChildGuard(command.spawn().expect("spawn pulsusdb"));
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while std::time::Instant::now() < deadline {
-        let (status, _) = curl(&[&format!("http://127.0.0.1:{PULSUS_PORT}/ready")]);
+        let (status, _) = curl(&[&format!("http://127.0.0.1:{port}/ready")]);
         if status == 200 {
             return guard;
         }
@@ -1859,8 +1886,8 @@ fn pulsus_answers_every_captured_probe_the_same_way() {
         .build()
         .expect("runtime");
     rt.block_on(drop_db(&db));
-    let _server = spawn_pulsus(&db);
-    let base_url = format!("http://127.0.0.1:{PULSUS_PORT}");
+    let _server = spawn_pulsus(&db, REPLAY_PORT);
+    let base_url = format!("http://127.0.0.1:{REPLAY_PORT}");
 
     let nonce = format!("{}p", now_ns() / 1_000_000_000);
     let base_ns = now_ns() - 60_000_000_000;
@@ -1976,8 +2003,8 @@ fn the_native_route_and_the_alias_agree_byte_for_byte() {
         .build()
         .expect("runtime");
     rt.block_on(drop_db(&db));
-    let _server = spawn_pulsus(&db);
-    let base_url = format!("http://127.0.0.1:{PULSUS_PORT}");
+    let _server = spawn_pulsus(&db, ALIAS_PORT);
+    let base_url = format!("http://127.0.0.1:{ALIAS_PORT}");
     let nonce = format!("{}x", now_ns() / 1_000_000_000);
     let base_ns = now_ns() - 60_000_000_000;
     push(&base_url, &push_body(&nonce, base_ns));
@@ -2069,8 +2096,8 @@ fn the_categorised_tail_frame_is_per_entry_ordered_and_carries_both_categories()
         .build()
         .expect("runtime");
     rt.block_on(drop_db(&db));
-    let _server = spawn_pulsus(&db);
-    let base_url = format!("http://127.0.0.1:{PULSUS_PORT}");
+    let _server = spawn_pulsus(&db, TAIL_PORT);
+    let base_url = format!("http://127.0.0.1:{TAIL_PORT}");
 
     let nonce = format!("{}t", now_ns() / 1_000_000_000);
     let app = format!("tail{nonce}");
@@ -2103,7 +2130,7 @@ fn the_categorised_tail_frame_is_per_entry_ordered_and_carries_both_categories()
         base_ns - 1_000_000_000
     );
     let mut client =
-        ws::Client::connect("127.0.0.1", PULSUS_PORT, &target, Some("categorize-labels"));
+        ws::Client::connect("127.0.0.1", TAIL_PORT, &target, Some("categorize-labels"));
     let frames = client.collect(std::time::Instant::now() + Duration::from_secs(10));
     assert!(!frames.is_empty(), "the tail produced no frame at all");
 
@@ -2201,8 +2228,8 @@ fn our_echo_is_in_first_occurrence_request_order() {
         .build()
         .expect("runtime");
     rt.block_on(drop_db(&db));
-    let _server = spawn_pulsus(&db);
-    let base_url = format!("http://127.0.0.1:{PULSUS_PORT}");
+    let _server = spawn_pulsus(&db, ECHO_PORT);
+    let base_url = format!("http://127.0.0.1:{ECHO_PORT}");
     let nonce = format!("{}e", now_ns() / 1_000_000_000);
     let base_ns = now_ns() - 60_000_000_000;
     push(&base_url, &push_body(&nonce, base_ns));
