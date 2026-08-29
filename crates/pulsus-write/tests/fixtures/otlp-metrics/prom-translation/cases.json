@@ -2103,6 +2103,19 @@
                     },
                     "name": "...",
                     "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
+                    "unit": ""
                   }
                 ]
               }
@@ -2154,6 +2167,19 @@
                     },
                     "name": "",
                     "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
+                    "unit": ""
                   }
                 ]
               }
@@ -2204,6 +2230,19 @@
                       ]
                     },
                     "name": "._.",
+                    "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
                     "unit": ""
                   }
                 ]
@@ -2263,6 +2302,19 @@
                     },
                     "name": "ok.a",
                     "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
+                    "unit": ""
                   }
                 ]
               }
@@ -2321,6 +2373,19 @@
                     },
                     "name": "ok.a",
                     "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
+                    "unit": ""
                   }
                 ]
               }
@@ -2378,6 +2443,19 @@
                       ]
                     },
                     "name": "ok.a",
+                    "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
                     "unit": ""
                   }
                 ]
@@ -8418,6 +8496,353 @@
                       ]
                     },
                     "name": "is.c",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "DUP"
+            },
+            "metric_name": "dn_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-target-info-one-service-name-entry",
+      "pair": "target-info-entry-count:base",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "DUP"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "dn.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "DUP"
+            },
+            "metric_name": "dn_a",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "DUP"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "pair-target-info-two-service-name-entries",
+      "pair": "target-info-entry-count:variant",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "DUP"
+                  }
+                },
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "DUP-SECOND"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "dn.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "instance": "I-FIRST"
+            },
+            "metric_name": "di2_a",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "instance": "I-FIRST"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "duplicate-service-instance-id-entries-clear-the-target-info-gate",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.instance.id",
+                  "value": {
+                    "stringValue": "I-FIRST"
+                  }
+                },
+                {
+                  "key": "service.instance.id",
+                  "value": {
+                    "stringValue": "I-SECOND"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "di2.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {},
+            "metric_name": "dns_a",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "duplicate-service-namespace-entries-clear-gate-a-but-have-no-identifier",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": "NS-FIRST"
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": "NS-SECOND"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "dns.a",
+                    "unit": ""
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "promote_scope_metadata": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "tags": [
+        "job-instance",
+        "target-info"
+      ]
+    },
+    {
+      "exp_histogram_mode": "classic",
+      "expect": {
+        "kind": "accept",
+        "reference_content_type": null,
+        "series": [
+          {
+            "labels": {
+              "job": "NS-FIRST/NAME"
+            },
+            "metric_name": "dnn_a",
+            "offset_ms": 0,
+            "value": "1"
+          },
+          {
+            "labels": {
+              "job": "NS-FIRST/NAME"
+            },
+            "metric_name": "target_info",
+            "offset_ms": 0,
+            "value": "1"
+          }
+        ]
+      },
+      "id": "duplicate-service-namespace-uses-the-first-entry",
+      "payload": {
+        "resourceMetrics": [
+          {
+            "resource": {
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "NAME"
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": "NS-FIRST"
+                  }
+                },
+                {
+                  "key": "service.namespace",
+                  "value": {
+                    "stringValue": "NS-SECOND"
+                  }
+                }
+              ]
+            },
+            "scopeMetrics": [
+              {
+                "metrics": [
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 1.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "dnn.a",
                     "unit": ""
                   }
                 ]

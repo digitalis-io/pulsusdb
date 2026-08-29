@@ -294,6 +294,33 @@ async fn post_metrics(
     (status, bytes.to_vec())
 }
 
+/// Splits a case's payload into one request per metric descriptor and
+/// parses each on its own, returning `(independently valid, faulty)`.
+///
+/// A metric counts as independently valid when it parses `Ok` **and**
+/// produces at least one sample: a metric that parses to nothing is not a
+/// witness that anything could have been written.
+fn solo_metric_outcomes(case: &Value) -> (usize, usize) {
+    let metrics = case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array()
+        .expect("metrics");
+    let mut valid = 0usize;
+    let mut faulty = 0usize;
+    for metric in metrics {
+        let mut solo = case.clone();
+        solo["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"] = json!([metric]);
+        let body = serde_json::to_vec(&solo["payload"]).expect("payload re-serializes");
+        let request =
+            otlp_metrics::decode_json(&body).expect("corpus payloads are valid OTLP/JSON");
+        match otlp_metrics::parse(&request, REFERENCE_TS_MS * 1_000_000, settings_of(case)) {
+            Ok(parsed) if !parsed.samples.is_empty() => valid += 1,
+            Ok(_) => {}
+            Err(_) => faulty += 1,
+        }
+    }
+    (valid, faulty)
+}
+
 #[tokio::test]
 async fn reference_rejections_are_whole_request_400() {
     let doc = load_cases();
@@ -337,6 +364,24 @@ async fn reference_rejections_are_whole_request_400() {
         }
         if !sink.admitted.lock().expect("sink lock").is_empty() {
             failures.push(format!("case {id}: a rejected request reached the sink"));
+        }
+
+        // ...and the fixture must carry something that COULD have been
+        // written, or "nothing was written" is trivially true (plan v19
+        // Δ61). Derived rather than declared: each metric in the payload is
+        // parsed on its own, and the fixture must contain at least one that
+        // succeeds with a sample of its own AND at least one that does not,
+        // so the payload really is a valid sibling beside a real fault.
+        let (valid, faulty) = solo_metric_outcomes(case);
+        if valid == 0 {
+            failures.push(format!(
+                "case {id}: no metric in this payload is independently valid, so the                  zero-sink-calls assertion above is vacuous"
+            ));
+        }
+        if faulty == 0 {
+            failures.push(format!(
+                "case {id}: every metric in this payload is independently valid, so the                  rejection cannot be coming from this fixture's own fault"
+            ));
         }
     }
     assert_eq!(
@@ -532,6 +577,22 @@ fn resource_attrs(case: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// The resource attributes as a lookup, **first entry wins**.
+///
+/// `pcommon.Map.Get` returns the first match, which is why a resource
+/// carrying two `service.name` entries derives `job` from the FIRST one
+/// (measured). `Iterator::collect` into a `BTreeMap` keeps the **last**,
+/// silently inverting that — a latent defect in these helpers that no case
+/// reached until `pair-target-info-two-service-name-entries` was captured.
+/// Every helper below goes through this rather than collecting directly.
+fn resource_attr_map(case: &Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (key, value) in resource_attrs(case) {
+        out.entry(key).or_insert(value);
+    }
+    out
+}
+
 /// A case's data-point attributes for its first metric, in wire order.
 fn datapoint_attrs(case: &Value) -> Vec<(String, String)> {
     let metric = &case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
@@ -556,6 +617,36 @@ fn datapoint_attrs(case: &Value) -> Vec<(String, String)> {
         }
     }
     Vec::new()
+}
+
+/// A case's scope attributes for its first `ScopeMetrics`, in wire order.
+fn scope_attrs(case: &Value) -> Vec<(String, String)> {
+    case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["attributes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|kv| {
+                    (
+                        kv["key"].as_str().expect("scope attr key").to_string(),
+                        kv["value"]["stringValue"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The label a promoted scope attribute lands under.
+///
+/// The reference composes the prefix and sanitizes the RESULT
+/// (`metrics_to_prw.go:461 @ v3.13.0`: `"otel_scope_" + k` is handed to the
+/// namer), which is why a digit-leading key keeps its digit — the composed
+/// name already begins with a letter.
+fn scope_label_key(key: &str) -> String {
+    sanitize(&format!("otel_scope_{key}"))
 }
 
 /// The OTLP metric names a case pushes, in wire order.
@@ -846,7 +937,7 @@ fn cases_json_binds_every_named_transformation() {
                 "the base resource has no service.name"
             );
         }
-        let attrs: BTreeMap<String, String> = resource_attrs(p.variant).into_iter().collect();
+        let attrs = resource_attr_map(p.variant);
         let expected = attrs.get("service.name").expect("variant has service.name");
         for labels in captured_metric_labels(p.variant) {
             assert_eq!(labels.get("job"), Some(expected));
@@ -855,7 +946,7 @@ fn cases_json_binds_every_named_transformation() {
     {
         let p = find_pair(&doc, "job-namespace");
         for case in [p.base, p.variant] {
-            let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+            let attrs = resource_attr_map(case);
             let name = attrs.get("service.name").expect("service.name");
             let expected = match attrs.get("service.namespace") {
                 Some(ns) => format!("{ns}/{name}"),
@@ -875,7 +966,7 @@ fn cases_json_binds_every_named_transformation() {
         for labels in captured_metric_labels(p.base) {
             assert!(!labels.contains_key("instance"));
         }
-        let attrs: BTreeMap<String, String> = resource_attrs(p.variant).into_iter().collect();
+        let attrs = resource_attr_map(p.variant);
         let expected = attrs
             .get("service.instance.id")
             .expect("variant has service.instance.id");
@@ -914,10 +1005,12 @@ fn cases_json_binds_every_named_transformation() {
         );
     }
 
-    // (10) scope metadata is not promoted by default. The enabled path is
-    // asserted only as far as the reference has been replayed here — see
-    // the module note; the full enabled-path binding lands with the
-    // scope-promotion measurement.
+    // (10) The three scope predicates of plan v7 Δ27, bound to
+    // `setScopeContext` (`metrics_to_prw.go:446-475 @ v3.13.0`).
+    //
+    // `scope-name-version`: the knob alone decides whether scope metadata
+    // appears at all, and when it does both labels carry the scope's OWN
+    // name and version — not a constant, and not one of the two.
     {
         let p = find_pair(&doc, "scope-not-promoted");
         for labels in captured_metric_labels(p.base) {
@@ -928,10 +1021,159 @@ fn cases_json_binds_every_named_transformation() {
         }
         let scope = &p.variant["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"];
         let scope_name = scope["name"].as_str().expect("scope name");
+        let scope_version = scope["version"].as_str().expect("scope version");
+        assert!(!scope_name.is_empty() && !scope_version.is_empty());
+        assert_ne!(
+            scope_name, scope_version,
+            "the pair cannot tell the two labels apart if the scope's name and version are equal"
+        );
         for labels in captured_metric_labels(p.variant) {
             assert_eq!(
                 labels.get("otel_scope_name").map(String::as_str),
                 Some(scope_name)
+            );
+            assert_eq!(
+                labels.get("otel_scope_version").map(String::as_str),
+                Some(scope_version)
+            );
+        }
+    }
+
+    // (10b) `scope-attributes`. The pair differs only in whether the scope
+    // carries `scope.extra="x"`, and the captured answers differ by exactly
+    // that label. Predicate (10) alone cannot see this: an implementation
+    // promoting the name and version and **no scope attributes at all**
+    // satisfies it.
+    //
+    // The second half is what makes a wrong VALUE fail too, and it is
+    // asserted over every scope-promoting case in the corpus rather than
+    // over the pair alone — which is what brings the digit-leading key
+    // `9scope` into the predicate. That key is the witness for the
+    // reference's composition ORDER: `setScopeContext` composes
+    // `"otel_scope_" + k` and sanitizes the result
+    // (`metrics_to_prw.go:461 @ v3.13.0`), so the composed name already
+    // starts with `o` and the namer's digit-prefix rule never fires —
+    // `9scope` lands as `otel_scope_9scope`. Sanitizing the key first and
+    // prefixing after would give `otel_scope_key_9scope`.
+    {
+        let p = find_pair(&doc, "scope-attributes");
+        let extra_key = scope_attrs(p.variant)
+            .into_iter()
+            .next()
+            .expect("the variant's scope carries one attribute");
+        assert!(
+            scope_attrs(p.base).is_empty(),
+            "the base's scope must carry no attributes"
+        );
+        let promoted = scope_label_key(&extra_key.0);
+        for labels in captured_metric_labels(p.variant) {
+            assert_eq!(
+                labels.get(&promoted),
+                Some(&extra_key.1),
+                "pair scope-attributes: the scope attribute must be promoted under {promoted}"
+            );
+        }
+        for labels in captured_metric_labels(p.base) {
+            assert!(
+                !labels.contains_key(&promoted),
+                "pair scope-attributes: the base has no scope attribute to promote"
+            );
+        }
+
+        let mut asserted = 0usize;
+        for case in doc["cases"].as_array().expect("cases") {
+            if case["expect"]["kind"] != "accept" || case["promote_scope_metadata"] != json!(true) {
+                continue;
+            }
+            let scope = &case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"];
+            if scope["name"].as_str().unwrap_or_default().is_empty() {
+                // The name gates every scope label; predicate (10c) owns
+                // that case.
+                continue;
+            }
+            for (key, value) in scope_attrs(case) {
+                asserted += 1;
+                for labels in captured_metric_labels(case) {
+                    assert_eq!(
+                        labels.get(&scope_label_key(&key)),
+                        Some(&value),
+                        "case {}: scope attribute {key:?} must be promoted under {:?} carrying \
+                         its own value",
+                        case["id"],
+                        scope_label_key(&key)
+                    );
+                }
+            }
+        }
+        assert!(
+            asserted >= 4,
+            "only {asserted} scope attributes are covered; the corpus must keep the \
+             dotted, plain and digit-leading keys"
+        );
+        assert!(
+            doc["cases"]
+                .as_array()
+                .expect("cases")
+                .iter()
+                .any(|c| scope_attrs(c).iter().any(|(k, _)| k == "9scope")),
+            "the corpus must keep a digit-leading scope attribute: it is the only witness \
+             for the reference's prefix-then-sanitize order"
+        );
+    }
+
+    // (10c) `scope-name-gates-all`. The pair's scopes carry the same
+    // non-empty version and the same non-empty attribute set, and differ
+    // only in whether the scope NAME is empty. An empty name suppresses
+    // every scope label — not just `otel_scope_name`
+    // (`metrics_to_prw.go:447-450 @ v3.13.0` returns before any label is
+    // set). Predicates (10) and (10b) both pass an implementation that
+    // emits the version and the attributes under an empty name.
+    {
+        let p = find_pair(&doc, "scope-name-gates-all");
+        let base_scope = &p.base["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"];
+        let variant_scope = &p.variant["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"];
+        assert!(!base_scope["name"].as_str().expect("name").is_empty());
+        assert!(variant_scope["name"].as_str().expect("name").is_empty());
+        assert_eq!(base_scope["version"], variant_scope["version"]);
+        assert!(
+            !base_scope["version"].as_str().expect("version").is_empty(),
+            "the version must be non-empty in both, or its suppression proves nothing"
+        );
+        assert_eq!(scope_attrs(p.base), scope_attrs(p.variant));
+        assert!(
+            !scope_attrs(p.base).is_empty(),
+            "the attributes must be non-empty in both, or their suppression proves nothing"
+        );
+
+        // Base: the full set is present, each carrying its own value.
+        let mut required: Vec<String> = vec![
+            "otel_scope_name".to_string(),
+            "otel_scope_version".to_string(),
+        ];
+        required.extend(scope_attrs(p.base).iter().map(|(k, _)| scope_label_key(k)));
+        for labels in captured_metric_labels(p.base) {
+            for key in &required {
+                assert!(
+                    labels.contains_key(key),
+                    "pair scope-name-gates-all base: {key} must be promoted"
+                );
+            }
+        }
+        // Variant: NOT ONE `otel_scope_*` key survives.
+        for labels in captured_metric_labels(p.variant) {
+            let promoted: Vec<&String> = labels
+                .keys()
+                .filter(|k| k.starts_with("otel_scope_"))
+                .collect();
+            assert!(
+                promoted.is_empty(),
+                "pair scope-name-gates-all variant: an empty scope name suppresses ALL scope \
+                 metadata, but {promoted:?} survived"
+            );
+            assert!(
+                !labels.is_empty(),
+                "the variant must still emit its ordinary labels, or the absence check is \
+                 vacuous"
             );
         }
     }
@@ -945,7 +1187,7 @@ fn cases_json_binds_every_named_transformation() {
         let target = captured_target_info(p.variant);
         assert_eq!(target.len(), 1, "exactly one target_info series");
         let identifying = ["service.name", "service.namespace", "service.instance.id"];
-        let attrs: BTreeMap<String, String> = resource_attrs(p.variant).into_iter().collect();
+        let attrs = resource_attr_map(p.variant);
         let mut expected: BTreeMap<String, String> = attrs
             .iter()
             .filter(|(k, _)| !identifying.contains(&k.as_str()))
@@ -1038,7 +1280,7 @@ fn caller_supplied_job_and_instance_survive_when_the_derivation_is_empty() {
             .iter()
             .find(|c| c["id"] == json!(id))
             .unwrap_or_else(|| panic!("case {id} is missing"));
-        let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+        let attrs = resource_attr_map(case);
         // The antecedent is that the DERIVATION comes back empty, which is
         // weaker than "no service attribute at all": an empty
         // `service.name`, or a namespace with no name, reach it too.
@@ -1136,7 +1378,7 @@ fn the_job_composite_follows_the_references_sequence_in_every_case() {
             continue;
         }
         let id = case["id"].as_str().expect("id");
-        let attrs: BTreeMap<String, String> = resource_attrs(case).into_iter().collect();
+        let attrs = resource_attr_map(case);
         let Some(expected) = reference_job(&attrs) else {
             continue;
         };
@@ -1198,7 +1440,7 @@ fn a_caller_supplied_instance_reaches_target_info_but_not_the_metric_series() {
 
     // Derived: `service.instance.id` -> `instance`, on BOTH series.
     let derived = case("derived-instance-reaches-both-series");
-    let attrs: BTreeMap<String, String> = resource_attrs(&derived).into_iter().collect();
+    let attrs = resource_attr_map(&derived);
     let expected = attrs
         .get("service.instance.id")
         .expect("the case must carry service.instance.id");
@@ -1217,7 +1459,7 @@ fn a_caller_supplied_instance_reaches_target_info_but_not_the_metric_series() {
 
     // Caller-supplied on the resource: `target_info` only.
     let caller = case("caller-instance-reaches-only-target-info");
-    let attrs: BTreeMap<String, String> = resource_attrs(&caller).into_iter().collect();
+    let attrs = resource_attr_map(&caller);
     assert!(
         !attrs.contains_key("service.instance.id"),
         "the antecedent is that no service.instance.id is present"
@@ -1294,7 +1536,7 @@ fn target_info_eligibility_counts_raw_keys_not_surviving_labels() {
         "...and its label is then dropped, because the value is empty"
     );
     let expected_job =
-        reference_job(&variant_attrs.iter().cloned().collect()).expect("the variant derives a job");
+        reference_job(&resource_attr_map(p.variant)).expect("the variant derives a job");
     assert_eq!(
         target[0],
         BTreeMap::from([("job".to_string(), expected_job)]),
@@ -1329,7 +1571,7 @@ fn identifying_attributes_are_consumed_and_empty_values_are_dropped() {
 
     // (1) Consumed, not emitted — and derived from this case's own input.
     let consumed = case("identifying-resource-attributes-are-consumed-not-emitted");
-    let attrs: BTreeMap<String, String> = resource_attrs(&consumed).into_iter().collect();
+    let attrs = resource_attr_map(&consumed);
     let target = captured_target_info(&consumed);
     assert_eq!(target.len(), 1);
     for key in ["service.name", "service.namespace", "service.instance.id"] {
@@ -1577,9 +1819,21 @@ fn capture_cases_json() {
     // historical anchor is refused by any warmed server.
     let anchor_s = now_s - 120;
 
+    // `PULSUS_CAPTURE_ONLY=<id>[,<id>...]` re-captures a subset against a
+    // single container, for a change that alters only some payloads. Unset,
+    // every case is captured and all five endpoints are required.
+    let only: Option<BTreeSet<String>> = std::env::var("PULSUS_CAPTURE_ONLY")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+
     let mut build_info: Option<Value> = None;
     let cases = doc["cases"].as_array_mut().expect("cases");
     for (index, case) in cases.iter_mut().enumerate() {
+        if let Some(only) = &only
+            && !only.contains(case["id"].as_str().expect("id"))
+        {
+            continue;
+        }
         let Some(endpoint) = endpoint_for(case) else {
             panic!("no capture endpoint configured for case {}", case["id"]);
         };
@@ -1701,7 +1955,7 @@ fn capture_cases_json() {
 
     doc["captured_from"] = json!({
         "image": "docker.io/prom/prometheus:v3.13.0",
-        "buildinfo": build_info.expect("at least one case")["data"],
+        "buildinfo": build_info.expect("at least one case was captured")["data"],
         "route": "POST /api/v1/otlp/v1/metrics",
         "read_back": "GET /api/v1/series + GET /api/v1/query last_over_time(..[1ms])",
     });
@@ -1957,6 +2211,15 @@ const LEDGER_ROWS: &[LedgerRow] = &[
             "write_otlp_handler.go:132-138",
             ":177-189",
             "otlp-delta-partial-success",
+            // AC18. Three separable claims, each needed: a request that
+            // rejects one series commits nothing (atomicity), a request
+            // mixing accepted and rejected series still counts only the
+            // rejected ones (line count), and the answer carries no OTLP
+            // envelope (absent body). A row stating any two of the three
+            // leaves the third unpublished.
+            "including otherwise valid siblings",
+            "accepted siblings do not affect the line count",
+            "`accepted`, `rejected` and `message` absent",
         ],
     },
     LedgerRow {
@@ -2238,6 +2501,201 @@ fn api_md_documents_the_fault_model() {
     assert!(
         section.contains("target_info") && section.contains("`job`"),
         "§1.1 must document the model that replaced it"
+    );
+}
+
+// ---------------------------------------------------------------------
+// AC12 — the scope predicates on the canonicalizer's reuse
+
+/// The workspace crates whose `src/` this gate walks, and the symbol it
+/// tracks: `pulsus_model::canonicalize_label_key`, the sole authority for
+/// turning an OTel attribute key into a Prometheus-style label name.
+const CANONICALIZER: &str = "canonicalize_label_key";
+
+/// Every file under `crates/*/src/` with a **production** call to
+/// [`CANONICALIZER`], derived from the tree under test.
+///
+/// "Production" is everything before the file's first `#[cfg(test)]` line —
+/// the same rule plan v23 Δ76 used to classify `label_name.rs:253` as
+/// test-only. A call is the symbol followed by `(`, or the symbol passed as
+/// a function value to `group_by`; a doc comment, a `use`, a `pub use` and
+/// the function's own definition are not calls, which is why the list below
+/// is shorter than a raw grep.
+fn production_canonicalizer_callers() -> BTreeSet<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files: Vec<String> = Vec::new();
+    collect_rs_under_src(&root.join("crates"), &root, &mut files);
+    let mut callers = BTreeSet::new();
+    for relative in files {
+        let text = std::fs::read_to_string(root.join(&relative)).expect("read source");
+        for line in production_lines(&text) {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // The DEFINITION is not a call: `canonical.rs` would otherwise
+            // list itself as its own caller.
+            if trimmed.starts_with(&format!("pub fn {CANONICALIZER}(")) {
+                continue;
+            }
+            let calls = line.contains(&format!("{CANONICALIZER}("))
+                || line.contains(&format!("group_by(pairs, {CANONICALIZER})"));
+            if calls {
+                callers.insert(relative.clone());
+                break;
+            }
+        }
+    }
+    callers
+}
+
+/// The lines of `text` before its first `#[cfg(test)]`.
+fn production_lines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            break;
+        }
+        out.push(line);
+    }
+    out
+}
+
+fn collect_rs_under_src(dir: &Path, root: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if name == "target" || name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_rs_under_src(&path, root, out);
+        } else if name.ends_with(".rs") {
+            let relative = path
+                .strip_prefix(root)
+                .expect("under the workspace root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            // `crates/<crate>/src/...` only: `tests/`, `benches/` and
+            // `xtask/` are not production code.
+            if relative.starts_with("crates/") && relative.contains("/src/") {
+                out.push(relative);
+            }
+        }
+    }
+}
+
+/// The production callers this change expects. Derived once by
+/// [`production_canonicalizer_callers`] and asserted as an **equality**, so
+/// a list computed at any other revision fails — which is the whole point:
+/// a caller added or removed anywhere in the workspace has to be looked at,
+/// not silently absorbed.
+const CANONICALIZER_CALLERS: &[&str] = &[
+    "crates/pulsus-model/src/labels.rs",
+    "crates/pulsus-write/src/protocols/otlp_logs.rs",
+    "crates/pulsus-write/src/protocols/prom_metric_name.rs",
+    "crates/pulsus-write/src/protocols/service_name.rs",
+];
+
+/// AC12. Three static predicates on the new module's reuse of the shared
+/// canonicalizer, and **nothing else**.
+///
+/// 1. the production call site exists in the new module;
+/// 2. the caller list is derived at the head under test and contains that
+///    site by name;
+/// 3. no aliasing import of the symbol exists under `crates/*/src/`.
+///
+/// **What this criterion does not assert.** It says nothing about
+/// behaviour: not that the call is reached, not that its result is
+/// consumed, and not that the output is right.
+/// `corpus_matches_prometheus_v3_13_0` is the criterion that carries that,
+/// and it is the one measured to catch a divergent mapping — a
+/// re-implementation grafted into the real code reddened 37 of the 94 cases
+/// the review replayed.
+///
+/// **Why it is only three predicates.** Four cheaper gates were written and
+/// each was falsified in turn: a modification-only scope, defeated by a
+/// re-implementation that never calls; a call-site assertion, defeated by a
+/// syntactic call whose result is discarded; a pinned twelve-element sample
+/// plus dataflow, defeated by delegating for exactly the pinned inputs; and
+/// a generated input domain, defeated by delegating for all inputs of
+/// eleven characters or fewer. Two further results closed the argument: a
+/// branch placed *before* the call bypasses a single-call-site leg, and an
+/// indirect function-pointer call passes a no-alias assertion. Those four
+/// gates are withdrawn, not narrowed.
+///
+/// **The two properties, kept apart because they have different answers:**
+///
+/// | property | statically enforceable? |
+/// |---|---|
+/// | **canonicalizer provenance** — the namer's escaping is *the* canonicalizer's and not a second spelling | **yes**, by an opaque newtype; reopenable |
+/// | **external reference fidelity** — our canonicalizer agrees with Prometheus v3.13.0 | **no**, by any static means; belongs to the corpus |
+///
+/// An escaped-label newtype whose only constructor is `canonicalize_label_key`,
+/// required by the emitter's signature, makes a second escaping spelling
+/// *unrepresentable* rather than merely detectable, and every one of the
+/// four escapes becomes a type error. It costs the type in `pulsus-model`,
+/// privatising the raw-`String` escape hatch, and threading the production
+/// call sites on the logs and metrics paths — today both
+/// `canonicalize_label_key` and the namer's `build` return a bare `String`
+/// (`canonical.rs:26`, `prom_metric_name.rs:372`) and no such type exists in
+/// the workspace. **It is not done in this change**, and that is a scope
+/// decision. Recorded as follow-up A on issue #461.
+#[test]
+fn the_label_namer_reuses_the_shared_canonicalizer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    const NEW_MODULE: &str = "crates/pulsus-write/src/protocols/prom_metric_name.rs";
+
+    // (1) The production call site exists in the new module.
+    let module = std::fs::read_to_string(root.join(NEW_MODULE)).expect("read the new module");
+    let call_lines: Vec<&str> = production_lines(&module)
+        .into_iter()
+        .filter(|l| l.contains(&format!("{CANONICALIZER}(")) && !l.trim_start().starts_with("//"))
+        .collect();
+    assert_eq!(
+        call_lines.len(),
+        1,
+        "{NEW_MODULE} must carry exactly one production call to {CANONICALIZER}, found \
+         {call_lines:?}"
+    );
+
+    // (2) The caller list is derived at the head under test, and the new
+    // module is in it by name.
+    let derived = production_canonicalizer_callers();
+    assert!(
+        derived.contains(NEW_MODULE),
+        "the derived caller list does not contain {NEW_MODULE}: {derived:?}"
+    );
+    let expected: BTreeSet<String> = CANONICALIZER_CALLERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(
+        derived, expected,
+        "the caller list derived from this tree is not the one recorded; a caller added or \
+         removed anywhere under crates/*/src/ has to be looked at"
+    );
+
+    // (3) No aliasing import of the symbol under `crates/*/src/`. A second
+    // name for one function is a second spelling waiting to drift.
+    let mut files: Vec<String> = Vec::new();
+    collect_rs_under_src(&root.join("crates"), &root, &mut files);
+    let mut aliases: Vec<String> = Vec::new();
+    for relative in &files {
+        let text = std::fs::read_to_string(root.join(relative)).expect("read source");
+        for (n, line) in text.lines().enumerate() {
+            if line.contains(&format!("{CANONICALIZER} as ")) {
+                aliases.push(format!("{relative}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        aliases.is_empty(),
+        "the canonicalizer is imported under a second name: {aliases:?}"
     );
 }
 

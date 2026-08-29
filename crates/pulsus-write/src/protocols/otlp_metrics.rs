@@ -3333,6 +3333,95 @@ mod tests {
         assert_eq!(target_info_timestamps(&out), vec![BASE]);
     }
 
+    /// **`target_info`'s first gate is arithmetic on ENTRIES, not set
+    /// membership on keys.** `attributes.Len()` minus one per present
+    /// identifying KIND (`helper.go:509-519 @ v3.13.0`: the loop is over
+    /// the three kinds and `Get` is a membership test, so each kind
+    /// decrements at most once).
+    ///
+    /// The discriminating pair is one `service.name` entry versus two, and
+    /// nothing else. Both derive the same `job` and store the same metric
+    /// series; only the second emits a `target_info`. A gate written as
+    /// "is any key outside the identifying three present", or as a count
+    /// of DISTINCT keys, answers both the same way and is wrong for the
+    /// second — and would pass every other case in the corpus.
+    #[test]
+    fn target_info_gate_counts_attribute_entries_not_distinct_keys() {
+        let one = |attributes: Vec<KeyValue>| {
+            super::parse(
+                &one_metric_request(
+                    Some(Resource {
+                        attributes,
+                        dropped_attributes_count: 0,
+                        entity_refs: vec![],
+                    }),
+                    gauge_metric("g", number_dp(1, 1.0, vec![])),
+                ),
+                0,
+                MetricIngestSettings::default(),
+            )
+            .expect("within the expansion budget")
+        };
+        let target_info_labels = |out: &ParsedMetrics| -> Vec<Vec<(String, String)>> {
+            out.series
+                .iter()
+                .filter(|s| &*s.metric_name == "target_info")
+                .map(|s| {
+                    s.labels
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                })
+                .collect()
+        };
+
+        // One entry: 1 - 1 = 0, blocked.
+        let single = one(vec![kv("service.name", Value::StringValue("DUP".into()))]);
+        assert!(
+            target_info_labels(&single).is_empty(),
+            "one identifying entry leaves nothing non-identifying"
+        );
+
+        // Two entries of the SAME key: 2 - 1 = 1, admitted — and `job`
+        // comes from the FIRST entry, as `pcommon.Map.Get` does.
+        let duplicated = one(vec![
+            kv("service.name", Value::StringValue("DUP".into())),
+            kv("service.name", Value::StringValue("DUP-SECOND".into())),
+        ]);
+        assert_eq!(
+            target_info_labels(&duplicated),
+            vec![vec![("job".to_string(), "DUP".to_string())]],
+            "a repeated identifying entry is still an entry, and the first value wins"
+        );
+
+        // The metric series is identical either way, so `target_info` is
+        // the only observable difference between the two.
+        let metric_labels = |out: &ParsedMetrics| {
+            out.series
+                .iter()
+                .find(|s| &*s.metric_name == "g")
+                .expect("the gauge series")
+                .labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(metric_labels(&single), metric_labels(&duplicated));
+
+        // Gate A and gate B are independent: two `service.namespace`
+        // entries clear A (2 - 1 = 1) and are then blocked by B, because a
+        // namespace with no name derives no `job` and there is no
+        // `instance`.
+        let namespace_only = one(vec![
+            kv("service.namespace", Value::StringValue("NS-FIRST".into())),
+            kv("service.namespace", Value::StringValue("NS-SECOND".into())),
+        ]);
+        assert!(
+            target_info_labels(&namespace_only).is_empty(),
+            "clearing the entry-count gate is not enough; an identifier is also required"
+        );
+    }
+
     /// `target_info` is deduplicated by `(labels, timestamp)` across the
     /// whole batch (`helper.go:569-585`), so two `ResourceMetrics` with the
     /// same resource at the same instant produce one sample, not two.
