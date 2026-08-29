@@ -1103,6 +1103,28 @@ jobs:
       # rule enforceable rather than advisory; see
       # `check_f_marked_regions_state_no_corpus_count`.
       # corpus-counts: end (ci-replay-leg)
+      # Issue #463: the `categorize-labels` capture drift leg. Re-pushes
+      # every probe of pulsus-server/tests/fixtures/categorize_labels/
+      # capture.json to this job's reference container, TWICE at least two
+      # seconds apart, and asserts (a) the two runs project identically —
+      # which catches a wall-clock dependence whatever produced it, with
+      # no list of time functions to keep current — and (b) the fresh
+      # answers match the committed capture. Like the #287 and #381 legs
+      # above it compares VALUES, not just HTTP status; the hermetic legs
+      # of the same file run in the plain `ci` job.
+      #
+      # It is the only leg on this container that opens a WEBSOCKET: the
+      # tail probes carry a request header, which is exactly what a
+      # browser cannot do, so this surface has no client and is covered
+      # here or nowhere. Eighteen tail probes with a six-second
+      # post-connect drain each dominate the runtime (~6 min per pass,
+      # ~12 min for the double run); it runs last on this container for
+      # that reason.
+      - name: LogQL categorize-labels capture drift leg (issue #463)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-server --test categorize_labels_differential -- --test-threads=1
+
       - name: LogQL corpus replay leg (issue #352, nightly)
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         env:
