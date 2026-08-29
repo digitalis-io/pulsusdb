@@ -1974,3 +1974,212 @@ fn the_native_route_and_the_alias_agree_byte_for_byte() {
     }
     eprintln!("#463 alias parity: both routes, both surfaces, both header settings agree");
 }
+
+/// **Criterion 17 — the categorised TAIL, on the shape a metadata-only
+/// probe cannot see.**
+///
+/// The fixture is the interleaved one: two streams differing in one
+/// label, three entries interleaved in time, each carrying structured
+/// metadata AND a parsed result. Four things are asserted about the
+/// whole frame, and each is a defect a narrower probe would miss:
+///
+/// * three stream objects, one per entry, in strict timestamp order —
+///   a renderer that grouped by label set would emit two and render the
+///   rows out of order, which is what a tail view would display;
+/// * each entry's `structuredMetadata` AND `parsed` present and exact —
+///   a renderer that dropped a category object passes the header table,
+///   the arity matrix and the position gate, and reds only here;
+/// * every entry, not the first — a parser-conditional renderer that
+///   kept one and dropped a later one is the shape a one-entry probe
+///   structurally cannot see;
+/// * the advertisement LAST, which is where the reference puts it on
+///   this envelope and the opposite of where the query response puts it.
+///
+/// **What it still does not cover:** an object whose category contents
+/// are right but whose key order or escaping differs, and any surface
+/// with no probe. One witness closes one shape.
+#[test]
+fn the_categorised_tail_frame_is_per_entry_ordered_and_carries_both_categories() {
+    if !pulsus_testkit::live_clickhouse_enabled() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_categorize_labels_tail_it");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(drop_db(&db));
+    let _server = spawn_pulsus(&db);
+    let base_url = format!("http://127.0.0.1:{PULSUS_PORT}");
+
+    let nonce = format!("{}t", now_ns() / 1_000_000_000);
+    let app = format!("tail{nonce}");
+    let base_ns = now_ns() - 30_000_000_000;
+    push(
+        &base_url,
+        &format!(
+            concat!(
+                r#"{{"streams":["#,
+                r#"{{"stream":{{"app":"{app}","env":"prod"}},"values":["#,
+                r#"["{a1}","k=A1",{{"trace_id":"sm-a1"}}],"#,
+                r#"["{a3}","k=A3",{{"trace_id":"sm-a3"}}]"#,
+                r#"]}},"#,
+                r#"{{"stream":{{"app":"{app}","env":"staging"}},"values":["#,
+                r#"["{b2}","k=B2",{{"trace_id":"sm-b2"}}]"#,
+                r#"]}}"#,
+                r#"]}}"#
+            ),
+            app = app,
+            a1 = base_ns,
+            b2 = base_ns + 1,
+            a3 = base_ns + 2,
+        ),
+    );
+
+    let selector = format!(r#"{{app="{app}"}} | logfmt"#);
+    let target = format!(
+        "/loki/api/v1/tail?query={}&limit=100&delay_for=0&start={}",
+        urlencode(&selector),
+        base_ns - 1_000_000_000
+    );
+    let mut client =
+        ws::Client::connect("127.0.0.1", PULSUS_PORT, &target, Some("categorize-labels"));
+    let frames = client.collect(std::time::Instant::now() + Duration::from_secs(10));
+    assert!(!frames.is_empty(), "the tail produced no frame at all");
+
+    // The advertisement is LAST on this envelope.
+    for f in &frames {
+        let streams_at = f.find(r#""streams""#).expect("streams key");
+        let total_at = f.find(r#""dropped_total""#).expect("dropped_total key");
+        let flag_at = f.find(r#""encodingFlags""#).expect("the frame advertises");
+        assert!(
+            streams_at < total_at && total_at < flag_at,
+            "the tail envelope's key order moved: {f}"
+        );
+    }
+
+    let projected = ordered_json::parse(&project_tail(&frames, &nonce)).expect("projection");
+    let objs = projected
+        .get("streams")
+        .and_then(Json::arr)
+        .expect("streams array");
+    assert_eq!(
+        objs.len(),
+        3,
+        "the categorised tail emits ONE stream object per entry: {}",
+        projected.render()
+    );
+    assert!(
+        strictly_increasing(&timestamps(&projected)),
+        "the objects are not in timestamp order: {}",
+        projected.render()
+    );
+
+    // Object order: prod, staging, prod — the same map on either side of
+    // a different one, which is what a label-set grouping cannot produce.
+    let envs: Vec<&str> = objs
+        .iter()
+        .map(|o| {
+            o.get("stream")
+                .and_then(|s| s.get("env"))
+                .and_then(Json::str)
+                .expect("env")
+        })
+        .collect();
+    assert_eq!(envs, vec!["prod", "staging", "prod"]);
+
+    // Every entry carries BOTH category objects, exactly.
+    let expected = [
+        (r#"{"trace_id":"sm-a1"}"#, r#"{"k":"A1"}"#),
+        (r#"{"trace_id":"sm-b2"}"#, r#"{"k":"B2"}"#),
+        (r#"{"trace_id":"sm-a3"}"#, r#"{"k":"A3"}"#),
+    ];
+    for (i, (o, (sm, parsed))) in objs.iter().zip(expected).enumerate() {
+        let third = o
+            .get("values")
+            .and_then(Json::arr)
+            .and_then(|v| v.first())
+            .and_then(Json::arr)
+            .and_then(|e| e.get(2))
+            .unwrap_or_else(|| panic!("entry {i} has no third element"));
+        assert_eq!(
+            third.get("structuredMetadata").map(Json::render).as_deref(),
+            Some(sm),
+            "entry {i}: structuredMetadata"
+        );
+        assert_eq!(
+            third.get("parsed").map(Json::render).as_deref(),
+            Some(parsed),
+            "entry {i}: parsed"
+        );
+        // `structuredMetadata` before `parsed`, which the object's own
+        // rendered order carries.
+        let rendered = third.render();
+        assert!(
+            rendered.find("structuredMetadata") < rendered.find("parsed"),
+            "entry {i}: the two category objects are in the wrong order: {rendered}"
+        );
+    }
+    eprintln!("#463 categorised tail: three per-entry objects, both categories, flag last");
+}
+
+/// **Our echo is deterministic, in first-occurrence request order.**
+///
+/// The drift leg compares a multi-token echo as a sorted multiset,
+/// because the reference's order is a map walk. That weakens what is
+/// asserted about the REFERENCE; this is what keeps the same weakening
+/// from reaching our own output.
+#[test]
+fn our_echo_is_in_first_occurrence_request_order() {
+    if !pulsus_testkit::live_clickhouse_enabled() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_categorize_labels_echo_it");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(drop_db(&db));
+    let _server = spawn_pulsus(&db);
+    let base_url = format!("http://127.0.0.1:{PULSUS_PORT}");
+    let nonce = format!("{}e", now_ns() / 1_000_000_000);
+    let base_ns = now_ns() - 60_000_000_000;
+    push(&base_url, &push_body(&nonce, base_ns));
+    let (start, end) = probe_window(base_ns);
+
+    for (sent, expected) in [
+        ("categorize-labels,foo", r#"["categorize-labels","foo"]"#),
+        ("foo,categorize-labels", r#"["foo","categorize-labels"]"#),
+        (
+            "foo,,categorize-labels",
+            r#"["foo","","categorize-labels"]"#,
+        ),
+        (
+            "foo,categorize-labels,foo",
+            r#"["foo","categorize-labels"]"#,
+        ),
+    ] {
+        let (status, body) = curl(&[
+            "-G",
+            "-H",
+            &format!("X-Loki-Response-Encoding-Flags: {sent}"),
+            "--data-urlencode",
+            &format!(r#"query={{app="co{nonce}"}}"#),
+            "--data-urlencode",
+            &format!("start={start}"),
+            "--data-urlencode",
+            &format!("end={end}"),
+            "--data-urlencode",
+            "limit=100",
+            &format!("{base_url}/loki/api/v1/query_range"),
+        ]);
+        assert_eq!(status, 200, "{sent}: {body}");
+        assert!(
+            body.contains(&format!(r#""encodingFlags":{expected}"#)),
+            "{sent}: the echo is not in first-occurrence request order: {body}"
+        );
+    }
+    eprintln!("#463 echo order: four multi-token headers, all in request order");
+}
