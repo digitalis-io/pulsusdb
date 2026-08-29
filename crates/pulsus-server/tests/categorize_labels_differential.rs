@@ -1781,6 +1781,7 @@ const REPLAY_PORT: u16 = 31_460;
 const ALIAS_PORT: u16 = 31_461;
 const TAIL_PORT: u16 = 31_462;
 const ECHO_PORT: u16 = 31_463;
+const GRANULARITY_PORT: u16 = 31_464;
 
 struct ChildGuard(std::process::Child);
 
@@ -2233,6 +2234,99 @@ fn the_categorised_tail_frame_is_per_entry_ordered_and_carries_both_categories()
         );
     }
     eprintln!("#463 categorised tail: three per-entry objects, both categories, flag last");
+}
+
+/// **Issue #469's criterion 9 — the UNFLAGGED tail frame equals the
+/// captured reference's, object for object.**
+///
+/// `T17` is the granularity witness: two streams differing in one label,
+/// entries interleaved in time, no pipeline and no header. Until issue
+/// #469 this probe was a DIVERGENCE witness — the reference split and we
+/// packed, and the `tail-stream-object-granularity-unflagged` ledger row
+/// recorded it. It is now a replay: our `streams` array must equal the
+/// captured one after the same nonce absorption and timestamp rebasing
+/// every tail projection in this file uses.
+///
+/// **Why the no-pipeline frame and not `T16`.** With `| logfmt` the
+/// parsed label folds into `stream`, the three maps are already
+/// distinct, and a renderer that grouped by label set would emit three
+/// objects too — `T16` cannot tell the two behaviours apart, which
+/// [`the_witness_frames_show_what_their_ledger_rows_say`] asserts about
+/// the capture directly. `T17`'s identical `prod` map on either side of
+/// `staging` is what discriminates.
+///
+/// # The witness form
+///
+/// **Pre-registered-stream**: the rows are pushed FIRST and the socket
+/// then opens with a `start` behind them, so one catch-up slice returns
+/// all three in one page. The capture's own `T17` leg is the live form
+/// against the reference; what is compared here is the RENDERED FRAME,
+/// and the delivery path is only how the rows arrive. The fresh-stream
+/// form was measured on issue #463 to produce no frame at all inside
+/// either a 10 s or a 30 s window — a visibility failure wearing a
+/// correctness failure's clothes.
+#[test]
+fn pulsus_replays_the_granularity_witness_frame_object_for_object() {
+    if !pulsus_testkit::live_clickhouse_enabled() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_categorize_labels_granularity_it");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(drop_db(&db));
+    let _server = spawn_pulsus(&db, GRANULARITY_PORT);
+    let base_url = format!("http://127.0.0.1:{GRANULARITY_PORT}");
+
+    // The capture's own app spelling, so the nonce absorption lands on
+    // the same bytes: `t{nonce}{id}` (see `run_tail_probe`).
+    let nonce = format!("{}g", now_ns() / 1_000_000_000);
+    let app = format!("t{nonce}t17");
+    let base_ns = now_ns() - 30_000_000_000;
+    push(
+        &base_url,
+        &tail_push_body(&app, TailFixture::Interleaved, base_ns),
+    );
+
+    let selector = format!(r#"{{app="{app}"}}"#);
+    let target = format!(
+        "/loki/api/v1/tail?query={}&limit=100&delay_for=0&start={}",
+        urlencode(&selector),
+        base_ns - 1_000_000_000
+    );
+    let mut client = ws::Client::connect("127.0.0.1", GRANULARITY_PORT, &target, None);
+    let frames = client.collect(std::time::Instant::now() + Duration::from_secs(10));
+    assert!(!frames.is_empty(), "the tail produced no frame at all");
+
+    let ours = project_tail(&frames, &nonce);
+    assert_eq!(
+        ours,
+        capture::probe("T17").projection,
+        "our unflagged tail frame differs from the captured reference's"
+    );
+
+    // Stated separately, because equality alone would pass on two
+    // frames reordered identically: the objects are in strict timestamp
+    // order and the identical map appears twice around a different one.
+    let projected = ordered_json::parse(&ours).expect("projection");
+    let objs = projected
+        .get("streams")
+        .and_then(Json::arr)
+        .expect("streams array");
+    assert_eq!(objs.len(), 3, "one object per entry: {ours}");
+    assert!(
+        strictly_increasing(&timestamps(&projected)),
+        "the objects are not in timestamp order: {ours}"
+    );
+    let maps: Vec<String> = objs
+        .iter()
+        .map(|o| o.get("stream").map(Json::render).unwrap_or_default())
+        .collect();
+    assert_eq!(maps[0], maps[2], "the first and third maps must be equal");
+    assert_ne!(maps[0], maps[1], "with a different one between them");
+    eprintln!("#469 granularity replay: our T17 frame equals the captured reference's");
 }
 
 /// **Our echo is deterministic, in first-occurrence request order.**

@@ -415,16 +415,25 @@ enum LabelBytes {
     Verbatim,
 }
 
-/// Renders one stream item into ONE buffer (issue #312): entry framing,
-/// timestamps and JSON-escaped lines are written in place, so no
-/// per-entry `String` and no whole-item second copy is ever live.
+/// Renders ONE stream object into ONE buffer (issue #312): entry
+/// framing, timestamps and JSON-escaped lines are written in place, so
+/// no per-entry `String` and no whole-item second copy is ever live.
+///
+/// `entries` is the half-open range of `s.entries` this OBJECT carries —
+/// the whole stream on the query envelope (`ObjectGranularity::PerStream`)
+/// and one entry on the tail (`PerEntry`, issue #469). It is an ABSOLUTE
+/// range into `StreamResult::entries`, and `s.categories` is indexed with
+/// the same numbers, so a split object's third elements stay the ones
+/// belonging to its own entries. A relative index would desynchronise the
+/// two vectors on every object after the first.
 ///
 /// Two production callers, and they ask for different label bytes —
-/// [`render_stream_item`] (the query response) and [`tail_frame`] (the
-/// WebSocket frame). See [`LabelBytes`].
+/// [`item_chunk`] (the query response) and [`tail_frame`] (the WebSocket
+/// frame). See [`LabelBytes`].
 fn render_stream_item_into(
     out: &mut Vec<u8>,
     s: &StreamResult,
+    entries: std::ops::Range<usize>,
     labels: LabelBytes,
     categorize: categorize::Categorize,
 ) {
@@ -437,8 +446,9 @@ fn render_stream_item_into(
         LabelBytes::Verbatim => out.extend_from_slice(s.labels_json.as_bytes()),
     }
     out.extend_from_slice(b",\"values\":[");
-    for (i, (ts, line)) in s.entries.iter().enumerate() {
-        if i > 0 {
+    let first = entries.start;
+    for (n, (ts, line)) in s.entries[entries].iter().enumerate() {
+        if n > 0 {
             out.push(b',');
         }
         out.extend_from_slice(b"[\"");
@@ -452,7 +462,7 @@ fn render_stream_item_into(
             // `WireArity::Three`, so the index is in range — but a
             // missing element would still render `,{}` rather than a
             // two-element entry inside a body that advertised three.
-            match s.categories.get(i) {
+            match s.categories.get(first + n) {
                 Some(cats) => write_third_element(out, cats),
                 None => out.extend_from_slice(THIRD_ELEMENT_EMPTY.as_bytes()),
             }
@@ -473,7 +483,10 @@ fn render_stream_item_into(
 /// the source-scan gate.
 fn item_chunk(w: categorize::ItemWriter, s: &StreamResult) -> Vec<u8> {
     let mut chunk: Vec<u8> = Vec::with_capacity(w.estimate(s));
-    w.write(&mut chunk, s);
+    // The query envelope plans [`ObjectGranularity::PerStream`], whose
+    // object for this item is its whole entry range — so the chunk is
+    // one object carrying every entry, exactly as before issue #469.
+    w.write(&mut chunk, s, 0..s.entries.len());
     chunk
 }
 
@@ -486,9 +499,11 @@ fn item_chunk(w: categorize::ItemWriter, s: &StreamResult) -> Vec<u8> {
 /// from the data**, and both the advertisement and the per-item renderer
 /// are derived from that one value.
 mod categorize {
+    use std::ops::Range;
+
     use super::{
-        EntryCategories, LabelBytes, StreamResult, WireArity, render_stream_item_into,
-        stream_item_estimate, third_element_estimate,
+        LabelBytes, StreamResult, WireArity, render_stream_item_into, stream_item_estimate,
+        third_element_estimate,
     };
 
     /// The token the reference switches on
@@ -568,22 +583,26 @@ mod categorize {
             ItemWriter { labels, categorize }
         }
 
+        /// The whole stream's rendered size — the query envelope's
+        /// object, which carries every entry.
         pub(super) fn estimate(self, s: &StreamResult) -> usize {
-            stream_item_estimate(s) + self.third_element_bytes(s)
+            stream_item_estimate(s) + self.third_element_bytes(s, 0..s.entries.len())
         }
 
-        /// What this stream's THIRD ELEMENTS add to the rendered size —
-        /// `0` when the decision is off, so a caller that reserves with
-        /// its own base formula stays exactly as it was on the plain
-        /// path.
-        pub(super) fn third_element_bytes(self, s: &StreamResult) -> usize {
+        /// What the THIRD ELEMENTS of `entries` add to the rendered size
+        /// — `0` when the decision is off, so a caller that reserves
+        /// with its own base formula stays exactly as it was on the
+        /// plain path.
+        ///
+        /// The range is ABSOLUTE into `s.entries`/`s.categories` (issue
+        /// #469), so a per-entry tail object reserves for its own third
+        /// element rather than for the first one's.
+        pub(super) fn third_element_bytes(self, s: &StreamResult, entries: Range<usize>) -> usize {
             if !self.categorize.is_on() {
                 return 0;
             }
-            s.entries
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
+            entries
+                .map(|i| {
                     s.categories
                         .get(i)
                         .map_or(super::THIRD_ELEMENT_EMPTY.len(), third_element_estimate)
@@ -591,19 +610,9 @@ mod categorize {
                 .sum::<usize>()
         }
 
-        pub(super) fn write(self, out: &mut Vec<u8>, s: &StreamResult) {
-            render_stream_item_into(out, s, self.labels, self.categorize);
+        pub(super) fn write(self, out: &mut Vec<u8>, s: &StreamResult, entries: Range<usize>) {
+            render_stream_item_into(out, s, entries, self.labels, self.categorize);
         }
-    }
-
-    /// One entry lifted out of its stream, for the categorised tail's
-    /// per-entry stream objects.
-    pub(super) struct LiftedEntry {
-        pub(super) timestamp_ns: i64,
-        pub(super) labels_json: String,
-        pub(super) fingerprint: u64,
-        pub(super) line: String,
-        pub(super) categories: EntryCategories,
     }
 }
 
@@ -628,6 +637,178 @@ enum StreamsEnvelope<'a> {
     },
 }
 
+/// How a streams body is cut into `{"stream":…,"values":[…]}` objects.
+///
+/// **A property of the WIRE SURFACE, never of a request flag** (issue
+/// #469). Measured on the pinned reference: the SAME fixture — two
+/// streams differing in one label, entries interleaved in time — comes
+/// back PACKED on `/loki/api/v1/query_range` (two objects) and SPLIT on
+/// `/loki/api/v1/tail` (three objects, the identical map twice with the
+/// other between), on one container at one moment. The mechanism is
+/// `pkg/querier/tail/tail.go:114-125 @ grafana/loki v3.7.4 b318f282`,
+/// which appends one `logproto.Stream` per entry as it pops the oldest
+/// from the merge iterator, with no grouping on that path.
+///
+/// It matters on the tail and nowhere else because the datasource's tail
+/// consumer walks OBJECTS first and VALUES second
+/// (`src/liveStreamsResultTransformer.ts` `appendResponseToBufferedData`,
+/// Grafana Loki datasource `d29b0ce`), so packing two of one stream's
+/// entries around another stream's renders the lines out of order on
+/// screen. The query response's consumer does not.
+///
+/// Derived from [`StreamsEnvelope`] by [`ObjectGranularity::of`] and by
+/// nothing else — in particular NOT from `categorize-labels`, which
+/// issue #463 had it conditioned on: an operator-configured proxy header
+/// is the only way that flag reaches this route, so a flag-conditional
+/// split fixed a path no default client takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectGranularity {
+    /// One object per stream, carrying all of its entries in the order
+    /// the caller sorted `items` into. The query response.
+    PerStream,
+    /// One object per ENTRY, ordered by `(timestamp_ns, labels_json,
+    /// fingerprint, entry_index)`. The tail frame.
+    PerEntry,
+}
+
+impl ObjectGranularity {
+    /// The ONE place granularity is decided. Total over the envelope, so
+    /// a third wire surface has to answer this question to compile.
+    fn of(env: &StreamsEnvelope<'_>) -> Self {
+        match env {
+            StreamsEnvelope::Query { .. } => ObjectGranularity::PerStream,
+            StreamsEnvelope::Tail { .. } => ObjectGranularity::PerEntry,
+        }
+    }
+}
+
+/// Which stream supplies an object's label map, and which of that
+/// stream's entries the object carries.
+///
+/// `first_entry` is an ABSOLUTE index into `StreamResult::entries`, so
+/// the parallel `categories` vector is indexed with the same number
+/// (issue #463's third element). A relative index, or a renderer that
+/// re-zeroed per object, would give every split object after the first
+/// the wrong entry's metadata.
+///
+/// `u32` and not `usize`: the plan is 12 bytes per entry rather than 24,
+/// and both indices are bounded far below `u32::MAX` on the only surface
+/// that materialises one — a tail poll's page is capped by
+/// `reader.tail_max_fetch_limit` (docs/configuration.md §6), which
+/// clamps at 5 000 entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamObject {
+    stream: u32,
+    first_entry: u32,
+    entries: u32,
+}
+
+impl StreamObject {
+    /// The absolute half-open range of `StreamResult::entries` this
+    /// object renders.
+    fn range(self) -> std::ops::Range<usize> {
+        let first = self.first_entry as usize;
+        first..first + self.entries as usize
+    }
+}
+
+/// The objects a streams body renders, and the only thing that consults
+/// [`ObjectGranularity`].
+enum ObjectPlan {
+    /// The identity plan — object `i` is item `i`'s whole entry range,
+    /// SYNTHESISED ON DEMAND. Allocates nothing, so the query envelope
+    /// cannot pay for this issue (criterion 11a).
+    PerStream,
+    /// One object per entry, materialised once and sorted.
+    PerEntry(Vec<StreamObject>),
+}
+
+impl ObjectPlan {
+    /// Builds the plan. Deterministic, and — for `PerEntry` — total up
+    /// to byte-identical output.
+    ///
+    /// **The comparator.** `(timestamp_ns, labels_json, fingerprint,
+    /// entry_index)`. The timestamp is the reference's own order; the
+    /// rest is our own deterministic tiebreak, because the reference's
+    /// equal-timestamp order within a stream is the order the entries
+    /// were appended in and we store no ordinal — the standing
+    /// `timestamp-tie-order` divergence. Measured: on a fixture whose
+    /// values separate storage-hash order from lexicographic order from
+    /// push order, ours is the storage hash order under both push
+    /// directions and the reference follows push order. **No reference
+    /// literal is pinned for any equal-timestamp fixture and none can
+    /// be**, since push order is not a function of anything we store.
+    ///
+    /// `sort_unstable_by` is correct here and is not an optimisation
+    /// detail: two plan objects can compare `Equal` only if their
+    /// streams share `labels_json` AND `fingerprint` AND the entry
+    /// index, and the accumulator's two maps are unique on fingerprint
+    /// and on `labels_json` respectively. If that were ever wrong the
+    /// two objects would still render identical bytes. A stable sort
+    /// would additionally allocate scratch.
+    fn build(g: ObjectGranularity, items: &[StreamResult]) -> Self {
+        match g {
+            ObjectGranularity::PerStream => ObjectPlan::PerStream,
+            ObjectGranularity::PerEntry => {
+                let total: usize = items.iter().map(|s| s.entries.len()).sum();
+                debug_assert!(
+                    items.len() <= u32::MAX as usize && total <= u32::MAX as usize,
+                    "the per-entry plan indexes streams and entries as u32"
+                );
+                let mut plan: Vec<StreamObject> = Vec::with_capacity(total);
+                for (stream, s) in items.iter().enumerate() {
+                    // A stream with NO entries contributes no object:
+                    // `{"stream":{…},"values":[]}` is not a shape the
+                    // reference emits and not one this envelope ever
+                    // carried.
+                    for first_entry in 0..s.entries.len() {
+                        plan.push(StreamObject {
+                            stream: stream as u32,
+                            first_entry: first_entry as u32,
+                            entries: 1,
+                        });
+                    }
+                }
+                plan.sort_unstable_by(|a, b| Self::order(items, a, b));
+                ObjectPlan::PerEntry(plan)
+            }
+        }
+    }
+
+    /// The `PerEntry` comparator, extracted so the totality gate drives
+    /// the SAME function [`ObjectPlan::build`] sorts with rather than a
+    /// transcription of it.
+    fn order(items: &[StreamResult], a: &StreamObject, b: &StreamObject) -> std::cmp::Ordering {
+        let (sa, sb) = (&items[a.stream as usize], &items[b.stream as usize]);
+        sa.entries[a.first_entry as usize]
+            .0
+            .cmp(&sb.entries[b.first_entry as usize].0)
+            .then_with(|| sa.labels_json.cmp(&sb.labels_json))
+            .then_with(|| sa.fingerprint.cmp(&sb.fingerprint))
+            .then_with(|| a.first_entry.cmp(&b.first_entry))
+    }
+
+    /// How many objects the body renders.
+    fn len(&self, items: &[StreamResult]) -> usize {
+        match self {
+            ObjectPlan::PerStream => items.len(),
+            ObjectPlan::PerEntry(plan) => plan.len(),
+        }
+    }
+
+    /// Object `i`. `PerStream` synthesises it; nothing is stored.
+    fn get(&self, i: usize, items: &[StreamResult]) -> StreamObject {
+        match self {
+            ObjectPlan::PerStream => StreamObject {
+                stream: i as u32,
+                first_entry: 0,
+                entries: items[i].entries.len() as u32,
+            },
+            ObjectPlan::PerEntry(plan) => plan[i],
+        }
+    }
+}
+
 /// Everything a streams body needs, built in ONE call from ONE decision.
 ///
 /// `prefix` and `suffix` are complete envelope bytes with the
@@ -644,6 +825,10 @@ struct StreamsRender {
     prefix: Vec<u8>,
     suffix: Vec<u8>,
     item: categorize::ItemWriter,
+    /// Taken from the ENVELOPE by [`ObjectGranularity::of`] (issue
+    /// #469), so the caller cannot supply one and no request flag can
+    /// reach it.
+    granularity: ObjectGranularity,
 }
 
 /// Builds both halves of a streams body from one [`categorize::decide`].
@@ -658,6 +843,9 @@ fn streams_render(
     label_bytes: LabelBytes,
 ) -> StreamsRender {
     use std::io::Write;
+    // Granularity is read off the envelope BEFORE it is destructured,
+    // and never off `flags` (issue #469).
+    let granularity = ObjectGranularity::of(&env);
     let decision = categorize::decide(flags, items);
     // The echo is an ITERATOR, not a collected list: `categorize-labels`
     // is dropped from it exactly when the decision came out off, and
@@ -736,6 +924,7 @@ fn streams_render(
         prefix,
         suffix,
         item: categorize::ItemWriter::new(label_bytes, decision),
+        granularity,
     }
 }
 
@@ -999,27 +1188,35 @@ pub(crate) fn patterns_response(
 /// from the stream's canonical JSON, ns as a string like stream values);
 /// `dropped_total` is the EXACT cumulative drop count since the last
 /// emitted frame — the documented additive field, so counts are never
-/// lost while the array never grows unbounded. Streams sort by
-/// `(labels_json, fingerprint)` for a deterministic wire order,
-/// mirroring [`query_response`].
+/// lost while the array never grows unbounded.
+///
+/// **ONE STREAM OBJECT PER ENTRY (issue #469).** This envelope plans
+/// [`ObjectGranularity::PerEntry`], so a frame carries one
+/// `{"stream":…,"values":[[ts,line]]}` object per entry, ordered by
+/// `(timestamp_ns, labels_json, fingerprint, entry_index)` — the same
+/// key issue #463 gave the categorised path, now taken off the request
+/// flag and onto the wire surface. Two entries of one stream come back
+/// as two objects carrying the identical map, and a third stream's entry
+/// between them in time sits between them on the wire.
+///
+/// **Why this envelope and not [`query_response`].** The reference
+/// answers the same fixture packed on its range route and split on its
+/// tail route, measured on one container at one moment; the datasource's
+/// tail consumer walks objects first and values second, so packing
+/// reorders lines there and only there. See [`ObjectGranularity`].
+///
+/// **What it costs.** Splitting repeats the label map per entry:
+/// `(E - S) * (len(labels_json) + 14)` bytes for `E` entries across `S`
+/// streams, on the one surface that buffers a whole frame. `E` is
+/// bounded by `reader.tail_max_fetch_limit` (docs/configuration.md §6),
+/// which is the operator's knob for it; no cap is introduced here,
+/// because the reference has the same property.
 pub(crate) fn tail_frame(
     streams: Vec<StreamResult>,
     dropped: &[super::tail::Dropped],
     dropped_total: u64,
     encoding_flags: &[String],
 ) -> String {
-    // Issue #463: under `categorize-labels` the tail emits ONE stream
-    // object per entry, in timestamp order — see [`split_tail_entries`].
-    // Splitting preserves every stream's `Three` arity (one entry, one
-    // category), so the decision `streams_render` re-takes below is the
-    // same one taken here.
-    let mut streams = streams;
-    if categorize::decide(encoding_flags, &streams).is_on() {
-        streams = split_tail_entries(streams);
-    } else {
-        streams
-            .sort_by(|a, b| (&a.labels_json, a.fingerprint).cmp(&(&b.labels_json, b.fingerprint)));
-    }
     let render = streams_render(
         StreamsEnvelope::Tail {
             dropped,
@@ -1033,131 +1230,53 @@ pub(crate) fn tail_frame(
         // against the reference, so it keeps what it served before.
         LabelBytes::Verbatim,
     );
-    // Pre-size the output (review round 1, low): labels + entry bodies
-    // dominate; ~48 bytes covers per-entry/per-drop JSON scaffolding.
-    //
-    // **The per-stream term is the pre-#463 allowance, unchanged**, so
-    // the plain frame reserves exactly what it always did and its
-    // per-stream peak slope does not move (criterion 16(a)). The two
-    // envelope halves are already rendered, so their exact lengths
-    // replace the old fixed 64 plus per-drop allowance — an INTERCEPT
-    // change, which that criterion permits — and the categorised third
-    // elements are added on top, which is what keeps the flagged frame
-    // from regrowing on bytes it knew it was going to write.
+    // The granularity comes from the ENVELOPE, not from
+    // `encoding_flags`: issue #463 split only under `categorize-labels`,
+    // which no default client can set on this route, so the path every
+    // client actually gets stayed packed. Issue #469 splits both.
+    let plan = ObjectPlan::build(render.granularity, &streams);
+    let objects = plan.len(&streams);
+    // Pre-size the output, PER OBJECT (issue #469): labels + entry
+    // bodies dominate; ~48 bytes covers per-entry JSON scaffolding and
+    // ~32 the object's own framing. The per-stream label allowance is
+    // now paid once per OBJECT, which is what splitting costs and what
+    // keeps the buffer from doubling on bytes it knew it would write.
+    // The two envelope halves are already rendered, so their exact
+    // lengths are the intercept.
     let capacity: usize = render.prefix.len()
         + render.suffix.len()
-        + streams
-            .iter()
-            .map(|s| {
+        + (0..objects)
+            .map(|i| {
+                let o = plan.get(i, &streams);
+                let s = &streams[o.stream as usize];
                 s.labels_json.len()
                     + 32
-                    + s.entries
+                    + s.entries[o.range()]
                         .iter()
                         .map(|(_, line)| line.len() + 48)
                         .sum::<usize>()
-                    + render.item.third_element_bytes(s)
+                    + render.item.third_element_bytes(s, o.range())
             })
             .sum::<usize>();
     let mut buf: Vec<u8> = Vec::with_capacity(capacity);
     buf.extend_from_slice(&render.prefix);
-    for (i, s) in streams.iter().enumerate() {
+    for i in 0..objects {
         if i > 0 {
             buf.push(b',');
         }
+        let o = plan.get(i, &streams);
         // Rendered IN PLACE (issue #312): no per-item `String` copy, and
         // no whole-item temporary — the tail cannot stream, so it writes
-        // straight into the frame buffer.
-        render.item.write(&mut buf, s);
+        // straight into the frame buffer. The entries are BORROWED from
+        // the stream they belong to; nothing is lifted or cloned per
+        // entry, which is what keeps the frame's allocation count
+        // independent of how many entries it carries.
+        render
+            .item
+            .write(&mut buf, &streams[o.stream as usize], o.range());
     }
     buf.extend_from_slice(&render.suffix);
     String::from_utf8(buf).expect("rendered JSON is UTF-8")
-}
-
-/// The categorised tail's per-entry stream objects (issue #463).
-///
-/// **Measured against the reference, header on AND off:** two streams
-/// differing in one label with entries interleaved in time — prod@t,
-/// staging@t+1, prod@t+2 — come back as THREE stream objects in strict
-/// timestamp order, the prod map appearing twice with staging between.
-/// The mechanism is `pkg/querier/tail/tail.go:114-125 @ grafana/loki
-/// v3.7.4 b318f282`, which appends one `logproto.Stream` per entry as it
-/// pops the oldest from the merge iterator.
-///
-/// A renderer that grouped by label set would emit two objects and the
-/// consumer — object loop outside, value loop inside — would render the
-/// rows `A1, A3, B2`. Log lines out of order in a tail view is a defect,
-/// not a verbosity trade, so the categorised path matches the reference
-/// exactly.
-///
-/// **The non-categorised tail is deliberately NOT changed here**: it
-/// carries the same pre-existing divergence, it is byte-frozen by every
-/// pre-#463 tail expectation, and it is owned by issue #469. Ledgered as
-/// `tail-stream-object-granularity-unflagged`.
-///
-/// The sort key is `(timestamp_ns, labels_json, fingerprint,
-/// entry_index)`. The timestamp is the reference's own order; the rest is
-/// our deterministic tiebreak, because the reference's tie order is its
-/// merge tree's arrival order and is not reproducible from the data.
-/// `entry_index` is carried by `sort_by`'s STABILITY — entries are lifted
-/// in per-stream order, so a full three-way tie keeps it.
-fn split_tail_entries(streams: Vec<StreamResult>) -> Vec<StreamResult> {
-    // Already one entry per object — the shape a tail poll usually
-    // produces, and the shape the split's own output has. Reorder in
-    // place: no lift, no rebuild, and no per-entry allocation, so the
-    // categorised frame's allocation profile equals the plain one's
-    // (criterion 16(b-i)). `sort_by` is stable, so a full key tie keeps
-    // the caller's order exactly as the general path's `entry_index`
-    // tiebreak does.
-    if streams.iter().all(|s| s.entries.len() == 1) {
-        let mut streams = streams;
-        streams.sort_by(|a, b| {
-            (a.entries[0].0, &a.labels_json, a.fingerprint).cmp(&(
-                b.entries[0].0,
-                &b.labels_json,
-                b.fingerprint,
-            ))
-        });
-        return streams;
-    }
-    let mut lifted: Vec<categorize::LiftedEntry> = Vec::new();
-    for s in streams {
-        let StreamResult {
-            fingerprint,
-            service: _,
-            labels_json,
-            entries,
-            categories,
-        } = s;
-        let mut cats = categories.into_iter();
-        for (ts, line) in entries {
-            lifted.push(categorize::LiftedEntry {
-                timestamp_ns: ts,
-                labels_json: labels_json.clone(),
-                fingerprint,
-                line,
-                categories: cats.next().unwrap_or_default(),
-            });
-        }
-    }
-    lifted.sort_by(|a, b| {
-        (a.timestamp_ns, &a.labels_json, a.fingerprint).cmp(&(
-            b.timestamp_ns,
-            &b.labels_json,
-            b.fingerprint,
-        ))
-    });
-    lifted
-        .into_iter()
-        .map(|e| StreamResult {
-            fingerprint: e.fingerprint,
-            // Not rendered on this surface; the frame carries labels and
-            // values only.
-            service: String::new(),
-            labels_json: e.labels_json,
-            entries: vec![(e.timestamp_ns, e.line)],
-            categories: vec![e.categories],
-        })
-        .collect()
 }
 
 fn render_matrix_item(s: &MatrixSeries) -> Vec<u8> {
@@ -1305,6 +1424,16 @@ pub(crate) fn query_response_warned(
                 prefix,
                 suffix,
                 item,
+                // The query envelope plans `ObjectGranularity::PerStream`
+                // — one object per item, carrying all of its entries,
+                // which is exactly the body `stream_array` frames below.
+                // This arm therefore has nothing to consult, and the
+                // equivalence is not left as a sentence: the hermetic
+                // `the_query_envelope_plans_per_stream_and_walking_that_plan_reproduces_the_body`
+                // renders the same items through `ObjectPlan` and
+                // requires the identical bytes, so a granularity that
+                // came out `PerEntry` here reds.
+                granularity: _,
             } = streams_render(
                 StreamsEnvelope::Query {
                     stats_json: &stats_json,
@@ -3320,6 +3449,20 @@ mod tests {
     /// `tail_frame` therefore keeps the pre-#463 per-stream RESERVATION
     /// term verbatim; only the envelope intercept moved, which this
     /// clause permits.
+    ///
+    /// **Issue #469 moves both increments, and both moves are derived
+    /// rather than retyped.**
+    ///
+    /// * The ALLOCATION slope falls from `1` to `0`. The `1` was the
+    ///   stable `streams.sort_by`'s scratch buffer, which Rust's merge
+    ///   sort takes above a short run; the tail no longer sorts streams
+    ///   at all — it sorts a `Vec<StreamObject>` with `sort_unstable_by`,
+    ///   which allocates nothing. The relation clause below (`<= 1`)
+    ///   held before and holds after.
+    /// * The PEAK slope grows by exactly the object plan:
+    ///   `(200 - 1) * size_of::<StreamObject>()` bytes, live beside the
+    ///   frame buffer. It is written as that product, so the figure
+    ///   moves if and only if the plan's element width does.
     #[test]
     fn the_tail_frame_keeps_its_allocation_profile() {
         // The fixture is built OUTSIDE `measure`: this gates the
@@ -3338,9 +3481,10 @@ mod tests {
         // 16(a) — the PER-STREAM cost may not move. The fixed cost may.
         let (_, a1, p1) = off(1);
         let (_, a200, p200) = off(200);
+        let plan_slope = 199 * std::mem::size_of::<StreamObject>() as u64;
         assert_eq!(
             (a200 - a1, p200 - p1),
-            (1, 23_880),
+            (0, 23_880 + plan_slope),
             "the flag-off tail's per-stream allocation/peak slope moved"
         );
         // Stated as a relation as well as a literal: whatever the
@@ -3687,6 +3831,522 @@ mod tests {
             assert!(
                 list.contains(term),
                 "the ledger's term list does not name {term}"
+            );
+        }
+    }
+
+    // --- Issue #469: the tail's object granularity. -------------------
+
+    const C469_PROD: &str = r#"{"app":"checkout","env":"prod","service_name":"checkout"}"#;
+    const C469_STAGING: &str = r#"{"app":"checkout","env":"staging","service_name":"checkout"}"#;
+
+    /// The #469 witness fixture: two streams differing in ONE label,
+    /// entries interleaved in time — `prod@10`, `staging@11`, `prod@12`.
+    ///
+    /// The absence of a pipeline stage is the whole point. With a parser
+    /// the extracted label folds into the `stream` map, all three maps
+    /// become distinct, and a renderer that grouped by label set would
+    /// emit three objects too — so such a frame cannot tell packing from
+    /// splitting. Here the identical `prod` map has to appear twice with
+    /// `staging` between, which only per-entry objects produce.
+    fn c469_interleaved() -> Vec<StreamResult> {
+        vec![
+            stream(1, C469_PROD, vec![(10, "a"), (12, "c")]),
+            stream(2, C469_STAGING, vec![(11, "b")]),
+        ]
+    }
+
+    /// **W1 — the tail frame splits, in timestamp order.**
+    ///
+    /// The `streams` array here is the reference's own, object for
+    /// object: measured against the pinned reference on this fixture,
+    /// three objects in strict timestamp order with the identical `prod`
+    /// map twice around `staging`. `dropped_entries`/`dropped_total` are
+    /// our documented additive keys and are unchanged.
+    ///
+    /// *Alternatives, each constructed and run:* grouping by stream map
+    /// (the pre-#469 tail) gives TWO objects and the rows `a, c, b`;
+    /// ordering the plan by `(labels_json, fingerprint, ts)` gives three
+    /// objects and the rows `a, c, b`. Both differ from this string.
+    #[test]
+    fn the_tail_frame_emits_one_object_per_entry_in_timestamp_order() {
+        assert_eq!(
+            tail_frame(c469_interleaved(), &[], 0, &[]),
+            concat!(
+                r#"{"streams":["#,
+                r#"{"stream":{"app":"checkout","env":"prod","service_name":"checkout"},"values":[["10","a"]]},"#,
+                r#"{"stream":{"app":"checkout","env":"staging","service_name":"checkout"},"values":[["11","b"]]},"#,
+                r#"{"stream":{"app":"checkout","env":"prod","service_name":"checkout"},"values":[["12","c"]]}"#,
+                r#"],"dropped_entries":[],"dropped_total":0}"#
+            )
+        );
+    }
+
+    /// The equal-timestamp fixture, with CONSTRUCTED entry vectors.
+    ///
+    /// `entries` is written here rather than arriving from storage, so
+    /// the within-stream index is chosen rather than hashed: this pins
+    /// the COMPARATOR, not the order stored rows arrive in. (On the real
+    /// pipeline stage 3 orders by `timestamp_ns, fingerprint, body_hash,
+    /// body` — `crates/pulsus-read/src/logql/sql.rs` — so a live push of
+    /// `z` then `a` at one nanosecond reaches `entries` as `a, z`.)
+    fn c469_tied() -> Vec<StreamResult> {
+        vec![
+            stream(1, C469_PROD, vec![(10, "z"), (10, "a")]),
+            stream(2, C469_STAGING, vec![(10, "m")]),
+        ]
+    }
+
+    /// **W2a — the tie order is deterministic and independent of the
+    /// order `items` arrives in.**
+    ///
+    /// All three entries at one nanosecond, so every component of the
+    /// key after the timestamp decides. `prod` sorts before `staging`,
+    /// and within `prod` the constructed entry index keeps `z` before
+    /// `a`.
+    ///
+    /// *Alternatives, each constructed and run:* tiebreaking by LINE
+    /// instead of `first_entry` gives `a, z, m`; a reduced key of
+    /// `(ts, first_entry)` gives `z, m, a` and, on the reversed input,
+    /// `m, z, a` — so it also fails the input-order half.
+    ///
+    /// **No reference literal is pinned for this fixture and none can
+    /// be.** The reference follows push order within a stream and we
+    /// store no ordinal; that is the standing `timestamp-tie-order`
+    /// divergence, and this test claims determinism only.
+    #[test]
+    fn the_tail_tie_order_is_deterministic_and_input_order_independent() {
+        let expected = concat!(
+            r#"{"streams":["#,
+            r#"{"stream":{"app":"checkout","env":"prod","service_name":"checkout"},"values":[["10","z"]]},"#,
+            r#"{"stream":{"app":"checkout","env":"prod","service_name":"checkout"},"values":[["10","a"]]},"#,
+            r#"{"stream":{"app":"checkout","env":"staging","service_name":"checkout"},"values":[["10","m"]]}"#,
+            r#"],"dropped_entries":[],"dropped_total":0}"#
+        );
+        for round in 0..20 {
+            let mut items = c469_tied();
+            if round % 2 == 1 {
+                items.reverse();
+            }
+            assert_eq!(
+                tail_frame(items, &[], 0, &[]),
+                expected,
+                "round {round}: the frame depends on the order `items` arrived in"
+            );
+        }
+    }
+
+    /// **W2b — the key is TOTAL: no two distinct objects compare
+    /// `Equal`.**
+    ///
+    /// This is the property `first_entry` actually supplies, and it is
+    /// what makes `sort_unstable_by` correct. Driven through
+    /// `ObjectPlan::order`, the same function `build` sorts with.
+    ///
+    /// *Alternative, constructed and run:* dropping `first_entry` from
+    /// the key makes `prod/"z"` and `prod/"a"` compare `Equal`.
+    #[test]
+    fn the_per_entry_key_is_total_over_the_plan() {
+        let items = c469_tied();
+        let ObjectPlan::PerEntry(plan) = ObjectPlan::build(ObjectGranularity::PerEntry, &items)
+        else {
+            panic!("PerEntry must materialise a plan");
+        };
+        assert_eq!(plan.len(), 3);
+        for w in plan.windows(2) {
+            assert_eq!(
+                ObjectPlan::order(&items, &w[0], &w[1]),
+                std::cmp::Ordering::Less,
+                "adjacent plan objects {:?} and {:?} are not strictly ordered",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// **W3 — the QUERY response still packs, byte for byte.**
+    ///
+    /// The same two streams through `query_response_warned` with no
+    /// encoding flags: ONE `prod` object carrying both values. This is
+    /// the answer the reference's own range route gives on this fixture,
+    /// measured on the same container that splits it on the tail — which
+    /// is what makes "split the tail" a property of the wire surface and
+    /// not a global rule.
+    ///
+    /// *Alternative, constructed and run:* a granularity decision that
+    /// came out `PerEntry` for the query envelope splits `prod` into two
+    /// objects and reds here. This is the criterion that stops W1 being
+    /// satisfiable by splitting everywhere.
+    #[tokio::test]
+    async fn the_query_response_still_packs_a_streams_entries_into_one_object() {
+        assert_eq!(
+            c463_query_body(c469_interleaved(), &[]).await,
+            concat!(
+                r#"{"status":"success","data":{"resultType":"streams","result":["#,
+                r#"{"stream":{"app":"checkout","env":"prod","service_name":"checkout"},"values":[["10","a"],["12","c"]]},"#,
+                r#"{"stream":{"app":"checkout","env":"staging","service_name":"checkout"},"values":[["11","b"]]}"#,
+                r#"],"stats":{"streams":2,"entries":3,"bytes":3}}}"#
+            )
+        );
+    }
+
+    /// **The query arm's granularity is not merely documented.**
+    ///
+    /// `query_response_warned` discards the granularity `streams_render`
+    /// hands it, because `stream_array` already frames one object per
+    /// item. That equivalence is checked rather than asserted in prose:
+    /// the SAME items walked through `ObjectPlan::build(granularity, …)`
+    /// and the SAME `ItemWriter` must reproduce the shipped body's bytes
+    /// exactly.
+    ///
+    /// *Alternative, constructed and run:* making
+    /// `ObjectGranularity::of` return `PerEntry` for the query envelope
+    /// makes the walked body carry three objects where the shipped one
+    /// carries two, and this reds. Nothing else in the suite does.
+    #[tokio::test]
+    async fn the_query_envelope_plans_per_stream_and_walking_that_plan_reproduces_the_body() {
+        let items = c469_interleaved();
+        // Already in `query_response_warned`'s `(labels_json,
+        // fingerprint)` order, so the walk sees what the shipped arm
+        // sees.
+        let render = streams_render(
+            StreamsEnvelope::Query {
+                stats_json: r#"{"streams":2,"entries":3,"bytes":3}"#,
+                explain: None,
+                warnings: "",
+            },
+            &[],
+            &items,
+            LabelBytes::SpaceForReplacementChars,
+        );
+        assert_eq!(render.granularity, ObjectGranularity::PerStream);
+        let plan = ObjectPlan::build(render.granularity, &items);
+        let mut walked: Vec<u8> = render.prefix.clone();
+        for i in 0..plan.len(&items) {
+            if i > 0 {
+                walked.push(b',');
+            }
+            let o = plan.get(i, &items);
+            render
+                .item
+                .write(&mut walked, &items[o.stream as usize], o.range());
+        }
+        walked.extend_from_slice(&render.suffix);
+        assert_eq!(
+            String::from_utf8(walked).expect("utf8"),
+            c463_query_body(c469_interleaved(), &[]).await,
+            "walking the query envelope's own plan does not reproduce the shipped body"
+        );
+    }
+
+    /// **W4 — two entries of ONE stream are two objects, even when the
+    /// lines are identical.**
+    ///
+    /// *Alternative, constructed and run:* a renderer that merged
+    /// adjacent objects carrying an equal `stream` map emits one object
+    /// with two values.
+    #[test]
+    fn identical_lines_in_one_stream_still_render_two_objects() {
+        let frame = tail_frame(
+            vec![stream(1, C469_PROD, vec![(10, "same"), (11, "same")])],
+            &[],
+            0,
+            &[],
+        );
+        assert_eq!(
+            frame,
+            concat!(
+                r#"{"streams":["#,
+                r#"{"stream":{"app":"checkout","env":"prod","service_name":"checkout"},"values":[["10","same"]]},"#,
+                r#"{"stream":{"app":"checkout","env":"prod","service_name":"checkout"},"values":[["11","same"]]}"#,
+                r#"],"dropped_entries":[],"dropped_total":0}"#
+            )
+        );
+    }
+
+    /// N entries per stream across TWO streams whose timestamps
+    /// interleave (A even, B odd), so the stream-major plan is in the
+    /// worst possible order for the key and the sort has real work.
+    fn c469_interleaved_n(n: usize) -> Vec<StreamResult> {
+        let entries = |odd: i64| -> Vec<(i64, String)> {
+            (0..n)
+                .map(|i| (2 * i as i64 + odd, format!("line {i}")))
+                .collect()
+        };
+        vec![
+            StreamResult {
+                fingerprint: 1,
+                service: "checkout".to_string(),
+                labels_json: C469_PROD.to_string(),
+                entries: entries(0),
+                categories: Vec::new(),
+            },
+            StreamResult {
+                fingerprint: 2,
+                service: "checkout".to_string(),
+                labels_json: C469_STAGING.to_string(),
+                entries: entries(1),
+                categories: Vec::new(),
+            },
+        ]
+    }
+
+    /// **W5 — splitting borrows; it does not clone a `StreamResult` per
+    /// entry.**
+    ///
+    /// The load-bearing assertion is the IDENTITY: the frame's
+    /// allocation count does not depend on how many entries it carries.
+    /// The companion constant is derived, not remembered — four
+    /// allocations: `streams_render`'s `prefix` and `suffix`, the object
+    /// plan's `Vec::with_capacity`, and the frame buffer.
+    /// `String::from_utf8` reuses the buffer, and `sort_unstable_by`
+    /// takes no scratch.
+    ///
+    /// *Alternative, constructed and run:* lifting each entry into its
+    /// own `StreamResult` (the pre-#469 categorised path's shape) makes
+    /// the count grow with N — measured 20 at N=5 against 210 at N=100.
+    #[test]
+    fn splitting_the_tail_frame_allocates_independently_of_the_entry_count() {
+        let measure_at = |n: usize| {
+            let items = c469_interleaved_n(n);
+            let (_, allocs, _) =
+                crate::probe_alloc::measure(move || tail_frame(items, &[], 0, &[]));
+            allocs
+        };
+        let small = measure_at(5);
+        let large = measure_at(100);
+        assert_eq!(
+            small, large,
+            "the split frame allocated {small} at N=5 and {large} at N=100 — a per-entry \
+             allocation appeared"
+        );
+        assert_eq!(
+            small, 4,
+            "the tail frame's allocation count moved off `prefix` + `suffix` + plan + buffer"
+        );
+    }
+
+    /// **W6 — a stream carrying NO entries renders no object.**
+    ///
+    /// A defensive unit contract on a shape the type permits: an empty
+    /// `entries` vector. The production accumulator materialises a group
+    /// only after a surviving row, so this is not a reachability claim —
+    /// it is what the renderer must not do if one ever arrives.
+    ///
+    /// *Alternative, constructed and run:* planning one object per
+    /// stream regardless of entry count emits two objects here, the
+    /// first `{"stream":{…},"values":[]}`.
+    #[test]
+    fn a_stream_with_no_entries_contributes_no_object() {
+        let empty = stream(3, r#"{"app":"checkout","env":"empty"}"#, vec![]);
+        let frame = tail_frame(
+            vec![empty, stream(1, C469_PROD, vec![(10, "a")])],
+            &[],
+            0,
+            &[],
+        );
+        assert_eq!(
+            frame,
+            concat!(
+                r#"{"streams":["#,
+                r#"{"stream":{"app":"checkout","env":"prod","service_name":"checkout"},"values":[["10","a"]]}"#,
+                r#"],"dropped_entries":[],"dropped_total":0}"#
+            )
+        );
+        // Companions: the all-empty frame, and the drop-only frame the
+        // pre-existing `pending_drops_without_a_frame_synthesize_an_empty_streams_frame`
+        // drives through `tail.rs`.
+        assert_eq!(
+            tail_frame(Vec::new(), &[], 0, &[]),
+            r#"{"streams":[],"dropped_entries":[],"dropped_total":0}"#
+        );
+    }
+
+    /// **Criterion 11a — the query envelope's plan costs nothing.**
+    ///
+    /// `PerStream` synthesises its objects on demand, so the surface
+    /// this issue must not touch pays neither an allocation nor a byte
+    /// of peak for the mechanism.
+    ///
+    /// *Alternative, constructed and run:* materialising a
+    /// `Vec<StreamObject>` for both granularities allocates once and
+    /// peaks at 2 400 bytes here.
+    #[test]
+    fn the_per_stream_plan_allocates_nothing() {
+        let items: Vec<StreamResult> = (0..200)
+            .map(|i| stream(i, C469_PROD, vec![(10 + i as i64, "line")]))
+            .collect();
+        let (plan, allocs, peak) =
+            crate::probe_alloc::measure(|| ObjectPlan::build(ObjectGranularity::PerStream, &items));
+        assert_eq!((allocs, peak), (0, 0), "the identity plan is not free");
+        assert_eq!(plan.len(&items), 200);
+        assert_eq!(
+            plan.get(7, &items),
+            StreamObject {
+                stream: 7,
+                first_entry: 0,
+                entries: 1
+            }
+        );
+    }
+
+    /// **The granularity is a function of the ENVELOPE and of nothing
+    /// else.**
+    ///
+    /// Both envelopes, and both encoding-flag settings on each: the
+    /// answer never moves with the flag. Issue #463 had the split
+    /// conditioned on `categorize-labels`, which only an operator's
+    /// configured proxy header can put on this route — so the path every
+    /// default client takes stayed packed.
+    #[test]
+    fn granularity_comes_from_the_envelope_and_never_from_the_flag() {
+        for flags in [Vec::new(), flags(&["categorize-labels"])] {
+            let items = c469_interleaved();
+            let query = streams_render(
+                StreamsEnvelope::Query {
+                    stats_json: "{}",
+                    explain: None,
+                    warnings: "",
+                },
+                &flags,
+                &items,
+                LabelBytes::SpaceForReplacementChars,
+            );
+            let tail = streams_render(
+                StreamsEnvelope::Tail {
+                    dropped: &[],
+                    dropped_total: 0,
+                },
+                &flags,
+                &items,
+                LabelBytes::Verbatim,
+            );
+            assert_eq!(query.granularity, ObjectGranularity::PerStream);
+            assert_eq!(tail.granularity, ObjectGranularity::PerEntry);
+        }
+    }
+
+    /// **Criterion 8's hermetic half — a split object carries its OWN
+    /// entry's third element.**
+    ///
+    /// `StreamObject::first_entry` is an absolute index into
+    /// `StreamResult::entries`, and `s.categories` is indexed with the
+    /// same number.
+    ///
+    /// *Alternative, constructed and run:* treating the index as
+    /// relative (re-zeroing per object) gives every object the FIRST
+    /// entry's metadata — `sm-0` three times.
+    #[test]
+    fn each_split_object_carries_its_own_entrys_third_element() {
+        let cats = |v: &str| EntryCategories {
+            structured_metadata: vec![("trace_id".to_string(), v.to_string())],
+            parsed: Vec::new(),
+        };
+        let items = vec![StreamResult {
+            fingerprint: 1,
+            service: "checkout".to_string(),
+            labels_json: C469_PROD.to_string(),
+            entries: vec![
+                (10, "a".to_string()),
+                (11, "b".to_string()),
+                (12, "c".to_string()),
+            ],
+            categories: vec![cats("sm-0"), cats("sm-1"), cats("sm-2")],
+        }];
+        let frame = tail_frame(items, &[], 0, &flags(&["categorize-labels"]));
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("frame JSON");
+        let objs = v["streams"].as_array().expect("streams");
+        assert_eq!(objs.len(), 3, "one object per entry: {frame}");
+        for (i, o) in objs.iter().enumerate() {
+            let vals = o["values"].as_array().expect("values");
+            assert_eq!(vals.len(), 1);
+            assert_eq!(
+                vals[0][2]["structuredMetadata"]["trace_id"],
+                serde_json::json!(format!("sm-{i}")),
+                "object {i} carries the wrong entry's metadata: {frame}"
+            );
+        }
+    }
+
+    /// **Criterion 11d(b) — the encoder acquires no engine handle.**
+    ///
+    /// Half of a change-scope discipline, and it is not a round-trip
+    /// gate: what it establishes is that this file imports data types
+    /// from the read crate and nothing that can issue a query. The other
+    /// half — that no production file outside this one changed — is a
+    /// diff check, not a test. **Neither sees outbound I/O placed inside
+    /// this file through a capability the crate already has**; that
+    /// residual is recorded on issue #469 and would be closed by an
+    /// I/O-capability boundary around the rendering modules, which is a
+    /// server-crate architecture change and not this issue's.
+    ///
+    /// The token scan reads a CODE VIEW built by dropping every line
+    /// whose trimmed form starts with `//` — this file uses no block
+    /// comments, asserted below so the filter cannot silently stop
+    /// describing it.
+    #[test]
+    fn the_encoder_imports_data_types_from_the_read_crate_and_nothing_that_queries() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logs_api/encode.rs"),
+        )
+        .expect("read encode.rs");
+        let start = src
+            .find("use pulsus_read::{")
+            .expect("the read-crate import");
+        let end = start + src[start..].find("};").expect("the import list closes");
+        let imported: Vec<String> = src[start + "use pulsus_read::{".len()..end]
+            .replace('\n', " ")
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert_eq!(
+            imported,
+            vec![
+                "DetectedFieldOut",
+                "DetectedFields",
+                "DetectedLabelOut",
+                "EntryCategories",
+                "ExplainStage",
+                "LogStats",
+                "MatrixSeries",
+                "PatternSeries",
+                "PlanExplain",
+                "QueryResult",
+                "RouteChoice",
+                "StreamResult",
+                "VectorSample",
+                "VolumeEntry",
+                "Warnings",
+                "WireArity",
+            ],
+            "the encoder's read-crate imports moved — every name here is a DATA type, and a \
+             name that can issue a query does not belong on this list"
+        );
+        // Assembled at run time so the needle does not occur literally
+        // in this file — a scanner that matches its own search string
+        // reports a construct nobody wrote.
+        let block_open = format!("{}{}", '/', '*');
+        assert!(
+            !src.contains(&block_open),
+            "this file grew a block comment; the code view below only drops `//` lines"
+        );
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Assembled at run time for the same reason as `block_open`
+        // above: written as literals, this list would match ITSELF in
+        // the code view and red on every tree.
+        for token in [
+            format!("LogQl{}", "Engine"),
+            format!("Ch{}", "Client"),
+            format!("query_{}", "stream"),
+        ] {
+            assert!(
+                !code.contains(&token),
+                "the encoder names {token} outside a comment — it acquired an engine handle"
             );
         }
     }

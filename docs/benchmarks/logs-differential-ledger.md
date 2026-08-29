@@ -3277,6 +3277,31 @@ WHICH order.**
   Nothing gates equivalence with the reference's order, because we do not
   claim it.
 
+- **The same divergence holds on the TAIL route (issue #469, 2026-08-29).**
+  That route now renders one stream object per entry (see
+  `tail-stream-object-granularity-unflagged`), so an equal-timestamp
+  group's order becomes an order of OBJECTS rather than of values inside
+  one. It is the same divergence, not a new one, and the reason is the
+  one stated above: within a stream the reference's key is arrival order
+  and we store no ordinal.
+
+  Measured by the review of that issue's plan, on two discriminating
+  pairs pushed in BOTH directions — pairs chosen so that storage-hash
+  order, lexicographic order and push order do not all agree — **ours is
+  the storage hash order regardless of push direction, and the reference
+  follows push order.** The reference side of the first pair was repeated
+  twelve times; no repetition count is recorded for the first pair's
+  local side or for either side of the second pair, because the record
+  does not carry one.
+
+  **No reference literal is pinned for any equal-timestamp tail fixture,
+  and none can be**, since push order is not a function of anything we
+  store. What is gated is our own determinism:
+  `encode.rs::the_tail_tie_order_is_deterministic_and_input_order_independent`
+  (twenty renders, the item vector reversed on odd rounds, byte-identical
+  every time) and
+  `encode.rs::the_per_entry_key_is_total_over_the_plan`.
+
 - **Sibling: `sort-tie-order`** (below). Same SHAPE — a tie in an ordering
   key that the reference breaks by something we do not reproduce —
   different mechanism and, decisively, different CONSEQUENCE. This entry
@@ -6182,15 +6207,31 @@ rename-colliding-metadata`
   reviewer of any change to those three ids, or to the probes they name,
   re-checks the three sentences above against the capture.
 
-### `tail-stream-object-granularity-unflagged` (issue #463 — RECORDED here, OWNED by #469)
+### `tail-stream-object-granularity-unflagged` (issue #463 — RECORDED here; CLOSED 2026-08-29 by #469)
 
 `witness: T17` · `alternative: group-by-stream-map`
 
-- **What diverges.** On the tail WITHOUT `categorize-labels`, the
-  reference emits **one stream object per entry, in strict timestamp
-  order**; PulsusDB groups a frame's entries by their label set. This
-  predates issue #463 and #463 does not change it — the non-categorised
-  tail is byte-frozen by every expectation that predates the header.
+**CLOSED 2026-08-29 (issue #469). Nothing is downgraded and nothing
+diverges here any more; the row stays as the record of why the tail
+renders the way it does.** Both tail paths — with and without
+`categorize-labels` — now emit one stream object per entry, ordered by
+`(timestamp_ns, labels_json, fingerprint, entry_index)`, because the
+granularity is taken from the WIRE SURFACE and no longer from the request
+flag. `T17` stops being a divergence witness and becomes a replay: our
+`streams` array must EQUAL the captured reference's, object for object,
+gated by
+`categorize_labels_differential.rs::pulsus_replays_the_granularity_witness_frame_object_for_object`
+(live) and by
+`encode.rs::the_tail_frame_emits_one_object_per_entry_in_timestamp_order`
+(hermetic). The alternative below is what those gates reject.
+
+- **What diverged, before 2026-08-29.** On the tail WITHOUT
+  `categorize-labels`, the reference emitted **one stream object per
+  entry, in strict timestamp order**; PulsusDB grouped a frame's entries
+  by their label set. This predated issue #463, which changed only the
+  flagged path — and the flag reaches this route only when an operator
+  has configured it as a datasource proxy header, so the path every
+  default client takes stayed packed until #469.
 
 - **What T17 shows.** Two streams differing in one label, entries
   interleaved in time — prod@t, staging@t+1, prod@t+2 — pushed once and
@@ -6209,22 +6250,40 @@ rename-colliding-metadata`
   appends one `logproto.Stream` per entry as it pops the oldest from the
   merge iterator.
 
-- **What the CATEGORISED tail does, and why it differs from this row.**
-  It splits — one object per entry, ordered by `(timestamp_ns,
-  labels_json, fingerprint, entry_index)` — so on that surface there is
-  no divergence to record. The timestamp key is the reference's own
-  order; the rest is our deterministic tiebreak, because the reference's
-  tie order is its merge tree's arrival order and is not reproducible
-  from the data (the `timestamp-tie-order` precedent).
+- **Both tail paths now do the same thing.** One object per entry,
+  ordered by `(timestamp_ns, labels_json, fingerprint, entry_index)`. The
+  timestamp key is the reference's own order; the rest is our
+  deterministic tiebreak, because the reference's tie order is its merge
+  tree's arrival order and is not reproducible from the data (the
+  `timestamp-tie-order` precedent, and see the tail-route paragraph in
+  that entry).
 
-- **Close condition:** issue #469 decides whether the unflagged tail
-  adopts per-entry objects. This row records the divergence and does not
-  fix it.
+- **The query route is deliberately NOT changed, and that is the control
+  that makes this safe.** Measured on the pinned reference at
+  `discover_log_levels: false`, on ONE container at one moment: the same
+  interleaved fixture comes back as three objects on
+  `/loki/api/v1/tail` and as two on `/loki/api/v1/query_range`. So
+  splitting is a property of the tail wire surface, not a global rule,
+  and `encode.rs::the_query_response_still_packs_a_streams_entries_into_one_object`
+  is what keeps the query response packed.
+
+- **What it costs.** Splitting repeats the label map once per entry:
+  `(entries − streams) × (len(labels_json) + 14)` bytes on the one
+  surface that buffers a whole frame. `reader.tail_max_fetch_limit`
+  bounds the entries in one frame and is the operator's knob for it. No
+  cap was introduced — the reference has the same property, and inventing
+  one would be a divergence created by the fix.
+
+- **Close condition (met):** issue #469 decided that the unflagged tail
+  adopts per-entry objects.
 
 - **Residual:** nothing mechanically prevents a later edit from
   substituting a non-discriminating witness. Whoever changes T17, the
   named alternative, or the probe it cites re-checks the discrimination
-  sentence above.
+  sentence above. **A tie fixture in particular proves nothing unless its
+  values separate storage-hash order from lexicographic order from push
+  order** — three candidates, and push order is the one nobody separated
+  for eight revisions of the plan behind this row.
 
 ### `categorize-instant-log-query` (issue #463 — no reference answer to match, so none is claimed)
 
