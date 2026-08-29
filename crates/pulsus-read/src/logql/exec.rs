@@ -39,9 +39,9 @@ use super::client_agg::{
     CLIENT_AGG_CHUNK_ROWS, ClientAggState, MetricAggState, RangeSlideState, run_client_agg_rows,
 };
 use super::detected_probe::{
-    DetectedPagedState, DetectedRowFeeder, FanOutGroup, LabelScratch, SmFanOutAccumulator,
-    TailCursorTracker, classify_page_error, eval_structured_metadata_row, push_fanout_entry,
-    push_group_entry, recycle_label_scratch, split_categories, split_merged_categories,
+    DetectedPagedState, DetectedRowFeeder, FanOutGroup, GroupKey, LabelScratch,
+    SmFanOutAccumulator, TailCursorTracker, classify_page_error, eval_structured_metadata_row,
+    push_fanout_entry, recycle_label_scratch, split_categories, split_merged_categories,
 };
 
 use super::labels::{
@@ -3649,14 +3649,16 @@ impl FastPathGroups {
         budget: &mut StreamsResultBudget,
     ) -> Result<(), ReadError> {
         if row.structured_metadata.is_empty() {
-            return push_group_entry(
+            return push_fanout_entry(
                 &mut self.cat_groups,
                 budget,
-                m.labels.clone(),
-                row.fingerprint,
-                &m.service,
+                GroupKey::Rendered {
+                    labels_json: m.labels.clone(),
+                    fingerprint: row.fingerprint,
+                },
                 row.timestamp_ns,
                 Cow::Owned(row.body),
+                &m.service,
                 Some(EntryCategories::default()),
             );
         }
@@ -3687,14 +3689,16 @@ impl FastPathGroups {
             let fp = fnv1a64(json.as_bytes());
             (json, fp)
         };
-        push_group_entry(
+        push_fanout_entry(
             &mut self.cat_groups,
             budget,
-            labels_json,
-            fingerprint,
-            &m.service,
+            GroupKey::Rendered {
+                labels_json,
+                fingerprint,
+            },
             row.timestamp_ns,
             Cow::Owned(row.body),
+            &m.service,
             Some(categories),
         )
     }
@@ -4055,7 +4059,7 @@ impl<'m> StreamAccumulator<'m> {
                     push_fanout_entry(
                         label_groups,
                         budget,
-                        &scratch,
+                        GroupKey::Sorted(&scratch),
                         row.timestamp_ns,
                         line,
                         &m.service,

@@ -5927,7 +5927,7 @@ divergence rather than a gap.
     per-entry framing plus up to 20 timestamp digits plus the separator
     comma and `json_string`'s two quotes (28 B/entry), and `serde_json`'s
     six-for-one `\u00XX` expansion of a C0 control byte — against the
-    same item's charge (`map_entry_bytes(STREAM_GROUP_SLOT)` = 840,
+    same item's charge (`map_entry_bytes(STREAM_GROUP_SLOT)` = 1,032,
     `6·|labels_json|` from `grown_alloc_bytes`, `STREAM_ENTRY_SLOT` = 32
     per entry, and `≥ 2·Σ|line|`). Every term of the output is dominated
     by three times its own contribution to the charge, and `6L ≤ 3·2L`
@@ -5935,7 +5935,7 @@ divergence rather than a gap.
     **3,221,225,472 B (~3.0 GiB)** encoded for a query at the cap.
   - **The input that reaches it:** one stream, 5,000 entries, every line
     107,340 B of `0x01`. That is admitted (`5,000 × (alloc_block_bytes
-    (107,340) + 32)` = 1,073,560,000 B plus a ~1,256 B group charge,
+    (107,340) + 32)` = 1,073,560,000 B plus a ~1,448 B group charge,
     inside 1,073,741,824) and renders `5,000 × 107,340 × 6` =
     3,220,200,000 B.
   - **Measured at CI scale:** 200 entries × 512 B of `0x01`,

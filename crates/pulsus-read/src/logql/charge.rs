@@ -1221,19 +1221,19 @@ const fn leaf_retained_bytes() -> u64 {
 /// peak — staged rows AND the assembled result (issue #312).
 ///
 /// **Derived under PEAK accounting**, with `STREAM_ENTRY_SLOT` = 32,
-/// [`STREAM_GROUP_SLOT`] = 88, [`STAGED_ROW_SLOT`] = 64,
-/// [`map_entry_bytes`]`(88)` = 840 and
+/// [`STREAM_GROUP_SLOT`] = 112, [`STAGED_ROW_SLOT`] = 64,
+/// [`map_entry_bytes`]`(112)` = 1 032 and
 /// [`super::exec::STREAM_FEED_CHUNK_BYTES`] = 8 388 608:
 ///
 /// ```text
 /// #  shape                                            entries        groups   staging peak         total   vs 1 GiB
 /// A  5 000 entries, 64 KiB lines, 5 000 streams,
-///    1 KiB labels_json                            655 520 000    35 080 000      8 519 776   699 119 776   admitted (65.1%)
+///    1 KiB labels_json                            655 520 000    36 040 000      8 519 776   700 079 776   admitted (65.2%)
 /// B  5 000 entries, 100 KiB lines, 1 stream,
-///    64 B labels_json                           1 024 160 000         1 256      8 593 504 1 032 754 760   admitted (96.2%)
-/// C  ONE maximal ingestible line (64 MiB body)    134 217 760         1 256    134 217 824   268 436 840   admitted (25.0%)
+///    64 B labels_json                           1 024 160 000         1 448      8 593 504 1 032 754 952   admitted (96.2%)
+/// C  ONE maximal ingestible line (64 MiB body)    134 217 760         1 448    134 217 824   268 437 032   admitted (25.0%)
 /// D  5 000 entries, 100 KiB lines, 5 000 streams,
-///    2 KiB labels_json                          1 024 160 000    65 800 000      8 593 504 1 098 553 504   REFUSED  (102.3%)
+///    2 KiB labels_json                          1 024 160 000    66 760 000      8 593 504 1 099 513 504   REFUSED  (102.4%)
 /// ```
 ///
 /// Row C is the property that matters most: no single stored row is ever

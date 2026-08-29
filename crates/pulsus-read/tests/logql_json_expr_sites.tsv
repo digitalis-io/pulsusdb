@@ -86,20 +86,20 @@ Site	LogqlUnparseable	crates/pulsus-logql/tests/string_escapes.rs:365	-	-	\d	-	-
 Site	Literal	crates/pulsus-read/src/logql/error.rs:420	-	-	b.c	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/logfmt_expr.rs:168	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict
 Site	Literal	crates/pulsus-read/src/logql/logfmt_expr.rs:169	-	-	b-c	accept	reject	-	-	the same: the second #394 gloss, this issue's two corpus-file headers, and b26_json_expr.test's eval_fail row pinning the new verdict
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3626	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3626	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4113	-	-	b.c	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4426	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4426	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4684	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4684	-	-	q	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4690	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4694	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4694	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4700	-	-	nosuch	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4700	-	-	p	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4701	-	-	nosuch	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5234	-	-	a.a.a…	accept	reject	-	-	a doc-comment ELISION, not an expression
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3716	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:3716	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4247	-	-	b.c	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4560	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4560	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4818	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4818	-	-	q	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4824	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4828	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4828	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4834	-	-	nosuch	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4834	-	-	p	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:4835	-	-	nosuch	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/pipeline.rs:5368	-	-	a.a.a…	accept	reject	-	-	a doc-comment ELISION, not an expression
 Site	Literal	crates/pulsus-read/tests/logql_json_flatten_budget.rs:268	-	-	{key}.k00000	accept	reject	-	-	a `format!` PLACEHOLDER (logql_json_flatten_budget.rs). Its real domain is `a`*32761 `.k00000`, FIELD DOT FIELD, which the reference accepts; that the generator produces only that is read out of the generator, not run (reading R4)
 Site	Literal	crates/pulsus-read/tests/logql_json_flatten_budget.rs:30	-	-	b.c	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_logfmt_expr_matrix.rs:157	-	-	b c	accept	reject	-	-	PROSE and FIXTURE about this expression, never a query that must keep working: one of the two #394 glosses that said it was `accepted here` (which this change makes false and rewrites), and b26_json_expr.test's own eval_fail row, which pins the new verdict

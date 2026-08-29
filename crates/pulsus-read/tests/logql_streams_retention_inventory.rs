@@ -338,6 +338,16 @@ const PINNED: &[(&str, &str, &str)] = &[
     ("detected_probe.rs", "push_fanout_entry", "entries.push"),
     // --- exec.rs: the declared containers.
     ("exec.rs", "<item>", "field:by_fp:HashMap<u64,StreamResult>"),
+    // Issue #463's categorised fast-path map. Charged through the SAME
+    // `push_fanout_entry` body as `label_groups` and `groups` above —
+    // `charge_group` before the vacant insert, `charge_entry` (now
+    // including `entry_category_bytes`) before `line.into_owned()` — so
+    // this container has no charge of its own to read.
+    (
+        "exec.rs",
+        "<item>",
+        "field:cat_groups:HashMap<String,FanOutGroup>",
+    ),
     ("exec.rs", "<item>", "field:chunk:Vec<SampleRow>"),
     ("exec.rs", "<item>", "field:entries:Vec<(i64,String)>"),
     (

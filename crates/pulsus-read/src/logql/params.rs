@@ -194,6 +194,22 @@ pub fn validate_duration_ns(
     Ok(ValidatedDuration(value as i64))
 }
 
+/// Response-shape options a request can ask for (issue #463).
+///
+/// Deliberately **not** on [`QueryParams`]: that type is `Copy` and built
+/// by struct literal at 136 sites, and none of them has an opinion about
+/// the wire shape. Threading an opaque options struct through the three
+/// engine entrypoints that can emit log lines keeps every one of those
+/// literals untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResponseOptions {
+    /// `X-Loki-Response-Encoding-Flags: categorize-labels` — the request
+    /// asked for the three-element `values` shape, so each entry's
+    /// structured-metadata and parsed labels are carried out of the
+    /// stream's label set and onto the entry.
+    pub categorize_labels: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,20 +284,4 @@ mod tests {
             HUNDRED_YEARS_NS as i64
         );
     }
-}
-
-/// Response-shape options a request can ask for (issue #463).
-///
-/// Deliberately **not** on [`QueryParams`]: that type is `Copy` and built
-/// by struct literal at 136 sites, and none of them has an opinion about
-/// the wire shape. Threading an opaque options struct through the three
-/// engine entrypoints that can emit log lines keeps every one of those
-/// literals untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ResponseOptions {
-    /// `X-Loki-Response-Encoding-Flags: categorize-labels` — the request
-    /// asked for the three-element `values` shape, so each entry's
-    /// structured-metadata and parsed labels are carried out of the
-    /// stream's label set and onto the entry.
-    pub categorize_labels: bool,
 }

@@ -41,6 +41,31 @@ pub(in crate::logql) struct FanOutGroup {
     pub(in crate::logql) categories: Vec<EntryCategories>,
 }
 
+/// How a caller supplies [`push_fanout_entry`]'s group key.
+///
+/// Two shapes because two paths reach the same retention: the pipeline
+/// paths hold a sorted label scratch and must render it, while the issue
+/// #463 categorised fast path already holds the hydrated `labels_json`
+/// verbatim — its stream category is the stored label set unless a
+/// metadata value took over one of its slots — so re-rendering it per row
+/// would be pure waste.
+///
+/// One function, not two, because the RETAINING statements have to live
+/// in one place: `tests/logql_streams_retention_inventory.rs` pins the
+/// streams retention surface by `(file, function, site)`, and a second
+/// copy of `FanOutGroup { .. }` would be a second site to keep charged.
+pub(in crate::logql) enum GroupKey<'a> {
+    /// Render the key from this sorted label set, and take `service` from
+    /// its own `service_name` where it has one.
+    Sorted(&'a [(Cow<'a, str>, Cow<'a, str>)]),
+    /// Use this already-canonical key and fingerprint; `service` comes
+    /// from the caller's fallback.
+    Rendered {
+        labels_json: String,
+        fingerprint: u64,
+    },
+}
+
 /// Inserts one surviving fan-out entry (its `sorted_scratch` label set already
 /// sorted) into the label-set-keyed group map — shared by the label-mutating
 /// pipeline path and the structured-metadata merge path (issue #97), which both
@@ -64,53 +89,30 @@ pub(in crate::logql) struct FanOutGroup {
 pub(in crate::logql) fn push_fanout_entry(
     label_groups: &mut HashMap<String, FanOutGroup>,
     budget: &mut StreamsResultBudget,
-    sorted_scratch: &[(Cow<'_, str>, Cow<'_, str>)],
+    key: GroupKey<'_>,
     timestamp_ns: i64,
     line: Cow<'_, str>,
     fallback_service: &str,
     categories: Option<EntryCategories>,
 ) -> Result<(), ReadError> {
-    let labels_json = render_labels_json_sorted(sorted_scratch);
-    let service: &str = sorted_scratch
-        .iter()
-        .find(|(k, _)| k == "service_name")
-        .map(|(_, v)| v.as_ref())
-        .unwrap_or(fallback_service);
-    let fingerprint = fnv1a64(labels_json.as_bytes());
-    push_group_entry(
-        label_groups,
-        budget,
-        labels_json,
-        fingerprint,
-        service,
-        timestamp_ns,
-        line,
-        categories,
-    )
-}
-
-/// [`push_fanout_entry`]'s core, for a caller that ALREADY holds the
-/// rendered group key — the issue #463 categorised fast path, whose
-/// stream-category label set is the hydrated `labels_json` verbatim
-/// unless a metadata value took over a stream slot, so re-rendering it
-/// per row would be pure waste.
-///
-/// The charge order is the one [`push_fanout_entry`] documents: the group
-/// charge precedes the `service` clone it pays for, and the entry charge
-/// precedes `line.into_owned()`. `categories`' bytes are charged with the
-/// entry (issue #463) — a third element the budget did not price is
-/// exactly how the retention cap stops bounding the result.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::logql) fn push_group_entry(
-    label_groups: &mut HashMap<String, FanOutGroup>,
-    budget: &mut StreamsResultBudget,
-    labels_json: String,
-    fingerprint: u64,
-    service: &str,
-    timestamp_ns: i64,
-    line: Cow<'_, str>,
-    categories: Option<EntryCategories>,
-) -> Result<(), ReadError> {
+    let (labels_json, fingerprint, service) = match key {
+        GroupKey::Sorted(sorted_scratch) => {
+            let labels_json = render_labels_json_sorted(sorted_scratch);
+            // Borrowed, not owned, so the group charge precedes the
+            // `service` allocation it pays for.
+            let service: &str = sorted_scratch
+                .iter()
+                .find(|(k, _)| k == "service_name")
+                .map(|(_, v)| v.as_ref())
+                .unwrap_or(fallback_service);
+            let fingerprint = fnv1a64(labels_json.as_bytes());
+            (labels_json, fingerprint, service)
+        }
+        GroupKey::Rendered {
+            labels_json,
+            fingerprint,
+        } => (labels_json, fingerprint, fallback_service),
+    };
     let cat_bytes = categories.as_ref().map_or(0, entry_category_bytes);
     match label_groups.entry(labels_json) {
         std::collections::hash_map::Entry::Occupied(e) => {
@@ -237,7 +239,7 @@ pub(in crate::logql) fn eval_structured_metadata_row<'a>(
             if let Err(e) = push_fanout_entry(
                 label_groups,
                 budget,
-                &scratch,
+                GroupKey::Sorted(&scratch),
                 timestamp_ns,
                 line,
                 service,
@@ -1081,7 +1083,7 @@ impl SmFanOutAccumulator {
         push_fanout_entry(
             &mut self.groups,
             budget,
-            &sorted,
+            GroupKey::Sorted(&sorted),
             row.timestamp_ns,
             Cow::Borrowed(row.body.as_str()),
             &m.service,

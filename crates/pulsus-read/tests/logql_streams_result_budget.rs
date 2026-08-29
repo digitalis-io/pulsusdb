@@ -42,7 +42,12 @@ const MIN_ALLOC_BYTES: u64 = 32;
 /// `size_of::<(i64, String)>()`.
 const STREAM_ENTRY_SLOT: u64 = 32;
 /// `max(size_of::<(u64, StreamResult)>(), size_of::<(String, FanOutGroup)>())`.
-const STREAM_GROUP_SLOT: u64 = 88;
+///
+/// 88 -> 112 with issue #463: `StreamResult` gained a `categories`
+/// `Vec` (24 B) and `FanOutGroup` gained the same, so both shapes grew
+/// by one `Vec` and the production constant — a `size_of` — moved with
+/// them. This is a per-STREAM widening, not per-entry.
+const STREAM_GROUP_SLOT: u64 = 112;
 /// `size_of::<SampleRow>()`.
 const STAGED_ROW_SLOT: u64 = 64;
 
@@ -572,10 +577,10 @@ fn the_derivation_rows_are_admitted_and_row_d_is_refused() {
 
     // The exact figures the doc table publishes, so a slot width moving
     // reddens here as well as the admit/refuse verdict.
-    assert_eq!(rows[0].1, 699_119_776);
-    assert_eq!(rows[1].1, 1_032_754_760);
-    assert_eq!(rows[2].1, 268_436_840);
-    assert_eq!(rows[3].1, 1_098_553_504);
+    assert_eq!(rows[0].1, 700_079_776);
+    assert_eq!(rows[1].1, 1_032_754_952);
+    assert_eq!(rows[2].1, 268_437_032);
+    assert_eq!(rows[3].1, 1_099_513_504);
 
     for (name, total, admitted) in rows {
         assert_eq!(
