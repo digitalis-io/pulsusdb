@@ -47,7 +47,21 @@ const STREAM_ENTRY_SLOT: u64 = 32;
 /// `Vec` (24 B) and `FanOutGroup` gained the same, so both shapes grew
 /// by one `Vec` and the production constant — a `size_of` — moved with
 /// them. This is a per-STREAM widening, not per-entry.
+///
+/// **What makes the new figures trustworthy is not that they were
+/// recomputed, it is that the same recomputation reproduces the OLD
+/// ones.** [`the_doc_table_arithmetic_reproduces_the_pre_463_figures`]
+/// runs the formula below at the pre-#463 slot width and asserts it
+/// returns the four totals that were committed then, byte for byte.
+/// That tests the MODEL rather than the new number: a recomputation
+/// that quietly changed a term would produce four plausible new totals
+/// and no signal at all, and this is what says the term list did not
+/// move — only its one input did.
 const STREAM_GROUP_SLOT: u64 = 112;
+
+/// The pre-#463 slot width, kept solely so the check above has an input
+/// whose ANSWER is already on the record.
+const STREAM_GROUP_SLOT_PRE_463: u64 = 88;
 /// `size_of::<SampleRow>()`.
 const STAGED_ROW_SLOT: u64 = 64;
 
@@ -68,9 +82,14 @@ fn entry_bytes(line_len: u64) -> u64 {
 }
 
 fn group_bytes(labels_json_len: u64, service_len: u64) -> u64 {
-    map_entry_bytes(STREAM_GROUP_SLOT)
-        + grown_alloc_bytes(labels_json_len)
-        + alloc_block_bytes(service_len)
+    group_bytes_at(STREAM_GROUP_SLOT, labels_json_len, service_len)
+}
+
+/// [`group_bytes`] at a stated slot width — ONE formula, so running it at
+/// the pre-#463 width exercises the shipped terms rather than a copy of
+/// them.
+fn group_bytes_at(slot: u64, labels_json_len: u64, service_len: u64) -> u64 {
+    map_entry_bytes(slot) + grown_alloc_bytes(labels_json_len) + alloc_block_bytes(service_len)
 }
 
 /// EVERYTHING one staged `SampleRow` retains — body AND structured
@@ -786,4 +805,68 @@ fn a_categorised_query_whose_metadata_alone_exceeds_the_cap_is_refused() {
         ),
         "expected the named streams-result refusal, got {err:?}"
     );
+}
+
+/// **The doc table's arithmetic reproduces the PRE-#463 figures at the
+/// pre-#463 slot width.**
+///
+/// `STREAM_GROUP_SLOT` moved 88 -> 112 because `StreamResult` and
+/// `FanOutGroup` each gained one `Vec`, and the four totals in
+/// `MAX_STREAMS_RESULT_BYTES`' doc table moved with it. Recomputing them
+/// proves nothing on its own: a recomputation that dropped or added a
+/// term would produce four plausible new totals and no signal at all.
+///
+/// So the same formula is run at the OLD width and compared against the
+/// totals that were committed before this issue — figures nobody in this
+/// change chose. They reproduce exactly, which is what says the term
+/// list did not move and only its one input did.
+#[test]
+fn the_doc_table_arithmetic_reproduces_the_pre_463_figures() {
+    let total = |entries: u64, line: u64, groups: u64, labels: u64, staged_line: u64, slot: u64| {
+        entries * entry_bytes(line)
+            + groups * group_bytes_at(slot, labels, SVC.len() as u64)
+            + STREAM_FEED_CHUNK_BYTES
+            + staged_row_bytes(staged_line, 0)
+    };
+    let one_max_line = 64 * 1024 * 1024u64;
+    let rows = |slot: u64| -> [u64; 4] {
+        [
+            total(5_000, 65_536, 5_000, 1_024, 65_536, slot),
+            total(5_000, 102_400, 1, 64, 102_400, slot),
+            entry_bytes(one_max_line)
+                + group_bytes_at(slot, 64, SVC.len() as u64)
+                + staged_row_bytes(one_max_line, 0),
+            total(5_000, 102_400, 5_000, 2_048, 102_400, slot),
+        ]
+    };
+
+    // Committed at `bf3a8f6`, the commit before issue #463 — read out of
+    // that revision's copy of the doc table, not recomputed here.
+    assert_eq!(
+        rows(STREAM_GROUP_SLOT_PRE_463),
+        [699_119_776, 1_032_754_760, 268_436_840, 1_098_553_504],
+        "the charge model no longer reproduces the pre-#463 doc table at the pre-#463 slot \
+         width — a TERM moved, not just the slot, and the new figures cannot be trusted"
+    );
+
+    // And the shipped width gives the figures the doc table now carries,
+    // which `the_streams_result_budget_doc_table_is_reproducible` also
+    // asserts against the same constants.
+    assert_eq!(
+        rows(STREAM_GROUP_SLOT),
+        [700_079_776, 1_032_754_952, 268_437_032, 1_099_513_504],
+        "the shipped slot width no longer produces the committed doc table"
+    );
+
+    // The whole delta is the slot, and it is the same per group either
+    // way: `map_entry_bytes(112) - map_entry_bytes(88)`.
+    let per_group = map_entry_bytes(STREAM_GROUP_SLOT) - map_entry_bytes(STREAM_GROUP_SLOT_PRE_463);
+    assert_eq!(per_group, 192);
+    for (groups, i) in [(5_000u64, 0usize), (1, 1), (1, 2), (5_000, 3)] {
+        assert_eq!(
+            rows(STREAM_GROUP_SLOT)[i] - rows(STREAM_GROUP_SLOT_PRE_463)[i],
+            groups * per_group,
+            "row {i}'s movement is not exactly its group count times the slot delta"
+        );
+    }
 }

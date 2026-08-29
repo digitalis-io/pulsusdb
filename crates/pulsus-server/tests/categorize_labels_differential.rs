@@ -195,6 +195,7 @@ fn query_probes() -> Vec<Probe> {
         q("O",  r#"{app="co{N}"} | label_format trace_id="forced""#, CAT),
         q("P",  r#"{app="co{N}"} | line_format `L={{.app}}`"#, CAT),
         q("R",  r#"{app="dbl{N}"}"#, CAT),
+        q("R0", r#"{app="dbl{N}"}"#, None),
         q("LF", r#"{app="pzlf{N}"} | logfmt"#, CAT),
         q("RE", r#"{app="pzre{N}"} | regexp `^RE (?P<app>\S+) (?P<trace_id>\S+)$`"#, CAT),
         q("PT", r#"{app="pzpt{N}"} | pattern `PT <app> <trace_id> end`"#, CAT),
@@ -762,8 +763,8 @@ fn the_manifest_the_capture_and_the_referenced_ids_are_one_set() {
         .collect();
     assert_eq!(
         manifest.len(),
-        55,
-        "the manifest is 55 probes: 20 Q-nonempty, 1 Q-empty, 14 Q-header, 2 Failure, 18 Tail"
+        56,
+        "the manifest is 56 probes: 21 Q-nonempty, 1 Q-empty, 14 Q-header, 2 Failure, 18 Tail"
     );
 
     // The capture holds every id whose side the REFERENCE can answer.
@@ -847,6 +848,18 @@ fn the_manifest_the_capture_and_the_referenced_ids_are_one_set() {
 /// false for four of the five classes: `G` is empty on purpose, a
 /// rejected query has no `data.result`, and a tail frame has no query
 /// range to contain anything.
+///
+/// **56, not the plan's 55, and the number moved because the probe set
+/// did.** `R0` — the double-collision stream read WITHOUT the header —
+/// was briefly dropped to keep the count at 55, which is backwards: this
+/// census exists to describe what is probed and to stop a probe
+/// appearing or disappearing silently, so trading coverage for the
+/// number inverts what the number is for, and does it invisibly, because
+/// the census stays green either way. `R0` is the unflagged half of the
+/// case where a metadata value wins a slot inside the stream region; its
+/// flagged twin `R` is the one the categorisation break table names, and
+/// without `R0` the merged-into-`stream` answer for that same fixture
+/// was captured nowhere. Owner ruling, issue #463.
 #[test]
 fn every_probe_declares_a_class_a_side_and_a_partner_where_it_has_one() {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
@@ -869,7 +882,7 @@ fn every_probe_declares_a_class_a_side_and_a_partner_where_it_has_one() {
     assert_eq!(
         counts,
         BTreeMap::from([
-            ("Q-nonempty", 20),
+            ("Q-nonempty", 21),
             ("Q-empty", 1),
             ("Q-header", 14),
             ("Failure", 2),
@@ -1786,13 +1799,48 @@ fn spawn_pulsus(db: &str) -> ChildGuard {
 ///
 /// Every probe the reference can answer is replayed through the SAME
 /// driver against our own server, and its projection compared against
-/// the committed one. The named breaking edits — dropping
-/// `parsed_over_stream`, dropping `sm_over_stream`, filing `__error__`
-/// under `structuredMetadata`, skipping the `_extracted` rename,
-/// categorising a live-metadata name as `Stream`, emitting the third
-/// element without the flag — are performed on the implemented tree and
-/// the reddened probe recorded in the issue's implementation notes; a
-/// criterion whose break was only predicted has never been run.
+/// the committed one. Each named breaking edit below was performed on
+/// the IMPLEMENTED tree, the reddened set recorded, and the file
+/// restored; a criterion whose break was only predicted has never been
+/// run. The recorded sets are on issue #463.
+///
+/// | edit | probes that reddened |
+/// |---|---|
+/// | drop the `parsed_over_stream` push from `note_parsed_set` | `D I` |
+/// | drop the `sm_over_stream` push from the merge | `R` |
+/// | file the error labels under `structuredMetadata` | `C` |
+/// | skip the collision rename in `add_extracted` | `LF RE PT` |
+/// | skip the collision rename in `run_unpack` | `UP` |
+/// | skip it for the expression parsers | `JX LX` |
+/// | live metadata categorised as `Stream` in `category_of` | thirteen pipeline probes |
+/// | the same on the no-pipeline path, in `split_merged_categories` | `B R M H2 H3 H8 H12 H13 H14` |
+/// | render the third element without the flag | `A H1 H4 H5 H6 H7 H9 H10 H11` |
+///
+/// **Two of those are TWO edits each, and the second is not padding —
+/// it is a fact about where the code puts the rule.**
+///
+/// * *The collision rename lives in two places.* Every parser but one
+///   renames through `add_extracted`; `unpack` carries its own rename
+///   inside `run_unpack`, because it resolves its keys before it
+///   buffers them. So an edit to the shared writer reaches `LF RE PT`
+///   and structurally cannot reach `UP`, and the second edit is the
+///   only way to exercise the packed-entry parser's copy of the rule.
+///
+/// * *The categorisation has two sources, one per read path.* On a
+///   pipeline query the category comes from `category_of`, which reads
+///   the builder state the stages left. On a bare selector no pipeline
+///   runs at all, and the category is derived from the merge itself by
+///   `split_merged_categories`. Probe `B` is a bare selector, so an
+///   edit to `category_of` leaves it untouched however wrong it makes
+///   the other thirteen — which is why the plan's predicted `B K O` is
+///   reached only by both edits: the first reds `K` and `O`, the second
+///   reds `B`.
+///
+/// Four of the recorded sets are WIDER than the plan predicted, and they
+/// are recorded at their measured width rather than trimmed to match:
+/// the third-element edit reds eight header cases beyond `A` (every case
+/// whose arity is two — the same defect seen through the header table),
+/// and the `category_of` edit reds eleven pipeline probes beyond `K O`.
 ///
 /// The one-sided probes are handled per their side: `F2-ref` has no
 /// PulsusDB answer (we serve the instant log query the reference

@@ -9,8 +9,8 @@
     "revision": "b318f282",
     "version": "3.7.4"
   },
-  "captured_at_unix": 1788006699,
-  "nonce": "1788006514a",
+  "captured_at_unix": 1788011764,
+  "nonce": "1788011580a",
   "probes": [
     {
       "id": "A",
@@ -110,6 +110,15 @@
       "header": "categorize-labels",
       "status": 200,
       "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"dblNONCE\",\"service_name\":\"dblNONCE\",\"zz\":\"1\"},\"values\":[[\"8\",\"double collision\",{\"structuredMetadata\":{\"app_extracted\":\"sm-side\"}}]]}]}"
+    },
+    {
+      "id": "R0",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"dbl{N}\"}",
+      "header": null,
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"result\":[{\"stream\":{\"app\":\"dblNONCE\",\"app_extracted\":\"sm-side\",\"service_name\":\"dblNONCE\",\"zz\":\"1\"},\"values\":[[\"8\",\"double collision\"]]}]}"
     },
     {
       "id": "LF",
