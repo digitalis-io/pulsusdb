@@ -3163,62 +3163,80 @@ mod tests {
     /// * `D2` every value has two elements
     #[tokio::test]
     async fn the_advertisement_and_the_arity_are_one_decision() {
+        // COLLECTED, not asserted eagerly: a mutation's signature is the
+        // SET of assertions it fails, and a test that stops at the first
+        // one can only ever report a prefix of it. Two mutations that
+        // both fail `A1` are then indistinguishable however many other
+        // assertions separate them.
+        let mut failed: Vec<String> = Vec::new();
+        let mut check = |ok: bool, id: &str, env: Env463, body: &str| {
+            if !ok {
+                failed.push(format!("{id}({env:?})"));
+                eprintln!("c463 matrix FAIL {id}({env:?}): {body}");
+            }
+        };
         for env in [Env463::Query, Env463::Tail] {
             // 4A — a construction bug downgrades the body; it never
             // advertises a shape it cannot serve.
             let body = c463_render(env, c463_short_by_one(), &flags(&["categorize-labels"])).await;
             let echo = encoding_flags_of(&body).unwrap_or_default();
-            assert!(
+            check(
                 !echo.iter().any(|f| f == "categorize-labels"),
-                "{env:?} A1: a downgraded body must not advertise the flag: {body}"
+                "A1",
+                env,
+                &body,
             );
-            assert!(
+            check(
                 value_arities(&body).iter().all(|n| *n == 2),
-                "{env:?} A2: a downgraded body must render two-element values: {body}"
+                "A2",
+                env,
+                &body,
             );
 
             // 4B — well-formed categories, NO header.
             let body = c463_render(env, c463_items(true), &[]).await;
-            assert_eq!(
-                encoding_flags_of(&body),
-                None,
-                "{env:?} B1: no header means no key at all: {body}"
-            );
-            assert!(
+            check(encoding_flags_of(&body).is_none(), "B1", env, &body);
+            check(
                 value_arities(&body).iter().all(|n| *n == 2),
-                "{env:?} B2: no header means two-element values: {body}"
+                "B2",
+                env,
+                &body,
             );
 
             // 4C — an EMPTY result with the flag still advertises it.
             let body = c463_render(env, Vec::new(), &flags(&["categorize-labels"])).await;
-            assert_eq!(
-                encoding_flags_of(&body).as_deref(),
-                Some(&["categorize-labels".to_string()][..]),
-                "{env:?} C1: an empty result advertises on the request alone: {body}"
+            check(
+                encoding_flags_of(&body).as_deref() == Some(&["categorize-labels".to_string()][..]),
+                "C1",
+                env,
+                &body,
             );
             let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
             let arr = match env {
                 Env463::Query => &parsed["data"]["result"],
                 Env463::Tail => &parsed["streams"],
             };
-            assert_eq!(
-                arr.as_array().map(Vec::len),
-                Some(0),
-                "{env:?} C2: the result array must be empty: {body}"
-            );
+            check(arr.as_array().map(Vec::len) == Some(0), "C2", env, &body);
 
             // 4D — an UNKNOWN flag is echoed verbatim and changes nothing.
             let body = c463_render(env, c463_items(true), &flags(&["foo"])).await;
-            assert_eq!(
-                encoding_flags_of(&body).as_deref(),
-                Some(&["foo".to_string()][..]),
-                "{env:?} D1: an unknown flag is echoed verbatim: {body}"
+            check(
+                encoding_flags_of(&body).as_deref() == Some(&["foo".to_string()][..]),
+                "D1",
+                env,
+                &body,
             );
-            assert!(
+            check(
                 value_arities(&body).iter().all(|n| *n == 2),
-                "{env:?} D2: an unknown flag must not change the arity: {body}"
+                "D2",
+                env,
+                &body,
             );
         }
+        assert!(
+            failed.is_empty(),
+            "the advertisement and the arity disagreed; signature: {failed:?}"
+        );
     }
 
     /// **The categorised body, on both envelopes.** The positive half of
