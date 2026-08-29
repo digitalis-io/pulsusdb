@@ -2084,6 +2084,31 @@ fn the_native_route_and_the_alias_agree_byte_for_byte() {
 /// **What it still does not cover:** an object whose category contents
 /// are right but whose key order or escaping differs, and any surface
 /// with no probe. One witness closes one shape.
+///
+/// # The witness form, and why it is not the other one
+///
+/// This test uses the **pre-registered-stream** form: the rows are
+/// pushed FIRST, and the socket then opens with a `start` behind them,
+/// so the tail's catch-up walk delivers them. It deliberately does not
+/// use the **fresh-stream** form — open the socket, then push a stream
+/// the server has never seen.
+///
+/// **The fresh-stream form does not discriminate this change, and it
+/// fails on VISIBILITY rather than on correctness.** Measured here by
+/// flipping this test to it: the frame collector returned nothing at
+/// all, and the assertion that reddened was `the tail produced no frame
+/// at all` — not one about categories, ordering or object count.
+/// Raising the deadline does not help, which is the tell: at a 10 s
+/// collect window it failed in 13 s, and at 30 s it failed in 33 s, the
+/// same way.
+///
+/// So a later reader who "fixes" this by switching to the fresh-stream
+/// form gets a test that reds for a reason unrelated to what it is
+/// about, and a flake that looks like a categorisation defect. The
+/// eighteen tail probes in the capture DO exercise both delivery paths
+/// against the reference, where the distinction is the subject; here
+/// the subject is the rendered frame, and the delivery path is only how
+/// the rows arrive.
 #[test]
 fn the_categorised_tail_frame_is_per_entry_ordered_and_carries_both_categories() {
     if !pulsus_testkit::live_clickhouse_enabled() {
