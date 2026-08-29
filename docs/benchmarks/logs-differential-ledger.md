@@ -889,6 +889,37 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   Controls: at 499 s and 900 s both bounds already sit on the derived
   grid and the two stores agree point for point (500 and 301 points),
   so what the 501 s row measures is the alignment and not the fixture.
+
+  <!-- range-grid:start -->window_ns=501000000000 our_points=251 our_step_ns=2000000000 ref_points=252 our_last_offset_ns=500000000000 ref_last_offset_ns=502000000000<!-- range-grid:end -->
+
+  **The measurement lives here and nowhere else.** `docs/api.md` and
+  `logs_api_live.rs`'s doc comment used to restate it; both now cite this
+  row. Two copies remain and they are BOUND to each other: the anchor
+  block above, and the executable case tuple `(501_000_000_000, 251,
+  2_000_000_000)` at `crates/pulsus-server/tests/logs_api_live.rs`, which
+  is the only copy that fails when the number is wrong.
+  `the_range_grid_anchor_binds_the_executable_case` asserts
+  `window_ns`/`our_points`/`our_step_ns` equal that tuple and that
+  `ref_last_offset_ns - our_last_offset_ns == our_step_ns`.
+
+  **Not to be confused with the step-derivation record.** `251` also
+  appears at `logs_api_live.rs`'s "before this change we derived
+  `span_ns / 250` NANOSECONDS" note and at
+  `crates/pulsus-server/src/logs_api/params.rs`, which belong to issue
+  #425 Part B — a different claim about a different quantity that
+  happens to share the digits, and which has no ledger row because it
+  restored parity rather than creating a divergence. A census that
+  conflates the two reports a phantom duplicate.
+
+  **What still overlaps, stated rather than removed.** The anchor's
+  `our_step_ns` and `params.rs`'s "a 501 s window `2s`" record the same
+  derived step for the same window, in prose and in an executable tuple
+  at `params.rs`, and nothing binds them to this row. Removing the
+  overlap would mean deleting a term from the step-derivation record to
+  serve this one, which is the wrong direction. Four sites state the
+  `501 s → 2 s` fact — this anchor, `logs_api_live.rs`'s case tuple,
+  `params.rs`'s prose and `params.rs`'s executable tuple — and the
+  binding covers the first two.
 - **Why it is accepted.** The alignment is an implementation detail of
   **query splitting** surfacing in the API, not a documented contract:
   the reference splits a range query into hour chunks to run them in
@@ -906,6 +937,39 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   migrated dashboard shifts — is about existing deployments; the stated
   goal is new ones, where points from your start, inside your window, at
   your step is what the documentation implies.
+
+  **Measured on the CLIENT, issue #462 (closed on this), and it replaces
+  the weaker framing above rather than sitting beside it.** The primary
+  client already sends a step-aligned `start`, so under a stock
+  deployment there is **no timestamp difference at all** — the whole
+  divergence is the reference's one extra trailing point, which a time
+  series panel clips off-canvas. Grafana **13.2.0**
+  (`sha256:3fd54ae1214669f8355f065ec9f6445d5279a3d77095ab048ca045685272429b`)
+  with its bundled datasource plugin **13.1.0**, one timeseries panel
+  over a 6 h `now`-relative range, sends `start=1787947980000000000`,
+  `end=1787969582798000000`, `step=10000ms`. `start % step == 0` and
+  `end % step != 0`, so `floor(start, step) == start`: the two grids
+  carry identical timestamps up to our last point at
+  `1787969580000000000`. Our grid carries 2161 points; the reference's
+  grid carries 2162 points, the extra one at `ceil(end, step)` —
+  one further point at `1787969590000000000`, which sits 7.202 s past
+  the `end` that was asked for, off the right-hand edge of the panel's
+  canvas. So the migrated-dashboard counter-argument does not describe
+  what a stock client actually sees: it sees the same points plus one it
+  does not draw.
+
+  <!-- grid-capture:start -->start=1787947980000000000 end=1787969582798000000 step_ns=10000000000 our_last=1787969580000000000 our_points=2161 ref_extra=1787969590000000000 ref_points=2162 past_end_ns=7202000000<!-- grid-capture:end -->
+
+  **Limits of that capture, stated so the row is not read wider than it
+  was measured.** The datasource's own query splitting never ran (one
+  request per panel was observed), the `> 11000`-point resolution clamp
+  never fired, and only a `now`-relative range query on a **timeseries**
+  panel was captured — no absolute range, no other panel type, no split
+  query, and nothing about `/query`. The capture is the coordinator's,
+  recorded as such; the arithmetic above is re-derived from its three
+  inputs by `the_grid_capture_anchor_recomputes_from_its_own_inputs`,
+  which also reads each value out of the role phrase that gives it its
+  meaning, so swapping the two timestamps or the two point counts reds.
 - **Close condition:** the owner reverses the 2026-08-12 ruling. Nothing
   else reopens this; it is not waiting on a fix.
 - **Pin:** `crates/pulsus-read/tests/logqltest/corpus/
@@ -6010,6 +6074,185 @@ divergence rather than a gap.
   at the worst shape. The `6R` figure is a model; the `2.09 R` is a
   measurement, and they are labelled here so nobody quotes one as the
   other.
+
+## Issue #463 — `X-Loki-Response-Encoding-Flags: categorize-labels`
+
+### `encoding-flags-echo-order` (issue #463, owner ruling — ordering only, and ours is the stable one)
+
+- **What diverges: the ORDER of the echoed `encodingFlags` array, and
+  nothing else.** The token CONTENT is the reference's own, echoed
+  verbatim: unknown flags pass through unchanged, whitespace is not
+  trimmed, matching is exact and case-sensitive, empty tokens are kept,
+  and duplicates collapse. Fourteen header shapes were measured and all
+  fourteen agree on content — see criterion 6's table in
+  `crates/pulsus-server/src/logs_api/params.rs`.
+
+- **The reference's own order is NOT STABLE.** `ParseEncodingFlags`
+  builds a fresh `map[string]struct{}` per request and the marshaller
+  walks it, so a two-token header comes back in either order from the
+  same process. Measured: 200 requests with `foo,categorize-labels`
+  split **183 / 17** between the two orders. An earlier reading of eight
+  agreeing repeats as evidence of per-process stability was wrong and is
+  withdrawn — under a 183/17 split, eight agreeing draws have
+  probability `0.915^8 ≈ 0.49`, a likelihood ratio near 2 against the
+  alternative, which is not evidence of anything.
+
+- **What we do:** first-occurrence request order, deterministically. The
+  same tokens, in the order the client sent them.
+
+- **Read this row as ordering only.** It is NOT "we reorder their flags":
+  there is no reference order to preserve. A later reader who tries to
+  "fix" this back will be matching a map walk.
+
+- **One state the reference cannot enter, and what we do in it.** Our
+  decision is `flag present AND every stream can serve a third element`;
+  theirs is the flag alone. When a stream cannot serve one, ours turns
+  off — and the echo then drops `categorize-labels`, because echoing it
+  beside two-element values is exactly the parser desynchronisation the
+  whole design exists to prevent. Unknown tokens are unaffected. The
+  reference has no answer here because it cannot reach the state; this
+  is our rule in it, and it is the safe direction (a feature loss, never
+  an unparseable body).
+
+- **Close condition:** the reference emits a stable order. Nothing else.
+
+- **Pinned by** `logs_api/params.rs`'s
+  `the_encoding_flags_header_parses_as_the_reference_does` (content and
+  decision, all fourteen cases) and `logs_api/encode.rs`'s
+  `the_advertisement_and_the_arity_are_one_decision` (the removal
+  clause, on both envelopes).
+
+### `categorize-tail-noop-pipeline` (issue #463, owner ruling — the reference is wrong here, and we do not copy it)
+
+`witness: T4` · `contrast: T8` · `control: T2` · `alternative:
+rename-colliding-metadata`
+
+- **What T4 shows.** Query `{app="<probe>"}` — no pipeline — tailed LIVE
+  with the header. The metadata-bearing stream object has **lost `app`**
+  from its `stream` map and carries the raw, **unrenamed** `app` inside
+  `structuredMetadata`; its sibling plain-entry object in the same frame
+  still retains `app`. A renderer that renamed on collision — which is
+  what every other tail path does — would have produced the control's
+  frame instead.
+
+- **T8 isolates the cause.** Same delivery path — live — and the same
+  fixture; the only change is the query, `` {app="<probe>"} |= `tail` ``.
+  The stream object **retains `app`** and the metadata key is renamed to
+  **`app_extracted`**. One line filter restores the label, so the
+  variable is the PIPELINE, not the path. Mechanism:
+  `pkg/ingester/tailer.go:181-184 @ grafana/loki v3.7.4 b318f282` returns
+  the raw stream and short-circuits, and only when
+  `log.IsNoopPipeline(t.pipeline)` holds.
+
+- **T2 shows the delivery path is not implicated.** The same no-pipeline
+  query delivered as CATCH-UP returns `app` in the `stream` map and
+  `app_extracted` in the metadata — the correct behaviour. Without it
+  this row would read as "the reference deletes stream labels on tail",
+  which is false of half its own behaviour. The defect is exactly
+  `noop ∧ live`, measured in all eight cells of the
+  pipeline × path × header grid.
+
+- **What we do:** categorise uniformly, on every tail query and every row
+  age, so PulsusDB answers what the reference's own catch-up path
+  answers. A response whose shape changes because of an unrelated
+  pipeline detail is not a contract, and the parity mandate's
+  "except where they are wrong" clause is what this is for.
+
+- **On the reference's merge deduplication, corrected.** An earlier
+  reading of this path said there is no entry-level deduplication.
+  There is, but it is WINDOWED: `mergeEntryIterator.fillBuffer`
+  (`pkg/iter/entry_iterator.go:116-155`) buffers entries while the
+  stream hash AND timestamp match, and drops an equal one inside that
+  buffer. Three reachable routes leave both copies alive — a different
+  stream hash, different structured metadata, or the copies not being
+  co-resident in the buffer. `EntryAdapter.Equal` also compares
+  `Parsed` (`pkg/push/push.pb.go:493-500`), but **no reachable input
+  producing differing `Parsed` between a catch-up and a live copy was
+  found for the two query shapes probed** (`| logfmt`, one entry and
+  two) — that is two query shapes, not a domain, and two holes in the
+  derivation that once claimed more are named on the issue. None of this
+  changes what PulsusDB implements: our tail has one source and no
+  historical/live merge, so it has no handoff to race at.
+
+- **Close condition:** the reference stops short-circuiting the noop
+  pipeline on the live path.
+
+- **Residual:** nothing mechanically prevents a later edit from
+  substituting a non-discriminating witness, contrast or control. The
+  reviewer of any change to those three ids, or to the probes they name,
+  re-checks the three sentences above against the capture.
+
+### `tail-stream-object-granularity-unflagged` (issue #463 — RECORDED here, OWNED by #469)
+
+`witness: T17` · `alternative: group-by-stream-map`
+
+- **What diverges.** On the tail WITHOUT `categorize-labels`, the
+  reference emits **one stream object per entry, in strict timestamp
+  order**; PulsusDB groups a frame's entries by their label set. This
+  predates issue #463 and #463 does not change it — the non-categorised
+  tail is byte-frozen by every expectation that predates the header.
+
+- **What T17 shows.** Two streams differing in one label, entries
+  interleaved in time — prod@t, staging@t+1, prod@t+2 — pushed once and
+  tailed with no pipeline and no header. Three stream objects come back
+  in timestamp order, and **the identical prod map appears twice, on
+  either side of staging**. A renderer that groups values by their
+  `stream` map emits **two** objects here and renders the rows
+  `A1, A3, B2` — log lines out of order in a tail view.
+
+- **Why THIS frame and not the `| logfmt` one.** With a parser and no
+  header the parsed label folds into `stream`, so the three maps are
+  already DISTINCT and a grouping renderer emits three objects too. That
+  frame cannot tell the two behaviours apart; this one can, because the
+  two prod maps are byte-identical. Mechanism:
+  `pkg/querier/tail/tail.go:114-125 @ grafana/loki v3.7.4 b318f282`
+  appends one `logproto.Stream` per entry as it pops the oldest from the
+  merge iterator.
+
+- **What the CATEGORISED tail does, and why it differs from this row.**
+  It splits — one object per entry, ordered by `(timestamp_ns,
+  labels_json, fingerprint, entry_index)` — so on that surface there is
+  no divergence to record. The timestamp key is the reference's own
+  order; the rest is our deterministic tiebreak, because the reference's
+  tie order is its merge tree's arrival order and is not reproducible
+  from the data (the `timestamp-tie-order` precedent).
+
+- **Close condition:** issue #469 decides whether the unflagged tail
+  adopts per-entry objects. This row records the divergence and does not
+  fix it.
+
+- **Residual:** nothing mechanically prevents a later edit from
+  substituting a non-discriminating witness. Whoever changes T17, the
+  named alternative, or the probe it cites re-checks the discrimination
+  sentence above.
+
+### `categorize-instant-log-query` (issue #463 — no reference answer to match, so none is claimed)
+
+`reference: F2-ref` · `pulsus: F2-pulsus`
+
+- **What the pair shows.** `GET /loki/api/v1/query?query={app="…"}` with
+  the header: the reference **rejects** an instant log query with `400`
+  and a plain-text message (`log queries are not supported as an instant
+  query type, please change your query to a range query type`), while
+  PulsusDB **plans it as a streams query** and answers `200` with a
+  categorised body.
+
+- **The divergence is in WHAT IS SERVED, not in the categorisation.**
+  Serving the instant log query predates this issue
+  (`crates/pulsus-read/src/logql/plan.rs` routes `Expr::Log` for any
+  spec); what issue #463 adds is that our answer follows exactly the
+  rules `query_range` follows — the same advertisement placement, the
+  same third element, the same all-or-nothing switch — and that
+  `/api/logs/v1/query` and its `/loki/api/v1/query` alias are
+  byte-identical.
+
+- **So there is no parity claim here**, and the two ids are recorded as a
+  one-sided pair rather than as a comparison: `F2-ref` can only be
+  captured from the reference, `F2-pulsus` can only be replayed against
+  PulsusDB, and neither side has an answer for the other's probe.
+
+- **Close condition:** the reference serves instant log queries, or
+  PulsusDB stops.
 
 ### `json-expression-bracket-key-unreachable` (issue #388, deliberate WITHDRAWAL, owner ruling 2026-08-13)
 

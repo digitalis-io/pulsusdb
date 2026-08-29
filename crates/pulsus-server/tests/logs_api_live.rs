@@ -3960,15 +3960,17 @@ fn matrix_points(res: &HttpResponse) -> Vec<(i64, u64)> {
 /// grid divergence (below) cannot separate us there.
 ///
 /// Row three is the deliberate contrast. The derived step now AGREES with
-/// the reference (`2s`); the grid does not, and by ruling never will. The
+/// the reference; the grid does not, and by ruling never will. The
 /// reference floors `start` and ceils `end` onto the step grid
 /// (`metricQuerySplitter.split` → `alignStartEnd`,
-/// `pkg/querier/queryrange/splitters.go` @ v3.7.4) and answers 252 points
-/// ending `T0 + 502s` — two seconds PAST the `end` the caller asked for.
-/// We stay start-anchored and stop at `T0 + 500s`. Owner ruling
-/// 2026-08-12 on issue #425 (#301 stands); ledger row
-/// `range-step-grid-start-anchored` in
-/// `docs/benchmarks/logs-differential-ledger.md`.
+/// `pkg/querier/queryrange/splitters.go` @ v3.7.4) and answers a point
+/// PAST the `end` the caller asked for; we stay start-anchored. The
+/// numbers — the window, the two point counts and the two last-point
+/// offsets — are recorded once, in
+/// `docs/benchmarks/logs-differential-ledger.md`'s
+/// `range-step-grid-start-anchored`, whose `range-grid` anchor block is
+/// bound to the case-table tuple below. Owner ruling 2026-08-12 on issue
+/// #425 (#301 stands).
 #[tokio::test]
 async fn query_range_derives_the_reference_whole_second_step() {
     if !should_run() {
