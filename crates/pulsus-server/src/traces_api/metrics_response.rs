@@ -5,11 +5,12 @@
 //! those endpoints (a documented breaking change; they are
 //! Tempo-datasource-only and never spoke PromQL).
 //!
-//! Clean-room: the shape below was authored from the published
-//! grafana.com/docs/tempo docs plus a black-box capture of the pinned
-//! `grafana/tempo:3.0.2` container (Plan v3 Fix 1) — no Tempo/`tempopb`
-//! source, `.proto`, or generated code was read or vendored. The captured
-//! invariants, all pinned by the byte-for-byte encoder golden below:
+//! Clean-room, **range shape**: the `query_range` body below was authored
+//! from the published grafana.com/docs/tempo docs plus a black-box capture
+//! of the pinned `grafana/tempo:3.0.2` container (Plan v3 Fix 1) — for
+//! that shape no Tempo/`tempopb` source, `.proto`, or generated code was
+//! read or vendored. The captured invariants, all pinned by the
+//! byte-for-byte encoder golden below:
 //!   * top level `{"series":[…],"metrics":{"completedJobs":…,"totalJobs":…}}`
 //!   * labels are OTLP protojson `AnyValue` (camelCase `stringValue`/
 //!     `doubleValue`)
@@ -17,6 +18,21 @@
 //!   * a sample `value` is **omitted when zero** (protojson default omission)
 //!   * exemplars carry the trace reference as a `trace:id` label, not a
 //!     top-level `traceId`/`spanId`
+//!
+//! **The instant shape is a DIFFERENT message, derived from cited Tempo
+//! source** (issue #464 wave 2), the form `search_response.rs` already
+//! uses. `/api/metrics/query` returns `tempopb.QueryInstantResponse`, not
+//! `QueryRangeResponse`: its series carry a scalar `double value` and no
+//! `samples` array (`pkg/tempopb/tempo.proto:339-355` @ v3.0.2), and the
+//! reference derives that scalar from the range result by taking
+//! `Samples[0].Value` and skipping any series with no samples
+//! (`modules/frontend/metrics_query_handler.go:187-204` @ v3.0.2).
+//! Grafana's Tempo datasource decodes the instant body with a **bare**
+//! `jsonpb.Unmarshal` (`pkg/tempo/traceql_query.go:102,104` @ `v13.2.0`),
+//! which rejects an unknown field, while the range decode beside it sets
+//! `AllowUnknownFields: true` (`:113-116`) — so a `samples` array on the
+//! instant route disables the client outright. [`build_instant`] emits
+//! that message; [`build`] is untouched.
 
 use axum::response::{IntoResponse, Response};
 use serde::{Serialize, Serializer};
@@ -88,6 +104,28 @@ struct Exemplar {
     timestamp_ms: i64,
 }
 
+/// One `tempopb.QueryInstantResponse` (`pkg/tempopb/tempo.proto:339-344`
+/// @ v3.0.2): `repeated InstantSeries series` + `SearchMetrics metrics`.
+/// `status`/`message` are deliberately not emitted — see docs/api.md §4.4.
+#[derive(Serialize)]
+struct InstantResponse {
+    series: Vec<InstantSeries>,
+    metrics: RangeMetrics,
+}
+
+/// One `tempopb.InstantSeries` (`pkg/tempopb/tempo.proto:346-355` @
+/// v3.0.2): `labels` and a scalar `double value`, field 3 `reserved`.
+/// No exemplars field, no timestamp.
+#[derive(Serialize)]
+struct InstantSeries {
+    labels: Vec<Label>,
+    /// Tempo's protojson default-omission of a zero `value`, the same rule
+    /// `Sample` follows. Captured: a `min_over_time` answering `0` comes
+    /// back from the pinned container as `{"labels":[…]}`, no `value` key.
+    #[serde(skip_serializing_if = "f64_is_zero")]
+    value: f64,
+}
+
 fn label(l: &MetricLabel) -> Label {
     let value = match &l.value {
         MetricLabelValue::Str(s) => AnyValue::StringValue(s.clone()),
@@ -147,6 +185,52 @@ pub(crate) fn encode_metrics(result: &TraceMetricsResult) -> Response {
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         encode_json(result),
+    )
+        .into_response()
+}
+
+/// Frames the engine result as the instant body. Reproduces BOTH halves of
+/// the reference's rule (`modules/frontend/metrics_query_handler.go:193-201`
+/// @ v3.0.2): the emitted scalar is a function of `Samples[0]` ALONE, and a
+/// series with no samples is skipped. All five of `frame_instant`'s exits
+/// build exactly one sample per series — structurally on the four match arms
+/// (`crates/pulsus-read/src/traces/exec.rs:1290,1314,1358,1398`), and via the
+/// constant instant bucket expression
+/// (`crates/pulsus-read/src/traces/metrics_plan.rs:419`) on the
+/// `PlanKind::Compare` early return (`exec.rs:1256-1263`) — so neither rule is
+/// reachable from this engine today; both are implemented and tested so the
+/// rule lives in the code rather than in an invariant that could lapse.
+fn build_instant(result: &TraceMetricsResult) -> InstantResponse {
+    let series = result
+        .series
+        .iter()
+        .filter_map(|s| {
+            let &(_, value) = s.samples.first()?; // the skip rule and the Samples[0] rule
+            Some(InstantSeries {
+                labels: s.labels.iter().map(label).collect(),
+                value,
+            })
+        })
+        .collect();
+    InstantResponse {
+        series,
+        metrics: RangeMetrics {
+            completed_jobs: 1,
+            total_jobs: 1,
+        },
+    }
+}
+
+/// Serializes the engine result to the compact instant JSON string.
+pub(crate) fn encode_json_instant(result: &TraceMetricsResult) -> String {
+    serde_json::to_string(&build_instant(result)).expect("instant metrics response serializes")
+}
+
+/// The `application/json` HTTP response `GET …/metrics/query` returns.
+pub(crate) fn encode_metrics_instant(result: &TraceMetricsResult) -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        encode_json_instant(result),
     )
         .into_response()
 }
@@ -387,6 +471,444 @@ mod tests {
         assert_eq!(
             json,
             "{\"series\":[],\"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #464 wave 2: the instant body is `tempopb.QueryInstantResponse`
+    // (`pkg/tempopb/tempo.proto:339-355` @ v3.0.2), a DIFFERENT message
+    // from the range body above — scalar `value`, no `samples`.
+    // ------------------------------------------------------------------
+
+    /// Every JSON number re-rendered as an `f64`, so `10` and `10.0`
+    /// compare equal. We render an integral `f64` as `10.0` and protojson
+    /// renders `10`: the same JSON number, both strict-decode, and this
+    /// comparison deliberately cannot see the difference (issue #464 wave
+    /// 2 risk 4 — closing it needs a custom serializer whose boundary
+    /// behaviour cannot be captured from the reference).
+    fn numbers_as_f64(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Number(n) => serde_json::Value::from(
+                n.as_f64()
+                    .expect("a JSON number in a metrics body is representable as f64"),
+            ),
+            serde_json::Value::Array(a) => {
+                serde_json::Value::Array(a.iter().map(numbers_as_f64).collect())
+            }
+            serde_json::Value::Object(o) => serde_json::Value::Object(
+                o.iter()
+                    .map(|(k, x)| (k.clone(), numbers_as_f64(x)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// One engine result, with the ungrouped `__name__` label shape
+    /// `frame_instant` emits (`crates/pulsus-read/src/traces/exec.rs:1358`).
+    fn named_instant(name: &str, value: f64) -> TraceMetricsResult {
+        TraceMetricsResult {
+            series: vec![TraceMetricSeries {
+                labels: vec![MetricLabel::str("__name__", name)],
+                samples: vec![(1_787_985_944_000, value)],
+                exemplars: vec![],
+            }],
+        }
+    }
+
+    /// The four captured `GET /api/metrics/query` cases: `(query, the
+    /// pinned reference container's body, the engine result the same
+    /// query produces here)`.
+    ///
+    /// Bodies captured 2026-08-29 from
+    /// `grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`
+    /// (the digest `.github/workflows/ci.yml:648` pins) run with this
+    /// repo's `ci/tempo/tempo-compare.yaml`, over one OTLP/JSON push of 10
+    /// spans `resource.service.name="w2a"` and 4 `"w2b"`, one per second
+    /// from `base = now - 120s`, each 10 ms wide, queried over
+    /// `[base-60, base+60]`.
+    fn instant_reference_cases() -> Vec<(&'static str, &'static str, TraceMetricsResult)> {
+        vec![
+            (
+                "{resource.service.name=\"w2a\"} | count_over_time()",
+                "{\"series\":[{\"labels\":[{\"key\":\"__name__\",\"value\":{\"stringValue\":\
+                 \"count_over_time\"}}],\"value\":10}],\"metrics\":{\"completedJobs\":1,\
+                 \"totalJobs\":1}}",
+                named_instant("count_over_time", 10.0),
+            ),
+            (
+                "{} | count_over_time() by (resource.service.name)",
+                "{\"series\":[{\"labels\":[{\"key\":\"resource.service.name\",\"value\":\
+                 {\"stringValue\":\"w2a\"}}],\"value\":10},{\"labels\":[{\"key\":\
+                 \"resource.service.name\",\"value\":{\"stringValue\":\"w2b\"}}],\"value\":4}],\
+                 \"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}",
+                TraceMetricsResult {
+                    series: vec![
+                        TraceMetricSeries {
+                            labels: vec![MetricLabel::str("resource.service.name", "w2a")],
+                            samples: vec![(1_787_985_944_000, 10.0)],
+                            exemplars: vec![],
+                        },
+                        TraceMetricSeries {
+                            labels: vec![MetricLabel::str("resource.service.name", "w2b")],
+                            samples: vec![(1_787_985_944_000, 4.0)],
+                            exemplars: vec![],
+                        },
+                    ],
+                },
+            ),
+            (
+                // The adversarial case: an EXACTLY zero value, which
+                // protojson omits and a hand-written encoder emits.
+                "{resource.service.name=\"nope-w2\"} | count_over_time()",
+                "{\"series\":[{\"labels\":[{\"key\":\"__name__\",\"value\":{\"stringValue\":\
+                 \"count_over_time\"}}]}],\"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}",
+                named_instant("count_over_time", 0.0),
+            ),
+            (
+                // The full-precision double.
+                "{resource.service.name=\"w2a\"} | rate()",
+                "{\"series\":[{\"labels\":[{\"key\":\"__name__\",\"value\":{\"stringValue\":\
+                 \"rate\"}}],\"value\":0.08333333333333333}],\"metrics\":{\"completedJobs\":1,\
+                 \"totalJobs\":1}}",
+                named_instant("rate", 0.08333333333333333),
+            ),
+        ]
+    }
+
+    /// AC 1. The instant body is the reference's, on three discriminating
+    /// shapes: a multi-series body, an exactly-zero value, and a
+    /// full-precision double. The two `assert!`s at the head are the
+    /// CORPUS gate — without either, an encoder that always emits `value`
+    /// and one that omits a zero are indistinguishable here.
+    #[test]
+    fn the_instant_body_is_a_scalar_value_never_a_samples_array() {
+        let cases = instant_reference_cases();
+        assert!(
+            cases.iter().any(|(_, _, r)| r.series.len() > 1),
+            "the case set must carry a MULTI-SERIES body, or a one-series-only encoder passes"
+        );
+        assert!(
+            cases.iter().any(|(_, _, r)| r
+                .series
+                .iter()
+                .any(|s| s.samples.iter().any(|&(_, v)| v == 0.0))),
+            "the case set must carry a ZERO-valued series, or an encoder that always emits \
+             `value` is indistinguishable from one that omits a zero"
+        );
+        for (q, reference_body, result) in &cases {
+            let ours: serde_json::Value = serde_json::from_str(&encode_json_instant(result))
+                .expect("our instant body is JSON");
+            let theirs: serde_json::Value =
+                serde_json::from_str(reference_body).expect("the captured reference body is JSON");
+            assert_eq!(
+                numbers_as_f64(&ours),
+                numbers_as_f64(&theirs),
+                "our instant body must be the reference's, key set and all — a samples array \
+                 here is rejected outright by the datasource's strict decoder (case q={q})"
+            );
+        }
+    }
+
+    /// Ten `(timestamp_ms, value)` samples. Non-monotonic timestamps are
+    /// load-bearing: with ascending ones, "earliest" and "first" are the
+    /// same selector and no fixture can tell them apart. The
+    /// discriminating properties are ASSERTED below, not chosen — a
+    /// fixture edit that destroys them fails the test rather than
+    /// silently weakening it.
+    const SAMPLES: [(i64, f64); 10] = [
+        (5_000, 7.0),
+        (1_000, 23.0),
+        (7_000, 2.0),
+        (10_000, 11.0),
+        (3_000, 29.0),
+        (8_000, 13.0),
+        (2_000, 31.0),
+        (9_000, 3.0),
+        (4_000, 17.0),
+        (6_000, 19.0),
+    ];
+
+    /// Selectors an implementation might plausibly be using. The test does
+    /// not check "first differs from each of these" — it checks that the
+    /// expected value occurs EXACTLY ONCE in the returned multiset, which
+    /// is the property that makes the fixture discriminating.
+    fn candidate_selectors(samples: &[(i64, f64)]) -> Vec<(&'static str, f64)> {
+        let vs: Vec<f64> = samples.iter().map(|&(_, v)| v).collect();
+        let mut sorted = vs.clone();
+        sorted.sort_by(f64::total_cmp);
+        let n = sorted.len();
+        let sum: f64 = vs.iter().sum();
+        vec![
+            ("first", vs[0]),
+            ("last", vs[n - 1]),
+            ("min", sorted[0]),
+            ("max", sorted[n - 1]),
+            ("sum", sum),
+            ("mean", sum / n as f64),
+            ("lower median", sorted[(n - 1) / 2]),
+            ("upper median", sorted[n / 2]),
+            (
+                "value at the earliest timestamp",
+                samples
+                    .iter()
+                    .min_by_key(|&&(t, _)| t)
+                    .expect("non-empty")
+                    .1,
+            ),
+            (
+                "value at the latest timestamp",
+                samples
+                    .iter()
+                    .max_by_key(|&&(t, _)| t)
+                    .expect("non-empty")
+                    .1,
+            ),
+        ]
+    }
+
+    /// One perturbation of a single `(timestamp_ms, value)` sample.
+    enum Perturb {
+        Value(f64),
+        Ts(i64),
+    }
+
+    impl Perturb {
+        fn apply(&self, s: &mut (i64, f64)) {
+            match self {
+                Perturb::Value(v) => s.1 = *v,
+                Perturb::Ts(t) => s.0 = *t,
+            }
+        }
+    }
+
+    /// The scalar the instant encoder puts on the wire for a one-series
+    /// result carrying `samples`. An ABSENT `value` is a zero (protojson
+    /// default omission), not an error.
+    fn emitted_scalar(samples: &[(i64, f64)]) -> f64 {
+        let result = TraceMetricsResult {
+            series: vec![TraceMetricSeries {
+                labels: vec![MetricLabel::str("__name__", "rate")],
+                samples: samples.to_vec(),
+                exemplars: vec![],
+            }],
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&encode_json_instant(&result)).expect("instant body is JSON");
+        body["series"][0]["value"].as_f64().unwrap_or(0.0)
+    }
+
+    /// AC 1b. The emitted scalar is a function of `Samples[0]` ALONE
+    /// (`modules/frontend/metrics_query_handler.go:200` @ v3.0.2). Three
+    /// checks: uniqueness over a computed candidate set, perturbation
+    /// invariance/covariance (which needs no list of selectors at all),
+    /// and the body itself.
+    #[test]
+    fn the_instant_scalar_is_the_first_samples_value_alone() {
+        // -- Check 1: uniqueness over a computed candidate set.
+        let want = SAMPLES[0].1;
+        let cands = candidate_selectors(&SAMPLES);
+        let aliases: Vec<&str> = cands
+            .iter()
+            .filter(|(name, v)| *name != "first" && v.to_bits() == want.to_bits())
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            cands
+                .iter()
+                .filter(|(_, v)| v.to_bits() == want.to_bits())
+                .count(),
+            1,
+            "the fixture is not discriminating: the first sample's value also equals {aliases:?}, \
+             so an implementation selecting any of those would pass this test"
+        );
+        assert!(
+            SAMPLES.len() >= 5,
+            "fewer than five samples collapses the medians onto min/max/first"
+        );
+        assert!(
+            SAMPLES
+                .iter()
+                .zip(SAMPLES.iter().skip(1))
+                .any(|(a, b)| b.0 < a.0),
+            "the timestamps must be non-monotonic, or `earliest` and `first` are one selector"
+        );
+        assert_ne!(
+            SAMPLES
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &(t, _))| t)
+                .expect("non-empty")
+                .0,
+            SAMPLES.len() - 1,
+            "`latest` must not coincide with `last`"
+        );
+        assert!(
+            SAMPLES.iter().all(|&(_, v)| v != 0.0),
+            "a zero would be protojson-omitted, so the value assertion could pass by absence"
+        );
+
+        // -- Check 2: perturbation invariance and covariance. Uniqueness
+        //    over a candidate SET is still an enumeration one level up; a
+        //    selector nobody listed can alias `first`. This check needs no
+        //    list. The extremes are computed from SAMPLES, never
+        //    hard-coded beside them.
+        let vs: Vec<f64> = SAMPLES.iter().map(|&(_, v)| v).collect();
+        let min_v = vs.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_v = vs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min_t = SAMPLES.iter().map(|&(t, _)| t).min().expect("non-empty");
+        let max_t = SAMPLES.iter().map(|&(t, _)| t).max().expect("non-empty");
+        for i in 1..SAMPLES.len() {
+            for (what, mutate) in [
+                ("value below every other", Perturb::Value(min_v - 1.0)),
+                ("value above every other", Perturb::Value(max_v + 1.0)),
+                ("timestamp before every other", Perturb::Ts(min_t - 1)),
+                ("timestamp after every other", Perturb::Ts(max_t + 1)),
+            ] {
+                let mut s = SAMPLES.to_vec();
+                mutate.apply(&mut s[i]);
+                assert_eq!(
+                    emitted_scalar(&s).to_bits(),
+                    want.to_bits(),
+                    "the emitted scalar moved when sample {i} was given a {what}: the value is \
+                     Samples[0] alone, so nothing after the first sample may change it"
+                );
+            }
+        }
+        for probe in [41.0_f64, -6.5_f64] {
+            let mut s = SAMPLES.to_vec();
+            s[0].1 = probe;
+            assert_eq!(
+                emitted_scalar(&s).to_bits(),
+                probe.to_bits(),
+                "the emitted scalar must follow the FIRST sample's value"
+            );
+        }
+
+        // -- Check 3: the body itself.
+        let result = TraceMetricsResult {
+            series: vec![TraceMetricSeries {
+                labels: vec![MetricLabel::str("__name__", "rate")],
+                samples: SAMPLES.to_vec(),
+                exemplars: vec![],
+            }],
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encode_json_instant(&result))
+                .expect("instant body is JSON"),
+            serde_json::json!({
+                "series": [{
+                    "labels": [{"key": "__name__", "value": {"stringValue": "rate"}}],
+                    "value": 7.0
+                }],
+                "metrics": {"completedJobs": 1, "totalJobs": 1}
+            }),
+            "the instant value is Samples[0] — a function of the FIRST sample alone"
+        );
+    }
+
+    /// AC 2. A series with no samples is dropped and the POPULATED one
+    /// survives (`metrics_query_handler.go:194-196` @ v3.0.2). The
+    /// assertion is on the emitted series count and their LABELS, never on
+    /// their values — the right test for a skip rule.
+    #[test]
+    fn an_instant_series_with_no_samples_is_dropped() {
+        let result = TraceMetricsResult {
+            series: vec![
+                TraceMetricSeries {
+                    labels: vec![
+                        MetricLabel::str("__name__", "rate"),
+                        MetricLabel::str("series", "empty"),
+                    ],
+                    samples: vec![],
+                    exemplars: vec![],
+                },
+                TraceMetricSeries {
+                    labels: vec![
+                        MetricLabel::str("__name__", "rate"),
+                        MetricLabel::str("series", "populated"),
+                    ],
+                    samples: vec![(1_700_000_000_000, 5.0)],
+                    exemplars: vec![],
+                },
+            ],
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&encode_json_instant(&result)).expect("instant body is JSON");
+        let series = body["series"].as_array().expect("series array");
+        assert_eq!(
+            series.len(),
+            1,
+            "a series with no samples is skipped, as the reference skips it"
+        );
+        assert_eq!(
+            series[0]["labels"],
+            serde_json::json!([
+                {"key": "__name__", "value": {"stringValue": "rate"}},
+                {"key": "series",   "value": {"stringValue": "populated"}}
+            ]),
+            "the SURVIVING series must be the POPULATED one — a count-only assertion cannot \
+             distinguish 'the empty series was dropped' from 'the populated series was dropped'"
+        );
+    }
+
+    /// AC 3. `tempopb.InstantSeries` has `labels` and a scalar `value` and
+    /// nothing else (`pkg/tempopb/tempo.proto:346-355` @ v3.0.2) — no
+    /// exemplars field, no timestamp — even when the engine result carries
+    /// an exemplar.
+    #[test]
+    fn an_instant_series_never_carries_exemplars() {
+        let result = TraceMetricsResult {
+            series: vec![TraceMetricSeries {
+                labels: vec![MetricLabel::str("__name__", "rate")],
+                samples: vec![(1_700_000_000_000, 2.0)],
+                exemplars: vec![MetricExemplar {
+                    labels: vec![MetricLabel::str("trace:id", "ceae79f2")],
+                    value: 2.0,
+                    timestamp_ms: 1_700_000_000_123,
+                }],
+            }],
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&encode_json_instant(&result)).expect("instant body is JSON");
+        let series = body["series"].as_array().expect("series array");
+        assert_eq!(
+            series.len(),
+            1,
+            "the populated series survives — the absence checks below are vacuous over an \
+             empty series list"
+        );
+        assert!(
+            series[0].get("exemplars").is_none(),
+            "an instant series carries no exemplars field, body {body}"
+        );
+        assert!(
+            series[0].get("timestampMs").is_none(),
+            "an instant series carries no timestamp, body {body}"
+        );
+    }
+
+    /// AC 4 (containment). Wave 2 adds an instant encoder BESIDE the range
+    /// one and moves nothing here: the range body keeps its `samples`
+    /// array with `timestampMs`. Deliberately stays green when the instant
+    /// encoder is broken — that is the point of a containment check.
+    #[test]
+    fn the_range_body_still_carries_timestamped_samples() {
+        let result = TraceMetricsResult {
+            series: vec![TraceMetricSeries {
+                labels: vec![MetricLabel::str("__name__", "rate")],
+                samples: vec![(1_700_000_000_000, 0.5), (1_700_000_060_000, 0.0)],
+                exemplars: vec![],
+            }],
+        };
+        assert_eq!(
+            encode_json(&result),
+            "{\"series\":[{\"labels\":[{\"key\":\"__name__\",\"value\":{\"stringValue\":\"rate\"}}],\
+             \"samples\":[{\"timestampMs\":\"1700000000000\",\"value\":0.5},\
+             {\"timestampMs\":\"1700000060000\"}]}],\
+             \"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}",
+            "the RANGE body keeps its timestamped samples array — the instant encoder is a \
+             separate message and changes nothing here"
         );
     }
 

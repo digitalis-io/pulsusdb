@@ -3,7 +3,9 @@
 //! → `pulsus_read::plan_trace_metrics` — all **before** the pool, same
 //! discipline as `search.rs`, so every 400/422-class failure resolves
 //! without ClickHouse — → `TraceEngine::metrics_range`/`metrics_instant`
-//! → the Tempo-native metrics encoder (`metrics_response::encode_metrics`).
+//! → the Tempo-native metrics encoders (`metrics_response::encode_metrics`
+//! for the range route, `::encode_metrics_instant` for the instant one —
+//! issue #464 wave 2: they are different `tempopb` messages).
 //! Thin by design: SQL/execution stays in `pulsus-read`. Issue #182
 //! replaced the Prometheus matrix/vector envelope with the Tempo-native
 //! `{series, metrics}` body (a documented breaking change — these
@@ -90,11 +92,22 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         pulsus_read::plan_trace_metrics(&query, &metrics_params, &ctx).map_err(ApiError::Plan)?;
 
     let engine = engine_for(&state).await?;
-    let result = match form {
-        MetricsForm::Range => engine.metrics_range(&plan).await?,
-        MetricsForm::Instant => engine.metrics_instant(&plan).await?,
-    };
-    Ok(super::metrics_response::encode_metrics(&result))
+    // Issue #464 wave 2: the two routes return DIFFERENT proto messages —
+    // `query_range` is `tempopb.QueryRangeResponse`, `query` is
+    // `tempopb.QueryInstantResponse` (`pkg/tempopb/tempo.proto:339-355` @
+    // v3.0.2), whose series carry a scalar `value` and no `samples`. One
+    // encoder for both emitted the range body on the instant route, which
+    // the datasource's bare `jsonpb.Unmarshal` rejects outright.
+    Ok(match form {
+        MetricsForm::Range => {
+            let result = engine.metrics_range(&plan).await?;
+            super::metrics_response::encode_metrics(&result)
+        }
+        MetricsForm::Instant => {
+            let result = engine.metrics_instant(&plan).await?;
+            super::metrics_response::encode_metrics_instant(&result)
+        }
+    })
 }
 
 #[cfg(test)]

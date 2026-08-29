@@ -998,18 +998,23 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
         assert_eq!(res.status, 200, "{ctx}");
         let json = res.json(&ctx);
         // Guard non-emptiness BEFORE indexing (issue #61 pattern): the
-        // instant form carries one `samples[]` entry per series.
+        // instant form carries a SCALAR `value` per series and no
+        // `samples` array at all (issue #464 wave 2 —
+        // `tempopb.InstantSeries`, `pkg/tempopb/tempo.proto:346-355` @
+        // v3.0.2).
         assert!(
             json["series"].as_array().is_some_and(|s| !s.is_empty()),
             "{ctx}: the seeded window must produce a non-empty instant series, body {json}"
         );
-        // The Tempo-native sample `value` is a JSON number (omitted at
-        // zero); the seeded window guarantees a strictly positive rate.
-        let value = json["series"][0]["samples"][0]["value"]
-            .as_f64()
-            .unwrap_or_else(|| {
-                panic!("{ctx}: the instant sample value must be a number, body {json}")
-            });
+        assert!(
+            json["series"][0].get("samples").is_none(),
+            "{ctx}: an instant series carries no samples array — the retired range shape is              rejected outright by the datasource's strict decoder, body {json}"
+        );
+        // The Tempo-native `value` is a JSON number (omitted at zero); the
+        // seeded window guarantees a strictly positive rate.
+        let value = json["series"][0]["value"].as_f64().unwrap_or_else(|| {
+            panic!("{ctx}: the instant series value must be a number, body {json}")
+        });
         assert!(
             value.is_finite() && value > 0.0,
             "{ctx}: the seeded window must count real spans (finite positive rate), got \
@@ -1137,21 +1142,26 @@ async fn zipkin_shared_span_trace_by_id_returns_both_the_server_and_client_sides
     );
 }
 
-/// Extracts the one instant sample's numeric token
-/// (`"samples":[{"timestampMs":…,"value":<tok>}`) from a raw metrics body
-/// and parses it with the std (correctly rounded) parser. Deliberately
-/// NOT `res.json()[…].as_f64()`: serde_json's default float parse is
+/// Extracts the instant series' scalar numeric token
+/// (`…"labels":[…],"value":<tok>`) from a raw metrics body and parses it
+/// with the std (correctly rounded) parser. Deliberately NOT
+/// `res.json()[…].as_f64()`: serde_json's default float parse is
 /// best-effort (the `float_roundtrip` feature is off workspace-wide) and
 /// mis-decodes some 17-significant-digit tokens by 1 ULP — the decoded
 /// assertion would then fire on a byte-correct body (issue #237; observed
 /// live on the 1_088_608_058_291_172_412 ns width).
+///
+/// Issue #464 wave 2 moved the anchor from `"samples":[` to the
+/// `],"value":` that closes the series' own `labels` array — the instant
+/// body has no `samples` key. The anchor is unambiguous: a LABEL's value
+/// is `"value":{`, always preceded by a quote or a comma and never by
+/// `]`, and the only other `]` followed by a key is the top-level
+/// `],"metrics":`.
 fn decoded_instant_sample_bits(body: &[u8], ctx: &str) -> u64 {
-    let samples = find_subslice(body, b"\"samples\":[")
-        .unwrap_or_else(|| panic!("{ctx}: body carries a samples array"));
-    let rest = &body[samples..];
-    let v = find_subslice(rest, b"\"value\":")
-        .unwrap_or_else(|| panic!("{ctx}: the sample carries a value"));
-    let tail = &rest[v + 8..];
+    let v = find_subslice(body, b"],\"value\":")
+        .unwrap_or_else(|| panic!("{ctx}: the instant series carries a scalar value"));
+    let rest = &body[v..];
+    let tail = &rest[10..];
     let end = tail
         .iter()
         .position(|b| *b == b'}' || *b == b',')
