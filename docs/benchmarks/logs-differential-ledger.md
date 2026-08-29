@@ -5945,6 +5945,45 @@ divergence rather than a gap.
     which parses the `3 ×` above out of THIS file at run time, so
     breaking the document alone reddens the test.
 
+  - **Categorised encoded-body factor (#463):** at most `3 ×` its charged bytes.
+
+    A rendered CATEGORISED stream item — the three-element `values` shape
+    `X-Loki-Response-Encoding-Flags: categorize-labels` asks for.
+
+    A SECOND anchor, not a re-use of the one above, and the reason is
+    arithmetic rather than preference. `alloc_block_bytes(n) = max(2n,
+    32)` and `grown_alloc_bytes(n) = 3·alloc_block_bytes(n)`, so every
+    shape's rendered/charged tends to 3 from below — a C0 control byte
+    renders as six characters and is charged two — while the third
+    element adds strictly more FIXED per-entry overhead (two `Vec`
+    spines through `grown_alloc_bytes`, plus `size_of::<EntryCategories>()`
+    = 48 B) than it adds amplification. So the categorised ratio is
+    LOWER than the plain one and a single anchor could never be forced to
+    move by it.
+
+    **Derivation, from the binding variant.** 200 entries, each a 512-byte
+    all-`\u{0001}` line, carrying structured metadata `{"kk1": <512 B of
+    \u{0001}>, "__error__": <the same>}` — the framing that carries BOTH
+    category objects. Driven through the shipped fast-path accumulator
+    and the shipped item renderer: `rendered = 1,860,644 B`,
+    `charged = 759,596 B`, ratio **2.450**. The other three framings
+    measure 2.433 (`structuredMetadata` only), 2.431 (`parsed` only) and
+    2.383 (`{}`), so the two-category framing is the binding one.
+
+    **The charge's term list**, which `entry_category_bytes` destructures
+    so a new field without a term is a build failure:
+    `structured_metadata`, `parsed`. Each pair's key and value go through
+    `alloc_block_bytes`; each vector's spine goes through
+    `grown_alloc_bytes`; plus `size_of::<EntryCategories>()`.
+
+    Pinned by
+    `logs_api/encode.rs::the_categorised_body_factor_matches_what_the_renderer_produces`,
+    which parses the `3 ×` on this bullet's first line out of THIS file
+    at run time, and by
+    `the_categorised_charge_terms_match_the_destructured_bindings`, which
+    reads the term list above out of this file and compares it against
+    the function's own bindings.
+
 - **Peak HEAP while rendering — measured, and reduced by this issue.**
   The encoder renders one item at a time, so the transient is one item,
   never the whole body. Before #312 that item cost **1,612** allocations

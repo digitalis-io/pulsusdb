@@ -3433,4 +3433,243 @@ mod tests {
             "streams_render must allocate exactly the two envelope buffers"
         );
     }
+
+    // --- Criterion 10: the encoded-body factor for the CATEGORISED shape.
+
+    /// Issue #463's categorised worst-case fixture, driven through the
+    /// REAL fast-path accumulator so both halves of the ratio come from
+    /// shipped code: 200 entries, each a 512-byte all-`\u{0001}` line,
+    /// in the `variant` third-element framing.
+    ///
+    /// The categories are DERIVED from structured metadata by the
+    /// accumulator, not injected: a reserved `__error__` pair is routed
+    /// to the error slots and files under `parsed`, an ordinary pair
+    /// files under `structuredMetadata`. That is what makes this measure
+    /// the shipped split rather than a transcription of it.
+    fn c463_factor_case(variant: usize) -> (u64, u64) {
+        use pulsus_read::logql::MAX_STREAMS_RESULT_BYTES;
+        use pulsus_read::logql::exec::StreamsFastPathProbe;
+        use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
+
+        let ctrl: String = std::iter::repeat_n('\u{1}', 512).collect();
+        let meta = std::collections::HashMap::from([(
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "svc".to_string(),
+                labels: r#"{"service_name":"svc"}"#.to_string(),
+            },
+        )]);
+        let esc = serde_json::to_string(&ctrl).expect("escape");
+        let sm = match variant {
+            // structuredMetadata + parsed
+            0 => format!(r#"{{"kk1":{esc},"__error__":{esc}}}"#),
+            // structuredMetadata only
+            1 => format!(r#"{{"kk1":{esc}}}"#),
+            // parsed only
+            2 => format!(r#"{{"__error__":{esc}}}"#),
+            // neither — the `{}` framing
+            _ => String::new(),
+        };
+        let mut probe = StreamsFastPathProbe::with_cap_categorized(MAX_STREAMS_RESULT_BYTES);
+        for i in 0..200 {
+            probe
+                .push_row(
+                    SampleRow {
+                        fingerprint: 1,
+                        timestamp_ns: 1_700_000_000_000_000_000i64 + i,
+                        body: ctrl.clone(),
+                        structured_metadata: sm.clone(),
+                    },
+                    &meta,
+                )
+                .expect("well inside the shipped cap");
+        }
+        let charged = probe.charged();
+        let items = probe.into_streams();
+        assert_eq!(items.len(), 1, "variant {variant}: one stream expected");
+        let w = query_item_writer(&flags(&["categorize-labels"]), &items);
+        let rendered: u64 = items.iter().map(|s| item_chunk(w, s).len() as u64).sum();
+        (rendered, charged)
+    }
+
+    /// Reads one integer factor out of the `streams-result-budget`
+    /// ledger entry's anchor line, so breaking the DOCUMENT alone fails
+    /// with no recompilation.
+    fn c463_ledger_factor(anchor: &str) -> u64 {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ledger =
+            std::fs::read_to_string(root.join("docs/benchmarks/logs-differential-ledger.md"))
+                .expect("ledger readable");
+        let tail = ledger
+            .split(anchor)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the ledger carries the anchor {anchor:?}"));
+        tail.split(" ×`")
+            .next()
+            .expect("the anchor names a factor")
+            .trim()
+            .parse()
+            .expect("the documented factor is an integer")
+    }
+
+    /// **Criterion 10 — the encoded-body factor holds for the
+    /// CATEGORISED shape, on its own anchor.**
+    ///
+    /// A single anchor could not be made to bind here, and the reason is
+    /// arithmetic rather than a choice: `alloc_block_bytes(n) = max(2n,
+    /// 32)` and `grown_alloc_bytes(n) = 3·alloc_block_bytes(n)`, so every
+    /// shape's rendered/charged tends to 3 from below — a C0 byte renders
+    /// as six characters and is charged two — while the third element
+    /// adds strictly more FIXED per-entry overhead than amplification. A
+    /// clause requiring the categorised ratio to EXCEED the plain one is
+    /// therefore unsatisfiable, and this is a second anchor instead.
+    ///
+    /// Two-sided on the categorised ratio alone: neither clause mentions
+    /// the plain fixture, so neither can be satisfied by it.
+    #[test]
+    fn the_categorised_body_factor_matches_what_the_renderer_produces() {
+        const ANCHOR: &str = "- **Categorised encoded-body factor (#463):** at most `";
+        let f_cat = c463_ledger_factor(ANCHOR);
+        let mut worst = 0.0f64;
+        let mut worst_variant = 0usize;
+        let mut worst_pair = (0u64, 0u64);
+        for variant in 0..4 {
+            let (rendered, charged) = c463_factor_case(variant);
+            let ratio = rendered as f64 / charged as f64;
+            eprintln!(
+                "c463 F_cat variant={variant} rendered={rendered} charged={charged} \
+                 ratio={ratio:.3}"
+            );
+            assert!(
+                rendered <= f_cat * charged,
+                "variant {variant}: the renderer emitted {rendered} B for {charged} charged B \
+                 — MORE than the documented factor {f_cat}x. The documented bound is too small."
+            );
+            if ratio > worst {
+                worst = ratio;
+                worst_variant = variant;
+                worst_pair = (rendered, charged);
+            }
+        }
+        let (rendered, charged) = worst_pair;
+        assert!(
+            rendered > (f_cat - 1) * charged,
+            "the widest categorised variant ({worst_variant}) emitted only {rendered} B for \
+             {charged} charged B — under {}x. The documented factor {f_cat}x is not tight, or \
+             this corpus is no longer the worst case.",
+            f_cat - 1
+        );
+        eprintln!("c463 F_cat worst variant={worst_variant} ratio={worst:.3} documented={f_cat}");
+    }
+
+    /// **Criterion 10(d) — the ledger records the DERIVATION, not just
+    /// the number.** The four ratios and the binding variant's two byte
+    /// totals are parsed out of the ledger and compared against what the
+    /// fixture actually produces, so the derivation cannot go stale
+    /// beside a still-correct factor.
+    #[test]
+    fn the_categorised_factor_derivation_matches_the_fixture() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ledger =
+            std::fs::read_to_string(root.join("docs/benchmarks/logs-differential-ledger.md"))
+                .expect("ledger readable");
+        let (rendered, charged) = c463_factor_case(0);
+        let ratio = rendered as f64 / charged as f64;
+        // The recorded totals, in the row's own thousands-separated form.
+        let sep = |n: u64| {
+            let d = n.to_string();
+            let mut out = String::new();
+            for (i, c) in d.chars().enumerate() {
+                if i > 0 && (d.len() - i).is_multiple_of(3) {
+                    out.push(',');
+                }
+                out.push(c);
+            }
+            out
+        };
+        for (what, needle) in [
+            (
+                "the rendered total",
+                format!("`rendered = {} B`", sep(rendered)),
+            ),
+            (
+                "the charged total",
+                format!("`charged = {} B`", sep(charged)),
+            ),
+            ("the binding ratio", format!("ratio **{ratio:.3}**")),
+        ] {
+            assert!(
+                ledger.contains(&needle),
+                "{what} the fixture produces ({needle}) is not what the \
+                 streams-result-budget entry records"
+            );
+        }
+        for variant in 1..4 {
+            let (r, c) = c463_factor_case(variant);
+            let recorded = format!("{:.3}", r as f64 / c as f64);
+            assert!(
+                ledger.contains(&recorded),
+                "variant {variant}'s ratio {recorded} is not recorded in the ledger"
+            );
+        }
+    }
+
+    /// **Criterion 10(e) — the ledger's term list and the charge
+    /// function's destructured bindings are the same set.**
+    ///
+    /// `entry_category_bytes` destructures `EntryCategories`, so a new
+    /// field without a term is a build failure. This is the other half:
+    /// a new field WITH a term but no ledger row would leave the
+    /// published derivation describing a narrower charge than the one
+    /// that ships.
+    #[test]
+    fn the_categorised_charge_terms_match_the_destructured_bindings() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let charge = std::fs::read_to_string(root.join("crates/pulsus-read/src/logql/charge.rs"))
+            .expect("charge.rs readable");
+        let at = charge
+            .find("let super::exec::EntryCategories {")
+            .expect("entry_category_bytes destructures EntryCategories");
+        let body = &charge[at..at
+            + charge[at..]
+                .find("} = cats;")
+                .expect("destructuring closes")];
+        let mut bindings: Vec<String> = body
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.trim().strip_suffix(','))
+            .map(str::to_string)
+            .collect();
+        bindings.sort();
+        assert_eq!(
+            bindings,
+            vec!["parsed".to_string(), "structured_metadata".to_string()],
+            "the destructured bindings moved"
+        );
+
+        let ledger =
+            std::fs::read_to_string(root.join("docs/benchmarks/logs-differential-ledger.md"))
+                .expect("ledger readable");
+        let at = ledger
+            .find("**The charge's term list**")
+            .expect("the streams-result-budget entry carries the term list");
+        let list = &ledger[at..at + 500];
+        for binding in &bindings {
+            assert!(
+                list.contains(&format!("`{binding}`")),
+                "the ledger's term list does not name `{binding}`"
+            );
+        }
+        for term in [
+            "`alloc_block_bytes`",
+            "`grown_alloc_bytes`",
+            "`size_of::<EntryCategories>()`",
+        ] {
+            assert!(
+                list.contains(term),
+                "the ledger's term list does not name {term}"
+            );
+        }
+    }
 }

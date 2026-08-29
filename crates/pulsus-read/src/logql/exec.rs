@@ -3740,6 +3740,16 @@ impl StreamsFastPathProbe {
         }
     }
 
+    /// [`Self::with_cap`] with the issue #463 categorised wire shape, so
+    /// a gate on the categorised charge drives the shipped accumulator
+    /// rather than a formula written beside it.
+    pub fn with_cap_categorized(cap: u64) -> Self {
+        Self {
+            groups: FastPathGroups::new_with(true),
+            budget: StreamsResultBudget::with_cap(cap),
+        }
+    }
+
     /// One row through the REAL fast-path body.
     pub fn push_row(
         &mut self,

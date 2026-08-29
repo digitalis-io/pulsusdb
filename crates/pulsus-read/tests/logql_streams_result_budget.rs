@@ -680,3 +680,107 @@ fn the_ledger_records_the_measured_reference_behaviour() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #463 — the CATEGORISED shape's bytes are charged
+// ---------------------------------------------------------------------
+
+/// The same rows, categorised and not, through the SAME shipped
+/// accumulator: the categorised ledger must exceed the plain one by at
+/// least the metadata bytes the third element retains.
+///
+/// "At least the metadata bytes" is the floor the plan states and it is
+/// the load-bearing half — a renderer that emits a third element the
+/// budget did not price is exactly how the 1 GiB retention cap stops
+/// bounding the result. The actual excess is larger, because each entry
+/// also retains two `Vec` spines and the `EntryCategories` struct itself.
+#[test]
+fn the_categorised_shape_charges_its_third_element() {
+    let meta = meta_one();
+    // 200 rows, each carrying one 64-byte ordinary metadata pair. The
+    // pair's key and value are what the third element retains.
+    let value: String = "v".repeat(64);
+    let sm = format!(r#"{{"trace_id":"{value}"}}"#);
+
+    let mut plain = StreamsFastPathProbe::with_cap(MAX_STREAMS_RESULT_BYTES);
+    let mut categorised = StreamsFastPathProbe::with_cap_categorized(MAX_STREAMS_RESULT_BYTES);
+    for i in 0..200 {
+        let r = |body_len: usize| SampleRow {
+            fingerprint: 1,
+            timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
+            body: "b".repeat(body_len),
+            structured_metadata: sm.clone(),
+        };
+        plain.push_row(r(40), &meta).expect("admitted");
+        categorised.push_row(r(40), &meta).expect("admitted");
+    }
+
+    let metadata_bytes =
+        200 * (alloc_block_bytes(b"trace_id".len() as u64) + alloc_block_bytes(value.len() as u64));
+    let excess = categorised.charged() - plain.charged();
+    assert!(
+        excess >= metadata_bytes,
+        "the categorised ledger exceeds the plain one by {excess} B, which is less than the \
+         {metadata_bytes} B of metadata the third element retains"
+    );
+
+    // And the two shapes really are the same rows: one categorised
+    // stream against 200 plain ones, because the categorised path groups
+    // by the STREAM-category subset while the plain path fans a
+    // metadata-bearing row into its own merged label set.
+    assert_eq!(categorised.into_streams().len(), 1);
+    assert_eq!(plain.into_streams().len(), 1);
+}
+
+/// A categorised query whose METADATA alone exceeds the cap is refused
+/// with the named `422`, never truncated — the same complete-or-error
+/// class every other retention breach takes.
+///
+/// The discriminator is that the same rows WITHOUT the header are
+/// admitted under the same cap: what refuses this query is the third
+/// element's bytes and nothing else.
+#[test]
+fn a_categorised_query_whose_metadata_alone_exceeds_the_cap_is_refused() {
+    let meta = meta_one();
+    let value: String = "v".repeat(4_096);
+    let sm = format!(r#"{{"trace_id":"{value}"}}"#);
+    let row = |i: usize| SampleRow {
+        fingerprint: 1,
+        timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
+        body: "b".repeat(8),
+        structured_metadata: sm.clone(),
+    };
+
+    // A cap that admits the plain shape's whole retention and nothing
+    // more: measured from the plain probe itself, so the number is not
+    // hand-derived.
+    let mut sizing = StreamsFastPathProbe::with_cap(MAX_STREAMS_RESULT_BYTES);
+    for i in 0..50 {
+        sizing.push_row(row(i), &meta).expect("admitted");
+    }
+    let cap = sizing.charged();
+
+    let mut plain = StreamsFastPathProbe::with_cap(cap);
+    for i in 0..50 {
+        plain
+            .push_row(row(i), &meta)
+            .expect("the plain shape fits its own footprint exactly");
+    }
+
+    let mut categorised = StreamsFastPathProbe::with_cap_categorized(cap);
+    let mut refusal = None;
+    for i in 0..50 {
+        if let Err(e) = categorised.push_row(row(i), &meta) {
+            refusal = Some(e);
+            break;
+        }
+    }
+    let err = refusal.expect("the categorised shape must not fit the plain shape's cap");
+    assert!(
+        matches!(
+            err,
+            ReadError::QueryTooBroad(TooBroadReason::StreamsResultBytes { .. })
+        ),
+        "expected the named streams-result refusal, got {err:?}"
+    );
+}

@@ -2880,4 +2880,142 @@ mod tests {
             parse_pattern_step(get(&absent, "k"), start_ns, end_ns).unwrap()
         );
     }
+
+    // -----------------------------------------------------------------
+    // Issue #463 — `X-Loki-Response-Encoding-Flags`
+    // -----------------------------------------------------------------
+
+    fn hdr(values: &[&str]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for v in values {
+            h.append(
+                "x-loki-response-encoding-flags",
+                axum::http::HeaderValue::from_str(v).expect("header value"),
+            );
+        }
+        h
+    }
+
+    /// **Criterion 6 — the header parser reproduces every measured wire
+    /// case.**
+    ///
+    /// Fourteen rows, each captured against the pinned reference
+    /// container by issuing the same `query_range` request with only the
+    /// header varied, and recording the `encodingFlags` array it echoed
+    /// and the ARITY of the first `values` entry. The arity column is
+    /// what makes rows 7, 9 and 10 wire-observable rather than an echo
+    /// detail: whitespace around a comma stops the token being the flag,
+    /// so a trimming parser serves three-element values where the
+    /// reference serves two.
+    ///
+    /// Row 5 is the two-header-lines case and it is the one an HTTP
+    /// client can silently get wrong — a client that REPLACES rather than
+    /// appends sends one header and measures the wrong thing. It was
+    /// captured with two literal header lines on the wire, verified in
+    /// the request trace.
+    #[test]
+    fn the_encoding_flags_header_parses_as_the_reference_does() {
+        // (id, header values as sent, echoed tokens, wants categorize)
+        let cases: &[(&str, &[&str], &[&str], bool)] = &[
+            ("H1", &["foo"], &["foo"], false),
+            (
+                "H2",
+                &["categorize-labels,foo"],
+                &["categorize-labels", "foo"],
+                true,
+            ),
+            (
+                "H3",
+                &["  categorize-labels"],
+                &["  categorize-labels"],
+                false,
+            ),
+            ("H4", &[""], &[], false),
+            ("H5", &["foo", "categorize-labels"], &["foo"], false),
+            ("H6", &["CATEGORIZE-LABELS"], &["CATEGORIZE-LABELS"], false),
+            (
+                "H7",
+                &["foo, categorize-labels"],
+                &["foo", " categorize-labels"],
+                false,
+            ),
+            (
+                "H8",
+                &["categorize-labels, foo"],
+                &["categorize-labels", " foo"],
+                true,
+            ),
+            (
+                "H9",
+                &["categorize-labels ,foo"],
+                &["categorize-labels ", "foo"],
+                false,
+            ),
+            (
+                "H10",
+                &["foo,\tcategorize-labels"],
+                &["foo", "\tcategorize-labels"],
+                false,
+            ),
+            ("H11", &["foo,foo"], &["foo"], false),
+            (
+                "H12",
+                &["categorize-labels,categorize-labels"],
+                &["categorize-labels"],
+                true,
+            ),
+            (
+                "H13",
+                &["foo,categorize-labels,foo"],
+                &["foo", "categorize-labels"],
+                true,
+            ),
+            (
+                "H14",
+                &["foo,,categorize-labels"],
+                &["foo", "", "categorize-labels"],
+                true,
+            ),
+        ];
+        for (id, sent, echoed, wants) in cases {
+            let flags = encoding_flags(&hdr(sent));
+            assert_eq!(
+                flags,
+                echoed.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+                "{id}: echoed tokens"
+            );
+            assert_eq!(
+                wants_categorize_labels(&flags),
+                *wants,
+                "{id}: the categorise decision"
+            );
+        }
+    }
+
+    /// H3's leading whitespace never reaches this parser in production —
+    /// the HTTP layer strips optional whitespace after the colon — so the
+    /// case is recorded here for what the parser does with it if it ever
+    /// arrives, and the WIRE answer it pins is H3's `["categorize-labels"]`
+    /// with three-element values, which the live suite asserts end to end.
+    #[test]
+    fn leading_optional_whitespace_is_stripped_by_the_http_layer_not_here() {
+        let mut h = axum::http::HeaderMap::new();
+        // `HeaderValue::from_str` keeps what it is given; a real request
+        // line `X-...: <SP><SP>categorize-labels` arrives already trimmed.
+        h.insert(
+            "x-loki-response-encoding-flags",
+            axum::http::HeaderValue::from_str("categorize-labels").expect("value"),
+        );
+        assert!(wants_categorize_labels(&encoding_flags(&h)));
+    }
+
+    /// An absent header and a present-but-empty one are the same on the
+    /// wire — no `encodingFlags` key at all — and both are DIFFERENT from
+    /// an empty TOKEN, which H14 shows is kept.
+    #[test]
+    fn an_absent_header_and_an_empty_one_both_echo_nothing() {
+        assert!(encoding_flags(&axum::http::HeaderMap::new()).is_empty());
+        assert!(encoding_flags(&hdr(&[""])).is_empty());
+        assert_eq!(encoding_flags(&hdr(&["foo,,categorize-labels"])).len(), 3);
+    }
 }
