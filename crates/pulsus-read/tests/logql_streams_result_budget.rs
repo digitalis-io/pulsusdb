@@ -717,7 +717,10 @@ fn the_categorised_shape_charges_its_third_element() {
 
     let metadata_bytes =
         200 * (alloc_block_bytes(b"trace_id".len() as u64) + alloc_block_bytes(value.len() as u64));
-    let excess = categorised.charged() - plain.charged();
+    // Saturating: when the charge stops counting the third element the
+    // categorised ledger can fall BELOW the plain one, and an overflow
+    // panic reports the arithmetic rather than the property.
+    let excess = categorised.charged().saturating_sub(plain.charged());
     assert!(
         excess >= metadata_bytes,
         "the categorised ledger exceeds the plain one by {excess} B, which is less than the \
