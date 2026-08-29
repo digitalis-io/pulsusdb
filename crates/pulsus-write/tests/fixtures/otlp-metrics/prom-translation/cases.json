@@ -2103,6 +2103,19 @@
                     },
                     "name": "...",
                     "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
+                    "unit": ""
                   }
                 ]
               }
@@ -2154,6 +2167,19 @@
                     },
                     "name": "",
                     "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
+                    "unit": ""
                   }
                 ]
               }
@@ -2204,6 +2230,19 @@
                       ]
                     },
                     "name": "._.",
+                    "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
                     "unit": ""
                   }
                 ]
@@ -2263,6 +2302,19 @@
                     },
                     "name": "ok.a",
                     "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
+                    "unit": ""
                   }
                 ]
               }
@@ -2321,6 +2373,19 @@
                     },
                     "name": "ok.a",
                     "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
+                    "unit": ""
                   }
                 ]
               }
@@ -2378,6 +2443,19 @@
                       ]
                     },
                     "name": "ok.a",
+                    "unit": ""
+                  },
+                  {
+                    "gauge": {
+                      "dataPoints": [
+                        {
+                          "asDouble": 5.0,
+                          "attributes": [],
+                          "timeUnixNano": "1787920000000000000"
+                        }
+                      ]
+                    },
+                    "name": "sibling.ok",
                     "unit": ""
                   }
                 ]

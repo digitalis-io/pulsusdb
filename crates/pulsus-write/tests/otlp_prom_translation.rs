@@ -294,6 +294,33 @@ async fn post_metrics(
     (status, bytes.to_vec())
 }
 
+/// Splits a case's payload into one request per metric descriptor and
+/// parses each on its own, returning `(independently valid, faulty)`.
+///
+/// A metric counts as independently valid when it parses `Ok` **and**
+/// produces at least one sample: a metric that parses to nothing is not a
+/// witness that anything could have been written.
+fn solo_metric_outcomes(case: &Value) -> (usize, usize) {
+    let metrics = case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array()
+        .expect("metrics");
+    let mut valid = 0usize;
+    let mut faulty = 0usize;
+    for metric in metrics {
+        let mut solo = case.clone();
+        solo["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"] = json!([metric]);
+        let body = serde_json::to_vec(&solo["payload"]).expect("payload re-serializes");
+        let request =
+            otlp_metrics::decode_json(&body).expect("corpus payloads are valid OTLP/JSON");
+        match otlp_metrics::parse(&request, REFERENCE_TS_MS * 1_000_000, settings_of(case)) {
+            Ok(parsed) if !parsed.samples.is_empty() => valid += 1,
+            Ok(_) => {}
+            Err(_) => faulty += 1,
+        }
+    }
+    (valid, faulty)
+}
+
 #[tokio::test]
 async fn reference_rejections_are_whole_request_400() {
     let doc = load_cases();
@@ -337,6 +364,24 @@ async fn reference_rejections_are_whole_request_400() {
         }
         if !sink.admitted.lock().expect("sink lock").is_empty() {
             failures.push(format!("case {id}: a rejected request reached the sink"));
+        }
+
+        // ...and the fixture must carry something that COULD have been
+        // written, or "nothing was written" is trivially true (plan v19
+        // Δ61). Derived rather than declared: each metric in the payload is
+        // parsed on its own, and the fixture must contain at least one that
+        // succeeds with a sample of its own AND at least one that does not,
+        // so the payload really is a valid sibling beside a real fault.
+        let (valid, faulty) = solo_metric_outcomes(case);
+        if valid == 0 {
+            failures.push(format!(
+                "case {id}: no metric in this payload is independently valid, so the                  zero-sink-calls assertion above is vacuous"
+            ));
+        }
+        if faulty == 0 {
+            failures.push(format!(
+                "case {id}: every metric in this payload is independently valid, so the                  rejection cannot be coming from this fixture's own fault"
+            ));
         }
     }
     assert_eq!(
@@ -1774,9 +1819,21 @@ fn capture_cases_json() {
     // historical anchor is refused by any warmed server.
     let anchor_s = now_s - 120;
 
+    // `PULSUS_CAPTURE_ONLY=<id>[,<id>...]` re-captures a subset against a
+    // single container, for a change that alters only some payloads. Unset,
+    // every case is captured and all five endpoints are required.
+    let only: Option<BTreeSet<String>> = std::env::var("PULSUS_CAPTURE_ONLY")
+        .ok()
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+
     let mut build_info: Option<Value> = None;
     let cases = doc["cases"].as_array_mut().expect("cases");
     for (index, case) in cases.iter_mut().enumerate() {
+        if let Some(only) = &only
+            && !only.contains(case["id"].as_str().expect("id"))
+        {
+            continue;
+        }
         let Some(endpoint) = endpoint_for(case) else {
             panic!("no capture endpoint configured for case {}", case["id"]);
         };
@@ -1898,7 +1955,7 @@ fn capture_cases_json() {
 
     doc["captured_from"] = json!({
         "image": "docker.io/prom/prometheus:v3.13.0",
-        "buildinfo": build_info.expect("at least one case")["data"],
+        "buildinfo": build_info.expect("at least one case was captured")["data"],
         "route": "POST /api/v1/otlp/v1/metrics",
         "read_back": "GET /api/v1/series + GET /api/v1/query last_over_time(..[1ms])",
     });
@@ -2444,6 +2501,201 @@ fn api_md_documents_the_fault_model() {
     assert!(
         section.contains("target_info") && section.contains("`job`"),
         "§1.1 must document the model that replaced it"
+    );
+}
+
+// ---------------------------------------------------------------------
+// AC12 — the scope predicates on the canonicalizer's reuse
+
+/// The workspace crates whose `src/` this gate walks, and the symbol it
+/// tracks: `pulsus_model::canonicalize_label_key`, the sole authority for
+/// turning an OTel attribute key into a Prometheus-style label name.
+const CANONICALIZER: &str = "canonicalize_label_key";
+
+/// Every file under `crates/*/src/` with a **production** call to
+/// [`CANONICALIZER`], derived from the tree under test.
+///
+/// "Production" is everything before the file's first `#[cfg(test)]` line —
+/// the same rule plan v23 Δ76 used to classify `label_name.rs:253` as
+/// test-only. A call is the symbol followed by `(`, or the symbol passed as
+/// a function value to `group_by`; a doc comment, a `use`, a `pub use` and
+/// the function's own definition are not calls, which is why the list below
+/// is shorter than a raw grep.
+fn production_canonicalizer_callers() -> BTreeSet<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files: Vec<String> = Vec::new();
+    collect_rs_under_src(&root.join("crates"), &root, &mut files);
+    let mut callers = BTreeSet::new();
+    for relative in files {
+        let text = std::fs::read_to_string(root.join(&relative)).expect("read source");
+        for line in production_lines(&text) {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // The DEFINITION is not a call: `canonical.rs` would otherwise
+            // list itself as its own caller.
+            if trimmed.starts_with(&format!("pub fn {CANONICALIZER}(")) {
+                continue;
+            }
+            let calls = line.contains(&format!("{CANONICALIZER}("))
+                || line.contains(&format!("group_by(pairs, {CANONICALIZER})"));
+            if calls {
+                callers.insert(relative.clone());
+                break;
+            }
+        }
+    }
+    callers
+}
+
+/// The lines of `text` before its first `#[cfg(test)]`.
+fn production_lines(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            break;
+        }
+        out.push(line);
+    }
+    out
+}
+
+fn collect_rs_under_src(dir: &Path, root: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if name == "target" || name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_rs_under_src(&path, root, out);
+        } else if name.ends_with(".rs") {
+            let relative = path
+                .strip_prefix(root)
+                .expect("under the workspace root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            // `crates/<crate>/src/...` only: `tests/`, `benches/` and
+            // `xtask/` are not production code.
+            if relative.starts_with("crates/") && relative.contains("/src/") {
+                out.push(relative);
+            }
+        }
+    }
+}
+
+/// The production callers this change expects. Derived once by
+/// [`production_canonicalizer_callers`] and asserted as an **equality**, so
+/// a list computed at any other revision fails — which is the whole point:
+/// a caller added or removed anywhere in the workspace has to be looked at,
+/// not silently absorbed.
+const CANONICALIZER_CALLERS: &[&str] = &[
+    "crates/pulsus-model/src/labels.rs",
+    "crates/pulsus-write/src/protocols/otlp_logs.rs",
+    "crates/pulsus-write/src/protocols/prom_metric_name.rs",
+    "crates/pulsus-write/src/protocols/service_name.rs",
+];
+
+/// AC12. Three static predicates on the new module's reuse of the shared
+/// canonicalizer, and **nothing else**.
+///
+/// 1. the production call site exists in the new module;
+/// 2. the caller list is derived at the head under test and contains that
+///    site by name;
+/// 3. no aliasing import of the symbol exists under `crates/*/src/`.
+///
+/// **What this criterion does not assert.** It says nothing about
+/// behaviour: not that the call is reached, not that its result is
+/// consumed, and not that the output is right.
+/// `corpus_matches_prometheus_v3_13_0` is the criterion that carries that,
+/// and it is the one measured to catch a divergent mapping — a
+/// re-implementation grafted into the real code reddened 37 of the 94 cases
+/// the review replayed.
+///
+/// **Why it is only three predicates.** Four cheaper gates were written and
+/// each was falsified in turn: a modification-only scope, defeated by a
+/// re-implementation that never calls; a call-site assertion, defeated by a
+/// syntactic call whose result is discarded; a pinned twelve-element sample
+/// plus dataflow, defeated by delegating for exactly the pinned inputs; and
+/// a generated input domain, defeated by delegating for all inputs of
+/// eleven characters or fewer. Two further results closed the argument: a
+/// branch placed *before* the call bypasses a single-call-site leg, and an
+/// indirect function-pointer call passes a no-alias assertion. Those four
+/// gates are withdrawn, not narrowed.
+///
+/// **The two properties, kept apart because they have different answers:**
+///
+/// | property | statically enforceable? |
+/// |---|---|
+/// | **canonicalizer provenance** — the namer's escaping is *the* canonicalizer's and not a second spelling | **yes**, by an opaque newtype; reopenable |
+/// | **external reference fidelity** — our canonicalizer agrees with Prometheus v3.13.0 | **no**, by any static means; belongs to the corpus |
+///
+/// An escaped-label newtype whose only constructor is `canonicalize_label_key`,
+/// required by the emitter's signature, makes a second escaping spelling
+/// *unrepresentable* rather than merely detectable, and every one of the
+/// four escapes becomes a type error. It costs the type in `pulsus-model`,
+/// privatising the raw-`String` escape hatch, and threading the production
+/// call sites on the logs and metrics paths — today both
+/// `canonicalize_label_key` and the namer's `build` return a bare `String`
+/// (`canonical.rs:26`, `prom_metric_name.rs:372`) and no such type exists in
+/// the workspace. **It is not done in this change**, and that is a scope
+/// decision. Recorded as follow-up A on issue #461.
+#[test]
+fn the_label_namer_reuses_the_shared_canonicalizer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    const NEW_MODULE: &str = "crates/pulsus-write/src/protocols/prom_metric_name.rs";
+
+    // (1) The production call site exists in the new module.
+    let module = std::fs::read_to_string(root.join(NEW_MODULE)).expect("read the new module");
+    let call_lines: Vec<&str> = production_lines(&module)
+        .into_iter()
+        .filter(|l| l.contains(&format!("{CANONICALIZER}(")) && !l.trim_start().starts_with("//"))
+        .collect();
+    assert_eq!(
+        call_lines.len(),
+        1,
+        "{NEW_MODULE} must carry exactly one production call to {CANONICALIZER}, found \
+         {call_lines:?}"
+    );
+
+    // (2) The caller list is derived at the head under test, and the new
+    // module is in it by name.
+    let derived = production_canonicalizer_callers();
+    assert!(
+        derived.contains(NEW_MODULE),
+        "the derived caller list does not contain {NEW_MODULE}: {derived:?}"
+    );
+    let expected: BTreeSet<String> = CANONICALIZER_CALLERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(
+        derived, expected,
+        "the caller list derived from this tree is not the one recorded; a caller added or \
+         removed anywhere under crates/*/src/ has to be looked at"
+    );
+
+    // (3) No aliasing import of the symbol under `crates/*/src/`. A second
+    // name for one function is a second spelling waiting to drift.
+    let mut files: Vec<String> = Vec::new();
+    collect_rs_under_src(&root.join("crates"), &root, &mut files);
+    let mut aliases: Vec<String> = Vec::new();
+    for relative in &files {
+        let text = std::fs::read_to_string(root.join(relative)).expect("read source");
+        for (n, line) in text.lines().enumerate() {
+            if line.contains(&format!("{CANONICALIZER} as ")) {
+                aliases.push(format!("{relative}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        aliases.is_empty(),
+        "the canonicalizer is imported under a second name: {aliases:?}"
     );
 }
 
