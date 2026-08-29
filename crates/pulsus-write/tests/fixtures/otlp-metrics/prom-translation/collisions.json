@@ -1,0 +1,4251 @@
+{
+  "captured_from": {
+    "buildinfo": {
+      "branch": "HEAD",
+      "buildDate": "20260701-10:57:01",
+      "buildUser": "root@4525cbec08c1",
+      "goVersion": "go1.26.4",
+      "revision": "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+      "version": "3.13.0"
+    },
+    "flags": "--web.enable-otlp-receiver --enable-feature=native-histograms",
+    "image": "docker.io/prom/prometheus:v3.13.0",
+    "note": "each push restamped to run time; captured bodies rewritten back to reference_timestamp_ms",
+    "route": "POST /api/v1/otlp/v1/metrics"
+  },
+  "cases": [
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-gauge-base-name",
+      "id": "collision-gauge-base-name:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "gauge",
+          "metric_name": "g"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "g"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf01"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "gauge": {
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "g",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "g"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf01"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "g",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "g"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-gauge-base-name",
+      "id": "collision-gauge-base-name:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "gauge",
+          "metric_name": "g"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "g"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf01"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "g",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "g"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf01"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "gauge": {
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "g",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 7\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "g"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-sum-base-name",
+      "id": "collision-sum-base-name:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "sum",
+          "metric_name": "s"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "s"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf02"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "s",
+                        "sum": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ],
+                          "isMonotonic": false
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf02"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "s",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-sum-base-name",
+      "id": "collision-sum-base-name:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "sum",
+          "metric_name": "s"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "s"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf02"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "s",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf02"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "s",
+                        "sum": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ],
+                          "isMonotonic": false
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 7\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-monotonic-sum-already-total",
+      "id": "collision-monotonic-sum-already-total:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "sum",
+          "metric_name": "req_total"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "req_total"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf03"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "req_total",
+                        "sum": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ],
+                          "isMonotonic": true
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "req_total"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf03"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "req_total",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "req_total"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-monotonic-sum-already-total",
+      "id": "collision-monotonic-sum-already-total:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "sum",
+          "metric_name": "req_total"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "req_total"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf03"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "req_total",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "req_total"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf03"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "req_total",
+                        "sum": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ],
+                          "isMonotonic": true
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 7\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "req_total"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-classic-histogram-sum",
+      "id": "collision-classic-histogram-sum:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "histogram",
+          "metric_name": "q3"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "q3_sum"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf04"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "histogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "bucketCounts": [
+                                "1",
+                                "1"
+                              ],
+                              "count": "2",
+                              "explicitBounds": [
+                                0.1
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "q3",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q3"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf04"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "q3_sum",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q3_sum"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-classic-histogram-sum",
+      "id": "collision-classic-histogram-sum:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "histogram",
+          "metric_name": "q3"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "q3_sum"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf04"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "q3_sum",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q3_sum"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf04"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "histogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "bucketCounts": [
+                                "1",
+                                "1"
+                              ],
+                              "count": "2",
+                              "explicitBounds": [
+                                0.1
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "q3",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 1.5\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q3"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-classic-histogram-count",
+      "id": "collision-classic-histogram-count:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "histogram",
+          "metric_name": "q2"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "q2_count"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf05"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "histogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "bucketCounts": [
+                                "1",
+                                "1"
+                              ],
+                              "count": "2",
+                              "explicitBounds": [
+                                0.1
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "q2",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q2"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf05"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "q2_count",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q2_count"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-classic-histogram-count",
+      "id": "collision-classic-histogram-count:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "histogram",
+          "metric_name": "q2"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "q2_count"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf05"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "q2_count",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q2_count"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf05"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "histogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "bucketCounts": [
+                                "1",
+                                "1"
+                              ],
+                              "count": "2",
+                              "explicitBounds": [
+                                0.1
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "q2",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 2\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q2"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-classic-histogram-bucket-bound",
+      "id": "collision-classic-histogram-bucket-bound:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "histogram",
+          "metric_name": "h"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "le",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "h_bucket"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf06"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "histogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "bucketCounts": [
+                                "1",
+                                "1"
+                              ],
+                              "count": "2",
+                              "explicitBounds": [
+                                0.1
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "h",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "h"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf06"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "le",
+                                  "value": {
+                                    "stringValue": "0.1"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "h_bucket",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "le",
+              "service.name"
+            ],
+            "metric_names": [
+              "h_bucket"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-classic-histogram-bucket-bound",
+      "id": "collision-classic-histogram-bucket-bound:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "histogram",
+          "metric_name": "h"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "le",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "h_bucket"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf06"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "le",
+                                  "value": {
+                                    "stringValue": "0.1"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "h_bucket",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "le",
+              "service.name"
+            ],
+            "metric_names": [
+              "h_bucket"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf06"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "histogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "bucketCounts": [
+                                "1",
+                                "1"
+                              ],
+                              "count": "2",
+                              "explicitBounds": [
+                                0.1
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "h",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 1\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "h"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-classic-histogram-bucket-inf",
+      "id": "collision-classic-histogram-bucket-inf:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "histogram",
+          "metric_name": "q1"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "le",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "q1_bucket"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf07"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "histogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "bucketCounts": [
+                                "1",
+                                "1"
+                              ],
+                              "count": "2",
+                              "explicitBounds": [
+                                0.1
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "q1",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q1"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf07"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "le",
+                                  "value": {
+                                    "stringValue": "+Inf"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "q1_bucket",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "le",
+              "service.name"
+            ],
+            "metric_names": [
+              "q1_bucket"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-classic-histogram-bucket-inf",
+      "id": "collision-classic-histogram-bucket-inf:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "histogram",
+          "metric_name": "q1"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "le",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "q1_bucket"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf07"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "le",
+                                  "value": {
+                                    "stringValue": "+Inf"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "q1_bucket",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "le",
+              "service.name"
+            ],
+            "metric_names": [
+              "q1_bucket"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf07"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "histogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "bucketCounts": [
+                                "1",
+                                "1"
+                              ],
+                              "count": "2",
+                              "explicitBounds": [
+                                0.1
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "q1",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 2\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "q1"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-summary-sum",
+      "id": "collision-summary-sum:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "z3"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "z3_sum"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf08"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "z3",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "z3"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf08"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "z3_sum",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "z3_sum"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-summary-sum",
+      "id": "collision-summary-sum:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "z3"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "z3_sum"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf08"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "z3_sum",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "z3_sum"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf08"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "z3",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 1.5\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "z3"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-summary-count",
+      "id": "collision-summary-count:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "z4"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "z4_count"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf09"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "z4",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "z4"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf09"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "z4_count",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "z4_count"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-summary-count",
+      "id": "collision-summary-count:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "z4"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "z4_count"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf09"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "z4_count",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "z4_count"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf09"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "z4",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 2\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "z4"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-summary-generated-quantile",
+      "id": "collision-summary-generated-quantile:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "s"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "quantile",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "s"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf10"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "s",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf10"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "quantile",
+                                  "value": {
+                                    "stringValue": "0.5"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "s",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "quantile",
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-summary-generated-quantile",
+      "id": "collision-summary-generated-quantile:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "s"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "quantile",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "s"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf10"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "quantile",
+                                  "value": {
+                                    "stringValue": "0.5"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "s",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "quantile",
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf10"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "s",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 1.5,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 0.25\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-target-info",
+      "id": "collision-target-info:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "host.arch",
+            "service.name"
+          ],
+          "kind": "gauge",
+          "metric_name": "ti.warm"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "host.arch",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "target_info"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf11"
+                      }
+                    },
+                    {
+                      "key": "host.arch",
+                      "value": {
+                        "stringValue": "amd64"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "gauge": {
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "ti.warm",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "host.arch",
+              "service.name"
+            ],
+            "metric_names": [
+              "ti.warm"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf11"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "host.arch",
+                                  "value": {
+                                    "stringValue": "amd64"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "target_info",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "host.arch",
+              "service.name"
+            ],
+            "metric_names": [
+              "target_info"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "collision-target-info",
+      "id": "collision-target-info:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "host.arch",
+            "service.name"
+          ],
+          "kind": "gauge",
+          "metric_name": "ti.warm"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "host.arch",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "target_info"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf11"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "host.arch",
+                                  "value": {
+                                    "stringValue": "amd64"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "target_info",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "host.arch",
+              "service.name"
+            ],
+            "metric_names": [
+              "target_info"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf11"
+                      }
+                    },
+                    {
+                      "key": "host.arch",
+                      "value": {
+                        "stringValue": "amd64"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "gauge": {
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "ti.warm",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "duplicate sample for timestamp 1787920000000; overrides not allowed: existing is a histogram, new value 1\n",
+            "content_type": "text/plain; charset=utf-8",
+            "status": 400
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "host.arch",
+              "service.name"
+            ],
+            "metric_names": [
+              "ti.warm"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "control-label-inequality",
+      "id": "control-label-inequality:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "s"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "s"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf12"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "s",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 3.0,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf12"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "s",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        }
+      ],
+      "same_identity": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "control-label-inequality",
+      "id": "control-label-inequality:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "s"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "s"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf12"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "s",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf12"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "s",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 3.0,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "s"
+            ]
+          }
+        }
+      ],
+      "same_identity": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "control-timestamp-inequality",
+      "id": "control-timestamp-inequality:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "gauge",
+          "metric_name": "g"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "g"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf13"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "gauge": {
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "name": "g",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "g"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf13"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920001000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "g",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "g"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "second-later"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "control-timestamp-inequality",
+      "id": "control-timestamp-inequality:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "gauge",
+          "metric_name": "g"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "g"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf13"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "g",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "g"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf13"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "gauge": {
+                          "dataPoints": [
+                            {
+                              "asDouble": 7.0,
+                              "attributes": [],
+                              "timeUnixNano": "1787920001000000000"
+                            }
+                          ]
+                        },
+                        "name": "g",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "g"
+            ]
+          }
+        }
+      ],
+      "same_identity": true,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "second-later"
+    },
+    {
+      "direction": "float-first",
+      "exp_histogram_mode": "native",
+      "fixture": "control-name-inequality",
+      "id": "control-name-inequality:float-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "n1"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "quantile",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "n2"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf14"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "n1",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 3.0,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "n1"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf14"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "quantile",
+                                  "value": {
+                                    "stringValue": "0.5"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "n2",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "quantile",
+              "service.name"
+            ],
+            "metric_names": [
+              "n2"
+            ]
+          }
+        }
+      ],
+      "same_identity": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    },
+    {
+      "direction": "histogram-first",
+      "exp_histogram_mode": "native",
+      "fixture": "control-name-inequality",
+      "id": "control-name-inequality:histogram-first",
+      "inputs": {
+        "float": {
+          "attribute_keys": [
+            "service.name"
+          ],
+          "kind": "summary",
+          "metric_name": "n1"
+        },
+        "histogram": {
+          "attribute_keys": [
+            "quantile",
+            "service.name"
+          ],
+          "kind": "exponentialHistogram",
+          "metric_name": "n2"
+        }
+      },
+      "promote_scope_metadata": false,
+      "pushes": [
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf14"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "exponentialHistogram": {
+                          "aggregationTemporality": 2,
+                          "dataPoints": [
+                            {
+                              "attributes": [
+                                {
+                                  "key": "quantile",
+                                  "value": {
+                                    "stringValue": "0.5"
+                                  }
+                                }
+                              ],
+                              "count": "1",
+                              "negative": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "positive": {
+                                "bucketCounts": [],
+                                "offset": 0
+                              },
+                              "scale": 0,
+                              "sum": 1.0,
+                              "timeUnixNano": "1787920000000000000",
+                              "zeroCount": "1"
+                            }
+                          ]
+                        },
+                        "name": "n2",
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "histogram",
+          "wire": {
+            "attribute_keys": [
+              "quantile",
+              "service.name"
+            ],
+            "metric_names": [
+              "n2"
+            ]
+          }
+        },
+        {
+          "payload": {
+            "resourceMetrics": [
+              {
+                "resource": {
+                  "attributes": [
+                    {
+                      "key": "service.name",
+                      "value": {
+                        "stringValue": "cf14"
+                      }
+                    }
+                  ]
+                },
+                "scopeMetrics": [
+                  {
+                    "metrics": [
+                      {
+                        "name": "n1",
+                        "summary": {
+                          "dataPoints": [
+                            {
+                              "attributes": [],
+                              "count": "2",
+                              "quantileValues": [
+                                {
+                                  "quantile": 0.5,
+                                  "value": 0.25
+                                }
+                              ],
+                              "sum": 3.0,
+                              "timeUnixNano": "1787920000000000000"
+                            }
+                          ]
+                        },
+                        "unit": ""
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "reference": {
+            "body": "",
+            "content_type": null,
+            "status": 200
+          },
+          "role": "float",
+          "wire": {
+            "attribute_keys": [
+              "service.name"
+            ],
+            "metric_names": [
+              "n1"
+            ]
+          }
+        }
+      ],
+      "same_identity": false,
+      "strategy": "UnderscoreEscapingWithSuffixes",
+      "timestamp_relation": "equal"
+    }
+  ],
+  "reference_timestamp_ms": 1787920000000
+}
