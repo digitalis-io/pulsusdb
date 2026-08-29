@@ -175,9 +175,12 @@ pub enum Surface {
     /// these endpoints are Tempo-datasource-only). Against this suite's
     /// empty databases a well-formed request is the mounting oracle:
     /// `query_range` → 200 with an empty `series` list; `query` → 200 with
-    /// exactly one `__name__`-labelled series whose single sample omits its
-    /// zero `value` (protojson default-omission; a `uniqExact` with no
-    /// `GROUP BY` always returns one row). Errors are the bare
+    /// exactly one `__name__`-labelled series carrying a SCALAR `value` and
+    /// no `samples` array (issue #464 wave 2: the instant route returns
+    /// `tempopb.QueryInstantResponse`, `pkg/tempopb/tempo.proto:346-355` @
+    /// v3.0.2), whose zero `value` is omitted entirely (protojson
+    /// default-omission; a `uniqExact` with no `GROUP BY` always returns
+    /// one row). Errors are the bare
     /// `text/plain` body of [`PlainTextWriter::TempoFrontendResponse`]
     /// (issue #384); a TraceQL parse error's byte offset travels inside
     /// the message, and the static point-cap rejection is a 422 (the

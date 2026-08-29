@@ -837,9 +837,12 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             // this suite's empty databases the well-formed match-all
             // request is the mounting oracle: `query_range` → an empty
             // `series` list; `query` → exactly one `__name__`-labelled
-            // series with one sample whose zero `value` is omitted
-            // (protojson default-omission) — a `uniqExact` with no
-            // `GROUP BY` always returns one row.
+            // series carrying a SCALAR `value` and no `samples` array
+            // (issue #464 wave 2: the instant route returns
+            // `tempopb.QueryInstantResponse`,
+            // `pkg/tempopb/tempo.proto:346-355` @ v3.0.2), whose zero
+            // `value` is omitted entirely (protojson default-omission) —
+            // a `uniqExact` with no `GROUP BY` always returns one row.
             assert!(
                 res.content_type()
                     .is_some_and(|ct| ct.starts_with("application/json")),
@@ -865,17 +868,13 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                     1,
                     "{ctx}: an instant metrics query always returns one series, body {json}"
                 );
-                let samples = series[0]["samples"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{ctx}: samples must be an array: {json}"));
-                assert_eq!(
-                    samples.len(),
-                    1,
-                    "{ctx}: the instant series carries exactly one sample, body {json}"
+                assert!(
+                    series[0].get("samples").is_none(),
+                    "{ctx}: an instant series carries no samples array, body {json}"
                 );
                 // The zero value is omitted (protojson default-omission).
                 assert!(
-                    samples[0].get("value").is_none(),
+                    series[0].get("value").is_none(),
                     "{ctx}: empty DB instant value is zero → omitted, body {json}"
                 );
             }

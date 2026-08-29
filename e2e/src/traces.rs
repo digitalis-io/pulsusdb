@@ -1600,16 +1600,54 @@ async fn assert_metrics_roundtrip(
         .json()
         .await
         .context("metrics/query body was not JSON")?;
-    // Issue #182: the instant `query` form also emits the Tempo-native
-    // `{series, metrics}` body — one `samples[]` entry per series.
+    // Issue #182: the instant `query` form also emits a Tempo-native
+    // `{series, metrics}` body — but a DIFFERENT message from the range
+    // one (issue #464 wave 2): each series carries a scalar `value` and no
+    // `samples` array, so it is read by `tempo_instant_values`, never by
+    // `tempo_metrics_points`.
     if body.get("series").and_then(|s| s.as_array()).is_none() {
         bail!("metrics/query missing Tempo-native series: {body}");
     }
-    let instant: f64 = tempo_metrics_points(&body).values().sum();
+    let instant = tempo_instant_values(&body)
+        .context("metrics/query instant body did not carry the tempopb.InstantSeries shape")?;
     if instant != expected {
         bail!("metrics/query count_over_time returned {instant}, expected {expected}: {body}");
     }
     Ok(())
+}
+
+/// The summed scalar values of a `tempopb.QueryInstantResponse` body
+/// (`pkg/tempopb/tempo.proto:339-355` @ v3.0.2). **Fail-closed.**
+///
+/// `tempopb.InstantSeries` carries a scalar `value` and no `samples`, so
+/// `tempo_metrics_points` (which walks `series[].samples[]`) reads nothing
+/// here and would silently sum to zero. A series carrying `samples` is the
+/// retired shape and is an ERROR, never a zero. An ABSENT `value` is a
+/// zero (protojson default omission), not an error.
+fn tempo_instant_values(body: &serde_json::Value) -> Result<f64> {
+    let series = body["series"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("instant body carries no series array: {body}"))?;
+    let mut total = 0.0_f64;
+    for s in series {
+        if s.get("samples").is_some() {
+            bail!(
+                "instant series carries a `samples` array — the retired range shape, which \
+                 the Tempo datasource's strict decoder rejects outright: {body}"
+            );
+        }
+        match s.get("value") {
+            // protojson default omission: an absent `value` is 0.
+            None => {}
+            Some(v) => {
+                let n = v.as_f64().ok_or_else(|| {
+                    anyhow::anyhow!("instant series value is not a JSON number: {body}")
+                })?;
+                total += n;
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Cluster-only shard-local sanity (mirrors
@@ -2059,13 +2097,14 @@ async fn run_search_case(
     Ok(())
 }
 
-/// PulsusDB's Prometheus-matrix metrics response normalized to
 /// Both stores' `/api/…/metrics/query_range` responses normalized to
 /// `bucket-ms -> summed value` (issue #182: PulsusDB's traces metrics
 /// endpoint now emits the **Tempo-native** body, so both sides use this
 /// one reader). `series[].samples[]` of `{timestampMs, value}` — jsonpb,
 /// so `timestampMs` is a string and a zero `value` may be omitted
-/// entirely.
+/// entirely. **RANGE route only** — the instant route returns
+/// `tempopb.QueryInstantResponse`, whose series have no `samples` array
+/// at all, and is read by `tempo_instant_values` (issue #464 wave 2).
 fn tempo_metrics_points(body: &serde_json::Value) -> std::collections::BTreeMap<i64, f64> {
     let mut out = std::collections::BTreeMap::new();
     for series in body["series"].as_array().into_iter().flatten() {
@@ -2977,6 +3016,58 @@ mod tests {
     /// deltas 2+3). Update deliberately, with the ledger entry, never
     /// as a quick fix for a red run.
     const INFORMATIONAL_CASE_IDS: &[&str] = &["neg_attr_missing_key"];
+
+    /// Issue #464 wave 2 (AC 7). `tempo_instant_values` reads
+    /// `tempopb.QueryInstantResponse` (`pkg/tempopb/tempo.proto:339-355` @
+    /// v3.0.2) and FAILS CLOSED on the retired range shape:
+    /// `tempo_metrics_points` walks `series[].samples[]`, so it reads
+    /// nothing from an instant body and would silently sum it to zero —
+    /// or, if the expected total were ever 0, pass wrongly.
+    #[test]
+    fn tempo_instant_values_reads_scalars_and_rejects_the_retired_samples_shape() {
+        // 1. A two-series scalar body, captured 2026-08-29 from
+        //    `grafana/tempo@sha256:aa8df8d0…` for
+        //    `{} | count_over_time() by (resource.service.name)` over a
+        //    corpus of 10 `w2a` spans and 4 `w2b` spans.
+        let captured: serde_json::Value = serde_json::from_str(
+            "{\"series\":[{\"labels\":[{\"key\":\"resource.service.name\",\"value\":\
+             {\"stringValue\":\"w2a\"}}],\"value\":10},{\"labels\":[{\"key\":\
+             \"resource.service.name\",\"value\":{\"stringValue\":\"w2b\"}}],\"value\":4}],\
+             \"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}",
+        )
+        .expect("the captured reference body is JSON");
+        assert_eq!(
+            tempo_instant_values(&captured).expect("the captured reference body reads"),
+            14.0,
+            "the reader sums every series' scalar value"
+        );
+
+        // 2. An omitted `value` is a protojson zero, not an error — the
+        //    reference emits exactly this for a zero-valued series.
+        let zero_omitted: serde_json::Value = serde_json::from_str(
+            "{\"series\":[{\"labels\":[{\"key\":\"__name__\",\"value\":{\"stringValue\":\
+             \"count_over_time\"}}]}],\"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}",
+        )
+        .expect("the zero-omitted body is JSON");
+        assert_eq!(
+            tempo_instant_values(&zero_omitted)
+                .expect("an omitted `value` is a protojson zero, never an error"),
+            0.0
+        );
+
+        // 3. The retired range shape is an ERROR, never a zero.
+        let retired: serde_json::Value = serde_json::from_str(
+            "{\"series\":[{\"labels\":[{\"key\":\"__name__\",\"value\":{\"stringValue\":\
+             \"rate\"}}],\"samples\":[{\"timestampMs\":\"1700000000000\",\"value\":0.5}]}],\
+             \"metrics\":{\"completedJobs\":1,\"totalJobs\":1}}",
+        )
+        .expect("the retired body is JSON");
+        assert!(
+            tempo_instant_values(&retired).is_err(),
+            "a `samples` array on the instant route is the retired shape and must fail closed \
+             — summing it silently yields 0.0"
+        );
+    }
 
     // -----------------------------------------------------------------
     // `retry_through_cut` — the by-ID gate's bounded reference-side
