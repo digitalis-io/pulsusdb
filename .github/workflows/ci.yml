@@ -1120,10 +1120,48 @@ jobs:
       # post-connect drain each dominate the runtime (~6 min per pass,
       # ~12 min for the double run); it runs last on this container for
       # that reason.
+      #
+      # It runs against its OWN container. `ci/logql/config-463.yaml` is
+      # the shared config plus `discover_log_levels: false`, and the
+      # difference is load-bearing rather than tidy: with discovery on
+      # the reference appends a level pair to every entry, and on the
+      # UNFLAGGED read path structured metadata merges into the stream
+      # label set — so that pair takes part in the grouping and two
+      # entries differing only in discovered level come back as two
+      # stream objects. Eliding the NAME from both sides afterwards
+      # leaves that split behind and manufactures a difference the
+      # elision itself created (measured: probe `A` returned seven stream
+      # objects there against PulsusDB's six). The shared container keeps
+      # its config, because two other committed captures assert the level
+      # pair is PRESENT in every entry they hold.
+      - name: Start LogQL v3.7.4 reference with level discovery off (issue #463)
+        run: |
+          docker run -d --name pulsus-logql-diff-463 -p 13101:3100 \
+            -v "$GITHUB_WORKSPACE"/ci/logql/config-463.yaml:/etc/loki/local-config.yaml:ro \
+            grafana/loki@sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc \
+            -config.file=/etc/loki/local-config.yaml
+          deadline=$(( $(date +%s) + 180 ))
+          until [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:13101/ready)" = "200" ]; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "the #463 reference never became ready" >&2
+              docker logs --tail 50 pulsus-logql-diff-463 >&2 || true
+              exit 1
+            fi
+            sleep 2
+          done
+
       - name: LogQL categorize-labels capture drift leg (issue #463)
         env:
-          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13101"
         run: cargo test -p pulsus-server --test categorize_labels_differential -- --test-threads=1
+
+      - name: LogQL categorize-labels reference diagnostics (on failure only)
+        if: failure()
+        run: docker logs pulsus-logql-diff-463 2>&1 || true
+
+      - name: Stop the #463 reference
+        if: always()
+        run: docker rm -f pulsus-logql-diff-463 || true
 
       - name: LogQL corpus replay leg (issue #352, nightly)
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
@@ -1509,6 +1547,20 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run logs_api_live -p pulsus-server --test logs_api_live
+
+      # Issue #463: the PulsusDB half of the categorise-labels
+      # differential. The reference half of the same file runs on the
+      # logql-diff job against its own container; this one spawns the
+      # real binary against this job's ClickHouse and replays every
+      # captured probe through the SAME driver, so both stores are probed
+      # by one body of code and cannot be probed differently. It also
+      # holds the route-alias parity check, both surfaces, both header
+      # settings.
+      - name: Live categorize-labels replay (issue #463)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run categorize_labels_differential -p pulsus-server --test categorize_labels_differential
 
       # Issue #32: spawns the real `pulsusdb` binary and drives `/api/v1/*`
       # (discovery incl. matcher-only `match[]`, instant query,
