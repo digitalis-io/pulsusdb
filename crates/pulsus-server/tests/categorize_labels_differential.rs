@@ -5,7 +5,7 @@
 //! in this file. Every expectation is DERIVED, at test time, from
 //! `tests/fixtures/categorize_labels/capture.json` — the raw response
 //! bodies and tail frames of the pinned reference container, booted on
-//! `ci/logql/config.yaml`, with the fixture pushed through
+//! `ci/logql/config-463.yaml`, with the fixture pushed through
 //! `/loki/api/v1/push` under a per-run nonce and read back with the
 //! header each probe declares. The artifact also records the
 //! container's `/loki/api/v1/status/buildinfo` answer. Refreshing it
@@ -15,7 +15,7 @@
 //!
 //! ```text
 //! podman run -d --name pulsus-c463 -p 13561:3100 \
-//!     -v $PWD/ci/logql/config.yaml:/etc/loki/local-config.yaml:ro \
+//!     -v $PWD/ci/logql/config-463.yaml:/etc/loki/local-config.yaml:ro \
 //!     grafana/loki:3.7.4 -config.file=/etc/loki/local-config.yaml
 //! PULSUSDB_LOGQL_DIFF_URL=http://localhost:13561 \
 //!     PULSUS_REGEN_CATEGORIZE_CAPTURE=1 \
@@ -73,8 +73,12 @@
 //! pair by the manifest and by the `categorize-instant-log-query` ledger
 //! row, which carries both answers.
 
+#[path = "support/live_db.rs"]
+mod live_db;
 #[path = "support/ordered_json.rs"]
 mod ordered_json;
+
+use live_db::drop_db;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -134,6 +138,29 @@ struct Probe {
     extra: &'static [(&'static str, &'static str)],
     /// `query_range` unless stated.
     route: &'static str,
+    /// How much of the answer this probe compares. See [`Compare`].
+    compare: Compare,
+}
+
+/// How much of a probe's answer is compared against the capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compare {
+    /// The whole class projection.
+    Full,
+    /// The envelope only — `resultType` and `encodingFlags`, not
+    /// `result`.
+    ///
+    /// One probe uses this, and it is `H`, the METRIC query. What `H`
+    /// pins is that a non-streams result never carries the
+    /// advertisement, whatever the request headed. Its POINTS are a
+    /// different subject: a stock reference floors `start` and ceils
+    /// `end` onto the step grid before its engine runs, so its point
+    /// lands on a whole second where our start-anchored one lands on the
+    /// instant that was asked for. That is a ruled, ledgered divergence
+    /// (`range-step-grid-start-anchored`) with its own pin, and dragging
+    /// it into this comparison would make this suite red about something
+    /// it does not own.
+    EnvelopeOnly,
 }
 
 const RANGE: &[(&str, &str)] = &[];
@@ -148,6 +175,7 @@ const fn q(id: &'static str, query: &'static str, header: Option<&'static str>) 
         header,
         extra: RANGE,
         route: "query_range",
+        compare: Compare::Full,
     }
 }
 
@@ -185,6 +213,7 @@ fn query_probes() -> Vec<Probe> {
     // an encoder that takes no flags.
     v.push(Probe {
         extra: &[("step", "1s")],
+        compare: Compare::EnvelopeOnly,
         ..q("H", r#"sum(count_over_time({app="co{N}"}[1s]))"#, CAT)
     });
     // G — the empty control.
@@ -302,13 +331,24 @@ const ARTIFACT_IMAGE: &str = "grafana/loki:3.7.4";
 const ARTIFACT_VERSION: &str = "3.7.4";
 const ARTIFACT_REVISION: &str = "b318f282";
 
-/// Names the container ADDS at ingest — `ci/logql/config.yaml` leaves
-/// `discover_log_levels` at its shipped default, which appends
-/// `detected_level` to every entry. PulsusDB does not, so it is elided
-/// from both sides by the same function. No probe name can canonicalize
-/// onto it ([`no_probe_name_collides_with_an_elided_ingest_label`]), so
-/// the elision cannot mask a real difference.
-const ELIDED_NAMES: &[&str] = &["detected_level"];
+/// Names that must NOT appear in any captured projection.
+///
+/// The reference container for this leg boots on `ci/logql/config-463.yaml`,
+/// which is the shared config plus `discover_log_levels: false`. With
+/// discovery ON the container appends a `detected_level`
+/// structured-metadata pair to every entry, and on the UNFLAGGED read
+/// path structured metadata merges into the stream label set — so that
+/// pair takes part in the GROUPING and two entries differing only in
+/// discovered level come back as two stream objects. Eliding the name
+/// from both sides afterwards leaves that split behind and manufactures
+/// a difference the elision itself created; measured, probe `A` came
+/// back as seven stream objects there against our six.
+///
+/// So the pair is removed at its source instead, and this list is what
+/// says the leg is pointed at the right container:
+/// [`no_captured_projection_carries_an_ingest_added_level`] fails
+/// immediately if it is not.
+const FORBIDDEN_NAMES: &[&str] = &["detected_level"];
 
 #[derive(Serialize, Deserialize)]
 struct Artifact {
@@ -421,10 +461,6 @@ fn project_query(body: &str, nonce: &str, base_ns: i128) -> String {
         panic!("response carries no `data` object: {body}");
     };
     let mut data = Json::Obj(pairs.into_iter().filter(|(k, _)| k != "stats").collect());
-    for name in ELIDED_NAMES {
-        data.elide(name);
-    }
-    prune_emptied_categories(&mut data);
     normalise_echo(&mut data);
     rebase_values(&mut data, base_ns);
     data.substitute(nonce, "NONCE");
@@ -484,36 +520,6 @@ fn rebase_values(v: &mut Json, base_ns: i128) {
     }
 }
 
-/// Drops a `structuredMetadata` or `parsed` member that eliding an
-/// ingest-added name left EMPTY.
-///
-/// Without this the elision is asymmetric rather than neutral: the
-/// container appends `detected_level` to every entry, so an entry whose
-/// only metadata is that name renders `{"structuredMetadata":{}}` there
-/// and `{}` on a store that never added it. Removing the name and
-/// leaving the husk would compare a difference the elision itself
-/// created. `{}` is what the reference emits for an entry with neither
-/// category, so this restores exactly that shape.
-fn prune_emptied_categories(v: &mut Json) {
-    match v {
-        Json::Obj(pairs) => {
-            pairs.retain(|(k, val)| {
-                !((k == "structuredMetadata" || k == "parsed")
-                    && matches!(val, Json::Obj(inner) if inner.is_empty()))
-            });
-            for (_, val) in pairs.iter_mut() {
-                prune_emptied_categories(val);
-            }
-        }
-        Json::Arr(items) => {
-            for val in items {
-                prune_emptied_categories(val);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Sorts a MULTI-token `encodingFlags` array.
 ///
 /// The reference builds a fresh map per request and marshals its walk,
@@ -564,10 +570,6 @@ fn project_tail(frames: &[String], nonce: &str) -> String {
         }
     }
     let mut all = Json::Arr(streams);
-    for name in ELIDED_NAMES {
-        all.elide(name);
-    }
-    prune_emptied_categories(&mut all);
     all.substitute(nonce, "NONCE");
     rebase_timestamps(&mut all);
     let mut out = vec![("streams".to_string(), all)];
@@ -825,6 +827,7 @@ fn the_manifest_the_capture_and_the_referenced_ids_are_one_set() {
     // which is what actually forbids a probe with no capture entry, is
     // the part that does not depend on reading test code.
     for name in [
+        "fn no_captured_projection_carries_an_ingest_added_level",
         "fn every_captured_probe_satisfies_its_class",
         "fn every_captured_tail_frame_carries_exactly_its_pushed_entries",
         "fn the_committed_capture_matches_the_live_reference",
@@ -958,18 +961,36 @@ fn no_probe_is_a_variants_query() {
     }
 }
 
-/// No probe name can canonicalize onto an elided ingest label, so the
-/// elision cannot mask a real difference.
+/// **The capture was taken against the right container.** No projection
+/// may carry an ingest-added level name: if one does, the leg was
+/// pointed at a container running with level discovery on, and every
+/// unflagged probe's grouping is then the reference's answer to a
+/// different question.
 #[test]
-fn no_probe_name_collides_with_an_elided_ingest_label() {
+fn no_captured_projection_carries_an_ingest_added_level() {
+    // The fixture pushes the name ONCE, as ordinary metadata on one
+    // entry — deliberately, because that entry is the case an
+    // ingest-added pair would be indistinguishable from. Every
+    // projection may therefore carry it at most once; with discovery ON
+    // the container appends it to all seven, so a projection carrying
+    // more is the container, not the fixture.
     let body = push_body("N", 0);
-    for elided in ELIDED_NAMES {
-        let pushed = body.matches(&format!("\"{elided}\"")).count();
-        assert!(
-            pushed <= 1,
-            "the fixture pushes {elided:?} {pushed} times; the elision would hide more than \
-             the ingest-added copy"
+    for name in FORBIDDEN_NAMES {
+        assert_eq!(
+            body.matches(&format!("\"{name}\"")).count(),
+            1,
+            "the fixture must push {name:?} exactly once, as ordinary metadata"
         );
+        for id in capture::ids() {
+            let p = capture::probe(id);
+            let seen = p.projection.matches(name).count();
+            assert!(
+                seen <= 1,
+                "{id}: the capture carries {name:?} {seen} times where the fixture pushes it \
+                 once — it was taken against a container with level discovery ON, and \
+                 `ci/logql/config-463.yaml` turns it off"
+            );
+        }
     }
 }
 
@@ -984,8 +1005,10 @@ fn the_projection_is_deterministic() {
     assert_eq!(a, b);
     assert!(!a.contains("stats"), "stats must be projected out: {a}");
     assert!(
-        !a.contains("detected_level"),
-        "the ingest-added name must be elided: {a}"
+        a.contains("detected_level"),
+        "nothing is elided by NAME: an ingest-added level is turned off at the source \
+         instead, because on the unflagged path it takes part in the grouping — see \
+         `FORBIDDEN_NAMES`. A pair the FIXTURE pushed must survive the projection: {a}"
     );
     assert!(a.contains("NONCE"), "the nonce must be absorbed: {a}");
     // Key ORDER survives the projection — the property `serde_json`'s
@@ -1153,7 +1176,17 @@ fn project_probe(p: &Probe, status: u16, body: &str, nonce: &str, base_ns: i128)
         Class::Failure => project_failure(status, body, nonce),
         _ => {
             assert_eq!(status, 200, "{}: expected 200, got {status}: {body}", p.id);
-            project_query(body, nonce, base_ns)
+            let full = project_query(body, nonce, base_ns);
+            match p.compare {
+                Compare::Full => full,
+                Compare::EnvelopeOnly => {
+                    let v = ordered_json::parse(&full).expect("projection is JSON");
+                    let Json::Obj(pairs) = v else {
+                        panic!("{}: projection is not an object", p.id)
+                    };
+                    Json::Obj(pairs.into_iter().filter(|(k, _)| k != "result").collect()).render()
+                }
+            }
         }
     }
 }
@@ -1437,7 +1470,7 @@ fn the_committed_capture_matches_the_live_reference() {
         );
         let artifact = Artifact {
             image: ARTIFACT_IMAGE.to_string(),
-            config: "ci/logql/config.yaml".to_string(),
+            config: "ci/logql/config-463.yaml".to_string(),
             buildinfo,
             captured_at_unix: (now_ns() / 1_000_000_000) as u64,
             nonce: nonce_a,
@@ -1468,7 +1501,7 @@ fn the_committed_capture_matches_the_live_reference() {
 
     // Criterion 1: the fresh capture agrees with the committed one.
     assert_eq!(capture::image(), ARTIFACT_IMAGE);
-    assert_eq!(capture::config(), "ci/logql/config.yaml");
+    assert_eq!(capture::config(), "ci/logql/config-463.yaml");
     assert_eq!(
         capture::buildinfo()["version"].as_str(),
         Some(ARTIFACT_VERSION)
@@ -1670,16 +1703,24 @@ fn every_captured_probe_satisfies_its_class() {
             _ => {
                 let v = ordered_json::parse(&captured.projection).expect("projection is JSON");
                 let result = v.get("result").and_then(Json::arr).unwrap_or(&[]);
-                if p.id == "H" {
+                if p.compare == Compare::EnvelopeOnly {
                     assert_eq!(
                         v.get("resultType").and_then(Json::str),
                         Some("matrix"),
-                        "H is the metric probe"
+                        "{}: the envelope-only probe is the metric one",
+                        p.id
                     );
                     assert!(
                         v.get("encodingFlags").is_none(),
-                        "H: a matrix result must not advertise the flag"
+                        "{}: a matrix result must not advertise the flag",
+                        p.id
                     );
+                    assert!(
+                        v.get("result").is_none(),
+                        "{}: the envelope-only projection must not carry `result`",
+                        p.id
+                    );
+                    continue;
                 }
                 assert!(
                     !result.is_empty(),
@@ -1690,4 +1731,246 @@ fn every_captured_probe_satisfies_its_class() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// The PulsusDB leg: the same probes, the same driver, our own server.
+// Gated on `PULSUS_TEST_CLICKHOUSE`.
+// ---------------------------------------------------------------------
+
+/// The fixed listener port this suite binds. Declared once, in the
+/// reserved 31000-31999 band the port-uniqueness guard scans.
+const PULSUS_PORT: u16 = 31_460;
+
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawns the real binary with the compat alias surface on, so
+/// `/loki/api/v1/push`, `/loki/api/v1/query_range`, `/loki/api/v1/query`
+/// and `/loki/api/v1/tail` are all reachable — the driver above talks to
+/// exactly those paths, so both stores are probed by one body of code.
+fn spawn_pulsus(db: &str) -> ChildGuard {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
+    command
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", PULSUS_PORT.to_string())
+        .env("PULSUS_COMPAT_ENDPOINTS", "1")
+        .env(
+            "CLICKHOUSE_SERVER",
+            std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        )
+        .env(
+            "CLICKHOUSE_HTTP_PORT",
+            std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
+        )
+        .env("CLICKHOUSE_DB", db);
+    let guard = ChildGuard(command.spawn().expect("spawn pulsusdb"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        let (status, _) = curl(&[&format!("http://127.0.0.1:{PULSUS_PORT}/ready")]);
+        if status == 200 {
+            return guard;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("/ready never reached 200 within 60s");
+}
+
+/// **Criterion 2 — PulsusDB's answer equals the capture, per probe.**
+///
+/// Every probe the reference can answer is replayed through the SAME
+/// driver against our own server, and its projection compared against
+/// the committed one. The named breaking edits — dropping
+/// `parsed_over_stream`, dropping `sm_over_stream`, filing `__error__`
+/// under `structuredMetadata`, skipping the `_extracted` rename,
+/// categorising a live-metadata name as `Stream`, emitting the third
+/// element without the flag — are performed on the implemented tree and
+/// the reddened probe recorded in the issue's implementation notes; a
+/// criterion whose break was only predicted has never been run.
+///
+/// The one-sided probes are handled per their side: `F2-ref` has no
+/// PulsusDB answer (we serve the instant log query the reference
+/// rejects) and is skipped here, while `F2-pulsus` has no capture and is
+/// asserted against the rules `query_range` follows rather than against
+/// a reference body.
+#[test]
+fn pulsus_answers_every_captured_probe_the_same_way() {
+    if !pulsus_testkit::live_clickhouse_enabled() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_categorize_labels_it");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(drop_db(&db));
+    let _server = spawn_pulsus(&db);
+    let base_url = format!("http://127.0.0.1:{PULSUS_PORT}");
+
+    let nonce = format!("{}p", now_ns() / 1_000_000_000);
+    let base_ns = now_ns() - 60_000_000_000;
+    push(&base_url, &push_body(&nonce, base_ns));
+
+    let mut compared = 0usize;
+    for p in query_probes() {
+        if p.side == Side::ReferenceOnly {
+            continue;
+        }
+        let (status, body) = run_query_probe_visible(&base_url, &p, &nonce, base_ns);
+        let ours = project_probe(&p, status, &body, &nonce, base_ns);
+        if p.side == Side::PulsusOnly {
+            // No reference answer to compare against — the divergence is
+            // in WHAT IS SERVED, and it is ledgered as
+            // `categorize-instant-log-query`. What is asserted is that
+            // our answer follows the same rules `query_range` follows.
+            let v = ordered_json::parse(&ours).expect("projection is JSON");
+            assert_eq!(
+                v.get("resultType").and_then(Json::str),
+                Some("streams"),
+                "{}: the instant log query is planned as a streams query",
+                p.id
+            );
+            assert!(
+                v.get("encodingFlags").is_some(),
+                "{}: the instant route must advertise the flag it was sent",
+                p.id
+            );
+            for s in v.get("result").and_then(Json::arr).unwrap_or(&[]) {
+                for e in s.get("values").and_then(Json::arr).unwrap_or(&[]) {
+                    assert_eq!(
+                        e.arr().map(<[Json]>::len),
+                        Some(3),
+                        "{}: a categorised body has three-element values",
+                        p.id
+                    );
+                }
+            }
+            compared += 1;
+            continue;
+        }
+        let committed = &capture::probe(p.id).projection;
+        if p.class == Class::Failure {
+            // **The STATUS and the absence of the advertisement, not the
+            // wording.** Error prose is not a parity surface here: the
+            // owner rulings on issue #246 pin the status and the
+            // accept/reject decision only, and the wording difference is
+            // ledgered as `logql-error-envelope`. What this probe is for
+            // is that the header changes neither the status nor the
+            // body's shape, and that a rejected query never advertises.
+            let (ref_status, _) = committed.split_once(' ').expect("status prefix");
+            let (our_status, our_body) = ours.split_once(' ').expect("status prefix");
+            assert_eq!(
+                our_status, ref_status,
+                "{}: the header changed the status, or the two stores disagree about the \
+                 accept/reject decision",
+                p.id
+            );
+            assert!(
+                !our_body.contains("encodingFlags"),
+                "{}: a rejected query must not advertise: {our_body}",
+                p.id
+            );
+            compared += 1;
+            continue;
+        }
+        assert_eq!(
+            &ours, committed,
+            "{}: PulsusDB answers differently from the captured reference",
+            p.id
+        );
+        compared += 1;
+    }
+    // 37 query probes, minus the one the reference alone can answer.
+    let replayable = query_probes()
+        .iter()
+        .filter(|p| p.side != Side::ReferenceOnly)
+        .count();
+    assert_eq!(
+        compared, replayable,
+        "expected every replayable query probe ({replayable}), compared {compared}"
+    );
+    eprintln!("#463 replay: {compared} query probes agree with the captured reference");
+}
+
+/// **Criterion 11 — the native route and its alias are byte-identical,
+/// on both surfaces, with and without the header.**
+///
+/// The header is read at two handlers and threaded through one options
+/// struct; nothing in that path is route-specific, and this is what says
+/// so rather than assuming it.
+#[test]
+fn the_native_route_and_the_alias_agree_byte_for_byte() {
+    if !pulsus_testkit::live_clickhouse_enabled() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_categorize_labels_alias_it");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(drop_db(&db));
+    let _server = spawn_pulsus(&db);
+    let base_url = format!("http://127.0.0.1:{PULSUS_PORT}");
+    let nonce = format!("{}x", now_ns() / 1_000_000_000);
+    let base_ns = now_ns() - 60_000_000_000;
+    push(&base_url, &push_body(&nonce, base_ns));
+
+    let (start, end) = probe_window(base_ns);
+    for header in [None, Some("categorize-labels")] {
+        for (native, alias, extra) in [
+            (
+                "/api/logs/v1/query_range",
+                "/loki/api/v1/query_range",
+                format!("start={start}&end={end}&direction=forward"),
+            ),
+            (
+                "/api/logs/v1/query",
+                "/loki/api/v1/query",
+                format!("time={end}"),
+            ),
+        ] {
+            let fetch = |path: &str| {
+                let mut args: Vec<String> = vec!["-G".to_string()];
+                if let Some(h) = header {
+                    args.push("-H".to_string());
+                    args.push(format!("X-Loki-Response-Encoding-Flags: {h}"));
+                }
+                args.push("--data-urlencode".to_string());
+                args.push(format!(r#"query={{app="co{nonce}"}}"#));
+                args.push("--data-urlencode".to_string());
+                args.push("limit=100".to_string());
+                for kv in extra.split('&') {
+                    args.push("--data-urlencode".to_string());
+                    args.push(kv.to_string());
+                }
+                args.push(format!("{base_url}{path}"));
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                curl(&refs)
+            };
+            let (sn, bn) = fetch(native);
+            let (sa, ba) = fetch(alias);
+            assert_eq!((sn, &bn), (sa, &ba), "{native} and {alias} disagree");
+            assert_eq!(sn, 200, "{native}: {bn}");
+            let advertised = bn.contains(r#""encodingFlags":["categorize-labels"]"#);
+            assert_eq!(
+                advertised,
+                header.is_some(),
+                "{native}: the advertisement must follow the header, header={header:?}: {bn}"
+            );
+            if header.is_some() {
+                let ef = bn.find(r#""encodingFlags""#).expect("advertised");
+                let result = bn.find(r#""result":"#).expect("result");
+                assert!(ef < result, "{native}: the flag must precede result: {bn}");
+            }
+        }
+    }
+    eprintln!("#463 alias parity: both routes, both surfaces, both header settings agree");
 }

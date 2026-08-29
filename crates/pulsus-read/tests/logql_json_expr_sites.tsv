@@ -222,6 +222,8 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:85	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:91	-	-	b["0"]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:94	-	-	b[0]	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b26_json_expr.test:97	-	-	arr["0"]	accept	accept	-	-	
+Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:202	-	-	lvl	accept	accept	-	-	
+Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:202	-	-	tid	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2643	-	-	a	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2644	-	-	o	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:2646	-	-	a	accept	accept	-	-	

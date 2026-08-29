@@ -80,6 +80,8 @@ Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.t
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:92	-	-	<a><a>	reject	reject	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b2_formatters.test:198	-	-	<method> <path> <status>	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/differential_parsers_filters.test:65	-	-	<method> <path> <status> <took>	accept	accept	-	-	
+Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:200	-	-	PT <app> <trace_id> end	accept	accept	-	-	
+Site	Literal	crates/pulsus-server/tests/fixtures/categorize_labels/capture.json:136	-	-	PT <app> <trace_id> end	accept	accept	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4113	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4114	-	-	<1a> x	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail row and the ledger's table -- the identifier-charset half, where `5d91ef1` invented the label `_1a`. Added by this change to pin the move
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4115	-	-		reject	reject	-	-	
