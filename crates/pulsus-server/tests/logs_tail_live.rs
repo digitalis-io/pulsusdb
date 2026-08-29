@@ -1241,6 +1241,149 @@ async fn loki_tail_alias_streams_like_native() {
 }
 
 // ---------------------------------------------------------------------
+// 6b) Issue #469: one stream object PER ENTRY, in timestamp order — the
+//     shape a tail client actually renders (port 31210)
+// ---------------------------------------------------------------------
+
+/// **Criterion 7 — the frame shape a client sees.**
+///
+/// Two streams differing in one label with their entries interleaved in
+/// time: `prod@t`, `staging@t+1ms`, `prod@t+2ms`. The frame must carry
+/// THREE stream objects in strict timestamp order, with the identical
+/// `prod` map on either side of `staging`.
+///
+/// **The repeated map is what makes this frame discriminate at all.**
+/// With a parser stage the extracted label folds into `stream`, all
+/// three maps become distinct, and a renderer that grouped by label set
+/// would emit three objects too — so a `| logfmt` frame cannot tell
+/// packing from splitting. This query has no pipeline for that reason.
+///
+/// A grouping renderer emits TWO objects here, and the datasource — an
+/// object loop outside, a value loop inside — renders the rows
+/// `a, c, b`: log lines out of order in a tail view.
+///
+/// # The witness form, and why it is not the other one
+///
+/// **Pre-registered-stream**: every row is seeded BEFORE the socket
+/// opens, and the socket then connects with an explicit `start` behind
+/// them, so one catch-up slice (`reader.tail_catchup_slice`, 60 s by
+/// default) covers the whole window and the first poll returns all three
+/// rows in ONE page. That single-page property is what makes "three
+/// objects in this frame" well defined.
+///
+/// It deliberately does not use the **fresh-stream** form — open the
+/// socket, then push rows the server has not seen. Measured on the
+/// sibling issue: that form produced no frame at all inside either a
+/// 10 s or a 30 s collect window, and the assertion that reddened was
+/// "no frame arrived", not one about object count or order. Raising the
+/// deadline does not help; the per-poll delay is what is bounded here
+/// (`PULSUS_TAIL_POLL_INTERVAL=200ms`).
+#[tokio::test(flavor = "multi_thread")]
+async fn tail_frames_carry_one_object_per_entry_in_timestamp_order() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_210;
+    let db = &pulsus_testkit::test_db("pulsus_tail_it_object_granularity");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_POLL_INTERVAL", "200ms")]);
+    let client = data_client(db).await;
+
+    // Two streams differing in ONE label. Both carry the same
+    // `service_name`, so the bare selector matches both and the maps
+    // differ only in `env`.
+    let t0 = now_ns() - 2_000_000_000;
+    seed_stream(
+        &client,
+        db,
+        1,
+        r#"{"env":"prod","service_name":"checkout"}"#,
+        t0,
+    )
+    .await;
+    seed_stream(
+        &client,
+        db,
+        2,
+        r#"{"env":"staging","service_name":"checkout"}"#,
+        t0,
+    )
+    .await;
+    // Seeded BEFORE the socket opens — see the doc comment.
+    seed_samples(
+        &client,
+        db,
+        &[
+            (1, t0, "a"),
+            (2, t0 + 1_000_000, "b"),
+            (1, t0 + 2_000_000, "c"),
+        ],
+    )
+    .await;
+
+    let start = t0 - 1_000_000_000;
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D";
+    let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start={start}"));
+
+    // The FIRST frame carrying entries. A frame is only pushed when some
+    // stream has entries, so an empty one cannot appear before it — but
+    // the loop is bounded rather than assuming that.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let frame = loop {
+        let text = ws
+            .next_text(deadline)
+            .unwrap_or_else(|| panic!("the tail produced no frame within the deadline"));
+        let v: serde_json::Value = serde_json::from_str(&text).expect("frame JSON");
+        if !v["streams"].as_array().expect("streams array").is_empty() {
+            break v;
+        }
+        assert!(Instant::now() < deadline, "only empty frames arrived");
+    };
+
+    let objs = frame["streams"].as_array().expect("streams array");
+    assert_eq!(objs.len(), 3, "one stream object per entry: {frame}");
+
+    // The flattened rows, in OBJECT order — which is the order the
+    // datasource renders them in.
+    let rows: Vec<(i64, String)> = objs
+        .iter()
+        .flat_map(|o| o["values"].as_array().expect("values").iter())
+        .map(|e| {
+            (
+                e[0].as_str().expect("ns string").parse().expect("ns"),
+                e[1].as_str().expect("line").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (t0, "a".to_string()),
+            (t0 + 1_000_000, "b".to_string()),
+            (t0 + 2_000_000, "c".to_string()),
+        ],
+        "the rows are not in timestamp order in object order: {frame}"
+    );
+
+    // The identical map twice, with a different one between — the part a
+    // label-set grouping cannot produce.
+    assert_eq!(
+        objs[0]["stream"], objs[2]["stream"],
+        "the first and third objects must carry the SAME map: {frame}"
+    );
+    assert_ne!(
+        objs[0]["stream"], objs[1]["stream"],
+        "with a different one between them: {frame}"
+    );
+    assert_eq!(objs[0]["stream"]["env"], "prod");
+    assert_eq!(objs[1]["stream"]["env"], "staging");
+
+    ws.close();
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
 // 7) Bounded month refresh + orphan cache (issue #94, atomicity-safe
 //    revision): a stream registered ONLY in an older calendar month
 //    (simulating the non-atomic log_streams/log_samples write path,
