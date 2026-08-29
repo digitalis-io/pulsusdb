@@ -26,6 +26,23 @@
 //! green because they pinned OUR output at that width instead of the
 //! reference's — which is why every width the unit test asserts is now a
 //! captured response fragment.
+//!
+//! **The `metrics` block is `tempopb.SearchMetrics` and nothing else**
+//! (issue #464). It used to carry `partial`, `limit` and `returned`, and
+//! none of the three is a field of that message
+//! (`pkg/tempopb/tempo.proto:164-172` @ v3.0.2). Grafana's Tempo
+//! datasource decodes a search response with `jsonpb.Unmarshal`
+//! (`pkg/tempo/search.go:95` @ `v13.1.5-11-g3c7375b`), which **rejects**
+//! an unknown field and returns the error instead of results — so those
+//! keys did not degrade trace search through that client, they disabled
+//! it. [`render`] documents where the truncation signal went.
+//!
+//! Removing them is not sufficient for a strict client, and nothing here
+//! claims it is: `durationMs` is `uint32` in the same message and we
+//! emit an unwrapped `i64`, so one trace over ~49.7 days fails the same
+//! decode and takes the whole response with it. That is one mechanism —
+//! an integer emitted outside its proto field's domain — tracked
+//! separately and deliberately not fixed field-by-field here.
 
 use serde_json::{Value, json};
 
@@ -40,7 +57,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Trace-level milliseconds only — `TraceSearchMetadata.durationMs`
-/// (`pkg/tempopb/tempo.proto:139` @ v3.0.2). A span never carries this.
+/// (`pkg/tempopb/tempo.proto:139` @ v3.0.2). A span never carries this,
+/// and the nanoseconds fed in are the TRACE's envelope width, not the
+/// root span's (issue #464).
 ///
 /// **Not truncated to `uint32`.** The reference computes
 /// `uint32(spanset.DurationNanos / 1_000_000)` (`engine.go:295`), so any
@@ -115,7 +134,21 @@ fn group_json(group: &SpanSetGroup) -> Value {
     })
 }
 
-/// One `traces[]` entry. `durationMs` follows the SAME protojson
+/// One `traces[]` entry.
+///
+/// **`startTimeUnixNano` and `durationMs` are TRACE-level and come from
+/// the trace's envelope, not from the root span** (issue #464). The
+/// reference fills both from the spanset (`pkg/traceql/engine.go:294-295`
+/// @ v3.0.2), whose writer computes `traceStart` and
+/// `traceEnd - traceStart` over EVERY span of the trace
+/// (`tempodb/encoding/vparquet4/schema.go:558-560`). Filling them from the
+/// root span answers wrongly whenever a child starts before the root
+/// (clock skew), ends after it, or extends the trace past the root's end —
+/// measured on an adversarial four-trace corpus, three of four traces.
+/// `rootServiceName`/`rootTraceName` stay the root span's, because those
+/// are what the reference takes from it.
+///
+/// `durationMs` follows the SAME protojson
 /// default-omission rule as the span level (issue #458, review round 2):
 /// it is dropped when it is zero, and it is zero for every SUB-MILLISECOND
 /// trace, not only for a zero-width one. Captured against
@@ -145,27 +178,49 @@ fn trace_json(trace: &TraceSearchResult) -> Value {
         "traceID": hex(&trace.trace_id),
         "rootServiceName": trace.root.service,
         "rootTraceName": trace.root.name,
-        "startTimeUnixNano": trace.root.start_ns.to_string(),
+        "startTimeUnixNano": trace.trace_start_ns.to_string(),
         "spanSets": span_sets,
     });
-    let ms = duration_ms(trace.root.duration_ns);
+    let ms = duration_ms(trace.trace_duration_ns);
     if ms != 0 {
         obj["durationMs"] = Value::from(ms);
     }
     obj
 }
 
-/// The full documented response envelope — `traces` in the engine's
-/// public order (max matched-span timestamp DESC, trace id ASC) plus the
-/// `metrics.{partial,limit,returned}` partial-results contract.
+/// The full documented response envelope: `traces` in the engine's public
+/// order (max matched-span timestamp DESC, trace id ASC), plus `metrics` —
+/// which is `tempopb.SearchMetrics` (`pkg/tempopb/tempo.proto:164-172` @
+/// v3.0.2) and NOTHING else.
+///
+/// This block used to carry `partial`, `limit` and `returned`, and all
+/// three were invented (issue #464). Grafana's Tempo datasource decodes a
+/// search response with `jsonpb.Unmarshal` (`pkg/tempo/search.go:95` @
+/// `v13.1.5-11-g3c7375b`), which REJECTS an unknown field and returns the
+/// error instead of results — so those keys did not degrade trace search
+/// through that client, they disabled it.
+///
+/// `limit` and `returned` are dropped outright: `limit` is the caller's own
+/// request parameter and `returned` is `traces.len()`. `partial` has no
+/// like-for-like home — `PartialStatus` (`tempo.proto:383-386`) is on
+/// `TraceByIDResponse`, `QueryRangeResponse` and `QueryInstantResponse`,
+/// never on `SearchResponse` — so it rides the pair the search route DOES
+/// use for incompleteness: `completedJobs < totalJobs`
+/// (`modules/frontend/combiner/response_metrics.go:19-38`,
+/// `combiner/search.go:126-135`). We run one plan, so `totalJobs` is 1 and
+/// `completedJobs` is 1 or 0. **A zero `completedJobs` is OMITTED**, the way
+/// protojson omits a default scalar and the way Grafana's own
+/// `(metrics.completedJobs || 0) / (metrics.totalJobs || 1)`
+/// (`src/streaming.ts:316`) reads it.
 pub(crate) fn render(output: &SearchOutput) -> Value {
+    let mut metrics = serde_json::Map::new();
+    if !output.partial {
+        metrics.insert("completedJobs".to_string(), Value::from(1u32));
+    }
+    metrics.insert("totalJobs".to_string(), Value::from(1u32));
     json!({
         "traces": output.traces.iter().map(trace_json).collect::<Vec<_>>(),
-        "metrics": {
-            "partial": output.partial,
-            "limit": output.limit,
-            "returned": output.returned,
-        },
+        "metrics": Value::Object(metrics),
     })
 }
 
@@ -175,16 +230,58 @@ mod tests {
 
     use super::*;
 
+    /// Every field of `tempopb.SearchMetrics`
+    /// (`pkg/tempopb/tempo.proto:164-172` @ grafana/tempo v3.0.2 /
+    /// `0c4b926d09234186de39833e9c7ecb5b7614c8b9`), transcribed by hand.
+    ///
+    /// **This list is a transcription and nothing in CI checks it.**
+    /// `tempopb` is not vendored and this workspace has no Go step, so a
+    /// field added to the reference will not be noticed here, and a name
+    /// mistyped into this list would let an invented key spelled that way
+    /// through. It is checkable by a human against the checkout.
+    const SEARCH_METRICS_FIELDS: [&str; 7] = [
+        "inspectedTraces",
+        "inspectedBytes",
+        "totalBlocks",
+        "completedJobs",
+        "totalJobs",
+        "totalBlockBytes",
+        "inspectedSpans",
+    ];
+
+    /// The values of `SearchOutput::partial` — the ONLY field
+    /// [`render`] branches on when it builds the `metrics` block, and so
+    /// the exact enumeration the documented metrics shape is derived over
+    /// (issue #464).
+    ///
+    /// **This is not "every branch of `render`".** `render` reaches at
+    /// least five other branch points, all of them inside the `traces`
+    /// array and none of them able to move a `metrics` key:
+    /// `trace_json`'s `groups` split (`:137`) and its zero-`durationMs`
+    /// omission (`:152`), `span_json`'s zero-`durationNanos` omission
+    /// (`:75`) and its empty-`attributes` omission (`:78`), and
+    /// `group_value_json`'s type match (`:94`). The constant covers the
+    /// metrics projection only.
+    const METRICS_PARTIALITY_BRANCHES: [bool; 2] = [false, true];
+
     fn sample_output() -> SearchOutput {
         SearchOutput {
             traces: vec![TraceSearchResult {
                 trace_id: [0xab; 16],
+                // Issue #464: the root span's window is deliberately NOT
+                // the trace's — it starts 1 s in and is 1 ms wide, while
+                // the trace starts at the base instant and runs 2500 ms.
+                // A fixture where the two coincide cannot tell the
+                // trace-level rule from the root-span rule, which is how
+                // the root-span reading survived until now.
                 root: RootSummary {
                     service: "checkout".to_string(),
                     name: "GET /pay".to_string(),
-                    start_ns: 1_700_000_000_000_000_000,
-                    duration_ns: 2_500_000_000,
+                    start_ns: 1_700_000_001_000_000_000,
+                    duration_ns: 1_000_000,
                 },
+                trace_start_ns: 1_700_000_000_000_000_000,
+                trace_duration_ns: 2_500_000_000,
                 matched: 5,
                 spans: vec![SpanSummary {
                     span_id: [0xcd; 8],
@@ -210,11 +307,22 @@ mod tests {
         );
         assert_eq!(v["traces"][0]["rootServiceName"], "checkout");
         assert_eq!(v["traces"][0]["rootTraceName"], "GET /pay");
+        // Issue #464: both are TRACE-level. The fixture's root span
+        // starts 1 s later and is 1 ms wide, so neither assertion below
+        // can be satisfied by the root span's own window.
+        let root = &sample_output().traces[0].root;
+        assert_ne!(root.start_ns, 1_700_000_000_000_000_000);
+        assert_ne!(root.duration_ns, 2_500_000_000);
         assert_eq!(v["traces"][0]["startTimeUnixNano"], "1700000000000000000");
         assert_eq!(v["traces"][0]["durationMs"], 2500);
-        assert_eq!(v["metrics"]["partial"], true);
-        assert_eq!(v["metrics"]["limit"], 20);
-        assert_eq!(v["metrics"]["returned"], 1);
+        // Issue #464: the whole block, not three keys of it — the
+        // retired `partial`/`limit`/`returned` were invented and a
+        // per-key assertion cannot see a fourth key reappearing.
+        assert_eq!(
+            v["metrics"],
+            serde_json::json!({"totalJobs": 1}),
+            "the sample output is truncated: completedJobs is zero and protojson omits a zero"
+        );
     }
 
     /// Issue #458 defect A: a span carries `durationNanos` as a protojson
@@ -439,6 +547,25 @@ mod tests {
                 "the captured set must carry the {required} ns width"
             );
         }
+        // DO NOT DELETE either of the two over-`u32::MAX` rows. They are
+        // the only captures whose reference value differs from ours, and
+        // therefore the only rows that can tell a truncating `durationMs`
+        // from a non-truncating one; the rest agree under both rules and
+        // would stay green if we started copying the overflow. Issue #464
+        // makes this field carry the TRACE's width rather than the root
+        // span's, which can only ENLARGE the set of stores that reach
+        // them. If a later change makes these two rows behave
+        // differently, make them pass — never remove them.
+        let over_u32: Vec<i64> = widths
+            .iter()
+            .copied()
+            .filter(|ns| ns / 1_000_000 > i64::from(u32::MAX))
+            .collect();
+        assert_eq!(
+            over_u32.len(),
+            2,
+            "exactly the two widths above u32::MAX milliseconds must remain — they are the only rows that can tell a truncating durationMs from a non-truncating one, got {over_u32:?}"
+        );
 
         for (duration_ns, captured) in captures {
             let want: serde_json::Value =
@@ -449,18 +576,25 @@ mod tests {
                     u8::from_str_radix(hex, 16).expect("hex byte")
                 })
                 .collect();
+            let trace_start_ns: i64 = want["startTimeUnixNano"]
+                .as_str()
+                .expect("startTimeUnixNano")
+                .parse()
+                .expect("i64 nanos");
             let mut got = trace_json(&TraceSearchResult {
                 trace_id: trace_id.try_into().expect("16 bytes"),
+                // Issue #464: the widths under test are the TRACE's, so
+                // the root span is given a deliberately different window —
+                // 7 s later, 1 ns wide. If `trace_json` ever reads the
+                // root span again, every row here fails.
                 root: RootSummary {
                     service: want["rootServiceName"].as_str().expect("svc").to_string(),
                     name: want["rootTraceName"].as_str().expect("name").to_string(),
-                    start_ns: want["startTimeUnixNano"]
-                        .as_str()
-                        .expect("startTimeUnixNano")
-                        .parse()
-                        .expect("i64 nanos"),
-                    duration_ns,
+                    start_ns: trace_start_ns.saturating_add(7_000_000_000),
+                    duration_ns: 1,
                 },
+                trace_start_ns,
+                trace_duration_ns: duration_ns,
                 matched: 1,
                 spans: vec![],
                 groups: None,
@@ -494,6 +628,124 @@ mod tests {
         }
     }
 
+    /// Issue #464: the trace level's `startTimeUnixNano` and `durationMs`
+    /// are the TRACE's envelope — the spanset's `StartTimeUnixNanos` and
+    /// `DurationNanos` (`pkg/traceql/engine.go:294-295` @ v3.0.2,
+    /// computed over every span at
+    /// `tempodb/encoding/vparquet4/schema.go:558-560`) — and not the root
+    /// span's own window.
+    ///
+    /// **Provenance.** One identical OTLP/JSON push to the pinned
+    /// reference container
+    /// (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`,
+    /// this repo's `ci/tempo/tempo-compare.yaml` unmodified) and to
+    /// PulsusDB, service `rev464b`, then
+    /// `GET /api/search?q={resource.service.name="rev464b"}&start=<base-300>&end=<base+300>&limit=20`.
+    /// The four trace objects below are the reference's answers verbatim,
+    /// with `spanSet`/`spanSets`/`serviceStats` removed (we emit none of
+    /// the three; separately recorded).
+    ///
+    /// **The corpus is adversarial by construction, and that is asserted
+    /// before anything is compared.** Three of the four traces answer
+    /// differently under the two rules — a root that starts after its
+    /// child, a later child that extends the trace, and a child that ends
+    /// after the root — and the fourth is a single-span control where the
+    /// root IS the trace. A corpus whose root windows coincide with its
+    /// traces' cannot tell the two rules apart, which is exactly how the
+    /// root-span reading survived issue #458.
+    #[test]
+    fn the_trace_envelope_renders_the_reference_captured_start_and_duration() {
+        // (root start_ns, root duration_ns, trace start_ns, trace
+        //  duration_ns, the trace object the reference returned).
+        const BASE: i64 = 1_787_922_982_000_000_000;
+        let captures: [(i64, i64, i64, i64, &str); 4] = [
+            (
+                // root +5 s, 42 ms — it starts AFTER its own child.
+                BASE + 5_000_000_000,
+                42_000_000,
+                BASE,
+                5_042_000_000,
+                r#"{"traceID":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","rootServiceName":"rev464b","rootTraceName":"root-skew","startTimeUnixNano":"1787922982000000000","durationMs":5042}"#,
+            ),
+            (
+                // root +0, 42 ms; a child 1 s later extends the trace.
+                BASE,
+                42_000_000,
+                BASE,
+                1_000_000_000,
+                r#"{"traceID":"b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1","rootServiceName":"rev464b","rootTraceName":"root-short","startTimeUnixNano":"1787922982000000000","durationMs":1000}"#,
+            ),
+            (
+                // root +0, 10 ms; a child starts inside it and ends after.
+                BASE,
+                10_000_000,
+                BASE,
+                35_000_000,
+                r#"{"traceID":"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1","rootServiceName":"rev464b","rootTraceName":"root-overrun","startTimeUnixNano":"1787922982000000000","durationMs":35}"#,
+            ),
+            (
+                // The control: one span, so the root IS the trace and
+                // both rules agree.
+                BASE,
+                2_500_000_000,
+                BASE,
+                2_500_000_000,
+                r#"{"traceID":"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1","rootServiceName":"rev464b","rootTraceName":"root-only","startTimeUnixNano":"1787922982000000000","durationMs":2500}"#,
+            ),
+        ];
+
+        // The corpus relation, asserted BEFORE any value comparison: a
+        // narrowed corpus fails here rather than passing under both rules.
+        assert!(
+            captures
+                .iter()
+                .any(|(root_start, _, trace_start, _, _)| root_start > trace_start),
+            "the corpus must carry a trace whose ROOT starts after the trace does"
+        );
+        assert!(
+            captures
+                .iter()
+                .filter(|(_, root_dur, _, trace_dur, _)| root_dur != trace_dur)
+                .count()
+                >= 2,
+            "the corpus must carry at least two traces whose ROOT width differs from the trace's"
+        );
+
+        for (root_start_ns, root_duration_ns, trace_start_ns, trace_duration_ns, captured) in
+            captures
+        {
+            let want: serde_json::Value =
+                serde_json::from_str(captured).expect("the capture is valid JSON");
+            let trace_id: Vec<u8> = (0..16)
+                .map(|i| {
+                    let hex = &want["traceID"].as_str().expect("traceID")[i * 2..i * 2 + 2];
+                    u8::from_str_radix(hex, 16).expect("hex byte")
+                })
+                .collect();
+            let mut got = trace_json(&TraceSearchResult {
+                trace_id: trace_id.try_into().expect("16 bytes"),
+                root: RootSummary {
+                    service: want["rootServiceName"].as_str().expect("svc").to_string(),
+                    name: want["rootTraceName"].as_str().expect("name").to_string(),
+                    start_ns: root_start_ns,
+                    duration_ns: root_duration_ns,
+                },
+                trace_start_ns,
+                trace_duration_ns,
+                matched: 1,
+                spans: vec![],
+                groups: None,
+            });
+            got.as_object_mut().expect("object").remove("spanSets");
+            assert_eq!(
+                got, want,
+                "trace envelope ({trace_start_ns}, {trace_duration_ns} ns) against root span \
+                 ({root_start_ns}, {root_duration_ns} ns): the rendered object must be the \
+                 reference's — startTimeUnixNano and durationMs are TRACE-level"
+            );
+        }
+    }
+
     #[test]
     fn an_empty_output_renders_the_documented_empty_envelope() {
         let v = render(&SearchOutput {
@@ -503,8 +755,119 @@ mod tests {
             limit: 20,
         });
         assert_eq!(v["traces"], serde_json::json!([]));
-        assert_eq!(v["metrics"]["partial"], false);
-        assert_eq!(v["metrics"]["returned"], 0);
+        // Issue #464 AC 3: zero traces is not a truncated result, so
+        // `completedJobs` must be PRESENT. This is the case a "just drop
+        // the invented keys" fix sails through and a wrong-branch fix
+        // does not.
+        assert_eq!(
+            v["metrics"],
+            serde_json::json!({"completedJobs": 1, "totalJobs": 1}),
+            "an empty complete search: one job, one completed"
+        );
+    }
+
+    /// Issue #464 AC 1: the `metrics` block is the reference's own
+    /// `completedJobs`/`totalJobs` pair, asserted as a WHOLE OBJECT on
+    /// each completeness branch — a per-key assertion is what let three
+    /// invented keys ship.
+    ///
+    /// `completedJobs` is omitted on the truncated branch because
+    /// protojson omits a default-valued scalar, and an omitted key is a
+    /// zero rather than a missing value: `completedJobs (absent => 0) <
+    /// totalJobs (1)` is the incompleteness signal the search route
+    /// carries (`modules/frontend/combiner/response_metrics.go:19-38`,
+    /// `combiner/search.go:126-135` @ v3.0.2).
+    #[test]
+    fn the_metrics_block_is_the_reference_jobs_pair_on_both_partiality_branches() {
+        let mut complete = sample_output();
+        complete.partial = false;
+        assert_eq!(
+            render(&complete)["metrics"],
+            serde_json::json!({"completedJobs": 1, "totalJobs": 1}),
+            "a complete search: one job, one completed"
+        );
+
+        let mut truncated = sample_output();
+        truncated.partial = true;
+        assert_eq!(
+            render(&truncated)["metrics"],
+            serde_json::json!({"totalJobs": 1}),
+            "a truncated search: completedJobs is zero, and protojson omits a zero"
+        );
+    }
+
+    /// Issue #464 AC 2: no key outside `tempopb.SearchMetrics` survives on
+    /// either branch. Grafana's Tempo datasource decodes the search
+    /// response with unknown fields REJECTED (`pkg/tempo/search.go:95` @
+    /// `v13.1.5-11-g3c7375b`), so one invented key costs the whole
+    /// response, not one field of it.
+    ///
+    /// **Scope, stated exactly.** This detects an *invented key* and
+    /// nothing else. It does not detect a wrong value, a wrong branch or
+    /// a missing key — those belong to
+    /// [`the_metrics_block_is_the_reference_jobs_pair_on_both_partiality_branches`],
+    /// and every value/branch break leaves this test green.
+    #[test]
+    fn every_metrics_key_is_a_tempopb_search_metrics_field() {
+        for partial in METRICS_PARTIALITY_BRANCHES {
+            let mut output = sample_output();
+            output.partial = partial;
+            let rendered = render(&output);
+            let metrics = rendered["metrics"].as_object().expect("metrics object");
+            for key in metrics.keys() {
+                assert!(
+                    SEARCH_METRICS_FIELDS.contains(&key.as_str()),
+                    "partial={partial}: {key:?} is not a tempopb.SearchMetrics field"
+                );
+            }
+        }
+    }
+
+    /// Issue #464 AC 6b: the metrics shape in docs/api.md §4.2 is
+    /// DERIVED from [`render`] over both partiality branches, never
+    /// restated. That sentence is the public contract for
+    /// `/api/traces/v1/search` and its `/api/search` alias, and the
+    /// hermetic docs pin in `crates/pulsus-read/tests/traces_search_sql.rs`
+    /// compares the document against a *constant*; this is the half that
+    /// compares it against the code.
+    ///
+    /// **What it couples:** the union of the `metrics` key sets across
+    /// [`METRICS_PARTIALITY_BRANCHES`], against the documentation. Both
+    /// branches, because a key emitted only when `output.partial` slips
+    /// past a single-call version of this test.
+    ///
+    /// **What it is not.** It is not "every branch of `render`" (see
+    /// [`METRICS_PARTIALITY_BRANCHES`] for the five it does not reach),
+    /// it does not reach the VALUES, and it does not reach the omission
+    /// rule: a key present on one branch and absent on the other is
+    /// indistinguishable here from a key present on both. Those are the
+    /// subjects of the two tests above and of the empty-envelope test.
+    #[test]
+    fn the_documented_metrics_shape_is_derived_from_both_partiality_branches() {
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for partial in METRICS_PARTIALITY_BRANCHES {
+            let mut output = sample_output();
+            output.partial = partial;
+            let rendered = render(&output);
+            let metrics = rendered["metrics"].as_object().expect("metrics object");
+            keys.extend(metrics.keys().cloned());
+        }
+        let shape = format!(
+            "{{{}}}",
+            keys.iter()
+                .map(|key| format!("\"{key}\":<n>"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let api = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api.md"),
+        )
+        .expect("read docs/api.md");
+        assert!(
+            api.contains(&shape),
+            "docs/api.md §4.2 must document the metrics-key union over both partiality \
+             branches, {shape:?} — derived from render(), never restated"
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //! deterministic corpus (`traces_corpus.rs`) **once** as OTLP/HTTP JSON
 //! through the real collector to `POST /v1/traces`, then asserts every
 //! native `/api/traces/v1` endpoint round-trips it: trace-by-ID span
-//! sets, search trace-ID set (with `metrics.partial == false`),
+//! sets, search trace-ID set (complete — `metrics.completedJobs ==
+//! metrics.totalJobs`),
 //! tags/tag-values containing the corpus's known keys/values, and
 //! TraceQL-metrics counts reconciling with the ingested span count; the
 //! cluster leg adds the shard-local `trace_spans` count-sum check
@@ -31,7 +32,8 @@
 //!   `test/fixtures/traces/differential.json`, over an identical
 //!   snapped window, PulsusDB's trace-ID set == the corpus expected set
 //!   == Tempo's — with the validity gates asserted first (ours:
-//!   `metrics.partial == false`; Tempo's, plan v2 delta 5: result count
+//!   `metrics.completedJobs == metrics.totalJobs`; Tempo's, plan v2
+//!   delta 5: result count
 //!   strictly below the requested limit AND set-equality with the
 //!   corpus, classified as oracle invalidity/divergence).
 //!
@@ -566,13 +568,29 @@ fn search_raw_result_count(body: &serde_json::Value) -> usize {
     body["traces"].as_array().map(Vec::len).unwrap_or(0)
 }
 
-/// PulsusDB's `metrics.partial` — the search validity gate asserted
-/// before any set comparison (a truncated response compares a top-K,
-/// not a set).
+/// PulsusDB's incompleteness signal — the search validity gate asserted
+/// before any set comparison (a truncated response compares a top-K, not
+/// a set).
+///
+/// Issue #464 retired the invented `metrics.partial`: `metrics` is
+/// `tempopb.SearchMetrics` (`pkg/tempopb/tempo.proto:164-172` @ v3.0.2)
+/// and that message has no partiality field, so the search route carries
+/// the pair the reference's own search route uses for incompleteness,
+/// `completedJobs < totalJobs`. **An omitted `completedJobs` is a ZERO**,
+/// not a missing value — protojson omits a default-valued scalar, so a
+/// truncated search answers the bare `{"totalJobs":1}`.
+///
+/// **Fails closed.** `totalJobs` must be present and an integer, so a
+/// response carrying the retired shape errors here instead of being
+/// silently classified "complete" and letting a top-K through a
+/// set-equality comparison.
 fn pulsus_search_is_partial(body: &serde_json::Value) -> Result<bool> {
-    body["metrics"]["partial"]
-        .as_bool()
-        .with_context(|| format!("search response missing metrics.partial: {body}"))
+    let metrics = &body["metrics"];
+    let total = metrics["totalJobs"]
+        .as_u64()
+        .with_context(|| format!("search response missing metrics.totalJobs: {body}"))?;
+    let completed = metrics["completedJobs"].as_u64().unwrap_or(0);
+    Ok(completed < total)
 }
 
 // ---------------------------------------------------------------------
@@ -1428,12 +1446,16 @@ pub async fn traces_roundtrip(ctx: &Ctx) -> Result<()> {
     )
     .await?;
     if pulsus_search_is_partial(&body)? {
-        bail!("run-scoped search reported metrics.partial=true: {body}");
+        bail!("run-scoped search reported an incomplete result: {body}");
     }
-    let returned = body["metrics"]["returned"].as_u64().unwrap_or_default();
-    if returned as usize != corpus.traces.len() {
+    // Issue #464: `metrics.returned` was an invented field and is gone.
+    // The count it carried is the RAW `traces[]` length, which this
+    // module already computes (and which is the number truncation
+    // validity has to be judged on anyway).
+    let returned = search_raw_result_count(&body);
+    if returned != corpus.traces.len() {
         bail!(
-            "run-scoped search metrics.returned={returned}, expected {}",
+            "run-scoped search returned {returned} traces, expected {}",
             corpus.traces.len()
         );
     }
@@ -1824,7 +1846,8 @@ async fn assert_trace_by_id_gate(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> 
 }
 
 /// One committed search case: validity gates first (ours
-/// `metrics.partial == false`; Tempo's result count strictly below the
+/// `metrics.completedJobs == metrics.totalJobs`; Tempo's result count
+/// strictly below the
 /// requested limit), then the three-way set comparison. `mode:
 /// "informational"` cases keep PulsusDB hard-gated against the corpus
 /// (our documented semantics) but report the Tempo delta as an
@@ -1898,7 +1921,7 @@ async fn run_search_case(
     // always hard, even on informational cases (it invalidates the
     // comparison itself, not the semantics under comparison).
     if pulsus_search_is_partial(&pulsus_body)? {
-        let path = dump("pulsus_validity", "pulsusdb reported metrics.partial=true")?;
+        let path = dump("pulsus_validity", "pulsusdb reported an incomplete result")?;
         bail!(
             "case {:?}: pulsusdb response was partial — corpus/limit sizing is invalid (repro {})",
             case.case_id,
@@ -3508,12 +3531,49 @@ mod tests {
         assert!(delta.summary().contains("max_abs_diff=5"));
     }
 
+    /// The committed `metrics` blocks
+    /// (`test/fixtures/traces/search_metrics.json`) — the SAME fixture
+    /// `crates/pulsus-server/tests/traces_search_live.rs` asserts the real
+    /// wire bytes against, so this gate is fed the shapes the wire
+    /// actually produces rather than a hand-written literal (issue #464:
+    /// the previous version of this test fed itself a literal and stayed
+    /// green while the renderer moved out from under it).
+    fn shipped_metrics_shapes() -> serde_json::Value {
+        let root = crate::engine::workspace_root();
+        let raw =
+            std::fs::read_to_string(root.join("test/fixtures/traces/search_metrics.json")).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// Issue #464: the validity gate reads `completedJobs < totalJobs`,
+    /// treats an omitted `completedJobs` as the zero protojson means by
+    /// it, and FAILS CLOSED on anything it cannot classify — including
+    /// both retired shapes.
     #[test]
-    fn pulsus_search_is_partial_requires_the_field() {
+    fn pulsus_search_is_partial_reads_the_jobs_pair_and_fails_closed() {
+        let shapes = shipped_metrics_shapes();
         assert!(
-            pulsus_search_is_partial(&serde_json::json!({"metrics":{"partial":true}})).unwrap()
+            !pulsus_search_is_partial(&serde_json::json!({"metrics": shapes["complete"]})).unwrap()
         );
+        assert!(
+            pulsus_search_is_partial(&serde_json::json!({"metrics": shapes["partial"]})).unwrap(),
+            "an ABSENT completedJobs is a zero, and 0 < 1 is incomplete"
+        );
+        // Fails closed rather than defaulting to "complete".
         assert!(pulsus_search_is_partial(&serde_json::json!({})).is_err());
+        assert!(
+            pulsus_search_is_partial(&serde_json::json!({"metrics":{"completedJobs":1}})).is_err()
+        );
+        // Both retired shapes are errors, not silent passes.
+        assert!(
+            pulsus_search_is_partial(&serde_json::json!({"metrics":{"partial":true}})).is_err()
+        );
+        assert!(
+            pulsus_search_is_partial(
+                &serde_json::json!({"metrics":{"partial":false,"limit":20,"returned":0}})
+            )
+            .is_err()
+        );
     }
 
     // ---- Issue #252: the reference-positive control's arithmetic -----

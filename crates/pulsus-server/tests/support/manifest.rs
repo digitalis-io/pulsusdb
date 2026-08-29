@@ -160,8 +160,9 @@ pub enum Surface {
     TracesFetch,
     /// `GET /api/traces/v1/search` (issue #57) — success is the
     /// documented docs/api.md §4.2 envelope
-    /// (`{"traces":[...],"metrics":{"partial","limit","returned"}}`), not
-    /// the `{"status","data"}` query envelope; against this suite's empty
+    /// (`{"traces":[...],"metrics":{"completedJobs","totalJobs"}}` —
+    /// `metrics` is `tempopb.SearchMetrics` and nothing else, issue
+    /// #464), not the `{"status","data"}` query envelope; against this suite's empty
     /// databases a well-formed request returns the empty envelope 200,
     /// which doubles as the mounting oracle. Errors are the bare
     /// `text/plain` body of [`PlainTextWriter::TempoFrontendResponse`]

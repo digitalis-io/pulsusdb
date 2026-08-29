@@ -46,7 +46,7 @@ pub use exec::{
     BATCH_TRACES, CANDIDATE_TUPLE_BYTES, HYDRATION_BYTE_BUDGET, MAX_SPANS_PER_TRACE,
     RETAINED_ENTRY_OVERHEAD, RootSummary, SearchOutput, ServiceGraph, TAG_NAMES_MAX,
     TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS,
-    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValues, TraceEngine, TraceReadConfig,
+    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValues, TraceContext, TraceEngine, TraceReadConfig,
     TraceSearchResult,
 };
 pub use filter::{CompiledLeaf, CompiledSpanFilter, PlanError, SpanFilterCtx, compile_span_filter};

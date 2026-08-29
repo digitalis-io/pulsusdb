@@ -65,6 +65,8 @@ const ZIPKIN_PORT: u16 = 31_192;
 const ULP_PORT: u16 = 31_193;
 /// The issue #458 span-duration wire-field suite's own spawn.
 const SPAN_DURATION_PORT: u16 = 31_208;
+/// The issue #464 trace-envelope wire suite's own spawn.
+const TRACE_ENVELOPE_PORT: u16 = 31_209;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,
@@ -1357,6 +1359,16 @@ async fn span_summaries_carry_duration_nanos_as_a_protojson_string_on_the_wire()
     // used. Sharing one trace id would make every trace's root the widest
     // span, so the trace-level assertions below would all be about that
     // one width and the sub-millisecond case could not be tested at all.
+    //
+    // **This corpus is a deliberate CONTROL and must stay single-span**
+    // (issue #464). Its subject is the per-width millisecond-omission
+    // boundary and the `uint32`-wrap divergence, and a second span would
+    // change the width under test. It therefore cannot discriminate the
+    // trace's envelope from the root span's window — under a single-span
+    // trace the two are the same number. The test that does discriminate
+    // them is
+    // `the_trace_level_start_and_duration_are_the_trace_envelope_on_the_wire`,
+    // below.
     let spans = vec![
         {
             let mut sp = span([0xa1; 16], [0x04; 8], "huge", start_ns);
@@ -1500,4 +1512,189 @@ fn span_duration_probe(
     let span_sets = serde_json::to_string(&traces[0]["spanSets"])
         .unwrap_or_else(|e| panic!("{ctx}: re-encode spanSets: {e}"));
     (res.body, span_sets)
+}
+
+/// Issue #464 at the wire: a trace's `startTimeUnixNano` and `durationMs`
+/// are the TRACE's envelope — the earliest span start of the whole trace,
+/// and `max(span end) - min(span start)` in integer milliseconds — not the
+/// root span's own window. The reference fills both from the spanset
+/// (`pkg/traceql/engine.go:294-295` @ v3.0.2), whose writer computes
+/// `traceStart` and `traceEnd - traceStart` over every span
+/// (`tempodb/encoding/vparquet4/schema.go:558-560`).
+///
+/// The corpus is adversarial **by construction, and that is asserted
+/// before any value is compared**: a root that starts five seconds after
+/// its own child, a later child that extends the trace, a child that
+/// starts inside the root and ends after it, and a single-span control
+/// where the root IS the trace. Three of the four answer differently under
+/// the two rules; the fourth agrees under both and is kept as the control.
+///
+/// This is the end-to-end leg: the corpus goes in through the product
+/// ingest path (`POST /v1/traces`, sync) and comes back out of the real
+/// search route, so it covers the engine's fold, the retained context and
+/// the renderer together rather than any one of them alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_trace_level_start_and_duration_are_the_trace_envelope_on_the_wire() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-server/tests/traces_api_live.rs for setup)"
+        );
+        return;
+    }
+
+    let port = TRACE_ENVELOPE_PORT;
+    let _guard = spawn_ready(
+        port,
+        &pulsus_testkit::test_db("pulsus_traces_envelope_it_live"),
+    );
+
+    // The file's fixture instant; window math below is in unix SECONDS.
+    const BASE_NS: u64 = 3_100_000_000_000_000_000;
+
+    // (tag / root span name, trace id byte, root start offset, root width,
+    //  optional child (start offset, width), expected trace start offset,
+    //  expected durationMs).
+    struct Case {
+        tag: &'static str,
+        id: u8,
+        root_start_off: u64,
+        root_dur: u64,
+        child: Option<(u64, u64)>,
+        trace_start_off: u64,
+        duration_ms: i64,
+    }
+    let cases = [
+        Case {
+            // The root starts AFTER its own child (clock skew).
+            tag: "env-skew",
+            id: 0xe1,
+            root_start_off: 5_000_000_000,
+            root_dur: 42_000_000,
+            child: Some((0, 545_000)),
+            trace_start_off: 0,
+            duration_ms: 5042,
+        },
+        Case {
+            // A later child extends the trace past the root's end.
+            tag: "env-late-child",
+            id: 0xe2,
+            root_start_off: 0,
+            root_dur: 42_000_000,
+            child: Some((1_000_000_000, 545_000)),
+            trace_start_off: 0,
+            duration_ms: 1000,
+        },
+        Case {
+            // A child starts inside the root and ends after it.
+            tag: "env-overrun",
+            id: 0xe3,
+            root_start_off: 0,
+            root_dur: 10_000_000,
+            child: Some((5_000_000, 30_000_000)),
+            trace_start_off: 0,
+            duration_ms: 35,
+        },
+        Case {
+            // The control: one span, so the root IS the trace and both
+            // rules agree. Kept deliberately — it pins that the envelope
+            // rule does not move the ordinary single-span answer.
+            tag: "env-only",
+            id: 0xe4,
+            root_start_off: 0,
+            root_dur: 2_500_000_000,
+            child: None,
+            trace_start_off: 0,
+            duration_ms: 2500,
+        },
+    ];
+
+    // The corpus relation, asserted BEFORE anything is seeded or
+    // compared: a narrowed corpus fails here, on the relation, rather
+    // than passing under both rules.
+    assert!(
+        cases.iter().any(|c| c.root_start_off > c.trace_start_off),
+        "the corpus must carry a trace whose ROOT starts after the trace does"
+    );
+    assert!(
+        cases
+            .iter()
+            .filter(|c| c.root_dur != (c.duration_ms as u64) * 1_000_000)
+            .count()
+            >= 2,
+        "the corpus must carry at least two traces whose ROOT width differs from the trace's"
+    );
+
+    for case in &cases {
+        let trace_id = [case.id; 16];
+        let mut spans = Vec::new();
+        let root_start = BASE_NS + case.root_start_off;
+        let mut root = span(trace_id, [0x01; 8], case.tag, root_start);
+        root.end_time_unix_nano = root_start + case.root_dur;
+        spans.push(root);
+        if let Some((child_off, child_dur)) = case.child {
+            let child_start = BASE_NS + child_off;
+            let mut child = span(
+                trace_id,
+                [0x02; 8],
+                &format!("{}-child", case.tag),
+                child_start,
+            );
+            child.parent_span_id = vec![0x01; 8];
+            child.end_time_unix_nano = child_start + child_dur;
+            spans.push(child);
+        }
+        ingest(port, spans, "seed issue #464 trace envelope");
+    }
+
+    for case in &cases {
+        let ctx = format!("envelope {}", case.tag);
+        let trace_hex = hex(&[case.id; 16]);
+        let q = format!("%7B%20name%20%3D%20%22{}%22%20%7D", case.tag);
+        let path = format!("/api/traces/v1/search?q={q}&start=3099999000&end=3100001000&limit=5");
+        let res = get(port, &path, &[], &ctx);
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        let json = res.json(&ctx);
+        let all = json["traces"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{ctx}: traces array, body {json}"));
+        // Selected by TRACE ID, not by position: the throwaway database
+        // is keyed on the suite name, so a re-run on the same ClickHouse
+        // finds the previous run's traces too.
+        let traces: Vec<&serde_json::Value> = all
+            .iter()
+            .filter(|t| t["traceID"].as_str() == Some(trace_hex.as_str()))
+            .collect();
+        assert_eq!(
+            traces.len(),
+            1,
+            "{ctx}: exactly one trace with id {trace_hex}, body {json}"
+        );
+        let trace = traces[0];
+
+        // The ROOT's metadata is still the root span's — the envelope
+        // rule moves the two time fields and nothing else.
+        assert_eq!(
+            trace["rootTraceName"].as_str(),
+            Some(case.tag),
+            "{ctx}: rootTraceName stays the ROOT SPAN's, body {json}"
+        );
+        assert_eq!(
+            trace["startTimeUnixNano"].as_str(),
+            Some((BASE_NS + case.trace_start_off).to_string().as_str()),
+            "{ctx}: startTimeUnixNano is the EARLIEST span of the trace, not the root's start, \
+             body {json}"
+        );
+        assert_eq!(
+            trace["durationMs"].as_i64(),
+            Some(case.duration_ms),
+            "{ctx}: durationMs is max(span end) - min(span start) in MILLISECONDS, not the root \
+             span's width, body {json}"
+        );
+    }
 }

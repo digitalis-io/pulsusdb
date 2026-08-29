@@ -1,0 +1,6 @@
+{
+  "_comment": "Issue #464 wave 1. The exact `metrics` block GET /api/traces/v1/search and its /api/search alias emit, per completeness branch. Every key is a field of tempopb.SearchMetrics (pkg/tempopb/tempo.proto:164-172 @ grafana/tempo v3.0.2 / 0c4b926d09234186de39833e9c7ecb5b7614c8b9); a key outside that set makes Grafana's Tempo datasource reject the whole response (jsonpb.Unmarshal, unknown fields rejected, pkg/tempo/search.go:95 @ v13.1.5-11-g3c7375b). completedJobs is omitted when zero because protojson omits a default-valued scalar. Read from BOTH sides: crates/pulsus-server/tests/traces_search_live.rs asserts real wire bytes against these blocks, e2e/src/traces.rs feeds them to the validity gate that must classify them.",
+  "tempopb_search_metrics_fields": ["inspectedTraces","inspectedBytes","totalBlocks","completedJobs","totalJobs","totalBlockBytes","inspectedSpans"],
+  "complete": { "completedJobs": 1, "totalJobs": 1 },
+  "partial":  { "totalJobs": 1 }
+}
