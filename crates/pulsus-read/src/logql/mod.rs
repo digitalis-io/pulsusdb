@@ -157,11 +157,11 @@ pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETEC
 pub use detected_probe::{DetectedFieldsProbe, MAX_FEEDER_SCRATCH_BYTES};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
-    EngineConfig, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine, LogStats,
-    MatrixSeries, PatternSeries, QueryResult, STREAM_FEED_CHUNK_BYTES, StreamAccumulator,
+    EngineConfig, EntryCategories, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine,
+    LogStats, MatrixSeries, PatternSeries, QueryResult, STREAM_FEED_CHUNK_BYTES, StreamAccumulator,
     StreamResult, StreamsFastPathProbe, StreamsPagedProbe, TAIL_REGISTRATION_GRACE_NS, TailCursor,
     TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
-    final_series_gate_applies, read_query_settings, run_pipeline_rows,
+    WireArity, final_series_gate_applies, read_query_settings, run_pipeline_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 /// The structured-metadata context [`pipeline::CompiledPipeline::run_into_with_sm`]
@@ -187,12 +187,12 @@ pub use labels::{EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx};
 /// `nested-sort-order` ledger entry for what we deliberately do not.
 pub use order::sorted_order_reaches_the_wire;
 pub use params::{
-    DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec, TimeBounds,
-    ValidatedDuration, validate_duration_ns,
+    DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec,
+    ResponseOptions, TimeBounds, ValidatedDuration, validate_duration_ns,
 };
 pub use pipeline::{
-    CompiledPipeline, EntryOut, MAX_JSON_FLATTEN_KEY_BYTES, MetricRun, PipelineError,
-    RangeGrouping, RowBudget, RowBudgetExceeded, SAMPLE_EXTRACTION_ERROR,
+    CompiledPipeline, EntryOut, LabelCategory, MAX_JSON_FLATTEN_KEY_BYTES, MetricRun,
+    PipelineError, RangeGrouping, RowBudget, RowBudgetExceeded, SAMPLE_EXTRACTION_ERROR,
 };
 pub use walkbound::{
     MAX_LOGQL_WALK_TRANSIENT_BYTES, REFERENCE_MAX_QUERY_BYTES, admit_logql_walk,

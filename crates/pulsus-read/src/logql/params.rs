@@ -24,16 +24,37 @@ pub enum Direction {
 ///
 /// **`Range` = Loki sliding windows (issue #227).** A range metric query
 /// re-evaluates the `[range]` window `(t - range, t]` at every
-/// **start-anchored** grid point `t ∈ {start + k·step ≤ end}` (Loki's
-/// `batchRangeVectorIterator`), streamed off raw `log_samples` — NOT the
-/// former fixed, epoch-aligned, non-overlapping `intDiv(ts, step) * step`
-/// tumbling buckets, and NOT the 5s rollup (which cannot reproduce Loki's
-/// per-event boundary). So `rate({}[1m]) ≠ rate({}[10m])`: the window width
-/// AND the `rate`/`bytes_rate` divisor both track the `[range]`, never
-/// `step`. The scan is widened to `(start - range, end]` so the first grid
-/// point sees its full lookback. The `[range]` itself is carried on
+/// **start-anchored** grid point `t ∈ {start + k·step ≤ end}`, streamed
+/// off raw `log_samples` — NOT the former fixed, epoch-aligned,
+/// non-overlapping `intDiv(ts, step) * step` tumbling buckets, and NOT
+/// the 5s rollup (which cannot reproduce Loki's per-event boundary). So
+/// `rate({}[1m]) ≠ rate({}[10m])`: the window width AND the
+/// `rate`/`bytes_rate` divisor both track the `[range]`, never `step`.
+/// The scan is widened to `(start - range, end]` so the first grid point
+/// sees its full lookback. The `[range]` itself is carried on
 /// [`super::plan::MetricPlan::range_ns`], not this spec (no type-shape
-/// churn). See docs/features.md and docs/benchmarks/logs-differential-ledger.md.
+/// churn).
+///
+/// **This is an ENGINE-level agreement, and it is not a wire-level
+/// parity claim — the two layers were conflated here until issue #462.**
+/// Loki's engine is start-anchored the same way
+/// (`batchRangeVectorIterator`, `pkg/logql/`), which is the semantics
+/// #227 ported. But its HTTP boundary re-anchors the request *before*
+/// that engine sees it: `metricQuerySplitter.split` calls
+/// `alignStartEnd(step, start, end)`
+/// (`pkg/querier/queryrange/splitters.go:236 @ grafana/loki v3.7.4
+/// b318f282`, definition at `:308`), flooring `start` and ceiling `end`
+/// onto absolute multiples of `step`, unconditionally and even for a
+/// single split. So a stock reference SERVES `{floor(start, step) +
+/// k·step ≤ ceil(end, step)}` while we serve the grid above, and the
+/// only tenant limit that switches it off is
+/// `split_queries_by_interval: 0` — which is exactly why
+/// `deploy/e2e/loki.yaml` sets it, so the differential's oracle
+/// evaluates the range query it was asked. The divergence, its owner
+/// ruling and its close condition are
+/// `docs/benchmarks/logs-differential-ledger.md`'s
+/// `range-step-grid-start-anchored`; `frontend-step-alignment` records
+/// the same mechanism as an oracle-config note. See docs/features.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuerySpec {
     Instant {
@@ -247,4 +268,20 @@ mod tests {
             HUNDRED_YEARS_NS as i64
         );
     }
+}
+
+/// Response-shape options a request can ask for (issue #463).
+///
+/// Deliberately **not** on [`QueryParams`]: that type is `Copy` and built
+/// by struct literal at 136 sites, and none of them has an opinion about
+/// the wire shape. Threading an opaque options struct through the three
+/// engine entrypoints that can emit log lines keeps every one of those
+/// literals untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResponseOptions {
+    /// `X-Loki-Response-Encoding-Flags: categorize-labels` — the request
+    /// asked for the three-element `values` shape, so each entry's
+    /// structured-metadata and parsed labels are carried out of the
+    /// stream's label set and onto the entry.
+    pub categorize_labels: bool,
 }

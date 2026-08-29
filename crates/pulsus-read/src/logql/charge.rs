@@ -1272,6 +1272,38 @@ pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 /// One retained streams entry's fixed slot: `(timestamp_ns, line)`.
 pub(in crate::logql) const STREAM_ENTRY_SLOT: usize = size_of::<(i64, String)>();
 
+/// EVERYTHING one entry's [`super::exec::EntryCategories`] retains
+/// (issue #463): every key and every value through
+/// [`alloc_block_bytes`], both `Vec` spines through
+/// [`grown_alloc_bytes`], plus the struct's own inline size.
+///
+/// **Destructured, not field-accessed** — the [`ResultBudgets`] idiom: a
+/// new field on `EntryCategories` without a term here is a BUILD FAILURE,
+/// not a silent under-charge.
+pub(in crate::logql) fn entry_category_bytes(cats: &super::exec::EntryCategories) -> u64 {
+    let super::exec::EntryCategories {
+        structured_metadata,
+        parsed,
+    } = cats;
+    let pairs = |v: &Vec<(String, String)>| -> u64 {
+        let content: u64 = v
+            .iter()
+            .map(|(k, val)| {
+                alloc_block_bytes(k.len() as u64)
+                    .saturating_add(alloc_block_bytes(val.len() as u64))
+            })
+            .fold(0u64, u64::saturating_add);
+        // The spine: `v.len()` slots of `(String, String)`, grown
+        // geometrically like every other retained buffer here.
+        content.saturating_add(grown_alloc_bytes(
+            (v.len() * size_of::<(String, String)>()) as u64,
+        ))
+    };
+    pairs(structured_metadata)
+        .saturating_add(pairs(parsed))
+        .saturating_add(size_of::<super::exec::EntryCategories>() as u64)
+}
+
 /// The map-entry slot ONE output stream occupies. The transform path
 /// keys by fingerprint and the fan-out path by the rendered label set,
 /// so the LARGER of the two shapes is charged — the [`FOLD_GROUP_SLOT`]
@@ -1368,10 +1400,21 @@ impl StreamsResultBudget {
     }
 
     /// Charges ONE retained entry: `alloc_block_bytes(line_len) +
-    /// STREAM_ENTRY_SLOT`. Called BEFORE the `String` holding `line_len`
-    /// bytes is allocated or moved in.
-    pub fn charge_entry(&mut self, line_len: usize) -> Result<(), ReadError> {
-        let bytes = alloc_block_bytes(line_len as u64).saturating_add(STREAM_ENTRY_SLOT as u64);
+    /// STREAM_ENTRY_SLOT + category_bytes`. Called BEFORE the `String`
+    /// holding `line_len` bytes is allocated or moved in.
+    ///
+    /// `category_bytes` is [`entry_category_bytes`] of the entry's
+    /// [`super::exec::EntryCategories`] and is `0` on every
+    /// non-categorised entry (issue #463) — so the plain path's charge is
+    /// bit-identical to what it was before that issue. It is not
+    /// optional: the categorised wire shape retains two owned pair
+    /// vectors per entry, and a renderer that emits bytes the budget did
+    /// not charge is exactly how the 1 GiB retention cap stops bounding
+    /// the result.
+    pub fn charge_entry(&mut self, line_len: usize, category_bytes: u64) -> Result<(), ReadError> {
+        let bytes = alloc_block_bytes(line_len as u64)
+            .saturating_add(STREAM_ENTRY_SLOT as u64)
+            .saturating_add(category_bytes);
         self.admit(bytes, 0)
     }
 

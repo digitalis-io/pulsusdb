@@ -1120,6 +1120,70 @@ fn trim_start_unicode_space(s: &str) -> &str {
     s.trim_start_matches(|c: char| c.is_whitespace())
 }
 
+// ---------------------------------------------------------------------
+// `X-Loki-Response-Encoding-Flags` (issue #463)
+// ---------------------------------------------------------------------
+
+/// The one encoding flag this build understands.
+pub(crate) const CATEGORIZE_LABELS: &str = "categorize-labels";
+
+/// Parses `X-Loki-Response-Encoding-Flags` exactly as the reference's
+/// `httpreq.ParseEncodingFlags` does
+/// (`pkg/util/httpreq/encoding_flags.go:98-108 @ grafana/loki v3.7.4
+/// b318f282`), and every clause below is a measured wire behaviour, not a
+/// reading:
+///
+/// * **First header value only.** Sent twice — `foo` then
+///   `categorize-labels` — the reference echoes `["foo"]` and serves
+///   two-element values. `HeaderMap::get` matches that; `get_all` would
+///   not.
+/// * **An absent-or-empty field yields nothing at all.** The reference
+///   returns nil before it splits, so a present-but-empty header emits no
+///   `encodingFlags` key rather than an array holding one empty string.
+///   This is a different case from an empty TOKEN — see below.
+/// * **Split on `,` and do NOT trim.** `foo, categorize-labels` echoes
+///   `["foo"," categorize-labels"]` and serves **two**-element values,
+///   because `" categorize-labels"` is not the flag. Whitespace around a
+///   comma therefore changes the wire ARITY, not merely the echo.
+/// * **Exact, case-sensitive token match.** `CATEGORIZE-LABELS` echoes
+///   verbatim and serves two-element values.
+/// * **Empty tokens are kept.** `foo,,categorize-labels` echoes a
+///   THREE-element array containing the empty string — the reference's
+///   `EncodingFlags` is a map and the empty string is a legitimate key.
+/// * **Duplicates collapse, first occurrence wins the position.**
+///   `foo,categorize-labels,foo` echoes two tokens.
+///
+/// The echo ORDER is ours: the reference iterates a Go map built fresh per
+/// request, so its order is not stable (measured 183/17 over 200 requests
+/// on a two-token header). We emit first-occurrence request order — the
+/// same content, deterministically. Ledgered as `encoding-flags-echo-order`.
+pub(crate) fn encoding_flags(headers: &axum::http::HeaderMap) -> Vec<String> {
+    let Some(raw) = headers
+        .get("x-loki-response-encoding-flags")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for tok in raw.split(',') {
+        if !out.iter().any(|s| s == tok) {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// Whether the parsed flag list carries the exact `categorize-labels`
+/// token. Separate from [`encoding_flags`] because the ECHO and the
+/// DECISION are two outputs: an unknown flag is echoed verbatim while
+/// changing nothing about the wire shape.
+pub(crate) fn wants_categorize_labels(flags: &[String]) -> bool {
+    flags.iter().any(|f| f == CATEGORIZE_LABELS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
