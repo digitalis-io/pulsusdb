@@ -16,14 +16,14 @@ use futures::StreamExt;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use super::charge::{StreamsResultBudget, alloc_block_bytes};
-use super::exec::{StreamResult, TailCursor};
+use super::charge::{StreamsResultBudget, alloc_block_bytes, entry_category_bytes};
+use super::exec::{EntryCategories, StreamResult, TailCursor};
 use super::labels::{
     EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
     merge_labels_with_structured_metadata, parse_flat_labels, parse_flat_labels_into,
     render_labels_json_sorted,
 };
-use super::pipeline::JsonPaths;
+use super::pipeline::{JsonPaths, LabelCategory};
 
 /// One fan-out group's accumulator — deliberately WITHOUT `labels_json`:
 /// the map key is the single owned copy of the rendered label set, moved
@@ -35,6 +35,35 @@ pub(in crate::logql) struct FanOutGroup {
     pub(in crate::logql) fingerprint: u64,
     pub(in crate::logql) service: String,
     pub(in crate::logql) entries: Vec<(i64, String)>,
+    /// Parallel to [`Self::entries`] in categorised mode (issue #463),
+    /// empty otherwise — the same all-or-nothing invariant
+    /// [`super::exec::StreamResult::categories`] carries.
+    pub(in crate::logql) categories: Vec<EntryCategories>,
+}
+
+/// How a caller supplies [`push_fanout_entry`]'s group key.
+///
+/// Two shapes because two paths reach the same retention: the pipeline
+/// paths hold a sorted label scratch and must render it, while the issue
+/// #463 categorised fast path already holds the hydrated `labels_json`
+/// verbatim — its stream category is the stored label set unless a
+/// metadata value took over one of its slots — so re-rendering it per row
+/// would be pure waste.
+///
+/// One function, not two, because the RETAINING statements have to live
+/// in one place: `tests/logql_streams_retention_inventory.rs` pins the
+/// streams retention surface by `(file, function, site)`, and a second
+/// copy of `FanOutGroup { .. }` would be a second site to keep charged.
+pub(in crate::logql) enum GroupKey<'a> {
+    /// Render the key from this sorted label set, and take `service` from
+    /// its own `service_name` where it has one.
+    Sorted(&'a [(Cow<'a, str>, Cow<'a, str>)]),
+    /// Use this already-canonical key and fingerprint; `service` comes
+    /// from the caller's fallback.
+    Rendered {
+        labels_json: String,
+        fingerprint: u64,
+    },
 }
 
 /// Inserts one surviving fan-out entry (its `sorted_scratch` label set already
@@ -60,18 +89,15 @@ pub(in crate::logql) struct FanOutGroup {
 pub(in crate::logql) fn push_fanout_entry(
     label_groups: &mut HashMap<String, FanOutGroup>,
     budget: &mut StreamsResultBudget,
-    sorted_scratch: &[(Cow<'_, str>, Cow<'_, str>)],
+    key: GroupKey<'_>,
     timestamp_ns: i64,
     line: Cow<'_, str>,
     fallback_service: &str,
+    categories: Option<EntryCategories>,
 ) -> Result<(), ReadError> {
-    let labels_json = render_labels_json_sorted(sorted_scratch);
-    match label_groups.entry(labels_json) {
-        std::collections::hash_map::Entry::Occupied(e) => {
-            budget.charge_entry(line.len())?;
-            e.into_mut().entries.push((timestamp_ns, line.into_owned()));
-        }
-        std::collections::hash_map::Entry::Vacant(e) => {
+    let (labels_json, fingerprint, service) = match key {
+        GroupKey::Sorted(sorted_scratch) => {
+            let labels_json = render_labels_json_sorted(sorted_scratch);
             // Borrowed, not owned, so the group charge precedes the
             // `service` allocation it pays for.
             let service: &str = sorted_scratch
@@ -79,18 +105,84 @@ pub(in crate::logql) fn push_fanout_entry(
                 .find(|(k, _)| k == "service_name")
                 .map(|(_, v)| v.as_ref())
                 .unwrap_or(fallback_service);
+            let fingerprint = fnv1a64(labels_json.as_bytes());
+            (labels_json, fingerprint, service)
+        }
+        GroupKey::Rendered {
+            labels_json,
+            fingerprint,
+        } => (labels_json, fingerprint, fallback_service),
+    };
+    let cat_bytes = categories.as_ref().map_or(0, entry_category_bytes);
+    match label_groups.entry(labels_json) {
+        std::collections::hash_map::Entry::Occupied(e) => {
+            budget.charge_entry(line.len(), cat_bytes)?;
+            let g = e.into_mut();
+            g.entries.push((timestamp_ns, line.into_owned()));
+            if let Some(c) = categories {
+                g.categories.push(c);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
             budget.charge_group(e.key(), service)?;
-            budget.charge_entry(line.len())?;
-            let service = service.to_string();
-            let fingerprint = fnv1a64(e.key().as_bytes());
+            budget.charge_entry(line.len(), cat_bytes)?;
             e.insert(FanOutGroup {
                 fingerprint,
-                service,
+                service: service.to_string(),
                 entries: vec![(timestamp_ns, line.into_owned())],
+                categories: categories.into_iter().collect(),
             });
         }
     }
     Ok(())
+}
+
+/// Splits one row's final label vector into its stream half (left in
+/// `scratch`, in place) and its two non-stream halves (returned), using
+/// the per-label categories the pipeline reported (issue #463).
+///
+/// **`cats` is parallel to `scratch` in the pipeline's own order**, which
+/// is why this runs BEFORE the caller sorts: sorting first would
+/// desynchronise the two vectors. `retain` visits in order, so walking a
+/// cursor over `cats` alongside it is exact.
+///
+/// The returned vectors are then sorted by key, which is the order
+/// `pkg/util/marshal/query.go:404-470 @ grafana/loki v3.7.4 b318f282`
+/// renders them in (a Go `map[string]string` marshalled by
+/// `encoding/json`, which sorts its keys).
+///
+/// Allocates only for the labels that actually leave the stream category:
+/// an entry whose whole label set is stream-category returns two empty
+/// `Vec`s and copies nothing.
+pub(in crate::logql) fn split_categories(
+    scratch: &mut LabelScratch<'_>,
+    cats: &[LabelCategory],
+) -> EntryCategories {
+    let mut out = EntryCategories::default();
+    for (i, (k, v)) in scratch.iter().enumerate() {
+        match cats.get(i) {
+            Some(LabelCategory::StructuredMetadata) => {
+                out.structured_metadata.push((k.to_string(), v.to_string()))
+            }
+            Some(LabelCategory::Parsed) => out.parsed.push((k.to_string(), v.to_string())),
+            // A missing category cannot happen — `run_mode_into` fills one
+            // per label — and treating it as stream is the shape that
+            // downgrades rather than mis-files.
+            Some(LabelCategory::Stream) | None => {}
+        }
+    }
+    let mut i = 0usize;
+    scratch.retain(|_| {
+        let keep = !matches!(
+            cats.get(i),
+            Some(LabelCategory::StructuredMetadata) | Some(LabelCategory::Parsed)
+        );
+        i += 1;
+        keep
+    });
+    out.structured_metadata.sort_unstable();
+    out.parsed.sort_unstable();
+    out
 }
 
 /// A reusable label scratch whose `Cow` entries borrow from the row's merged
@@ -119,16 +211,40 @@ pub(in crate::logql) fn eval_structured_metadata_row<'a>(
     timestamp_ns: i64,
     service: &str,
     mut scratch: LabelScratch<'a>,
+    mut cat_scratch: Option<&mut Vec<LabelCategory>>,
 ) -> (bool, Result<LabelScratch<'a>, ReadError>) {
-    let survived = match compiled.run_into_with_sm(body, merged, timestamp_ns, sm, &mut scratch) {
+    let run = match cat_scratch.as_deref_mut() {
+        None => compiled.run_into_with_sm(body, merged, timestamp_ns, sm, &mut scratch),
+        Some(cats) => compiled.run_into_with_sm_categorized(
+            body,
+            merged,
+            timestamp_ns,
+            sm,
+            &mut scratch,
+            cats,
+        ),
+    };
+    let survived = match run {
         Ok(Some(line)) => {
+            // Issue #463: the split runs BEFORE the sort, because the
+            // pipeline's category vector is parallel to the label vector
+            // in the order the pipeline left it.
+            let categories = cat_scratch
+                .as_deref()
+                .map(|cats| split_categories(&mut scratch, cats));
             scratch.sort_unstable();
             // The result-budget breach (issue #312) is the same bounded
             // 422 class; clear the scratch first so the recycling
             // contract holds on the way out.
-            if let Err(e) =
-                push_fanout_entry(label_groups, budget, &scratch, timestamp_ns, line, service)
-            {
+            if let Err(e) = push_fanout_entry(
+                label_groups,
+                budget,
+                GroupKey::Sorted(&scratch),
+                timestamp_ns,
+                line,
+                service,
+                categories,
+            ) {
                 scratch.clear();
                 return (false, Err(e));
             }
@@ -967,10 +1083,11 @@ impl SmFanOutAccumulator {
         push_fanout_entry(
             &mut self.groups,
             budget,
-            &sorted,
+            GroupKey::Sorted(&sorted),
             row.timestamp_ns,
             Cow::Borrowed(row.body.as_str()),
             &m.service,
+            None,
         )
     }
 
@@ -982,9 +1099,62 @@ impl SmFanOutAccumulator {
                 service: g.service,
                 labels_json,
                 entries: g.entries,
+                categories: g.categories,
             })
             .collect()
     }
+}
+
+/// The issue #463 categorised split for a NO-PIPELINE structured-metadata
+/// row: the fast path runs no `CompiledPipeline`, so there is no
+/// `LabelCategory` vector to read and the three categories are derived
+/// from the merge itself.
+///
+/// - **stream** — the merged base's leading `stream_label_count` entries,
+///   MINUS any slot a metadata value took over
+///   ([`StructuredMetadataCtx::sm_over_stream`], the double collision);
+/// - **structured metadata** — everything past `stream_label_count`
+///   (the row's ordinary metadata, post-`_extracted` rename) plus those
+///   taken-over stream slots;
+/// - **parsed** — the visible reserved slots only. `__error__` /
+///   `__error_details__` arriving AS structured metadata are routed to
+///   the error slots by `LabelsBuilder.Add`
+///   (`pkg/logql/log/labels.go:399-408 @ grafana/loki v3.7.4 b318f282`)
+///   and then filed under `parsed` by `LabelsResult` (`:610-614`) — so on
+///   this path they belong in `parsed`, never in `structuredMetadata`.
+///
+/// `merge_buf` is left holding the STREAM half only, sorted, so the
+/// caller renders the `stream` object straight from it.
+pub(in crate::logql) fn split_merged_categories(
+    merge_buf: &mut Vec<(String, String)>,
+    sm_ctx: &StructuredMetadataCtx,
+) -> EntryCategories {
+    let base_len = sm_ctx.stream_label_count.unwrap_or(merge_buf.len());
+    // Stable in-place partition: stream entries to the front. The
+    // predicate reads index `r` before this iteration's swap writes it,
+    // and every earlier swap wrote only indices `< r`, so each pair is
+    // classified at its ORIGINAL position. `swap` (not `clone`) keeps the
+    // owned `String`s moving rather than copying.
+    let mut w = 0usize;
+    for r in 0..merge_buf.len() {
+        let is_stream = r < base_len && !sm_ctx.sm_over_stream.iter().any(|s| *s == merge_buf[r].0);
+        if is_stream {
+            merge_buf.swap(w, r);
+            w += 1;
+        }
+    }
+    let mut out = EntryCategories {
+        structured_metadata: merge_buf.split_off(w),
+        parsed: Vec::new(),
+    };
+    // The reserved slots, under the same visibility gate the pipeline's
+    // `ErrorSlots` applies at emit — but into `parsed`, not into the
+    // stream object.
+    sm_ctx.append_visible(&mut out.parsed);
+    out.structured_metadata.sort_unstable();
+    out.parsed.sort_unstable();
+    merge_buf.sort_unstable();
+    out
 }
 
 /// The pre-#312 page-at-a-time shape, reimplemented over

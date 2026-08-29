@@ -34,12 +34,13 @@ use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{RawQuery, State};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
 use pulsus_config::Config;
 use pulsus_logql::Expr;
 use pulsus_read::{
-    Direction, LogQlEngine, QueryParams, QuerySpec, ReadError, StreamResult,
+    Direction, LogQlEngine, QueryParams, QuerySpec, ReadError, ResponseOptions, StreamResult,
     TAIL_REGISTRATION_GRACE_NS, TailLower, TailPage, TailSetup,
 };
 use tokio::sync::{Notify, watch};
@@ -171,7 +172,12 @@ fn parse_tail_params(pairs: &[(String, String)], cfg: &Config) -> Result<TailPar
 
 /// The per-connection loop configuration, snapshotted from `Config` +
 /// request params at upgrade time.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Clone`, not `Copy`, since issue #463: the connection's response
+/// encoding flags are read ONCE at upgrade (a WebSocket has no per-frame
+/// request) and travel with the config to the writer that encodes each
+/// frame.
+#[derive(Debug, Clone)]
 struct TailLoopConfig {
     start_ns: i64,
     delay_ns: i64,
@@ -187,10 +193,15 @@ struct TailLoopConfig {
     /// (pinned by `narrow_grace_ns_defaults_to_the_production_constant`);
     /// only the hermetic producer tests inject a smaller value.
     narrow_grace_ns: i64,
+    /// `X-Loki-Response-Encoding-Flags` as received at upgrade (issue
+    /// #463), echoed and acted on by every frame this connection emits.
+    /// `Arc` so the per-frame clone the writer loop needs is a refcount
+    /// bump rather than a `Vec<String>` copy.
+    encoding_flags: Arc<[String]>,
 }
 
 impl TailLoopConfig {
-    fn new(cfg: &Config, p: &TailParams) -> Self {
+    fn new(cfg: &Config, p: &TailParams, encoding_flags: Arc<[String]>) -> Self {
         TailLoopConfig {
             start_ns: p.start_ns,
             delay_ns: p.delay_ns,
@@ -201,6 +212,7 @@ impl TailLoopConfig {
             send_timeout: cfg.reader.tail_send_timeout.0,
             dropped_sample_cap: cfg.reader.tail_max_entries_per_frame,
             narrow_grace_ns: TAIL_REGISTRATION_GRACE_NS,
+            encoding_flags,
         }
     }
 }
@@ -215,6 +227,7 @@ impl TailLoopConfig {
 /// `101` once the tail is actually going to run.
 pub(crate) async fn tail(
     State(state): State<AppState>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -238,7 +251,15 @@ pub(crate) async fn tail(
         limit: p.fetch_limit,
         direction: Direction::Forward,
     };
-    let setup = match engine.tail_setup(&p.expr, &qp) {
+    // Issue #463: read once, at upgrade. A WebSocket carries no
+    // per-frame request, so the connection's wire shape is fixed here and
+    // travels with the setup (the engine, which carries the categories)
+    // and the loop config (the encoder, which advertises them).
+    let encoding_flags: Arc<[String]> = params::encoding_flags(&headers).into();
+    let opts = ResponseOptions {
+        categorize_labels: params::wants_categorize_labels(&encoding_flags),
+    };
+    let setup = match engine.tail_setup_with(&p.expr, &qp, opts) {
         Ok(setup) => setup,
         Err(e) => return ApiError::Read(e).into_response(),
     };
@@ -250,7 +271,7 @@ pub(crate) async fn tail(
         Err(_) => return ApiError::TailBusy.into_response(),
     };
     let shutdown = state.tail.shutdown.clone();
-    let cfg = TailLoopConfig::new(&state.config, &p);
+    let cfg = TailLoopConfig::new(&state.config, &p, encoding_flags);
 
     ws.on_upgrade(move |socket| async move {
         use futures::StreamExt;
@@ -525,8 +546,13 @@ struct PoppedFrame {
 }
 
 impl PoppedFrame {
-    fn encode(self) -> String {
-        encode::tail_frame(self.streams, &self.dropped, self.dropped_total)
+    fn encode(self, encoding_flags: &[String]) -> String {
+        encode::tail_frame(
+            self.streams,
+            &self.dropped,
+            self.dropped_total,
+            encoding_flags,
+        )
     }
 }
 
@@ -776,7 +802,7 @@ async fn writer_loop<S: TailSender>(
         loop {
             let popped = shared.lock().pop_next();
             let Some(popped) = popped else { break };
-            let text = popped.encode();
+            let text = popped.encode(&cfg.encoding_flags);
             tokio::select! {
                 _ = cancelled(&mut shutdown, &mut cancel) => break 'conn,
                 sent = tokio::time::timeout(cfg.send_timeout, sender.send_text(text)) => {
@@ -836,7 +862,7 @@ async fn run_tail<F: TailFetcher, S: TailSender, R: TailReceiver>(
     let producer = tokio::spawn(producer_loop(
         fetcher,
         Arc::clone(&shared),
-        cfg,
+        cfg.clone(),
         shutdown.clone(),
         cancel_rx.clone(),
         Arc::clone(&cancel_tx),
@@ -870,6 +896,7 @@ mod tests {
                 .into_iter()
                 .map(|(ts, line)| (ts, line.to_string()))
                 .collect(),
+            categories: Vec::new(),
         }
     }
 
@@ -1019,6 +1046,7 @@ mod tests {
             // tests override this with an injected grace via the same
             // construction-site seam.
             narrow_grace_ns: TAIL_REGISTRATION_GRACE_NS,
+            encoding_flags: Vec::new().into(),
         }
     }
 
@@ -1306,7 +1334,7 @@ mod tests {
         for i in 1..=6i64 {
             buf.push_evicting(vec![stream(r#"{"app":"x"}"#, vec![(i, "line")])]);
         }
-        let first = parse(&buf.pop_next().expect("frame 5").encode());
+        let first = parse(&buf.pop_next().expect("frame 5").encode(&[]));
         assert_eq!(first["dropped_total"], 4, "exact cumulative count");
         let sample = first["dropped_entries"].as_array().expect("array");
         assert_eq!(sample.len(), 3, "sample bounded at the cap");
@@ -1320,7 +1348,7 @@ mod tests {
         // The surviving frame's own entry is intact.
         assert_eq!(first["streams"][0]["values"][0][0], "5");
 
-        let second = parse(&buf.pop_next().expect("frame 6").encode());
+        let second = parse(&buf.pop_next().expect("frame 6").encode(&[]));
         assert_eq!(second["dropped_total"], 0, "drained exactly once");
         assert_eq!(second["dropped_entries"], serde_json::json!([]));
         assert!(buf.pop_next().is_none());
@@ -1333,7 +1361,7 @@ mod tests {
         let mut buf = FrameBuf::new(2, 10);
         buf.dropped
             .absorb(&[stream(r#"{"app":"x"}"#, vec![(9, "line")])]);
-        let frame = parse(&buf.pop_next().expect("synthesized frame").encode());
+        let frame = parse(&buf.pop_next().expect("synthesized frame").encode(&[]));
         assert_eq!(frame["streams"], serde_json::json!([]));
         assert_eq!(frame["dropped_total"], 1);
         assert_eq!(frame["dropped_entries"][0]["timestamp"], "9");
@@ -1704,7 +1732,7 @@ mod tests {
             fetcher,
             sender,
             FakeReceiver(RecvMode::Silent),
-            cfg,
+            cfg.clone(),
             rx,
         ));
         // Wait until the backlog has been walked (≥ 10 polls).
@@ -2131,7 +2159,7 @@ mod tests {
     fn narrow_grace_ns_defaults_to_the_production_constant() {
         let pairs = params::parse_pairs("query=%7Ba%3D%22x%22%7D");
         let p = parse_tail_params(&pairs, &cfg_default()).expect("ok");
-        let cfg = TailLoopConfig::new(&cfg_default(), &p);
+        let cfg = TailLoopConfig::new(&cfg_default(), &p, Vec::new().into());
         assert_eq!(cfg.narrow_grace_ns, TAIL_REGISTRATION_GRACE_NS);
     }
 

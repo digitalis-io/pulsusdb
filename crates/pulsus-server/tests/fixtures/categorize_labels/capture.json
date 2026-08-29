@@ -1,0 +1,511 @@
+{
+  "image": "grafana/loki:3.7.4",
+  "config": "ci/logql/config-463.yaml",
+  "buildinfo": {
+    "branch": "release-3.7.x",
+    "buildDate": "2026-07-22T03:46:58Z",
+    "buildUser": "root@buildkitsandbox",
+    "goVersion": "",
+    "revision": "b318f282",
+    "version": "3.7.4"
+  },
+  "captured_at_unix": 1788011764,
+  "nonce": "1788011580a",
+  "probes": [
+    {
+      "id": "A",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": null,
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "B",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "C",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"} | json",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{\"parsed\":{\"__error__\":\"JSONParserErr\",\"__error_details__\":\"Value looks like object, but can't find closing '}' symbol\"}}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"},\"parsed\":{\"__error__\":\"JSONParserErr\",\"__error_details__\":\"Value looks like object, but can't find closing '}' symbol\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"},\"parsed\":{\"__error__\":\"JSONParserErr\",\"__error_details__\":\"Value looks like object, but can't find closing '}' symbol\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{\"parsed\":{\"app_extracted\":\"json-app\",\"lvl\":\"warn\",\"msg\":\"hi\"}}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"},\"parsed\":{\"lvl\":\"error\",\"trace_id_extracted\":\"json-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"},\"parsed\":{\"__error__\":\"JSONParserErr\",\"__error_details__\":\"Value looks like object, but can't find closing '}' symbol\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"},\"parsed\":{\"__error__\":\"JSONParserErr\",\"__error_details__\":\"Value looks like object, but can't find closing '}' symbol\"}}]]}]}"
+    },
+    {
+      "id": "D",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"} | label_format app=\"rewritten\"",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{\"parsed\":{\"app\":\"rewritten\"}}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"},\"parsed\":{\"app\":\"rewritten\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"},\"parsed\":{\"app\":\"rewritten\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{\"parsed\":{\"app\":\"rewritten\"}}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"},\"parsed\":{\"app\":\"rewritten\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"},\"parsed\":{\"app\":\"rewritten\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"},\"parsed\":{\"app\":\"rewritten\"}}]]}]}"
+    },
+    {
+      "id": "E",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"} | drop env",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "I",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"} | label_format app=\"x\", env=\"y\", service_name=\"z\"",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{},\"values\":[[\"1\",\"plain no metadata\",{\"parsed\":{\"app\":\"x\",\"env\":\"y\",\"service_name\":\"z\"}}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"},\"parsed\":{\"app\":\"x\",\"env\":\"y\",\"service_name\":\"z\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"},\"parsed\":{\"app\":\"x\",\"env\":\"y\",\"service_name\":\"z\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{\"parsed\":{\"app\":\"x\",\"env\":\"y\",\"service_name\":\"z\"}}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"},\"parsed\":{\"app\":\"x\",\"env\":\"y\",\"service_name\":\"z\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"},\"parsed\":{\"app\":\"x\",\"env\":\"y\",\"service_name\":\"z\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"},\"parsed\":{\"app\":\"x\",\"env\":\"y\",\"service_name\":\"z\"}}]]}]}"
+    },
+    {
+      "id": "K",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"} | drop trace_id",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "L",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"} | keep app",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{}],[\"3\",\"metadata collides\",{}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{}],[\"6\",\"not json at all\",{}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{}]]}]}"
+    },
+    {
+      "id": "O",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"} | label_format trace_id=\"forced\"",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{\"parsed\":{\"trace_id\":\"forced\"}}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\"},\"parsed\":{\"trace_id\":\"forced\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"},\"parsed\":{\"trace_id\":\"forced\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{\"parsed\":{\"trace_id\":\"forced\"}}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"parsed\":{\"trace_id\":\"forced\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"},\"parsed\":{\"trace_id\":\"forced\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"},\"parsed\":{\"trace_id\":\"forced\"}}]]}]}"
+    },
+    {
+      "id": "P",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"} | line_format `L={{.app}}`",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"L=coNONCE\",{}],[\"2\",\"L=coNONCE\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"L=coNONCE\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"L=coNONCE\",{}],[\"5\",\"L=coNONCE\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"L=coNONCE\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"L=coNONCE\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "R",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"dbl{N}\"}",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"dblNONCE\",\"service_name\":\"dblNONCE\",\"zz\":\"1\"},\"values\":[[\"8\",\"double collision\",{\"structuredMetadata\":{\"app_extracted\":\"sm-side\"}}]]}]}"
+    },
+    {
+      "id": "R0",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"dbl{N}\"}",
+      "header": null,
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"result\":[{\"stream\":{\"app\":\"dblNONCE\",\"app_extracted\":\"sm-side\",\"service_name\":\"dblNONCE\",\"zz\":\"1\"},\"values\":[[\"8\",\"double collision\"]]}]}"
+    },
+    {
+      "id": "LF",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"pzlf{N}\"} | logfmt",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"pzlfNONCE\",\"env\":\"prod\",\"service_name\":\"pzlfNONCE\"},\"values\":[[\"9\",\"app=logfmt-app trace_id=logfmt-trace msg=hi\",{\"structuredMetadata\":{\"trace_id\":\"sm-lf\"},\"parsed\":{\"app_extracted\":\"logfmt-app\",\"msg\":\"hi\",\"trace_id_extracted\":\"logfmt-trace\"}}]]}]}"
+    },
+    {
+      "id": "RE",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"pzre{N}\"} | regexp `^RE (?P<app>\\S+) (?P<trace_id>\\S+)$`",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"pzreNONCE\",\"env\":\"prod\",\"service_name\":\"pzreNONCE\"},\"values\":[[\"10\",\"RE regexp-app regexp-trace\",{\"structuredMetadata\":{\"trace_id\":\"sm-re\"},\"parsed\":{\"app_extracted\":\"regexp-app\",\"trace_id_extracted\":\"regexp-trace\"}}]]}]}"
+    },
+    {
+      "id": "PT",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"pzpt{N}\"} | pattern `PT <app> <trace_id> end`",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"pzptNONCE\",\"env\":\"prod\",\"service_name\":\"pzptNONCE\"},\"values\":[[\"11\",\"PT pattern-app pattern-trace end\",{\"structuredMetadata\":{\"trace_id\":\"sm-pt\"},\"parsed\":{\"app_extracted\":\"pattern-app\",\"trace_id_extracted\":\"pattern-trace\"}}]]}]}"
+    },
+    {
+      "id": "UP",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"pzup{N}\"} | unpack",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"pzupNONCE\",\"env\":\"prod\",\"service_name\":\"pzupNONCE\"},\"values\":[[\"12\",\"inner line\",{\"structuredMetadata\":{\"trace_id\":\"sm-up\"},\"parsed\":{\"app_extracted\":\"unpack-app\",\"trace_id_extracted\":\"unpack-trace\"}}]]}]}"
+    },
+    {
+      "id": "JX",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"pzjx{N}\"} | json app=\"lvl\", trace_id=\"tid\"",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"pzjxNONCE\",\"env\":\"prod\",\"service_name\":\"pzjxNONCE\"},\"values\":[[\"13\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"tid\\\":\\\"jx-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-jx\"},\"parsed\":{\"app_extracted\":\"warn\",\"trace_id_extracted\":\"jx-trace\"}}]]}]}"
+    },
+    {
+      "id": "LX",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"pzlx{N}\"} | logfmt app=\"lvl\", trace_id=\"tid\"",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"pzlxNONCE\",\"env\":\"prod\",\"service_name\":\"pzlxNONCE\"},\"values\":[[\"14\",\"lvl=warn tid=lx-trace\",{\"structuredMetadata\":{\"trace_id\":\"sm-lx\"},\"parsed\":{\"app_extracted\":\"warn\",\"trace_id_extracted\":\"lx-trace\"}}]]}]}"
+    },
+    {
+      "id": "M",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}]]}]}"
+    },
+    {
+      "id": "H",
+      "class": "Q-nonempty",
+      "side": "both",
+      "query": "sum(count_over_time({app=\"co{N}\"}[1s]))",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"matrix\"}"
+    },
+    {
+      "id": "G",
+      "class": "Q-empty",
+      "side": "both",
+      "query": "{app=\"nosuch{N}\"}",
+      "header": "categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[]}"
+    },
+    {
+      "id": "H1",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "foo",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "H2",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "categorize-labels,foo",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\",\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "H3",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "  categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "H4",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "H5",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "foo\u0001categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "H6",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "CATEGORIZE-LABELS",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"CATEGORIZE-LABELS\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "H7",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "foo, categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\" categorize-labels\",\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "H8",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "categorize-labels, foo",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\" foo\",\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "H9",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "categorize-labels ,foo",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels \",\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "H10",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "foo,\tcategorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"\\tcategorize-labels\",\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "H11",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "foo,foo",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"app_extracted\":\"from-metadata\",\"env\":\"prod\",\"scope_name\":\"gen\",\"service_name\":\"coNONCE\"},\"values\":[[\"3\",\"metadata collides\"]]},{\"stream\":{\"app\":\"coNONCE\",\"detected_level\":\"info\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"abc123\"},\"values\":[[\"2\",\"with metadata\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"k_dot\":\"v1\",\"service_name\":\"coNONCE\"},\"values\":[[\"7\",\"unicode ünïcødé and sep a-b_c.d\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"trace_id\":\"sm-trace\"},\"values\":[[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\",\"user_id\":\"42\"},\"values\":[[\"6\",\"not json at all\"]]},{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\"],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\"]]}]}"
+    },
+    {
+      "id": "H12",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "categorize-labels,categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "H13",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "foo,categorize-labels,foo",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"categorize-labels\",\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "H14",
+      "class": "Q-header",
+      "side": "both",
+      "query": "{app=\"co{N}\"}",
+      "header": "foo,,categorize-labels",
+      "status": 200,
+      "projection": "{\"resultType\":\"streams\",\"encodingFlags\":[\"\",\"categorize-labels\",\"foo\"],\"result\":[{\"stream\":{\"app\":\"coNONCE\",\"env\":\"prod\",\"service_name\":\"coNONCE\"},\"values\":[[\"1\",\"plain no metadata\",{}],[\"2\",\"with metadata\",{\"structuredMetadata\":{\"detected_level\":\"info\",\"trace_id\":\"abc123\"}}],[\"3\",\"metadata collides\",{\"structuredMetadata\":{\"app_extracted\":\"from-metadata\",\"scope_name\":\"gen\"}}],[\"4\",\"{\\\"lvl\\\":\\\"warn\\\",\\\"app\\\":\\\"json-app\\\",\\\"msg\\\":\\\"hi\\\"}\",{}],[\"5\",\"{\\\"lvl\\\":\\\"error\\\",\\\"trace_id\\\":\\\"json-trace\\\"}\",{\"structuredMetadata\":{\"trace_id\":\"sm-trace\"}}],[\"6\",\"not json at all\",{\"structuredMetadata\":{\"user_id\":\"42\"}}],[\"7\",\"unicode ünïcødé and sep a-b_c.d\",{\"structuredMetadata\":{\"k_dot\":\"v1\"}}]]}]}"
+    },
+    {
+      "id": "F2-ref",
+      "class": "Failure",
+      "side": "reference-only",
+      "query": "{app=\"co{N}\"}",
+      "header": "categorize-labels",
+      "status": 400,
+      "projection": "400 log queries are not supported as an instant query type, please change your query to a range query type"
+    },
+    {
+      "id": "F1",
+      "class": "Failure",
+      "side": "both",
+      "query": "{app=}",
+      "header": "categorize-labels",
+      "status": 400,
+      "projection": "400 parse error at line 1, col 6: syntax error: unexpected }, expecting STRING"
+    },
+    {
+      "id": "T1",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t1\"}",
+      "header": null,
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt1\",\"service_name\":\"tNONCEt1\"},\"values\":[[\"0\",\"tail plain\"]]},{\"stream\":{\"app\":\"tNONCEt1\",\"app_extracted\":\"collide\",\"service_name\":\"tNONCEt1\",\"trace_id\":\"t1\"},\"values\":[[\"1\",\"tail with sm\"]]}]}"
+    },
+    {
+      "id": "T2",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t2\"}",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt2\",\"service_name\":\"tNONCEt2\"},\"values\":[[\"0\",\"tail plain\",{}]]},{\"stream\":{\"app\":\"tNONCEt2\",\"service_name\":\"tNONCEt2\"},\"values\":[[\"1\",\"tail with sm\",{\"structuredMetadata\":{\"app_extracted\":\"collide\",\"trace_id\":\"t1\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T3",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t3\"}",
+      "header": null,
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt3\",\"service_name\":\"tNONCEt3\"},\"values\":[[\"0\",\"tail plain\"]]},{\"stream\":{\"app\":\"tNONCEt3\",\"service_name\":\"tNONCEt3\"},\"values\":[[\"1\",\"tail with sm\"]]}]}"
+    },
+    {
+      "id": "T4",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t4\"}",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt4\",\"service_name\":\"tNONCEt4\"},\"values\":[[\"0\",\"tail plain\",{}]]},{\"stream\":{\"service_name\":\"tNONCEt4\"},\"values\":[[\"1\",\"tail with sm\",{\"structuredMetadata\":{\"app\":\"collide\",\"trace_id\":\"t1\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T5",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t5\"} |= `tail`",
+      "header": null,
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt5\",\"service_name\":\"tNONCEt5\"},\"values\":[[\"0\",\"tail plain\"]]},{\"stream\":{\"app\":\"tNONCEt5\",\"app_extracted\":\"collide\",\"service_name\":\"tNONCEt5\",\"trace_id\":\"t1\"},\"values\":[[\"1\",\"tail with sm\"]]}]}"
+    },
+    {
+      "id": "T6",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t6\"} |= `tail`",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt6\",\"service_name\":\"tNONCEt6\"},\"values\":[[\"0\",\"tail plain\",{}]]},{\"stream\":{\"app\":\"tNONCEt6\",\"service_name\":\"tNONCEt6\"},\"values\":[[\"1\",\"tail with sm\",{\"structuredMetadata\":{\"app_extracted\":\"collide\",\"trace_id\":\"t1\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T7",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t7\"} |= `tail`",
+      "header": null,
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt7\",\"service_name\":\"tNONCEt7\"},\"values\":[[\"0\",\"tail plain\"]]},{\"stream\":{\"app\":\"tNONCEt7\",\"app_extracted\":\"collide\",\"service_name\":\"tNONCEt7\",\"trace_id\":\"t1\"},\"values\":[[\"1\",\"tail with sm\"]]}]}"
+    },
+    {
+      "id": "T8",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t8\"} |= `tail`",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt8\",\"service_name\":\"tNONCEt8\"},\"values\":[[\"0\",\"tail plain\",{}]]},{\"stream\":{\"app\":\"tNONCEt8\",\"service_name\":\"tNONCEt8\"},\"values\":[[\"1\",\"tail with sm\",{\"structuredMetadata\":{\"app_extracted\":\"collide\",\"trace_id\":\"t1\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T9",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t9\"} | logfmt",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt9\",\"env\":\"prod\",\"service_name\":\"tNONCEt9\"},\"values\":[[\"0\",\"app=logfmt-app trace_id=logfmt-trace msg=hi\",{\"structuredMetadata\":{\"trace_id\":\"sm-lf\"},\"parsed\":{\"app_extracted\":\"logfmt-app\",\"msg\":\"hi\",\"trace_id_extracted\":\"logfmt-trace\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T10",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t10\"} | logfmt",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt10\",\"env\":\"prod\",\"service_name\":\"tNONCEt10\"},\"values\":[[\"0\",\"app=logfmt-app trace_id=logfmt-trace msg=hi\",{\"structuredMetadata\":{\"trace_id\":\"sm-lf\"},\"parsed\":{\"app_extracted\":\"logfmt-app\",\"msg\":\"hi\",\"trace_id_extracted\":\"logfmt-trace\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T11",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t11\"} | logfmt",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt11\",\"env\":\"prod\",\"service_name\":\"tNONCEt11\"},\"values\":[[\"0\",\"app=logfmt-app trace_id=logfmt-trace msg=hi\",{\"structuredMetadata\":{\"trace_id\":\"sm-lf\"},\"parsed\":{\"app_extracted\":\"logfmt-app\",\"msg\":\"hi\",\"trace_id_extracted\":\"logfmt-trace\"}}]]},{\"stream\":{\"app\":\"tNONCEt11\",\"env\":\"prod\",\"service_name\":\"tNONCEt11\"},\"values\":[[\"1\",\"app=second-app trace_id=second-trace msg=bye\",{\"structuredMetadata\":{\"trace_id\":\"sm-2nd\",\"user_id\":\"42\"},\"parsed\":{\"app_extracted\":\"second-app\",\"msg\":\"bye\",\"trace_id_extracted\":\"second-trace\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T12",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t12\"} | logfmt",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt12\",\"env\":\"prod\",\"service_name\":\"tNONCEt12\"},\"values\":[[\"0\",\"app=logfmt-app trace_id=logfmt-trace msg=hi\",{\"structuredMetadata\":{\"trace_id\":\"sm-lf\"},\"parsed\":{\"app_extracted\":\"logfmt-app\",\"msg\":\"hi\",\"trace_id_extracted\":\"logfmt-trace\"}}]]},{\"stream\":{\"app\":\"tNONCEt12\",\"env\":\"prod\",\"service_name\":\"tNONCEt12\"},\"values\":[[\"1\",\"app=second-app trace_id=second-trace msg=bye\",{\"structuredMetadata\":{\"trace_id\":\"sm-2nd\",\"user_id\":\"42\"},\"parsed\":{\"app_extracted\":\"second-app\",\"msg\":\"bye\",\"trace_id_extracted\":\"second-trace\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T13",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t13\"} | logfmt",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt13\",\"env\":\"prod\",\"service_name\":\"tNONCEt13\"},\"values\":[[\"0\",\"k=same\",{\"structuredMetadata\":{\"trace_id\":\"sm-x\"},\"parsed\":{\"k\":\"same\"}}]]},{\"stream\":{\"app\":\"tNONCEt13\",\"env\":\"prod\",\"service_name\":\"tNONCEt13\"},\"values\":[[\"1\",\"k=same\",{\"structuredMetadata\":{\"trace_id\":\"sm-x\"},\"parsed\":{\"k\":\"same\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T14",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t14\"} | logfmt",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt14\",\"env\":\"prod\",\"service_name\":\"tNONCEt14\"},\"values\":[[\"0\",\"k=same\",{\"structuredMetadata\":{\"trace_id\":\"sm-x\"},\"parsed\":{\"k\":\"same\"}}]]},{\"stream\":{\"app\":\"tNONCEt14\",\"env\":\"prod\",\"service_name\":\"tNONCEt14\"},\"values\":[[\"1\",\"k=same\",{\"structuredMetadata\":{\"trace_id\":\"sm-x\"},\"parsed\":{\"k\":\"same\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T15",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t15\"} | logfmt",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt15\",\"env\":\"prod\",\"service_name\":\"tNONCEt15\"},\"values\":[[\"0\",\"k=A1\",{\"parsed\":{\"k\":\"A1\"}}]]},{\"stream\":{\"app\":\"tNONCEt15\",\"env\":\"staging\",\"service_name\":\"tNONCEt15\"},\"values\":[[\"1\",\"k=B2\",{\"parsed\":{\"k\":\"B2\"}}]]},{\"stream\":{\"app\":\"tNONCEt15\",\"env\":\"prod\",\"service_name\":\"tNONCEt15\"},\"values\":[[\"2\",\"k=A3\",{\"parsed\":{\"k\":\"A3\"}}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    },
+    {
+      "id": "T16",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t16\"} | logfmt",
+      "header": null,
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt16\",\"env\":\"prod\",\"k\":\"A1\",\"service_name\":\"tNONCEt16\"},\"values\":[[\"0\",\"k=A1\"]]},{\"stream\":{\"app\":\"tNONCEt16\",\"env\":\"staging\",\"k\":\"B2\",\"service_name\":\"tNONCEt16\"},\"values\":[[\"1\",\"k=B2\"]]},{\"stream\":{\"app\":\"tNONCEt16\",\"env\":\"prod\",\"k\":\"A3\",\"service_name\":\"tNONCEt16\"},\"values\":[[\"2\",\"k=A3\"]]}]}"
+    },
+    {
+      "id": "T17",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t17\"}",
+      "header": null,
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt17\",\"env\":\"prod\",\"service_name\":\"tNONCEt17\"},\"values\":[[\"0\",\"k=A1\"]]},{\"stream\":{\"app\":\"tNONCEt17\",\"env\":\"staging\",\"service_name\":\"tNONCEt17\"},\"values\":[[\"1\",\"k=B2\"]]},{\"stream\":{\"app\":\"tNONCEt17\",\"env\":\"prod\",\"service_name\":\"tNONCEt17\"},\"values\":[[\"2\",\"k=A3\"]]}]}"
+    },
+    {
+      "id": "T18",
+      "class": "Tail",
+      "side": "both",
+      "query": "{app=\"t{N}t18\"}",
+      "header": "categorize-labels",
+      "status": 101,
+      "projection": "{\"streams\":[{\"stream\":{\"app\":\"tNONCEt18\",\"env\":\"prod\",\"service_name\":\"tNONCEt18\"},\"values\":[[\"0\",\"k=A1\",{}]]},{\"stream\":{\"app\":\"tNONCEt18\",\"env\":\"staging\",\"service_name\":\"tNONCEt18\"},\"values\":[[\"1\",\"k=B2\",{}]]},{\"stream\":{\"app\":\"tNONCEt18\",\"env\":\"prod\",\"service_name\":\"tNONCEt18\"},\"values\":[[\"2\",\"k=A3\",{}]]}],\"encodingFlags\":[\"categorize-labels\"]}"
+    }
+  ]
+}

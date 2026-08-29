@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 
 use pulsus_logql::{Expr, LogExpr};
-use pulsus_read::{LogQlEngine, QueryParams, QuerySpec, TimeBounds};
+use pulsus_read::{LogQlEngine, QueryParams, QuerySpec, ResponseOptions, TimeBounds};
 
 use crate::app::AppState;
 use crate::chconfig;
@@ -387,6 +387,7 @@ async fn query_range_impl(
         &query_params,
         wants_explain(headers),
         end_ns,
+        &params::encoding_flags(headers),
     )
     .await
 }
@@ -444,7 +445,15 @@ async fn query_impl(
     };
 
     let engine = engine_for(&state).await?;
-    run_query(&engine, &expr, &query_params, wants_explain(headers), at_ns).await
+    run_query(
+        &engine,
+        &expr,
+        &query_params,
+        wants_explain(headers),
+        at_ns,
+        &params::encoding_flags(headers),
+    )
+    .await
 }
 
 /// Shared success path for `query`/`query_range`: run with or without the
@@ -456,29 +465,40 @@ async fn run_query(
     query_params: &QueryParams,
     explain: bool,
     at_ns: i64,
+    encoding_flags: &[String],
 ) -> Result<Response, ApiError> {
     let preserve_vector_order = preserve_vector_order(&query_params.spec, expr);
+    // Issue #463: the header decides the response SHAPE, so it has to
+    // reach the engine (which carries the categories onto each entry) and
+    // the encoder (which advertises and renders them) from one read.
+    let opts = ResponseOptions {
+        categorize_labels: params::wants_categorize_labels(encoding_flags),
+    };
     if explain {
         // Issue #277: `explain` lives INSIDE `data`, `warnings` outside
         // it — the two are not siblings, so both must be threaded
         // through and the encoder places each on its own side of
         // `data`'s closing brace.
-        let (result, warnings, plan_explain) = engine.query_explained(expr, query_params).await?;
+        let (result, warnings, plan_explain) = engine
+            .query_explained_with(expr, query_params, opts)
+            .await?;
         Ok(encode::query_response_warned(
             result,
             Some(plan_explain),
             at_ns,
             preserve_vector_order,
             &warnings,
+            encoding_flags,
         ))
     } else {
-        let (result, warnings) = engine.query(expr, query_params).await?;
+        let (result, warnings) = engine.query_with(expr, query_params, opts).await?;
         Ok(encode::query_response_warned(
             result,
             None,
             at_ns,
             preserve_vector_order,
             &warnings,
+            encoding_flags,
         ))
     }
 }

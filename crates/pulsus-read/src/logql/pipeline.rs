@@ -1477,7 +1477,46 @@ impl CompiledPipeline {
         sm: &'a StructuredMetadataCtx,
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Result<Option<Cow<'a, str>>, RowBudgetExceeded> {
-        match self.run_mode_into(body, base, ts_ns, sm, None, labels, false, None)? {
+        match self.run_mode_into(body, base, ts_ns, sm, None, labels, false, None, None)? {
+            (MetricRun::Dropped, _) => Ok(None),
+            (MetricRun::Kept { line, .. }, _) => Ok(Some(line)),
+        }
+    }
+
+    /// As [`CompiledPipeline::run_into_with_sm`], additionally reporting
+    /// each output label's category (issue #463) — the reference's
+    /// `LabelsBuilder.LabelsResult` split
+    /// (`pkg/logql/log/labels.go:606-626 @ grafana/loki v3.7.4
+    /// b318f282`), which `pkg/iter/categorized_labels_iterator.go:37-55`
+    /// applies to move the non-stream categories onto the entry.
+    ///
+    /// On `Some`, `categories` is exactly parallel to `labels`. On
+    /// `None` (the line was dropped) `categories` is left untouched and
+    /// must not be read — there is no label set to categorise.
+    ///
+    /// The plain [`CompiledPipeline::run_into_with_sm`] passes `None` for
+    /// the same out-parameter, so the non-categorised path executes no
+    /// extra instruction and allocates nothing new.
+    pub fn run_into_with_sm_categorized<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        ts_ns: i64,
+        sm: &'a StructuredMetadataCtx,
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        categories: &mut Vec<LabelCategory>,
+    ) -> Result<Option<Cow<'a, str>>, RowBudgetExceeded> {
+        match self.run_mode_into(
+            body,
+            base,
+            ts_ns,
+            sm,
+            None,
+            labels,
+            false,
+            None,
+            Some(categories),
+        )? {
             (MetricRun::Dropped, _) => Ok(None),
             (MetricRun::Kept { line, .. }, _) => Ok(Some(line)),
         }
@@ -1535,6 +1574,7 @@ impl CompiledPipeline {
             labels,
             false,
             json_paths,
+            None,
         )? {
             (MetricRun::Dropped, has_err) => Ok((None, has_err)),
             (MetricRun::Kept { line, .. }, has_err) => Ok((Some(line), has_err)),
@@ -1606,7 +1646,7 @@ impl CompiledPipeline {
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Result<MetricRun<'a>, RowBudgetExceeded> {
         Ok(self
-            .run_mode_into(body, base, ts_ns, sm, grouping, labels, true, None)?
+            .run_mode_into(body, base, ts_ns, sm, grouping, labels, true, None, None)?
             .0)
     }
 
@@ -1624,6 +1664,7 @@ impl CompiledPipeline {
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
         metric: bool,
         mut json_paths: Option<&mut JsonPaths>,
+        categories: Option<&mut Vec<LabelCategory>>,
     ) -> Result<(MetricRun<'a>, bool), RowBudgetExceeded> {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
         let mut value: Option<f64> = None;
@@ -1676,6 +1717,8 @@ impl CompiledPipeline {
             sm: sm_base,
             parsed_over_sm: Vec::new(),
             removed_parsed: Vec::new(),
+            parsed_over_stream: Vec::new(),
+            sm_over_stream: &sm.sm_over_stream,
         };
 
         for stage in &self.stages {
@@ -2407,6 +2450,15 @@ impl CompiledPipeline {
             }
         }
         errs.merge_into(labels);
+        // Issue #463: the categorisation walk runs LAST, over the final
+        // vector and after the error slots have merged, because
+        // `LabelsResult` is what the reference asks at exactly this
+        // point. `None` — every non-categorised caller — allocates
+        // nothing and executes nothing.
+        if let Some(out) = categories {
+            out.clear();
+            out.extend(labels.iter().map(|(k, _)| st.category_of(k)));
+        }
         Ok((MetricRun::Kept { line, value }, has_err))
     }
 }
@@ -3608,6 +3660,44 @@ struct ExtractionState<'a, 'r> {
     /// still extracted for the rest of the line, though no longer in the
     /// vector (`Del` does not touch `ParserHint.extracted`).
     removed_parsed: Vec<Cow<'a, str>>,
+    /// Names in [`Self::stream`] that a parsed `Set` has taken over
+    /// (issue #463). The reference's `Set(ParsedLabel, n, …)` calls
+    /// `deleteWithCategory` for BOTH other categories
+    /// (`pkg/logql/log/labels.go:344-352 @ grafana/loki v3.7.4
+    /// b318f282`), so a `| label_format app="x"` over a stream label
+    /// `app` leaves `app` in `add[ParsedLabel]` and NOT in `b.base`'s
+    /// contribution to `LabelsResult` — reference-captured: the `stream`
+    /// object loses `app` entirely and `parsed` carries it.
+    ///
+    /// Empty for every parser, because
+    /// [`add_extracted`] renames before it writes, so a parsed `Set`
+    /// never lands on a stream name. It fills for `| label_format` and
+    /// for any future writer that bypasses the rename.
+    ///
+    /// **Read only by [`ExtractionState::category_of`].** The rename
+    /// predicates are deliberately unchanged: `parsed_over_stream ⊆
+    /// stream names`, so `stream_has` still answers `BaseHas` exactly as
+    /// issue #334 pinned it.
+    parsed_over_stream: Vec<Cow<'a, str>>,
+    /// The names [`super::labels::StructuredMetadataCtx::sm_over_stream`]
+    /// recorded for this row — a metadata value that won a slot inside
+    /// the stream region. Borrowed from the row's context, so this costs
+    /// nothing on an ordinary row.
+    sm_over_stream: &'r [String],
+}
+
+/// Which of the reference's three label categories one output label
+/// belongs to (issue #463), as
+/// `LabelsBuilder.LabelsResult` splits them
+/// (`pkg/logql/log/labels.go:606-626 @ grafana/loki v3.7.4 b318f282`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelCategory {
+    /// Stays inside the response's `stream` object.
+    Stream,
+    /// Rendered under the entry's `structuredMetadata` key.
+    StructuredMetadata,
+    /// Rendered under the entry's `parsed` key.
+    Parsed,
 }
 
 /// What a parser does when its resolved key is already extracted.
@@ -3698,7 +3788,51 @@ impl<'a> ExtractionState<'a, '_> {
         if self.sm_has(&key) && !self.parsed_over_sm.contains(&key) {
             self.parsed_over_sm.push(key.clone());
         }
+        // Issue #463: the same `Set` also removes the name from the
+        // STREAM category (`labels.go:344-352`'s second
+        // `deleteWithCategory`), which only the categorisation walk
+        // reads. Both lists stay empty unless a stage overwrites
+        // something, so an ordinary pipeline allocates nothing here.
+        if self.stream_has(&key) && !self.parsed_over_stream.contains(&key) {
+            self.parsed_over_stream.push(key.clone());
+        }
         key
+    }
+
+    /// `LabelsBuilder.LabelsResult`'s split, in its order
+    /// (`pkg/logql/log/labels.go:606-626 @ grafana/loki v3.7.4
+    /// b318f282`). Asked once per output label, after the stage loop and
+    /// after the error slots have merged.
+    ///
+    /// The order is the reference's and is load-bearing at every step:
+    /// `__error__`/`__error_details__` are filed under `parsed`
+    /// unconditionally (`:610-614`, the `if b.err != ""` block writes
+    /// into the parsed slice regardless of where the value came from —
+    /// captured: an `__error__` arriving as STRUCTURED METADATA still
+    /// renders under `parsed`); then the parsed category, then structured
+    /// metadata, then the stream base.
+    fn category_of(&self, name: &str) -> LabelCategory {
+        if name == ERROR_LABEL || name == ERROR_DETAILS_LABEL {
+            // `labels.go:610-614`
+            return LabelCategory::Parsed;
+        }
+        if self.parsed_over_stream.iter().any(|k| k == name)
+            || self.parsed_over_sm.iter().any(|k| k == name)
+        {
+            // `labels.go:617-618` — a parsed `Set` took the name over.
+            return LabelCategory::Parsed;
+        }
+        if self.sm_over_stream.iter().any(|k| k == name) || self.sm_has(name) {
+            // `labels.go:619-620`
+            return LabelCategory::StructuredMetadata;
+        }
+        if self.stream_has(name) {
+            // `labels.go:621-623`
+            return LabelCategory::Stream;
+        }
+        // Nothing else writes into the vector: a parsed `Set` is the only
+        // remaining source, so a name the base never carried is parsed.
+        LabelCategory::Parsed
     }
 
     /// Book-keeping for one `Del(name)`: a name that WAS extracted stays
@@ -8160,6 +8294,7 @@ mod tests {
             details: details.to_string(),
             has_ordinary,
             stream_label_count: None,
+            sm_over_stream: Vec::new(),
         }
     }
 
@@ -9271,6 +9406,7 @@ mod tests {
             details: String::new(),
             has_ordinary: !sm.is_empty(),
             stream_label_count: Some(stream.len()),
+            sm_over_stream: Vec::new(),
         };
         let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
         let mut labels = Vec::new();

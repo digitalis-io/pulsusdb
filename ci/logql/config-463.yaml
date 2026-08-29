@@ -1,0 +1,115 @@
+# Issue #463: `ci/logql/config.yaml` with ONE line added,
+# `limits_config.discover_log_levels: false`.
+#
+# **Why a second file rather than the shared one.** With level discovery
+# at its shipped default the container appends a `detected_level`
+# structured-metadata pair to every entry, and on the UNFLAGGED read path
+# structured metadata merges into the stream label set — so that pair
+# takes part in the grouping. Two entries whose only difference is the
+# discovered level come back as two stream objects there. PulsusDB adds
+# no such pair, so eliding the NAME from both sides after the fact leaves
+# the reference's split behind and manufactures a difference the elision
+# itself created. Turning discovery off removes the pair before it can
+# group anything, which is the state the #463 capture was taken in.
+#
+# The shared file is deliberately NOT changed: two committed captures
+# assert `detected_level` is PRESENT in every entry they hold
+# (`logql_json_key_sanitization`, `structured_metadata_collisions`), and
+# their legs run on the same container.
+#
+# Minimal single-binary LogQL reference-implementation config used ONLY as a
+# black-box LogQL syntax oracle for the env-gated differential leg
+# (crates/pulsus-logql/tests/logql_differential.rs, issue #191).
+#
+# It stores nothing meaningful and serves no production role: the leg sends
+# LogQL query strings to /loki/api/v1/query_range and observes only the HTTP
+# status (2xx accept vs 400 reject). No upstream source is copied — this is
+# pure runtime use of the unmodified, digest-pinned reference image. This
+# file is deployment config authored from the reference container's documented
+# (non-copyleft) config schema, not lifted source.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  # `info`, not `warn`, and NOT a stylistic choice — do not tidy it back.
+  #
+  # At `warn` this container says nothing about the queries it serves. At
+  # `info` it emits its own per-query accounting,
+  # `caller=metrics.go:457 ... duration=...`, which is the one measurement
+  # issue #291 spent four rounds without: a query that took 31.45 s at the
+  # wire left NO entry in this log at `warn`, so nobody could say whether
+  # the reference thought it was slow, or even saw it.
+  #
+  # Verbosity only. No limit, timeout or code path moves with it, and
+  # nothing consumes this container's log — the two `docker logs` calls in
+  # `.github/workflows/ci.yml` dump it for a human on failure and parse
+  # nothing. Checked before changing: no test reads this file's contents
+  # (only its mount path is named), no capture fixture records
+  # `log_level`, and the capture-drift legs
+  # (`logql_json_key_sanitization`, `structured_metadata_collisions`) plus
+  # `logql_regex_accept_matrix` and `logql_differential` all pass
+  # unchanged against a container running at `info`.
+  log_level: info
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /tmp/loki
+  storage:
+    filesystem:
+      chunks_directory: /tmp/loki/chunks
+      rules_directory: /tmp/loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# The query length/range limits are left at their SHIPPED DEFAULTS, and
+# this block raises none of them: `/config` on the running container
+# reports `max_query_length: 30d1h`, `max_query_range: 0s`,
+# `max_query_lookback: 0s`, `query_ingesters_within: 3h` (issue #248 —
+# this comment used to describe the limits as "generous", which read as
+# if they had been raised here). The legs stay well inside them (the
+# differential leg queries a 1h window), so a syntactically valid query
+# answers 2xx-empty rather than tripping a length cap, and the leg can
+# read a 400 as a syntax rejection. What the block DOES do is enable
+# features the legs would otherwise be unable to probe:
+# `shard_aggregations` (issue #221): without it EVERY approx_topk query is a
+# 500 `approx_topk is not enabled` — inconclusive for the leg, never a
+# syntax verdict.
+limits_config:
+  # Issue #463 — see this file's header.
+  discover_log_levels: false
+  metric_aggregation_enabled: true
+  shard_aggregations:
+    - approx_topk
+  # `enable_multi_variant_queries` (issue #221): without it EVERY
+  # `variants(...) of (...)` query is a 400 `multi variant queries are
+  # disabled for this instance` — a FALSE syntax REJECT that would red the
+  # differential leg against the `func.variants` supported/accept
+  # disposition.
+  enable_multi_variant_queries: true
+
+# Issue #221: with shard_aggregations set, the frontend must ship the
+# serialized query PLAN downstream (the approx_topk rewrite produces an
+# internal `__count_min_sketch__` subquery that is not user-parseable; under
+# the default JSON encoding the querier re-parses the string and 400s with
+# `syntax error: unexpected IDENTIFIER` — a FALSE syntax verdict). The
+# reference's own config validation couples the two settings.
+frontend:
+  encoding: protobuf
+
+query_range:
+  cache_results: false
+
+analytics:
+  reporting_enabled: false

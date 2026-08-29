@@ -1439,8 +1439,13 @@ const EXPECTED_CENSUS: [(FrameKey, &str); 15] = [
      ".anyx1 .as_refx4 .as_strx1 .clearx3 .intox1 .iterx3 .observe_pairx2 .run_into_with_smx1 Errx1 Okx1 auto_parse_observex1 parse_flat_labels_intox1 recycle_label_scratchx2"),
     (("detected_probe.rs", None, "auto_parse_observe"),
      ".as_refx2 .clearx1 .enumeratex1 .getx1 .intox1 .iterx1 .observe_pairx1 Errx1 Okx1 auto_parse_intox1 defaultx1 recycle_label_scratchx1"),
+    // Issue #463 moved the upsert from `.find` to `.position`: the INDEX
+    // is what says whether a metadata value won a slot inside the stream
+    // region, which is the double-collision case the categorised `stream`
+    // object has to drop. Same single scan, one more `.clear` (the new
+    // `sm_over_stream` list) and one more `.push`.
     (("labels.rs", None, "merge_labels_with_structured_metadata"),
-     ".anyx1 .clearx4 .clonedx1 .drainx1 .extendx1 .findx1 .is_emptyx1 .iterx2 .iter_mutx1 .lenx1 .pushx1 .push_strx1 Somex1 parse_flat_labels_intox1"),
+     ".anyx1 .clearx5 .clonedx1 .drainx1 .extendx1 .is_emptyx1 .iterx3 .lenx1 .positionx1 .pushx2 .push_strx1 Somex1 parse_flat_labels_intox1"),
     (("labels.rs", None, "parse_flat_labels_into"),
      ".charsx1 .nextx3 .peekx3 .peekablex1 .pushx1 Somex1 parse_json_stringx2 skip_wsx3"),
     (("detected_probe.rs", None, "recycle_label_scratch"),

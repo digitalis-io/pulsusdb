@@ -497,6 +497,7 @@ fn emitted(p: &SourceProbe) -> Vec<(String, String)> {
         details: String::new(),
         has_ordinary: !p.sm.is_empty(),
         stream_label_count: Some(p.base.len()),
+        sm_over_stream: Vec::new(),
     };
     let query = format!(r#"{{app="a"}} {}"#, p.pipeline);
     let compiled = compiled(&query);

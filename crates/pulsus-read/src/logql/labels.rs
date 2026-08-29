@@ -252,6 +252,28 @@ pub struct StructuredMetadataCtx {
     /// on the stream side, which is where the reference's `BaseHas` finds it
     /// too.
     pub stream_label_count: Option<usize>,
+    /// The names whose value in the merged base came from the row's
+    /// STRUCTURED METADATA while the slot they won sits inside the stream
+    /// region (issue #463). Empty on every ordinary row.
+    ///
+    /// This is the double-collision case: base carries both `k` and
+    /// `k_extracted`, the row's metadata supplies `k`, so the rename
+    /// resolves to `k_extracted` and the upsert OVERWRITES the existing
+    /// stream-region slot. The vector entry under that name is then the
+    /// metadata's value, not the stream's — which is exactly what
+    /// `LabelsBuilder.LabelsResult` files under
+    /// `StructuredMetadataLabel` (`pkg/logql/log/labels.go:606-626 @
+    /// grafana/loki v3.7.4 b318f282`), while
+    /// [`Self::stream_label_count`] alone would still call it a stream
+    /// label. Reference-captured: a stream `{app, app_extracted, zz}`
+    /// with metadata `{app: …}` renders `app_extracted` inside
+    /// `structuredMetadata` and drops it from the `stream` object.
+    ///
+    /// **Read only by the categorisation walk.** `ExtractionState`'s
+    /// rename predicate deliberately does NOT consult it —
+    /// `sm_over_stream ⊆ stream names`, so `stream_has` already covers
+    /// the rename question and issue #334's semantics stay bit-identical.
+    pub sm_over_stream: Vec<String>,
 }
 
 /// The shared no-structured-metadata context. NOT a `const`: `String` has a
@@ -262,6 +284,9 @@ pub static EMPTY_STRUCTURED_METADATA: StructuredMetadataCtx = StructuredMetadata
     details: String::new(),
     has_ordinary: false,
     stream_label_count: None,
+    // `Vec::new` is `const`, so the shared empty context stays a `static`
+    // with no initializer cost.
+    sm_over_stream: Vec::new(),
 };
 
 impl StructuredMetadataCtx {
@@ -339,6 +364,7 @@ pub(in crate::logql) fn merge_labels_with_structured_metadata(
     sm_ctx.err.clear();
     sm_ctx.details.clear();
     sm_ctx.has_ordinary = false;
+    sm_ctx.sm_over_stream.clear();
     merge_buf.clear();
     merge_buf.extend(base.iter().cloned());
     let base_len = merge_buf.len();
@@ -365,8 +391,17 @@ pub(in crate::logql) fn merge_labels_with_structured_metadata(
             continue;
         }
         sm_ctx.has_ordinary |= !value.is_empty();
-        match merge_buf.iter_mut().find(|(k, _)| *k == key) {
-            Some(slot) => slot.1 = value,
+        // `position`, not `find`: the INDEX is what says whether the slot
+        // this metadata value just won sits in the stream region (issue
+        // #463 — see `StructuredMetadataCtx::sm_over_stream`). The scan
+        // itself is the one the `find` already did.
+        match merge_buf.iter().position(|(k, _)| *k == key) {
+            Some(at) => {
+                if at < base_len {
+                    sm_ctx.sm_over_stream.push(key);
+                }
+                merge_buf[at].1 = value;
+            }
             None => merge_buf.push((key, value)),
         }
     }

@@ -42,7 +42,26 @@ const MIN_ALLOC_BYTES: u64 = 32;
 /// `size_of::<(i64, String)>()`.
 const STREAM_ENTRY_SLOT: u64 = 32;
 /// `max(size_of::<(u64, StreamResult)>(), size_of::<(String, FanOutGroup)>())`.
-const STREAM_GROUP_SLOT: u64 = 88;
+///
+/// 88 -> 112 with issue #463: `StreamResult` gained a `categories`
+/// `Vec` (24 B) and `FanOutGroup` gained the same, so both shapes grew
+/// by one `Vec` and the production constant — a `size_of` — moved with
+/// them. This is a per-STREAM widening, not per-entry.
+///
+/// **What makes the new figures trustworthy is not that they were
+/// recomputed, it is that the same recomputation reproduces the OLD
+/// ones.** [`the_doc_table_arithmetic_reproduces_the_pre_463_figures`]
+/// runs the formula below at the pre-#463 slot width and asserts it
+/// returns the four totals that were committed then, byte for byte.
+/// That tests the MODEL rather than the new number: a recomputation
+/// that quietly changed a term would produce four plausible new totals
+/// and no signal at all, and this is what says the term list did not
+/// move — only its one input did.
+const STREAM_GROUP_SLOT: u64 = 112;
+
+/// The pre-#463 slot width, kept solely so the check above has an input
+/// whose ANSWER is already on the record.
+const STREAM_GROUP_SLOT_PRE_463: u64 = 88;
 /// `size_of::<SampleRow>()`.
 const STAGED_ROW_SLOT: u64 = 64;
 
@@ -63,9 +82,14 @@ fn entry_bytes(line_len: u64) -> u64 {
 }
 
 fn group_bytes(labels_json_len: u64, service_len: u64) -> u64 {
-    map_entry_bytes(STREAM_GROUP_SLOT)
-        + grown_alloc_bytes(labels_json_len)
-        + alloc_block_bytes(service_len)
+    group_bytes_at(STREAM_GROUP_SLOT, labels_json_len, service_len)
+}
+
+/// [`group_bytes`] at a stated slot width — ONE formula, so running it at
+/// the pre-#463 width exercises the shipped terms rather than a copy of
+/// them.
+fn group_bytes_at(slot: u64, labels_json_len: u64, service_len: u64) -> u64 {
+    map_entry_bytes(slot) + grown_alloc_bytes(labels_json_len) + alloc_block_bytes(service_len)
 }
 
 /// EVERYTHING one staged `SampleRow` retains — body AND structured
@@ -572,10 +596,10 @@ fn the_derivation_rows_are_admitted_and_row_d_is_refused() {
 
     // The exact figures the doc table publishes, so a slot width moving
     // reddens here as well as the admit/refuse verdict.
-    assert_eq!(rows[0].1, 699_119_776);
-    assert_eq!(rows[1].1, 1_032_754_760);
-    assert_eq!(rows[2].1, 268_436_840);
-    assert_eq!(rows[3].1, 1_098_553_504);
+    assert_eq!(rows[0].1, 700_079_776);
+    assert_eq!(rows[1].1, 1_032_754_952);
+    assert_eq!(rows[2].1, 268_437_032);
+    assert_eq!(rows[3].1, 1_099_513_504);
 
     for (name, total, admitted) in rows {
         assert_eq!(
@@ -672,6 +696,177 @@ fn the_ledger_records_the_measured_reference_behaviour() {
         assert!(
             entry.contains(token),
             "the streams-result-budget entry no longer records {token}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #463 — the CATEGORISED shape's bytes are charged
+// ---------------------------------------------------------------------
+
+/// The same rows, categorised and not, through the SAME shipped
+/// accumulator: the categorised ledger must exceed the plain one by at
+/// least the metadata bytes the third element retains.
+///
+/// "At least the metadata bytes" is the floor the plan states and it is
+/// the load-bearing half — a renderer that emits a third element the
+/// budget did not price is exactly how the 1 GiB retention cap stops
+/// bounding the result. The actual excess is larger, because each entry
+/// also retains two `Vec` spines and the `EntryCategories` struct itself.
+#[test]
+fn the_categorised_shape_charges_its_third_element() {
+    let meta = meta_one();
+    // 200 rows, each carrying one 64-byte ordinary metadata pair. The
+    // pair's key and value are what the third element retains.
+    let value: String = "v".repeat(64);
+    let sm = format!(r#"{{"trace_id":"{value}"}}"#);
+
+    let mut plain = StreamsFastPathProbe::with_cap(MAX_STREAMS_RESULT_BYTES);
+    let mut categorised = StreamsFastPathProbe::with_cap_categorized(MAX_STREAMS_RESULT_BYTES);
+    for i in 0..200 {
+        let r = |body_len: usize| SampleRow {
+            fingerprint: 1,
+            timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
+            body: "b".repeat(body_len),
+            structured_metadata: sm.clone(),
+        };
+        plain.push_row(r(40), &meta).expect("admitted");
+        categorised.push_row(r(40), &meta).expect("admitted");
+    }
+
+    let metadata_bytes =
+        200 * (alloc_block_bytes(b"trace_id".len() as u64) + alloc_block_bytes(value.len() as u64));
+    // Saturating: when the charge stops counting the third element the
+    // categorised ledger can fall BELOW the plain one, and an overflow
+    // panic reports the arithmetic rather than the property.
+    let excess = categorised.charged().saturating_sub(plain.charged());
+    assert!(
+        excess >= metadata_bytes,
+        "the categorised ledger exceeds the plain one by {excess} B, which is less than the \
+         {metadata_bytes} B of metadata the third element retains"
+    );
+
+    // And the two shapes really are the same rows: one categorised
+    // stream against 200 plain ones, because the categorised path groups
+    // by the STREAM-category subset while the plain path fans a
+    // metadata-bearing row into its own merged label set.
+    assert_eq!(categorised.into_streams().len(), 1);
+    assert_eq!(plain.into_streams().len(), 1);
+}
+
+/// A categorised query whose METADATA alone exceeds the cap is refused
+/// with the named `422`, never truncated — the same complete-or-error
+/// class every other retention breach takes.
+///
+/// The discriminator is that the same rows WITHOUT the header are
+/// admitted under the same cap: what refuses this query is the third
+/// element's bytes and nothing else.
+#[test]
+fn a_categorised_query_whose_metadata_alone_exceeds_the_cap_is_refused() {
+    let meta = meta_one();
+    let value: String = "v".repeat(4_096);
+    let sm = format!(r#"{{"trace_id":"{value}"}}"#);
+    let row = |i: usize| SampleRow {
+        fingerprint: 1,
+        timestamp_ns: 1_700_000_000_000_000_000i64 + i as i64,
+        body: "b".repeat(8),
+        structured_metadata: sm.clone(),
+    };
+
+    // A cap that admits the plain shape's whole retention and nothing
+    // more: measured from the plain probe itself, so the number is not
+    // hand-derived.
+    let mut sizing = StreamsFastPathProbe::with_cap(MAX_STREAMS_RESULT_BYTES);
+    for i in 0..50 {
+        sizing.push_row(row(i), &meta).expect("admitted");
+    }
+    let cap = sizing.charged();
+
+    let mut plain = StreamsFastPathProbe::with_cap(cap);
+    for i in 0..50 {
+        plain
+            .push_row(row(i), &meta)
+            .expect("the plain shape fits its own footprint exactly");
+    }
+
+    let mut categorised = StreamsFastPathProbe::with_cap_categorized(cap);
+    let mut refusal = None;
+    for i in 0..50 {
+        if let Err(e) = categorised.push_row(row(i), &meta) {
+            refusal = Some(e);
+            break;
+        }
+    }
+    let err = refusal.expect("the categorised shape must not fit the plain shape's cap");
+    assert!(
+        matches!(
+            err,
+            ReadError::QueryTooBroad(TooBroadReason::StreamsResultBytes { .. })
+        ),
+        "expected the named streams-result refusal, got {err:?}"
+    );
+}
+
+/// **The doc table's arithmetic reproduces the PRE-#463 figures at the
+/// pre-#463 slot width.**
+///
+/// `STREAM_GROUP_SLOT` moved 88 -> 112 because `StreamResult` and
+/// `FanOutGroup` each gained one `Vec`, and the four totals in
+/// `MAX_STREAMS_RESULT_BYTES`' doc table moved with it. Recomputing them
+/// proves nothing on its own: a recomputation that dropped or added a
+/// term would produce four plausible new totals and no signal at all.
+///
+/// So the same formula is run at the OLD width and compared against the
+/// totals that were committed before this issue — figures nobody in this
+/// change chose. They reproduce exactly, which is what says the term
+/// list did not move and only its one input did.
+#[test]
+fn the_doc_table_arithmetic_reproduces_the_pre_463_figures() {
+    let total = |entries: u64, line: u64, groups: u64, labels: u64, staged_line: u64, slot: u64| {
+        entries * entry_bytes(line)
+            + groups * group_bytes_at(slot, labels, SVC.len() as u64)
+            + STREAM_FEED_CHUNK_BYTES
+            + staged_row_bytes(staged_line, 0)
+    };
+    let one_max_line = 64 * 1024 * 1024u64;
+    let rows = |slot: u64| -> [u64; 4] {
+        [
+            total(5_000, 65_536, 5_000, 1_024, 65_536, slot),
+            total(5_000, 102_400, 1, 64, 102_400, slot),
+            entry_bytes(one_max_line)
+                + group_bytes_at(slot, 64, SVC.len() as u64)
+                + staged_row_bytes(one_max_line, 0),
+            total(5_000, 102_400, 5_000, 2_048, 102_400, slot),
+        ]
+    };
+
+    // Committed at `bf3a8f6`, the commit before issue #463 — read out of
+    // that revision's copy of the doc table, not recomputed here.
+    assert_eq!(
+        rows(STREAM_GROUP_SLOT_PRE_463),
+        [699_119_776, 1_032_754_760, 268_436_840, 1_098_553_504],
+        "the charge model no longer reproduces the pre-#463 doc table at the pre-#463 slot \
+         width — a TERM moved, not just the slot, and the new figures cannot be trusted"
+    );
+
+    // And the shipped width gives the figures the doc table now carries,
+    // which `the_streams_result_budget_doc_table_is_reproducible` also
+    // asserts against the same constants.
+    assert_eq!(
+        rows(STREAM_GROUP_SLOT),
+        [700_079_776, 1_032_754_952, 268_437_032, 1_099_513_504],
+        "the shipped slot width no longer produces the committed doc table"
+    );
+
+    // The whole delta is the slot, and it is the same per group either
+    // way: `map_entry_bytes(112) - map_entry_bytes(88)`.
+    let per_group = map_entry_bytes(STREAM_GROUP_SLOT) - map_entry_bytes(STREAM_GROUP_SLOT_PRE_463);
+    assert_eq!(per_group, 192);
+    for (groups, i) in [(5_000u64, 0usize), (1, 1), (1, 2), (5_000, 3)] {
+        assert_eq!(
+            rows(STREAM_GROUP_SLOT)[i] - rows(STREAM_GROUP_SLOT_PRE_463)[i],
+            groups * per_group,
+            "row {i}'s movement is not exactly its group count times the slot delta"
         );
     }
 }

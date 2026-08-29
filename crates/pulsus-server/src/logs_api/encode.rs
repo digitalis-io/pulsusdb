@@ -39,9 +39,9 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use pulsus_read::{
-    DetectedFieldOut, DetectedFields, DetectedLabelOut, ExplainStage, LogStats, MatrixSeries,
-    PatternSeries, PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample, VolumeEntry,
-    Warnings,
+    DetectedFieldOut, DetectedFields, DetectedLabelOut, EntryCategories, ExplainStage, LogStats,
+    MatrixSeries, PatternSeries, PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample,
+    VolumeEntry, Warnings, WireArity,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -329,6 +329,73 @@ fn space_for_replacement_chars(labels_json: &str) -> Cow<'_, str> {
     }
 }
 
+/// The bytes one entry's third element renders as when both category
+/// objects are empty — the reference emits `{}` rather than omitting the
+/// element (`pkg/util/marshal/query.go:404-470 @ grafana/loki v3.7.4
+/// b318f282`).
+const THIRD_ELEMENT_EMPTY: &str = ",{}";
+
+/// The UNESCAPED rendered size of one entry's third element (issue #463),
+/// computed in `O(pairs)` with no per-byte work — the
+/// [`stream_item_estimate`] discipline.
+fn third_element_estimate(cats: &EntryCategories) -> usize {
+    let pairs = |v: &[(String, String)]| -> usize {
+        // `"k":"v",` per pair, plus the object's own braces.
+        v.iter()
+            .map(|(k, val)| k.len() + val.len() + 6)
+            .sum::<usize>()
+            + 2
+    };
+    // `,{` + `}` plus, per present category, its key and object.
+    let mut n = 3;
+    if !cats.structured_metadata.is_empty() {
+        n += 22 + pairs(&cats.structured_metadata);
+    }
+    if !cats.parsed.is_empty() {
+        n += 10 + pairs(&cats.parsed);
+    }
+    n
+}
+
+/// Writes one entry's third element (issue #463): `structuredMetadata`
+/// before `parsed`, each omitted when empty, `{}` when both are —
+/// `pkg/util/marshal/query.go:404-470 @ grafana/loki v3.7.4 b318f282`,
+/// where the two maps are Go `map[string]string`s marshalled by
+/// `encoding/json`, which sorts its keys. Ours arrive sorted from the
+/// engine.
+fn write_third_element(out: &mut Vec<u8>, cats: &EntryCategories) {
+    fn object(out: &mut Vec<u8>, key: &str, pairs: &[(String, String)]) {
+        out.extend_from_slice(key.as_bytes());
+        out.push(b'{');
+        for (i, (k, v)) in pairs.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            if serde_json::to_writer(&mut *out, k).is_err() {
+                out.extend_from_slice(b"\"\"");
+            }
+            out.push(b':');
+            if serde_json::to_writer(&mut *out, v).is_err() {
+                out.extend_from_slice(b"\"\"");
+            }
+        }
+        out.push(b'}');
+    }
+    out.extend_from_slice(b",{");
+    let mut wrote = false;
+    if !cats.structured_metadata.is_empty() {
+        object(out, "\"structuredMetadata\":", &cats.structured_metadata);
+        wrote = true;
+    }
+    if !cats.parsed.is_empty() {
+        if wrote {
+            out.push(b',');
+        }
+        object(out, "\"parsed\":", &cats.parsed);
+    }
+    out.push(b'}');
+}
+
 /// Which rule a caller of [`render_stream_item_into`] wants applied to the
 /// stream's label JSON.
 ///
@@ -355,7 +422,12 @@ enum LabelBytes {
 /// Two production callers, and they ask for different label bytes —
 /// [`render_stream_item`] (the query response) and [`tail_frame`] (the
 /// WebSocket frame). See [`LabelBytes`].
-fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult, labels: LabelBytes) {
+fn render_stream_item_into(
+    out: &mut Vec<u8>,
+    s: &StreamResult,
+    labels: LabelBytes,
+    categorize: categorize::Categorize,
+) {
     use std::io::Write;
     out.extend_from_slice(b"{\"stream\":");
     match labels {
@@ -375,17 +447,296 @@ fn render_stream_item_into(out: &mut Vec<u8>, s: &StreamResult, labels: LabelByt
         if serde_json::to_writer(&mut *out, line).is_err() {
             out.extend_from_slice(b"\"\"");
         }
+        if categorize.is_on() {
+            // `decide` only returns `on` when EVERY stream reports
+            // `WireArity::Three`, so the index is in range — but a
+            // missing element would still render `,{}` rather than a
+            // two-element entry inside a body that advertised three.
+            match s.categories.get(i) {
+                Some(cats) => write_third_element(out, cats),
+                None => out.extend_from_slice(THIRD_ELEMENT_EMPTY.as_bytes()),
+            }
+        }
         out.push(b']');
     }
     out.extend_from_slice(b"]}");
 }
 
-/// The QUERY response's stream item — the surface issue #455 measured, so
-/// the one that substitutes.
-fn render_stream_item(s: &StreamResult) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(stream_item_estimate(s));
-    render_stream_item_into(&mut out, s, LabelBytes::SpaceForReplacementChars);
-    out
+/// The chunk one stream contributes to a streamed body — the ONE place
+/// the QUERY path allocates a per-item buffer, and byte- and
+/// allocation-identical to the pre-#463 `render_stream_item`.
+///
+/// The `Streams` arm's `stream_array` closure is exactly this call and so
+/// is `ac19_render_path_peak_and_allocation_profile`, so the gate drives
+/// the shipped body rather than a transcription of it (the
+/// `StreamsFastPathProbe` pattern). Exactly two call sites, asserted by
+/// the source-scan gate.
+fn item_chunk(w: categorize::ItemWriter, s: &StreamResult) -> Vec<u8> {
+    let mut chunk: Vec<u8> = Vec::with_capacity(w.estimate(s));
+    w.write(&mut chunk, s);
+    chunk
+}
+
+/// The issue #463 wire-shape decision, and the only way to obtain one.
+///
+/// The categorised `values` shape is all-or-nothing: a three-element
+/// entry in a body that does not advertise `categorize-labels`
+/// desynchronises the datasource's streaming decoder, and so does a
+/// two-element entry in one that does. So the decision is taken **once,
+/// from the data**, and both the advertisement and the per-item renderer
+/// are derived from that one value.
+mod categorize {
+    use super::{
+        EntryCategories, LabelBytes, StreamResult, WireArity, render_stream_item_into,
+        stream_item_estimate, third_element_estimate,
+    };
+
+    /// The token the reference switches on
+    /// (`pkg/util/httpreq/encoding_flags.go @ grafana/loki v3.7.4
+    /// b318f282`).
+    pub(super) const CATEGORIZE_LABELS: &str = "categorize-labels";
+
+    /// Opaque outside this module: the field is private, so no other code
+    /// in `encode.rs` can mint one. A renderer that emits a third element
+    /// must be HANDED a `Categorize`, and [`decide`] is its only source —
+    /// so the predicate has exactly one implementation by construction
+    /// rather than by convention.
+    ///
+    /// **What that proves, and what it does not.** It proves every
+    /// `Categorize` value was built by `decide`. It does NOT prove the
+    /// effective decision is unique: a caller could compute its own
+    /// predicate and use it to doctor `flags` or the stream slice on the
+    /// way in. The resulting body is still self-consistent — it
+    /// advertises iff it renders three elements — so that residual can
+    /// produce a wrongly-flagged body, never one a client cannot parse.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Categorize(bool);
+
+    impl Categorize {
+        pub(super) fn is_on(self) -> bool {
+            self.0
+        }
+    }
+
+    /// `on` iff the request asked for `categorize-labels` **and** every
+    /// stream can serve a third element — so an assembly bug downgrades
+    /// the whole body to the two-element shape and never desynchronises a
+    /// parser.
+    ///
+    /// `all()` over an empty slice is `true`, so an empty `result` with
+    /// the flag advertises it and renders no entries — which is what the
+    /// reference does.
+    pub(super) fn decide(flags: &[String], streams: &[StreamResult]) -> Categorize {
+        Categorize(
+            flags.iter().any(|f| f == CATEGORIZE_LABELS)
+                && streams.iter().all(|s| s.wire_arity() == WireArity::Three),
+        )
+    }
+
+    /// The tokens the response echoes, in first-occurrence request order.
+    ///
+    /// **`categorize-labels` is removed iff the decision came out off.**
+    /// Echoing it beside two-element values is exactly the
+    /// desynchronisation the whole design exists to prevent, produced by
+    /// the downgrade meant to prevent it. Unknown tokens are untouched
+    /// and still echoed verbatim, which is what the reference does with
+    /// them. The reference cannot enter the state that triggers the
+    /// removal, because its decision is the flag alone — a divergence in
+    /// a state it has no answer for, and in the safe direction. Ledgered
+    /// as `encoding-flags-echo-order`.
+    pub(super) fn echoed(
+        flags: &[String],
+        decision: Categorize,
+    ) -> impl Iterator<Item = &str> + '_ {
+        flags
+            .iter()
+            .map(String::as_str)
+            .filter(move |f| decision.is_on() || *f != CATEGORIZE_LABELS)
+    }
+
+    /// The per-item rendering decision: `Copy`, allocation-free, and
+    /// constructible only by [`super::streams_render`], so it cannot
+    /// carry a decision the envelope bytes were not built from.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct ItemWriter {
+        labels: LabelBytes,
+        categorize: Categorize,
+    }
+
+    impl ItemWriter {
+        pub(super) fn new(labels: LabelBytes, categorize: Categorize) -> Self {
+            ItemWriter { labels, categorize }
+        }
+
+        pub(super) fn estimate(self, s: &StreamResult) -> usize {
+            stream_item_estimate(s) + self.third_element_bytes(s)
+        }
+
+        /// What this stream's THIRD ELEMENTS add to the rendered size —
+        /// `0` when the decision is off, so a caller that reserves with
+        /// its own base formula stays exactly as it was on the plain
+        /// path.
+        pub(super) fn third_element_bytes(self, s: &StreamResult) -> usize {
+            if !self.categorize.is_on() {
+                return 0;
+            }
+            s.entries
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    s.categories
+                        .get(i)
+                        .map_or(super::THIRD_ELEMENT_EMPTY.len(), third_element_estimate)
+                })
+                .sum::<usize>()
+        }
+
+        pub(super) fn write(self, out: &mut Vec<u8>, s: &StreamResult) {
+            render_stream_item_into(out, s, self.labels, self.categorize);
+        }
+    }
+
+    /// One entry lifted out of its stream, for the categorised tail's
+    /// per-entry stream objects.
+    pub(super) struct LiftedEntry {
+        pub(super) timestamp_ns: i64,
+        pub(super) labels_json: String,
+        pub(super) fingerprint: u64,
+        pub(super) line: String,
+        pub(super) categories: EntryCategories,
+    }
+}
+
+/// Which envelope a streams body is spliced into. The reference places
+/// the advertisement differently in each: `resultType, encodingFlags,
+/// result, stats` for the query response
+/// (`pkg/util/marshal/query.go:301-322 @ grafana/loki v3.7.4 b318f282`)
+/// and LAST — after `streams`/`dropped_entries` — for the tail frame
+/// (`:231-257`).
+///
+/// Two variants, and the count is asserted by the source-scan gate: a
+/// third response shape carrying log lines has to come through here.
+enum StreamsEnvelope<'a> {
+    Query {
+        stats_json: &'a str,
+        explain: Option<&'a PlanExplain>,
+        warnings: &'a str,
+    },
+    Tail {
+        dropped: &'a [super::tail::Dropped],
+        dropped_total: u64,
+    },
+}
+
+/// Everything a streams body needs, built in ONE call from ONE decision.
+///
+/// `prefix` and `suffix` are complete envelope bytes with the
+/// advertisement already spliced at the position the envelope dictates —
+/// the caller never sees an advertisement it could place, drop or
+/// reorder, and the item writer it gets back carries the same decision
+/// those bytes were built from.
+///
+/// **Streaming is preserved (issue #312):** `item` is a `Copy` value, not
+/// a boxed closure and not bytes. The query body is still rendered
+/// item-by-item by `stream_array`, and nothing here materialises the
+/// response.
+struct StreamsRender {
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    item: categorize::ItemWriter,
+}
+
+/// Builds both halves of a streams body from one [`categorize::decide`].
+///
+/// Exactly two production call sites, one per [`StreamsEnvelope`]
+/// variant — the `Streams` arm of [`query_response_warned`] and
+/// [`tail_frame`].
+fn streams_render(
+    env: StreamsEnvelope<'_>,
+    flags: &[String],
+    items: &[StreamResult],
+    label_bytes: LabelBytes,
+) -> StreamsRender {
+    use std::io::Write;
+    let decision = categorize::decide(flags, items);
+    // The echo is an ITERATOR, not a collected list: `categorize-labels`
+    // is dropped from it exactly when the decision came out off, and
+    // every other token passes through verbatim. See
+    // `categorize::echoed`.
+    let echoed = || categorize::echoed(flags, decision);
+    let advertised = echoed().next().is_some();
+    // Exact, not an allowance: `"encodingFlags":[]` is 18 bytes, each
+    // token adds its own bytes plus two quotes and a separator comma, and
+    // an escape can only shrink the reservation's accuracy in the safe
+    // direction (`serde_json` never emits fewer bytes than the input).
+    let advertisement_len: usize = if advertised {
+        18 + echoed().map(|f| f.len() + 3).sum::<usize>()
+    } else {
+        0
+    };
+    /// Writes `"encodingFlags":[…]` — the ONE place the echo is
+    /// rendered, so the two envelopes cannot disagree about its bytes.
+    fn write_advertisement<'a>(out: &mut Vec<u8>, tokens: impl Iterator<Item = &'a str>) {
+        out.extend_from_slice(b"\"encodingFlags\":[");
+        for (i, f) in tokens.enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            if serde_json::to_writer(&mut *out, f).is_err() {
+                out.extend_from_slice(b"\"\"");
+            }
+        }
+        out.push(b']');
+    }
+    let (prefix, suffix) = match env {
+        StreamsEnvelope::Query {
+            stats_json,
+            explain,
+            warnings,
+        } => {
+            const HEAD: &[u8] = b"{\"status\":\"success\",\"data\":{\"resultType\":\"streams\",";
+            let mut prefix: Vec<u8> = Vec::with_capacity(HEAD.len() + advertisement_len + 12);
+            prefix.extend_from_slice(HEAD);
+            if advertised {
+                write_advertisement(&mut prefix, echoed());
+                prefix.push(b',');
+            }
+            prefix.extend_from_slice(b"\"result\":[");
+            let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain);
+            (prefix, format!("{suffix}}}{warnings}}}").into_bytes())
+        }
+        StreamsEnvelope::Tail {
+            dropped,
+            dropped_total,
+        } => {
+            let drops: usize = dropped.iter().map(|d| d.labels_json.len() + 48).sum();
+            let mut suffix: Vec<u8> = Vec::with_capacity(64 + drops + advertisement_len);
+            suffix.extend_from_slice(b"],\"dropped_entries\":[");
+            for (i, d) in dropped.iter().enumerate() {
+                if i > 0 {
+                    suffix.push(b',');
+                }
+                suffix.extend_from_slice(b"{\"labels\":");
+                suffix.extend_from_slice(d.labels_json.as_bytes());
+                suffix.extend_from_slice(b",\"timestamp\":\"");
+                let _ = write!(&mut suffix, "{}", d.timestamp_ns);
+                suffix.extend_from_slice(b"\"}");
+            }
+            suffix.extend_from_slice(b"],\"dropped_total\":");
+            let _ = write!(&mut suffix, "{dropped_total}");
+            if advertised {
+                suffix.push(b',');
+                write_advertisement(&mut suffix, echoed());
+            }
+            suffix.push(b'}');
+            (b"{\"streams\":[".to_vec(), suffix)
+        }
+    };
+    StreamsRender {
+        prefix,
+        suffix,
+        item: categorize::ItemWriter::new(label_bytes, decision),
+    }
 }
 
 /// Encodes a `/api/logs/v1/stats` result (issue #74, docs/api.md §2.5):
@@ -652,14 +1003,49 @@ pub(crate) fn patterns_response(
 /// `(labels_json, fingerprint)` for a deterministic wire order,
 /// mirroring [`query_response`].
 pub(crate) fn tail_frame(
-    mut streams: Vec<StreamResult>,
+    streams: Vec<StreamResult>,
     dropped: &[super::tail::Dropped],
     dropped_total: u64,
+    encoding_flags: &[String],
 ) -> String {
-    streams.sort_by(|a, b| (&a.labels_json, a.fingerprint).cmp(&(&b.labels_json, b.fingerprint)));
+    // Issue #463: under `categorize-labels` the tail emits ONE stream
+    // object per entry, in timestamp order — see [`split_tail_entries`].
+    // Splitting preserves every stream's `Three` arity (one entry, one
+    // category), so the decision `streams_render` re-takes below is the
+    // same one taken here.
+    let mut streams = streams;
+    if categorize::decide(encoding_flags, &streams).is_on() {
+        streams = split_tail_entries(streams);
+    } else {
+        streams
+            .sort_by(|a, b| (&a.labels_json, a.fingerprint).cmp(&(&b.labels_json, b.fingerprint)));
+    }
+    let render = streams_render(
+        StreamsEnvelope::Tail {
+            dropped,
+            dropped_total,
+        },
+        encoding_flags,
+        &streams,
+        // `LabelBytes::Verbatim` (issue #455): the tail frame's label
+        // bytes are UNCHANGED by that issue. Its evidence is entirely
+        // `/loki/api/v1/query_range`; this route was never measured
+        // against the reference, so it keeps what it served before.
+        LabelBytes::Verbatim,
+    );
     // Pre-size the output (review round 1, low): labels + entry bodies
     // dominate; ~48 bytes covers per-entry/per-drop JSON scaffolding.
-    let capacity: usize = 64
+    //
+    // **The per-stream term is the pre-#463 allowance, unchanged**, so
+    // the plain frame reserves exactly what it always did and its
+    // per-stream peak slope does not move (criterion 16(a)). The two
+    // envelope halves are already rendered, so their exact lengths
+    // replace the old fixed 64 plus per-drop allowance — an INTERCEPT
+    // change, which that criterion permits — and the categorised third
+    // elements are added on top, which is what keeps the flagged frame
+    // from regrowing on bytes it knew it was going to write.
+    let capacity: usize = render.prefix.len()
+        + render.suffix.len()
         + streams
             .iter()
             .map(|s| {
@@ -669,39 +1055,109 @@ pub(crate) fn tail_frame(
                         .iter()
                         .map(|(_, line)| line.len() + 48)
                         .sum::<usize>()
+                    + render.item.third_element_bytes(s)
             })
-            .sum::<usize>()
-        + dropped
-            .iter()
-            .map(|d| d.labels_json.len() + 48)
             .sum::<usize>();
     let mut buf: Vec<u8> = Vec::with_capacity(capacity);
-    buf.extend_from_slice(b"{\"streams\":[");
+    buf.extend_from_slice(&render.prefix);
     for (i, s) in streams.iter().enumerate() {
         if i > 0 {
             buf.push(b',');
         }
-        // Rendered IN PLACE (issue #312): no per-item `String` copy.
-        //
-        // `LabelBytes::Verbatim` (issue #455): the tail frame's label
-        // bytes are UNCHANGED by that issue. Its evidence is entirely
-        // `/loki/api/v1/query_range`; this route was never measured
-        // against the reference, so it keeps what it served before.
-        render_stream_item_into(&mut buf, s, LabelBytes::Verbatim);
+        // Rendered IN PLACE (issue #312): no per-item `String` copy, and
+        // no whole-item temporary — the tail cannot stream, so it writes
+        // straight into the frame buffer.
+        render.item.write(&mut buf, s);
     }
-    let mut out = String::from_utf8(buf).expect("rendered JSON is UTF-8");
-    out.push_str("],\"dropped_entries\":[");
-    for (i, d) in dropped.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
+    buf.extend_from_slice(&render.suffix);
+    String::from_utf8(buf).expect("rendered JSON is UTF-8")
+}
+
+/// The categorised tail's per-entry stream objects (issue #463).
+///
+/// **Measured against the reference, header on AND off:** two streams
+/// differing in one label with entries interleaved in time — prod@t,
+/// staging@t+1, prod@t+2 — come back as THREE stream objects in strict
+/// timestamp order, the prod map appearing twice with staging between.
+/// The mechanism is `pkg/querier/tail/tail.go:114-125 @ grafana/loki
+/// v3.7.4 b318f282`, which appends one `logproto.Stream` per entry as it
+/// pops the oldest from the merge iterator.
+///
+/// A renderer that grouped by label set would emit two objects and the
+/// consumer — object loop outside, value loop inside — would render the
+/// rows `A1, A3, B2`. Log lines out of order in a tail view is a defect,
+/// not a verbosity trade, so the categorised path matches the reference
+/// exactly.
+///
+/// **The non-categorised tail is deliberately NOT changed here**: it
+/// carries the same pre-existing divergence, it is byte-frozen by every
+/// pre-#463 tail expectation, and it is owned by issue #469. Ledgered as
+/// `tail-stream-object-granularity-unflagged`.
+///
+/// The sort key is `(timestamp_ns, labels_json, fingerprint,
+/// entry_index)`. The timestamp is the reference's own order; the rest is
+/// our deterministic tiebreak, because the reference's tie order is its
+/// merge tree's arrival order and is not reproducible from the data.
+/// `entry_index` is carried by `sort_by`'s STABILITY — entries are lifted
+/// in per-stream order, so a full three-way tie keeps it.
+fn split_tail_entries(streams: Vec<StreamResult>) -> Vec<StreamResult> {
+    // Already one entry per object — the shape a tail poll usually
+    // produces, and the shape the split's own output has. Reorder in
+    // place: no lift, no rebuild, and no per-entry allocation, so the
+    // categorised frame's allocation profile equals the plain one's
+    // (criterion 16(b-i)). `sort_by` is stable, so a full key tie keeps
+    // the caller's order exactly as the general path's `entry_index`
+    // tiebreak does.
+    if streams.iter().all(|s| s.entries.len() == 1) {
+        let mut streams = streams;
+        streams.sort_by(|a, b| {
+            (a.entries[0].0, &a.labels_json, a.fingerprint).cmp(&(
+                b.entries[0].0,
+                &b.labels_json,
+                b.fingerprint,
+            ))
+        });
+        return streams;
+    }
+    let mut lifted: Vec<categorize::LiftedEntry> = Vec::new();
+    for s in streams {
+        let StreamResult {
+            fingerprint,
+            service: _,
+            labels_json,
+            entries,
+            categories,
+        } = s;
+        let mut cats = categories.into_iter();
+        for (ts, line) in entries {
+            lifted.push(categorize::LiftedEntry {
+                timestamp_ns: ts,
+                labels_json: labels_json.clone(),
+                fingerprint,
+                line,
+                categories: cats.next().unwrap_or_default(),
+            });
         }
-        out.push_str(&format!(
-            "{{\"labels\":{},\"timestamp\":\"{}\"}}",
-            d.labels_json, d.timestamp_ns
-        ));
     }
-    out.push_str(&format!("],\"dropped_total\":{dropped_total}}}"));
-    out
+    lifted.sort_by(|a, b| {
+        (a.timestamp_ns, &a.labels_json, a.fingerprint).cmp(&(
+            b.timestamp_ns,
+            &b.labels_json,
+            b.fingerprint,
+        ))
+    });
+    lifted
+        .into_iter()
+        .map(|e| StreamResult {
+            fingerprint: e.fingerprint,
+            // Not rendered on this surface; the frame carries labels and
+            // values only.
+            service: String::new(),
+            labels_json: e.labels_json,
+            entries: vec![(e.timestamp_ns, e.line)],
+            categories: vec![e.categories],
+        })
+        .collect()
 }
 
 fn render_matrix_item(s: &MatrixSeries) -> Vec<u8> {
@@ -798,6 +1254,7 @@ pub(crate) fn query_response(
         at_ns,
         preserve_vector_order,
         &Warnings::new(),
+        &[],
     )
 }
 
@@ -825,6 +1282,7 @@ pub(crate) fn query_response_warned(
     at_ns: i64,
     preserve_vector_order: bool,
     warnings: &Warnings,
+    encoding_flags: &[String],
 ) -> Response {
     let warns = warnings_suffix(warnings);
     match result {
@@ -843,12 +1301,28 @@ pub(crate) fn query_response_warned(
                 pulsus_partial: partial,
             };
             let stats_json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
-            let prefix =
-                b"{\"status\":\"success\",\"data\":{\"resultType\":\"streams\",\"result\":["
-                    .to_vec();
-            let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain.as_ref());
-            let suffix = format!("{suffix}}}{warns}}}").into_bytes();
-            json_response(stream_array(prefix, items, render_stream_item, suffix))
+            let StreamsRender {
+                prefix,
+                suffix,
+                item,
+            } = streams_render(
+                StreamsEnvelope::Query {
+                    stats_json: &stats_json,
+                    explain: explain.as_ref(),
+                    warnings: &warns,
+                },
+                encoding_flags,
+                &items,
+                // The QUERY response is the surface issue #455 measured,
+                // so the one that substitutes.
+                LabelBytes::SpaceForReplacementChars,
+            );
+            json_response(stream_array(
+                prefix,
+                items,
+                move |s: &StreamResult| item_chunk(item, s),
+                suffix,
+            ))
         }
         QueryResult::Matrix(mut items) => {
             items.sort_by(|a, b| a.labels.cmp(&b.labels));
@@ -989,6 +1463,7 @@ mod tests {
                 .into_iter()
                 .map(|(ts, line)| (ts, line.to_string()))
                 .collect(),
+            categories: Vec::new(),
         }
     }
 
@@ -1002,7 +1477,27 @@ mod tests {
             entries: (0..n)
                 .map(|i| (1_700_000_000_000_000_000i64 + i as i64, line.clone()))
                 .collect(),
+            categories: Vec::new(),
         }
+    }
+
+    /// The QUERY path's production [`categorize::ItemWriter`], obtained
+    /// the way the shipped `Streams` arm obtains it — through a real
+    /// [`streams_render`] call — so a gate that measures through it
+    /// measures the decision production makes, not a transcription of it
+    /// (issue #463).
+    fn query_item_writer(flags: &[String], items: &[StreamResult]) -> categorize::ItemWriter {
+        streams_render(
+            StreamsEnvelope::Query {
+                stats_json: "{}",
+                explain: None,
+                warnings: "",
+            },
+            flags,
+            items,
+            LabelBytes::SpaceForReplacementChars,
+        )
+        .item
     }
 
     /// AC-19 (issue #312): the render path's PEAK LIVE BYTES and its
@@ -1013,7 +1508,12 @@ mod tests {
     fn ac19_render_path_peak_and_allocation_profile() {
         let benign = probe312_item(200, 512, false);
         let est = stream_item_estimate(&benign);
-        let (out, allocs, peak) = crate::probe_alloc::measure(|| render_stream_item(&benign));
+        // Issue #463 repoints this from the deleted `render_stream_item`
+        // onto `item_chunk`, whose operations are the same ones in the
+        // same order — and the writer comes from a real `streams_render`,
+        // so this measures the shipped decision.
+        let w = query_item_writer(&[], std::slice::from_ref(&benign));
+        let (out, allocs, peak) = crate::probe_alloc::measure(|| item_chunk(w, &benign));
         // PEAK BYTES is the load-bearing figure: #312 guarantees a memory
         // bound, and peak live bytes is that quantity in its own unit. The
         // allocation COUNT is a companion — cheap and structural, but blind
@@ -1030,8 +1530,9 @@ mod tests {
 
         let adversarial = probe312_item(200, 512, true);
         let est_a = stream_item_estimate(&adversarial);
+        let w_a = query_item_writer(&[], std::slice::from_ref(&adversarial));
         let (out_a, allocs_a, peak_a) =
-            crate::probe_alloc::measure(|| render_stream_item(&adversarial));
+            crate::probe_alloc::measure(|| item_chunk(w_a, &adversarial));
 
         // adversarial: reservation is the UNESCAPED size and each 0x01 byte
         // renders as a six-character escape, so the buffer doubles until it
@@ -1114,6 +1615,7 @@ mod tests {
             0,
             false,
             &Warnings::new(),
+            &[],
         );
         let body = body_string(res).await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
@@ -1148,7 +1650,8 @@ mod tests {
         // written here.
         let bodies: Vec<String> = item.entries.iter().map(|(_, l)| l.clone()).collect();
         let (_items, charged) = probe312_accumulate(&bodies);
-        let rendered = render_stream_item(&item).len() as u64;
+        let rendered =
+            item_chunk(query_item_writer(&[], std::slice::from_ref(&item)), &item).len() as u64;
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let ledger =
@@ -1300,7 +1803,7 @@ mod tests {
             vec![(1, "line")],
         );
 
-        let frame = tail_frame(vec![item.clone()], &[], 0);
+        let frame = tail_frame(vec![item.clone()], &[], 0, &[]);
         assert!(
             frame.contains("\"stream\":{\"k\":\"\u{FFFD}\",\"service_name\":\"a\"}"),
             "the tail frame splices the label JSON verbatim: {frame}"
@@ -1312,7 +1815,11 @@ mod tests {
 
         // The same item through the query response DOES substitute, so a
         // renderer that simply stopped substituting cannot pass this.
-        let rendered = String::from_utf8(render_stream_item(&item)).expect("utf8");
+        let rendered = String::from_utf8(item_chunk(
+            query_item_writer(&[], std::slice::from_ref(&item)),
+            &item,
+        ))
+        .expect("utf8");
         assert!(
             rendered.contains("\"stream\":{\"k\":\" \",\"service_name\":\"a\"}"),
             "the query response still substitutes: {rendered}"
@@ -2012,6 +2519,7 @@ mod tests {
                     service: "checkout".to_string(),
                     labels_json,
                     entries,
+                    categories: Vec::new(),
                 }
             })
             .collect();
@@ -2264,6 +2772,7 @@ mod tests {
             5_500_000_000,
             false,
             &one_warning(),
+            &[],
         ))
         .await;
         assert_eq!(
@@ -2300,6 +2809,7 @@ mod tests {
             0,
             false,
             &w,
+            &[],
         ))
         .await;
         assert_eq!(
@@ -2326,6 +2836,7 @@ mod tests {
             0,
             false,
             &one_warning(),
+            &[],
         ))
         .await;
         let explain_at = body.find(r#""explain""#).expect("explain is present");
@@ -2384,8 +2895,14 @@ mod tests {
         ];
 
         for (name, result) in arms {
-            let with_empty =
-                query_response_warned(result.clone(), None, 5_500_000_000, false, &Warnings::new());
+            let with_empty = query_response_warned(
+                result.clone(),
+                None,
+                5_500_000_000,
+                false,
+                &Warnings::new(),
+                &[],
+            );
             let plain = query_response(result, None, 5_500_000_000, false);
             assert_eq!(
                 with_empty.status(),
@@ -2398,6 +2915,778 @@ mod tests {
             assert!(
                 !a.contains("warnings"),
                 "{name}: an empty accumulator must emit no key at all: {a}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #463 — `X-Loki-Response-Encoding-Flags: categorize-labels`
+    // -----------------------------------------------------------------
+
+    /// The one fixture every issue #463 hermetic gate below is built from:
+    /// two streams, the first carrying an entry of each third-element
+    /// framing (`structuredMetadata` + `parsed`, `structuredMetadata`
+    /// only, `parsed` only, and both empty), the second a single plain
+    /// entry. Written once so the plain and categorised bodies below are
+    /// the same data seen two ways.
+    fn cat_pair(k: &str, v: &str) -> (String, String) {
+        (k.to_string(), v.to_string())
+    }
+
+    fn c463_items(categorize: bool) -> Vec<StreamResult> {
+        let cats = |sm: &[(&str, &str)], parsed: &[(&str, &str)]| EntryCategories {
+            structured_metadata: sm.iter().map(|(k, v)| cat_pair(k, v)).collect(),
+            parsed: parsed.iter().map(|(k, v)| cat_pair(k, v)).collect(),
+        };
+        let mut a = StreamResult {
+            fingerprint: 7,
+            service: "checkout".to_string(),
+            labels_json: r#"{"app":"checkout","service_name":"checkout"}"#.to_string(),
+            entries: vec![
+                (1_700_000_000_000_000_001, "both".to_string()),
+                (1_700_000_000_000_000_002, "sm only".to_string()),
+                (1_700_000_000_000_000_003, "parsed only".to_string()),
+                (1_700_000_000_000_000_004, "neither".to_string()),
+            ],
+            categories: Vec::new(),
+        };
+        let mut b = StreamResult {
+            fingerprint: 9,
+            service: "billing".to_string(),
+            labels_json: r#"{"app":"billing","service_name":"billing"}"#.to_string(),
+            entries: vec![(1_700_000_000_000_000_005, "plain".to_string())],
+            categories: Vec::new(),
+        };
+        if categorize {
+            a.categories = vec![
+                cats(&[("trace_id", "abc")], &[("lvl", "warn")]),
+                cats(&[("user_id", "42")], &[]),
+                cats(&[], &[("__error__", "JSONParserErr")]),
+                cats(&[], &[]),
+            ];
+            b.categories = vec![cats(&[], &[])];
+        }
+        vec![a, b]
+    }
+
+    fn flags(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Every `values` element in a rendered streams body, as arrays.
+    fn value_arities(body: &str) -> Vec<usize> {
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON body");
+        let streams = v["data"]["result"]
+            .as_array()
+            .or_else(|| v["streams"].as_array())
+            .expect("a streams array");
+        streams
+            .iter()
+            .flat_map(|s| s["values"].as_array().expect("values").iter())
+            .map(|e| e.as_array().expect("entry array").len())
+            .collect()
+    }
+
+    fn encoding_flags_of(body: &str) -> Option<Vec<String>> {
+        let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON body");
+        let node = if v["data"].is_object() {
+            &v["data"]["encodingFlags"]
+        } else {
+            &v["encodingFlags"]
+        };
+        node.as_array().map(|a| {
+            a.iter()
+                .map(|s| s.as_str().expect("token").to_string())
+                .collect()
+        })
+    }
+
+    async fn c463_query_body(items: Vec<StreamResult>, flags: &[String]) -> String {
+        body_string(query_response_warned(
+            QueryResult::Streams {
+                items,
+                partial: false,
+            },
+            None,
+            0,
+            false,
+            &Warnings::new(),
+            flags,
+        ))
+        .await
+    }
+
+    /// **Criterion 3 — no header ⇒ byte-identical to the pre-#463 tree.**
+    ///
+    /// The literal below was captured by running THIS fixture through
+    /// `query_response_warned` at `bf3a8f6` (the commit this branch
+    /// forked from, before any of issue #463 existed), by checking that
+    /// tree out in place and printing the body. It is not a
+    /// transcription of what the current code emits.
+    ///
+    /// The companion half of this criterion is that
+    /// `logql_pipeline_alloc.rs`, `logql_variants_alloc.rs`,
+    /// `logql_streams_retention_inventory.rs` and
+    /// [`ac19_render_path_peak_and_allocation_profile`] pass with no edit
+    /// to their expected values.
+    #[tokio::test]
+    async fn no_header_renders_the_pre_change_bytes_exactly() {
+        // Categorised data present on every stream, and NO header: the
+        // decision must still come out off, so this also pins that the
+        // arity is never taken from the data alone.
+        let body = c463_query_body(c463_items(true), &[]).await;
+        assert_eq!(body, C463_PLAIN_GOLDEN);
+        assert!(
+            value_arities(&body).iter().all(|n| *n == 2),
+            "every value must stay two-element: {body}"
+        );
+        assert_eq!(encoding_flags_of(&body), None);
+    }
+
+    /// Captured at `bf3a8f6` — see
+    /// [`no_header_renders_the_pre_change_bytes_exactly`]. Generated by
+    /// checking that commit out in this worktree, printing the body from
+    /// the same fixture data, and pasting the bytes; never retyped from
+    /// what the current renderer emits.
+    const C463_PLAIN_GOLDEN: &str = r#"{"status":"success","data":{"resultType":"streams","result":[{"stream":{"app":"billing","service_name":"billing"},"values":[["1700000000000000005","plain"]]},{"stream":{"app":"checkout","service_name":"checkout"},"values":[["1700000000000000001","both"],["1700000000000000002","sm only"],["1700000000000000003","parsed only"],["1700000000000000004","neither"]]}],"stats":{"streams":2,"entries":5,"bytes":34}}}"#;
+
+    /// **Criterion 5 — `encodingFlags` precedes `result`.**
+    ///
+    /// The datasource's decoder dispatches the moment it reaches
+    /// `result`, so a flag emitted after it is silently ignored and the
+    /// three-element entries then fail to parse. The tail's order is the
+    /// other way round — the reference puts the key LAST there — and the
+    /// consumer parses the whole frame before reading a key, so both
+    /// orders are asserted where they belong.
+    #[tokio::test]
+    async fn the_advertisement_sits_where_each_envelope_puts_it() {
+        let body = c463_query_body(c463_items(true), &flags(&["categorize-labels"])).await;
+        let ef = body.find(r#""encodingFlags""#).expect("advertised");
+        let result = body.find(r#""result""#).expect("result");
+        let rt = body.find(r#""resultType""#).expect("resultType");
+        assert!(rt < ef && ef < result, "query envelope order: {body}");
+
+        let frame = tail_frame(c463_items(true), &[], 0, &flags(&["categorize-labels"]));
+        let streams = frame.find(r#""streams""#).expect("streams");
+        let total = frame.find(r#""dropped_total""#).expect("dropped_total");
+        let ef = frame.find(r#""encodingFlags""#).expect("advertised");
+        assert!(
+            streams < total && total < ef,
+            "tail envelope order: {frame}"
+        );
+    }
+
+    /// **Criterion 7 — only a `streams` result carries the key.**
+    ///
+    /// The reference's frontend codec sends every other result type
+    /// through an encoder that takes no flags at all, so the key must not
+    /// appear on a matrix or a vector however the request was headed.
+    #[tokio::test]
+    async fn only_the_streams_arm_advertises_the_flag() {
+        let f = flags(&["categorize-labels"]);
+        let matrix = body_string(query_response_warned(
+            QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![("app".to_string(), "checkout".to_string())],
+                points: vec![(0, 1.0)],
+            }]),
+            None,
+            0,
+            false,
+            &Warnings::new(),
+            &f,
+        ))
+        .await;
+        let vector = body_string(query_response_warned(
+            QueryResult::Vector(vec![VectorSample {
+                labels: vec![("app".to_string(), "checkout".to_string())],
+                value: 1.0,
+            }]),
+            None,
+            0,
+            false,
+            &Warnings::new(),
+            &f,
+        ))
+        .await;
+        for (name, body) in [("matrix", &matrix), ("vector", &vector)] {
+            assert!(
+                !body.contains("encodingFlags"),
+                "{name} must not advertise: {body}"
+            );
+        }
+    }
+
+    // --- Criterion 4 / 13: the advertisement and the arity are ONE
+    // decision, on BOTH envelopes.
+
+    /// The two wire surfaces a streams body can be spliced into. Every
+    /// criterion-4 assertion runs once per variant, which is what lets a
+    /// tail-only defect have a signature of its own.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Env463 {
+        Query,
+        Tail,
+    }
+
+    async fn c463_render(env: Env463, items: Vec<StreamResult>, flags: &[String]) -> String {
+        match env {
+            Env463::Query => c463_query_body(items, flags).await,
+            Env463::Tail => tail_frame(items, &[], 0, flags),
+        }
+    }
+
+    /// 4A's fixture: the second stream's `categories` is one element
+    /// short, so it cannot serve a third element and the WHOLE body must
+    /// downgrade — a mixed-arity body is a hard client parse failure, and
+    /// losing a feature is the only safe direction.
+    fn c463_short_by_one() -> Vec<StreamResult> {
+        let mut items = c463_items(true);
+        items[1].categories.pop();
+        items
+    }
+
+    /// **Criteria 4 and 13(b)/13(c): the mutation matrix, run on both
+    /// envelopes.**
+    ///
+    /// Each mutation named in the plan has a signature in these eight
+    /// assertion ids, and the coder performs every one on the implemented
+    /// tree and records which reddened — a criterion that only says a
+    /// break "would" fire has never been run.
+    ///
+    /// * `A1` the echo does not contain `categorize-labels`
+    /// * `A2` every value has two elements
+    /// * `B1` no `encodingFlags` key at all
+    /// * `B2` every value has two elements
+    /// * `C1` the echo is exactly `["categorize-labels"]`
+    /// * `C2` the result/streams array is empty
+    /// * `D1` the echo is exactly `["foo"]`
+    /// * `D2` every value has two elements
+    #[tokio::test]
+    async fn the_advertisement_and_the_arity_are_one_decision() {
+        // COLLECTED, not asserted eagerly: a mutation's signature is the
+        // SET of assertions it fails, and a test that stops at the first
+        // one can only ever report a prefix of it. Two mutations that
+        // both fail `A1` are then indistinguishable however many other
+        // assertions separate them.
+        let mut failed: Vec<String> = Vec::new();
+        let mut check = |ok: bool, id: &str, env: Env463, body: &str| {
+            if !ok {
+                failed.push(format!("{id}({env:?})"));
+                eprintln!("c463 matrix FAIL {id}({env:?}): {body}");
+            }
+        };
+        for env in [Env463::Query, Env463::Tail] {
+            // 4A — a construction bug downgrades the body; it never
+            // advertises a shape it cannot serve.
+            let body = c463_render(env, c463_short_by_one(), &flags(&["categorize-labels"])).await;
+            let echo = encoding_flags_of(&body).unwrap_or_default();
+            check(
+                !echo.iter().any(|f| f == "categorize-labels"),
+                "A1",
+                env,
+                &body,
+            );
+            check(
+                value_arities(&body).iter().all(|n| *n == 2),
+                "A2",
+                env,
+                &body,
+            );
+
+            // 4B — well-formed categories, NO header.
+            let body = c463_render(env, c463_items(true), &[]).await;
+            check(encoding_flags_of(&body).is_none(), "B1", env, &body);
+            check(
+                value_arities(&body).iter().all(|n| *n == 2),
+                "B2",
+                env,
+                &body,
+            );
+
+            // 4C — an EMPTY result with the flag still advertises it.
+            let body = c463_render(env, Vec::new(), &flags(&["categorize-labels"])).await;
+            check(
+                encoding_flags_of(&body).as_deref() == Some(&["categorize-labels".to_string()][..]),
+                "C1",
+                env,
+                &body,
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let arr = match env {
+                Env463::Query => &parsed["data"]["result"],
+                Env463::Tail => &parsed["streams"],
+            };
+            check(arr.as_array().map(Vec::len) == Some(0), "C2", env, &body);
+
+            // 4D — an UNKNOWN flag is echoed verbatim and changes nothing.
+            let body = c463_render(env, c463_items(true), &flags(&["foo"])).await;
+            check(
+                encoding_flags_of(&body).as_deref() == Some(&["foo".to_string()][..]),
+                "D1",
+                env,
+                &body,
+            );
+            check(
+                value_arities(&body).iter().all(|n| *n == 2),
+                "D2",
+                env,
+                &body,
+            );
+        }
+        assert!(
+            failed.is_empty(),
+            "the advertisement and the arity disagreed; signature: {failed:?}"
+        );
+    }
+
+    /// **The categorised body, on both envelopes.** The positive half of
+    /// the matrix above: with the flag and well-formed categories, every
+    /// value is three-element and the third element carries
+    /// `structuredMetadata` before `parsed`, each omitted when empty and
+    /// `{}` when both are.
+    #[tokio::test]
+    async fn the_categorised_body_renders_the_reference_third_element() {
+        let body = c463_query_body(c463_items(true), &flags(&["categorize-labels"])).await;
+        assert!(
+            value_arities(&body).iter().all(|n| *n == 3),
+            "every value must be three-element: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let checkout = v["data"]["result"]
+            .as_array()
+            .expect("result")
+            .iter()
+            .find(|s| s["stream"]["app"] == "checkout")
+            .expect("the checkout stream");
+        let vals = checkout["values"].as_array().expect("values");
+        assert_eq!(
+            vals[0][2],
+            serde_json::json!({
+                "structuredMetadata": {"trace_id": "abc"},
+                "parsed": {"lvl": "warn"}
+            })
+        );
+        assert_eq!(
+            vals[1][2],
+            serde_json::json!({"structuredMetadata": {"user_id": "42"}})
+        );
+        assert_eq!(
+            vals[2][2],
+            serde_json::json!({"parsed": {"__error__": "JSONParserErr"}})
+        );
+        assert_eq!(vals[3][2], serde_json::json!({}));
+        // Key ORDER inside the third element is load-bearing on the wire,
+        // and `serde_json::Value` comparison cannot see it.
+        let both =
+            body.contains(r#""structuredMetadata":{"trace_id":"abc"},"parsed":{"lvl":"warn"}"#);
+        assert!(both, "structuredMetadata must precede parsed: {body}");
+    }
+
+    // --- Criterion 16: the tail's allocation and peak profile.
+
+    /// N single-entry streams, optionally categorised with an EMPTY
+    /// third element — the shape whose flag-on/flag-off delta is exactly
+    /// the two things issue #463 adds to this path.
+    fn c463_tail_items(n: usize, categorize: bool) -> Vec<StreamResult> {
+        (0..n)
+            .map(|i| StreamResult {
+                fingerprint: i as u64,
+                service: "svc".to_string(),
+                labels_json: format!(r#"{{"app":"a{i:04}","service_name":"svc"}}"#),
+                entries: vec![(1_700_000_000_000_000_000i64 + i as i64, "line".to_string())],
+                categories: if categorize {
+                    vec![EntryCategories::default()]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect()
+    }
+
+    /// **Criterion 16 — the tail path's cost, gated on the SLOPE with the
+    /// intercept enumerated.**
+    ///
+    /// The tail cannot stream: it builds one `String` and must not grow a
+    /// whole-item temporary beside it. What issue #463 costs here is two
+    /// envelope `Vec`s that do not scale with streams or entries; there
+    /// is no per-item cost and no boxed closure. So the per-stream cost
+    /// may not move, and the fixed cost is enumerated rather than left as
+    /// an allowance.
+    ///
+    /// The flag-off increments below are the pre-#463 tree's, measured
+    /// at `bf3a8f6` by checking it out in this worktree and running the
+    /// same fixture through the same probe: `n=1 allocs=2 peak=222`,
+    /// `n=200 allocs=3 peak=24102` — increments `(1, 23 880)`.
+    /// `tail_frame` therefore keeps the pre-#463 per-stream RESERVATION
+    /// term verbatim; only the envelope intercept moved, which this
+    /// clause permits.
+    #[test]
+    fn the_tail_frame_keeps_its_allocation_profile() {
+        // The fixture is built OUTSIDE `measure`: this gates the
+        // RENDERER's profile, and `StreamResult`'s own width is a
+        // separate, per-stream question the streams-result budget owns.
+        let off = |n: usize| {
+            let items = c463_tail_items(n, false);
+            crate::probe_alloc::measure(move || tail_frame(items, &[], 0, &[]))
+        };
+        let on = |n: usize| {
+            let items = c463_tail_items(n, true);
+            let f = flags(&["categorize-labels"]);
+            crate::probe_alloc::measure(move || tail_frame(items, &[], 0, &f))
+        };
+
+        // 16(a) — the PER-STREAM cost may not move. The fixed cost may.
+        let (_, a1, p1) = off(1);
+        let (_, a200, p200) = off(200);
+        assert_eq!(
+            (a200 - a1, p200 - p1),
+            (1, 23_880),
+            "the flag-off tail's per-stream allocation/peak slope moved"
+        );
+        // Stated as a relation as well as a literal: whatever the
+        // reservation, the tail may not allocate per stream.
+        assert!(
+            a200 - a1 <= 1,
+            "the tail allocated {a200} buffers for 200 streams and {a1} for one — a per-item              allocation appeared"
+        );
+
+        // 16(b-i) — NO per-item allocation appears with the flag on,
+        // and no fixed one either. This is the clause that catches a
+        // whole-item temporary, and it is independent of any byte
+        // accounting: `streams_render` reserves both envelope halves
+        // exactly and writes the echo in place, so turning the flag on
+        // costs no allocation at all.
+        for n in [1usize, 200] {
+            let (_, allocs_off, _) = off(n);
+            let (_, allocs_on, _) = on(n);
+            assert_eq!(
+                allocs_on, allocs_off,
+                "n={n}: the categorised tail allocated {allocs_on} where the plain one \
+                 allocated {allocs_off} — a temporary appeared"
+            );
+        }
+
+        // 16(b-ii) — the intercept is exactly the two things that
+        // changed: one empty third element per entry, and the
+        // advertisement. Both are COMPUTED from what production emits,
+        // never asserted as a constant.
+        let items = c463_tail_items(1, true);
+        let advertisement = {
+            let render = streams_render(
+                StreamsEnvelope::Tail {
+                    dropped: &[],
+                    dropped_total: 0,
+                },
+                &flags(&["categorize-labels"]),
+                &items,
+                LabelBytes::Verbatim,
+            );
+            let plain = streams_render(
+                StreamsEnvelope::Tail {
+                    dropped: &[],
+                    dropped_total: 0,
+                },
+                &[],
+                &items,
+                LabelBytes::Verbatim,
+            );
+            render.suffix.len() - plain.suffix.len()
+        };
+        let (body_off, _, _) = off(1);
+        let (body_on, _, _) = on(1);
+        assert_eq!(
+            body_on.len() - body_off.len(),
+            THIRD_ELEMENT_EMPTY.len() + advertisement,
+            "the categorised frame grew by something other than one empty third element \
+             plus the advertisement"
+        );
+
+        // 16(b-iii) — the peak delta is attributable to rendered bytes
+        // and nothing else.
+        //
+        // Stated scale-invariantly, because the exact form is what a
+        // staged envelope makes true: the advertisement is live twice
+        // while the frame is assembled — once in `suffix`, once copied
+        // into `buf` — and its `String` over-reserves geometrically
+        // while it is built. Every one of those terms is a function of
+        // the ADVERTISEMENT's length, none of the frame's. So the
+        // property is that the peak overhead the flag adds, over and
+        // above the bytes it renders, does not grow with the frame.
+        //
+        // Measured: 38 B at N = 1 and 38 B at N = 200 — exactly the
+        // advertisement's own bytes, held in `suffix` while the frame
+        // buffer holds its copy.
+        let overhead = |n: usize| -> i64 {
+            let (body_off, _, peak_off) = off(n);
+            let (body_on, _, peak_on) = on(n);
+            (peak_on as i64 - peak_off as i64) - (body_on.len() as i64 - body_off.len() as i64)
+        };
+        let (o1, o200) = (overhead(1), overhead(200));
+        assert_eq!(
+            o1, o200,
+            "the categorised tail's non-rendered peak overhead grows with the frame: \
+             {o1} B at N=1 against {o200} B at N=200"
+        );
+        assert_eq!(o1, 38, "the categorised tail's fixed peak overhead moved");
+
+        // 16(c) — the fixed cost, enumerated. Wrapping ONLY the
+        // `streams_render` call, exactly two allocations: `prefix` and
+        // `suffix`. A third buffer, or a reintroduced boxed closure,
+        // reds here.
+        let f = flags(&["categorize-labels"]);
+        let (_, allocs, _) = crate::probe_alloc::measure(|| {
+            streams_render(
+                StreamsEnvelope::Tail {
+                    dropped: &[],
+                    dropped_total: 0,
+                },
+                &f,
+                &items,
+                LabelBytes::Verbatim,
+            )
+        });
+        eprintln!("c463 streams_render allocations: {allocs}");
+        assert_eq!(
+            allocs, 2,
+            "streams_render must allocate exactly the two envelope buffers"
+        );
+    }
+
+    // --- Criterion 10: the encoded-body factor for the CATEGORISED shape.
+
+    /// Issue #463's categorised worst-case fixture, driven through the
+    /// REAL fast-path accumulator so both halves of the ratio come from
+    /// shipped code: 200 entries, each a 512-byte all-`\u{0001}` line,
+    /// in the `variant` third-element framing.
+    ///
+    /// The categories are DERIVED from structured metadata by the
+    /// accumulator, not injected: a reserved `__error__` pair is routed
+    /// to the error slots and files under `parsed`, an ordinary pair
+    /// files under `structuredMetadata`. That is what makes this measure
+    /// the shipped split rather than a transcription of it.
+    fn c463_factor_case(variant: usize) -> (u64, u64) {
+        use pulsus_read::logql::MAX_STREAMS_RESULT_BYTES;
+        use pulsus_read::logql::exec::StreamsFastPathProbe;
+        use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
+
+        let ctrl: String = std::iter::repeat_n('\u{1}', 512).collect();
+        let meta = std::collections::HashMap::from([(
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "svc".to_string(),
+                labels: r#"{"service_name":"svc"}"#.to_string(),
+            },
+        )]);
+        let esc = serde_json::to_string(&ctrl).expect("escape");
+        let sm = match variant {
+            // structuredMetadata + parsed
+            0 => format!(r#"{{"kk1":{esc},"__error__":{esc}}}"#),
+            // structuredMetadata only
+            1 => format!(r#"{{"kk1":{esc}}}"#),
+            // parsed only
+            2 => format!(r#"{{"__error__":{esc}}}"#),
+            // neither — the `{}` framing
+            _ => String::new(),
+        };
+        let mut probe = StreamsFastPathProbe::with_cap_categorized(MAX_STREAMS_RESULT_BYTES);
+        for i in 0..200 {
+            probe
+                .push_row(
+                    SampleRow {
+                        fingerprint: 1,
+                        timestamp_ns: 1_700_000_000_000_000_000i64 + i,
+                        body: ctrl.clone(),
+                        structured_metadata: sm.clone(),
+                    },
+                    &meta,
+                )
+                .expect("well inside the shipped cap");
+        }
+        let charged = probe.charged();
+        let items = probe.into_streams();
+        assert_eq!(items.len(), 1, "variant {variant}: one stream expected");
+        let w = query_item_writer(&flags(&["categorize-labels"]), &items);
+        let rendered: u64 = items.iter().map(|s| item_chunk(w, s).len() as u64).sum();
+        (rendered, charged)
+    }
+
+    /// Reads one integer factor out of the `streams-result-budget`
+    /// ledger entry's anchor line, so breaking the DOCUMENT alone fails
+    /// with no recompilation.
+    fn c463_ledger_factor(anchor: &str) -> u64 {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ledger =
+            std::fs::read_to_string(root.join("docs/benchmarks/logs-differential-ledger.md"))
+                .expect("ledger readable");
+        let tail = ledger
+            .split(anchor)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the ledger carries the anchor {anchor:?}"));
+        tail.split(" ×`")
+            .next()
+            .expect("the anchor names a factor")
+            .trim()
+            .parse()
+            .expect("the documented factor is an integer")
+    }
+
+    /// **Criterion 10 — the encoded-body factor holds for the
+    /// CATEGORISED shape, on its own anchor.**
+    ///
+    /// A single anchor could not be made to bind here, and the reason is
+    /// arithmetic rather than a choice: `alloc_block_bytes(n) = max(2n,
+    /// 32)` and `grown_alloc_bytes(n) = 3·alloc_block_bytes(n)`, so every
+    /// shape's rendered/charged tends to 3 from below — a C0 byte renders
+    /// as six characters and is charged two — while the third element
+    /// adds strictly more FIXED per-entry overhead than amplification. A
+    /// clause requiring the categorised ratio to EXCEED the plain one is
+    /// therefore unsatisfiable, and this is a second anchor instead.
+    ///
+    /// Two-sided on the categorised ratio alone: neither clause mentions
+    /// the plain fixture, so neither can be satisfied by it.
+    #[test]
+    fn the_categorised_body_factor_matches_what_the_renderer_produces() {
+        const ANCHOR: &str = "- **Categorised encoded-body factor (#463):** at most `";
+        let f_cat = c463_ledger_factor(ANCHOR);
+        let mut worst = 0.0f64;
+        let mut worst_variant = 0usize;
+        let mut worst_pair = (0u64, 0u64);
+        for variant in 0..4 {
+            let (rendered, charged) = c463_factor_case(variant);
+            let ratio = rendered as f64 / charged as f64;
+            eprintln!(
+                "c463 F_cat variant={variant} rendered={rendered} charged={charged} \
+                 ratio={ratio:.3}"
+            );
+            assert!(
+                rendered <= f_cat * charged,
+                "variant {variant}: the renderer emitted {rendered} B for {charged} charged B \
+                 — MORE than the documented factor {f_cat}x. The documented bound is too small."
+            );
+            if ratio > worst {
+                worst = ratio;
+                worst_variant = variant;
+                worst_pair = (rendered, charged);
+            }
+        }
+        let (rendered, charged) = worst_pair;
+        assert!(
+            rendered > (f_cat - 1) * charged,
+            "the widest categorised variant ({worst_variant}) emitted only {rendered} B for \
+             {charged} charged B — under {}x. The documented factor {f_cat}x is not tight, or \
+             this corpus is no longer the worst case.",
+            f_cat - 1
+        );
+        eprintln!("c463 F_cat worst variant={worst_variant} ratio={worst:.3} documented={f_cat}");
+    }
+
+    /// **Criterion 10(d) — the ledger records the DERIVATION, not just
+    /// the number.** The four ratios and the binding variant's two byte
+    /// totals are parsed out of the ledger and compared against what the
+    /// fixture actually produces, so the derivation cannot go stale
+    /// beside a still-correct factor.
+    #[test]
+    fn the_categorised_factor_derivation_matches_the_fixture() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let ledger =
+            std::fs::read_to_string(root.join("docs/benchmarks/logs-differential-ledger.md"))
+                .expect("ledger readable");
+        let (rendered, charged) = c463_factor_case(0);
+        let ratio = rendered as f64 / charged as f64;
+        // The recorded totals, in the row's own thousands-separated form.
+        let sep = |n: u64| {
+            let d = n.to_string();
+            let mut out = String::new();
+            for (i, c) in d.chars().enumerate() {
+                if i > 0 && (d.len() - i).is_multiple_of(3) {
+                    out.push(',');
+                }
+                out.push(c);
+            }
+            out
+        };
+        for (what, needle) in [
+            (
+                "the rendered total",
+                format!("`rendered = {} B`", sep(rendered)),
+            ),
+            (
+                "the charged total",
+                format!("`charged = {} B`", sep(charged)),
+            ),
+            ("the binding ratio", format!("ratio **{ratio:.3}**")),
+        ] {
+            assert!(
+                ledger.contains(&needle),
+                "{what} the fixture produces ({needle}) is not what the \
+                 streams-result-budget entry records"
+            );
+        }
+        for variant in 1..4 {
+            let (r, c) = c463_factor_case(variant);
+            let recorded = format!("{:.3}", r as f64 / c as f64);
+            assert!(
+                ledger.contains(&recorded),
+                "variant {variant}'s ratio {recorded} is not recorded in the ledger"
+            );
+        }
+    }
+
+    /// **Criterion 10(e) — the ledger's term list and the charge
+    /// function's destructured bindings are the same set.**
+    ///
+    /// `entry_category_bytes` destructures `EntryCategories`, so a new
+    /// field without a term is a build failure. This is the other half:
+    /// a new field WITH a term but no ledger row would leave the
+    /// published derivation describing a narrower charge than the one
+    /// that ships.
+    #[test]
+    fn the_categorised_charge_terms_match_the_destructured_bindings() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let charge = std::fs::read_to_string(root.join("crates/pulsus-read/src/logql/charge.rs"))
+            .expect("charge.rs readable");
+        let at = charge
+            .find("let super::exec::EntryCategories {")
+            .expect("entry_category_bytes destructures EntryCategories");
+        let body = &charge[at..at
+            + charge[at..]
+                .find("} = cats;")
+                .expect("destructuring closes")];
+        let mut bindings: Vec<String> = body
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.trim().strip_suffix(','))
+            .map(str::to_string)
+            .collect();
+        bindings.sort();
+        assert_eq!(
+            bindings,
+            vec!["parsed".to_string(), "structured_metadata".to_string()],
+            "the destructured bindings moved"
+        );
+
+        let ledger =
+            std::fs::read_to_string(root.join("docs/benchmarks/logs-differential-ledger.md"))
+                .expect("ledger readable");
+        let at = ledger
+            .find("**The charge's term list**")
+            .expect("the streams-result-budget entry carries the term list");
+        let list = &ledger[at..at + 500];
+        for binding in &bindings {
+            assert!(
+                list.contains(&format!("`{binding}`")),
+                "the ledger's term list does not name `{binding}`"
+            );
+        }
+        for term in [
+            "`alloc_block_bytes`",
+            "`grown_alloc_bytes`",
+            "`size_of::<EntryCategories>()`",
+        ] {
+            assert!(
+                list.contains(term),
+                "the ledger's term list does not name {term}"
             );
         }
     }

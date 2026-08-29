@@ -10,7 +10,7 @@
 use super::detected::{self, DetectedFields, DetectedLabelOut, FieldAccumulator};
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
-use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
+use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, ResponseOptions, TimeBounds};
 use super::pipeline::CompiledPipeline;
 use super::plan::{self, ClientAgg, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::predicate::CheckedLiteral;
@@ -39,13 +39,15 @@ use super::client_agg::{
     CLIENT_AGG_CHUNK_ROWS, ClientAggState, MetricAggState, RangeSlideState, run_client_agg_rows,
 };
 use super::detected_probe::{
-    DetectedPagedState, DetectedRowFeeder, FanOutGroup, LabelScratch, SmFanOutAccumulator,
-    TailCursorTracker, classify_page_error, eval_structured_metadata_row, push_fanout_entry,
-    recycle_label_scratch,
+    DetectedPagedState, DetectedRowFeeder, FanOutGroup, GroupKey, LabelScratch,
+    SmFanOutAccumulator, TailCursorTracker, classify_page_error, eval_structured_metadata_row,
+    push_fanout_entry, recycle_label_scratch, split_categories, split_merged_categories,
 };
 
 use super::labels::{
-    StructuredMetadataCtx, merge_labels_with_structured_metadata, parse_flat_labels, series_labels,
+    EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
+    merge_labels_with_structured_metadata, parse_flat_labels, render_labels_json_sorted,
+    series_labels,
 };
 use super::post_agg::{
     MAX_POST_AGG_BYTES, apply_label_replace, apply_vector_aggs, charged_instant_chain,
@@ -136,9 +138,62 @@ impl EngineConfig {
 pub struct StreamResult {
     pub fingerprint: u64,
     pub service: String,
+    /// With `categorize_labels` (issue #463) this holds the
+    /// STREAM-category labels only; without it, the full final label set
+    /// exactly as before.
     pub labels_json: String,
     /// `(timestamp_ns, body)`, in the plan's requested direction.
     pub entries: Vec<(i64, String)>,
+    /// Parallel to [`Self::entries`] when non-empty (issue #463).
+    ///
+    /// **Empty on every non-categorised response**, which is why that
+    /// path allocates nothing new per entry and stays byte-identical: a
+    /// `StreamResult` grows one empty `Vec` per STREAM (24 B), never per
+    /// entry.
+    pub categories: Vec<EntryCategories>,
+}
+
+/// One entry's non-stream labels (issue #463), split the way
+/// `LabelsBuilder.LabelsResult` splits them
+/// (`pkg/logql/log/labels.go:606-626 @ grafana/loki v3.7.4 b318f282`).
+/// Both vectors are sorted by key and neither may contain a name the
+/// other does.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EntryCategories {
+    /// Rendered under the entry's `structuredMetadata` key.
+    pub structured_metadata: Vec<(String, String)>,
+    /// Rendered under the entry's `parsed` key. Includes `__error__` /
+    /// `__error_details__` — the reference files both under `parsed`
+    /// unconditionally (`labels.go:610-614`), including when they
+    /// arrived as structured metadata.
+    pub parsed: Vec<(String, String)>,
+}
+
+/// Which `values` element shape a stream can serve (issue #463). The
+/// categorised wire shape is all-or-nothing: a three-element entry in a
+/// body that does not advertise `categorize-labels`, or a two-element
+/// entry in one that does, is a hard parse failure in the datasource's
+/// streaming decoder — so the decision is taken once, from the data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireArity {
+    Two,
+    Three,
+}
+
+impl StreamResult {
+    /// `Three` iff [`Self::categories`] is exactly parallel to
+    /// [`Self::entries`].
+    ///
+    /// A stream whose vectors disagree reports `Two`, so a construction
+    /// bug DOWNGRADES the whole response to the two-element shape instead
+    /// of emitting a body no client can parse.
+    pub fn wire_arity(&self) -> WireArity {
+        if !self.entries.is_empty() && self.categories.len() == self.entries.len() {
+            WireArity::Three
+        } else {
+            WireArity::Two
+        }
+    }
 }
 
 /// One instant-query series.
@@ -253,11 +308,24 @@ impl LogQlEngine {
         expr: &Expr,
         params: &QueryParams,
     ) -> Result<(QueryResult, Warnings), ReadError> {
+        self.query_with(expr, params, ResponseOptions::default())
+            .await
+    }
+
+    /// [`Self::query`] with the response-shape options the request asked
+    /// for (issue #463). `ResponseOptions::default()` is the pre-#463
+    /// behaviour exactly.
+    pub async fn query_with(
+        &self,
+        expr: &Expr,
+        params: &QueryParams,
+        opts: ResponseOptions,
+    ) -> Result<(QueryResult, Warnings), ReadError> {
         let ctx = self.config.plan_ctx();
         let mut warnings = Warnings::new();
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => self
-                .run_streams_inner(&sp, None)
+                .run_streams_inner(&sp, None, opts)
                 .await
                 .map(|(items, partial)| (QueryResult::Streams { items, partial }, warnings)),
             // Issue #236: [`MAX_QUERY_SERIES`] is a FINAL-RESULT cap, so it
@@ -292,12 +360,26 @@ impl LogQlEngine {
         expr: &Expr,
         params: &QueryParams,
     ) -> Result<(QueryResult, Warnings, PlanExplain), ReadError> {
+        self.query_explained_with(expr, params, ResponseOptions::default())
+            .await
+    }
+
+    /// [`Self::query_explained`] with the response-shape options the
+    /// request asked for (issue #463).
+    pub async fn query_explained_with(
+        &self,
+        expr: &Expr,
+        params: &QueryParams,
+        opts: ResponseOptions,
+    ) -> Result<(QueryResult, Warnings, PlanExplain), ReadError> {
         let ctx = self.config.plan_ctx();
         let mut warnings = Warnings::new();
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => {
                 let mut explain = PlanExplain::new("streams");
-                let (items, partial) = self.run_streams_inner(&sp, Some(&mut explain)).await?;
+                let (items, partial) = self
+                    .run_streams_inner(&sp, Some(&mut explain), opts)
+                    .await?;
                 Ok((QueryResult::Streams { items, partial }, warnings, explain))
             }
             Plan::Metric(mp) => {
@@ -917,6 +999,7 @@ impl LogQlEngine {
         &self,
         sp: &StreamsPlan,
         mut explain: Option<&mut PlanExplain>,
+        opts: ResponseOptions,
     ) -> Result<(Vec<StreamResult>, bool), ReadError> {
         // Compile before any I/O: a bad regex/template is a 400-class
         // rejection, never a wasted scan.
@@ -978,7 +1061,7 @@ impl LogQlEngine {
             // pre-#312 `filter_map` dropped exactly those) and is what
             // makes the charge equal the returned footprint exactly.
             let mut budget = StreamsResultBudget::new();
-            let mut groups = FastPathGroups::new();
+            let mut groups = FastPathGroups::new_with(opts.categorize_labels);
             let mut stream = self
                 .query_stream::<SampleRow>(&sql, &self.budget_settings())
                 .await?;
@@ -1001,7 +1084,7 @@ impl LogQlEngine {
         // fills, the window exhausts, or the budget is spent.
         if sp.fetch_until_limit {
             return self
-                .run_streams_paged(sp, &compiled, &meta, &services, &fingerprints)
+                .run_streams_paged(sp, &compiled, &meta, &services, &fingerprints, opts)
                 .await;
         }
 
@@ -1016,7 +1099,7 @@ impl LogQlEngine {
         // LIMIT — 5 000 rows x the 64 MiB ingest cap = 320 GiB. Rows now
         // flow through the accumulator's byte-denominated chunk, charged
         // on push and released on flush.
-        let mut acc = StreamAccumulator::new(&meta, sp.result_limit);
+        let mut acc = StreamAccumulator::with_opts(&meta, sp.result_limit, opts);
         {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule).
@@ -1105,13 +1188,14 @@ impl LogQlEngine {
         meta: &HashMap<u64, StreamMetaRow>,
         services: &[CheckedLiteral],
         fingerprints: &[u64],
+        opts: ResponseOptions,
     ) -> Result<(Vec<StreamResult>, bool), ReadError> {
         let budget = self.config.scan_budget_bytes;
         let window = super::sql::TimeWindow {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
         };
-        let mut acc = StreamAccumulator::new(meta, sp.result_limit);
+        let mut acc = StreamAccumulator::with_opts(meta, sp.result_limit, opts);
         let mut st = StreamsPagedState {
             cursor: None,
             spent: 0,
@@ -2009,6 +2093,10 @@ pub struct TailSetup {
     /// partial-failure (older-month-registered) stream resolvable after
     /// the stage-1 month window narrows past its registration month.
     resolved: Vec<u64>,
+    /// The response-shape options the connection was opened with (issue
+    /// #463) — the tail's whole lifetime, since the header is read once
+    /// at upgrade and a WebSocket has no per-frame request.
+    opts: ResponseOptions,
 }
 
 /// Whether a `/stats` pipeline is fully served by pushdown aggregation: a
@@ -2928,6 +3016,17 @@ impl LogQlEngine {
     /// expression or an uncompilable pipeline is a 400-class rejection
     /// here, never a wasted upgrade.
     pub fn tail_setup(&self, expr: &Expr, params: &QueryParams) -> Result<TailSetup, ReadError> {
+        self.tail_setup_with(expr, params, ResponseOptions::default())
+    }
+
+    /// [`Self::tail_setup`] with the response-shape options the upgrade
+    /// request asked for (issue #463).
+    pub fn tail_setup_with(
+        &self,
+        expr: &Expr,
+        params: &QueryParams,
+        opts: ResponseOptions,
+    ) -> Result<TailSetup, ReadError> {
         let ctx = self.config.plan_ctx();
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => {
@@ -2943,6 +3042,7 @@ impl LogQlEngine {
                         plan::year_month(spec_end_ns(&params.spec)),
                     ),
                     resolved: Vec::new(),
+                    opts,
                 })
             }
             Plan::Metric(_) | Plan::MetricBinary(_) => Err(ReadError::PipelineInvalid {
@@ -3065,7 +3165,7 @@ impl LogQlEngine {
         // now charged and chunked as they arrive, and the cursor walks
         // the raw page incrementally through the same
         // [`TailCursorTracker`] the paged loops use.
-        let mut acc = StreamAccumulator::new(&meta, fetch_limit);
+        let mut acc = StreamAccumulator::with_opts(&meta, fetch_limit, setup.opts);
         let mut tracker = TailCursorTracker::new();
         {
             // Scoped: the row stream holds its pooled connection until
@@ -3469,11 +3569,34 @@ impl StreamsPagedState {
 pub(in crate::logql) struct FastPathGroups {
     by_fp: HashMap<u64, StreamResult>,
     sm: SmFanOutAccumulator,
+    /// Issue #463. With `categorize-labels` the response groups by the
+    /// STREAM-category label set, not by fingerprint-or-merged-set — so a
+    /// structured-metadata row rejoins the stream it came from instead of
+    /// fanning out (reference-captured: seven differently-flagged entries
+    /// collapse from seven stream objects to one). Both kinds of row
+    /// therefore land in ONE label-keyed map here, and `by_fp`/`sm` stay
+    /// empty.
+    categorize: bool,
+    cat_groups: HashMap<String, FanOutGroup>,
+    /// Reused per row on the categorised metadata path only — the same
+    /// clear-and-refill discipline `SmFanOutAccumulator` uses.
+    cat_base: HashMap<u64, Vec<(String, String)>>,
+    cat_merge_buf: Vec<(String, String)>,
+    cat_sm_buf: Vec<(String, String)>,
+    cat_sm_ctx: StructuredMetadataCtx,
 }
 
 impl FastPathGroups {
     pub(in crate::logql) fn new() -> Self {
         Self::default()
+    }
+
+    /// [`Self::new`] with the issue #463 wire-shape decision stated.
+    pub(in crate::logql) fn new_with(categorize: bool) -> Self {
+        Self {
+            categorize,
+            ..Self::default()
+        }
     }
 
     /// Charges the group on FIRST SIGHT of the fingerprint and the entry
@@ -3488,31 +3611,112 @@ impl FastPathGroups {
         let Some(m) = meta.get(&row.fingerprint) else {
             return Ok(());
         };
+        if self.categorize {
+            return self.push_row_categorized(row, m, budget);
+        }
         if !row.structured_metadata.is_empty() {
             return self.sm.push_row(&row, meta, budget);
         }
         match self.by_fp.entry(row.fingerprint) {
             std::collections::hash_map::Entry::Occupied(e) => {
-                budget.charge_entry(row.body.len())?;
+                budget.charge_entry(row.body.len(), 0)?;
                 e.into_mut().entries.push((row.timestamp_ns, row.body));
             }
             std::collections::hash_map::Entry::Vacant(e) => {
                 budget.charge_group(&m.labels, &m.service)?;
-                budget.charge_entry(row.body.len())?;
+                budget.charge_entry(row.body.len(), 0)?;
                 e.insert(StreamResult {
                     fingerprint: row.fingerprint,
                     service: m.service.clone(),
                     labels_json: m.labels.clone(),
                     entries: vec![(row.timestamp_ns, row.body)],
+                    categories: Vec::new(),
                 });
             }
         }
         Ok(())
     }
 
+    /// The issue #463 categorised branch. No pipeline runs on this path,
+    /// so the stream category is the hydrated `labels_json` VERBATIM
+    /// unless a metadata value took over one of its slots — which is the
+    /// only case that re-renders, and is what makes the common row cost
+    /// exactly one hash probe more than the plain path.
+    fn push_row_categorized(
+        &mut self,
+        row: SampleRow,
+        m: &StreamMetaRow,
+        budget: &mut StreamsResultBudget,
+    ) -> Result<(), ReadError> {
+        if row.structured_metadata.is_empty() {
+            return push_fanout_entry(
+                &mut self.cat_groups,
+                budget,
+                GroupKey::Rendered {
+                    labels_json: m.labels.clone(),
+                    fingerprint: row.fingerprint,
+                },
+                row.timestamp_ns,
+                Cow::Owned(row.body),
+                &m.service,
+                Some(EntryCategories::default()),
+            );
+        }
+        let base = self
+            .cat_base
+            .entry(row.fingerprint)
+            .or_insert_with(|| parse_flat_labels(&m.labels));
+        merge_labels_with_structured_metadata(
+            base,
+            &row.structured_metadata,
+            &mut self.cat_merge_buf,
+            &mut self.cat_sm_buf,
+            &mut self.cat_sm_ctx,
+        );
+        let categories = split_merged_categories(&mut self.cat_merge_buf, &self.cat_sm_ctx);
+        // The stream half is unchanged from the hydrated set unless a
+        // metadata value won a stream slot, so the canonical JSON is
+        // already in hand for every ordinary row.
+        let (labels_json, fingerprint) = if self.cat_sm_ctx.sm_over_stream.is_empty() {
+            (m.labels.clone(), row.fingerprint)
+        } else {
+            let sorted: Vec<(Cow<'_, str>, Cow<'_, str>)> = self
+                .cat_merge_buf
+                .iter()
+                .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
+                .collect();
+            let json = render_labels_json_sorted(&sorted);
+            let fp = fnv1a64(json.as_bytes());
+            (json, fp)
+        };
+        push_fanout_entry(
+            &mut self.cat_groups,
+            budget,
+            GroupKey::Rendered {
+                labels_json,
+                fingerprint,
+            },
+            row.timestamp_ns,
+            Cow::Owned(row.body),
+            &m.service,
+            Some(categories),
+        )
+    }
+
     pub(in crate::logql) fn into_streams(self) -> Vec<StreamResult> {
         let mut streams: Vec<StreamResult> = self.by_fp.into_values().collect();
         streams.extend(self.sm.into_streams());
+        streams.extend(
+            self.cat_groups
+                .into_iter()
+                .map(|(labels_json, g)| StreamResult {
+                    fingerprint: g.fingerprint,
+                    service: g.service,
+                    labels_json,
+                    entries: g.entries,
+                    categories: g.categories,
+                }),
+        );
         streams
     }
 }
@@ -3532,6 +3736,16 @@ impl StreamsFastPathProbe {
     pub fn with_cap(cap: u64) -> Self {
         Self {
             groups: FastPathGroups::new(),
+            budget: StreamsResultBudget::with_cap(cap),
+        }
+    }
+
+    /// [`Self::with_cap`] with the issue #463 categorised wire shape, so
+    /// a gate on the categorised charge drives the shipped accumulator
+    /// rather than a formula written beside it.
+    pub fn with_cap_categorized(cap: u64) -> Self {
+        Self {
+            groups: FastPathGroups::new_with(true),
             budget: StreamsResultBudget::with_cap(cap),
         }
     }
@@ -3653,11 +3867,29 @@ pub struct StreamAccumulator<'m> {
     /// [`STREAM_FEED_CHUNK_BYTES`] rather than by a row count — a row
     /// count is exactly the proxy issue #312 exists to reject.
     chunk: Vec<SampleRow>,
+    /// Issue #463. With `categorize-labels` EVERY surviving row — plain,
+    /// transform and fan-out alike — is keyed by its STREAM-category
+    /// label set, so all three land in `label_groups` and `fp_groups`
+    /// stays empty. That single map is what makes a stream's
+    /// differently-flagged entries collapse back into one object, which
+    /// is what the reference returns under the flag.
+    categorize: bool,
 }
 
 impl<'m> StreamAccumulator<'m> {
     pub fn new(meta: &'m HashMap<u64, StreamMetaRow>, result_limit: u32) -> Self {
         Self::with_cap(meta, result_limit, MAX_STREAMS_RESULT_BYTES)
+    }
+
+    /// [`Self::new`] with the issue #463 wire-shape decision stated.
+    pub fn with_opts(
+        meta: &'m HashMap<u64, StreamMetaRow>,
+        result_limit: u32,
+        opts: super::params::ResponseOptions,
+    ) -> Self {
+        let mut acc = Self::with_cap(meta, result_limit, MAX_STREAMS_RESULT_BYTES);
+        acc.categorize = opts.categorize_labels;
+        acc
     }
 
     /// A test-visible ceiling; production sites call [`Self::new`].
@@ -3675,6 +3907,7 @@ impl<'m> StreamAccumulator<'m> {
             survivors: 0,
             budget: StreamsResultBudget::with_cap(cap),
             chunk: Vec::new(),
+            categorize: false,
         }
     }
 
@@ -3757,8 +3990,13 @@ impl<'m> StreamAccumulator<'m> {
             // here, so `feed` never sees it. Named rather than elided so a
             // future field is a build failure, not a silent omission.
             chunk: _,
+            categorize,
         } = self;
-        let fan_out = compiled.mutates_labels();
+        let categorize = *categorize;
+        // Categorised mode groups by the stream-category subset, which is
+        // a rendered label set for every row — so it takes the fan-out
+        // shape whatever the pipeline does.
+        let fan_out = compiled.mutates_labels() || categorize;
         // One label scratch reused across every row of this page (issue
         // #72 review round 1, finding 3): `run_into` clears and refills the
         // same vector — zero per-row label-vector allocations on the
@@ -3778,6 +4016,10 @@ impl<'m> StreamAccumulator<'m> {
         // `eval_structured_metadata_row` for why the reuse goes through a
         // by-value helper rather than a hoisted `&mut` binding.
         let mut sm_scratch: LabelScratch<'static> = Vec::new();
+        // Issue #463: the per-label category vector the categorised
+        // pipeline fills, reused across rows exactly like the label
+        // scratch beside it. Never touched when the flag is off.
+        let mut cat_scratch: Vec<super::pipeline::LabelCategory> = Vec::new();
         // The per-row reserved-SM routing outcome (issue #238), cleared and
         // refilled by the merge — reused across rows like the buffers above.
         let mut sm_ctx = StructuredMetadataCtx::default();
@@ -3795,9 +4037,18 @@ impl<'m> StreamAccumulator<'m> {
                 // Zero-structured-metadata fast path — UNCHANGED (the
                 // `logql_pipeline_alloc` golden pins its zero-per-row
                 // profile; AC-8 byte-identity for pre-#97 data).
-                let Some(line) =
+                let Some(line) = (if categorize {
+                    compiled.run_into_with_sm_categorized(
+                        &row.body,
+                        base,
+                        row.timestamp_ns,
+                        &EMPTY_STRUCTURED_METADATA,
+                        &mut scratch,
+                        &mut cat_scratch,
+                    )?
+                } else {
                     compiled.run_into(&row.body, base, row.timestamp_ns, &mut scratch)?
-                else {
+                }) else {
                     continue;
                 };
                 *survivors += 1;
@@ -3809,14 +4060,20 @@ impl<'m> StreamAccumulator<'m> {
                     // `labels_json` string (needed as the group key either
                     // way) + the owned output line; the `StreamResult` fields
                     // materialize once per NEW group only.
+                    // Issue #463: split BEFORE the sort — the category
+                    // vector is parallel to the label vector in the
+                    // order the pipeline left it.
+                    let categories =
+                        categorize.then(|| split_categories(&mut scratch, &cat_scratch));
                     scratch.sort_unstable();
                     push_fanout_entry(
                         label_groups,
                         budget,
-                        &scratch,
+                        GroupKey::Sorted(&scratch),
                         row.timestamp_ns,
                         line,
                         &m.service,
+                        categories,
                     )?;
                 } else {
                     // Issue #312: the group is charged on FIRST SIGHT of
@@ -3825,19 +4082,20 @@ impl<'m> StreamAccumulator<'m> {
                     // the owned line exists when the cap refuses.
                     match fp_groups.entry(row.fingerprint) {
                         std::collections::hash_map::Entry::Occupied(e) => {
-                            budget.charge_entry(line.len())?;
+                            budget.charge_entry(line.len(), 0)?;
                             e.into_mut()
                                 .entries
                                 .push((row.timestamp_ns, line.into_owned()));
                         }
                         std::collections::hash_map::Entry::Vacant(e) => {
                             budget.charge_group(&m.labels, &m.service)?;
-                            budget.charge_entry(line.len())?;
+                            budget.charge_entry(line.len(), 0)?;
                             e.insert(StreamResult {
                                 fingerprint: row.fingerprint,
                                 service: m.service.clone(),
                                 labels_json: m.labels.clone(),
                                 entries: vec![(row.timestamp_ns, line.into_owned())],
+                                categories: Vec::new(),
                             });
                         }
                     }
@@ -3869,6 +4127,7 @@ impl<'m> StreamAccumulator<'m> {
                     row.timestamp_ns,
                     &m.service,
                     sm_scratch,
+                    categorize.then_some(&mut cat_scratch),
                 );
                 sm_scratch = recycle_label_scratch(used?);
                 if survived {
@@ -3891,6 +4150,7 @@ impl<'m> StreamAccumulator<'m> {
                         service: g.service,
                         labels_json,
                         entries: g.entries,
+                        categories: g.categories,
                     }),
             )
             .collect()
@@ -5381,6 +5641,7 @@ mod tests {
                     scan_floor_ns: start_ns,
                     covered_months: (plan::year_month(start_ns), plan::year_month(end_ns)),
                     resolved: Vec::new(),
+                    opts: ResponseOptions::default(),
                 }
             }
             _ => panic!("stream selector must plan to Plan::Streams"),

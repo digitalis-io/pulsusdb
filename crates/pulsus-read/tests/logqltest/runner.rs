@@ -106,9 +106,24 @@ fn compile_for_corpus(stages: &[Stage]) -> Result<CompiledPipeline, String> {
              exclude."
         ));
     }
-    // Pin the template environment to the capture precondition (stock
-    // container: degenerate-UTC Local, PROVENANCE §230) so goldens
-    // replay identically on any host/CI timezone.
+    // Pin the template ZONE to the capture precondition (stock
+    // container: degenerate-UTC `Local`, PROVENANCE §230) so a golden
+    // replays on any host/CI timezone.
+    //
+    // **The CLOCK is not pinned, and this is not a timezone caveat.**
+    // `TemplateEnv::default()` leaves `now_ns` at `None` (the derive at
+    // `template/timefns.rs:41`, the field at `:51`), so
+    // `TemplateEnv::now()` reads `SystemTime::now()` (`:76-85`). A
+    // corpus case whose output depends on `now` therefore does NOT
+    // replay identically here — it would differ between two runs on the
+    // same host. No shipped case does, which is why nothing has caught
+    // it; `with_template_env` takes an injectable `now_ns` for the case
+    // that needs one.
+    //
+    // An earlier reading of the old comment took "replay identically" as
+    // covering the clock and concluded PulsusDB was insulated from
+    // wall-clock drift where the reference is not (issue #463, plan v10,
+    // withdrawn in v11). It is not; the exposure is symmetric.
     Ok(compiled.with_template_env(TemplateEnv::default()))
 }
 

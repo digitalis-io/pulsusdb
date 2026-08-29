@@ -1120,6 +1120,70 @@ fn trim_start_unicode_space(s: &str) -> &str {
     s.trim_start_matches(|c: char| c.is_whitespace())
 }
 
+// ---------------------------------------------------------------------
+// `X-Loki-Response-Encoding-Flags` (issue #463)
+// ---------------------------------------------------------------------
+
+/// The one encoding flag this build understands.
+pub(crate) const CATEGORIZE_LABELS: &str = "categorize-labels";
+
+/// Parses `X-Loki-Response-Encoding-Flags` exactly as the reference's
+/// `httpreq.ParseEncodingFlags` does
+/// (`pkg/util/httpreq/encoding_flags.go:98-108 @ grafana/loki v3.7.4
+/// b318f282`), and every clause below is a measured wire behaviour, not a
+/// reading:
+///
+/// * **First header value only.** Sent twice — `foo` then
+///   `categorize-labels` — the reference echoes `["foo"]` and serves
+///   two-element values. `HeaderMap::get` matches that; `get_all` would
+///   not.
+/// * **An absent-or-empty field yields nothing at all.** The reference
+///   returns nil before it splits, so a present-but-empty header emits no
+///   `encodingFlags` key rather than an array holding one empty string.
+///   This is a different case from an empty TOKEN — see below.
+/// * **Split on `,` and do NOT trim.** `foo, categorize-labels` echoes
+///   `["foo"," categorize-labels"]` and serves **two**-element values,
+///   because `" categorize-labels"` is not the flag. Whitespace around a
+///   comma therefore changes the wire ARITY, not merely the echo.
+/// * **Exact, case-sensitive token match.** `CATEGORIZE-LABELS` echoes
+///   verbatim and serves two-element values.
+/// * **Empty tokens are kept.** `foo,,categorize-labels` echoes a
+///   THREE-element array containing the empty string — the reference's
+///   `EncodingFlags` is a map and the empty string is a legitimate key.
+/// * **Duplicates collapse, first occurrence wins the position.**
+///   `foo,categorize-labels,foo` echoes two tokens.
+///
+/// The echo ORDER is ours: the reference iterates a Go map built fresh per
+/// request, so its order is not stable (measured 183/17 over 200 requests
+/// on a two-token header). We emit first-occurrence request order — the
+/// same content, deterministically. Ledgered as `encoding-flags-echo-order`.
+pub(crate) fn encoding_flags(headers: &axum::http::HeaderMap) -> Vec<String> {
+    let Some(raw) = headers
+        .get("x-loki-response-encoding-flags")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for tok in raw.split(',') {
+        if !out.iter().any(|s| s == tok) {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// Whether the parsed flag list carries the exact `categorize-labels`
+/// token. Separate from [`encoding_flags`] because the ECHO and the
+/// DECISION are two outputs: an unknown flag is echoed verbatim while
+/// changing nothing about the wire shape.
+pub(crate) fn wants_categorize_labels(flags: &[String]) -> bool {
+    flags.iter().any(|f| f == CATEGORIZE_LABELS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2815,5 +2879,154 @@ mod tests {
             parse_pattern_step(get(&empty, "k"), start_ns, end_ns).unwrap(),
             parse_pattern_step(get(&absent, "k"), start_ns, end_ns).unwrap()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #463 — `X-Loki-Response-Encoding-Flags`
+    // -----------------------------------------------------------------
+
+    fn hdr(values: &[&str]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for v in values {
+            h.append(
+                "x-loki-response-encoding-flags",
+                axum::http::HeaderValue::from_str(v).expect("header value"),
+            );
+        }
+        h
+    }
+
+    /// **Criterion 6 — the header parser reproduces every measured wire
+    /// case.**
+    ///
+    /// Fourteen rows, each captured against the pinned reference
+    /// container by issuing the same `query_range` request with only the
+    /// header varied, and recording the `encodingFlags` array it echoed
+    /// and the ARITY of the first `values` entry. The arity column is
+    /// what makes rows 7, 9 and 10 wire-observable rather than an echo
+    /// detail: whitespace around a comma stops the token being the flag,
+    /// so a trimming parser serves three-element values where the
+    /// reference serves two.
+    ///
+    /// Row 5 is the two-header-lines case and it is the one an HTTP
+    /// client can silently get wrong — a client that REPLACES rather than
+    /// appends sends one header and measures the wrong thing. It was
+    /// captured with two literal header lines on the wire, verified in
+    /// the request trace.
+    #[test]
+    fn the_encoding_flags_header_parses_as_the_reference_does() {
+        // (id, header values as sent, echoed tokens, wants categorize)
+        let cases: &[(&str, &[&str], &[&str], bool)] = &[
+            ("H1", &["foo"], &["foo"], false),
+            (
+                "H2",
+                &["categorize-labels,foo"],
+                &["categorize-labels", "foo"],
+                true,
+            ),
+            (
+                "H3",
+                &["  categorize-labels"],
+                &["  categorize-labels"],
+                false,
+            ),
+            ("H4", &[""], &[], false),
+            ("H5", &["foo", "categorize-labels"], &["foo"], false),
+            ("H6", &["CATEGORIZE-LABELS"], &["CATEGORIZE-LABELS"], false),
+            (
+                "H7",
+                &["foo, categorize-labels"],
+                &["foo", " categorize-labels"],
+                false,
+            ),
+            (
+                "H8",
+                &["categorize-labels, foo"],
+                &["categorize-labels", " foo"],
+                true,
+            ),
+            (
+                "H9",
+                &["categorize-labels ,foo"],
+                &["categorize-labels ", "foo"],
+                false,
+            ),
+            (
+                "H10",
+                &["foo,\tcategorize-labels"],
+                &["foo", "\tcategorize-labels"],
+                false,
+            ),
+            ("H11", &["foo,foo"], &["foo"], false),
+            (
+                "H12",
+                &["categorize-labels,categorize-labels"],
+                &["categorize-labels"],
+                true,
+            ),
+            (
+                "H13",
+                &["foo,categorize-labels,foo"],
+                &["foo", "categorize-labels"],
+                true,
+            ),
+            (
+                "H14",
+                &["foo,,categorize-labels"],
+                &["foo", "", "categorize-labels"],
+                true,
+            ),
+        ];
+        // COLLECTED, not asserted eagerly. A mutation's signature is the
+        // set of cases it moves and WHICH half of each it moves — the
+        // echo or the arity — and a loop that stops at the first case
+        // reports a prefix of it. Under a trimming parser, for instance,
+        // case 8 moves on the echo alone while 7, 9 and 10 move on the
+        // arity too, and only the whole set separates that from a
+        // separator change.
+        let mut failed: Vec<String> = Vec::new();
+        for (id, sent, echoed, wants) in cases {
+            let flags = encoding_flags(&hdr(sent));
+            let want_echo: Vec<String> = echoed.iter().map(|s| (*s).to_string()).collect();
+            if flags != want_echo {
+                failed.push(format!("{id}:E"));
+                eprintln!("c463 header FAIL {id}:E sent={sent:?} got={flags:?} want={want_echo:?}");
+            }
+            if wants_categorize_labels(&flags) != *wants {
+                failed.push(format!("{id}:A"));
+                eprintln!("c463 header FAIL {id}:A sent={sent:?} want={wants}");
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "the header parser disagrees with the measured wire cases; signature: {failed:?}"
+        );
+    }
+
+    /// H3's leading whitespace never reaches this parser in production —
+    /// the HTTP layer strips optional whitespace after the colon — so the
+    /// case is recorded here for what the parser does with it if it ever
+    /// arrives, and the WIRE answer it pins is H3's `["categorize-labels"]`
+    /// with three-element values, which the live suite asserts end to end.
+    #[test]
+    fn leading_optional_whitespace_is_stripped_by_the_http_layer_not_here() {
+        let mut h = axum::http::HeaderMap::new();
+        // `HeaderValue::from_str` keeps what it is given; a real request
+        // line `X-...: <SP><SP>categorize-labels` arrives already trimmed.
+        h.insert(
+            "x-loki-response-encoding-flags",
+            axum::http::HeaderValue::from_str("categorize-labels").expect("value"),
+        );
+        assert!(wants_categorize_labels(&encoding_flags(&h)));
+    }
+
+    /// An absent header and a present-but-empty one are the same on the
+    /// wire — no `encodingFlags` key at all — and both are DIFFERENT from
+    /// an empty TOKEN, which H14 shows is kept.
+    #[test]
+    fn an_absent_header_and_an_empty_one_both_echo_nothing() {
+        assert!(encoding_flags(&axum::http::HeaderMap::new()).is_empty());
+        assert!(encoding_flags(&hdr(&[""])).is_empty());
+        assert_eq!(encoding_flags(&hdr(&["foo,,categorize-labels"])).len(), 3);
     }
 }

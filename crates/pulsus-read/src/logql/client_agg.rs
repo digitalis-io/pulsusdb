@@ -6817,6 +6817,7 @@ mod tests {
             details: String::new(),
             has_ordinary: false,
             stream_label_count: None,
+            sm_over_stream: Vec::new(),
         };
         let mut labels = Vec::new();
         compiled
@@ -6828,6 +6829,7 @@ mod tests {
             details: "bdet".to_string(),
             has_ordinary: false,
             stream_label_count: None,
+            sm_over_stream: Vec::new(),
         };
         let mut labels = Vec::new();
         compiled
