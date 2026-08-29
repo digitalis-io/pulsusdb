@@ -7,7 +7,8 @@ pub mod annotations;
 pub mod error;
 pub mod eval;
 /// The parsed-expression depth cap (issue #262) — see the module doc
-/// for why it exists and `docs/api.md` §3.5 for the divergence row.
+/// for why it exists and `docs/benchmarks/metrics-differential-ledger.md`
+/// for the divergence row (moved out of `docs/api.md` §3.5 by issue #461).
 pub mod limits;
 pub mod math;
 pub mod parser;

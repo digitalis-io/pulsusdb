@@ -27,8 +27,8 @@ pub use error::ConfigError;
 pub use load::{load, parse};
 pub use model::{
     AzDetect, ChAuth, ChProto, ChServerEntry, ClickHouseConfig, Config, DownsamplingConfig,
-    ExpHistogramMode, InsertMode, LogLevel, Mode, ReaderConfig, RulerConfig, Tier, TierPolicy,
-    WriterConfig,
+    ExpHistogramMode, InsertMode, LogLevel, Mode, OtlpTranslationStrategy, ReaderConfig,
+    RulerConfig, Tier, TierPolicy, WriterConfig,
 };
 pub use secret::Secret;
 pub use timezone::{TemplateTimezone, UnknownTimezone};

@@ -19,8 +19,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
-use pulsus_config::ExpHistogramMode;
 use pulsus_write::protocols::otlp_metrics;
+use pulsus_write::protocols::otlp_metrics::MetricIngestSettings;
 use pulsus_write::protocols::remote_write::{
     Label, MetricMetadataProto, Sample, TimeSeries, WriteRequest, parse as rw_parse,
 };
@@ -73,13 +73,19 @@ fn rw_label(name: &str, value: &str) -> Label {
     }
 }
 
+/// The remote-write half carries `job`, not `service_name` (issue #461):
+/// an OpenTelemetry collector's `prometheusremotewrite` exporter derives
+/// `job` from `service.namespace`/`service.name` before it writes, so this
+/// is the label an OTLP-sourced series actually arrives with on that
+/// transport. The pre-#461 fixture used `service_name`, the logs
+/// convention, which our OTLP metrics receiver no longer emits.
 fn rw_request(metric_name: &str, host: &str, service: &str) -> WriteRequest {
     WriteRequest {
         timeseries: vec![TimeSeries {
             labels: vec![
                 rw_label("__name__", metric_name),
                 rw_label("host", host),
-                rw_label("service_name", service),
+                rw_label("job", service),
             ],
             samples: vec![Sample {
                 value: 1.0,
@@ -95,9 +101,9 @@ fn rw_request(metric_name: &str, host: &str, service: &str) -> WriteRequest {
 }
 
 /// Test gap 2 (code review): the same logical series (`up{host="node-a",
-/// service_name="checkout"}`) pushed via OTLP (resource `service.name`
+/// job="checkout"}`) pushed via OTLP (resource `service.name`
 /// attribute + data point `host` attribute) and via remote-write (`host`/
-/// `service_name` labels directly) must resolve to the identical
+/// `job` labels directly) must resolve to the identical
 /// `(metric_name, fingerprint)` — proving both receivers' label
 /// normalization + fingerprinting paths converge on one series identity
 /// regardless of transport, not just self-consistently within each
@@ -105,7 +111,7 @@ fn rw_request(metric_name: &str, host: &str, service: &str) -> WriteRequest {
 #[test]
 fn same_logical_series_fingerprints_identically_across_otlp_and_remote_write() {
     let otlp_req = otlp_gauge_request("up", "node-a", "checkout");
-    let otlp_out = otlp_metrics::parse(&otlp_req, 0, ExpHistogramMode::Classic)
+    let otlp_out = otlp_metrics::parse(&otlp_req, 0, MetricIngestSettings::default())
         .expect("within the expansion budget");
 
     let rw_req = rw_request("up", "node-a", "checkout");
@@ -128,19 +134,20 @@ fn same_logical_series_fingerprints_identically_across_otlp_and_remote_write() {
         rw_out.series[0].labels.get("host")
     );
     assert_eq!(
-        otlp_out.series[0].labels.get("service_name"),
-        rw_out.series[0].labels.get("service_name")
+        otlp_out.series[0].labels.get("job"),
+        rw_out.series[0].labels.get("job")
     );
+    assert_eq!(otlp_out.series[0].labels.get("job"), Some("checkout"));
 }
 
-/// The dot-vs-underscore normalization form of the same cross-transport
-/// identity: OTLP's `service.name` resource attribute (normalized to
-/// `service_name`) must fingerprint identically to remote-write's
-/// already-underscored `service_name` label.
+/// The derivation form of the same cross-transport identity: OTLP's
+/// `service.name` resource attribute becomes `job`
+/// (`metrics_to_prw.go:420-426 @ v3.13.0`), which must fingerprint
+/// identically to a remote-write `job` label carrying the same value.
 #[test]
-fn dotted_otlp_attribute_and_underscored_remote_write_label_fingerprint_identically() {
+fn otlp_derived_job_and_remote_write_job_label_fingerprint_identically() {
     let otlp_req = otlp_gauge_request("cpu_usage_ratio", "node-b", "billing");
-    let otlp_out = otlp_metrics::parse(&otlp_req, 0, ExpHistogramMode::Classic)
+    let otlp_out = otlp_metrics::parse(&otlp_req, 0, MetricIngestSettings::default())
         .expect("within the expansion budget");
 
     let rw_req = rw_request("cpu_usage_ratio", "node-b", "billing");
@@ -213,7 +220,7 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_gauge",
     );
-    let otlp_gauge_type = otlp_metrics::parse(&gauge_req, 0, ExpHistogramMode::Classic)
+    let otlp_gauge_type = otlp_metrics::parse(&gauge_req, 0, MetricIngestSettings::default())
         .expect("within the expansion budget")
         .metadata[0]
         .metric_type
@@ -236,7 +243,7 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_counter",
     );
-    let otlp_counter_type = otlp_metrics::parse(&counter_req, 0, ExpHistogramMode::Classic)
+    let otlp_counter_type = otlp_metrics::parse(&counter_req, 0, MetricIngestSettings::default())
         .expect("within the expansion budget")
         .metadata[0]
         .metric_type
@@ -263,11 +270,12 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_histogram",
     );
-    let otlp_histogram_type = otlp_metrics::parse(&histogram_req, 0, ExpHistogramMode::Classic)
-        .expect("within the expansion budget")
-        .metadata[0]
-        .metric_type
-        .clone();
+    let otlp_histogram_type =
+        otlp_metrics::parse(&histogram_req, 0, MetricIngestSettings::default())
+            .expect("within the expansion budget")
+            .metadata[0]
+            .metric_type
+            .clone();
     assert_eq!(
         otlp_histogram_type,
         rw_metadata_type_string(3, "a_histogram")
@@ -291,7 +299,7 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_summary",
     );
-    let otlp_summary_type = otlp_metrics::parse(&summary_req, 0, ExpHistogramMode::Classic)
+    let otlp_summary_type = otlp_metrics::parse(&summary_req, 0, MetricIngestSettings::default())
         .expect("within the expansion budget")
         .metadata[0]
         .metric_type

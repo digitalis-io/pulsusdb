@@ -115,6 +115,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: |ctx| Box::pin(crate::metrics::metrics_differential(ctx)),
     },
     Scenario {
+        name: "otlp_metrics_naming_differential",
+        // Single-variant (issue #461): one OTLP push to each backend plus
+        // one `/api/v1/series` diff and one `query_range` — it adds no new
+        // job and no new image, and the cluster overlay would only re-test
+        // `_dist` fan-out that `metrics_differential` already covers. It is
+        // the ONLY leg that reaches PulsusDB's OTLP metrics receiver: the
+        // collector fans `metrics_differential` out as remote write, so
+        // `otlp_metrics::parse` is never invoked there.
+        variants: &[Variant::Single],
+        run: |ctx| Box::pin(crate::otlp_naming::otlp_metrics_naming_differential(ctx)),
+    },
+    Scenario {
         name: "traces_roundtrip",
         // Both variants (issue #60 architect plan, mirroring
         // `logs_roundtrip`): the M4 DoD's "collector traces pipeline

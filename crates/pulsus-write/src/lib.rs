@@ -21,7 +21,9 @@ pub use protocols::loki_push::{
     parse_protobuf as parse_loki_protobuf,
 };
 pub use protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow, decode, parse};
-pub use protocols::otlp_metrics::{decode as decode_metrics, parse as parse_metrics};
+pub use protocols::otlp_metrics::{
+    MetricIngestSettings, decode as decode_metrics, parse as parse_metrics,
+};
 pub use protocols::otlp_traces::{decode as decode_traces, parse as parse_traces};
 pub use protocols::remote_write::{
     WriteRequest, decode as decode_remote_write, parse as parse_remote_write,

@@ -104,6 +104,12 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --web.enable-remote-write-receiver
+      # Issue #461: `otlp_metrics_naming_differential` pushes the
+      # identical OTLP body to this oracle's own OTLP receiver and to
+      # PulsusDB's `POST /v1/metrics`, then diffs the series each
+      # stores. Off by default at v3.13.0; enabling it changes nothing
+      # for `metrics_differential`, which fans in over remote write.
+      - --web.enable-otlp-receiver
       # Issue #84 (M6-08b): duration expressions are gated behind this
       # feature flag at v3.13.0 (OFF by default) — the oracle's feature
       # set must match the pulsus experimental gate the differential

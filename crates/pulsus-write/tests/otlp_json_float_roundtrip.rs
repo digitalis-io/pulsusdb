@@ -63,7 +63,7 @@
 
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueEnum;
 use opentelemetry_proto::tonic::metrics::v1::{metric, number_data_point};
-use pulsus_config::ExpHistogramMode;
+use pulsus_write::protocols::otlp_metrics::MetricIngestSettings;
 use pulsus_write::protocols::{otlp_logs, otlp_metrics, otlp_traces};
 
 /// A decimal literal on which the correctly-rounded parser and `serde_json`'s
@@ -381,8 +381,12 @@ fn gauge_as_double_decodes_to_the_nearest_representable_f64() {
 #[test]
 fn gauge_as_double_reaches_metric_point_value_unchanged() {
     let req = otlp_metrics::decode_json(&gauge_body()).expect("gauge body decodes");
-    let parsed = otlp_metrics::parse(&req, 1_700_000_000_000_000_001, ExpHistogramMode::Classic)
-        .expect("gauge body parses");
+    let parsed = otlp_metrics::parse(
+        &req,
+        1_700_000_000_000_000_001,
+        MetricIngestSettings::default(),
+    )
+    .expect("gauge body parses");
     assert_eq!(parsed.rejected, 0, "no data point may be dropped");
     assert_eq!(parsed.samples.len(), VECTORS.len());
     for (v, s) in VECTORS.iter().zip(&parsed.samples) {

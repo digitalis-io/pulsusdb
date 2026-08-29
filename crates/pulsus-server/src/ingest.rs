@@ -234,13 +234,17 @@ pub(crate) async fn ingest_metrics(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    pulsus_write::ingest_metrics(
-        state.metric_writer.as_ref(),
-        headers,
-        body,
-        state.config.exp_histogram_mode,
-    )
-    .await
+    let settings = pulsus_write::MetricIngestSettings {
+        exp_histogram_mode: state.config.exp_histogram_mode,
+        translation_strategy: state.config.otlp_translation_strategy,
+        promote_scope_metadata: state.config.otlp_promote_scope_metadata,
+        // `target_info`'s cadence is the PromQL lookback halved
+        // (`helper.go:560-567 @ v3.13.0`), so the write path reads the same
+        // knob the read path evaluates against.
+        promql_lookback_ms: i64::try_from(state.config.reader.promql_lookback.0.as_millis())
+            .unwrap_or(i64::MAX),
+    };
+    pulsus_write::ingest_metrics(state.metric_writer.as_ref(), headers, body, settings).await
 }
 
 /// `POST /v1/traces` (docs/api.md §1.1, issue #54): pulls `AppState`'s

@@ -101,7 +101,7 @@ impl IntoResponse for ApiError {
 /// | source | HTTP | `errorType` |
 /// |---|---|---|
 /// | `PromqlError::Parse` (position **in** the message) | 400 | `bad_data` |
-/// | `PromqlError::ExprTooDeep` (issue #262, docs/api.md §3.5) | 400 | `bad_data` |
+/// | `PromqlError::ExprTooDeep` (issue #262, docs/benchmarks/metrics-differential-ledger.md) | 400 | `bad_data` |
 /// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet,ScalarOp,ExtendedHistogram}` | 422 | `execution` |
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
@@ -129,7 +129,8 @@ fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
         // query. Prometheus has no such rejection at all (it grows its
         // stacks and answers the query), which is why this is a
         // ledgered divergence rather than a parity fix: docs/api.md
-        // §3.5, row `promql-expression-depth-cap`.
+        // docs/benchmarks/metrics-differential-ledger.md, row
+        // `promql-expression-depth-cap`.
         PromqlError::Parse(_)
         | PromqlError::InvalidRegexMatcher { .. }
         | PromqlError::ExprTooDeep { .. } => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),

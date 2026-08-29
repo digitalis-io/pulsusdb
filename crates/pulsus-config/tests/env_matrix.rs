@@ -15,7 +15,8 @@ mod support;
 use std::time::Duration;
 
 use pulsus_config::{
-    ByteSize, ChProto, Config, ExpHistogramMode, InsertMode, LogLevel, Mode, TierPolicy,
+    ByteSize, ChProto, Config, ExpHistogramMode, InsertMode, LogLevel, Mode,
+    OtlpTranslationStrategy, TierPolicy,
 };
 
 struct Row {
@@ -237,6 +238,16 @@ const ROWS: &[Row] = &[
         check: |c| c.exp_histogram_mode == ExpHistogramMode::Native,
     },
     Row {
+        var: "PULSUS_OTLP_TRANSLATION_STRATEGY",
+        value: "NoTranslation",
+        check: |c| c.otlp_translation_strategy == OtlpTranslationStrategy::NoTranslation,
+    },
+    Row {
+        var: "PULSUS_OTLP_PROMOTE_SCOPE_METADATA",
+        value: "true",
+        check: |c| c.otlp_promote_scope_metadata,
+    },
+    Row {
         var: "PULSUS_CACHE_TTL",
         value: "90s",
         check: |c| c.reader.cache_ttl.0 == Duration::from_secs(90),
@@ -416,8 +427,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        73,
-        "docs/configuration.md §§1-8 document exactly 73 variables"
+        75,
+        "docs/configuration.md §§1-8 document exactly 75 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();
@@ -445,6 +456,63 @@ fn each_documented_env_var_parses_in_isolation() {
             row.value
         );
     }
+
+    support::clear_all();
+}
+
+/// `PULSUS_OTLP_TRANSLATION_STRATEGY` has four valid values, spelled
+/// exactly as Prometheus v3.13.0 spells them
+/// (`otlptranslator@v1.0.0/strategy.go:254-289`) so a value copied out of
+/// a Prometheus `otlp:` block means the same thing here. The ROWS matrix
+/// exercises only `NoTranslation` (one row per variable, by set equality);
+/// this covers the rest, the default, the round trip, and that a
+/// lower-cased spelling is a parse error rather than a silent default.
+#[test]
+fn otlp_translation_strategy_parses_every_reference_spelling() {
+    let _guard = support::lock_env();
+    for (value, expected) in [
+        (
+            "NoUTF8EscapingWithSuffixes",
+            OtlpTranslationStrategy::NoUtf8EscapingWithSuffixes,
+        ),
+        (
+            "UnderscoreEscapingWithSuffixes",
+            OtlpTranslationStrategy::UnderscoreEscapingWithSuffixes,
+        ),
+        (
+            "UnderscoreEscapingWithoutSuffixes",
+            OtlpTranslationStrategy::UnderscoreEscapingWithoutSuffixes,
+        ),
+        ("NoTranslation", OtlpTranslationStrategy::NoTranslation),
+    ] {
+        support::clear_all();
+        support::set("PULSUS_OTLP_TRANSLATION_STRATEGY", value);
+        let cfg = pulsus_config::parse(None, None)
+            .unwrap_or_else(|e| panic!("translation strategy {value:?}: parse() failed: {e}"));
+        assert_eq!(cfg.otlp_translation_strategy, expected);
+        assert_eq!(cfg.otlp_translation_strategy.to_string(), value);
+    }
+
+    support::clear_all();
+    let cfg = pulsus_config::parse(None, None).expect("defaults parse");
+    assert_eq!(
+        cfg.otlp_translation_strategy,
+        OtlpTranslationStrategy::UnderscoreEscapingWithSuffixes,
+        "the default is the reference's own default"
+    );
+    assert!(
+        !cfg.otlp_promote_scope_metadata,
+        "scope promotion is off by default"
+    );
+
+    support::clear_all();
+    support::set("PULSUS_OTLP_TRANSLATION_STRATEGY", "notranslation");
+    let err = pulsus_config::parse(None, None)
+        .expect_err("the spellings are case-sensitive, as the reference's are");
+    assert!(
+        err.to_string().contains("NoUTF8EscapingWithSuffixes"),
+        "the error must list the accepted spellings: {err}"
+    );
 
     support::clear_all();
 }

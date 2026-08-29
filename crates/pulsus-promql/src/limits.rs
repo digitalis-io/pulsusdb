@@ -42,8 +42,10 @@
 //! only stops at 50,000 by hitting its ordinary two-minute query timeout.
 //!
 //! So there is no reference value and no reference message to match.
-//! Ledgered as `promql-expression-depth-cap` in `docs/api.md` §3.5, which
-//! also records what the cap does **not** cover.
+//! Ledgered as `promql-expression-depth-cap` in
+//! `docs/benchmarks/metrics-differential-ledger.md` (moved there from
+//! `docs/api.md` §3.5 by issue #461); `docs/api.md` §3.5 keeps the
+//! measurements of what the cap does **not** cover.
 //!
 //! # The guard must not have the defect it guards against
 //!
@@ -73,7 +75,7 @@ use crate::parser::Expr;
 /// exactly `MAX_EXPR_DEPTH`.
 ///
 /// **A DELIBERATE DIVERGENCE** — Prometheus has no such bound (module doc
-/// above, and `docs/api.md` §3.5).
+/// above, and `docs/benchmarks/metrics-differential-ledger.md`).
 ///
 /// **Why 250.** The margin is the argument: 888 (the measured
 /// user-layer floor) / 250 = **3.55×**, against a Prometheus conformance

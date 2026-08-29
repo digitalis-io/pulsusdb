@@ -46,6 +46,7 @@ use pulsus_model::{
 };
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::protocols::otlp_metrics;
+use pulsus_write::protocols::otlp_metrics::MetricIngestSettings;
 use pulsus_write::{
     HistogramPoint, MetricHistSampleRow, MetricPoint, MetricSink, MetricWriter, MetricWriterTables,
     ParsedMetrics, SeriesRef,
@@ -303,7 +304,15 @@ async fn native_exp_histogram_round_trips_absolute_counts_through_clickhouse() {
             schema_url: String::new(),
         }],
     };
-    let parsed = otlp_metrics::parse(&req, 0, ExpHistogramMode::Native).expect("within the budget");
+    let parsed = otlp_metrics::parse(
+        &req,
+        0,
+        MetricIngestSettings {
+            exp_histogram_mode: ExpHistogramMode::Native,
+            ..MetricIngestSettings::default()
+        },
+    )
+    .expect("within the budget");
     flush(&writer, parsed).await;
     writer.shutdown(Duration::from_secs(5)).await;
 

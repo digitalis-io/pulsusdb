@@ -1,0 +1,31 @@
+{
+  "comment": "Manifest for e2e/src/otlp_naming.rs (issue #461). One entry per series the shared OTLP payload must produce on BOTH backends, so adding a metric to the payload forces this file to move with it. `{R}` is the per-run isolation id; `{SVC}` is the per-run service name (varied because target_info is resource-level and carries no data-point run id, so two runs sharing a resource collide as `400 out of order sample` on the reference).",
+  "reference": {
+    "image": "prom/prometheus:v3.13.0",
+    "revision": "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+    "push_route": "POST /api/v1/otlp/v1/metrics"
+  },
+  "expected_metric_series": [
+    {"__name__": "app_checkout_request_count_total", "instance": "pod-7", "job": "shop/{SVC}", "region": "eu-west-1", "run_id": "{R}"},
+    {"__name__": "cpu_utilization_ratio", "instance": "pod-7", "job": "shop/{SVC}", "run_id": "{R}"},
+    {"__name__": "http_server_duration_seconds_bucket", "instance": "pod-7", "job": "shop/{SVC}", "le": "+Inf", "run_id": "{R}"},
+    {"__name__": "http_server_duration_seconds_bucket", "instance": "pod-7", "job": "shop/{SVC}", "le": "0.1", "run_id": "{R}"},
+    {"__name__": "http_server_duration_seconds_bucket", "instance": "pod-7", "job": "shop/{SVC}", "le": "0.5", "run_id": "{R}"},
+    {"__name__": "http_server_duration_seconds_count", "instance": "pod-7", "job": "shop/{SVC}", "run_id": "{R}"},
+    {"__name__": "http_server_duration_seconds_sum", "instance": "pod-7", "job": "shop/{SVC}", "run_id": "{R}"},
+    {"__name__": "lbl_a", "a_b": "dash;dot;under", "instance": "pod-7", "job": "shop/{SVC}", "key_9lives": "cat", "key_priv": "p", "run_id": "{R}"},
+    {"__name__": "queue_bytes_sent_total", "instance": "pod-7", "job": "shop/{SVC}", "run_id": "{R}"}
+  ],
+  "expected_target_info": [
+    {"__name__": "target_info", "deployment_environment": "prod", "host_arch": "amd64", "instance": "pod-7", "job": "shop/{SVC}"}
+  ],
+  "rate_query": {
+    "comment": "The query the Grafana panel on issue #461 sent, verbatim, with a run_id matcher added so the assertion is scoped. The answer is Prometheus's rate extrapolation on a counter advancing exactly 1/s — NOT `1`, which is why it has to be captured from the reference rather than reasoned out.",
+    "expr": "sum by (region) (rate(app_checkout_request_count_total{run_id=\"{R}\"}[1m0s]))",
+    "step": 15,
+    "series": 1,
+    "metric": {"region": "eu-west-1"},
+    "points": 41,
+    "value": "0.9999999999999999"
+  }
+}

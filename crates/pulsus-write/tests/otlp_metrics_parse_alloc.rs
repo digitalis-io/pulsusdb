@@ -50,8 +50,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
-use pulsus_config::ExpHistogramMode;
 use pulsus_write::error::LogsIngestError;
+use pulsus_write::protocols::otlp_metrics::MetricIngestSettings;
 use pulsus_write::protocols::otlp_metrics::{MAX_EXPANDED_BYTES, parse};
 
 fn kv(key: &str, value: String) -> KeyValue {
@@ -125,7 +125,7 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
 
     // Warm-up (allocator internals) + prove the shape is exercised.
     let warm =
-        parse(&valid_req, 0, ExpHistogramMode::Classic).expect("valid request within budget");
+        parse(&valid_req, 0, MetricIngestSettings::default()).expect("valid request within budget");
     assert_eq!(warm.samples.len(), N_VALID, "one sample per data point");
     assert_eq!(
         warm.series.len(),
@@ -135,19 +135,25 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
     drop(warm);
 
     let start = ALLOCS.load(Ordering::Relaxed);
-    let out = parse(&valid_req, 0, ExpHistogramMode::Classic).expect("valid request within budget");
+    let out =
+        parse(&valid_req, 0, MetricIngestSettings::default()).expect("valid request within budget");
     let valid_allocs = ALLOCS.load(Ordering::Relaxed) - start;
     black_box(&out);
 
-    // Post-#62 the valid path measures ~41.0 allocations/sample on this
-    // fixture and toolchain (4 base pairs + 2 dp-attr pairs cloned into an
-    // owned `LabelSet`, its normalized `BTreeMap`, plus `SeriesRef`/
-    // `MetricPoint`) — the required-distinct-series-count ceiling of the
-    // owned-label model (interning is deferred). Bound at 46/sample (~10%
-    // headroom): above the measured cost, yet an added per-sample base
-    // OVER-clone or any super-linear regression blows past it. The
-    // expansion-budget charge itself is allocation-free (wire-length
-    // arithmetic only), so it does not move this number.
+    // Post-#62 the valid path measured ~41.0 allocations/sample on this
+    // fixture and toolchain. **Issue #461 lowered it to 30.06** (measured:
+    // `30056 allocations over 1000 samples`, three consecutive runs, all
+    // 30056): the four resource attributes
+    // are no longer cloned into every sample's `LabelSet` — they are
+    // charged and materialized once per `ResourceMetrics`, for
+    // `target_info` — so each sample now carries only its two data-point
+    // attributes plus any derived `job`/`instance`. The bound stays at
+    // 46/sample rather than being tightened to the new figure: it is a
+    // ceiling on the owned-label model (interning is deferred), and an
+    // added per-sample base OVER-clone or any super-linear regression
+    // still blows past it. The expansion-budget charge itself is
+    // allocation-free (wire-length arithmetic only), so it does not move
+    // this number.
     const C: u64 = 46;
     assert!(
         valid_allocs <= C * N_VALID as u64,
@@ -158,8 +164,15 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
 
     // -- (b) over-budget request: abort before mass materialization (B) ---
     const MIB: usize = 1024 * 1024;
+    // Issue #461 moved the amplification onto `service.name`. A plain
+    // resource attribute is no longer cloned into every sample — it is
+    // charged ONCE per `ResourceMetrics`, just before `target_info`
+    // materializes it — so `big.attr` would no longer describe a
+    // per-sample fan-out at all. `service.name` becomes the derived `job`
+    // label, which every sample does clone, so the amplification shape
+    // this arm exists to test is preserved exactly.
     let big_resource = Resource {
-        attributes: vec![kv("big.attr", "v".repeat(MIB))],
+        attributes: vec![kv("service.name", "v".repeat(MIB))],
         dropped_attributes_count: 0,
         entity_refs: vec![],
     };
@@ -173,7 +186,7 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
     let over_budget_req = gauge_request(big_resource, big_data_points);
 
     let start = ALLOCS.load(Ordering::Relaxed);
-    let err = parse(&over_budget_req, 0, ExpHistogramMode::Classic)
+    let err = parse(&over_budget_req, 0, MetricIngestSettings::default())
         .expect_err("over-budget request must abort");
     let abort_allocs = ALLOCS.load(Ordering::Relaxed) - start;
 
@@ -186,15 +199,25 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
         "unexpected error: {err}"
     );
 
-    // The abort materializes ≈ 250 samples before tripping; each clones the
-    // ~1 MiB base pair and builds a small `LabelSet` (a handful of allocs),
-    // so the whole aborted parse measures ~4.1k allocations on this
-    // toolchain. Bound at 5000 (~20% headroom) — comfortably above the
+    // The abort materializes ≈ 250 samples before tripping; each builds its
+    // data point's label set and clones the ~1 MiB `job` pair into an owned
+    // `LabelSet`, so the whole aborted parse measures **7402** allocations
+    // on this toolchain (measured three consecutive runs, all 7402). Issue
+    // #461 raised the per-sample cost from ~16 to ~29 allocations: the
+    // `createAttributes` port sorts the data point's attributes, sanitizes
+    // each key into an owned `String`, and merges through a builder before
+    // `LabelSet::from_verbatim` groups the result — where the pre-#461 path
+    // chained three iterators straight into `from_normalized`. That is a
+    // per-data-point cost, not a per-sample one (the label set is built once
+    // per data point and only the finished pairs are cloned per sample), and
+    // it buys the reference's collision-merge and empty-value-delete rules.
+    //
+    // Bound at 10000 (~1.35x the measured value) — comfortably above the
     // abort prefix, yet ORDERS of magnitude below the ~100k-sample full
     // materialization the budget prevents (which would be >= 100k
     // allocations). This is the charge-before-allocate proof: materialization
     // stops at hundreds, not 100k.
-    const B: u64 = 5000;
+    const B: u64 = 10_000;
     assert!(
         abort_allocs <= B,
         "over-budget parse made {abort_allocs} allocations — it must abort within its ~256-sample \

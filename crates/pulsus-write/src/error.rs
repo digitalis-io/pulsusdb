@@ -159,6 +159,29 @@ pub enum LogsIngestError {
     #[error("{0}")]
     InvalidLabelName(String),
 
+    /// An OTLP **metric** name that Prometheus v3.13.0's `MetricNamer`
+    /// refuses (issue #461): normalization produced an empty name, or a
+    /// name made entirely of underscores
+    /// (`otlptranslator@v1.0.0/metric_namer.go:158-177`). The message is
+    /// the reference's, byte for byte, modulo the quoting difference
+    /// recorded for [`InvalidLabelName`].
+    ///
+    /// Whole-request 400-class failure, joining [`classify`]'s 400 arm for
+    /// the same reason `InvalidLabelName` does: the reference answers
+    /// `500` with a bare `text/plain` body
+    /// (`storage/remote/write_handler.go`'s `default:` arm, reached because
+    /// `FromMetrics` joins the error into `errs`,
+    /// `metrics_to_prw.go:235-239 @ v3.13.0`), the input is entirely
+    /// client-controlled, no retry can succeed, and `5xx` is precisely the
+    /// class OTLP exporters retry. Ledgered as
+    /// `otlp-name-reject-status-400` in
+    /// docs/benchmarks/metrics-differential-ledger.md.
+    ///
+    /// [`classify`]: crate::ingest::http
+    /// [`InvalidLabelName`]: LogsIngestError::InvalidLabelName
+    #[error("{0}")]
+    InvalidMetricName(String),
+
     /// A Zipkin v2 JSON span array (issue #75, `POST /api/v2/spans`) was not
     /// decodable into the span model: malformed JSON, or a span carrying a
     /// non-hex / wrong-length `traceId`/`id`/`parentId` or an
