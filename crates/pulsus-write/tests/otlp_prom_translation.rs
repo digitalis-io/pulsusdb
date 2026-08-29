@@ -574,6 +574,36 @@ fn datapoint_attrs(case: &Value) -> Vec<(String, String)> {
     Vec::new()
 }
 
+/// A case's scope attributes for its first `ScopeMetrics`, in wire order.
+fn scope_attrs(case: &Value) -> Vec<(String, String)> {
+    case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["attributes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|kv| {
+                    (
+                        kv["key"].as_str().expect("scope attr key").to_string(),
+                        kv["value"]["stringValue"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The label a promoted scope attribute lands under.
+///
+/// The reference composes the prefix and sanitizes the RESULT
+/// (`metrics_to_prw.go:461 @ v3.13.0`: `"otel_scope_" + k` is handed to the
+/// namer), which is why a digit-leading key keeps its digit — the composed
+/// name already begins with a letter.
+fn scope_label_key(key: &str) -> String {
+    sanitize(&format!("otel_scope_{key}"))
+}
+
 /// The OTLP metric names a case pushes, in wire order.
 fn input_metric_names(case: &Value) -> Vec<String> {
     case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
@@ -930,10 +960,12 @@ fn cases_json_binds_every_named_transformation() {
         );
     }
 
-    // (10) scope metadata is not promoted by default. The enabled path is
-    // asserted only as far as the reference has been replayed here — see
-    // the module note; the full enabled-path binding lands with the
-    // scope-promotion measurement.
+    // (10) The three scope predicates of plan v7 Δ27, bound to
+    // `setScopeContext` (`metrics_to_prw.go:446-475 @ v3.13.0`).
+    //
+    // `scope-name-version`: the knob alone decides whether scope metadata
+    // appears at all, and when it does both labels carry the scope's OWN
+    // name and version — not a constant, and not one of the two.
     {
         let p = find_pair(&doc, "scope-not-promoted");
         for labels in captured_metric_labels(p.base) {
@@ -944,10 +976,159 @@ fn cases_json_binds_every_named_transformation() {
         }
         let scope = &p.variant["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"];
         let scope_name = scope["name"].as_str().expect("scope name");
+        let scope_version = scope["version"].as_str().expect("scope version");
+        assert!(!scope_name.is_empty() && !scope_version.is_empty());
+        assert_ne!(
+            scope_name, scope_version,
+            "the pair cannot tell the two labels apart if the scope's name and version are equal"
+        );
         for labels in captured_metric_labels(p.variant) {
             assert_eq!(
                 labels.get("otel_scope_name").map(String::as_str),
                 Some(scope_name)
+            );
+            assert_eq!(
+                labels.get("otel_scope_version").map(String::as_str),
+                Some(scope_version)
+            );
+        }
+    }
+
+    // (10b) `scope-attributes`. The pair differs only in whether the scope
+    // carries `scope.extra="x"`, and the captured answers differ by exactly
+    // that label. Predicate (10) alone cannot see this: an implementation
+    // promoting the name and version and **no scope attributes at all**
+    // satisfies it.
+    //
+    // The second half is what makes a wrong VALUE fail too, and it is
+    // asserted over every scope-promoting case in the corpus rather than
+    // over the pair alone — which is what brings the digit-leading key
+    // `9scope` into the predicate. That key is the witness for the
+    // reference's composition ORDER: `setScopeContext` composes
+    // `"otel_scope_" + k` and sanitizes the result
+    // (`metrics_to_prw.go:461 @ v3.13.0`), so the composed name already
+    // starts with `o` and the namer's digit-prefix rule never fires —
+    // `9scope` lands as `otel_scope_9scope`. Sanitizing the key first and
+    // prefixing after would give `otel_scope_key_9scope`.
+    {
+        let p = find_pair(&doc, "scope-attributes");
+        let extra_key = scope_attrs(p.variant)
+            .into_iter()
+            .next()
+            .expect("the variant's scope carries one attribute");
+        assert!(
+            scope_attrs(p.base).is_empty(),
+            "the base's scope must carry no attributes"
+        );
+        let promoted = scope_label_key(&extra_key.0);
+        for labels in captured_metric_labels(p.variant) {
+            assert_eq!(
+                labels.get(&promoted),
+                Some(&extra_key.1),
+                "pair scope-attributes: the scope attribute must be promoted under {promoted}"
+            );
+        }
+        for labels in captured_metric_labels(p.base) {
+            assert!(
+                !labels.contains_key(&promoted),
+                "pair scope-attributes: the base has no scope attribute to promote"
+            );
+        }
+
+        let mut asserted = 0usize;
+        for case in doc["cases"].as_array().expect("cases") {
+            if case["expect"]["kind"] != "accept" || case["promote_scope_metadata"] != json!(true) {
+                continue;
+            }
+            let scope = &case["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"];
+            if scope["name"].as_str().unwrap_or_default().is_empty() {
+                // The name gates every scope label; predicate (10c) owns
+                // that case.
+                continue;
+            }
+            for (key, value) in scope_attrs(case) {
+                asserted += 1;
+                for labels in captured_metric_labels(case) {
+                    assert_eq!(
+                        labels.get(&scope_label_key(&key)),
+                        Some(&value),
+                        "case {}: scope attribute {key:?} must be promoted under {:?} carrying \
+                         its own value",
+                        case["id"],
+                        scope_label_key(&key)
+                    );
+                }
+            }
+        }
+        assert!(
+            asserted >= 4,
+            "only {asserted} scope attributes are covered; the corpus must keep the \
+             dotted, plain and digit-leading keys"
+        );
+        assert!(
+            doc["cases"]
+                .as_array()
+                .expect("cases")
+                .iter()
+                .any(|c| scope_attrs(c).iter().any(|(k, _)| k == "9scope")),
+            "the corpus must keep a digit-leading scope attribute: it is the only witness \
+             for the reference's prefix-then-sanitize order"
+        );
+    }
+
+    // (10c) `scope-name-gates-all`. The pair's scopes carry the same
+    // non-empty version and the same non-empty attribute set, and differ
+    // only in whether the scope NAME is empty. An empty name suppresses
+    // every scope label — not just `otel_scope_name`
+    // (`metrics_to_prw.go:447-450 @ v3.13.0` returns before any label is
+    // set). Predicates (10) and (10b) both pass an implementation that
+    // emits the version and the attributes under an empty name.
+    {
+        let p = find_pair(&doc, "scope-name-gates-all");
+        let base_scope = &p.base["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"];
+        let variant_scope = &p.variant["payload"]["resourceMetrics"][0]["scopeMetrics"][0]["scope"];
+        assert!(!base_scope["name"].as_str().expect("name").is_empty());
+        assert!(variant_scope["name"].as_str().expect("name").is_empty());
+        assert_eq!(base_scope["version"], variant_scope["version"]);
+        assert!(
+            !base_scope["version"].as_str().expect("version").is_empty(),
+            "the version must be non-empty in both, or its suppression proves nothing"
+        );
+        assert_eq!(scope_attrs(p.base), scope_attrs(p.variant));
+        assert!(
+            !scope_attrs(p.base).is_empty(),
+            "the attributes must be non-empty in both, or their suppression proves nothing"
+        );
+
+        // Base: the full set is present, each carrying its own value.
+        let mut required: Vec<String> = vec![
+            "otel_scope_name".to_string(),
+            "otel_scope_version".to_string(),
+        ];
+        required.extend(scope_attrs(p.base).iter().map(|(k, _)| scope_label_key(k)));
+        for labels in captured_metric_labels(p.base) {
+            for key in &required {
+                assert!(
+                    labels.contains_key(key),
+                    "pair scope-name-gates-all base: {key} must be promoted"
+                );
+            }
+        }
+        // Variant: NOT ONE `otel_scope_*` key survives.
+        for labels in captured_metric_labels(p.variant) {
+            let promoted: Vec<&String> = labels
+                .keys()
+                .filter(|k| k.starts_with("otel_scope_"))
+                .collect();
+            assert!(
+                promoted.is_empty(),
+                "pair scope-name-gates-all variant: an empty scope name suppresses ALL scope \
+                 metadata, but {promoted:?} survived"
+            );
+            assert!(
+                !labels.is_empty(),
+                "the variant must still emit its ordinary labels, or the absence check is \
+                 vacuous"
             );
         }
     }
@@ -1973,6 +2154,15 @@ const LEDGER_ROWS: &[LedgerRow] = &[
             "write_otlp_handler.go:132-138",
             ":177-189",
             "otlp-delta-partial-success",
+            // AC18. Three separable claims, each needed: a request that
+            // rejects one series commits nothing (atomicity), a request
+            // mixing accepted and rejected series still counts only the
+            // rejected ones (line count), and the answer carries no OTLP
+            // envelope (absent body). A row stating any two of the three
+            // leaves the third unpublished.
+            "including otherwise valid siblings",
+            "accepted siblings do not affect the line count",
+            "`accepted`, `rejected` and `message` absent",
         ],
     },
     LedgerRow {
