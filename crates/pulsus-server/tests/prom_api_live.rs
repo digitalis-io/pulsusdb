@@ -1239,3 +1239,501 @@ async fn prom_api_query_surface_bundle_issue_471() {
 
     drop_db(&db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #472 — `/api/v1/label/__name__/values` end to end
+// ---------------------------------------------------------------------
+
+/// One `count()` off `system.query_log`.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct StatementCountRow {
+    n: u64,
+}
+
+/// One logged statement's text.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct StatementTextRow {
+    query: String,
+}
+
+async fn flush_logs(admin: &ChClient) {
+    admin
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+}
+
+/// `count()` of finalized `Select`s this run's database saw whose text
+/// satisfies `predicate` — a whole SQL boolean over the `query` column
+/// (`query LIKE '…'`, optionally `AND query NOT LIKE '…'`), because the
+/// #472 builder and the #96 degraded probe share a projection prefix and
+/// are told apart by what the probe additionally carries.
+async fn statements_matching(admin: &ChClient, db: &str, predicate: &str) -> u64 {
+    use futures::StreamExt;
+    let sql = format!(
+        "SELECT count() AS n FROM system.query_log \
+         WHERE current_database = '{db}' AND type != 'QueryStart' \
+           AND query_kind = 'Select' AND ({predicate})"
+    );
+    let mut stream = admin
+        .query_stream::<StatementCountRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.query_log");
+    let mut n = 0u64;
+    while let Some(row) = stream.next().await {
+        n = row.expect("decode count row").n;
+    }
+    n
+}
+
+/// The distinct statement texts this run's database saw, for the test
+/// output — so a failure shows what actually dispatched instead of only
+/// that a count was wrong.
+async fn statement_texts(admin: &ChClient, db: &str) -> Vec<String> {
+    use futures::StreamExt;
+    let sql = format!(
+        "SELECT DISTINCT query FROM system.query_log \
+         WHERE current_database = '{db}' AND type != 'QueryStart' \
+           AND query_kind = 'Select' AND query LIKE '%metric_series%' ORDER BY query"
+    );
+    let mut stream = admin
+        .query_stream::<StatementTextRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.query_log");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode statement row").query);
+    }
+    out
+}
+
+/// Issue #472 — every `/api/v1/label/__name__/values` body, byte for byte,
+/// plus proof that the narrow statement is what dispatched.
+///
+/// **The response is unchanged by this issue, so no test that only reads
+/// the response can prove the fix happened** — a body assertion passes
+/// identically on both sides of it. The `system.query_log` half is what
+/// distinguishes them, and it is scoped to this run's nonce'd database
+/// because `system.query_log` outlives databases (the
+/// `promql_memory_breach_is_422_and_actually_dispatched` precedent).
+///
+/// **The fixture is adversarial and the activity bucket is deliberately the
+/// current one.** A one-character name sorting before everything; a name
+/// that is a strict prefix of another; a non-ASCII metric name and a
+/// non-ASCII label value carrying a `/`; an empty label value; a `+Inf`
+/// label value. Rows are seeded **directly into `metric_series`** (this
+/// suite's established style), so nothing here exercises the writer's
+/// registration path. They are seeded at the CURRENT activity bucket on
+/// purpose: the no-bounds request's default window is the current hour, so
+/// a historically-placed fixture would answer `[]` and every body below
+/// would be asserting an empty list.
+///
+/// The `{zone=""}` rejection's wording differs from the reference's
+/// (`vector selector must contain at least one non-empty matcher` against
+/// its own `match[] must …`) at the same status and `errorType`. That
+/// divergence is **pre-existing and out of scope here** — recorded so the
+/// next reader comparing the two responses does not rediscover and file it.
+#[tokio::test(flavor = "multi_thread")]
+async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = pulsus_testkit::test_db(&format!("pulsus_prom_472_it_{nonce}"));
+    let db = db.as_str();
+    let port: u16 = 31_303;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("PULSUS_CACHE_TTL", "1s")
+        .env(
+            "CLICKHOUSE_SERVER",
+            std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        )
+        .env(
+            "CLICKHOUSE_HTTP_PORT",
+            std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
+        )
+        .env("CLICKHOUSE_DB", db)
+        .spawn()
+        .expect("spawn pulsusdb");
+    let _guard = ChildGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut became_ready = false;
+    while Instant::now() < deadline {
+        if let Some((200, _)) = http_get(port, "/ready") {
+            became_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(became_ready, "/ready never reached 200 within 60s");
+
+    let client = ChClient::new(test_ch_config(db))
+        .await
+        .expect("connect to seed data");
+    let bucket_ms: i64 = 3_600_000;
+    // `h` is the CURRENT activity bucket — see the doc comment.
+    let h = (now_ms() / bucket_ms) * bucket_ms;
+    let corpus: &[(&str, u64, &str)] = &[
+        ("a", 1001, r#"{"job":"api"}"#),
+        (
+            "http_requests_total",
+            2001,
+            r#"{"instance":"host-1:9100","job":"api"}"#,
+        ),
+        (
+            "http_requests_total",
+            2002,
+            r#"{"instance":"host-2:9100","job":"web"}"#,
+        ),
+        (
+            "http_requests_total",
+            2003,
+            r#"{"instance":"host-3:9100","job":"api","zone":""}"#,
+        ),
+        (
+            "http_requests_created",
+            3001,
+            r#"{"instance":"host-1:9100","job":"api"}"#,
+        ),
+        (
+            "http_request_duration_seconds_bucket",
+            4001,
+            r#"{"instance":"host-1:9100","job":"api","le":"0.1"}"#,
+        ),
+        (
+            "http_request_duration_seconds_bucket",
+            4002,
+            r#"{"instance":"host-1:9100","job":"api","le":"+Inf"}"#,
+        ),
+        (
+            "node_cpu_seconds_total",
+            5001,
+            r#"{"cpu":"0","instance":"host-9:9100","job":"node","mode":"idle"}"#,
+        ),
+        (
+            "node_cpu_seconds_total",
+            5002,
+            r#"{"cpu":"1","instance":"host-9:9100","job":"node","mode":"user"}"#,
+        ),
+        ("up", 6001, r#"{"instance":"host-1:9100","job":"api"}"#),
+        ("up", 6002, r#"{"instance":"host-9:9100","job":"node"}"#),
+        (
+            "käse_temperatur_celsius",
+            7001,
+            r#"{"job":"küche","raum":"kühl/lager"}"#,
+        ),
+    ];
+    client
+        .insert_block(
+            "metric_series",
+            &corpus
+                .iter()
+                .map(|(name, fp, labels)| SeedSeriesRow {
+                    metric_name: (*name).to_string(),
+                    fingerprint: *fp,
+                    unix_milli: h,
+                    labels: (*labels).to_string(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("seed metric_series");
+
+    let start = (h - 3_600_000) / 1000;
+    let end = (h + 3_600_000) / 1000;
+    let bounds = format!("start={start}&end={end}");
+    const ALL_SEVEN: &str = "{\"status\":\"success\",\"data\":[\"a\",\
+        \"http_request_duration_seconds_bucket\",\"http_requests_created\",\
+        \"http_requests_total\",\"käse_temperatur_celsius\",\"node_cpu_seconds_total\",\"up\"]}";
+
+    // The discovery client's own first resource call.
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/label/__name__/values?limit=40000&{bounds}"),
+    )
+    .expect("/label/__name__/values");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body.trim(), ALL_SEVEN);
+
+    // No bounds at all: the default window is the current hour, which is
+    // where the fixture sits.
+    let (status, body) = http_get(port, "/api/v1/label/__name__/values").expect("no bounds");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body.trim(), ALL_SEVEN);
+
+    // The limit boundary — applied last, to the already-sorted answer.
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/label/__name__/values?limit=3&{bounds}"),
+    )
+    .expect("limit=3");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body.trim(),
+        "{\"status\":\"success\",\"data\":[\"a\",\"http_request_duration_seconds_bucket\",\
+         \"http_requests_created\"],\"warnings\":[\"results truncated due to limit\"]}"
+    );
+
+    // A label matcher. `node_cpu_seconds_total` and
+    // `käse_temperatur_celsius` are absent and `up` is present — a builder
+    // that dropped the matcher conjunct would return all seven.
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/label/__name__/values?match[]=%7Bjob%3D%22api%22%7D&{bounds}"),
+    )
+    .expect("match[]={job=\"api\"}");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body.trim(),
+        "{\"status\":\"success\",\"data\":[\"a\",\"http_request_duration_seconds_bucket\",\
+         \"http_requests_created\",\"http_requests_total\",\"up\"]}"
+    );
+
+    // The concrete-name arm. Dropping the `metric_name =` head returns all
+    // seven; confusing the prefix returns two.
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/label/__name__/values?match[]=http_requests_total&{bounds}"),
+    )
+    .expect("match[]=http_requests_total");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body.trim(),
+        "{\"status\":\"success\",\"data\":[\"http_requests_total\"]}"
+    );
+
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/label/__name__/values?match[]=nosuchmetric&{bounds}"),
+    )
+    .expect("match[]=nosuchmetric");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body.trim(), "{\"status\":\"success\",\"data\":[]}");
+
+    // Two `match[]`, one narrow query each, unioned in Rust exactly where
+    // the wide path unioned. The non-ASCII value survives into SQL.
+    let (status, body) = http_get(
+        port,
+        &format!(
+            "/api/v1/label/__name__/values?match[]=%7Bjob%3D%22node%22%7D\
+             &match[]=%7Bjob%3D%22k%C3%BCche%22%7D&{bounds}"
+        ),
+    )
+    .expect("two match[]");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body.trim(),
+        "{\"status\":\"success\",\"data\":[\"käse_temperatur_celsius\",\
+         \"node_cpu_seconds_total\",\"up\"]}"
+    );
+
+    // Must FAIL, unchanged.
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/label/__name__/values?limit=-1&{bounds}"),
+    )
+    .expect("limit=-1");
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body.trim(),
+        "{\"status\":\"error\",\"errorType\":\"bad_data\",\"error\":\"invalid parameter \
+         \\\"limit\\\": limit must be non-negative\"}"
+    );
+
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/label/__name__/values?match[]=%7Bzone%3D%22%22%7D&{bounds}"),
+    )
+    .expect("match[]={zone=\"\"}");
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body.trim(),
+        "{\"status\":\"error\",\"errorType\":\"bad_data\",\"error\":\"vector selector must \
+         contain at least one non-empty matcher\"}"
+    );
+
+    // The unchanged neighbours: the `name != "__name__"` branch and the
+    // endpoint this issue does not touch.
+    const JOB_VALUES: &str =
+        "{\"status\":\"success\",\"data\":[\"api\",\"küche\",\"node\",\"web\"]}";
+    for path in ["/api/v1/label/job/values", "/api/v1/label/U__job/values"] {
+        let (status, body) = http_get(port, &format!("{path}?{bounds}")).expect("label values");
+        assert_eq!(status, 200, "{path}: {body}");
+        assert_eq!(body.trim(), JOB_VALUES, "{path}");
+    }
+    let (status, body) = http_get(port, &format!("/api/v1/labels?{bounds}")).expect("/labels");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body.trim(),
+        "{\"status\":\"success\",\"data\":[\"__name__\",\"cpu\",\"instance\",\"job\",\"le\",\
+         \"mode\",\"raum\",\"zone\"]}"
+    );
+
+    // -----------------------------------------------------------------
+    // Proof of dispatch, and that the adjudicated route stayed wide.
+    // -----------------------------------------------------------------
+    let admin = ChClient::new(test_ch_config("default"))
+        .await
+        .expect("connect (admin)");
+    flush_logs(&admin).await;
+
+    // The #472 statement, told apart from the #96 degraded probe: both
+    // begin `SELECT DISTINCT metric_name FROM metric_series WHERE
+    // unix_milli >=`, and the probe additionally carries the name-matcher
+    // regex's compile-probe splice and a `LIMIT <fanout cap + 1>`. The
+    // discovery `limit` is a response-size cap applied last (docs/api.md
+    // §3.3), so the #472 statement never carries a `LIMIT` at all.
+    const NARROW_PREFIX: &str =
+        "query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series\\nWHERE unix_milli >=%'";
+    let narrow_472 = format!("{NARROW_PREFIX} AND query NOT LIKE '%\\nLIMIT %'");
+    let narrow_472 = narrow_472.as_str();
+    let probe_96 = format!("{NARROW_PREFIX} AND query LIKE '%\\nLIMIT %'");
+    let probe_96 = probe_96.as_str();
+    let narrow = statements_matching(&admin, db, narrow_472).await;
+    assert!(
+        narrow > 0,
+        "no narrow `SELECT DISTINCT metric_name` statement dispatched for {db} — a \
+         body-only assertion would pass on both sides of this fix.\nstatements:\n{}",
+        statement_texts(&admin, db).await.join("\n---\n")
+    );
+    assert_eq!(
+        statements_matching(&admin, db, probe_96).await,
+        0,
+        "no request so far takes the degraded-probe route, so every narrow statement here \
+         must be the #472 builder's — otherwise the count above is measuring the probe"
+    );
+
+    // A `SELECT DISTINCT metric_name` naming `fingerprint` or `labels` in
+    // its projection is impossible under the `LIKE` above — the projection
+    // is pinned from the first byte. The other direction needs a marker
+    // that only a `__name__` request could have produced, because
+    // `/api/v1/labels` and `/api/v1/label/job/values` legitimately still
+    // read the wide statement over the same window (measured: an
+    // unfiltered wide read appears in this run's log, and it is theirs plus
+    // the label-cache sweep's own unbounded-upper query — a different path,
+    // out of scope here). `match[]=http_requests_total` is that marker: it
+    // is the only request in this test that renders `metric_name =
+    // 'http_requests_total'`, and the regex route renders `metric_name IN
+    // (…)` rather than `= '…'`. The quotes are backslash-escaped because
+    // the pattern becomes a ClickHouse string literal.
+    const CONCRETE: &str = "metric_series\\nWHERE metric_name = \\'http_requests_total\\'%";
+    let concrete_narrow = statements_matching(
+        &admin,
+        db,
+        &format!("query LIKE 'SELECT DISTINCT metric_name\\nFROM {CONCRETE}'"),
+    )
+    .await;
+    let concrete_wide = statements_matching(
+        &admin,
+        db,
+        &format!("query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM {CONCRETE}'"),
+    )
+    .await;
+    assert!(
+        concrete_narrow > 0,
+        "the concrete-name `__name__` request must render the narrow projection.\nstatements:\n{}",
+        statement_texts(&admin, db).await.join("\n---\n")
+    );
+    assert_eq!(
+        concrete_wide,
+        0,
+        "`/api/v1/label/__name__/values?match[]=http_requests_total` must no longer dispatch \
+         the wide `fingerprint, metric_name, labels` read — this is the marker no other \
+         request in this test can produce.\nstatements:\n{}",
+        statement_texts(&admin, db).await.join("\n---\n")
+    );
+
+    // The adjudicated name-matcher route (#85/#89/#96) must be untouched:
+    // the narrow projection must not reach it.
+    //
+    // **Which of the two adjudicated shapes runs is not fixed by this
+    // fixture** — it depends on whether the label cache is authoritative
+    // for the request window at the moment of the call, and with `end` at
+    // the end of the current hour the cache is normally stale for it
+    // (degraded probe) but need not be. So the assertions below are the
+    // ones that hold under BOTH shapes; which one actually ran is printed.
+    let narrow_before = narrow;
+    let in_fetch_before = statements_matching(
+        &admin,
+        db,
+        "query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM metric_series\\nWHERE \
+         metric_name IN (%'",
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let name_regex = "%7B__name__%3D~%22http_requests.%2A%22%7D";
+    let regex_path = format!("/api/v1/label/__name__/values?match[]={name_regex}&{bounds}");
+    let regex_body;
+    loop {
+        let (status, body) = http_get(port, &regex_path).expect("match[]={__name__=~...}");
+        assert_eq!(status, 200, "{body}");
+        if body.contains("http_requests_total") {
+            regex_body = body;
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the regex-`__name__` route never resolved within 30s: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        regex_body.trim(),
+        "{\"status\":\"success\",\"data\":[\"http_requests_created\",\"http_requests_total\"]}",
+        "`http_request_duration_seconds_bucket` matches the fragment but not the anchored \
+         pattern, so it must stay absent"
+    );
+
+    flush_logs(&admin).await;
+    assert_eq!(
+        statements_matching(&admin, db, narrow_472).await,
+        narrow_before,
+        "the regex-`__name__` route must not render the narrow projection — its fan-out \
+         semantics are adjudicated (#85/#89/#96, docs/api.md §3.3).\nstatements:\n{}",
+        statement_texts(&admin, db).await.join("\n---\n")
+    );
+    let in_fetch_after = statements_matching(
+        &admin,
+        db,
+        "query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM metric_series\\nWHERE \
+         metric_name IN (%'",
+    )
+    .await;
+    assert!(
+        in_fetch_after > in_fetch_before,
+        "the regex-`__name__` route must still reach its wide `metric_name IN (…)` fetch — \
+         the shape BOTH the warm and the degraded route end in.\nstatements:\n{}",
+        statement_texts(&admin, db).await.join("\n---\n")
+    );
+    let probes = statements_matching(&admin, db, probe_96).await;
+    eprintln!(
+        "#472: the regex-`__name__` request took the {} route ({probes} bounded probe \
+         statement(s), {} wide IN fetch(es) added)",
+        if probes > 0 {
+            "degraded two-stage"
+        } else {
+            "warm flat IN x IN"
+        },
+        in_fetch_after - in_fetch_before
+    );
+
+    eprintln!(
+        "#472 statements this run's database saw:\n{}",
+        statement_texts(&admin, db).await.join("\n---\n")
+    );
+
+    drop_db(db).await;
+}

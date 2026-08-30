@@ -2227,6 +2227,170 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
     );
 }
 
+/// Raw `EXPLAIN PIPELINE` text — the transform chain, which
+/// [`explain_raw`]'s `indexes = 1` output does not carry. Used by issue
+/// #472's sorted-key DISTINCT gate below; `?`-doubling for the same reason
+/// [`explain_raw`] does it.
+async fn explain_pipeline_raw(client: &ChClient, sql: &str) -> String {
+    let full = format!("EXPLAIN PIPELINE {sql}").replace('?', "??");
+    let mut out = String::new();
+    let mut stream = client
+        .query_stream::<ExplainRow>(&full, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("explain pipeline failed: {e}\nSQL:\n{full}"));
+    while let Some(row) = stream.next().await {
+        out.push_str(&row.expect("decode explain row").explain);
+        out.push('\n');
+    }
+    out
+}
+
+/// Lines of `raw` equal (after trimming) to `transform`.
+fn transform_lines(raw: &str, transform: &str) -> usize {
+    raw.lines().filter(|l| l.trim() == transform).count()
+}
+
+/// The unfiltered discovery filter both #472 gates render from — the
+/// datasource's actual first `/api/v1/label/__name__/values` call, which
+/// carries no `match[]` at all.
+fn unfiltered_discovery_filter() -> pulsus_read::metrics::DiscoveryFilter {
+    pulsus_read::metrics::DiscoveryFilter::default()
+}
+
+/// Issue #472 — **no index regression** from the narrow name projection.
+///
+/// `/api/v1/label/__name__/values` now renders `SELECT DISTINCT
+/// metric_name` where it rendered `SELECT fingerprint, metric_name, labels
+/// … LIMIT 1 BY metric_name, fingerprint`. This gate is deliberately NOT a
+/// claim that the narrow form prunes better: measured on 26.3.17.110 the
+/// two forms' `Indexes:` blocks are character-identical, both engaging
+/// `unix_milli` through generic exclusion search, and the win is projection
+/// plus a sorted-key DISTINCT (the next test), not index selection.
+///
+/// Asserted twice, because the halves catch different regressions: the
+/// pinned literal catches a regression the two forms would **share** (a
+/// dropped window bound turns `Condition` into `true`), and the equality
+/// states the non-regression claim itself — the new statement engages
+/// exactly what the old one did.
+#[tokio::test]
+async fn discovery_distinct_names_engages_the_same_indexes_as_the_wide_discovery_query() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_discovery_names_idx");
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    seed_metric_series(&client, db, now_ms).await;
+
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: now_ms - 3_600_000,
+        end_ms: now_ms,
+    };
+    let table = format!("{db}.metric_series");
+    let filter = unfiltered_discovery_filter();
+    // `bucket_ms = 1` floors to the exact bounds, so the seeded now-stamped
+    // rows stay inside the queried window and the analysis runs against a
+    // populated part.
+    let narrow_sql =
+        pulsus_read::metrics::sql::discovery_distinct_names_query(&table, &filter, window, 1);
+    let wide_sql = pulsus_read::metrics::sql::discovery_query(&table, &filter, window, 1);
+
+    let narrow = explain(&client, &narrow_sql).await;
+    assert_eq!(
+        narrow,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+        ]),
+        "the narrow name projection must still carry both window bounds into the \
+         MinMax/Partition/PrimaryKey analysis"
+    );
+    let wide = explain(&client, &wide_sql).await;
+    assert_eq!(
+        narrow, wide,
+        "issue #472 must not trade the wide discovery read for a differently-indexed one: \
+         the narrow statement's index usage must equal the statement it replaces"
+    );
+}
+
+/// Issue #472 — the **sorted-key DISTINCT**, with a live control.
+///
+/// `metric_series ORDER BY (metric_name, fingerprint, unix_milli)` makes
+/// `metric_name` the leading key, so `SELECT DISTINCT metric_name … ORDER
+/// BY metric_name` is planned as `DistinctSortedStreamTransform` at both
+/// the preliminary and the final stage — a streaming de-duplication over
+/// already-sorted input, with no hash set built over the corpus. That is
+/// the transform this issue's win rests on, and it is the reason the
+/// builder's `ORDER BY metric_name` is not cosmetic.
+///
+/// **The absence half needs a witness or it passes vacuously.** "No
+/// `DistinctTransform`" is only meaningful if this same server, in this
+/// same test, on this same corpus, does emit one for a query that should
+/// have one — otherwise a ClickHouse that renamed the transform would make
+/// the gate pass while measuring nothing. `SELECT DISTINCT fingerprint`
+/// (the same table, the same window bound, a **non-leading** key column) is
+/// that control.
+///
+/// Measured on 26.3.17.110: the narrow statement gives two
+/// `DistinctSortedStreamTransform` and no `DistinctTransform`; dropping the
+/// `ORDER BY` turns the FINAL distinct into `DistinctTransform`, and moving
+/// the projection off the leading key (`DISTINCT fingerprint`, `DISTINCT
+/// labels`) turns the PRELIMINARY one into `DistinctTransform`.
+#[tokio::test]
+async fn discovery_distinct_names_uses_the_sorted_key_distinct_transform() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_discovery_names_pipeline");
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    seed_metric_series(&client, db, now_ms).await;
+
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: now_ms - 3_600_000,
+        end_ms: now_ms,
+    };
+    let table = format!("{db}.metric_series");
+    let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
+        &table,
+        &unfiltered_discovery_filter(),
+        window,
+        1,
+    );
+    let narrow = explain_pipeline_raw(&client, &narrow_sql).await;
+    assert!(
+        transform_lines(&narrow, "DistinctSortedStreamTransform") >= 2,
+        "both DISTINCT stages must stream off the sorted leading key:\n{narrow}"
+    );
+    assert_eq!(
+        transform_lines(&narrow, "DistinctTransform"),
+        0,
+        "a hash-set DISTINCT means the projection is no longer served from the sorted \
+         key:\n{narrow}"
+    );
+
+    // The live control: same server, same corpus, same window bound, a
+    // non-leading key column. Without this the assertion above could pass
+    // by ClickHouse having renamed the transform.
+    let control_sql = format!(
+        "SELECT DISTINCT fingerprint\nFROM {table}\nWHERE unix_milli >= {} AND unix_milli <= {}\n\
+         ORDER BY fingerprint",
+        window.start_ms, window.end_ms
+    );
+    let control = explain_pipeline_raw(&client, &control_sql).await;
+    assert!(
+        transform_lines(&control, "DistinctTransform") >= 1,
+        "the control must show the hash-set DISTINCT this server still emits, or the \
+         absence assertion above is vacuous:\n{control}"
+    );
+}
+
 /// Issue #96 (degraded-cache discovery fallback) — the probe-derived
 /// **fetch** gate: `discovery_fetch_by_names` (`metric_name IN (…)` + the
 /// `unix_milli` window, label matchers in SQL, NO `fingerprint IN`) must
