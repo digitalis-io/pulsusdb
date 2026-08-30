@@ -33,6 +33,17 @@
 //!   requests ride the same exact-count zero-payload proof: they issue
 //!   the identical catalog SELECTs, so `discovered` counts them too.
 //!
+//! Issue #475 adds a second test here, on a deliberately COLLIDING
+//! corpus, for the tag answers that are served from the static intrinsic
+//! vocabulary and read nothing. Its zero-delta gate is bounded, and the
+//! boundary is written down in full beside the gate itself
+//! (`intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_table`,
+//! the block introducing steps (1)-(6)): what the predicate covers and
+//! why that coverage is exact, the five things it does not cover — one of
+//! them a measured escape accepted as a deliberate limit — the reason a
+//! query-text exclusion must NOT be used to close it, and the durable
+//! provenance-keyed fix, recorded uncosted and unscheduled.
+//!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
 //! ```text
@@ -1452,12 +1463,65 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     // `tables` entries begins `<db>.trace_`. Every object the traces
     // schema declares is under that prefix.
     //
-    // What it does NOT prove: a read of a table outside the prefix; a
-    // query that never reached `QueryFinish`; a read whose `tables`
-    // array does not name the table (a scalar subquery folds to
-    // `system.one`) — unreachable through the builders since the
-    // catalog name became a module constant; work that is not a
-    // ClickHouse query at all; anything outside the two windows.
+    // WHAT THAT COVERS, and why the coverage is exact rather than
+    // hopeful. Every tag-discovery read the server can issue is built by
+    // `tag_names_sql` or `tag_values_sql`
+    // (`crates/pulsus-read/src/traces/tags_sql.rs`). Both open with
+    // `FROM {CATALOG_TABLE}` against a PRIVATE module constant, and the
+    // only caller-supplied strings they accept land inside `WHERE`. So a
+    // builder-emitted query always names the table in a top-level `FROM`,
+    // and a top-level `FROM` on a real table always populates `tables` —
+    // which is why this predicate sees every read those two functions can
+    // produce, including one whose result is discarded.
+    //
+    // WHAT IT DOES NOT COVER — a DELIBERATE LIMIT, not an oversight, and
+    // recorded here so the next reader finds a decision instead of
+    // rediscovering a hole:
+    //
+    //   1. A handler that constructs its OWN `ChClient` and its OWN query
+    //      text — calling neither builder, never reaching `engine_for`,
+    //      never entering `pulsus-read`. Measured in code review (round 1
+    //      on this suite): eight completed `SELECT count() FROM
+    //      <db>.trace_tag_catalog` reads issued that way finished with
+    //      `current_database = default` and an EMPTY `tables` array, and
+    //      this gate passed. That is a real read this predicate cannot
+    //      see.
+    //   2. A read of a table that is not `<db>.trace_*`.
+    //   3. A query that never reached `QueryFinish` — one that errored or
+    //      was cancelled. Such a request also fails its body assertion,
+    //      so it surfaces there instead.
+    //   4. A read whose `tables` array does not name the table (a scalar
+    //      subquery folds to `system.one`). Not reachable through either
+    //      builder since the catalog name became a module constant.
+    //   5. Work that is not a ClickHouse query at all — an in-process
+    //      cache, a value computed at startup, a read completed before
+    //      the window opens; and anything outside the two windows.
+    //
+    // WHY LIMIT 1 IS ACCEPTED RATHER THAN CLOSED. Reaching it requires
+    // SQL neither builder can emit, which is the case this issue's plan
+    // named in advance as recorded-and-reported rather than as another
+    // hardening round. The escape that DID matter — a caller passing a
+    // query fragment where the table name belonged — was closed in
+    // production instead, by deleting the parameter: see `CATALOG_TABLE`.
+    //
+    // DO NOT close limit 1 by excluding this gate's own reads on their
+    // QUERY TEXT. That is the same defect the limit describes: a claim
+    // about WHO ISSUED a query, tested against WHAT THE QUERY SAYS. It
+    // would have to inherit every spelling of this file's own SQL across
+    // the five sites that issue it, it turns into a false positive the
+    // moment one of them is reformatted, and the natural repair is to
+    // widen the pattern — which then exempts a production read whose text
+    // happens to match.
+    //
+    // THE DURABLE FIX, recorded uncosted and unscheduled for whoever
+    // picks it up. The subject of the claim is "a store read happened";
+    // the predicate reads a table list, which is a proper subset of that.
+    // Keying on PROVENANCE rather than on text would let the predicate
+    // state the claim actually being made — every `Select` on this
+    // database that this gate did not issue — through a per-connection
+    // `log_comment`, `initial_query_id`, or a dedicated ClickHouse user
+    // for the admin connection. Any of the three identifies the issuer
+    // directly, so no query text enters the check at all.
     // =================================================================
 
     // (1) baseline.
