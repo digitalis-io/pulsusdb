@@ -3861,3 +3861,290 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
 
     drop_database(&bootstrap, db).await;
 }
+
+/// Issue #472 — the narrow `__name__` projection returns exactly what the
+/// wide path returns.
+///
+/// `label_values("__name__", …)` now renders `SELECT DISTINCT metric_name`
+/// where it used to read every series row and its `labels` blob. The
+/// response is unchanged **by construction** (the two statements share one
+/// rendered `WHERE`), and this is the live check of that: for every filter
+/// shape the endpoint accepts, the narrow answer must equal the sorted,
+/// deduplicated `__name__` set of `series(…)` — which still goes through
+/// the untouched wide `discovery_series` path, so the two genuinely come
+/// from different SQL.
+///
+/// **The corpus is adversarial on purpose.** A one-character name sorting
+/// before everything; a name that is a strict PREFIX of another
+/// (`http_requests_created` / `http_requests_total`) with a third sharing
+/// only the fragment `http_request_`; a non-ASCII metric name and a
+/// non-ASCII label value containing a `/`; an empty label value; a `+Inf`
+/// label value.
+///
+/// **The window is deliberately NOT activity-bucket-aligned.** Both paths
+/// floor their bounds to the activity bucket, and they must floor them the
+/// same way — an aligned window could not tell a builder that floored
+/// differently from one that did not floor at all.
+///
+/// The last filter (`{__name__=~"http_requests.*"}`) is the route this
+/// issue must NOT touch: it takes the name-matcher path in both calls, so
+/// equality there says the partition sent it to the untouched path.
+///
+/// **This test and `pulsus-server`'s `prom_api_live::
+/// prom_api_name_values_bodies_and_narrow_dispatch_issue_472` are the two
+/// that cover that claim — `live_discovery_fallback.rs` does not.** Issue
+/// #472's AC9 attributed it there. Named by breaking rather than by
+/// reading: routing the regex selector through the narrow builder left
+/// `live_discovery_fallback` 2/2 green while the endpoint returned every
+/// metric name, because that suite compares a warm engine against a cold
+/// one and both took the broken path, so they still agreed. Its
+/// warm-equals-cold assertion is a non-regression check of that route's own
+/// semantics, which is real and still passes; it is not a check that the
+/// narrow projection stayed away from it. Under the same break this test
+/// failed 29/30 (the row below) and the HTTP suite 5/6.
+#[tokio::test]
+async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = &pulsus_testkit::test_db("pulsus_read_it_metrics_name_projection");
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now_ms() / bucket) * bucket;
+    let corpus: &[(&str, u64, &str)] = &[
+        ("a", 1001, r#"{"job":"api"}"#),
+        (
+            "http_requests_total",
+            2001,
+            r#"{"instance":"host-1:9100","job":"api"}"#,
+        ),
+        (
+            "http_requests_total",
+            2002,
+            r#"{"instance":"host-2:9100","job":"web"}"#,
+        ),
+        (
+            "http_requests_total",
+            2003,
+            r#"{"instance":"host-3:9100","job":"api","zone":""}"#,
+        ),
+        (
+            "http_requests_created",
+            3001,
+            r#"{"instance":"host-1:9100","job":"api"}"#,
+        ),
+        (
+            "http_request_duration_seconds_bucket",
+            4001,
+            r#"{"instance":"host-1:9100","job":"api","le":"0.1"}"#,
+        ),
+        (
+            "http_request_duration_seconds_bucket",
+            4002,
+            r#"{"instance":"host-1:9100","job":"api","le":"+Inf"}"#,
+        ),
+        (
+            "node_cpu_seconds_total",
+            5001,
+            r#"{"cpu":"0","instance":"host-9:9100","job":"node","mode":"idle"}"#,
+        ),
+        (
+            "node_cpu_seconds_total",
+            5002,
+            r#"{"cpu":"1","instance":"host-9:9100","job":"node","mode":"user"}"#,
+        ),
+        ("up", 6001, r#"{"instance":"host-1:9100","job":"api"}"#),
+        ("up", 6002, r#"{"instance":"host-9:9100","job":"node"}"#),
+        (
+            "käse_temperatur_celsius",
+            7001,
+            r#"{"job":"küche","raum":"kühl/lager"}"#,
+        ),
+    ];
+    seed_series(
+        &client,
+        &corpus
+            .iter()
+            .map(|(name, fp, labels)| SeedSeriesRow {
+                metric_name: (*name).to_string(),
+                fingerprint: *fp,
+                unix_milli: recent_bucket,
+                labels: (*labels).to_string(),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+
+    // Neither bound sits on an activity-bucket boundary.
+    let window = DataWindow {
+        start_ms: recent_bucket + 12_345,
+        end_ms: recent_bucket + bucket - 6_789,
+    };
+
+    let eq = |key: &str, value: &str| LabelMatcher {
+        key: key.to_string(),
+        op: MatchOp::Eq,
+        value: value.to_string(),
+    };
+    let cases: Vec<(&str, Vec<DiscoveryFilter>)> = vec![
+        ("unfiltered", vec![DiscoveryFilter::default()]),
+        (
+            "{job=\"api\"}",
+            vec![DiscoveryFilter {
+                metric_name: None,
+                name_matchers: vec![],
+                matchers: vec![eq("job", "api")],
+            }],
+        ),
+        (
+            "{job=\"node\"}",
+            vec![DiscoveryFilter {
+                metric_name: None,
+                name_matchers: vec![],
+                matchers: vec![eq("job", "node")],
+            }],
+        ),
+        (
+            "{job=\"küche\"}",
+            vec![DiscoveryFilter {
+                metric_name: None,
+                name_matchers: vec![],
+                matchers: vec![eq("job", "küche")],
+            }],
+        ),
+        (
+            "up{job=\"api\"}",
+            vec![DiscoveryFilter {
+                metric_name: Some("up".to_string()),
+                name_matchers: vec![],
+                matchers: vec![eq("job", "api")],
+            }],
+        ),
+        (
+            "nosuchmetric",
+            vec![DiscoveryFilter {
+                metric_name: Some("nosuchmetric".to_string()),
+                name_matchers: vec![],
+                matchers: vec![],
+            }],
+        ),
+        (
+            "{__name__=~\"http_requests.*\"}",
+            vec![DiscoveryFilter {
+                metric_name: None,
+                name_matchers: vec![LabelMatcher {
+                    key: "__name__".to_string(),
+                    op: MatchOp::Re,
+                    value: "http_requests.*".to_string(),
+                }],
+                matchers: vec![],
+            }],
+        ),
+        (
+            "two match[]: {job=\"node\"} and {job=\"küche\"}",
+            vec![
+                DiscoveryFilter {
+                    metric_name: None,
+                    name_matchers: vec![],
+                    matchers: vec![eq("job", "node")],
+                },
+                DiscoveryFilter {
+                    metric_name: None,
+                    name_matchers: vec![],
+                    matchers: vec![eq("job", "küche")],
+                },
+            ],
+        ),
+    ];
+
+    let mut answers: Vec<Vec<String>> = Vec::new();
+    for (what, filters) in &cases {
+        let narrow = engine
+            .label_values("__name__", filters, window)
+            .await
+            .unwrap_or_else(|e| panic!("label_values(__name__) for {what}: {e}"));
+        let wide_series = engine
+            .series(filters, window)
+            .await
+            .unwrap_or_else(|e| panic!("series for {what}: {e}"));
+        let mut wide: Vec<String> = wide_series
+            .iter()
+            .filter_map(|pairs| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| k == "__name__")
+                    .map(|(_, v)| v.clone())
+            })
+            .collect();
+        wide.sort();
+        wide.dedup();
+        assert_eq!(
+            narrow, wide,
+            "{what}: the narrow name projection must return exactly the wide discovery \
+             path's __name__ set"
+        );
+        answers.push(narrow);
+    }
+
+    // Non-vacuity: the cases must not all answer the same thing, or the
+    // equalities above would hold for a builder that ignored its filter
+    // entirely. The prefix pair is what the regex case discriminates —
+    // `http_request_duration_seconds_bucket` shares the fragment
+    // `http_request` and must be absent.
+    assert_eq!(
+        answers[0],
+        vec![
+            "a",
+            "http_request_duration_seconds_bucket",
+            "http_requests_created",
+            "http_requests_total",
+            "käse_temperatur_celsius",
+            "node_cpu_seconds_total",
+            "up",
+        ]
+    );
+    assert_eq!(
+        answers[1],
+        vec![
+            "a",
+            "http_request_duration_seconds_bucket",
+            "http_requests_created",
+            "http_requests_total",
+            "up",
+        ]
+    );
+    assert_eq!(answers[2], vec!["node_cpu_seconds_total", "up"]);
+    assert_eq!(answers[3], vec!["käse_temperatur_celsius"]);
+    assert_eq!(answers[4], vec!["up"]);
+    assert!(answers[5].is_empty());
+    assert_eq!(
+        answers[6],
+        vec!["http_requests_created", "http_requests_total"]
+    );
+    assert_eq!(
+        answers[7],
+        vec!["käse_temperatur_celsius", "node_cpu_seconds_total", "up"]
+    );
+
+    drop_database(&bootstrap, db).await;
+}

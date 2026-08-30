@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 
-use futures::future::join_all;
+use futures::future::{join, join_all};
 use pulsus_clickhouse::{ChClient, ChRow, QuerySettings};
 use pulsus_model::{Fingerprint, LabelSet, NativeHistogram};
 use pulsus_promql::parser::Expr;
@@ -1133,11 +1133,7 @@ impl MetricsEngine {
         window: DataWindow,
     ) -> Result<Vec<(String, LabelSet)>, ReadError> {
         let bucket_ms = self.resolver.config.bucket_ms;
-        let effective: Vec<DiscoveryFilter> = if filters.is_empty() {
-            vec![DiscoveryFilter::default()]
-        } else {
-            filters.to_vec()
-        };
+        let effective = effective_filters(filters);
         // Resolve pre-pass (synchronous, in-process cache reads only) —
         // a filter whose name matchers can be answered statically
         // contributes no query at all. A regex/negated-`__name__` filter
@@ -1146,7 +1142,12 @@ impl MetricsEngine {
         let mut fetch_sqls: Vec<String> = Vec::with_capacity(effective.len());
         let mut probe_specs: Vec<ProbeSpec> = Vec::new();
         for filter in &effective {
-            match self.discovery_query_for(filter, window, bucket_ms)? {
+            match self.discovery_query_for(
+                filter,
+                window,
+                bucket_ms,
+                DiscoveryProjection::SeriesLabels,
+            )? {
                 Some(DiscoveryQuery::Sql(sql)) => fetch_sqls.push(sql),
                 Some(DiscoveryQuery::Probe {
                     name_matchers,
@@ -1222,25 +1223,41 @@ impl MetricsEngine {
     ///   and deliberately NOT routed through the fan-out cap —
     ///   `{job="api"}` must not fail on a deployment with many metric
     ///   names, and its SQL already prunes without a resolved name set.
+    ///
+    /// `projection` selects which statement the two **plain** routes render
+    /// (issue #472) and is ignored by the name-matcher route, whose
+    /// adjudicated fan-out shape is untouched. Under
+    /// [`DiscoveryProjection::SeriesLabels`] every arm's outcome — the
+    /// concrete-name arm's issue #316 error mapping included — is byte-
+    /// unchanged from before #472.
     fn discovery_query_for(
         &self,
         filter: &DiscoveryFilter,
         window: DataWindow,
         bucket_ms: i64,
+        projection: DiscoveryProjection,
     ) -> Result<Option<DiscoveryQuery>, ReadError> {
+        if !takes_plain_discovery_route(filter) {
+            return self.discovery_multi_query(filter, window, bucket_ms);
+        }
         let discovery_query = || {
-            DiscoveryQuery::Sql(super::sql::discovery_query(
-                &self.config.series_table,
-                filter,
-                window,
-                bucket_ms,
-            ))
+            DiscoveryQuery::Sql(match projection {
+                DiscoveryProjection::SeriesLabels => super::sql::discovery_query(
+                    &self.config.series_table,
+                    filter,
+                    window,
+                    bucket_ms,
+                ),
+                DiscoveryProjection::MetricNamesOnly => super::sql::discovery_distinct_names_query(
+                    &self.config.series_table,
+                    filter,
+                    window,
+                    bucket_ms,
+                ),
+            })
         };
         let Some(name) = filter.metric_name.as_deref() else {
-            if filter.name_matchers.is_empty() {
-                return Ok(Some(discovery_query()));
-            }
-            return self.discovery_multi_query(filter, window, bucket_ms);
+            return Ok(Some(discovery_query()));
         };
         match super::labels::concrete_name_matches(&filter.name_matchers, name) {
             Ok(true) => Ok(Some(discovery_query())),
@@ -1397,27 +1414,105 @@ impl MetricsEngine {
         Ok(names.into_iter().collect())
     }
 
+    /// Issue #472. `label_values("__name__", …)`: the distinct metric names
+    /// only, never the series' label sets.
+    ///
+    /// Filters on the plain route ([`takes_plain_discovery_route`]) render
+    /// [`super::sql::discovery_distinct_names_query`] — the same `WHERE`
+    /// [`super::sql::discovery_query`] would have rendered, with the
+    /// `fingerprint`/`labels` columns dropped from the projection and the
+    /// per-series rows collapsed to one row per metric name. Every other
+    /// filter is handed to the untouched [`Self::discovery_series`] **as a
+    /// non-empty slice**, so its own empty-slice substitution can never fire
+    /// here and silently add an unfiltered query. Each filter is routed
+    /// exactly once — `discovery_multi_query`'s cache resolution must not
+    /// run twice for one request, which is why the partition asks the pure
+    /// [`takes_plain_discovery_route`] rather than calling
+    /// [`Self::discovery_query_for`] to find out.
+    ///
+    /// The two waves run concurrently ([`join`]), keeping
+    /// `discovery_series`'s own fetch-concurrency contract for a request
+    /// that mixes both route kinds.
+    async fn discovery_metric_names(
+        &self,
+        filters: &[DiscoveryFilter],
+        window: DataWindow,
+    ) -> Result<Vec<String>, ReadError> {
+        let bucket_ms = self.resolver.config.bucket_ms;
+        let effective = effective_filters(filters);
+        let mut narrow_sqls: Vec<String> = Vec::with_capacity(effective.len());
+        let mut wide: Vec<DiscoveryFilter> = Vec::new();
+        for filter in &effective {
+            if !takes_plain_discovery_route(filter) {
+                wide.push(filter.clone());
+                continue;
+            }
+            match self.discovery_query_for(
+                filter,
+                window,
+                bucket_ms,
+                DiscoveryProjection::MetricNamesOnly,
+            )? {
+                Some(DiscoveryQuery::Sql(sql)) => narrow_sqls.push(sql),
+                // Unreachable while `discovery_query_for` branches on
+                // `takes_plain_discovery_route`: the plain arm returns
+                // `Sql`/`None` only. Routed to the untouched wide path
+                // rather than panicking, so a future arm that did return a
+                // probe here would degrade to the old behaviour instead of
+                // aborting the request. No filter is resolved twice: the
+                // plain arm reads no cache at all.
+                Some(DiscoveryQuery::Probe { .. }) => wide.push(filter.clone()),
+                None => {}
+            }
+        }
+
+        let narrow = async {
+            let fetches = narrow_sqls
+                .into_iter()
+                .map(|sql| self.fetch_rows::<super::rows::MetricNameRow>(sql));
+            join_all(fetches).await
+        };
+        let wide_series = async {
+            if wide.is_empty() {
+                Ok(Vec::new())
+            } else {
+                self.discovery_series(&wide, window).await
+            }
+        };
+        let (narrow_results, wide_result) = join(narrow, wide_series).await;
+
+        let mut values: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for rows in narrow_results {
+            for row in rows? {
+                values.insert(row.metric_name);
+            }
+        }
+        for (metric_name, _) in wide_result? {
+            values.insert(metric_name);
+        }
+        Ok(values.into_iter().collect())
+    }
+
     /// `GET /api/v1/label/{name}/values` (issue #32): distinct values of
     /// `name` across every series [`DiscoveryFilter`] matches.
     /// `name == "__name__"` returns the distinct metric names themselves
-    /// (docs/api.md §3.3).
+    /// (docs/api.md §3.3) — through [`Self::discovery_metric_names`]'s
+    /// narrow projection (issue #472), never by reading every series' label
+    /// blob and discarding it.
     pub async fn label_values(
         &self,
         name: &str,
         filters: &[DiscoveryFilter],
         window: DataWindow,
     ) -> Result<Vec<String>, ReadError> {
+        if name == "__name__" {
+            return self.discovery_metric_names(filters, window).await;
+        }
         let series = self.discovery_series(filters, window).await?;
         let mut values: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        if name == "__name__" {
-            for (metric_name, _) in &series {
-                values.insert(metric_name.clone());
-            }
-        } else {
-            for (_, labels) in &series {
-                if let Some(v) = labels.get(name) {
-                    values.insert(v.to_string());
-                }
+        for (_, labels) in &series {
+            if let Some(v) = labels.get(name) {
+                values.insert(v.to_string());
             }
         }
         Ok(values.into_iter().collect())
@@ -1576,6 +1671,50 @@ fn info_cardinality_bound(total_series: usize, cap: u64) -> Option<TooBroadReaso
 /// set before the fetch is built. Keeps `discovery_query_for` synchronous
 /// (in-process cache reads only); the async probe runs in
 /// `discovery_series`'s wave 1.
+/// Which projection the plain `metric_series` discovery route renders
+/// (issue #472). The name-matcher ([`MetricsEngine::discovery_multi_query`])
+/// and degraded-probe routes ignore this: their projections are adjudicated
+/// (#85/#89/#96, docs/api.md §3.3) and unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryProjection {
+    /// `SELECT fingerprint, metric_name, labels …` — fetched as
+    /// [`super::rows::SeriesRow`].
+    SeriesLabels,
+    /// `SELECT DISTINCT metric_name …` — fetched as
+    /// [`super::rows::MetricNameRow`] (issue #472).
+    MetricNamesOnly,
+}
+
+/// `true` iff [`MetricsEngine::discovery_query_for`] resolves `filter` on
+/// the plain [`super::sql::discovery_query`] route — concrete-name or
+/// matcher-only — rather than the name-matcher/probe routes.
+///
+/// **One predicate, two readers:** `discovery_query_for` branches on this
+/// very function, so a caller that asks the question in advance
+/// ([`MetricsEngine::discovery_metric_names`]) and the function that
+/// answers it cannot disagree. Pure and cache-free on purpose — asking it
+/// costs no `PULSUS_PROMQL_MAX_CACHE_SCAN` budget, so no filter is resolved
+/// twice for one request.
+fn takes_plain_discovery_route(filter: &DiscoveryFilter) -> bool {
+    filter.metric_name.is_some() || filter.name_matchers.is_empty()
+}
+
+/// `filters` empty is Prometheus's "no `match[]`" contract (docs/api.md
+/// §3.3) — one unfiltered [`DiscoveryFilter`], i.e. every series in the
+/// window. Shared by [`MetricsEngine::discovery_series`] and
+/// [`MetricsEngine::discovery_metric_names`] so the two cannot disagree
+/// about it; **calling either with an empty slice must keep meaning "every
+/// series in the window", never "no query at all"** — which is also why
+/// `discovery_metric_names` never hands `discovery_series` an empty
+/// leftover slice.
+fn effective_filters(filters: &[DiscoveryFilter]) -> Vec<DiscoveryFilter> {
+    if filters.is_empty() {
+        vec![DiscoveryFilter::default()]
+    } else {
+        filters.to_vec()
+    }
+}
+
 enum DiscoveryQuery {
     /// A ready-to-run `metric_series` fetch SQL (concrete-name, matcher-
     /// only, or the warm name-matcher [`super::sql::discovery_fetch_multi`]

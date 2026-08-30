@@ -1761,3 +1761,364 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         .await
         .expect("drop run db");
 }
+
+// ---------------------------------------------------------------------
+// Issue #472 — the `__name__` discovery projection's Tier-1 ratio gate.
+// ---------------------------------------------------------------------
+
+/// 50 metric names x 200 series each. The two numbers are what make the
+/// gate's identities readable: the narrow statement returns
+/// [`NAMES_472`] rows where the wide one returns [`SERIES_472`].
+const NAMES_472: u64 = 50;
+const SERIES_472: u64 = 10_000;
+
+/// The pre-committed thresholds. Named constants rather than literals in
+/// the assertions so the numbers the plan fixed **before** any measurement
+/// are readable in one place, and so a later relaxation is a visible edit.
+const B1_MIN_READ_BYTES_RATIO: f64 = 5.0;
+const B3_MAX_NARROW_GROWTH: f64 = 1.10;
+const B3_MIN_WIDE_GROWTH: f64 = 3.0;
+
+/// `system.query_log` evidence for the #472 gate.
+///
+/// `result_rows` is the coordinator fan-in and `read_bytes` is the cost —
+/// this scenario needs both, and the suite-wide [`QueryLogRow`] carries no
+/// `result_rows`. It gets its own row shape rather than widening the shared
+/// one (the [`FanInRow`] precedent), so no other gate's evidence query
+/// changes.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct NameProjectionRow {
+    read_rows: u64,
+    read_bytes: u64,
+    result_rows: u64,
+    result_bytes: u64,
+    /// Read back for the same reason [`QueryLogRow::condition_cache`] is:
+    /// the pin below must not be deletable silently.
+    condition_cache: String,
+}
+
+/// Runs `sql` under a unique `query_id`, drains every row of `R`'s shape
+/// (the `QueryFinish` row only lands once the query has fully completed),
+/// flushes logs and reads the evidence back. The stream is scoped to this
+/// function so its pooled connection lease is released before the
+/// `system.query_log` read.
+///
+/// `use_query_condition_cache = 0` is pinned for [`run_and_capture`]'s
+/// reason (issue #376): from 26.3 a repeated identical query can be served
+/// partly from that cache, which would let a ratio pass by having CACHED
+/// rather than by having read less.
+async fn run_name_projection<R: pulsus_clickhouse::ChRow>(
+    client: &ChClient,
+    sql: &str,
+    query_id: &str,
+) -> NameProjectionRow {
+    let settings = QuerySettings::new()
+        .set("query_id", query_id)
+        .set("use_query_condition_cache", 0);
+    {
+        let mut stream = client
+            .query_stream::<R>(sql, &settings)
+            .await
+            .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+        while let Some(row) = stream.next().await {
+            row.expect("decode row");
+        }
+    }
+    client
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    let log_sql = format!(
+        "SELECT read_rows, read_bytes, result_rows, result_bytes, \
+         Settings['use_query_condition_cache'] AS condition_cache \
+         FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish' \
+         ORDER BY event_time_microseconds DESC LIMIT 1"
+    );
+    let mut log_stream = client
+        .query_stream::<NameProjectionRow>(&log_sql, &QuerySettings::new())
+        .await
+        .expect("query system.query_log");
+    let evidence = log_stream
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("no query_log row for query_id {query_id}"))
+        .expect("decode query_log row");
+    assert_eq!(
+        evidence.condition_cache, "0",
+        "the query-condition-cache pin must survive, or this gate measures a cache hit \
+         rather than a read (query_id {query_id})"
+    );
+    evidence
+}
+
+/// Creates `{db}.{table}` with `metric_series`'s own DDL and fills it with
+/// [`SERIES_472`] rows over [`NAMES_472`] names in ONE activity bucket,
+/// server-side (`INSERT … SELECT FROM numbers`), so no row crosses the
+/// wire. `pad_bytes` is the only thing that differs between the two
+/// tables: `(metric_name, fingerprint, unix_milli)` is a pure function of
+/// `number` and `bucket_ms`, so the two tables are identical in every
+/// column the `WHERE` and the projection touch — asserted by the identity
+/// hash in the test below, which is what makes the blob-invariance
+/// comparison a comparison of blob size and nothing else.
+async fn seed_metric_series_472(client: &ChClient, db: &str, table: &str, bucket: i64, pad: u64) {
+    client
+        .execute(
+            &format!(
+                "CREATE TABLE {db}.{table} (\
+                   metric_name  LowCardinality(String), \
+                   fingerprint  UInt64  CODEC(Delta(8), ZSTD(1)), \
+                   unix_milli   Int64   CODEC(Delta(8), ZSTD(1)), \
+                   labels       String  CODEC(ZSTD(5))\
+                 ) ENGINE = MergeTree \
+                 PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(unix_milli)) \
+                 ORDER BY (metric_name, fingerprint, unix_milli)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create the #472 corpus table");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.{table} \
+                 SELECT concat('metric_', leftPad(toString(number % {NAMES_472}), 2, '0')), \
+                        number + 1, \
+                        {bucket}, \
+                        concat('{{\"job\":\"api\",\"namespace\":\"ns-', toString(number % 13), \
+                               '\",\"pod\":\"pod-', toString(number), \
+                               '\",\"pad\":\"', repeat('x', {pad}), '\"}}') \
+                 FROM numbers({SERIES_472})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed the #472 corpus");
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CorpusShapeRow {
+    rows: u64,
+    names: u64,
+    mean_label_bytes: f64,
+    identity: u64,
+}
+
+async fn corpus_shape(client: &ChClient, db: &str, table: &str) -> CorpusShapeRow {
+    let sql = format!(
+        "SELECT count() AS rows, uniqExact(metric_name) AS names, \
+         avg(length(labels)) AS mean_label_bytes, \
+         sum(cityHash64(metric_name, fingerprint, unix_milli)) AS identity \
+         FROM {db}.{table}"
+    );
+    let mut stream = client
+        .query_stream::<CorpusShapeRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("corpus shape");
+    stream
+        .next()
+        .await
+        .expect("one corpus-shape row")
+        .expect("decode corpus-shape row")
+}
+
+/// Issue #472 — the pre-committed `read_bytes` ratio, the blob-invariance
+/// identity, and the fan-in identity for `/api/v1/label/__name__/values`.
+///
+/// The endpoint used to render `SELECT fingerprint, metric_name, labels …
+/// LIMIT 1 BY metric_name, fingerprint` and keep only the distinct
+/// `metric_name` set. It now renders `SELECT DISTINCT metric_name` over the
+/// **same** `WHERE`. Both statements come from the real builders, both
+/// numbers come from `system.query_log` on this server, and the raw pairs
+/// are printed so a CI log records the measurement rather than the verdict.
+///
+/// **Thresholds, fixed before any measurement was taken** (the plan's
+/// pre-committed bar, recorded here beside the raw pairs it was checked
+/// against):
+///
+/// - **B1** `read_bytes(wide) / read_bytes(narrow) >= 5.0` on the
+///   unfiltered filter. Measured on this corpus at 26.3.17.110:
+///   **19.6x** (1 782 055 / 90 858).
+/// - **B3** `read_bytes(narrow, inflated) <= 1.10x` its small-blob self and
+///   `read_bytes(wide, inflated) >= 3.0x` its own. Measured: **1.000x**
+///   (90 858 -> 90 858, not one byte) and **11.05x** (1 782 055 ->
+///   19 691 197), for a 12.3x blob inflation (mean `labels` 158 B ->
+///   1948 B).
+/// - **B2** `result_rows(narrow) == 50` and `result_rows(wide) == 10 000`.
+///
+/// **The magnitudes are properties of THIS corpus**, not of a deployment:
+/// they scale with series-per-name and with blob size, both chosen here.
+/// What is corpus-independent — and what B3 and B2 actually gate — is the
+/// *shape*: the narrow form's `read_bytes` does not move with blob size and
+/// its returned rows equal the name count. Scale and wall time route to
+/// issue #25; nothing here asserts a duration.
+///
+/// **What this gate does NOT claim.** Blob-invariance holds for the
+/// **unfiltered** call only. A `match[]` carrying a label matcher renders
+/// `JSONExtractString(labels, …)` into the same `WHERE`, so `labels` is
+/// read to evaluate the filter and the narrow form's bytes grow with the
+/// blob too; that case's win is transport and parse count, not bytes read.
+#[tokio::test]
+async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invariant() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_qlg_name_projection");
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create test database");
+    let client = data_client(db).await;
+
+    let bucket_ms: i64 = 3_600_000;
+    let bucket = (now_ns() / 1_000_000 / bucket_ms) * bucket_ms;
+    seed_metric_series_472(&client, db, "series_small", bucket, 100).await;
+    seed_metric_series_472(&client, db, "series_big", bucket, 1_890).await;
+
+    let small = corpus_shape(&client, db, "series_small").await;
+    let big = corpus_shape(&client, db, "series_big").await;
+    eprintln!(
+        "#472 corpus: small {} rows / {} names / {:.1} B labels; big {} rows / {} names / {:.1} B \
+         labels; blob inflation {:.2}x",
+        small.rows,
+        small.names,
+        small.mean_label_bytes,
+        big.rows,
+        big.names,
+        big.mean_label_bytes,
+        big.mean_label_bytes / small.mean_label_bytes
+    );
+    assert_eq!((small.rows, small.names), (SERIES_472, NAMES_472));
+    assert_eq!((big.rows, big.names), (SERIES_472, NAMES_472));
+    assert_eq!(
+        small.identity, big.identity,
+        "the two tables must be identical in (metric_name, fingerprint, unix_milli) — otherwise \
+         the blob-invariance comparison is comparing two different corpora, not two blob sizes"
+    );
+    assert!(
+        big.mean_label_bytes >= 10.0 * small.mean_label_bytes,
+        "the inflated table's labels must be an order of magnitude larger, or B3's wide side \
+         cannot move: {:.1} B vs {:.1} B",
+        big.mean_label_bytes,
+        small.mean_label_bytes
+    );
+
+    // The real builders, over the exact filter the discovery client's first
+    // call produces: no `match[]` at all.
+    let filter = pulsus_read::metrics::DiscoveryFilter::default();
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: bucket,
+        end_ms: bucket,
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let mut evidence = Vec::new();
+    for (tag, table) in [("small", "series_small"), ("big", "series_big")] {
+        let qualified = format!("{db}.{table}");
+        let wide_sql =
+            pulsus_read::metrics::sql::discovery_query(&qualified, &filter, window, bucket_ms);
+        let narrow_sql = pulsus_read::metrics::sql::discovery_distinct_names_query(
+            &qualified, &filter, window, bucket_ms,
+        );
+        let wide = run_name_projection::<pulsus_read::metrics::rows::SeriesRow>(
+            &client,
+            &wide_sql,
+            &format!("qlg-472-wide-{tag}-{nonce}"),
+        )
+        .await;
+        let narrow = run_name_projection::<pulsus_read::metrics::rows::MetricNameRow>(
+            &client,
+            &narrow_sql,
+            &format!("qlg-472-narrow-{tag}-{nonce}"),
+        )
+        .await;
+        eprintln!(
+            "#472 {tag}: wide read_rows {} read_bytes {} result_rows {} result_bytes {}; \
+             narrow read_rows {} read_bytes {} result_rows {} result_bytes {}",
+            wide.read_rows,
+            wide.read_bytes,
+            wide.result_rows,
+            wide.result_bytes,
+            narrow.read_rows,
+            narrow.read_bytes,
+            narrow.result_rows,
+            narrow.result_bytes,
+        );
+        evidence.push((tag, wide, narrow));
+    }
+    let (_, wide_small, narrow_small) = &evidence[0];
+    let (_, wide_big, narrow_big) = &evidence[1];
+
+    // B1 — the headline ratio, on the small-blob corpus.
+    let b1 = wide_small.read_bytes as f64 / narrow_small.read_bytes.max(1) as f64;
+    eprintln!("#472 B1 read_bytes ratio: {b1:.2}x");
+    assert!(
+        b1 >= B1_MIN_READ_BYTES_RATIO,
+        "B1: read_bytes ratio {b1:.2}x (wide {} / narrow {}) is below the pre-committed \
+         {B1_MIN_READ_BYTES_RATIO}x — the name projection is no longer keeping the read off the \
+         labels blob",
+        wide_small.read_bytes,
+        narrow_small.read_bytes
+    );
+
+    // B2 — the fan-in identity. The wide statement returns one row per
+    // series; the narrow one returns one per metric name.
+    assert_eq!(
+        narrow_small.result_rows, NAMES_472,
+        "B2: the narrow statement must return one row per metric name"
+    );
+    assert_eq!(
+        wide_small.result_rows, SERIES_472,
+        "B2: the wide statement it replaces returned one row per series — if this ever \
+         stopped being true the B1 ratio would be measuring something else"
+    );
+
+    // B3 — blob invariance, the discriminating result. Inflating `labels`
+    // moves the wide read and must not move the narrow one.
+    let narrow_growth = narrow_big.read_bytes as f64 / narrow_small.read_bytes.max(1) as f64;
+    let wide_growth = wide_big.read_bytes as f64 / wide_small.read_bytes.max(1) as f64;
+    eprintln!(
+        "#472 B3 growth under blob inflation: narrow {narrow_growth:.3}x, wide {wide_growth:.2}x"
+    );
+    assert!(
+        narrow_growth <= B3_MAX_NARROW_GROWTH,
+        "B3: the narrow read grew {narrow_growth:.3}x ({} -> {}) when the labels blob was \
+         inflated — it must not read the column at all on an unfiltered call",
+        narrow_small.read_bytes,
+        narrow_big.read_bytes
+    );
+    assert!(
+        wide_growth >= B3_MIN_WIDE_GROWTH,
+        "B3: the wide read grew only {wide_growth:.2}x ({} -> {}) — if the statement being \
+         replaced does not pay for the blob, the invariance above proves nothing",
+        wide_small.read_bytes,
+        wide_big.read_bytes
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+}

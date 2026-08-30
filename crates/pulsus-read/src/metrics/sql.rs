@@ -174,22 +174,85 @@ pub fn discovery_query(
     window: DataWindow,
     bucket_ms: i64,
 ) -> String {
+    format!(
+        "SELECT fingerprint, metric_name, labels\n{}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
+        discovery_from_where(series_table, filter, window, bucket_ms)
+    )
+}
+
+/// The `FROM <table>` + `WHERE …` head [`discovery_query`] and
+/// [`discovery_distinct_names_query`] share. Extracted rather than
+/// re-derived: the equivalence of the two statements is exactly "same
+/// WHERE, different projection", so a WHERE that is *written once* is what
+/// keeps that true. Private to this module — which is a scope, not a
+/// guarantee: it stops nobody in this file from re-deriving a head by hand,
+/// and `the_two_discovery_builders_share_one_where_byte_for_byte` below is
+/// what would catch that.
+fn discovery_from_where(
+    series_table: &str,
+    filter: &DiscoveryFilter,
+    window: DataWindow,
+    bucket_ms: i64,
+) -> String {
     let tail = SeriesWhere::new(window, bucket_ms, &filter.matchers, MatcherTarget::Labels);
-    let mut sql = format!("SELECT fingerprint, metric_name, labels\nFROM {series_table}\n");
     match &filter.metric_name {
-        Some(name) => {
-            sql.push_str(&format!(
-                "WHERE metric_name = {}\n  AND {}",
-                ch_string(name),
-                tail.where_tail()
-            ));
-        }
-        None => {
-            sql.push_str(&format!("WHERE {}", tail.where_tail()));
-        }
+        Some(name) => format!(
+            "FROM {series_table}\nWHERE metric_name = {}\n  AND {}",
+            ch_string(name),
+            tail.where_tail()
+        ),
+        None => format!("FROM {series_table}\nWHERE {}", tail.where_tail()),
     }
-    sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
-    sql
+}
+
+/// Issue #472's narrow discovery projection: the distinct metric names of
+/// exactly the series [`discovery_query`] would have returned, for the SAME
+/// `filter`/`window`/`bucket_ms`.
+///
+/// **Why the answer is unchanged.** [`discovery_query`]'s `LIMIT 1 BY
+/// metric_name, fingerprint` yields one row per `(metric_name, fingerprint)`
+/// of its `WHERE`, and the distinct `metric_name` projection of that set
+/// *is* the distinct `metric_name` set of the same `WHERE`. The two share
+/// [`discovery_from_where`], so "the same `WHERE`" is a property of the
+/// code, not of a comment.
+///
+/// **`ORDER BY metric_name` is load-bearing, not cosmetic.** `metric_series
+/// ORDER BY (metric_name, fingerprint, unix_milli)` (docs/schemas.md:73,
+/// rendered at `crates/pulsus-schema/src/catalog.rs:179`) makes
+/// `metric_name` the leading key, and with the `ORDER BY` present
+/// ClickHouse plans BOTH the preliminary and the final DISTINCT as
+/// `DistinctSortedStreamTransform` (no hash set). Measured on 26.3.17.110:
+/// dropping the `ORDER BY` turns the final one into `DistinctTransform`,
+/// and moving the projection to a non-leading key column turns the
+/// preliminary one into `DistinctTransform` — both gated in
+/// `crates/pulsus-read/tests/explain_indexes.rs`.
+///
+/// **`labels` is dropped from the projection, which is not the same as
+/// never being read.** With no `match[]` — the discovery client's actual
+/// first call — there are no matcher conjuncts, so `labels` is not
+/// referenced at all and the column is genuinely not touched. With label
+/// matchers the `WHERE` renders them as `JSONExtractString(labels, '<key>')`
+/// predicates, so `labels` **is** read to evaluate the filter; the win
+/// there is transport and parse count (rows collapse from one-per-series to
+/// one-per-metric-name, and `parse_canonical_labels` is not called at all),
+/// not bytes read.
+///
+/// **NO `LIMIT`.** The discovery `limit` stays a response-size cap applied
+/// last, in the handler (docs/api.md §3.3): measured on this table shape,
+/// `LIMIT 6`/`41`/`40001`/none all read the identical 10 000 rows and
+/// 91 508 bytes, so pushing it down buys nothing and would put a
+/// union-of-per-filter-prefixes argument on the multi-`match[]` path for no
+/// measured gain. Scale-dependent early termination routes to issue #25.
+pub fn discovery_distinct_names_query(
+    series_table: &str,
+    filter: &DiscoveryFilter,
+    window: DataWindow,
+    bucket_ms: i64,
+) -> String {
+    format!(
+        "SELECT DISTINCT metric_name\n{}\nORDER BY metric_name",
+        discovery_from_where(series_table, filter, window, bucket_ms)
+    )
 }
 
 /// Issue #89's discovery analog of [`super::sample_sql::sample_fetch_multi`]:
@@ -671,6 +734,12 @@ mod tests {
             ),
             discovery_query("metric_series", &filter, window(), 3_600_000),
             discovery_query("metric_series", &nameless, window(), 3_600_000),
+            // Issue #472's narrow projection shares `discovery_from_where`
+            // with `discovery_query`, so it inherits the same sealed tail —
+            // listed here anyway, because the list is what says a builder
+            // was considered.
+            discovery_distinct_names_query("metric_series", &filter, window(), 3_600_000),
+            discovery_distinct_names_query("metric_series", &nameless, window(), 3_600_000),
             discovery_fetch_by_names(
                 "metric_series",
                 &["up".to_string()],
@@ -827,6 +896,132 @@ mod tests {
         let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
         assert!(sql.contains(&format!("metric_name = {}", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
+    }
+
+    // --- discovery_distinct_names_query (issue #472) ---
+
+    /// The filter table AC1 and AC3 both range over: no name, a concrete
+    /// name, one `Eq` matcher, one `Re` matcher, and a name carrying a
+    /// hostile quote. Both statements are rendered from each element, so a
+    /// head that drifts in only one of the five shapes is still caught.
+    fn discovery_filter_table() -> Vec<(&'static str, DiscoveryFilter)> {
+        vec![
+            ("unfiltered", DiscoveryFilter::default()),
+            (
+                "concrete name",
+                DiscoveryFilter {
+                    metric_name: Some("up".to_string()),
+                    name_matchers: vec![],
+                    matchers: vec![],
+                },
+            ),
+            (
+                "one Eq matcher",
+                DiscoveryFilter {
+                    metric_name: None,
+                    name_matchers: vec![],
+                    matchers: vec![eq("job", "api")],
+                },
+            ),
+            (
+                "one Re matcher",
+                DiscoveryFilter {
+                    metric_name: None,
+                    name_matchers: vec![],
+                    matchers: vec![re("status", "5..")],
+                },
+            ),
+            (
+                "hostile-quote name",
+                DiscoveryFilter {
+                    metric_name: Some("up'; DROP TABLE metric_series; --".to_string()),
+                    name_matchers: vec![],
+                    matchers: vec![eq("job", "api")],
+                },
+            ),
+        ]
+    }
+
+    /// Issue #472 AC1 — the wide statement is still exactly its projection
+    /// prefix, the shared head, and its `ORDER BY`/`LIMIT 1 BY` suffix.
+    ///
+    /// **What this pins and what it does not.** The head is now shared, so
+    /// this equality cannot see a change *inside* the head — that is what
+    /// [`the_narrow_discovery_builder_is_byte_exact`] freezes, byte for
+    /// byte, and what
+    /// [`the_two_discovery_builders_share_one_where_byte_for_byte`] carries
+    /// across to this builder. What this test earns on its own is the part
+    /// only `discovery_query` has: that the projection list, the `ORDER BY
+    /// unix_milli DESC` and the `LIMIT 1 BY metric_name, fingerprint` are
+    /// unmoved by the extraction.
+    #[test]
+    fn discovery_query_is_its_projection_plus_the_shared_head_plus_its_suffix() {
+        for (what, filter) in discovery_filter_table() {
+            let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+            let expected = format!(
+                "SELECT fingerprint, metric_name, labels\n{}\nORDER BY unix_milli \
+                 DESC\nLIMIT 1 BY metric_name, fingerprint",
+                discovery_from_where("metric_series", &filter, window(), 3_600_000)
+            );
+            assert_eq!(sql, expected, "{what}");
+        }
+    }
+
+    /// Issue #472 AC2 — the narrow builder's literal bytes, for the
+    /// unfiltered call the discovery client actually makes and for a
+    /// concrete-name-plus-matcher filter.
+    #[test]
+    fn the_narrow_discovery_builder_is_byte_exact() {
+        let plain_window = DataWindow {
+            start_ms: 0,
+            end_ms: 3_600_000,
+        };
+        assert_eq!(
+            discovery_distinct_names_query(
+                "metric_series",
+                &DiscoveryFilter::default(),
+                plain_window,
+                3_600_000
+            ),
+            "SELECT DISTINCT metric_name\nFROM metric_series\nWHERE unix_milli >= 0 AND \
+             unix_milli <= 3600000\nORDER BY metric_name"
+        );
+        let scoped = DiscoveryFilter {
+            metric_name: Some("up".to_string()),
+            name_matchers: vec![],
+            matchers: vec![eq("job", "api")],
+        };
+        assert_eq!(
+            discovery_distinct_names_query("metric_series", &scoped, plain_window, 3_600_000),
+            "SELECT DISTINCT metric_name\nFROM metric_series\nWHERE metric_name = 'up'\n  AND \
+             unix_milli >= 0 AND unix_milli <= 3600000\n  AND JSONExtractString(labels, 'job') = \
+             'api'\nORDER BY metric_name"
+        );
+    }
+
+    /// Issue #472 AC3 — the two builders' `FROM …WHERE …` heads are
+    /// byte-identical over the whole filter table.
+    ///
+    /// **What it does not prove:** that the head is *shared* rather than
+    /// duplicated-and-currently-equal. That is what [`discovery_from_where`]
+    /// gives by construction, and construction is all it gives.
+    #[test]
+    fn the_two_discovery_builders_share_one_where_byte_for_byte() {
+        for (what, filter) in discovery_filter_table() {
+            let wide = discovery_query("metric_series", &filter, window(), 3_600_000);
+            let narrow =
+                discovery_distinct_names_query("metric_series", &filter, window(), 3_600_000);
+            let head = |sql: &str| -> String {
+                let from = sql
+                    .find("FROM ")
+                    .expect("a FROM in every discovery statement");
+                let order = sql
+                    .rfind("\nORDER BY ")
+                    .expect("an ORDER BY in every discovery statement");
+                sql[from..order].to_string()
+            };
+            assert_eq!(head(&wide), head(&narrow), "{what}");
+        }
     }
 
     // --- discovery_fetch_multi (issue #89) ---
