@@ -9,12 +9,12 @@ pub mod traces;
 
 pub use eval_gate::{DEFAULT_EVAL_CONCURRENCY, EvalGate, EvalGateSnapshot};
 pub use logql::{
-    DEFAULT_MAX_STREAMS, DetectedFieldOut, DetectedFields, DetectedLabelOut, Direction,
-    EngineConfig, EntryCategories, ExplainStage, HistMatrixSeries, HistOrFloat, HistVectorSample,
-    LogQlEngine, LogStats, MatrixSeries, PatternSeries, PlanCtx, PlanExplain, QueryParams,
-    QueryResult, QuerySpec, ReadError, ResponseOptions, RouteChoice, RoutingDecision, StreamResult,
-    TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, TimeBounds,
-    VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery, Warnings, WireArity,
+    DEFAULT_MAX_STREAMS, DetectedFieldOut, DetectedFieldValues, DetectedFields, DetectedLabelOut,
+    Direction, EngineConfig, EntryCategories, ExplainStage, HistMatrixSeries, HistOrFloat,
+    HistVectorSample, LogQlEngine, LogStats, MatrixSeries, PatternSeries, PlanCtx, PlanExplain,
+    QueryParams, QueryResult, QuerySpec, ReadError, ResponseOptions, RouteChoice, RoutingDecision,
+    StreamResult, TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup,
+    TimeBounds, VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery, Warnings, WireArity,
 };
 pub use metrics::{
     CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, DiscoveryFilter,

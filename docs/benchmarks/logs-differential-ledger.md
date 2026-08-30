@@ -315,12 +315,15 @@ Both runs agree on the four things that decide the deferral:
    (65,536 vs 25,802,136 rows; the architect measured ~395× on the same
    shape). That is what makes `/series` — always scoped by `match[]` — and
    `detected_labels?query=` cheap.
-4. **The expensive cases are exactly the three unscoped ones.** `/labels`
-   and `/label/{name}/values` accept no `query=` narrowing in our
-   implementation (deferred M1 scope, `sql.rs`) while the reference's do
-   (`pkg/querier/querier.go:706-737` passes `matchers` to both store
-   calls), so those two sit **permanently** on the unscoped path;
-   unscoped `detected_labels` joins them. A day-granular activity index
+4. **The expensive cases are exactly the unscoped ones.** An UNSCOPED
+   `/labels`, `/label/{name}/values` or `detected_labels` pays the whole
+   activity scan. Issue #482 gave the first two the same `query=`
+   narrowing `detected_labels` already had — the reference passes
+   `matchers` to both store calls (`pkg/querier/querier.go:706-737`) —
+   so a SCOPED request on either now takes the embedded form measured in
+   item 3 instead, at the cost of one stage-1 round trip. What remains
+   expensive is a request that supplies no selector, which is the
+   request that has no narrowing to apply. A day-granular activity index
    would take that scan from ~26M rows to ~2,000. Deferred per the issue
    #399 rulings; re-open against these tables, not against a projection.
 
@@ -632,10 +635,14 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
 ### detected-fields-array-order-pinned (issues #244, #258)
 
 - **Construct:** the ORDER of the `fields` array in a
-  `/detected_fields` `200`. Per-field object shape and the zero-field
-  body are byte-exact (issues #254/#258); this entry is scoped to the
-  array order alone, which is why the endpoint is **not** byte-exact
-  end to end for a populated response.
+  `/detected_fields` `200`, and (issue #482) the ORDER of the `values`
+  array in a `/detected_field/{name}/values` `200`. Per-field object
+  shape and the zero-field body are byte-exact (issues #254/#258); this
+  entry is scoped to the array order alone, which is why neither
+  endpoint is byte-exact end to end for a populated response. The two
+  routes are one registered class, not two: the reference builds both
+  arrays by ranging the same kind of Go map, and a row that did not name
+  its second endpoint would go stale invisibly.
 - **Reference behaviour (source, not inferred):** irreproducible **Go
   map iteration order**, at BOTH points that build the slice
   (`grafana/loki` v3.7.4 = `b318f2829f0ae2094ab3a1e90780450e9e4b03be`):
@@ -665,7 +672,8 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
   `detected_level` is another draw from the same distribution, not a
   rule.
 - **PulsusDB behaviour:** **label-ascending**, pinned in
-  `FieldAccumulator::finish`. This is the ratified treatment of every
+  `FieldAccumulator::finish`; `values` is **byte-ascending**, pinned in
+  `FieldAccumulator::into_field_values`. This is the ratified treatment of every
   irreproducible reference tie in this repo — the same call as
   `label-replace-collision-tie-order` and `approx_topk` beyond the
   retention cap. Mirroring is not available at any price: no reproducible
@@ -683,7 +691,10 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
 - **Fixture status:** as the entry above — no
   `test/fixtures/logs/differential.json` case, registered for identity.
   Gated by `logs_detected_live.rs`'s label-ordered `fields_of`
-  comparison and `detected.rs::finish_sorts_fields_by_label`.
+  comparison and `detected.rs::finish_sorts_fields_by_label`; the
+  `values` clause is gated by `logs_detected_live.rs`'s
+  `detected_field_values_*` cases, which assert whole response bodies
+  including the ascending array.
 
 ### detected-fields-jsonpath-survives-merge (issues #254, #258)
 

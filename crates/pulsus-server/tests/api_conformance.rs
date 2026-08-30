@@ -785,6 +785,27 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 "{ctx}: exact empty-DB detected_fields body"
             );
         }
+        (Surface::LogsDetectedFieldValues, _) => {
+            // Issue #482, docs/api.md §2.6.5: against an empty database
+            // the exact body is the bare `{}` — no `values`, no `limit`
+            // (only emitted alongside a populated `values`), no
+            // `pulsus_partial`.
+            //
+            // A SHAPE assertion, not the mounting oracle, for the same
+            // reason `/detected_fields` gives: mounting is proven by the
+            // documented success STATUS above and by
+            // `assert_detected_field_values_handler_identity` below.
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: detected_field_values content-type"
+            );
+            assert_eq!(
+                res.json(ctx),
+                serde_json::json!({}),
+                "{ctx}: exact empty-DB detected_field_values body"
+            );
+        }
         (Surface::TracesFetch, _) => {
             // Against this suite's empty databases the documented outcome
             // of a well-formed fetch is the mounted-but-absent `404 trace
@@ -1314,6 +1335,9 @@ fn assert_full_route_matrix(port: u16, spec: &RouteSpec, spawn: &str) {
     if spec.surface == Surface::LogsDetectedFields {
         assert_detected_fields_handler_identity(port, spec, spawn);
     }
+    if spec.surface == Surface::LogsDetectedFieldValues {
+        assert_detected_field_values_handler_identity(port, spec, spawn);
+    }
 
     for case in spec.cases {
         run_case(port, spec, case, spawn);
@@ -1356,6 +1380,36 @@ fn assert_detected_fields_handler_identity(port: u16, spec: &RouteSpec, spawn: &
     assert_eq!(
         json["explain"]["result_type"], "detected_fields",
         "{ctx}: only the detected_fields handler stamps this result_type, body {json}"
+    );
+}
+
+/// The `/detected_field/{name}/values` MOUNTING ORACLE (issue #482), the
+/// `/detected_fields` idiom applied to the neighbouring route: its
+/// empty-database body is the same bare `{}`, which identifies no
+/// handler, so mounting is proven from the `X-Pulsus-Explain` fingerprint
+/// instead. `detected_field_values` is the literal only
+/// `LogQlEngine::detected_field_values_explained` passes to
+/// `PlanExplain::new`, so a route mounted onto `detected::detected_fields`
+/// answers `detected_fields` here and fails.
+fn assert_detected_field_values_handler_identity(port: u16, spec: &RouteSpec, spawn: &str) {
+    let ctx = format!(
+        "[{spawn}] GET {} case=mounting-oracle-explain-fingerprint",
+        spec.path
+    );
+    let mut req = manifest::Req::new("GET", resolve_path(spec.path));
+    req.query = spec.base_query.to_string();
+    req.headers.push(("x-pulsus-explain", "1".to_string()));
+    let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_eq!(
+        res.status,
+        spec.success_status,
+        "{ctx}: status (body: {:?})",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(&ctx);
+    assert_eq!(
+        json["explain"]["result_type"], "detected_field_values",
+        "{ctx}: only the detected_field_values handler stamps this result_type, body {json}"
     );
 }
 

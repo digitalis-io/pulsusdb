@@ -674,6 +674,103 @@ fn field_count_is_bounded_by_the_retention_budget_not_by_the_parameter() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #482: the value cap on the PAGED path, and its inertness on
+// `/detected_fields` (AC 12).
+// ---------------------------------------------------------------------
+
+/// Rows whose json bodies each carry ONE distinct value of `level`.
+fn level_rows(n: u64) -> Vec<Result<TailSampleRow, ReadError>> {
+    (0..n)
+        .map(|i| {
+            Ok(TailSampleRow {
+                fingerprint: 1,
+                timestamp_ns: 2_000_000 - i as i64,
+                body: format!(r#"{{"level":"v{i}"}}"#),
+                body_hash: i,
+                structured_metadata: String::new(),
+            })
+        })
+        .collect()
+}
+
+/// **AC 12 — the shared `absorb_page` gate is provably inert on
+/// `/detected_fields`.** The same page through a `/detected_fields`-shaped
+/// probe yields the same fields it did before the value cap existed: 40
+/// distinct values of one field, and the drain terminates COMPLETE on
+/// window exhaustion rather than on a cap.
+///
+/// **`field_limit` is deliberately 3, not 1000.** The corpus has ONE
+/// field name, so 3 is not a name-axis constraint here — it is what makes
+/// this test able to fail. Measured: at `field_limit = 1000` this test
+/// stays GREEN under both breaks below, because 40 values never reach
+/// 1000, and it would then be a name that never reddens. At 3 it reddens
+/// on either of:
+///   * `value_cap_reached()` falling back to `field_limit` when
+///     `value_limit` is `None`;
+///   * `with_byte_budget`/`new` defaulting `name_filter`/`value_limit` to
+///     anything other than `None`.
+#[test]
+fn absorb_page_value_cap_is_inert_on_a_detected_fields_probe() {
+    let _guard = lock_serial();
+    let compiled = compile(r#"{app="x"}"#);
+    let mut probe = DetectedFieldsProbe::new(5000, 3);
+    probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+    let mut stream = futures::stream::iter(level_rows(40));
+    let decision = futures::executor::block_on(probe.absorb_page(&compiled, &mut stream, 1))
+        .expect("absorb_page succeeds");
+    assert_eq!(
+        decision,
+        Some(false),
+        "40 < page_size terminates COMPLETE on window exhaustion"
+    );
+    assert_eq!(probe.matched(), 40, "every row must have been fed");
+    let (fields, capped) = probe.finish();
+    assert!(!capped);
+    let level = fields
+        .iter()
+        .find(|f| f.label == "level")
+        .expect("level detected");
+    assert_eq!(
+        level.cardinality, 40,
+        "every value must be retained — /detected_fields has no value cap"
+    );
+}
+
+/// **AC 12's other half — the same gate BITES on the field-values
+/// probe.** The cap is checked between entries, so feeding stops at the
+/// first row after the set reaches `value_limit`: 3 rows fed for
+/// `value_limit = 3`, and the drain terminates COMPLETE rather than
+/// partial. This is the paged path; the fast path's live equivalent is
+/// `logs_detected_live.rs`'s V2/V3 cases.
+#[test]
+fn absorb_page_value_cap_stops_feeding_on_a_field_values_probe() {
+    let _guard = lock_serial();
+    let compiled = compile(r#"{app="x"}"#);
+    let mut probe = DetectedFieldsProbe::for_field_values(5000, "level", 3);
+    probe.add_stream(1, &[("app".to_string(), "x".to_string())]);
+    let mut stream = futures::stream::iter(level_rows(40));
+    let decision = futures::executor::block_on(probe.absorb_page(&compiled, &mut stream, 1))
+        .expect("absorb_page succeeds");
+    assert_eq!(
+        decision,
+        Some(false),
+        "a filled cap is COMPLETE, not partial"
+    );
+    assert_eq!(
+        probe.matched(),
+        3,
+        "feeding must stop at the first entry after the cap is reached"
+    );
+    let (values, capped) = probe.finish_field_values();
+    assert!(!capped);
+    assert_eq!(
+        values,
+        vec!["v0".to_string(), "v1".to_string(), "v2".to_string()],
+        "one value per entry, so the between-entries cap lands exactly on 3 here"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Case E: the sampled-row axis is streamed (AC 11).
 // ---------------------------------------------------------------------
 
@@ -1450,8 +1547,11 @@ const EXPECTED_CENSUS: [(FrameKey, &str); 15] = [
      ".charsx1 .nextx3 .peekx3 .peekablex1 .pushx1 Somex1 parse_json_stringx2 skip_wsx3"),
     (("detected_probe.rs", None, "recycle_label_scratch"),
      ".clearx1 .collectx1 .into_iterx1 .into_ownedx2 .mapx1 Ownedx2"),
+    // Issue #482 added the one-statement name filter (`/detected_field/
+    // {name}/values` tracks exactly one field name), which is the
+    // `.as_deref` + `.is_some_and` pair. Nothing else in this frame moved.
     (("detected.rs", Some("FieldAccumulator"), "observe_pair"),
-     ".chargex1 .contains_keyx1 .get_mutx1 .insertx1 .lenx1 .to_stringx1 field_entry_bytesx1 newx1 observe_admittedx1 with_capacityx1"),
+     ".as_derefx1 .chargex1 .contains_keyx1 .get_mutx1 .insertx1 .is_some_andx1 .lenx1 .to_stringx1 field_entry_bytesx1 newx1 observe_admittedx1 with_capacityx1"),
     (("detected.rs", None, "observe_admitted"),
      ".chargex1 .containsx2 .insertx1 .parserx1 .pushx1 .to_stringx1 determine_typex1 store_json_pathx1 value_entry_bytesx1"),
     (("detected.rs", None, "store_json_path"),

@@ -1558,12 +1558,28 @@ async fn every_logql_engine_query_carries_the_memory_ceiling() {
         )
         .await
         .expect("metric query");
-    // Discovery reads.
-    engine.label_names(bounds).await.expect("label_names");
+    // Discovery reads — unscoped and, since issue #482, `query=`-scoped
+    // (a distinct dispatch site: the scoped form issues stage 1 first).
     engine
-        .label_values("service_name", bounds)
+        .label_names(None, bounds)
         .await
-        .expect("label_values");
+        .expect("label_names unscoped");
+    engine
+        .label_names(Some(&parse(&selector).expect("parse")), bounds)
+        .await
+        .expect("label_names scoped");
+    engine
+        .label_values("service_name", None, bounds)
+        .await
+        .expect("label_values unscoped");
+    engine
+        .label_values(
+            "service_name",
+            Some(&parse(&selector).expect("parse")),
+            bounds,
+        )
+        .await
+        .expect("label_values scoped");
     engine
         .series(&[parse(&selector).expect("parse")], bounds)
         .await
@@ -1580,9 +1596,130 @@ async fn every_logql_engine_query_carries_the_memory_ceiling() {
         .detected_fields(&parse(&selector).expect("parse"), bounds, 100, 100)
         .await
         .expect("detected_fields");
+    engine
+        .detected_field_values(
+            "service_name",
+            &parse(&selector).expect("parse"),
+            bounds,
+            100,
+            100,
+        )
+        .await
+        .expect("detected_field_values");
 
     let rows = mem_ceiling_rows(&admin, &run_db, &marker).await;
     assert_every_row_carries_the_ceiling(&rows, "LogQL engine");
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop run db");
+}
+
+/// **Issue #482 AC 0a — a scoped discovery request that matches no
+/// stream issues stage one and NOTHING ELSE.**
+///
+/// The property is a COUNT of statements the server logged, not a
+/// presence test: `mem_ceiling_rows` returns every finalized `Select`
+/// against the run database since the marker, with no filter on the
+/// statement text (`:1458-1486`), so an extra dispatch pushes the count
+/// up and fails.
+///
+/// Phase 2 is the positive control. Without it, phase 1's `rows.len() ==
+/// 1` would be equally consistent with a sweep that cannot see stage-2
+/// statements at all.
+///
+/// Both selectors are pure equality, so no selectivity probe is issued
+/// (`sql.rs`: probes are computed only for a selector carrying a regex
+/// matcher) and the counts are exactly two statements' worth.
+///
+/// What this cannot see: a stage-2 statement built and then discarded
+/// before dispatch — which is not a user-visible defect — and any
+/// statement issued against a database other than the run database.
+#[tokio::test]
+async fn a_no_match_scoped_discovery_request_issues_stage_one_and_no_stage_two() {
+    skip_unless_live!();
+    let (admin, run_db, ts_ns) = fresh_run_db().await;
+    let config = engine_config(&run_db, 50 * 1024 * 1024 * 1024);
+    let client = data_client(&run_db).await;
+    let engine = LogQlEngine::new(client, config);
+    let bounds = pulsus_read::logql::TimeBounds {
+        start_ns: ts_ns - 3_600_000_000_000,
+        end_ns: ts_ns + 3_600_000_000_000,
+    };
+
+    // Phase 1 — the no-match request.
+    let m1 = query_log_marker(&admin).await;
+    let out = engine
+        .label_values(
+            "service_name",
+            Some(&parse(r#"{service_name="no-such-service-482"}"#).expect("parse")),
+            bounds,
+        )
+        .await
+        .expect("no-match label_values");
+    assert_eq!(out, Vec::<String>::new());
+    let rows = mem_ceiling_rows(&admin, &run_db, &m1).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one statement: stage one and nothing else\n{}",
+        rows.iter()
+            .map(|r| r.q.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        rows[0]
+            .q
+            .starts_with("SELECT fingerprint\nFROM log_streams_idx"),
+        "the one statement must be stage one, got {:?}",
+        rows[0].q
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.q.starts_with("SELECT DISTINCT val AS value")),
+        "no stage-2 label_values statement may be issued"
+    );
+
+    // Phase 2 — the positive control.
+    let m2 = query_log_marker(&admin).await;
+    let out = engine
+        .label_values(
+            "service_name",
+            Some(&parse(&format!(r#"{{service_name="{SERVICE}"}}"#)).expect("parse")),
+            bounds,
+        )
+        .await
+        .expect("matching label_values");
+    assert_eq!(out, vec![SERVICE.to_string()]);
+    let rows = mem_ceiling_rows(&admin, &run_db, &m2).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "stage one, then stage two\n{}",
+        rows.iter()
+            .map(|r| r.q.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        rows[0]
+            .q
+            .starts_with("SELECT fingerprint\nFROM log_streams_idx"),
+        "rows[0] must be stage one, got {:?}",
+        rows[0].q
+    );
+    assert!(
+        rows[1].q.starts_with("SELECT DISTINCT val AS value"),
+        "rows[1] must be stage two, got {:?}",
+        rows[1].q
+    );
 
     admin
         .execute(

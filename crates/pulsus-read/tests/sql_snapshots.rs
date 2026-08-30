@@ -1060,14 +1060,17 @@ fn detected_labels_scoped_is_byte_exact() {
 
 /// Byte-exact `label_names` snapshot (issue #399 AC11): the `/labels`
 /// scan is the same single `DISTINCT key` pass it always was, plus the
-/// activity semi-join. Always unscoped — `label_names` takes no
-/// fingerprints (`query=` narrowing is deferred M1 scope).
+/// activity semi-join. The UNSCOPED form — issue #482 added the
+/// `fingerprints` argument, and this expected text must stay
+/// character-identical to what it was before that: a request with no
+/// `query=` still issues exactly this statement.
 #[test]
 fn label_names_is_byte_exact() {
     assert_eq!(
         sql::label_names(
             "log_streams_idx",
             &[month_literal(2026, 7)],
+            None,
             "log_metrics_5s",
             DISCOVERY_WINDOW,
             DISCOVERY_RES_NS,
@@ -1082,9 +1085,155 @@ fn label_names_is_byte_exact() {
     );
 }
 
+/// Issue #482 AC 1 — the activity semi-join with the caller's stage-1
+/// fingerprints pushed INSIDE it. HAND-WRITTEN, exactly as
+/// `ACTIVE_UNSCOPED` above is. Nothing on the expected side of the
+/// assertions below is produced by `sql::`: a mutation inside the
+/// shared builder must move only the left side.
+const ACTIVE_SCOPED_1: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
+     WHERE fingerprint IN (7) AND bucket_ns >= 1751328000000000000 \
+     AND bucket_ns <= 1751331600000000000";
+const ACTIVE_SCOPED_3: &str = "SELECT DISTINCT fingerprint FROM log_metrics_5s \
+     WHERE fingerprint IN (101, 205, 4294967296) AND bucket_ns >= 1751328000000000000 \
+     AND bucket_ns <= 1751331600000000000";
+
+/// The three whole-statement templates AC 1 compares against, one per
+/// discovery builder. `{MONTH}`, `{ACTIVE}` and `{UUID_LITERAL}` are
+/// substituted with [`str::replace`] rather than interpolated, so the
+/// text below stays byte-identical to the plan's and no `sql::` call can
+/// reach the expected side.
+const STMT_LABEL_NAMES: &str = "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE {MONTH}\n  AND fingerprint IN ({ACTIVE})\nORDER BY name";
+const STMT_LABEL_VALUES: &str = "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE {MONTH} AND key = 'env'\n  AND fingerprint IN ({ACTIVE})\nORDER BY value";
+const STMT_DETECTED_LABELS: &str = "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\nFROM log_streams_idx\nWHERE {MONTH}\n  AND fingerprint IN ({ACTIVE})\nGROUP BY key\nORDER BY key";
+
+/// One AC 1 triple: the months, the stage-1 fingerprints, the window, the
+/// hand-written subquery text and the hand-written month clause.
+struct ScopedTriple {
+    name: &'static str,
+    months: Vec<pulsus_read::logql::predicate::MonthLiteral>,
+    fingerprints: Vec<u64>,
+    window: TimeWindow,
+    active: &'static str,
+    month: &'static str,
+}
+
+/// T1 (one month, one fingerprint), T2 (two months, three fingerprints)
+/// and T3 (one month, one fingerprint, a start deliberately OFF the 5s
+/// grid — its expected lower bound is still `1751328000000000000`, which
+/// is what pins `activity_lower_bucket_ns`'s flooring inside the scoped
+/// form).
+fn scoped_triples() -> Vec<ScopedTriple> {
+    vec![
+        ScopedTriple {
+            name: "T1",
+            months: vec![month_literal(2026, 7)],
+            fingerprints: vec![7],
+            window: DISCOVERY_WINDOW,
+            active: ACTIVE_SCOPED_1,
+            month: "month = '2026-07-01'",
+        },
+        ScopedTriple {
+            name: "T2",
+            months: vec![month_literal(2026, 7), month_literal(2026, 8)],
+            fingerprints: vec![101, 205, 4_294_967_296],
+            window: DISCOVERY_WINDOW,
+            active: ACTIVE_SCOPED_3,
+            month: "month IN ('2026-07-01', '2026-08-01')",
+        },
+        ScopedTriple {
+            name: "T3",
+            months: vec![month_literal(2026, 7)],
+            fingerprints: vec![7],
+            window: TimeWindow {
+                start_ns: 1_751_328_003_000_000_000,
+                end_ns: 1_751_331_600_000_000_000,
+            },
+            active: ACTIVE_SCOPED_1,
+            month: "month = '2026-07-01'",
+        },
+    ]
+}
+
+fn expected_stmt(template: &str, t: &ScopedTriple) -> String {
+    template
+        .replace("{MONTH}", t.month)
+        .replace("{ACTIVE}", t.active)
+        .replace("{UUID_LITERAL}", UUID_LITERAL)
+}
+
+/// Issue #482 AC 1, the FINDER VALIDATION half: `sql::detected_labels`
+/// already takes `Option<&[u64]>`, so these three equalities pass before
+/// any production code is touched. If they do not, the hand-written
+/// expected literals are wrong and nothing else in AC 1 means anything.
+///
+/// A `contains` check cannot state this claim — `fingerprint IN (<exact
+/// subquery>) OR 1 = 1` contains the substring and is wrong — and an
+/// equality whose expected side calls `sql::active_fingerprints` moves
+/// with the builder it is meant to check. These are whole-statement
+/// equalities against hand-written text.
+#[test]
+fn scoped_detected_labels_statements_are_byte_exact() {
+    for t in scoped_triples() {
+        assert_eq!(
+            sql::detected_labels(
+                "log_streams_idx",
+                &t.months,
+                Some(&t.fingerprints),
+                "log_metrics_5s",
+                t.window,
+                DISCOVERY_RES_NS,
+            ),
+            expected_stmt(STMT_DETECTED_LABELS, &t),
+            "{} detected_labels",
+            t.name
+        );
+    }
+}
+
+/// Issue #482 AC 1: the two builders the change touches, over the same
+/// three triples and against the same hand-written text. Nine
+/// whole-statement equalities in total with the finder above — so a
+/// mutation inside `sql::active_fingerprints` moves only the left side
+/// and the comparison goes red, where an expected side built by calling
+/// that builder would move with it and stay green.
+#[test]
+fn scoped_label_discovery_statements_are_byte_exact() {
+    for t in scoped_triples() {
+        assert_eq!(
+            sql::label_names(
+                "log_streams_idx",
+                &t.months,
+                Some(&t.fingerprints),
+                "log_metrics_5s",
+                t.window,
+                DISCOVERY_RES_NS,
+            ),
+            expected_stmt(STMT_LABEL_NAMES, &t),
+            "{} label_names",
+            t.name
+        );
+        assert_eq!(
+            sql::label_values(
+                "log_streams_idx",
+                &t.months,
+                &literal("env"),
+                Some(&t.fingerprints),
+                "log_metrics_5s",
+                t.window,
+                DISCOVERY_RES_NS,
+            ),
+            expected_stmt(STMT_LABEL_VALUES, &t),
+            "{} label_values",
+            t.name
+        );
+    }
+}
+
 /// Byte-exact `label_values` snapshot (issue #399 AC11): the semi-join
 /// sits beside the existing `AND key = ...`, on its own line, so the
-/// key predicate keeps its place in the primary-key prefix.
+/// key predicate keeps its place in the primary-key prefix. The
+/// UNSCOPED form — see [`label_names_is_byte_exact`] on why this text
+/// does not move under issue #482.
 #[test]
 fn label_values_is_byte_exact() {
     assert_eq!(
@@ -1092,6 +1241,7 @@ fn label_values_is_byte_exact() {
             "log_streams_idx",
             &[month_literal(2026, 7)],
             &literal("env"),
+            None,
             "log_metrics_5s",
             DISCOVERY_WINDOW,
             DISCOVERY_RES_NS,

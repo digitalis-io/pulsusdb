@@ -39,9 +39,9 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use pulsus_read::{
-    DetectedFieldOut, DetectedFields, DetectedLabelOut, EntryCategories, ExplainStage, LogStats,
-    MatrixSeries, PatternSeries, PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample,
-    VolumeEntry, Warnings, WireArity,
+    DetectedFieldOut, DetectedFieldValues, DetectedFields, DetectedLabelOut, EntryCategories,
+    ExplainStage, LogStats, MatrixSeries, PatternSeries, PlanExplain, QueryResult, RouteChoice,
+    StreamResult, VectorSample, VolumeEntry, Warnings, WireArity,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -1113,6 +1113,56 @@ pub(crate) fn detected_fields_response(
             item.push('}');
             item.into_bytes()
         },
+        suffix,
+    ))
+}
+
+/// Encodes a `/detected_field/{name}/values` result (issue #482):
+/// `{"limit":N,"values":[...]}` — `limit` FIRST, then `values` (the
+/// opposite key order from `/detected_fields`' `fields`-then-`limit`).
+///
+/// The empty result is the bare `{}`: `limit` is emitted only alongside a
+/// populated `values`, exactly as [`detected_fields_response`]'s empty
+/// branch does. `pulsus_partial` and `explain` are the same two additive
+/// keys, in the same order, and both survive into the empty body.
+///
+/// `values` arrives already sorted ascending
+/// (`pulsus_read::logql::DetectedFieldValues`); the reference has no
+/// order here, so ours is a deterministic pin recorded as a clause of the
+/// `detected-fields-array-order-pinned` row in
+/// docs/benchmarks/logs-differential-ledger.md.
+pub(crate) fn detected_field_values_response(
+    out: DetectedFieldValues,
+    limit: u32,
+    explain: Option<PlanExplain>,
+) -> Response {
+    let partial = out.truncated || out.retention_capped;
+    if out.values.is_empty() {
+        let mut body = String::from("{");
+        if partial {
+            body.push_str("\"pulsus_partial\":true");
+        }
+        if let Some(e) = explain.as_ref() {
+            if body.len() > 1 {
+                body.push(',');
+            }
+            body.push_str("\"explain\":");
+            body.push_str(&explain_json(e));
+        }
+        body.push('}');
+        return json_response(Body::from(body));
+    }
+    let prefix = format!("{{\"limit\":{limit},\"values\":[").into_bytes();
+    let mut tail = String::from("]");
+    if partial {
+        tail.push_str(",\"pulsus_partial\":true");
+    }
+    let suffix = explain_suffix(tail, explain.as_ref());
+    let suffix = format!("{suffix}}}").into_bytes();
+    json_response(stream_array(
+        prefix,
+        out.values,
+        |v: &String| json_string(v).into_bytes(),
         suffix,
     ))
 }
@@ -4304,6 +4354,7 @@ mod tests {
             imported,
             vec![
                 "DetectedFieldOut",
+                "DetectedFieldValues",
                 "DetectedFields",
                 "DetectedLabelOut",
                 "EntryCategories",

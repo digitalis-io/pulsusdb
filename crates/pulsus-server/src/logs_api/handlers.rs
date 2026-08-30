@@ -563,14 +563,21 @@ async fn labels_impl(
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
+    // Issue #482: `query` is optional and matchers only, parsed through
+    // the seam `/detected_labels` uses, and parsed BEFORE the bounds so a
+    // request bad in both ways answers the selector error on all three
+    // endpoints alike.
+    let selector = super::parse_optional_selector(&pairs)?;
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
     let engine = engine_for(&state).await?;
     if wants_explain(headers) {
-        let (names, explain) = engine.label_names_explained(bounds).await?;
+        let (names, explain) = engine
+            .label_names_explained(selector.as_ref(), bounds)
+            .await?;
         Ok(encode::string_array_response(names, Some(explain)))
     } else {
-        let names = engine.label_names(bounds).await?;
+        let names = engine.label_names(selector.as_ref(), bounds).await?;
         Ok(encode::string_array_response(names, None))
     }
 }
@@ -622,14 +629,19 @@ async fn label_values_impl(
     headers: &HeaderMap,
     pairs: Vec<(String, String)>,
 ) -> Result<Response, ApiError> {
+    // Issue #482: same optional matchers-only `query` as `/labels`, same
+    // seam, same before-the-bounds order.
+    let selector = super::parse_optional_selector(&pairs)?;
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
     let engine = engine_for(&state).await?;
     if wants_explain(headers) {
-        let (values, explain) = engine.label_values_explained(name, bounds).await?;
+        let (values, explain) = engine
+            .label_values_explained(name, selector.as_ref(), bounds)
+            .await?;
         Ok(encode::string_array_response(values, Some(explain)))
     } else {
-        let values = engine.label_values(name, bounds).await?;
+        let values = engine.label_values(name, selector.as_ref(), bounds).await?;
         Ok(encode::string_array_response(values, None))
     }
 }
