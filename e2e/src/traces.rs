@@ -2784,8 +2784,15 @@ async fn run_informational_comparisons(
     let mut sections: Vec<serde_json::Value> = Vec::new();
     let query_timeout = query_request_timeout(corpus.scale);
 
-    // Tags: our scoped shape vs Tempo's `/api/search/tags` (structurally
-    // divergent by design — scope/intrinsic handling differs).
+    // Tags: our scoped shape vs Tempo's flat `/api/search/tags` — two
+    // different shapes on purpose (scoped `{"scopes":[…]}` against flat
+    // `{"tagNames":[…]}`), so this section is informational and never
+    // gates. Since issue #475 the intrinsic half no longer differs: our
+    // `intrinsic` scope serves the same 25 names. What still differs is
+    // the projection — our scoped body leads with that scope, while the
+    // flat route on either side carries catalog keys only, ours in
+    // catalog order and theirs sorted
+    // (`traceql-v1-flat-tag-names-order`).
     let pulsus_tags = get_json(ctx, &ctx.url("/api/traces/v1/tags"), query_timeout).await;
     let tempo_tags = get_json(
         ctx,
