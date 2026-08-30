@@ -94,6 +94,48 @@ use manifest::{
 /// developer machine with no container; **panics** rather than skipping when
 /// the gate is absent in a live CI job, so a lost `env:` block reddens the
 /// build instead of reporting green (issue #320).
+/// The 25 names the `intrinsic` scope serves against ANY database,
+/// empty or not (issue #475): the static vocabulary is unconditional by
+/// design, so an empty store still returns it.
+///
+/// A LITERAL typed into this suite, deliberately a second independent
+/// copy of the one in `traces_api::intrinsics`'s unit test — a wrong
+/// list has to be typed wrong twice. The cost is that a legitimate
+/// change to the served list edits two places.
+const INTRINSIC_NAMES: [&str; 25] = [
+    "duration",
+    "event:name",
+    "event:timeSinceStart",
+    "instrumentation:name",
+    "instrumentation:version",
+    "kind",
+    "link:spanID",
+    "link:traceID",
+    "name",
+    "rootName",
+    "rootServiceName",
+    "span:duration",
+    "span:id",
+    "span:kind",
+    "span:name",
+    "span:parentID",
+    "span:status",
+    "span:statusMessage",
+    "status",
+    "statusMessage",
+    "trace:duration",
+    "trace:id",
+    "trace:rootName",
+    "trace:rootService",
+    "traceDuration",
+];
+
+/// The `scopes` value both scoped tag-names routes return against an
+/// empty database.
+fn empty_db_scopes() -> serde_json::Value {
+    serde_json::json!([{"name": "intrinsic", "tags": INTRINSIC_NAMES}])
+}
+
 fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
 }
@@ -938,12 +980,16 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
         }
         (Surface::TracesTags, path) => {
             // Issue #58: success is the documented docs/api.md §4.3
-            // native envelope. Against this suite's empty databases both
-            // routes return the empty envelope 200 — the mounting oracle
-            // (an unmounted path would 404 instead). For the values
-            // route this cell runs with the manifest's NON-TRIVIAL
-            // `base_query` `q=` — proving accept-and-ignore (a 400 here
-            // is the adjudicated-away rejection behavior).
+            // native envelope; the mounting oracle is the exact body
+            // (an unmounted path would 404 instead). Against this
+            // suite's empty databases the VALUES route returns an empty
+            // array, while the NAMES route returns the static
+            // `intrinsic` scope and nothing else (issue #475): the
+            // vocabulary is unconditional, so it does not depend on the
+            // store holding spans. For the values route this cell runs
+            // with the manifest's NON-TRIVIAL `base_query` `q=` —
+            // proving accept-and-ignore (a 400 here is the
+            // adjudicated-away rejection behavior).
             assert!(
                 res.content_type()
                     .is_some_and(|ct| ct.starts_with("application/json")),
@@ -959,8 +1005,8 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             } else {
                 assert_eq!(
                     json["scopes"],
-                    serde_json::json!([]),
-                    "{ctx}: empty DB must return an empty scopes array, body {json}"
+                    empty_db_scopes(),
+                    "{ctx}: empty DB must return the static intrinsic scope, body {json}"
                 );
             }
             assert_eq!(
@@ -971,9 +1017,11 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
         (Surface::TracesTagsV2, path) => {
             // Issue #61: the v2 aliases are the native §4.3 shapes MINUS
             // the PulsusDB-only `truncated` field (Tempo v2 wire-shape
-            // conformance). Empty-DB empty envelope 200 is the mounting
-            // oracle; the `truncated` ABSENCE is the reshaping oracle (a
-            // pure binding onto the native handler would carry it). The
+            // conformance). The empty-DB body is the mounting oracle —
+            // an empty `tagValues` on the values route, the static
+            // `intrinsic` scope on the names route (issue #475) — and
+            // the `truncated` ABSENCE is the reshaping oracle (a pure
+            // binding onto the native handler would carry it). The
             // seeded non-empty shape proof lives in `traces_tags_live.rs`.
             assert!(
                 res.content_type()
@@ -990,8 +1038,8 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             } else {
                 assert_eq!(
                     json["scopes"],
-                    serde_json::json!([]),
-                    "{ctx}: empty DB must return an empty scopes array, body {json}"
+                    empty_db_scopes(),
+                    "{ctx}: empty DB must return the static intrinsic scope, body {json}"
                 );
             }
             assert!(
@@ -1002,8 +1050,13 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
         (Surface::TracesTagsV1, path) => {
             // Issue #61: Tempo's legacy v1 FLAT shapes — bare-string
             // arrays, no scopes, no types, no `truncated`. Empty-DB flat
-            // empty envelope 200 is the mounting oracle. Seeded
-            // non-empty flat-vs-typed proof in `traces_tags_live.rs`.
+            // empty envelope 200 is the mounting oracle. The empty
+            // `tagNames` is also what pins the v1 flat route OUT of the
+            // static intrinsic list (issue #475): the two scoped routes
+            // above return 25 names against the same empty database, so
+            // this cell fails if the injection reaches this route.
+            // Seeded non-empty flat-vs-typed proof in
+            // `traces_tags_live.rs`.
             assert!(
                 res.content_type()
                     .is_some_and(|ct| ct.starts_with("application/json")),
