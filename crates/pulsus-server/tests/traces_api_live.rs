@@ -1690,34 +1690,30 @@ async fn search_response_integers_stay_inside_their_wire_domain_on_the_wire() {
     rootless.end_time_unix_nano = 3_100_000_000_042_000_200;
     ingest_rootless(port, vec![rootless], "seed issue #473 rootless trace");
 
-    // (span name, the whole response body, the one delimited token that
-    //  says why this row is here). Key order is `serde_json`'s: the
-    //  workspace does not enable `preserve_order`, so object keys come out
-    //  sorted.
-    let expected: [(&str, &str, &[u8]); 4] = [
+    // (span name, the whole response body). Key order is `serde_json`'s:
+    // the workspace does not enable `preserve_order`, so object keys come
+    // out sorted.
+    let expected: [(&str, &str); 4] = [
         (
             "wd-over",
             r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"durationMs":4294967295,"rootServiceName":"checkout","rootTraceName":"wd-over","spanSets":[{"matched":1,"spans":[{"durationNanos":"4294967296000000","name":"wd-over","spanID":"1111111111111111","startTimeUnixNano":"3100000000000000200"}]}],"startTimeUnixNano":"3100000000000000200","traceID":"a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"}]}"#,
-            b"\"durationMs\":4294967295",
         ),
         (
             "wd-edge",
             r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"durationMs":4294967295,"rootServiceName":"checkout","rootTraceName":"wd-edge","spanSets":[{"matched":1,"spans":[{"durationNanos":"4294967295999999","name":"wd-edge","spanID":"1212121212121212","startTimeUnixNano":"3100000000000000200"}]}],"startTimeUnixNano":"3100000000000000200","traceID":"a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"}]}"#,
-            b"\"durationNanos\":\"4294967295999999\"",
         ),
         (
             "wd-i64max",
             r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"durationMs":4294967295,"rootServiceName":"checkout","rootTraceName":"wd-i64max","spanSets":[{"matched":1,"spans":[{"durationNanos":"9223372036854775807","name":"wd-i64max","spanID":"1313131313131313","startTimeUnixNano":"3100000000000000200"}]}],"startTimeUnixNano":"3100000000000000200","traceID":"a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6"}]}"#,
-            b"\"durationNanos\":\"9223372036854775807\"",
         ),
         (
             "wd-rootless",
             r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"durationMs":42,"rootServiceName":"<root span not yet received>","rootTraceName":"wd-rootless","spanSets":[{"matched":1,"spans":[{"durationNanos":"42000000","name":"wd-rootless","spanID":"1414141414141414","startTimeUnixNano":"3100000000000000200"}]}],"startTimeUnixNano":"3100000000000000200","traceID":"a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"}]}"#,
-            b"\"rootServiceName\":\"<root span not yet received>\"",
         ),
     ];
 
-    for (name, want, token) in expected {
+    let mut bodies: HashMap<&str, Vec<u8>> = HashMap::new();
+    for (name, want) in expected {
         let q = format!("%7B%20name%20%3D%20%22{name}%22%20%7D");
         let path = format!("/api/traces/v1/search?q={q}&start=3099999000&end=3100001000&limit=5");
         let ctx = format!("wire domain {name}");
@@ -1728,20 +1724,57 @@ async fn search_response_integers_stay_inside_their_wire_domain_on_the_wire() {
             "{ctx}: body {:?}",
             String::from_utf8_lossy(&res.body)
         );
-        // The discriminating token first, so a failure says which
-        // property moved before it says the bodies differ.
-        assert!(
-            find_subslice(&res.body, token).is_some(),
-            "{ctx}: the raw body must carry the exact delimited token {:?}, got {:?}",
-            String::from_utf8_lossy(token),
-            String::from_utf8_lossy(&res.body)
-        );
         assert_eq!(
             String::from_utf8_lossy(&res.body),
             want,
             "{ctx}: the whole response body, byte for byte"
         );
+        bodies.insert(name, res.body);
     }
+
+    // The discriminating tokens again, each spelled INLINE as a delimited
+    // byte string, so a failure names the property that moved rather than
+    // only reporting that two long bodies differ — and so the issue #237
+    // wire-literal scanner (`metrics_response.rs`, Rule D) can see that
+    // every raw-byte search in this file is guarded by a literal needle.
+    // Delimited on both sides: `4294967295` is a prefix of
+    // `4294967295999999`, and a bare digit needle could not tell the
+    // saturated trace field from the exact span one.
+    let over = bodies.get("wd-over").expect("wd-over body");
+    assert!(
+        find_subslice(over, b"\"durationMs\":4294967295").is_some(),
+        "the boundary width must SATURATE at the wire uint32 maximum, got {:?}",
+        String::from_utf8_lossy(over)
+    );
+    let edge = bodies.get("wd-edge").expect("wd-edge body");
+    assert!(
+        find_subslice(edge, b"\"durationMs\":4294967295").is_some(),
+        "one nanosecond below the boundary is IN domain and must not move, got {:?}",
+        String::from_utf8_lossy(edge)
+    );
+    let i64max = bodies.get("wd-i64max").expect("wd-i64max body");
+    assert!(
+        find_subslice(i64max, b"\"durationMs\":4294967295").is_some(),
+        "a far larger width must saturate to the SAME number as the boundary one — two \
+         different inputs, one output, is what saturation means, got {:?}",
+        String::from_utf8_lossy(i64max)
+    );
+    assert!(
+        find_subslice(i64max, b"\"durationNanos\":\"9223372036854775807\"").is_some(),
+        "the span's own width is 64-bit unsigned on the wire and nothing about it saturates, \
+         got {:?}",
+        String::from_utf8_lossy(i64max)
+    );
+    // Short binding name on purpose: the issue #237 scanner (Rule D)
+    // reads one masked line at a time and treats a call whose needle
+    // rustfmt wrapped onto the next line as unguarded, so the needle and
+    // its haystack have to fit rustfmt's 60-column call-argument budget.
+    let rs = bodies.get("wd-rootless").expect("wd-rootless body");
+    assert!(
+        find_subslice(rs, b"\"rootServiceName\":\"<root span not yet received>\"").is_some(),
+        "an empty root service renders the reference's literal marker, unescaped, got {:?}",
+        String::from_utf8_lossy(rs)
+    );
 
     // The marker must NOT appear on the three traces that have a service.
     // Asserted here rather than only through the three bodies above so the
