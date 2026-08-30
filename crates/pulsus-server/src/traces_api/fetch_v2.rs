@@ -74,11 +74,15 @@ struct EnvelopeJson<'a> {
     metrics: MetricsField,
 }
 
-/// The JSON rendering (`Content-Type: application/json`). The populated
-/// `trace` object uses docs/api.md §4.1's existing OTLP protojson
-/// convention (hex ids, no default omission), which differs from the
-/// reference's protojson for reasons that predate this route; only the
-/// absent-trace body is byte-identical.
+/// The JSON rendering (`Content-Type: application/json`). Only the
+/// ABSENT-trace body is byte-identical to the reference's; the populated
+/// `trace` object is rendered by `assemble.rs`'s existing protojson
+/// serializer, which emits proto3 defaults and hex ids where the
+/// reference omits defaults and uses base64. That is a pre-existing
+/// property of the §4.1 representation, measured on both sides and
+/// recorded as `traces-fetch-json-emits-proto3-defaults` in
+/// docs/benchmarks/traces-differential-ledger.md — not a convention
+/// docs/api.md ever stated before that row was written.
 pub(super) fn encode_json(trace: &AssembledTrace) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&EnvelopeJson {
         trace: TraceField {
@@ -154,10 +158,12 @@ mod tests {
         );
         let span = &json["trace"]["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
         assert_eq!(span["spanId"], "bb00000000000001");
-        // The materialized status is present. It renders with its proto3
-        // defaults spelled out, not as `{}`: docs/api.md §4.1's protojson
-        // convention emits defaults rather than omitting them, and that
-        // convention predates this route.
+        // The materialized status is present, and it renders with its
+        // proto3 defaults spelled out rather than as the reference's
+        // `{}` — measured on both sides, ledgered as
+        // `traces-fetch-json-emits-proto3-defaults`. Asserted here so a
+        // change to the serializer reddens instead of passing silently;
+        // this is the shape the ledger row describes.
         assert_eq!(
             span["status"],
             serde_json::json!({"code": 0, "message": ""})
