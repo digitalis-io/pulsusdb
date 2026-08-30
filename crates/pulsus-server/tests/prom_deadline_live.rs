@@ -442,16 +442,31 @@ async fn prom_request_deadline_answers_503_with_the_error_envelope() {
     // catch a bare prefix test, and it is not optional.
     //
     // **Why these assert presence and absence rather than an exact header
-    // set**, unlike the hermetic twin in `middleware.rs`: a response off a
-    // real server has also passed through the globally-applied CORS and
-    // trace layers, so it additionally carries `access-control-allow-
-    // origin: *` and a `vary:` line — on **every** route, before and after
-    // issue #471 alike, and on the `405`s and `200`s too. Those are not
-    // this change's to pin, and pinning them here would make an unrelated
-    // CORS default a failure of the deadline suite. What is load-bearing
-    // is what the deadline layer itself contributes: the status, an empty
-    // body, and the ABSENCE of `Content-Type` — the last being what kept
-    // this response out of the set a client parses a body for.
+    // set**, unlike the hermetic twin in `middleware.rs`. A response off a
+    // real server has also passed through the globally-applied CORS layer
+    // and the HTTP stack, so the whole block is (measured on this suite's
+    // own stalled `/api/logs/v1/labels`):
+    //
+    // ```text
+    // HTTP/1.1 408 Request Timeout
+    // vary: origin, access-control-request-method, access-control-request-headers
+    // access-control-allow-origin: *
+    // connection: close
+    // content-length: 0
+    // date: <a clock reading>
+    // ```
+    //
+    // The two CORS lines are `cors_layer`'s defaults and appear on
+    // **every** route and every status — the `405`s and `200`s included,
+    // before and after issue #471 alike; `connection` echoes this client's
+    // own request header and `date` is a clock reading. None of them is
+    // this change's to pin, and pinning them would make an unrelated CORS
+    // default, or a wall clock, a failure of the deadline suite. What IS
+    // load-bearing is what the deadline layer itself contributes: the
+    // status, an empty body, and the ABSENCE of `Content-Type` — the last
+    // being what kept this response out of the set a client parses a body
+    // for. The exact-set assertion lives in the hermetic twin, where the
+    // router carries no global layers.
     // -----------------------------------------------------------------
     let rw = valid_remote_write_body();
     let (status, headers, body) = request(
