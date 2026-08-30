@@ -1600,7 +1600,13 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
         "query LIKE 'SELECT DISTINCT metric_name\\nFROM metric_series\\nWHERE unix_milli >=%'";
     let narrow_472 = format!("{NARROW_PREFIX} AND query NOT LIKE '%\\nLIMIT %'");
     let narrow_472 = narrow_472.as_str();
-    let probe_96 = format!("{NARROW_PREFIX} AND query LIKE '%\\nLIMIT %'");
+    // The #96 degraded probe, named unambiguously: the same projection
+    // prefix, PLUS the bounded `LIMIT <fanout cap + 1>` and the anchored
+    // `match(metric_name, …)` predicate only a name-matcher selector
+    // renders. The #472 builder can carry neither.
+    let probe_96 = format!(
+        "{NARROW_PREFIX} AND query LIKE '%\\nLIMIT %' AND query LIKE '%match(metric_name,%'"
+    );
     let probe_96 = probe_96.as_str();
     let narrow = statements_matching(&admin, db, narrow_472).await;
     assert!(
@@ -1657,39 +1663,43 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     );
 
     // The adjudicated name-matcher route (#85/#89/#96) must be untouched:
-    // the narrow projection must not reach it.
+    // the narrow projection must not reach it, and the route must still run
+    // its OWN two statements.
     //
-    // **Which of the two adjudicated shapes runs is not fixed by this
-    // fixture** — it depends on whether the label cache is authoritative
-    // for the request window at the moment of the call, and with `end` at
-    // the end of the current hour the cache is normally stale for it
-    // (degraded probe) but need not be. So the assertions below are the
-    // ones that hold under BOTH shapes; which one actually ran is printed.
+    // **This leg widens the window to `H + 2h`, and that is what makes the
+    // assertion below deterministic rather than a coin flip.** Which of the
+    // two adjudicated shapes runs depends on whether the resident label
+    // cache is authoritative for the *request* window: the cache is
+    // non-authoritative once `end` is past its sweep time plus
+    // `staleness_multiplier * PULSUS_CACHE_TTL`. With `end` at the end of
+    // the current hour that holds for all but the last few seconds of the
+    // hour — so the degraded route is what normally runs, but not always.
+    // With `end` two hours past the bucket start it is at least one hour
+    // ahead of `now` on every run, so the degraded two-stage route is
+    // forced. The answer does not move with the wider window: nothing is
+    // seeded past `H`.
+    //
+    // Asserting the pair POSITIVELY is the point. "Zero narrow statements
+    // and at least one wide fetch" is satisfied by a stale cache wrongly
+    // treated as authoritative, which would answer from the cache's own
+    // resolution and omit newly active names — a wrong answer passing the
+    // check.
     let narrow_before = narrow;
-    let in_fetch_before = statements_matching(
-        &admin,
-        db,
-        "query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM metric_series\\nWHERE \
-         metric_name IN (%'",
-    )
-    .await;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM \
+                            metric_series\\nWHERE metric_name IN (%'";
+    let in_fetch_before = statements_matching(&admin, db, IN_FETCH).await;
+    let probes_before = statements_matching(&admin, db, &probe_96).await;
+
+    let regex_end = (h + 2 * 3_600_000) / 1000;
     let name_regex = "%7B__name__%3D~%22http_requests.%2A%22%7D";
-    let regex_path = format!("/api/v1/label/__name__/values?match[]={name_regex}&{bounds}");
-    let regex_body;
-    loop {
-        let (status, body) = http_get(port, &regex_path).expect("match[]={__name__=~...}");
-        assert_eq!(status, 200, "{body}");
-        if body.contains("http_requests_total") {
-            regex_body = body;
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the regex-`__name__` route never resolved within 30s: {body}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let (status, regex_body) = http_get(
+        port,
+        &format!(
+            "/api/v1/label/__name__/values?match[]={name_regex}&start={start}&end={regex_end}"
+        ),
+    )
+    .expect("match[]={__name__=~...}");
+    assert_eq!(status, 200, "{regex_body}");
     assert_eq!(
         regex_body.trim(),
         "{\"status\":\"success\",\"data\":[\"http_requests_created\",\"http_requests_total\"]}",
@@ -1698,36 +1708,27 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     );
 
     flush_logs(&admin).await;
+    let statements = statement_texts(&admin, db).await.join("\n---\n");
     assert_eq!(
         statements_matching(&admin, db, narrow_472).await,
         narrow_before,
         "the regex-`__name__` route must not render the narrow projection — its fan-out \
-         semantics are adjudicated (#85/#89/#96, docs/api.md §3.3).\nstatements:\n{}",
-        statement_texts(&admin, db).await.join("\n---\n")
+         semantics are adjudicated (#85/#89/#96, docs/api.md §3.3).\nstatements:\n{statements}"
     );
-    let in_fetch_after = statements_matching(
-        &admin,
-        db,
-        "query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM metric_series\\nWHERE \
-         metric_name IN (%'",
-    )
-    .await;
-    assert!(
-        in_fetch_after > in_fetch_before,
-        "the regex-`__name__` route must still reach its wide `metric_name IN (…)` fetch — \
-         the shape BOTH the warm and the degraded route end in.\nstatements:\n{}",
-        statement_texts(&admin, db).await.join("\n---\n")
+    assert_eq!(
+        statements_matching(&admin, db, &probe_96).await - probes_before,
+        1,
+        "the degraded route must run exactly ONE bounded `SELECT DISTINCT metric_name … \
+         match(metric_name, …) … LIMIT <cap + 1>` probe. Zero means the cache was treated as \
+         authoritative for a window it cannot cover, which answers from its own resolution \
+         and would omit newly active names.\nstatements:\n{statements}"
     );
-    let probes = statements_matching(&admin, db, probe_96).await;
-    eprintln!(
-        "#472: the regex-`__name__` request took the {} route ({probes} bounded probe \
-         statement(s), {} wide IN fetch(es) added)",
-        if probes > 0 {
-            "degraded two-stage"
-        } else {
-            "warm flat IN x IN"
-        },
-        in_fetch_after - in_fetch_before
+    assert_eq!(
+        statements_matching(&admin, db, IN_FETCH).await - in_fetch_before,
+        1,
+        "…and exactly ONE wide `metric_name IN (…)` fetch after it — the second half of the \
+         adjudicated pair, which is where this route reads the series' label \
+         sets.\nstatements:\n{statements}"
     );
 
     eprintln!(
