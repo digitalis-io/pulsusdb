@@ -1023,3 +1023,100 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (`docs/api.md` §4.2, issue #384). Nothing here is a behaviour change and
   nothing is proposed: the row exists so that the *next* comparison is made
   against the right endpoint.
+
+### `traceql-search-duration-ms-saturates-not-wraps` (issue #473) — **a value divergence at four wire fields, one operation**
+
+- **Route.** `GET /api/traces/v1/search` and its `GET /api/search` alias —
+  the only route that renders these fields
+  (`crates/pulsus-server/src/traces_api/search.rs` is the sole caller of
+  `search_response::render`). The trace-fetch route re-emits stored OTLP
+  and is not described by this row.
+
+- **What.** The response's `durationMs` is `uint32` on the wire
+  (`TraceSearchMetadata.durationMs`, `pkg/tempopb/tempo.proto:139` @
+  v3.0.2) and the reference fills it with an unchecked
+  `uint32(spanset.DurationNanos / 1_000_000)`
+  (`pkg/traceql/engine.go:295`), so a trace longer than ~49.7 days
+  **wraps**. PulsusDB **saturates**: below `0` renders `0`, above
+  `4294967295` renders `4294967295`. Two captured inputs, one output:
+
+  | trace width | reference | PulsusDB |
+  |---|---|---|
+  | 2^53 + 1 ns (`9007199254740993`) | `417264662` | `4294967295` |
+  | `i64::MAX` ns (`9223372036854775807`) | `2077252342` | `4294967295` |
+
+  Ours is the **same number for both inputs**; the reference's two values
+  differ. That is the whole discriminator: a wrapping renderer and a
+  saturating one agree on every width at or below the boundary and can
+  only be told apart by a pair like this one. The captured reference
+  values live in
+  `crates/pulsus-server/src/traces_api/search_response.rs`
+  (`every_trace_width_renders_the_reference_captured_trace_object`) and
+  are never edited to match us.
+
+  The same operation covers the other three integers the response
+  carries — `startTimeUnixNano` at the trace level and at the span level,
+  and a span's `durationNanos`, all `uint64` on the wire
+  (`pkg/tempopb/tempo.proto:138,159,160` @ v3.0.2). For those the upper
+  clamp is inert (every `i64` fits a `u64`), so saturation there is
+  exactly "below `0` renders `0`". A negative is reachable only from a
+  write that bypassed `pulsus-write`; the projection exists so that such
+  a value cannot render a minus-signed protojson string.
+
+- **Why saturation and not the reference's wrap.** Saturation is
+  monotonic and preserves a lower bound; wrapping does not. A 60-day
+  trace wrapped is `889032704` ms — 10.3 days, an ordinary-looking
+  duration a reader cannot distinguish from a genuinely short trace.
+  Saturated it is `4294967295` ms — 49.7 days, visibly extreme, and a
+  true lower bound. A consumer can act on "at least 49.7 days"; there is
+  nothing to do with a plausible-looking number that is simply wrong.
+  This is the same shape, for the same reason, as
+  `detected-fields-limit-saturates-not-wraps` in
+  `docs/benchmarks/logs-differential-ledger.md` — which is what makes it
+  a rule rather than an ad-hoc call.
+
+- **What a consumer sees, named at the client.** For a trace wider than
+  ~49.7 days, the Duration column of a search result shows 49.7 days
+  where the reference shows a shorter, plausible number. **Neither is the
+  true duration.** For every other trace the two agree exactly. The
+  reason this divergence is worth having at all is the other half of the
+  change: a strict protobuf-JSON client decodes the search body with no
+  per-field recovery, so a single out-of-domain integer returns an error
+  instead of results and **one bad trace discards every trace of that
+  response**. Before this change, a store containing one such trace made
+  every search whose window matched it fail with an error where the
+  results table should be — intermittent, data-dependent, and naming
+  neither the field nor the trace.
+
+- **How it is gated.**
+  `crates/pulsus-server/src/traces_api/search_response.rs`:
+  `duration_ms_saturates_into_the_wire_uint32_domain` (the boundary and
+  the two-input identity),
+  `every_trace_width_renders_the_reference_captured_trace_object` (the
+  captured pair: the reference's values differ, ours are equal and equal
+  to the maximum), and
+  `every_integer_the_response_emits_lies_in_its_wire_domain` (the
+  response-wide walk).
+  `crates/pulsus-server/tests/traces_api_live.rs`:
+  `search_response_integers_stay_inside_their_wire_domain_on_the_wire`
+  asserts the wire bytes on the real route for the boundary width, the
+  width one nanosecond below it, and an `i64::MAX` width.
+
+- **Not referenced from `test/fixtures/traces/differential.json`, and it
+  cannot be.** The search differential compares trace-ID **sets** only
+  (`e2e/src/traces.rs`), so no fixture case can express a field-value
+  divergence; a fixture entry that cannot carry the claim is not a record
+  of it. `traceql-search-metrics-completed-jobs` above is the precedent
+  for a ledger entry with no fixture case, and the fixture-to-ledger test
+  (`informational_cases_are_recorded_in_the_committed_ledger`) constrains
+  only the other direction. Adding a value-comparison axis to the
+  differential is its own piece of work with its own measurement.
+
+- **Also recorded here, out of scope and not fixed:**
+  `crates/pulsus-read/src/traces/search_sql.rs` computes
+  `max(timestamp_ns + duration_ns) AS trace_end_ns` in ClickHouse
+  `Int64`, which wraps silently rather than erroring. That column feeds
+  the `traceDuration` **intrinsic**, not the rendered `durationMs`, so it
+  cannot reach this response — but `{ traceDuration > 1h }` would
+  evaluate a negative width for a trace whose end overflows. Different
+  surface, different rule; noted so the next person on that code finds it.

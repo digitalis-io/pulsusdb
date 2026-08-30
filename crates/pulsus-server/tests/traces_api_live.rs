@@ -67,6 +67,8 @@ const ULP_PORT: u16 = 31_193;
 const SPAN_DURATION_PORT: u16 = 31_208;
 /// The issue #464 trace-envelope wire suite's own spawn.
 const TRACE_ENVELOPE_PORT: u16 = 31_209;
+/// The issue #473 search wire-domain suite's own spawn.
+const WIRE_DOMAIN_PORT: u16 = 31_211;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,
@@ -514,6 +516,84 @@ fn ingest(port: u16, spans: Vec<Span>, ctx: &str) {
         "{ctx}: sync ingest must succeed, body {:?}",
         String::from_utf8_lossy(&res.body)
     );
+}
+
+/// Seeds `spans` through `POST /v1/traces` with a resource carrying **no
+/// attributes at all** — so no `service.name` reaches the store and the
+/// trace's `rootServiceName` is the empty string (issue #473). Everything
+/// else matches [`ingest`]; the scope context is identical, so the only
+/// difference between a trace seeded here and one seeded there is the
+/// field under test.
+fn ingest_rootless(port: u16, spans: Vec<Span>, ctx: &str) {
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "live-scope".to_string(),
+                    version: String::new(),
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                }),
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let res = request(
+        port,
+        "POST",
+        "/v1/traces",
+        &[],
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+    )
+    .unwrap_or_else(|| panic!("{ctx}: ingest must be reachable"));
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: sync ingest must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+}
+
+/// Drops `db` before the server is spawned, so a suite that asserts whole
+/// response bodies starts from an empty store.
+///
+/// `trace_spans` is a plain `MergeTree` with no de-duplication, and this
+/// file's throwaway databases are keyed on the suite name rather than the
+/// run — so a second run against the same ClickHouse would otherwise see
+/// every seeded span twice, and `matched` and the `spans` array of a
+/// byte-exact expected body would both move. The other tests in this file
+/// select by trace id instead and do not need this.
+async fn drop_database(db: &str) {
+    let config = pulsus_clickhouse::ChConnConfig {
+        server: std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        http_port: std::env::var("PULSUS_TEST_CH_HTTP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(19123),
+        database: "default".to_string(),
+        proto: pulsus_clickhouse::ChProto::Http,
+        pool_size: 1,
+        query_timeout: Duration::from_secs(30),
+        ..pulsus_clickhouse::ChConnConfig::default()
+    };
+    let client = pulsus_clickhouse::ChClient::new(config)
+        .await
+        .expect("connect to ClickHouse to drop the throwaway database");
+    client
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &pulsus_clickhouse::QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the throwaway database");
 }
 
 // ---------------------------------------------------------------------
@@ -1337,8 +1417,10 @@ fn wire_literal_occurs_in_is_delimiter_sensitive() {
 ///
 /// `9007199254740993` (2^53 + 1) and `545000` are the widths a
 /// `durationMs` field destroys: a JSON number rounds the first to `…992`
-/// and a millisecond integer truncates it to `9007199254`, and the second
-/// renders `0` as milliseconds.
+/// and a millisecond integer is a different unit entirely — since issue
+/// #473 that trace's `durationMs` saturates at the wire field's 32-bit
+/// maximum, `4294967295`, because 9007199254 ms is outside it. The
+/// second renders `0` as milliseconds.
 ///
 /// Every needle below is a **delimited** byte literal spelled inline —
 /// `"durationNanos":"<digits>"`, closing quote included — so
@@ -1401,10 +1483,12 @@ async fn span_summaries_carry_duration_nanos_as_a_protojson_string_on_the_wire()
     ];
     ingest(port, spans, "seed issue #458 span durations");
 
-    // -- 2^53 + 1 ns: a JSON number would round it, a millisecond integer
-    // would truncate it to nine fewer significant digits.
+    // -- 2^53 + 1 ns: a JSON number would round it, and the trace-level
+    // millisecond field is a different unit AND a narrower domain —
+    // 9007199254 ms is above the wire `uint32`, so it saturates
+    // (issue #473). The span's own nanoseconds are exact regardless.
     let (body, span_sets) =
-        span_duration_probe(port, "huge", &"a1".repeat(16), Some(9_007_199_254));
+        span_duration_probe(port, "huge", &"a1".repeat(16), Some(4_294_967_295));
     let sets = span_sets.as_bytes();
     assert!(
         find_subslice(&body, b"\"durationNanos\":\"9007199254740993\"").is_some(),
@@ -1522,6 +1606,157 @@ fn span_duration_probe(
     let span_sets = serde_json::to_string(&traces[0]["spanSets"])
         .unwrap_or_else(|e| panic!("{ctx}: re-encode spanSets: {e}"));
     (res.body, span_sets)
+}
+
+/// Issue #473 at the wire: every integer the search response emits lies
+/// inside the domain of the wire field it lands in, and an empty root
+/// service renders the reference's own literal marker.
+///
+/// **Why the whole body, byte for byte.** A strict protobuf-JSON client
+/// decodes this body with no per-field recovery: it returns on the first
+/// out-of-domain number and the caller gets that error instead of
+/// results, so one bad trace discards every trace of the response.
+/// Nothing in this repository can run that decoder — there is no Go step
+/// and it is not vendored — so what is gated here is the property one
+/// layer up: the exact bytes, including the values, the key sets and the
+/// keys that must be ABSENT.
+///
+/// **The four seeded widths are chosen to discriminate, not to be
+/// comfortable.**
+///
+/// * `wd-over` is `4294967296000000` ns — exactly `4294967296` ms, one
+///   past the wire field's 32-bit maximum. It is the boundary itself.
+/// * `wd-edge` is one nanosecond less and is the control: `4294967295`
+///   ms is IN domain and must not move.
+/// * `wd-i64max` is a far larger width that must produce the **same**
+///   `durationMs` as `wd-over`. Two different inputs, one output, is what
+///   saturation means; a wrapping renderer answers `0` and `2148491558`
+///   for this pair, and the unclamped `i64` this route used to emit
+///   answers `4294967296` and `6123372036854`. Its span's own
+///   `durationNanos` stays exact at `9223372036854775807`, because that
+///   field is 64-bit unsigned and nothing about it saturates — the case a
+///   blanket "clamp everything to 32 bits" fix gets wrong.
+/// * `wd-rootless` carries a resource with no attributes, so its
+///   `rootServiceName` is empty and renders the marker. The other three
+///   bodies carry `"rootServiceName":"checkout"` and so fail together if
+///   the substitution is ever made unconditional.
+///
+/// The NEGATIVE half of the projection has no live coverage and cannot
+/// have any: all three mounted write routes funnel through
+/// `otlp_traces::resolve_duration_ns`, which clamps `end == 0` and
+/// `end < start` to `0`, and the trace envelope is folded with
+/// `saturating_add`. It is gated hermetically in
+/// `crates/pulsus-server/src/traces_api/search_response.rs`
+/// (`negative_widths_and_starts_render_inside_the_wire_domain`), and this
+/// sentence is here so nobody reads this suite as covering it.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_response_integers_stay_inside_their_wire_domain_on_the_wire() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-server/tests/traces_api_live.rs for setup)"
+        );
+        return;
+    }
+
+    let db = pulsus_testkit::test_db("pulsus_traces_wire_domain_it_live");
+    drop_database(&db).await;
+    let port = WIRE_DOMAIN_PORT;
+    let _guard = spawn_ready(port, &db);
+
+    // The file's fixture instant; window math below is in unix SECONDS.
+    const START_NS: u64 = 3_100_000_000_000_000_200;
+    // One single-span trace per width: sharing a trace id would make every
+    // trace's envelope the widest span's, and three of the four widths
+    // could not be tested at all.
+    let mut spans = Vec::new();
+    for (trace_byte, span_byte, name, end_ns) in [
+        (0xa4u8, 0x11u8, "wd-over", 3_104_294_967_296_000_200u64),
+        (0xa5, 0x12, "wd-edge", 3_104_294_967_296_000_199),
+        // `end - start` overflows an `i64`, so ingest saturates the stored
+        // width at `i64::MAX` — which is what makes this the far-larger
+        // second input of the saturation pair.
+        (0xa6, 0x13, "wd-i64max", 15_000_000_000_000_000_000),
+    ] {
+        let mut sp = span([trace_byte; 16], [span_byte; 8], name, START_NS);
+        sp.end_time_unix_nano = end_ns;
+        spans.push(sp);
+    }
+    ingest(port, spans, "seed issue #473 wire domains");
+
+    // Its own push: the resource carries NO attributes, which is what
+    // leaves `rootServiceName` empty.
+    let mut rootless = span([0xa7; 16], [0x14; 8], "wd-rootless", START_NS);
+    rootless.end_time_unix_nano = 3_100_000_000_042_000_200;
+    ingest_rootless(port, vec![rootless], "seed issue #473 rootless trace");
+
+    // (span name, the whole response body, the one delimited token that
+    //  says why this row is here). Key order is `serde_json`'s: the
+    //  workspace does not enable `preserve_order`, so object keys come out
+    //  sorted.
+    let expected: [(&str, &str, &[u8]); 4] = [
+        (
+            "wd-over",
+            r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"durationMs":4294967295,"rootServiceName":"checkout","rootTraceName":"wd-over","spanSets":[{"matched":1,"spans":[{"durationNanos":"4294967296000000","name":"wd-over","spanID":"1111111111111111","startTimeUnixNano":"3100000000000000200"}]}],"startTimeUnixNano":"3100000000000000200","traceID":"a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"}]}"#,
+            b"\"durationMs\":4294967295",
+        ),
+        (
+            "wd-edge",
+            r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"durationMs":4294967295,"rootServiceName":"checkout","rootTraceName":"wd-edge","spanSets":[{"matched":1,"spans":[{"durationNanos":"4294967295999999","name":"wd-edge","spanID":"1212121212121212","startTimeUnixNano":"3100000000000000200"}]}],"startTimeUnixNano":"3100000000000000200","traceID":"a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"}]}"#,
+            b"\"durationNanos\":\"4294967295999999\"",
+        ),
+        (
+            "wd-i64max",
+            r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"durationMs":4294967295,"rootServiceName":"checkout","rootTraceName":"wd-i64max","spanSets":[{"matched":1,"spans":[{"durationNanos":"9223372036854775807","name":"wd-i64max","spanID":"1313131313131313","startTimeUnixNano":"3100000000000000200"}]}],"startTimeUnixNano":"3100000000000000200","traceID":"a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6"}]}"#,
+            b"\"durationNanos\":\"9223372036854775807\"",
+        ),
+        (
+            "wd-rootless",
+            r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"durationMs":42,"rootServiceName":"<root span not yet received>","rootTraceName":"wd-rootless","spanSets":[{"matched":1,"spans":[{"durationNanos":"42000000","name":"wd-rootless","spanID":"1414141414141414","startTimeUnixNano":"3100000000000000200"}]}],"startTimeUnixNano":"3100000000000000200","traceID":"a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"}]}"#,
+            b"\"rootServiceName\":\"<root span not yet received>\"",
+        ),
+    ];
+
+    for (name, want, token) in expected {
+        let q = format!("%7B%20name%20%3D%20%22{name}%22%20%7D");
+        let path = format!("/api/traces/v1/search?q={q}&start=3099999000&end=3100001000&limit=5");
+        let ctx = format!("wire domain {name}");
+        let res = get(port, &path, &[], &ctx);
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        // The discriminating token first, so a failure says which
+        // property moved before it says the bodies differ.
+        assert!(
+            find_subslice(&res.body, token).is_some(),
+            "{ctx}: the raw body must carry the exact delimited token {:?}, got {:?}",
+            String::from_utf8_lossy(token),
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&res.body),
+            want,
+            "{ctx}: the whole response body, byte for byte"
+        );
+    }
+
+    // The marker must NOT appear on the three traces that have a service.
+    // Asserted here rather than only through the three bodies above so the
+    // failure names the rule rather than a diff.
+    for name in ["wd-over", "wd-edge", "wd-i64max"] {
+        let q = format!("%7B%20name%20%3D%20%22{name}%22%20%7D");
+        let path = format!("/api/traces/v1/search?q={q}&start=3099999000&end=3100001000&limit=5");
+        let ctx = format!("wire domain marker scope {name}");
+        let res = get(port, &path, &[], &ctx);
+        assert!(
+            find_subslice(&res.body, b"\"rootServiceName\":\"checkout\"").is_some(),
+            "{ctx}: a present root service is never substituted, got {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+    }
 }
 
 /// Issue #464 at the wire: a trace's `startTimeUnixNano` and `durationMs`
