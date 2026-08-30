@@ -1,0 +1,848 @@
+{
+  "image": "grafana/loki:3.7.4",
+  "config": "ci/logql/config.yaml",
+  "push_endpoint": "/loki/api/v1/push",
+  "otlp_endpoint": "/otlp/v1/logs",
+  "query_endpoint": "/loki/api/v1/query_range",
+  "read_headers": [
+    "X-Loki-Response-Encoding-Flags: categorize-labels"
+  ],
+  "buildinfo": {
+    "branch": "release-3.7.x",
+    "buildDate": "2026-07-22T03:46:58Z",
+    "buildUser": "root@buildkitsandbox",
+    "goVersion": "",
+    "revision": "b318f282",
+    "version": "3.7.4"
+  },
+  "captured_at_unix": 1788107403,
+  "push_cases": [
+    {
+      "id": "lvl1",
+      "selector": "{app=\"dl1788107403-lvl1\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "info"
+      },
+      "detected_level": "info"
+    },
+    {
+      "id": "lvl2",
+      "selector": "{app=\"dl1788107403-lvl2\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl3",
+      "selector": "{app=\"dl1788107403-lvl3\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "lvl4",
+      "selector": "{app=\"dl1788107403-lvl4\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl5",
+      "selector": "{app=\"dl1788107403-lvl5\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "info"
+      },
+      "detected_level": "info"
+    },
+    {
+      "id": "lvl6",
+      "selector": "{app=\"dl1788107403-lvl6\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl7",
+      "selector": "{app=\"dl1788107403-lvl7\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "lvl8",
+      "selector": "{app=\"dl1788107403-lvl8\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "critical"
+      },
+      "detected_level": "critical"
+    },
+    {
+      "id": "lvl9",
+      "selector": "{app=\"dl1788107403-lvl9\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "fatal"
+      },
+      "detected_level": "fatal"
+    },
+    {
+      "id": "lvl10",
+      "selector": "{app=\"dl1788107403-lvl10\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl11",
+      "selector": "{app=\"dl1788107403-lvl11\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl12",
+      "selector": "{app=\"dl1788107403-lvl12\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl13",
+      "selector": "{app=\"dl1788107403-lvl13\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "lvl14",
+      "selector": "{app=\"dl1788107403-lvl14\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl15",
+      "selector": "{app=\"dl1788107403-lvl15\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "banana"
+      },
+      "detected_level": "banana"
+    },
+    {
+      "id": "lvl16",
+      "selector": "{app=\"dl1788107403-lvl16\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl17",
+      "selector": "{app=\"dl1788107403-lvl17\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "debug"
+      },
+      "detected_level": "debug"
+    },
+    {
+      "id": "lvl18",
+      "selector": "{app=\"dl1788107403-lvl18\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn",
+        "severity_text": "Warning"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "lvl19",
+      "selector": "{app=\"dl1788107403-lvl19\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl20",
+      "selector": "{app=\"dl1788107403-lvl20\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl21",
+      "selector": "{app=\"dl1788107403-lvl21\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl22",
+      "selector": "{app=\"dl1788107403-lvl22\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "lvl23",
+      "selector": "{app=\"dl1788107403-lvl23\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "debug"
+      },
+      "detected_level": "debug"
+    },
+    {
+      "id": "lvl24",
+      "selector": "{app=\"dl1788107403-lvl24\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl25",
+      "selector": "{app=\"dl1788107403-lvl25\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error",
+        "level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl26",
+      "selector": "{app=\"dl1788107403-lvl26\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "lvl27",
+      "selector": "{app=\"dl1788107403-lvl27\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "trace"
+      },
+      "detected_level": "trace"
+    },
+    {
+      "id": "lvl28",
+      "selector": "{app=\"dl1788107403-lvl28\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl29",
+      "selector": "{app=\"dl1788107403-lvl29\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "info"
+      },
+      "detected_level": "info"
+    },
+    {
+      "id": "lvl30",
+      "selector": "{app=\"dl1788107403-lvl30\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "fatal"
+      },
+      "detected_level": "fatal"
+    },
+    {
+      "id": "lvl31",
+      "selector": "{app=\"dl1788107403-lvl31\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl32",
+      "selector": "{app=\"dl1788107403-lvl32\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "critical"
+      },
+      "detected_level": "critical"
+    },
+    {
+      "id": "lvl33",
+      "selector": "{app=\"dl1788107403-lvl33\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl34",
+      "selector": "{app=\"dl1788107403-lvl34\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl35",
+      "selector": "{app=\"dl1788107403-lvl35\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error",
+        "level": "error",
+        "severity": "critical"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "lvl36",
+      "selector": "{app=\"dl1788107403-lvl36\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "lvl37",
+      "selector": "{app=\"dl1788107403-lvl37\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "critical"
+      },
+      "detected_level": "critical"
+    },
+    {
+      "id": "lvl38",
+      "selector": "{app=\"dl1788107403-lvl38\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "trace"
+      },
+      "detected_level": "trace"
+    },
+    {
+      "id": "d1",
+      "selector": "{app=\"dl1788107403-d1\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "d2",
+      "selector": "{app=\"dl1788107403-d2\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown",
+        "log_level": "error"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "d3",
+      "selector": "{app=\"dl1788107403-d3\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown",
+        "log_level": "error"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "d4",
+      "selector": "{app=\"dl1788107403-d4\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "Severity_Text": "Fatal",
+        "detected_level": "fatal"
+      },
+      "detected_level": "fatal"
+    },
+    {
+      "id": "d5",
+      "selector": "{app=\"dl1788107403-d5\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "fatal",
+        "severity_text": "Fatal"
+      },
+      "detected_level": "fatal"
+    },
+    {
+      "id": "e1",
+      "selector": "{app=\"dl1788107403-e1\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "e2",
+      "selector": "{app=\"dl1788107403-e2\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "e3",
+      "selector": "{app=\"dl1788107403-e3\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "e4",
+      "selector": "{app=\"dl1788107403-e4\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "e5",
+      "selector": "{app=\"dl1788107403-e5\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "e6",
+      "selector": "{app=\"dl1788107403-e6\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "e7",
+      "selector": "{app=\"dl1788107403-e7\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "e8",
+      "selector": "{app=\"dl1788107403-e8\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "u1",
+      "selector": "{app=\"dl1788107403-u1\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "info"
+      },
+      "detected_level": "info"
+    },
+    {
+      "id": "u2",
+      "selector": "{app=\"dl1788107403-u2\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "u3",
+      "selector": "{app=\"dl1788107403-u3\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "u4",
+      "selector": "{app=\"dl1788107403-u4\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "info"
+      },
+      "detected_level": "info"
+    },
+    {
+      "id": "u5",
+      "selector": "{app=\"dl1788107403-u5\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn"
+      },
+      "detected_level": "warn"
+    }
+  ],
+  "otlp_cases": [
+    {
+      "id": "o1",
+      "selector": "{service_name=\"dl1788107403-o1\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown",
+        "scope_name": "sc"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "o2",
+      "selector": "{service_name=\"dl1788107403-o2\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "trace",
+        "scope_name": "sc",
+        "severity_number": "1"
+      },
+      "detected_level": "trace"
+    },
+    {
+      "id": "o3",
+      "selector": "{service_name=\"dl1788107403-o3\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "debug",
+        "scope_name": "sc",
+        "severity_number": "5"
+      },
+      "detected_level": "debug"
+    },
+    {
+      "id": "o4",
+      "selector": "{service_name=\"dl1788107403-o4\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "info",
+        "scope_name": "sc",
+        "severity_number": "9"
+      },
+      "detected_level": "info"
+    },
+    {
+      "id": "o5",
+      "selector": "{service_name=\"dl1788107403-o5\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn",
+        "scope_name": "sc",
+        "severity_number": "13"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "o6",
+      "selector": "{service_name=\"dl1788107403-o6\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error",
+        "scope_name": "sc",
+        "severity_number": "17"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "o7",
+      "selector": "{service_name=\"dl1788107403-o7\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "fatal",
+        "scope_name": "sc",
+        "severity_number": "21"
+      },
+      "detected_level": "fatal"
+    },
+    {
+      "id": "o8",
+      "selector": "{service_name=\"dl1788107403-o8\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "fatal",
+        "scope_name": "sc",
+        "severity_number": "24"
+      },
+      "detected_level": "fatal"
+    },
+    {
+      "id": "o9",
+      "selector": "{service_name=\"dl1788107403-o9\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn",
+        "scope_name": "sc",
+        "severity_number": "17",
+        "severity_text": "Warning"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "o10",
+      "selector": "{service_name=\"dl1788107403-o10\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "debug",
+        "scope_name": "sc",
+        "severity_text": "Debug"
+      },
+      "detected_level": "debug"
+    },
+    {
+      "id": "o11",
+      "selector": "{service_name=\"dl1788107403-o11\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "error",
+        "scope_name": "sc",
+        "severity_number": "17"
+      },
+      "detected_level": "error"
+    },
+    {
+      "id": "o12",
+      "selector": "{service_name=\"dl1788107403-o12\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "trace",
+        "scope_name": "sc"
+      },
+      "detected_level": "trace"
+    },
+    {
+      "id": "o13",
+      "selector": "{service_name=\"dl1788107403-o13\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "banana",
+        "scope_name": "sc",
+        "severity_number": "17",
+        "severity_text": "banana"
+      },
+      "detected_level": "banana"
+    },
+    {
+      "id": "p1",
+      "selector": "{service_name=\"dl1788107403-p1\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown",
+        "scope_name": "sc",
+        "severity_number": "25"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "p2",
+      "selector": "{service_name=\"dl1788107403-p2\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "unknown",
+        "scope_name": "sc",
+        "severity_number": "30"
+      },
+      "detected_level": "unknown"
+    },
+    {
+      "id": "p3",
+      "selector": "{service_name=\"dl1788107403-p3\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn",
+        "level": "warn",
+        "scope_name": "sc"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "p4",
+      "selector": "{service_name=\"dl1788107403-p4\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn",
+        "level": "warn",
+        "scope_name": "sc",
+        "severity_number": "17"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "p5",
+      "selector": "{service_name=\"dl1788107403-p5\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "critical",
+        "level": "critical",
+        "scope_name": "sc"
+      },
+      "detected_level": "critical"
+    },
+    {
+      "id": "p6",
+      "selector": "{service_name=\"dl1788107403-p6\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn",
+        "scope_name": "sc"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "p7",
+      "selector": "{service_name=\"dl1788107403-p7\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn",
+        "scope_name": "sc"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "p8",
+      "selector": "{service_name=\"dl1788107403-p8\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "warn",
+        "level": "critical",
+        "scope_name": "sc"
+      },
+      "detected_level": "warn"
+    },
+    {
+      "id": "p9",
+      "selector": "{service_name=\"dl1788107403-p9\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "critical",
+        "level": "warn",
+        "scope_name": "sc"
+      },
+      "detected_level": "critical"
+    },
+    {
+      "id": "p10",
+      "selector": "{service_name=\"dl1788107403-p10\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "banana",
+        "scope_name": "sc"
+      },
+      "detected_level": "banana"
+    },
+    {
+      "id": "p11",
+      "selector": "{service_name=\"dl1788107403-p11\"}",
+      "push_status": 204,
+      "structured_metadata": {
+        "detected_level": "WARN",
+        "scope_name": "sc"
+      },
+      "detected_level": "WARN"
+    }
+  ],
+  "cap_cases": [
+    {
+      "id": "c1",
+      "push_status": 204,
+      "error": ""
+    },
+    {
+      "id": "c2",
+      "push_status": 400,
+      "error": "stream '{app=\"dc1788107403-c2\", service_name=\"dc1788107403-c2\"}' has structured metadata too large: '65537' bytes, limit: '65536' bytes. Please see `limits_config.max_structured_metadata_size` or contact your Loki administrator to increase it"
+    },
+    {
+      "id": "c3",
+      "push_status": 204,
+      "error": ""
+    },
+    {
+      "id": "c4",
+      "push_status": 400,
+      "error": "stream '{app=\"dc1788107403-c4\", service_name=\"dc1788107403-c4\"}' has structured metadata too large: '200000' bytes, limit: '65536' bytes. Please see `limits_config.max_structured_metadata_size` or contact your Loki administrator to increase it"
+    },
+    {
+      "id": "c5",
+      "push_status": 204,
+      "error": ""
+    },
+    {
+      "id": "c6",
+      "push_status": 204,
+      "error": ""
+    },
+    {
+      "id": "c7",
+      "push_status": 204,
+      "error": ""
+    },
+    {
+      "id": "c8",
+      "push_status": 400,
+      "error": "stream '{app=\"dc1788107403-c8\", service_name=\"dc1788107403-c8\"}' has too many structured metadata labels: '129', limit: '128'. Please see `limits_config.max_structured_metadata_entries_count` or contact your Loki administrator to increase it"
+    },
+    {
+      "id": "c9",
+      "push_status": 204,
+      "error": ""
+    },
+    {
+      "id": "c10",
+      "push_status": 400,
+      "error": "stream '{app=\"dc1788107403-c10\", service_name=\"dc1788107403-c10\"}' has too many structured metadata labels: '129', limit: '128'. Please see `limits_config.max_structured_metadata_entries_count` or contact your Loki administrator to increase it"
+    }
+  ]
+}

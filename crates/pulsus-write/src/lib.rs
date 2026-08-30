@@ -16,11 +16,12 @@ pub use ingest::metrics::{
 };
 pub use ingest::traces::{AttrRecord, ParsedTraces, SpanRecord, TraceSink};
 pub use ingest::{Backpressure, FlushWait, LogSink};
+pub use protocols::log_level::LevelDiscovery;
 pub use protocols::loki_push::{
     decode_protobuf as decode_loki_protobuf, parse_json as parse_loki_json,
     parse_protobuf as parse_loki_protobuf,
 };
-pub use protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow, decode, parse};
+pub use protocols::otlp_logs::{LogIngestSettings, LogRow, ParsedLogs, StreamRow, decode, parse};
 pub use protocols::otlp_metrics::{
     MetricIngestSettings, decode as decode_metrics, parse as parse_metrics,
 };

@@ -272,6 +272,20 @@ pub struct WriterConfig {
     /// every `log_patterns` append (zero write-path work), while the read
     /// endpoint stays mounted and serves empty data.
     pub log_patterns: bool,
+    /// `PULSUS_DISCOVER_LOG_LEVELS` (issue #483): ingest-time log-level
+    /// detection. Default `true`, matching the reference's own default —
+    /// every log entry gets a `detected_level` structured-metadata pair, and
+    /// setting this `false` means entries carry no such pair at all and a
+    /// client-supplied one is stored exactly as sent.
+    ///
+    /// **If a structured-metadata enable/disable switch is ever added to
+    /// PulsusDB, this knob must become a conjunction with it.** The
+    /// reference gates level discovery on both switches, because it stores
+    /// the level AS structured metadata — with structured metadata off there
+    /// is nowhere to put it. PulsusDB has no such switch to conjoin with
+    /// today, which is why one knob is right now and wrong the moment that
+    /// switch exists.
+    pub discover_log_levels: bool,
 }
 
 impl Default for WriterConfig {
@@ -282,6 +296,7 @@ impl Default for WriterConfig {
             insert_mode: InsertMode::Sync,
             ingest_queue_bytes: ByteSize(256 * 1024 * 1024),
             log_patterns: true,
+            discover_log_levels: true,
         }
     }
 }

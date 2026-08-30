@@ -1093,6 +1093,21 @@ jobs:
           PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
         run: cargo test -p pulsus-write --test structured_metadata_collisions
 
+      # Issue #483: the ingest-time `detected_level` capture drift leg.
+      # Re-pushes every row of pulsus-write/tests/fixtures/detected_level/
+      # reference_cases.json to this job's reference container — 56 push
+      # rows, 24 OTLP rows and 10 cap rows, one one-entry stream each — and
+      # asserts the fresh answers match the committed capture, so the table
+      # the rule's expectations are READ from provably stays a capture
+      # rather than a transcription of our own output. Like the #287 and
+      # #381 legs above it compares VALUES, not just HTTP status; the
+      # hermetic legs of the same file run in the `ci` job with the gate
+      # off.
+      - name: detected_level capture drift leg (issue #483)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-write --test detected_level_reference_cases
+
       # corpus-counts: none (ci-replay-leg)
       # Issue #352 step 3: the LogQL corpus replay. Takes each reachable
       # corpus case's `load` to this same reference and compares its

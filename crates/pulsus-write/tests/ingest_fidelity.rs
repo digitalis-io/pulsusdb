@@ -101,7 +101,6 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySetti
 use pulsus_config::WriterConfig;
 use pulsus_model::{Date, LabelSet, canonicalize_label_key};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
-use pulsus_write::ingest::http::logs;
 use pulsus_write::writer::{LogSampleRow, LogStreamRow};
 use pulsus_write::{LogWriter, WriterTables};
 
@@ -342,9 +341,32 @@ async fn run_path_a(db: &str, f: &Fixture) {
         &WriterConfig::default(),
         WriterTables::logs_default(),
     ));
-    let router: Router = Router::new()
-        .route("/v1/logs", post(logs::<LogWriter>))
-        .with_state(writer);
+    // Issue #483: level discovery OFF on this mount. `pulsus_write::logs`
+    // would use the product default (ON), but this suite's whole purpose is
+    // that Path A and Path B produce byte-identical rows, and Path B is the
+    // bulk RowBinary dataset-generator path, which has no detector at all —
+    // with discovery on the gate would be asserting an equivalence that does
+    // not hold. The six committed goldens under `tests/fixtures/otlp/` are
+    // therefore unchanged. The default is exercised live by
+    // `crates/pulsus-server/tests/loki_push_live.rs`.
+    let handler_writer = Arc::clone(&writer);
+    let router: Router = Router::new().route(
+        "/v1/logs",
+        post(move |headers: axum::http::HeaderMap, body: Body| {
+            let sink = Arc::clone(&handler_writer);
+            async move {
+                pulsus_write::ingest(
+                    sink.as_ref(),
+                    headers,
+                    body,
+                    pulsus_write::LogIngestSettings {
+                        discover_log_levels: false,
+                    },
+                )
+                .await
+            }
+        }),
+    );
 
     let body = build_request(f).encode_to_vec();
     let request = axum::http::Request::builder()

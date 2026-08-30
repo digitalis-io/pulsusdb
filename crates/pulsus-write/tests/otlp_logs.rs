@@ -17,14 +17,24 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 
 use pulsus_write::ParsedLogs;
-use pulsus_write::protocols::otlp_logs::{decode, parse as parse_result};
+use pulsus_write::protocols::otlp_logs::{LogIngestSettings, decode, parse as parse_result};
 
 /// The `AnyValue` depth guard (finding #54) made `otlp_logs::parse` fallible.
 /// Every captured fixture below is shallow and in-bounds, so this shim unwraps
 /// the whole-request result to keep the assertions reading against `ParsedLogs`
 /// unchanged.
 fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
-    parse_result(req, now_ns).expect("fixture is within the AnyValue depth cap")
+    // Issue #483: discovery OFF — every golden below predates ingest-time
+    // level detection and pins a stored structured-metadata string carrying
+    // no `detected_level` pair.
+    parse_result(
+        req,
+        now_ns,
+        LogIngestSettings {
+            discover_log_levels: false,
+        },
+    )
+    .expect("fixture is within the AnyValue depth cap")
 }
 
 fn fixtures_dir() -> PathBuf {

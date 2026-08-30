@@ -352,7 +352,8 @@ fn loki_push_stored(sm: &[(&str, &str)]) -> String {
         r#"{{"streams":[{{"stream":{{"service_name":"checkout"}},"values":[["1700000000000000000","hello",{{{}}}]]}}]}}"#,
         object.join(",")
     );
-    let out = pulsus_write::parse_loki_json(body.as_bytes(), 0).expect("admissible push body");
+    let out = pulsus_write::parse_loki_json(body.as_bytes(), 0, pulsus_write::LevelDiscovery::Off)
+        .expect("admissible push body");
     out.rows[0].structured_metadata.clone()
 }
 
@@ -396,7 +397,14 @@ fn otlp_scope_stored(sm: &[(&str, &str)]) -> String {
             schema_url: String::new(),
         }],
     };
-    let out = pulsus_write::parse(&req, 0).expect("admissible OTLP body");
+    let out = pulsus_write::parse(
+        &req,
+        0,
+        pulsus_write::LogIngestSettings {
+            discover_log_levels: false,
+        },
+    )
+    .expect("admissible OTLP body");
     out.rows[0].structured_metadata.clone()
 }
 

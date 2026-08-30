@@ -41,6 +41,12 @@ services:
       # the experimental gate — flag parity with the prometheus oracle's
       # --enable-feature=promql-experimental-functions below.
       PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS: "true"
+      # Issue #483: level discovery off on OUR side too, because the oracle
+      # keeps it off and the two must be the same configuration. The reason
+      # is not the old product position (which was reversed on 2026-08-30) —
+      # it is that this harness's reference container implements an older,
+      # materially different level rule. See `deploy/e2e/loki.yaml`.
+      PULSUS_DISCOVER_LOG_LEVELS: "false"
     # Plain start-order form, not `condition: service_healthy` — the
     # harness polls `/ready` itself rather than trusting compose's health
     # condition, whose semantics (and, on older Podman, reliability) differ

@@ -5,6 +5,7 @@
 
 pub mod label_name;
 pub mod log_label_limits;
+pub mod log_level;
 pub mod loki_push;
 pub mod otlp_depth;
 pub mod otlp_exp_histogram;

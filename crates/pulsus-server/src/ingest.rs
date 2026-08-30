@@ -222,7 +222,22 @@ pub(crate) async fn ingest_logs(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    pulsus_write::ingest(state.writer.as_ref(), headers, body).await
+    pulsus_write::ingest(
+        state.writer.as_ref(),
+        headers,
+        body,
+        log_ingest_settings(&state),
+    )
+    .await
+}
+
+/// Builds the log receivers' settings from `AppState`, mirroring
+/// `ingest_metrics`'s `MetricIngestSettings` construction below. One place,
+/// so the OTLP and Loki-push receivers cannot disagree about a knob.
+fn log_ingest_settings(state: &AppState) -> pulsus_write::LogIngestSettings {
+    pulsus_write::LogIngestSettings {
+        discover_log_levels: state.config.writer.discover_log_levels,
+    }
 }
 
 /// `POST /v1/metrics` (docs/api.md §1.1, issue #27): pulls `AppState`'s
@@ -282,7 +297,13 @@ pub(crate) async fn ingest_loki_push(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    pulsus_write::ingest_loki_push(state.writer.as_ref(), headers, body).await
+    pulsus_write::ingest_loki_push(
+        state.writer.as_ref(),
+        headers,
+        body,
+        log_ingest_settings(&state),
+    )
+    .await
 }
 
 /// The Loki push compat surface (issue #77): a single writer-side compat

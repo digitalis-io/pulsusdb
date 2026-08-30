@@ -54,6 +54,7 @@ use pulsus_model::{
 use crate::error::LogsIngestError;
 use crate::protocols::label_name::validate_label_names;
 use crate::protocols::log_label_limits;
+use crate::protocols::log_level::{self, DETECTED_LEVEL, LevelDiscovery, LevelOutcome, PairsView};
 use crate::protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow};
 use crate::protocols::otlp_prescan::MAX_DECODED_BYTES;
 use crate::protocols::service_name::push_service_name;
@@ -725,9 +726,16 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 /// The infallible canonicalization/serialization core shared by every
 /// structured-metadata producer — the Loki-push receiver
 /// ([`canonical_structured_metadata`]) and the OTLP-logs scope path
-/// (`otlp_logs::build_scope_structured_metadata`, issue #109). Both funnel
+/// (`otlp_logs::build_scope_metadata_pairs`, issue #109). Both funnel
 /// through this one seam so the stored `log_samples.structured_metadata`
 /// String is byte-identical across transports by construction.
+///
+/// The core is two functions, not one (issue #483): [`resolve_structured_metadata`]
+/// produces the resolved pair list and this function renders it. They were a
+/// single `structured_metadata_json` until ingest-time level detection needed
+/// to read and extend that list in between — the rule reads the RESOLVED
+/// view, names already canonicalized and empty values already dropped, which
+/// is what [`crate::protocols::log_level`] records the measurements for.
 ///
 /// - The pair list is first resolved by [`resolve_structured_metadata`], which
 ///   IS the reference's builder: Loki's distributor runs the whole entry's
@@ -771,21 +779,37 @@ pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 /// [`canonical_structured_metadata`] (charge-before-allocate, before this is
 /// reached), and the OTLP path is intentionally uncapped (matching OTLP
 /// `parse`'s existing unbounded-label, infallible behaviour).
-pub(crate) fn structured_metadata_json(
-    pairs: impl IntoIterator<Item = (String, String)>,
-) -> String {
-    // Materialized because the builder decides by NORMALIZED NAME over the
-    // whole entry and therefore needs a second look at the pair list. The
-    // per-entry cardinality/byte caps are charged on borrowed data by
-    // `canonical_structured_metadata` BEFORE this is reached, so the `Vec` is
-    // bounded, and `LabelSet::from_normalized` allocates a `BTreeMap` of
-    // `BTreeSet`s from it immediately afterwards either way.
-    let resolved = resolve_structured_metadata(pairs.into_iter().collect());
+pub(crate) fn render_structured_metadata(resolved: Vec<(String, String)>) -> String {
     if resolved.is_empty() {
         return String::new();
     }
     let (labels, _collisions) = LabelSet::from_normalized(resolved);
     labels.to_canonical_json()
+}
+
+/// Applies a [`LevelOutcome`] to the RESOLVED pair list a caller is about to
+/// render. Rewriting in place rather than appending beside is what keeps a
+/// pre-existing `detected_level` a single pair (case lvl7 stores exactly
+/// `{"detected_level":"warn"}`, not two pairs whose canonical names collide).
+pub(crate) fn apply_level_outcome(resolved: &mut Vec<(String, String)>, outcome: LevelOutcome<'_>) {
+    match outcome {
+        LevelOutcome::NormalizeExisting(value) => {
+            for (name, existing) in resolved.iter_mut() {
+                if name == DETECTED_LEVEL {
+                    *existing = value.into_owned();
+                    return;
+                }
+            }
+        }
+        // Unreachable from the two push transports — their view IS the
+        // stored list, so `first_level_is_stored` is always true — and
+        // handled here rather than asserted away, because the arm is a
+        // property of the rule and not of one caller.
+        LevelOutcome::LeaveStored => {}
+        LevelOutcome::Append(value) => {
+            resolved.push((DETECTED_LEVEL.to_string(), value.into_owned()));
+        }
+    }
 }
 
 /// Canonicalizes one Loki-push entry's structured-metadata pairs into the
@@ -816,8 +840,11 @@ fn canonical_structured_metadata<'a>(
     byte_count: usize,
     names: impl IntoIterator<Item = &'a str>,
     pairs: impl IntoIterator<Item = (String, String)>,
+    discovery: LevelDiscovery,
+    stream_labels: &LabelSet,
+    line: &str,
 ) -> Result<String, LogsIngestError> {
-    if pair_count == 0 {
+    if pair_count == 0 && discovery == LevelDiscovery::Off {
         return Ok(String::new());
     }
     if pair_count > MAX_STRUCTURED_METADATA_PER_ENTRY {
@@ -835,7 +862,13 @@ fn canonical_structured_metadata<'a>(
         });
     }
     validate_label_names(names)?;
-    Ok(structured_metadata_json(pairs))
+    let mut resolved = resolve_structured_metadata(pairs.into_iter().collect());
+    if discovery == LevelDiscovery::On {
+        let view = PairsView(&resolved);
+        let outcome = log_level::resolve(stream_labels, &view, line, None).into_owned();
+        apply_level_outcome(&mut resolved, outcome);
+    }
+    Ok(render_structured_metadata(resolved))
 }
 
 /// Decodes a (decompressed) snappy-protobuf `POST /loki/api/v1/push` body,
@@ -951,7 +984,11 @@ fn validate_bounds(
 /// collapses a repeat, because the duplicate-name bound would otherwise be
 /// unobservable — the protobuf `labels` literal is the one log transport that
 /// can carry `{foo="bar", foo="barf"}` to this point, exactly as it is upstream.
-pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
+pub fn parse_protobuf(
+    req: &PushRequest,
+    now_ns: i64,
+    discovery: LevelDiscovery,
+) -> Result<ParsedLogs, LogsIngestError> {
     let mut out = ParsedLogs::default();
     let mut seen_streams: HashSet<(Fingerprint, Date)> = HashSet::new();
     for stream in &req.streams {
@@ -983,20 +1020,35 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
             };
             let sm = &entry.structured_metadata;
             // Byte budget charged on borrowed data before the cloning iterator
-            // below is consumed — the reject path performs zero clones.
-            let byte_count = sm.iter().map(|p| p.name.len() + p.value.len()).sum();
+            // below is consumed — the reject path performs zero clones. A pair
+            // whose RAW name is exactly `detected_level` is left out of the
+            // charge (issue #483) and left IN the count charge, mirroring
+            // `ExcludedStructuredMetadataLabels`
+            // (`pkg/util/entry_size.go:23-33 @ v3.7.4`), which the reference
+            // applies to the entry AS SENT. The exclusion is by the raw name,
+            // not the canonical one: measured, a 200 000-byte `detected_level`
+            // is accepted (c3) and the same value under `detected.level` is
+            // rejected (c4).
+            let byte_count = sm
+                .iter()
+                .filter(|p| p.name != DETECTED_LEVEL)
+                .map(|p| p.name.len() + p.value.len())
+                .sum();
             let structured_metadata = canonical_structured_metadata(
                 sm.len(),
                 byte_count,
                 sm.iter().map(|p| p.name.as_str()),
                 sm.iter().map(|p| (p.name.clone(), p.value.clone())),
+                discovery,
+                &labels,
+                &entry.line,
             )?;
             Ok((timestamp_ns, entry.line.clone(), structured_metadata))
         });
         append_stream(
             &mut out,
             &mut seen_streams,
-            labels,
+            &labels,
             collisions,
             entries,
             now_ns,
@@ -1054,7 +1106,11 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
 /// (issue #115) before canonicalization, so an invalid name (`9bad`, `a.b`,
 /// non-ASCII) is a whole-request reject on both transports, not a silent
 /// canonicalization on the JSON one.
-pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
+pub fn parse_json(
+    body: &[u8],
+    now_ns: i64,
+    discovery: LevelDiscovery,
+) -> Result<ParsedLogs, LogsIngestError> {
     let push: JsonPush =
         serde_json::from_slice(body).map_err(|e| LogsIngestError::LokiDecode(e.to_string()))?;
     // Aggregate-budget charge at the same seam as the protobuf path, before
@@ -1158,20 +1214,29 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
             // Byte budget charged on borrowed data before the cloning iterator
             // below is consumed — the reject path performs zero clones. Both
             // paths get the budget: amplification is identical once strings are
-            // materialized 1:1 from the wire/JSON.
-            let byte_count = sm.iter().map(|(k, v)| k.len() + v.len()).sum();
+            // materialized 1:1 from the wire/JSON. The raw-`detected_level`
+            // exclusion is the protobuf path's, for the same measured reason
+            // (c3 accepted / c4 rejected).
+            let byte_count = sm
+                .iter()
+                .filter(|(k, _)| k != DETECTED_LEVEL)
+                .map(|(k, v)| k.len() + v.len())
+                .sum();
             let structured_metadata = canonical_structured_metadata(
                 sm.len(),
                 byte_count,
                 sm.iter().map(|(k, _)| k.as_str()),
                 sm.iter().map(|(k, v)| (k.clone(), v.clone())),
+                discovery,
+                &labels,
+                &entry.line,
             )?;
             Ok((timestamp_ns, entry.line.clone(), structured_metadata))
         });
         append_stream(
             &mut out,
             &mut seen_streams,
-            labels,
+            &labels,
             collisions,
             entries,
             now_ns,
@@ -1190,13 +1255,13 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
 fn append_stream(
     out: &mut ParsedLogs,
     seen_streams: &mut HashSet<(Fingerprint, Date)>,
-    labels: LabelSet,
+    labels: &LabelSet,
     collisions: usize,
     entries: impl Iterator<Item = Result<(i64, String, String), LogsIngestError>>,
     now_ns: i64,
 ) -> Result<(), LogsIngestError> {
     out.collisions += collisions as u64;
-    let fingerprint = stream_fingerprint(&labels);
+    let fingerprint = stream_fingerprint(labels);
     let service = labels.service().to_string();
     for entry in entries {
         let (timestamp_ns, line, structured_metadata) = entry?;
@@ -2643,6 +2708,27 @@ impl<'de> serde::Deserialize<'de> for DrainedValues {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 118 call sites below predate ingest-time level detection (issue
+    /// #483) and assert stored structured-metadata strings that carry no
+    /// `detected_level` pair. These two items SHADOW the glob-imported
+    /// `super::parse_json` / `super::parse_protobuf` with the discovery
+    /// argument fixed [`LevelDiscovery::Off`], so those expectations stay
+    /// exactly what they were and this module keeps testing the
+    /// canonicalization, cap and label rules it was written for.
+    ///
+    /// The cost of the shadowing is that this module then exercises the OFF
+    /// path only. The ON path's composition with each of those rules is
+    /// covered by a named list in
+    /// `crates/pulsus-write/tests/detected_level_reference_cases.rs`
+    /// (`discovery_on_composes_with_*`), not left to inference.
+    fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
+        super::parse_json(body, now_ns, LevelDiscovery::Off)
+    }
+
+    fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
+        super::parse_protobuf(req, now_ns, LevelDiscovery::Off)
+    }
 
     fn ts(seconds: i64, nanos: i32) -> Timestamp {
         Timestamp { seconds, nanos }

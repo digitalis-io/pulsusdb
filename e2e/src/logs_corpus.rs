@@ -22,6 +22,24 @@
 //! stream-label-set equality stays mechanically valid and the flattened
 //! structured-metadata output is asserted identical across stores.
 //!
+//! **2026-08-30 (issue #483): this harness runs with ingest-time level
+//! detection OFF on both sides, so no expectation below moved.** PulsusDB
+//! now synthesizes a `detected_level` structured-metadata pair on every
+//! log-ingest path by default; the `pulsusdb` service in
+//! `deploy/e2e/compose.single.yaml` and `compose.cluster.yaml` sets
+//! `PULSUS_DISCOVER_LOG_LEVELS: "false"` to match the oracle's own
+//! `discover_log_levels: false`, because the container pinned here
+//! implements an older, materially different level rule (see
+//! `deploy/e2e/loki.yaml`). If it were ever turned on, every record on both
+//! stores would grow a `detected_level` pair and only one service would
+//! carry a meaningful value: `svc-logfmt` would split into `info` and
+//! `error` (its bodies carry a `level=` key), while `svc-json` and
+//! `svc-plain` would both carry `unknown` — the JSON bodies have no allowed
+//! level field and the plain bodies contain no bounded level word. "No
+//! severity or record attributes" above is a statement about
+//! stream-label-set equality and would no longer be a reason for the level
+//! to be absent.
+//!
 //! **Two independent oracles (the circularity breaker):**
 //! [`case_projection`] derives each case's verdict + final
 //! `(labels, line)` from the record's **typed feature fields**;
@@ -741,6 +759,14 @@ impl LogCorpus {
         };
         // The `rate_counter` base label set (`unwrap c` deletes the only
         // parsed label, so every sample collapses onto `{service_name, run_id}`).
+        //
+        // 2026-08-30 (issue #483): this value did NOT move, and the reason
+        // is worth writing down rather than rediscovering. PulsusDB now
+        // synthesizes a `detected_level` pair per entry by default, and with
+        // it on this collapse would not happen — the pair joins the grouping
+        // and `svc-logfmt` splits into one series per discovered level. The
+        // harness runs with the knob off on both sides (see this module's
+        // header), so the single-series answer here is still the right one.
         let rc_base = |service: &str| {
             BTreeMap::from([
                 ("service_name".to_string(), service.to_string()),
@@ -766,6 +792,13 @@ impl LogCorpus {
                 // extraction adds only `took`, which the unwrap then
                 // deletes — every record collapses onto the base label
                 // set, one series, values summed in timestamp order.
+                //
+                // 2026-08-30 (issue #483): this value did NOT move. With
+                // ingest-time level detection on, the per-entry
+                // `detected_level` pair would join the grouping and this
+                // one series would become two (`info` and `error`, the two
+                // levels `svc-logfmt` generates). The harness runs with the
+                // knob off on both sides — see this module's header.
                 let mut sum = 0.0f64;
                 let mut any = false;
                 for r in &self.records {

@@ -23,11 +23,35 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use pulsus_write::ingest::decompress::{Encoding, decompress};
+use pulsus_write::protocols::log_level::LevelDiscovery;
 use pulsus_write::protocols::loki_push::{
     EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter, Timestamp, decode_protobuf,
-    parse_json, parse_protobuf,
 };
-use pulsus_write::protocols::otlp_logs;
+use pulsus_write::protocols::otlp_logs::{self, LogIngestSettings};
+
+/// Ingest-time level detection (issue #483) is driven with discovery OFF in
+/// this suite: every expectation below predates it and pins a stored
+/// structured-metadata string carrying no `detected_level` pair. The ON path
+/// is covered by `detected_level_reference_cases.rs`.
+const DISCOVERY: LevelDiscovery = LevelDiscovery::Off;
+/// See [`DISCOVERY`].
+const SETTINGS: LogIngestSettings = LogIngestSettings {
+    discover_log_levels: false,
+};
+
+fn parse_protobuf(
+    req: &PushRequest,
+    now_ns: i64,
+) -> Result<pulsus_write::ParsedLogs, pulsus_write::LogsIngestError> {
+    pulsus_write::protocols::loki_push::parse_protobuf(req, now_ns, DISCOVERY)
+}
+
+fn parse_json(
+    body: &[u8],
+    now_ns: i64,
+) -> Result<pulsus_write::ParsedLogs, pulsus_write::LogsIngestError> {
+    pulsus_write::protocols::loki_push::parse_json(body, now_ns, DISCOVERY)
+}
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/loki-push")
@@ -191,8 +215,8 @@ fn loki_stream_fingerprints_identically_to_the_equivalent_otlp_log_stream() {
             schema_url: String::new(),
         }],
     };
-    let otlp_out =
-        otlp_logs::parse(&otlp, 0).expect("OTLP fixture is within the AnyValue depth cap");
+    let otlp_out = otlp_logs::parse(&otlp, 0, SETTINGS)
+        .expect("OTLP fixture is within the AnyValue depth cap");
 
     assert_eq!(
         loki_out.rows[0].fingerprint, otlp_out.rows[0].fingerprint,
@@ -265,8 +289,8 @@ fn scope_present_otlp_converges_with_loki_scope_leaves_the_fingerprint() {
             schema_url: String::new(),
         }],
     };
-    let otlp_out =
-        otlp_logs::parse(&otlp, 0).expect("OTLP fixture is within the AnyValue depth cap");
+    let otlp_out = otlp_logs::parse(&otlp, 0, SETTINGS)
+        .expect("OTLP fixture is within the AnyValue depth cap");
 
     // Scope is out of the fingerprint: identical stream identity + labels.
     assert_eq!(
