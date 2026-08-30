@@ -561,4 +561,90 @@ mod tests {
             assert!(body.is_empty(), "{path}: the bare 408 has an empty body");
         }
     }
+
+    /// Issue #471 M2, review round 1. **The timer-first poll order in
+    /// [`RequestDeadline::call`] is a compatibility contract, and this is
+    /// the check that stops a refactor silently restoring value-first
+    /// ordering** (which is what `tokio::time::timeout` does, and what
+    /// the first draft of that function used).
+    ///
+    /// **Why it is deterministic without a stalled backend.** The race is
+    /// between two timers *inside this process*. Both are armed in the
+    /// same first poll — the layer's `sleep`, then the handler's when the
+    /// inner service first runs — and both carry the same duration,
+    /// because in production every `PULSUS_QUERY_TIMEOUT`-fed clock does.
+    /// Under a paused clock, advancing by exactly that duration makes
+    /// both ready in one tick, so the poll order alone decides the
+    /// answer. Measured, with the polls inverted: `504` carrying the
+    /// handler's own `inner deadline` body, where the bare `408` is
+    /// required.
+    ///
+    /// Both classes are driven, because one tie decides both: the LogQL
+    /// path must stay byte-identical (issue #264) and the PromQL path
+    /// must answer its own envelope — neither may leak the inner error.
+    ///
+    /// The live `prom_deadline_live` leg observes the same property
+    /// against a real stalled backend, but only wins the race about half
+    /// the time; **this test is the deterministic one.**
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_wins_a_tie_against_an_inner_timeout_of_the_same_duration() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        const DEADLINE: Duration = Duration::from_secs(3);
+
+        /// A handler whose OWN deadline is the layer's duration, and whose
+        /// expiry is shaped like the ones production really produces — a
+        /// `504` carrying a body naming the layer beneath.
+        async fn inner_deadline() -> Response<Body> {
+            tokio::time::sleep(DEADLINE).await;
+            let mut res = Response::new(Body::from("inner deadline"));
+            *res.status_mut() = StatusCode::GATEWAY_TIMEOUT;
+            res
+        }
+
+        let cfg = Config {
+            query_timeout: pulsus_config::HumanDuration(DEADLINE),
+            ..Config::default()
+        };
+
+        let prom_envelope = concat!(
+            r#"{"status":"error","errorType":"timeout","#,
+            r#""error":"request exceeded the server deadline of 3s (PULSUS_QUERY_TIMEOUT)"}"#
+        );
+        for (path, want_status, want_body) in [
+            ("/api/logs/v1/labels", StatusCode::REQUEST_TIMEOUT, ""),
+            ("/api/v1/query", StatusCode::SERVICE_UNAVAILABLE, prom_envelope),
+        ] {
+            let router: axum::Router = axum::Router::new()
+                .route("/api/logs/v1/labels", get(inner_deadline))
+                .route("/api/v1/query", get(inner_deadline))
+                .layer(timeout_layer(&cfg));
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let mut call = Box::pin(router.oneshot(request));
+
+            // The first poll arms BOTH timers. `poll!` rather than
+            // `.await` so the paused clock cannot auto-advance before
+            // they are armed — the same trap that made the
+            // strictly-shorter guard test unable to fail.
+            assert!(
+                futures::poll!(call.as_mut()).is_pending(),
+                "{path}: the first poll must arm both timers"
+            );
+            tokio::time::advance(DEADLINE).await;
+
+            let res = call.await.expect("the inner service is infallible");
+            assert_eq!(
+                res.status(),
+                want_status,
+                "{path}: the inner timeout won the tie, so the poll order has been inverted"
+            );
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert_eq!(String::from_utf8_lossy(&body), want_body, "{path}");
+        }
+    }
 }
