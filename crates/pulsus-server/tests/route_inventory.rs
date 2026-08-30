@@ -1126,7 +1126,8 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             Surface::LogsTail
             | Surface::LogsStats
             | Surface::LogsDetectedLabels
-            | Surface::LogsDetectedFields => {
+            | Surface::LogsDetectedFields
+            | Surface::LogsDetectedFieldValues => {
                 matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader)
             }
             Surface::PromApi => spec.gate == Gate::ReaderMode,

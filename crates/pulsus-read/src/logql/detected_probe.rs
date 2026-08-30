@@ -763,7 +763,11 @@ impl DetectedPagedState {
             // Advance over the RAW page, not survivors — a page entirely
             // dropped by the pipeline must never stall the walk.
             tracker.observe(row.timestamp_ns, row.fingerprint, row.body_hash);
-            if self.matched >= self.line_limit {
+            // Issue #482's value cap is the second feeding stop, checked
+            // here between entries. Inert on `/detected_fields`, whose
+            // accumulator leaves both `name_filter` and `value_limit`
+            // `None`.
+            if self.matched >= self.line_limit || acc.value_cap_reached() {
                 continue;
             }
             match self.feeder.feed_row(
@@ -794,8 +798,10 @@ impl DetectedPagedState {
         }
         let read = read_bytes(stream).unwrap_or_else(|| self.budget.saturating_sub(self.spent));
         self.spent = self.spent.saturating_add(read);
-        if self.matched >= self.line_limit {
-            // Post-pipeline limit filled — complete, never partial.
+        if self.matched >= self.line_limit || acc.value_cap_reached() {
+            // Post-pipeline limit filled — or, on
+            // `/detected_field/{name}/values`, the value cap reached
+            // (issue #482). Complete either way, never partial.
             return Ok(Some(false));
         }
         if fetched < self.page_size {
@@ -831,8 +837,27 @@ impl DetectedFieldsProbe {
     }
 
     pub fn with_byte_budget(line_limit: u32, field_limit: u32, retention_budget: u64) -> Self {
+        Self::over(
+            line_limit,
+            FieldAccumulator::with_byte_budget(field_limit, retention_budget),
+        )
+    }
+
+    /// Issue #482: the probe over a
+    /// `/detected_field/{name}/values`-shaped accumulator — one tracked
+    /// name, one capped value set, the PRODUCTION retention budget. The
+    /// paged-path half of the value cap is pinned here rather than with a
+    /// third live server spawn.
+    pub fn for_field_values(line_limit: u32, field: &str, value_limit: u32) -> Self {
+        Self::over(
+            line_limit,
+            FieldAccumulator::for_field_values(field, value_limit),
+        )
+    }
+
+    fn over(line_limit: u32, acc: FieldAccumulator) -> Self {
         Self {
-            acc: FieldAccumulator::with_byte_budget(field_limit, retention_budget),
+            acc,
             state: DetectedPagedState {
                 feeder: DetectedRowFeeder::new(),
                 cursor: None,
@@ -1009,6 +1034,13 @@ impl DetectedFieldsProbe {
 
     pub fn finish(self) -> (Vec<DetectedFieldOut>, bool) {
         self.acc.finish()
+    }
+
+    /// Issue #482: the tracked field's values, ascending, plus the
+    /// retention budget's `capped` flag — the projection
+    /// `/detected_field/{name}/values` takes.
+    pub fn finish_field_values(self) -> (Vec<String>, bool) {
+        self.acc.into_field_values()
     }
 }
 

@@ -120,6 +120,22 @@ pub struct DetectedFields {
     pub retention_capped: bool,
 }
 
+/// A `/detected_field/{name}/values` engine result (issue #482): the one
+/// requested field's distinct values, plus the same two partial-answer
+/// flags [`DetectedFields`] carries and for the same reasons.
+///
+/// `values` is sorted ASCENDING by byte order. The reference has no order
+/// here at all — it ranges a Go map — so a deterministic one is a PIN,
+/// not a divergence, and it is the clause issue #482 added to the
+/// existing `detected-fields-array-order-pinned` row in
+/// docs/benchmarks/logs-differential-ledger.md.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedFieldValues {
+    pub values: Vec<String>,
+    pub truncated: bool,
+    pub retention_capped: bool,
+}
+
 /// Labels the reference always keeps regardless of ID-likeness
 /// (`containsAllIDTypes` is only consulted for non-static labels).
 pub(super) const STATIC_DETECTED_LABELS: [&str; 4] = ["cluster", "namespace", "instance", "pod"];
@@ -350,6 +366,16 @@ pub(super) struct FieldAccumulator {
     field_limit: u32,
     fields: HashMap<String, FieldState>,
     budget: RetentionBudget,
+    /// Issue #482: `/detected_field/{name}/values` tracks exactly one
+    /// field name; every other observed pair is dropped before it can be
+    /// charged. `None` on every `/detected_fields` accumulator.
+    name_filter: Option<String>,
+    /// Issue #482: the per-request cap on the tracked field's retained
+    /// value set, checked BETWEEN entries by
+    /// [`FieldAccumulator::value_cap_reached`]. `None` on every
+    /// `/detected_fields` accumulator, which is what makes the shared
+    /// feeding gate provably inert there.
+    value_limit: Option<u32>,
 }
 
 impl FieldAccumulator {
@@ -364,7 +390,55 @@ impl FieldAccumulator {
             field_limit,
             fields: HashMap::new(),
             budget: RetentionBudget::new(budget),
+            name_filter: None,
+            value_limit: None,
         }
+    }
+
+    /// Issue #482's `/detected_field/{name}/values` accumulator: one
+    /// tracked field name, one capped value set, the PRODUCTION retention
+    /// budget. `field_limit` is 1 because the name filter admits exactly
+    /// one name.
+    pub(super) fn for_field_values(field: &str, value_limit: u32) -> Self {
+        Self {
+            field_limit: 1,
+            fields: HashMap::new(),
+            budget: RetentionBudget::new(MAX_DETECTED_FIELD_BYTES),
+            name_filter: Some(field.to_string()),
+            value_limit: Some(value_limit),
+        }
+    }
+
+    /// `true` once the tracked field's retained value set has reached
+    /// `value_limit`. ALWAYS `false` for an accumulator built by
+    /// [`FieldAccumulator::new`] or
+    /// [`FieldAccumulator::with_byte_budget`] — both leave `name_filter`
+    /// and `value_limit` `None`, and only
+    /// [`FieldAccumulator::for_field_values`] sets them — which is what
+    /// makes the shared per-row feeding gate inert on
+    /// `/detected_fields`.
+    pub(super) fn value_cap_reached(&self) -> bool {
+        let (Some(name), Some(limit)) = (self.name_filter.as_deref(), self.value_limit) else {
+            return false;
+        };
+        self.fields
+            .get(name)
+            .is_some_and(|state| state.values.len() >= limit as usize)
+    }
+
+    /// The tracked field's values, ASCENDING, plus the retention budget's
+    /// `capped` flag. An untracked or never-observed name yields an empty
+    /// vector, which the encoder renders as the bare `{}`.
+    pub(super) fn into_field_values(self) -> (Vec<String>, bool) {
+        let capped = self.budget.capped();
+        let mut values: Vec<String> = self
+            .name_filter
+            .as_deref()
+            .and_then(|name| self.fields.get(name))
+            .map(|state| state.values.iter().cloned().collect())
+            .unwrap_or_default();
+        values.sort();
+        (values, capped)
     }
 
     /// Structured-metadata pairs: fields with no parser attribution.
@@ -386,6 +460,12 @@ impl FieldAccumulator {
     /// `__error__`/`__error_details__` never become fields.
     pub(super) fn observe_pair(&mut self, key: &str, value: &str, source: FieldSource<'_>) {
         if key == ERROR_LABEL || key == ERROR_DETAILS_LABEL {
+            return;
+        }
+        // Issue #482: `/detected_field/{name}/values` tracks exactly one
+        // name. Dropping here means an untracked pair is never charged
+        // and never counted against `field_limit`.
+        if self.name_filter.as_deref().is_some_and(|f| f != key) {
             return;
         }
         if !self.fields.contains_key(key) {
@@ -1068,6 +1148,148 @@ mod tests {
             fields.iter().map(|f| f.label.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "zeta"]
         );
+    }
+
+    // -- issue #482: the field-values accumulator -----------------------
+
+    /// **AC 14 — the PRODUCTION retention ceiling, through the PRODUCTION
+    /// constructors.** Both lengths are absolute literals, NOT derived
+    /// from [`MAX_DETECTED_FIELD_BYTES`]: a fixture sized from the
+    /// constant moves with it and can never see it change, which is
+    /// exactly the defect this test replaces. `with_byte_budget`'s
+    /// fixtures elsewhere in this module supply their own budgets, so
+    /// they cannot see the production constant at all.
+    ///
+    /// Pin 1 alone would assert a value with no proof it is used; Pin 2
+    /// alone would not distinguish a changed constant from a changed
+    /// constructor. Both are required. Margins are ~25 MB and ~17 MB, so
+    /// a plausible change to the charging model cannot flip the verdict.
+    #[test]
+    fn the_production_retention_ceiling_admits_one_twenty_mib_value_and_refuses_the_second() {
+        // Pin 1 — the constant itself, as a bare literal.
+        assert_eq!(MAX_DETECTED_FIELD_BYTES, 67_108_864);
+
+        // Pin 2 — the behaviour the constant buys, via the two
+        // constructors that read it and supply no budget of their own.
+        const V: usize = 20 * 1024 * 1024; // ~41.9 MB charged
+        let a = "a".repeat(V);
+        let b = "b".repeat(V);
+
+        let mut acc = FieldAccumulator::new(10);
+        acc.observe_pair("f", &a, FieldSource::Unattributed); // ~41.9 MB < 64 MiB
+        acc.observe_pair("f", &b, FieldSource::Unattributed); // ~83.9 MB > 64 MiB
+        let (fields, capped) = acc.finish();
+        assert!(
+            capped,
+            "the second value must be refused at the production ceiling"
+        );
+        assert_eq!(
+            fields[0].cardinality, 1,
+            "the first value must have been retained"
+        );
+
+        let mut acc = FieldAccumulator::for_field_values("f", 10);
+        acc.observe_pair("f", &a, FieldSource::Unattributed);
+        acc.observe_pair("f", &b, FieldSource::Unattributed);
+        let (values, capped) = acc.into_field_values();
+        assert!(
+            capped,
+            "the second route value must be refused at the production ceiling"
+        );
+        assert_eq!(
+            values,
+            vec![a],
+            "the first route value must have been retained"
+        );
+    }
+
+    /// **AC 12(a) — the shared feeding gate is inert on
+    /// `/detected_fields`.** An accumulator built by
+    /// [`FieldAccumulator::new`] leaves both `name_filter` and
+    /// `value_limit` `None`, so `value_cap_reached()` is `false` however
+    /// many values one field has accumulated — including well past
+    /// `field_limit`, which is a NAME axis and must not be mistaken for
+    /// a value one.
+    #[test]
+    fn value_cap_is_never_reached_on_a_detected_fields_accumulator() {
+        let mut acc = FieldAccumulator::new(3);
+        for i in 0..50 {
+            acc.observe_pair("f", &format!("v{i}"), FieldSource::Unattributed);
+            assert!(
+                !acc.value_cap_reached(),
+                "a /detected_fields accumulator has no value cap (after {} values)",
+                i + 1
+            );
+        }
+        let (fields, _) = acc.finish();
+        assert_eq!(fields[0].cardinality, 50);
+    }
+
+    /// **AC 12(b) — the name filter admits exactly one name**, and an
+    /// untracked pair is dropped before it is charged, so it neither
+    /// appears in the output nor consumes the (1-wide) name budget.
+    #[test]
+    fn the_field_values_accumulator_tracks_exactly_the_named_field() {
+        let mut acc = FieldAccumulator::for_field_values("level", 100);
+        acc.observe_parsed(
+            &owned(&[("other", "x"), ("level", "warn"), ("another", "y")]),
+            FieldSource::Unattributed,
+        );
+        acc.observe_pair("level", "info", FieldSource::Unattributed);
+        let charged_before = acc.charged();
+        acc.observe_pair("noise", "z", FieldSource::Unattributed);
+        assert_eq!(
+            acc.charged(),
+            charged_before,
+            "an untracked name must not be charged at all"
+        );
+        let (values, capped) = acc.into_field_values();
+        assert_eq!(values, vec!["info".to_string(), "warn".to_string()]);
+        assert!(!capped);
+    }
+
+    /// The cap is consulted BETWEEN entries, so the accumulator itself
+    /// never truncates: it keeps admitting values until asked, and
+    /// `value_cap_reached()` flips at exactly `value_limit`.
+    #[test]
+    fn value_cap_reached_flips_at_the_limit_and_never_truncates_the_set() {
+        let mut acc = FieldAccumulator::for_field_values("f", 3);
+        acc.observe_pair("f", "a", FieldSource::Unattributed);
+        assert!(!acc.value_cap_reached());
+        acc.observe_pair("f", "b", FieldSource::Unattributed);
+        assert!(!acc.value_cap_reached());
+        acc.observe_pair("f", "c", FieldSource::Unattributed);
+        assert!(acc.value_cap_reached());
+        // Nothing stops a caller adding more within the same entry —
+        // that is the between-entries contract, and the response may
+        // therefore carry more than `value_limit` values.
+        acc.observe_pair("f", "d", FieldSource::Unattributed);
+        let (values, _) = acc.into_field_values();
+        assert_eq!(values, vec!["a", "b", "c", "d"]);
+    }
+
+    /// `values` is byte-ascending, the empty string is a real value, and
+    /// non-ASCII sorts by its UTF-8 bytes — the order the
+    /// `detected-fields-array-order-pinned` ledger clause registers.
+    #[test]
+    fn into_field_values_sorts_ascending_and_keeps_the_empty_value() {
+        let mut acc = FieldAccumulator::for_field_values("tag", 100);
+        for v in ["日本語", "a,b", "", "héllo", "a b", "a"] {
+            acc.observe_pair("tag", v, FieldSource::Unattributed);
+        }
+        let (values, _) = acc.into_field_values();
+        assert_eq!(values, vec!["", "a", "a b", "a,b", "héllo", "日本語"]);
+    }
+
+    /// A never-observed name yields an empty vector, which the encoder
+    /// renders as the bare `{}`.
+    #[test]
+    fn into_field_values_of_an_absent_field_is_empty() {
+        let mut acc = FieldAccumulator::for_field_values("nosuchfield", 100);
+        acc.observe_pair("level", "info", FieldSource::Unattributed);
+        let (values, capped) = acc.into_field_values();
+        assert!(values.is_empty());
+        assert!(!capped);
     }
 
     #[test]

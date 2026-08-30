@@ -2451,15 +2451,13 @@ async fn a_grouped_range_aggregation_merges_two_streams_raw_samples_end_to_end()
 /// counterparts on 2026-08-08, and the malformed one is **`400` on all
 /// ten**, `/labels` and `/label/{n}/values` included.
 ///
-/// **Two routes answer `200` here, and that is recorded rather than
-/// accepted**: `/labels` and `/label/{n}/values` do not read `query` at
-/// all — `labels_impl` and `label_values_impl` in
-/// `crates/pulsus-server/src/logs_api/handlers.rs` parse only the time
-/// bounds, and docs/api.md §2.3 documents their parameter list without
-/// `query`. That is a route-level gap and NOT a regex one: those two
-/// routes would serve `{app=~"a.*b"}` and `{app=~"("}` identically
-/// because they serve every selector identically. Owned by **#400** with
-/// the rest of this surface's divergences; nothing here fixes it.
+/// **Issue #482 closed the two-route gap this test used to record.**
+/// `/labels` and `/label/{n}/values` answered `200` to a malformed
+/// selector because they did not read `query` at all; they now parse it
+/// through the same `parse_optional_selector` seam `/detected_labels`
+/// uses, so every mounted route in the table below refuses the malformed
+/// regex and the committed gap set is EMPTY. The empty set is asserted,
+/// not dropped: a route that quietly stops parsing `query` reddens here.
 #[tokio::test]
 async fn a_malformed_selector_regex_is_refused_on_every_mounted_logs_route() {
     if !should_run() {
@@ -2514,18 +2512,17 @@ async fn a_malformed_selector_regex_is_refused_on_every_mounted_logs_route() {
             "labels",
             "query",
             &[],
+            400,
             200,
-            200,
-            "GAP: the handler reads only the time bounds, so `query` is never parsed. The \
-             reference answers 400. Route-level, not regex-level",
+            "parses the selector (issue #482 — this row was a recorded 200 gap before)",
         ),
         (
             "label/env/values",
             "query",
             &[],
+            400,
             200,
-            200,
-            "GAP: same as `labels` — `label_values_impl` reads only the bounds",
+            "parses the selector (issue #482 — as `labels`)",
         ),
         ("stats", "query", &[], 400, 200, "parses the selector"),
         ("volume", "query", &[], 400, 200, "parses the selector"),
@@ -2552,6 +2549,14 @@ async fn a_malformed_selector_regex_is_refused_on_every_mounted_logs_route() {
             400,
             200,
             "parses the selector",
+        ),
+        (
+            "detected_field/level/values",
+            "query",
+            &[],
+            400,
+            200,
+            "parses the selector (issue #482's new route)",
         ),
     ];
 
@@ -2586,10 +2591,9 @@ async fn a_malformed_selector_regex_is_refused_on_every_mounted_logs_route() {
     // parsing `query` reddens instead of drifting.
     assert_eq!(
         gaps,
-        vec!["labels", "label/env/values"],
+        Vec::<&str>::new(),
         "the set of routes that ignore `query` has changed — the reference refuses the malformed \
-         regex on all ten, so a new member is a new divergence and a lost one is a fix that \
-         needs its row removed"
+         regex on every one of them, so any member at all is a divergence"
     );
 }
 
@@ -4131,4 +4135,224 @@ fn read_rss_kb(pid: u32) -> Option<u64> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------
+// Issue #482: `query=` narrows /labels and /label/{name}/values.
+// ---------------------------------------------------------------------
+
+const FP_L1: u64 = 0x8000_0000_0000_0011;
+const FP_L2: u64 = 0x8000_0000_0000_0012;
+
+/// Fixture L — two streams differing on `app`/`env`, one of which also
+/// carries a `tier` label the other lacks. Three `log_samples` rows per
+/// fingerprint so the rollup materialized view records activity inside
+/// the window (`log_streams_idx` carries no time column; the window
+/// arrives as the activity semi-join, docs/api.md §2.3).
+async fn seed_fixture_l(client: &ChClient, db: &str, base_ns: i64) {
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
+                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_L1}, 'frontend', \
+                 '{{\"app\":\"frontend\",\"env\":\"prod\",\"service_name\":\"frontend\"}}', 0), \
+                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_L2}, 'backend', \
+                 '{{\"app\":\"backend\",\"env\":\"dev\",\"service_name\":\"backend\",\"tier\":\"batch\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed fixture L log_streams");
+
+    let mut values = Vec::new();
+    for (fp, service) in [(FP_L1, "frontend"), (FP_L2, "backend")] {
+        for i in 0..3i64 {
+            let ts = base_ns - (3 - i) * 1_000_000_000;
+            values.push(format!(
+                "('{service}', {fp}, {ts}, 0, '{service} line {i}')"
+            ));
+        }
+    }
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                 VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed fixture L log_samples");
+}
+
+/// **Issue #482 AC 4, fixture L.** `query=` on `/labels` and
+/// `/label/{name}/values`, asserted as WHOLE response bodies.
+///
+/// Both halves are required and neither is sufficient. L1/L3 are the
+/// GUARD: the unscoped answers must stay byte-identical to what these
+/// endpoints returned before, so an implementation that narrows to
+/// nothing fails here. L2/L4 are the narrowing: they fail on the old
+/// code, which dropped `query=` and answered the unscoped body.
+///
+/// The rest are the cases a bare equality matcher would let through:
+/// L5 is the present-but-empty rule; L6 drives a REGEX matcher through
+/// stage 1 (an equality-only shortcut answers it wrongly); L7 is the
+/// no-matching-stream path, which returns before any stage-2 statement;
+/// L8 is a key that exists in the store but not on the matched stream —
+/// an implementation that narrows by stream and forgets the key filter
+/// answers `["batch"]`.
+#[tokio::test]
+async fn query_narrows_labels_and_label_values() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_scoped_discovery");
+    let port = 31_211;
+    let guard = spawn_ready_server(port, db);
+    let client = ChClient::new(data_client_config(db))
+        .await
+        .expect("connect data client");
+    let base_ns = now_ns();
+    seed_fixture_l(&client, db, base_ns).await;
+
+    let start = (base_ns - 3_600_000_000_000).to_string();
+    let end = (base_ns + 3_600_000_000_000).to_string();
+    let get = |path: &str, extra: &[(&str, &str)]| {
+        let mut params: Vec<(&str, &str)> = vec![("start", &start), ("end", &end)];
+        params.extend_from_slice(extra);
+        let res = http_get(port, &q(path, &params)).expect("route reachable");
+        (res.status, res.body)
+    };
+
+    // L1 / L3 — the unscoped guard.
+    let (status, l1) = get("/api/logs/v1/label/env/values", &[]);
+    assert_eq!(status, 200);
+    assert_eq!(l1, r#"{"status":"success","data":["dev","prod"]}"#);
+    let (status, l3) = get("/api/logs/v1/labels", &[]);
+    assert_eq!(status, 200);
+    assert_eq!(
+        l3,
+        r#"{"status":"success","data":["app","env","service_name","tier"]}"#
+    );
+
+    // L2 / L4 — the narrowing.
+    let (status, body) = get(
+        "/api/logs/v1/label/env/values",
+        &[("query", r#"{app="frontend"}"#)],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"status":"success","data":["prod"]}"#);
+    let (status, body) = get("/api/logs/v1/labels", &[("query", r#"{app="frontend"}"#)]);
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        r#"{"status":"success","data":["app","env","service_name"]}"#
+    );
+
+    // L5 — present-but-empty is the absent form, byte for byte.
+    let (status, body) = get("/api/logs/v1/labels", &[("query", "")]);
+    assert_eq!(status, 200);
+    assert_eq!(body, l3, "an empty `query=` must answer as an absent one");
+
+    // L6 — a regex matcher through stage 1.
+    let (status, body) = get(
+        "/api/logs/v1/label/env/values",
+        &[("query", r#"{app=~"front.*"}"#)],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"status":"success","data":["prod"]}"#);
+
+    // L7 — no matching stream.
+    let (status, body) = get(
+        "/api/logs/v1/label/env/values",
+        &[("query", r#"{app="frontend",env="dev"}"#)],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"status":"success","data":[]}"#);
+
+    // L7e — the same request's explain trace stops at stage one: no
+    // stage-2 `label_values` stage is pushed, because none was built.
+    let res = http_request(
+        port,
+        "GET",
+        &q(
+            "/api/logs/v1/label/env/values",
+            &[
+                ("start", &start),
+                ("end", &end),
+                ("query", r#"{app="frontend",env="dev"}"#),
+            ],
+        ),
+        &[("X-Pulsus-Explain", "1")],
+        None,
+    )
+    .expect("explain reachable");
+    assert_eq!(res.status, 200);
+    let body = json(&res);
+    assert_eq!(body["data"], serde_json::json!([]));
+    let stages = body["explain"]["stages"].as_array().expect("stages array");
+    assert_eq!(
+        stages.len(),
+        1,
+        "a no-match scoped request runs stage one only: {}",
+        res.body
+    );
+    assert_eq!(stages[0]["name"], "stage1_stream_resolution");
+
+    // L8 — a key on the OTHER stream only.
+    let (status, body) = get(
+        "/api/logs/v1/label/tier/values",
+        &[("query", r#"{app="frontend"}"#)],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"status":"success","data":[]}"#);
+
+    drop(guard);
+}
+
+/// **The health-check request this compat surface owes** (issue #482,
+/// carried from the issue) — the one request a dashboard UI issues when
+/// its datasource is saved and tested. A regression guard, not a fix:
+/// it passes on the tree that introduced it, so "watched fail" meant
+/// breaking the instant-query result type deliberately, watching it go
+/// red, and reverting.
+///
+/// It does NOT exercise the datasource's own client SDK, which is not on
+/// this machine and which no HTTP-level probe reaches. That gap is
+/// stated, not gated.
+#[tokio::test]
+async fn the_compat_health_check_query_answers_the_exact_expected_body() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_logs_api_it_health_check");
+    let port = 31_212;
+    let (_guard, _client, _base_ns) =
+        setup_env(db, port, &[("PULSUS_COMPAT_ENDPOINTS", "1")]).await;
+
+    let res = http_request(
+        port,
+        "GET",
+        &q(
+            "/loki/api/v1/query",
+            &[
+                ("direction", "backward"),
+                ("query", "vector(1)+vector(1)"),
+                ("time", "4000000000"),
+            ],
+        ),
+        &[("X-Loki-Response-Encoding-Flags", "categorize-labels")],
+        None,
+    )
+    .expect("health check reachable");
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(
+        res.body,
+        r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[4000000000.000,"2"]}],"stats":{"series":1}}}"#
+    );
 }

@@ -1,5 +1,6 @@
-//! `GET|POST /api/logs/v1/{detected_labels,detected_fields}` (issue #170,
-//! docs/api.md §2.6): the drilldown field/label discovery endpoints,
+//! `GET|POST /api/logs/v1/{detected_labels,detected_fields}` (issue #170)
+//! and `/api/logs/v1/detected_field/{name}/values` (issue #482),
+//! docs/api.md §2.6: the drilldown field/label discovery endpoints,
 //! semantics pinned against the repo's interop reference.
 //!
 //! - **detected_labels** reads ONLY the stream index (`log_streams_idx`)
@@ -15,19 +16,24 @@
 //!   refused a distinct value/name — clamped and served, never an error)
 //!   is signaled by the additive `pulsus_partial: true` response key
 //!   (omitted when false).
+//! - **detected_field/{name}/values** is detected_fields' sampling
+//!   projected onto ONE field name: same required `query`, same
+//!   `line_limit`, and `limit` capping the VALUE set rather than the
+//!   field set. Success is `{"limit":N,"values":[...]}` with `values`
+//!   ascending; the empty result is the bare `{}`.
 //!
-//! Both are `GET|POST` form-encoded (the house `/labels`/`/series`
+//! All three are `GET|POST` form-encoded (the house `/labels`/`/series`
 //! precedent — a documented deviation from api.md's earlier GET-only
 //! sketch, ratified on the issue); all validation runs BEFORE pool
 //! acquisition (the stats precedent). `step`/`since` are accepted and
 //! ignored (documented).
 
 use axum::body::Body;
-use axum::extract::{RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
-use pulsus_logql::{Expr, LogExpr};
+use pulsus_logql::Expr;
 use pulsus_read::TimeBounds;
 
 use crate::app::AppState;
@@ -84,18 +90,11 @@ async fn detected_labels_impl(
     // `query` is optional, matchers only (the reference's
     // `syntax.ParseMatchers`): absent OR empty = the unscoped form
     // (matching the reference's empty-string handling); anything else
-    // must parse as a bare selector — a pipeline is a parse error with
-    // BEFORE any pool work.
-    let selector: Option<Expr> = match params::get(&pairs, "query") {
-        None | Some("") => None,
-        Some(q) => {
-            let selector = pulsus_logql::parse_selector(q)?;
-            Some(Expr::Log(LogExpr {
-                selector,
-                pipeline: Vec::new(),
-            }))
-        }
-    };
+    // must parse as a bare selector — a pipeline is a parse error,
+    // BEFORE any pool work. Issue #482 moved this block into
+    // `super::parse_optional_selector` so `/labels` and
+    // `/label/{name}/values` cannot drift from it.
+    let selector: Option<Expr> = super::parse_optional_selector(&pairs)?;
     let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
     let bounds = TimeBounds { start_ns, end_ns };
 
@@ -185,6 +184,93 @@ async fn detected_fields_impl(
             .detected_fields(&expr, bounds, line_limit, field_limit)
             .await?;
         Ok(encode::detected_fields_response(out, field_limit, None))
+    }
+}
+
+// ---------------------------------------------------------------------
+// GET|POST /api/logs/v1/detected_field/{name}/values
+// ---------------------------------------------------------------------
+
+/// Issue #482. Extractor order is load-bearing: `Path` BEFORE the body
+/// extractor, which must stay last (the rule spelled out on
+/// `handlers::label_values_post`).
+pub(crate) async fn detected_field_values(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
+    match detected_field_values_impl(state, &name, &headers, pairs).await {
+        Ok(res) => res,
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(crate) async fn detected_field_values_post(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Body,
+) -> Response {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
+        Ok(pairs) => match detected_field_values_impl(state, &name, &headers, pairs).await {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        },
+        Err(response) => response,
+    }
+}
+
+async fn detected_field_values_impl(
+    state: AppState,
+    name: &str,
+    headers: &HeaderMap,
+    pairs: Vec<(String, String)>,
+) -> Result<Response, ApiError> {
+    // Parameter handling is `/detected_fields`' verbatim: `query` is
+    // required and non-empty, a metric query is a 400, and `line_limit`
+    // and `limit` ride the same two parsers. On this route `limit` caps
+    // the VALUE set rather than the field set.
+    let query = match params::get(&pairs, "query") {
+        None | Some("") => return Err(ParamError::MissingQuery.into()),
+        Some(q) => q,
+    };
+    let expr = super::parse_logql(query)?;
+    if !matches!(expr, Expr::Log(_)) {
+        return Err(ParamError::MetricQueryUnsupported {
+            endpoint: "detected_field_values",
+        }
+        .into());
+    }
+    let (start_ns, end_ns) = parse_bounds_ordered(&pairs)?;
+    let bounds = TimeBounds { start_ns, end_ns };
+    let line_limit = params::parse_line_limit(params::get(&pairs, "line_limit"))?;
+    let value_limit = params::parse_field_limit(
+        params::get(&pairs, "limit"),
+        params::get(&pairs, "field_limit"),
+    )?;
+
+    let engine = engine_for(&state).await?;
+    if wants_explain(headers) {
+        let (out, explain) = engine
+            .detected_field_values_explained(name, &expr, bounds, line_limit, value_limit)
+            .await?;
+        Ok(encode::detected_field_values_response(
+            out,
+            value_limit,
+            Some(explain),
+        ))
+    } else {
+        let out = engine
+            .detected_field_values(name, &expr, bounds, line_limit, value_limit)
+            .await?;
+        Ok(encode::detected_field_values_response(
+            out,
+            value_limit,
+            None,
+        ))
     }
 }
 

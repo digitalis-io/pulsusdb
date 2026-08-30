@@ -153,7 +153,10 @@ pub use client_agg::{
     instant_leaf_bounded_bytes_without, reducer_class, run_client_agg_rows,
     run_client_agg_rows_folded, run_client_agg_rows_folded_measured,
 };
-pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut, MAX_DETECTED_FIELD_BYTES};
+pub use detected::{
+    DetectedFieldOut, DetectedFieldValues, DetectedFields, DetectedLabelOut,
+    MAX_DETECTED_FIELD_BYTES,
+};
 pub use detected_probe::{DetectedFieldsProbe, MAX_FEEDER_SCRATCH_BYTES};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
