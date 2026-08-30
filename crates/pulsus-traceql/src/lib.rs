@@ -46,9 +46,10 @@ mod validate;
 
 pub use ast::{
     AggregateOp, ArithOp, AttrScope, BOUNDARY_CONSTRUCTS, BoolOp, COMPARE_DEFAULT_TOP_N,
-    ComparisonOp, Duration, Field, FieldExpr, FieldOp, HintValue, Intrinsic, MetricFn, MetricHint,
-    MetricStage, PipelineStage, Query, SecondStage, SpanKindValue, SpansetExpr, SpansetFilter,
-    StatusValue, StructuralModifier, StructuralOp, UNARY_BINDING_POWER, UnaryOp, Value,
+    ComparisonOp, Duration, Field, FieldExpr, FieldOp, HintValue, INTRINSIC_KIND_VALUES,
+    INTRINSIC_STATUS_VALUES, Intrinsic, MetricFn, MetricHint, MetricStage, PipelineStage, Query,
+    SecondStage, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, StructuralModifier,
+    StructuralOp, UNARY_BINDING_POWER, UnaryOp, Value,
 };
 pub use error::TraceQlError;
 pub use parser::parse;

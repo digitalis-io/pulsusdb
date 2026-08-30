@@ -231,8 +231,11 @@ pub enum Surface {
     /// (issue #58, docs/api.md §4.3) — success is the documented native
     /// envelope (`{"scopes":[...],"truncated":...}` /
     /// `{"tagValues":[...],"truncated":...}`); against this suite's empty
-    /// databases a well-formed request returns the empty envelope 200 —
-    /// the mounting oracle. The values route's `base_query` carries a
+    /// databases a well-formed request returns 200 with an empty
+    /// `tagValues` on the values route and the static `intrinsic` scope
+    /// alone on the names route (issue #475 — the vocabulary is
+    /// unconditional, never gated on store contents) — the mounting
+    /// oracle. The values route's `base_query` carries a
     /// NON-TRIVIAL `q=` on purpose: `q` is adjudicated accept-and-ignore
     /// (superset semantics), so the cell proves a 200, never a 400.
     /// Unlike `TracesFetch`, the middle `{tag}` param with a trailing
@@ -247,9 +250,10 @@ pub enum Surface {
     /// reshaping, not pure bindings: the native §4.3 scoped/typed shapes
     /// MINUS the PulsusDB-only top-level `truncated` field (Tempo's v2
     /// wire has no equivalent). Against this suite's empty databases a
-    /// well-formed request returns the empty envelope 200
-    /// (`{"scopes":[]}` / `{"tagValues":[]}`) with NO `truncated` key —
-    /// the mounting oracle. Errors are native-identical (shared param
+    /// well-formed request returns 200 with NO `truncated` key —
+    /// `{"tagValues":[]}` on the values route, and the static
+    /// `intrinsic` scope alone on the names route (issue #475) — the
+    /// mounting oracle. Errors are native-identical (shared param
     /// parsing and the same #384 responder), never carrying a byte
     /// offset. The seeded non-empty wire-shape proof lives in
     /// `traces_tags_live.rs`.
@@ -260,7 +264,10 @@ pub enum Surface {
     /// `{"tagValues":[<bare strings>]}` (scope, value types, and
     /// `truncated` all projected away server-side). Empty-DB mounting
     /// oracle: the flat empty envelope 200, with neither a `scopes` nor
-    /// a `truncated` key. Errors native-identical (the same #384
+    /// a `truncated` key — load-bearing since issue #475: an unscoped
+    /// listing on this route carries the catalog keys ONLY, never the
+    /// static intrinsic names the two scoped routes return against the
+    /// same empty database. Errors native-identical (the same #384
     /// responder), never carrying a byte offset. Seeded proof in
     /// `traces_tags_live.rs`.
     TracesTagsV1,
@@ -1502,8 +1509,10 @@ const TRACES_GRAPH_CASES: &[CaseClass] = &[
 pub const TRACES_TAG_VALUES_BASE_QUERY: &str = "q=%7Bspan.x%3D%22y%22%7D";
 
 fn traces_tags_bogus_scope(req: &mut Req) {
-    // `scope` ∈ {resource, span, absent}; anything else is an explicit
-    // 400, never silently widened to "all scopes" (adjudication 4).
+    // `scope` is a closed, case-sensitive keyword set — the five
+    // attribute scopes, plus `intrinsic`, `trace`, `none` and the empty
+    // string (issue #475). Anything else is an explicit 400, never
+    // silently widened to "all scopes" (adjudication 4).
     req.query = "scope=bogus".to_string();
 }
 

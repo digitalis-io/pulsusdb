@@ -720,7 +720,6 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             attrs_table: "trace_attrs_idx_dist".to_string(),
             // Never `_dist`: the tag catalog is a Global table with no
             // wrapper (unused by this bench's search-only path anyway).
-            catalog_table: "trace_tag_catalog".to_string(),
             // `_dist` like the other Traces-family tables (unused by this
             // bench's search-only path).
             edges_table: "trace_edges_dist".to_string(),

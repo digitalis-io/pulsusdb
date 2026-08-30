@@ -33,6 +33,17 @@
 //!   requests ride the same exact-count zero-payload proof: they issue
 //!   the identical catalog SELECTs, so `discovered` counts them too.
 //!
+//! Issue #475 adds a second test here, on a deliberately COLLIDING
+//! corpus, for the tag answers that are served from the static intrinsic
+//! vocabulary and read nothing. Its zero-delta gate is bounded, and the
+//! boundary is written down in full beside the gate itself
+//! (`intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_table`,
+//! the block introducing steps (1)-(6)): what the predicate covers and
+//! why that coverage is exact, the five things it does not cover — one of
+//! them a measured escape accepted as a deliberate limit — the reason a
+//! query-text exclusion must NOT be used to close it, and the durable
+//! provenance-keyed fix, recorded uncosted and unscheduled.
+//!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
 //! ```text
@@ -63,8 +74,9 @@ use prost::Message;
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 
@@ -532,9 +544,15 @@ async fn tag_discovery_against_real_clickhouse() {
     // -- Tags: full scoped shape, deduped, (scope, key)-ordered. ---------
     let ctx = "tags full";
     let json = get_json(port, NAMES_URL, ctx, &mut discovered);
+    let scopes = scopes_of(&json, ctx);
+    // Issue #475: the static intrinsic scope leads, then the catalog
+    // scopes in `(scope, key)` order. The two writer-reserved intrinsic
+    // scopes appear nowhere.
+    assert_eq!(scopes[0].0, "intrinsic", "{ctx}: body {json}");
+    assert_eq!(scopes[0].1.len(), 25, "{ctx}: the served intrinsic names");
     assert_eq!(
-        scopes_of(&json, ctx),
-        vec![
+        scopes[1..],
+        [
             (
                 "resource".to_string(),
                 vec!["env".to_string(), "service.name".to_string()],
@@ -864,24 +882,28 @@ async fn tag_discovery_against_real_clickhouse() {
     let json = get_json(port, NAMES_URL, ctx, &mut discovered);
     assert_eq!(json["truncated"], true, "{ctx}: non-silent, body {json}");
     let scopes = scopes_of(&json, ctx);
-    let total_pairs: usize = scopes.iter().map(|(_, keys)| keys.len()).sum();
+    // The cap counts CATALOG pairs only: the leading intrinsic scope is
+    // a static list that no catalog read produced, so it is excluded
+    // from the sum (issue #475).
+    assert_eq!(scopes[0].0, "intrinsic", "{ctx}: the static scope leads");
+    let total_pairs: usize = scopes[1..].iter().map(|(_, keys)| keys.len()).sum();
     assert_eq!(total_pairs, TAG_NAMES_MAX, "{ctx}: exactly the cap");
     // Catalog holds 2 resource + (4 + 11,000) span pairs = 11,006; the
     // (scope, key)-ordered cap keeps resource whole and cuts the span
     // list at pair 10,000: bulk.id + bulkkey.00000..bulkkey.09996.
     assert_eq!(
-        scopes[0],
+        scopes[1],
         (
             "resource".to_string(),
             vec!["env".to_string(), "service.name".to_string()],
         ),
         "{ctx}: the resource scope survives the cap whole"
     );
-    assert_eq!(scopes[1].0, "span", "{ctx}");
-    assert_eq!(scopes[1].1.len(), TAG_NAMES_MAX - 2, "{ctx}");
-    assert_eq!(scopes[1].1[0], "bulk.id", "{ctx}: ascending key order");
+    assert_eq!(scopes[2].0, "span", "{ctx}");
+    assert_eq!(scopes[2].1.len(), TAG_NAMES_MAX - 2, "{ctx}");
+    assert_eq!(scopes[2].1[0], "bulk.id", "{ctx}: ascending key order");
     assert_eq!(
-        scopes[1].1.last().map(String::as_str),
+        scopes[2].1.last().map(String::as_str),
         Some("bulkkey.09996"),
         "{ctx}: the cap cuts at exactly the 10,000th (scope, key) pair"
     );
@@ -954,6 +976,718 @@ async fn tag_discovery_against_real_clickhouse() {
         Some(0),
         "no Select in this run — regardless of its SQL text — may touch trace_spans or \
          trace_attrs_idx"
+    );
+
+    drop_db(db).await;
+}
+
+// =====================================================================
+// Issue #475: the colliding corpus, the static answers, and the
+// zero-delta proof that a static answer reads no trace table.
+//
+// A CLEAN corpus cannot tell "bypass the catalog" from "add the static
+// list on top of it" — both give the right bytes. This corpus therefore
+// carries a user attribute keyed `status`, a span event named the same
+// thing as a span, and a link attribute keyed `spanID` that collides
+// with a reserved intrinsic key.
+// =====================================================================
+
+/// The 25 names the `intrinsic` scope serves, as a LITERAL typed into
+/// this suite — an independent copy from `intrinsics.rs`'s, so a wrong
+/// list has to be typed wrong twice.
+const INTRINSIC_NAMES: [&str; 25] = [
+    "duration",
+    "event:name",
+    "event:timeSinceStart",
+    "instrumentation:name",
+    "instrumentation:version",
+    "kind",
+    "link:spanID",
+    "link:traceID",
+    "name",
+    "rootName",
+    "rootServiceName",
+    "span:duration",
+    "span:id",
+    "span:kind",
+    "span:name",
+    "span:parentID",
+    "span:status",
+    "span:statusMessage",
+    "status",
+    "statusMessage",
+    "trace:duration",
+    "trace:id",
+    "trace:rootName",
+    "trace:rootService",
+    "traceDuration",
+];
+
+const KIND_VALUES: [&str; 6] = [
+    "unspecified",
+    "internal",
+    "server",
+    "client",
+    "producer",
+    "consumer",
+];
+
+/// A 200-asserting request with NO bookkeeping. This test carries no
+/// request counter: nothing it asserts depends on classifying a request
+/// as counted or uncounted, which is what made the earlier form of this
+/// gate agreeable to a wrong implementation.
+fn get_ok_json(port: u16, path: &str, ctx: &str) -> serde_json::Value {
+    let res = get(port, path, ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    res.json(ctx)
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SettingRow {
+    value: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct QueryTablesRow {
+    query: String,
+    tables: Vec<String>,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CatalogRow {
+    scope: String,
+    key: String,
+    val: String,
+}
+
+/// Step (0) of the zero-delta gate: a NAMED PRECONDITION, not a property
+/// the gate proves.
+///
+/// Per-query `log_queries=0` erases the gate's input before any
+/// predicate runs, so no predicate can recover it. Asserting the
+/// precondition turns a zero delta computed from an empty log into a
+/// named failure. What it covers: this connection's effective setting —
+/// a container profile, a user profile, a connection-level setting. What
+/// it does not: a per-query override the server applies to its own
+/// reads, which the positive control catches for the one settings root
+/// those reads share, and which nothing here catches for a root used
+/// only by the batch-window reads.
+async fn assert_query_logging_is_on(admin: &ChClient) {
+    let mut stream = admin
+        .query_stream::<SettingRow>(
+            "SELECT toString(value) AS value FROM system.settings WHERE name = 'log_queries'",
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("read log_queries");
+    let mut value = None;
+    while let Some(row) = stream.next().await {
+        value = Some(row.expect("decode setting row").value);
+    }
+    let value = value.expect("system.settings has a log_queries row");
+    assert_eq!(
+        value, "1",
+        "precondition failed: query logging is off for this session (log_queries = {value}); \
+         the zero-delta gate cannot run"
+    );
+}
+
+/// `SYSTEM FLUSH LOGS`, then the number of finished `Select`s whose
+/// `tables` array names any `<db>.trace_*` object.
+///
+/// The counted set is defined by the table read and by nothing else. The
+/// run's identity lives in `db` itself — `pulsus_testkit::test_db`
+/// composes a per-checkout prefix with a millisecond nonce — so no
+/// `current_database` condition is used or wanted: a completed read
+/// issued through a client whose session database is something else must
+/// still be counted. (That is not the reasoning the older test's comment
+/// gives for its own identity, and it is deliberately different.)
+async fn flush_and_count_trace_reads(admin: &ChClient, db: &str) -> u64 {
+    admin
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    let sql = format!(
+        "SELECT toUInt64(count()) AS n FROM system.query_log \
+         WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+           AND arrayExists(t -> startsWith(t, '{db}.trace_'), arrayMap(x -> toString(x), tables))"
+    );
+    let mut stream = admin
+        .query_stream::<CountRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("count trace reads");
+    let mut n = 0;
+    while let Some(row) = stream.next().await {
+        n = row.expect("decode count row").n;
+    }
+    n
+}
+
+/// Only used to build a panic message: `query` and `tables` for every
+/// row the counting predicate matches.
+async fn trace_read_rows(admin: &ChClient, db: &str) -> Vec<(String, Vec<String>)> {
+    let sql = format!(
+        "SELECT query, arraySort(arrayMap(x -> toString(x), tables)) AS tables \
+         FROM system.query_log \
+         WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+           AND arrayExists(t -> startsWith(t, '{db}.trace_'), arrayMap(x -> toString(x), tables))"
+    );
+    let mut stream = admin
+        .query_stream::<QueryTablesRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("read matching rows");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode row");
+        out.push((row.query, row.tables));
+    }
+    out
+}
+
+/// The catalog rows the colliding corpus produced, ascending.
+async fn catalog_rows(admin: &ChClient, db: &str) -> Vec<(String, String, String)> {
+    let sql = format!(
+        "SELECT DISTINCT scope, key, val FROM {db}.trace_tag_catalog ORDER BY scope, key, val"
+    );
+    let mut stream = admin
+        .query_stream::<CatalogRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("read catalog");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        let row = row.expect("decode catalog row");
+        out.push((row.scope, row.key, row.val));
+    }
+    out
+}
+
+/// Ingests the colliding corpus over `POST /v1/traces`: one resource,
+/// one instrumentation scope, three spans, one span event, one span
+/// link.
+fn ingest_colliding_corpus(port: u16, base_ns: u64) {
+    let mut checkout = span(
+        1,
+        1,
+        "checkout",
+        base_ns,
+        vec![kv_str("status", "degraded")],
+    );
+    let mut exception = span(1, 2, "exception", base_ns + 1_000, vec![]);
+    exception.events = vec![Event {
+        time_unix_nano: base_ns + 1_000 + 5_000_000,
+        name: "exception".to_string(),
+        attributes: vec![kv_str("kind", "retry")],
+        dropped_attributes_count: 0,
+    }];
+    let mut payment = span(1, 3, "payment", base_ns + 2_000, vec![]);
+    payment.links = vec![Link {
+        trace_id: {
+            let mut t = [0u8; 16];
+            t[15] = 0x07;
+            t.to_vec()
+        },
+        span_id: vec![0, 0, 0, 0, 0, 0, 0, 0x63],
+        trace_state: String::new(),
+        attributes: vec![kv_str("spanID", "from-attribute")],
+        dropped_attributes_count: 0,
+        flags: 0,
+    }];
+    checkout.kind = 0;
+
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    kv_str("service.name", "checkout"),
+                    kv_str("name", "resource-name-attr"),
+                    kv_str("empty.attr", ""),
+                ],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "checkout-lib".to_string(),
+                    version: "1.0.0".to_string(),
+                    attributes: vec![kv_str("sdk", "rust")],
+                    dropped_attributes_count: 0,
+                }),
+                spans: vec![checkout, exception, payment],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let res = request(
+        port,
+        "POST",
+        "/v1/traces",
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+    )
+    .unwrap_or_else(|| panic!("colliding corpus: ingest must be reachable"));
+    assert_eq!(
+        res.status,
+        200,
+        "colliding corpus: sync ingest must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+}
+
+/// Issue #475: the intrinsic scope, the static `status`/`kind` values,
+/// and the scope discipline — against a corpus built so that a wrong
+/// implementation and a right one give DIFFERENT bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_table() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_290;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = pulsus_testkit::test_db(&format!("pulsus_traces_intrinsics_live_it_{nonce}"));
+    let db = db.as_str();
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db);
+
+    ingest_colliding_corpus(port, 1_700_000_000_000_000_000);
+
+    let admin = ChClient::new(ch_config()).await.expect("connect admin");
+
+    // -- Step (0): the gate's named precondition. ------------------------
+    assert_query_logging_is_on(&admin).await;
+
+    // -- The corpus really produced the colliding rows. ------------------
+    // This is what makes every assertion below discriminating rather
+    // than vacuous: without the `("span","status","degraded")` row a
+    // catalog-reading implementation would answer `status` empty, which
+    // is indistinguishable from a bypass on bytes alone.
+    let rows = catalog_rows(&admin, db).await;
+    assert_eq!(
+        rows,
+        vec![
+            ("event".to_string(), "kind".to_string(), "retry".to_string()),
+            (
+                "event:intrinsic".to_string(),
+                "name".to_string(),
+                "exception".to_string()
+            ),
+            (
+                "event:intrinsic".to_string(),
+                "timeSinceStart".to_string(),
+                "5000000".to_string()
+            ),
+            (
+                "instrumentation".to_string(),
+                "sdk".to_string(),
+                "rust".to_string()
+            ),
+            (
+                "link".to_string(),
+                "spanID".to_string(),
+                "from-attribute".to_string()
+            ),
+            (
+                "link:intrinsic".to_string(),
+                "spanID".to_string(),
+                "0000000000000063".to_string()
+            ),
+            (
+                "link:intrinsic".to_string(),
+                "traceID".to_string(),
+                "00000000000000000000000000000007".to_string()
+            ),
+            (
+                "resource".to_string(),
+                "empty.attr".to_string(),
+                "".to_string()
+            ),
+            (
+                "resource".to_string(),
+                "name".to_string(),
+                "resource-name-attr".to_string()
+            ),
+            (
+                "resource".to_string(),
+                "service.name".to_string(),
+                "checkout".to_string()
+            ),
+            (
+                "span".to_string(),
+                "status".to_string(),
+                "degraded".to_string()
+            ),
+        ],
+        "the colliding corpus must produce exactly these catalog rows"
+    );
+
+    // -- The catalog-reading answers, which the statics must beat. -------
+    let ctx = "scoped attribute lookup still reaches the colliding attribute";
+    let json = get_ok_json(port, "/api/v2/search/tag/span.status/values", ctx);
+    assert_eq!(
+        json,
+        serde_json::json!({"tagValues": [{"type": "string", "value": "degraded"}]}),
+        "{ctx}"
+    );
+
+    let ctx = "a leading dot is an unscoped attribute lookup";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/.status/values", ctx),
+        serde_json::json!({"tagValues": [{"type": "string", "value": "degraded"}]}),
+        "{ctx}"
+    );
+
+    let ctx = "a bare reserved KEY is an attribute lookup, and the reserved scope is excluded";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/spanID/values", ctx),
+        serde_json::json!({"tagValues": [{"type": "string", "value": "from-attribute"}]}),
+        "{ctx}: the link:intrinsic row 0000000000000063 sorts first and must not appear"
+    );
+
+    let ctx = "the dot form of a reserved key reaches the attribute";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/link.spanID/values", ctx),
+        serde_json::json!({"tagValues": [{"type": "string", "value": "from-attribute"}]}),
+        "{ctx}"
+    );
+
+    let ctx = "the event scope prefix resolves";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/event.kind/values", ctx),
+        serde_json::json!({"tagValues": [{"type": "string", "value": "retry"}]}),
+        "{ctx}"
+    );
+
+    let ctx = "the instrumentation scope prefix resolves";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/instrumentation.sdk/values", ctx),
+        serde_json::json!({"tagValues": [{"type": "string", "value": "rust"}]}),
+        "{ctx}"
+    );
+
+    let ctx = "an empty attribute value omits the value key";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/resource.empty.attr/values", ctx),
+        serde_json::json!({"tagValues": [{"type": "string"}]}),
+        "{ctx}"
+    );
+    let ctx = "the v1 flat projection still emits the empty string";
+    assert_eq!(
+        get_ok_json(port, "/api/search/tag/resource.empty.attr/values", ctx),
+        serde_json::json!({"tagValues": [""]}),
+        "{ctx}"
+    );
+    let ctx = "the v1 flat values route keeps the attribute-only reading";
+    assert_eq!(
+        get_ok_json(port, "/api/search/tag/status/values", ctx),
+        serde_json::json!({"tagValues": ["degraded"]}),
+        "{ctx}: v1 answers `status` from the store, not from the statics"
+    );
+
+    let ctx = "the unscoped listing carries the intrinsic scope and no reserved scope";
+    let json = get_ok_json(port, "/api/v2/search/tags", ctx);
+    let scopes = scopes_of(&json, ctx);
+    let names: Vec<&str> = scopes.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "intrinsic",
+            "event",
+            "instrumentation",
+            "link",
+            "resource",
+            "span"
+        ],
+        "{ctx}: body {json}"
+    );
+    assert_eq!(scopes[0].1, INTRINSIC_NAMES, "{ctx}");
+    assert_eq!(scopes[1].1, ["kind"], "{ctx}");
+    assert_eq!(scopes[2].1, ["sdk"], "{ctx}");
+    assert_eq!(scopes[3].1, ["spanID"], "{ctx}");
+    assert_eq!(scopes[4].1, ["empty.attr", "name", "service.name"], "{ctx}");
+    assert_eq!(scopes[5].1, ["status"], "{ctx}");
+
+    let ctx = "the v1 flat listing carries the catalog keys only";
+    assert_eq!(
+        get_ok_json(port, "/api/search/tags", ctx),
+        serde_json::json!({"tagNames": [
+            "kind", "sdk", "spanID", "empty.attr", "name", "service.name", "status"
+        ]}),
+        "{ctx}: no intrinsic names on the unscoped flat route"
+    );
+
+    let ctx = "an attribute-scoped request is not given the intrinsic scope";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tags?scope=span", ctx),
+        serde_json::json!({"scopes": [{"name": "span", "tags": ["status"]}]}),
+        "{ctx}"
+    );
+
+    // -- The rejection surface, which the widened accept list must keep. -
+    for value in ["bogus", "Intrinsic", "TRACE", "trace%20"] {
+        let ctx = format!("scope={value} rejects");
+        let res = get(port, &format!("/api/v2/search/tags?scope={value}"), &ctx);
+        assert_error_body(&res, 400, &ctx);
+    }
+    for path in [
+        "/api/traces/v1/tag/resource./values",
+        "/api/v2/search/tag/span./values",
+        "/api/v2/search/tag/event./values",
+    ] {
+        let ctx = format!("{path} rejects an empty key");
+        let res = get(port, path, &ctx);
+        let body = assert_error_body(&res, 400, &ctx);
+        assert_eq!(
+            body, "invalid tag: the attribute key must be non-empty",
+            "{ctx}"
+        );
+    }
+
+    // =================================================================
+    // The zero-delta gate.
+    //
+    // What it asserts, and nothing more: during the window between two
+    // `SYSTEM FLUSH LOGS` calls, `system.query_log` holds no
+    // `QueryFinish` row with `query_kind = 'Select'` any of whose
+    // `tables` entries begins `<db>.trace_`. Every object the traces
+    // schema declares is under that prefix.
+    //
+    // WHAT THAT COVERS. Every tag-discovery read the server can issue is
+    // built by `tag_names_sql` or `tag_values_sql`
+    // (`crates/pulsus-read/src/traces/tags_sql.rs`), and between them
+    // those two functions can emit exactly two SQL shapes:
+    // `SELECT DISTINCT scope, key FROM trace_tag_catalog …` and
+    // `SELECT DISTINCT val FROM trace_tag_catalog …`. The table name is a
+    // PRIVATE module constant and the only caller-supplied strings land
+    // inside `WHERE`, so neither shape's `FROM` can be anything else.
+    //
+    // **Those two shapes are OBSERVED to log that table**, which is the
+    // fact this predicate rests on. It is checked, not assumed, and in
+    // two places: the other test in this file asserts `tables` equals
+    // exactly `[<db>.trace_tag_catalog]` for every `SELECT DISTINCT`
+    // discovery row it produces, over both shapes; and step (3) below
+    // re-establishes it for the values shape on this run, which is why a
+    // control that fails to move the count aborts the gate.
+    //
+    // The claim is about THOSE TWO SHAPES and nothing wider. It is NOT
+    // that a top-level `FROM` on a real table always populates `tables` —
+    // that is false, and non-coverage item 1 below is a measured
+    // counterexample to it. Deriving this gate's reach from such a rule
+    // would claim more than the gate has.
+    //
+    // WHAT IT DOES NOT COVER — a DELIBERATE LIMIT, not an oversight, and
+    // recorded here so the next reader finds a decision instead of
+    // rediscovering a hole:
+    //
+    //   1. A handler that constructs its OWN `ChClient` and its OWN query
+    //      text — calling neither builder, never reaching `engine_for`,
+    //      never entering `pulsus-read`. Measured in code review (round 1
+    //      on this suite): eight completed `SELECT count() FROM
+    //      <db>.trace_tag_catalog` reads issued that way finished with
+    //      `current_database = default` and an EMPTY `tables` array, and
+    //      this gate passed. That is a real read this predicate cannot
+    //      see.
+    //   2. A read of a table that is not `<db>.trace_*`.
+    //   3. A query that never reached `QueryFinish` — one that errored or
+    //      was cancelled. Such a request also fails its body assertion,
+    //      so it surfaces there instead.
+    //   4. A read whose `tables` array does not name the table (a scalar
+    //      subquery folds to `system.one`). Not reachable through either
+    //      builder since the catalog name became a module constant.
+    //   5. Work that is not a ClickHouse query at all — an in-process
+    //      cache, a value computed at startup, a read completed before
+    //      the window opens; and anything outside the two windows.
+    //
+    // WHY LIMIT 1 IS ACCEPTED RATHER THAN CLOSED. Reaching it requires
+    // SQL neither builder can emit, which is the case this issue's plan
+    // named in advance as recorded-and-reported rather than as another
+    // hardening round. The escape that DID matter — a caller passing a
+    // query fragment where the table name belonged — was closed in
+    // production instead, by deleting the parameter: see `CATALOG_TABLE`.
+    //
+    // DO NOT close limit 1 by excluding this gate's own reads on their
+    // QUERY TEXT. That is the same defect the limit describes: a claim
+    // about WHO ISSUED a query, tested against WHAT THE QUERY SAYS. It
+    // would have to inherit every spelling of this file's own SQL across
+    // the five sites that issue it, it turns into a false positive the
+    // moment one of them is reformatted, and the natural repair is to
+    // widen the pattern — which then exempts a production read whose text
+    // happens to match.
+    //
+    // THE DURABLE FIX, recorded uncosted and unscheduled for whoever
+    // picks it up. The subject of the claim is "a store read happened";
+    // the predicate reads a table list, which is a proper subset of that.
+    // Keying on PROVENANCE rather than on text would let the predicate
+    // state the claim actually being made — every `Select` on this
+    // database that this gate did not issue — through a per-connection
+    // `log_comment`, `initial_query_id`, or a dedicated ClickHouse user
+    // for the admin connection. Any of the three identifies the issuer
+    // directly, so no query text enters the check at all.
+    // =================================================================
+
+    // (1) baseline.
+    let b0 = flush_and_count_trace_reads(&admin, db).await;
+    // (2) the positive control: one real catalog read.
+    let ctx = "positive control";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/span.status/values", ctx),
+        serde_json::json!({"tagValues": [{"type": "string", "value": "degraded"}]}),
+        "{ctx}"
+    );
+    // (3) it moved the count by exactly one.
+    let a0 = flush_and_count_trace_reads(&admin, db).await;
+    assert_eq!(
+        a0,
+        b0 + 1,
+        "the positive control must move the count by exactly one — if it does not, the \
+         predicate is vacuous and the zero below proves nothing. Rows: {:#?}",
+        trace_read_rows(&admin, db).await
+    );
+
+    // (4) the static window opens. Nothing else runs between here and (6).
+    let b1 = flush_and_count_trace_reads(&admin, db).await;
+
+    let intrinsic_scope_body = serde_json::json!({
+        "scopes": [{"name": "intrinsic", "tags": INTRINSIC_NAMES}]
+    });
+    let status_values = serde_json::json!({"tagValues": [
+        {"type": "keyword", "value": "ok"},
+        {"type": "keyword", "value": "error"},
+        {"type": "keyword", "value": "unset"},
+    ]});
+    let kind_values = serde_json::json!({
+        "tagValues": KIND_VALUES
+            .iter()
+            .map(|v| serde_json::json!({"type": "keyword", "value": v}))
+            .collect::<Vec<_>>()
+    });
+    let empty_values = serde_json::json!({"tagValues": []});
+
+    // B1: the exact request the Search tab's Status field issues,
+    // redundant `tag=` query parameter included.
+    let ctx = "B1 status values";
+    assert_eq!(
+        get_ok_json(
+            port,
+            "/api/v2/search/tag/status/values?limit=5000&tag=status",
+            ctx
+        ),
+        status_values,
+        "{ctx}: the closed keyword set, typed keyword — never the colliding `degraded`"
+    );
+    // B2: the native twin carries `truncated`.
+    let ctx = "B2 native status values";
+    let mut native_status = status_values.clone();
+    native_status["truncated"] = serde_json::json!(false);
+    assert_eq!(
+        get_ok_json(port, "/api/traces/v1/tag/status/values", ctx),
+        native_status,
+        "{ctx}"
+    );
+    // B3-B5: `kind`, and its colon-scoped spelling encoded and not. The
+    // corpus holds an event attribute literally keyed `kind` whose value
+    // is `retry`; none of these may return it.
+    let ctx = "B3 kind values";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/kind/values", ctx),
+        kind_values,
+        "{ctx}"
+    );
+    let ctx = "B4 span:kind values";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/span:kind/values", ctx),
+        kind_values,
+        "{ctx}"
+    );
+    let ctx = "B5 span%3Akind values";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/span%3Akind/values", ctx),
+        kind_values,
+        "{ctx}: the path extractor percent-decodes before the resolver sees it"
+    );
+    // B6-B9: the open-valued intrinsics answer EMPTY rather than falling
+    // through to the catalog. `name` is the one that used to return span
+    // EVENT names; `link:spanID` is one character from `link.spanID`,
+    // which answers `from-attribute` above.
+    for (ctx, path) in [
+        ("B6 name values", "/api/v2/search/tag/name/values"),
+        (
+            "B7 link:spanID values",
+            "/api/v2/search/tag/link:spanID/values",
+        ),
+        ("B8 duration values", "/api/v2/search/tag/duration/values"),
+        (
+            "B9 nestedSetLeft values",
+            "/api/v2/search/tag/nestedSetLeft/values",
+        ),
+    ] {
+        assert_eq!(get_ok_json(port, path, ctx), empty_values, "{ctx}");
+    }
+    // B10-B12: `scope=intrinsic` on all three names routes.
+    let ctx = "B10 v2 scope=intrinsic";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tags?scope=intrinsic", ctx),
+        intrinsic_scope_body,
+        "{ctx}"
+    );
+    let ctx = "B11 native scope=intrinsic";
+    let mut native_intrinsic = intrinsic_scope_body.clone();
+    native_intrinsic["truncated"] = serde_json::json!(false);
+    assert_eq!(
+        get_ok_json(port, "/api/traces/v1/tags?scope=intrinsic", ctx),
+        native_intrinsic,
+        "{ctx}"
+    );
+    let ctx = "B12 v1 flat scope=intrinsic";
+    assert_eq!(
+        get_ok_json(port, "/api/search/tags?scope=intrinsic", ctx),
+        serde_json::json!({"tagNames": INTRINSIC_NAMES}),
+        "{ctx}"
+    );
+    // B13-B15: `scope=trace` is accepted and answers an empty list on
+    // all three names routes. This is the row whose RIGHT BYTES a wrong
+    // implementation also produces — appending `trace` to `ATTR_SCOPES`
+    // would answer identically while issuing three catalog reads, and
+    // only the delta below sees it.
+    let ctx = "B13 v2 scope=trace";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tags?scope=trace", ctx),
+        serde_json::json!({"scopes": []}),
+        "{ctx}"
+    );
+    let ctx = "B14 native scope=trace";
+    assert_eq!(
+        get_ok_json(port, "/api/traces/v1/tags?scope=trace", ctx),
+        serde_json::json!({"scopes": [], "truncated": false}),
+        "{ctx}"
+    );
+    let ctx = "B15 v1 flat scope=trace";
+    assert_eq!(
+        get_ok_json(port, "/api/search/tags?scope=trace", ctx),
+        serde_json::json!({"tagNames": []}),
+        "{ctx}"
+    );
+
+    // (6) the window closes: not one of those fifteen requests read a
+    // trace table.
+    let a1 = flush_and_count_trace_reads(&admin, db).await;
+    assert_eq!(
+        a1,
+        b1,
+        "a static tag-discovery answer must read no trace table; the window moved the count \
+         from {b1} to {a1}. Rows: {:#?}",
+        trace_read_rows(&admin, db).await
     );
 
     drop_db(db).await;

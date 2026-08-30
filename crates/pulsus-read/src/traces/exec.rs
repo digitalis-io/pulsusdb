@@ -303,14 +303,6 @@ pub struct TraceReadConfig {
     /// `trace_attrs_idx{_dist}` — the attribute index the search
     /// generators/membership reads target.
     pub attrs_table: String,
-    /// `trace_tag_catalog` — the Global tag catalog the §4.3 discovery
-    /// reads (issue #58) target. NEVER `_dist`-suffixed: migration 18 is
-    /// `Replication::Global, family: None` (no `_dist` wrapper exists to
-    /// name), so every catalog read is a local-replica primary-key-prefix
-    /// scan with no coordinator fan-out (docs/schemas.md §4.1/§7 —
-    /// `chconfig::trace_read_config_from` sets it unconditionally, the
-    /// `metric_metadata` carve-out pattern).
-    pub catalog_table: String,
     /// `trace_edges{_dist}` — the service-graph half-row ledger the
     /// `service_graph` read targets (issue #173). `_dist`-suffixed when
     /// clustered exactly like `spans_table`/`attrs_table` (halves co-shard
@@ -1484,25 +1476,24 @@ impl TraceEngine {
 
     /// Streams the §4.3 tag-names read (issue #58): distinct
     /// `(scope, key)` pairs from the Global tag catalog — only ever
-    /// `config.catalog_table` (`trace_tag_catalog`, never `_dist`, never
-    /// a span/attr table: discovery never scans payloads, epic #19 AC1).
+    /// [`tags_sql::CATALOG_TABLE`](super::tags_sql) (`trace_tag_catalog`,
+    /// never `_dist`, never a span/attr table: discovery never scans
+    /// payloads, epic #19 AC1).
     /// `scope` is escaped HERE (`ch_string`) before it reaches the pure
     /// builder — the engine is the catalog reads' injection boundary.
     /// Bounded by the SQL `LIMIT` cap + 1 probe: at most
     /// [`TAG_NAMES_MAX`] rows return, and the probe row (row cap + 1)
     /// flips `truncated` instead of shipping a silent subset. The `LIMIT`
-    /// bounds *returned* rows only — an unscoped read has no `WHERE`
-    /// predicate, so it is a full catalog scan; [`catalog_settings`]
-    /// (issue #58 re-review) bounds *scanned* rows: a breach maps through
+    /// bounds *returned* rows only; an unscoped read carries the
+    /// `scope IN (…)` attribute-scope predicate on the catalog's leading
+    /// primary-key column (issue #475), so it prunes rather than scanning
+    /// the whole table, and [`catalog_settings`] (issue #58 re-review)
+    /// bounds *scanned* rows regardless: a breach maps through
     /// [`map_trace_read_error`] to `422 query_too_broad` instead of
     /// running unbounded.
     pub async fn list_tag_names(&self, scope: Option<&str>) -> Result<TagNames, ReadError> {
         let scope_literal = scope.map(crate::logql::escape::ch_string);
-        let sql = super::tags_sql::tag_names_sql(
-            &self.config.catalog_table,
-            scope_literal.as_deref(),
-            TAG_NAMES_MAX + 1,
-        );
+        let sql = super::tags_sql::tag_names_sql(scope_literal.as_deref(), TAG_NAMES_MAX + 1);
         let settings = catalog_settings(&self.config);
         crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut names = Vec::new();
@@ -1527,9 +1518,11 @@ impl TraceEngine {
     /// one key, optionally scope-confined — same catalog-only,
     /// escape-at-the-engine, `LIMIT` cap + 1 probe, and [`catalog_settings`]
     /// read-budget contract as [`Self::list_tag_names`], capped at
-    /// [`TAG_VALUES_MAX`]. A bare-key lookup (no `scope`) cannot prune the
-    /// catalog's leading `(scope, key, val)` primary-key column, so it is
-    /// a full scan bounded only by the budget.
+    /// [`TAG_VALUES_MAX`]. A bare-key lookup (no `scope`) prunes the
+    /// catalog's leading `(scope, key, val)` primary-key column on the
+    /// `scope IN (…)` attribute-scope list (issue #475), so it reads the
+    /// five attribute scopes and never the writer-reserved intrinsic
+    /// ones.
     pub async fn list_tag_values(
         &self,
         key: &str,
@@ -1538,7 +1531,6 @@ impl TraceEngine {
         let key_literal = crate::logql::escape::ch_string(key);
         let scope_literal = scope.map(crate::logql::escape::ch_string);
         let sql = super::tags_sql::tag_values_sql(
-            &self.config.catalog_table,
             &key_literal,
             scope_literal.as_deref(),
             TAG_VALUES_MAX + 1,
@@ -2978,7 +2970,6 @@ mod tests {
         let config = TraceReadConfig {
             spans_table: "trace_spans".to_string(),
             attrs_table: "trace_attrs_idx".to_string(),
-            catalog_table: "trace_tag_catalog".to_string(),
             edges_table: "trace_edges".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
@@ -2998,7 +2989,6 @@ mod tests {
         TraceReadConfig {
             spans_table: "trace_spans".to_string(),
             attrs_table: "trace_attrs_idx".to_string(),
-            catalog_table: "trace_tag_catalog".to_string(),
             edges_table: "trace_edges".to_string(),
             max_candidates: 100,
             scan_budget_rows: 1_000,

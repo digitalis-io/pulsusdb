@@ -1285,3 +1285,212 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (`the_populated_json_envelope_nests_resource_spans_under_trace`), which
   asserts the `status` object this row describes so a change to the
   serializer reddens rather than passing silently.
+
+### `traceql-intrinsic-scope-unserved-names` (issue #475) — **four intrinsics we deliberately do not offer as tags**
+
+- **Route.** `GET /api/traces/v1/tags`, `GET /api/v2/search/tags` and
+  `GET /api/search/tags` — the `intrinsic` scope's tag list. The two
+  values routes are **unaffected** and the row says so explicitly:
+  `GET /api/v2/search/tag/nestedSetLeft/values` (and its native twin)
+  answers `200 {"tagValues":[]}`, because an intrinsic absent from the
+  served NAME list is still an intrinsic for a value LOOKUP.
+
+- **What.** `pulsus_traceql::Intrinsic` has 21 variants
+  (`crates/pulsus-traceql/src/ast.rs`). Four of them carry an explicitly
+  EMPTY spelling list and are therefore absent from the served scope:
+  `span:childCount`, `nestedSetParent`, `nestedSetLeft`,
+  `nestedSetRight`. The remaining 17 contribute 25 spellings (8 variants
+  with two spellings, 9 with one), which is the served list.
+
+- **Why they are absent.** They are query-time structural properties of a
+  span, not tags a user picks from a dropdown; offering them would put
+  values in an autocomplete that no value lookup can ever populate. The
+  list of 25 was measured equal, byte for byte, to the pinned reference
+  build's own `intrinsic` scope during planning on 2026-08-30 (issue
+  #475), so this is a decision recorded against our own vocabulary rather
+  than a divergence from the reference's.
+
+- **What is gated.** `crates/pulsus-server/src/traces_api/intrinsics.rs`
+  pins the 25 names as a literal and asserts the four empty slices;
+  `crates/pulsus-traceql/src/ast.rs` asserts that both discovery matches
+  have NO wildcard arm, so a variant added later cannot go silently
+  unserved — it fails to compile until someone chooses.
+
+### `traceql-tag-discovery-ordering` (issue #475) — **ours is deterministic where the reference's varies between requests**
+
+- **Route.** `GET /api/v2/search/tags` (the `scopes` order) and
+  `GET /api/v2/search/tag/{tag}/values` (the value order). The native
+  twins are identical to the aliases by construction.
+
+- **What was measured.** During planning on 2026-08-30 against the pinned
+  reference build, three requests to the SAME process over the SAME
+  corpus that select the same scope set — unscoped, `?scope=none`,
+  `?scope=` — returned three different scope orders, and four consecutive
+  `status` value requests returned three different value orders.
+
+- **Ours.** The `intrinsic` scope first, then the catalog scopes in
+  `(scope, key)` ascending order; values ascending for a catalog read and
+  in grammar order for the two closed keyword sets. Deterministic on
+  every request.
+
+- **Disposition.** A deliberate refinement, no code proposed. A client
+  that depends on the order gets a stable answer from us and an unstable
+  one from the reference, so any future comparison of these bodies must
+  compare SETS, not sequences.
+
+### `traceql-intrinsic-shadows-attribute-lookup` (issue #475) — **a bare intrinsic spelling wins over an attribute of the same name**
+
+- **Route.** `GET /api/traces/v1/tag/{tag}/values` and
+  `GET /api/v2/search/tag/{tag}/values` **only** — explicitly NOT
+  `GET /api/search/tag/{tag}/values`, which keeps the attribute-only
+  reading (see `traceql-v1-tag-values-statics-unimplemented`).
+
+- **What.** On those two routes a `{tag}` that is an intrinsic spelling is
+  answered from the static vocabulary and the catalog is not read. So in
+  a store holding a user attribute keyed `status`, `.../tag/status/values`
+  answers `ok`/`error`/`unset`, not that attribute's values. The attribute
+  remains reachable by its scoped spelling: `.../tag/span.status/values`
+  answers `degraded` on the same store.
+
+- **Why this is the right shape.** The alternative — union the static list
+  with a catalog read — leaves the collision in place: the dropdown then
+  offers both the keywords and whatever a same-named attribute happens to
+  hold, which is the wrong-values case the issue exists to remove. The
+  reference does not read its store for these keys at all.
+
+- **Gated by.** `crates/pulsus-server/tests/traces_tags_live.rs`
+  (`intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_table`)
+  on a corpus that carries the colliding `status` attribute, so the two
+  behaviours give different bytes.
+
+### `traceql-v1-tag-values-statics-unimplemented` (issue #475) — **the v1 flat values route serves no static values, matching the reference**
+
+- **Route.** `GET /api/search/tag/{tag}/values`. The row also states the
+  other half: `GET /api/v2/search/tag/{tag}/values` answers the same two
+  keys from our statics.
+
+- **What was measured.** During planning on 2026-08-30 against the pinned
+  reference build, on a store seeded with a user attribute keyed
+  `status`: `/api/search/tag/status.code/values` →
+  `{"tagValues":["error","ok","unset"]}` and
+  `/api/search/tag/error/values` → `{"tagValues":["true"]}` (its own v1
+  static map), while `/api/search/tag/status/values` →
+  `{"tagValues":["degraded"]}` — its store read, not a static.
+
+- **Ours.** `GET /api/search/tag/status/values` → `{"tagValues":["degraded"]}`
+  — the same store-read answer. We implement none of the reference's v1
+  static map (`status.code`, `error`), and no client of ours reads status
+  values off the v1 route.
+
+- **Disposition.** No code. The split is deliberate parity: a v1 lookup
+  conflates an intrinsic with an attribute of the same name, which is
+  exactly the defect removed on v2.
+
+### `traceql-intrinsic-values-empty-pending-span-names` (issue #475) — **an open-valued intrinsic answers empty where the reference answers from its store**
+
+- **Route.** `GET /api/traces/v1/tag/{tag}/values` and
+  `GET /api/v2/search/tag/{tag}/values`.
+
+- **What.** For an intrinsic with no closed value set — `name`,
+  `duration`, `rootName`, `span:id`, every one except `status` and `kind`
+  — we answer `200 {"tagValues":[]}`. Measured during planning on
+  2026-08-30, the pinned reference build answers
+  `/api/v2/search/tag/name/values` with the three **span** names its
+  store holds.
+
+- **Why empty rather than a store read.** Before issue #475 that lookup
+  fell through to a bare-key catalog read, which answered with span
+  EVENT names (the catalog carries one `event:intrinsic`/`name` row per
+  span event) — a syntactically valid query against a real intrinsic,
+  populated with values from the wrong thing, and occasionally matching
+  by coincidence when an event and a span share a name. An empty list is
+  legible; that was not.
+
+- **What remains.** Populating span names correctly needs distinct span
+  names out of a table with no index prefix for them, and is tracked as a
+  separate unit. This row is the placeholder for that work, not a
+  permanent decision.
+
+### `traceql-v1-flat-tag-names-order` (issue #475) — **catalog order, not sorted**
+
+- **Route.** `GET /api/search/tags`.
+
+- **What.** Our flat `tagNames` are the distinct keys in catalog
+  `(scope, key)` order, deduplicated on first occurrence. Measured during
+  planning on 2026-08-30, the pinned reference build returns the same SET
+  sorted ascending. Pre-existing, unchanged by issue #475; recorded
+  because the two are byte-different and a future comparison must compare
+  sets.
+
+### `traceql-v1-flat-empty-value-dropped` (issue #475) — **we emit the empty string, the reference omits the element**
+
+- **Route.** `GET /api/search/tag/{tag}/values`.
+
+- **What.** For an attribute whose stored value is the empty string, our
+  v1 flat body is `{"tagValues":[""]}`; measured during planning on
+  2026-08-30, the reference returns `{"tagValues":[]}`.
+
+- **Note the asymmetry with the typed routes, which issue #475 changed.**
+  On the native and v2 typed routes an empty value now omits the `value`
+  key (`{"type":"string"}`), the canonical protobuf JSON mapping for a
+  default-valued scalar. The v1 flat projection has no key to omit — the
+  element is the value — so matching the reference there would mean
+  dropping the element, which changes the list length. Not done, not
+  proposed; recorded so the difference between the two shapes is not read
+  as an oversight in one of them.
+
+### `traceql-v2-bare-attribute-key-accepted` (issue #475) — **we accept a bare non-intrinsic key where the reference rejects it**
+
+- **Route.** `GET /api/v2/search/tag/{tag}/values`. The native twin
+  (`GET /api/traces/v1/tag/{tag}/values`) has no reference counterpart,
+  and this row does not imply one.
+
+- **What.** `GET /api/v2/search/tag/spanID/values` answers `200` with the
+  matching attribute values from the five attribute scopes. Measured
+  during planning on 2026-08-30, the pinned reference build answers `400`
+  (`please provide a valid tagName: …`) for every bare key that is not an
+  intrinsic spelling, and likewise rejects a `trace.`-prefixed key, which
+  we treat as an ordinary bare key.
+
+- **Disposition.** A documented superset, unchanged by issue #475. Our
+  acceptance is strictly more permissive, so no client that works against
+  the reference breaks against us.
+
+### `traceql-tag-routes-metrics-object-absent` (issue #475) — **the reference's tag bodies carry a `metrics` object we do not emit**
+
+- **Route.** Measured on three: `GET /api/v2/search/tags`,
+  `GET /api/search/tags` and `GET /api/v2/search/tag/{tag}/values`. **Not
+  captured on `GET /api/search/tag/{tag}/values`** — stated rather than
+  assumed.
+
+- **What.** Measured during planning on 2026-08-30, the pinned reference
+  build's tag bodies carry a trailing `"metrics":{...}` (for example
+  `{"scopes":[],"metrics":{"inspectedBytes":"18694"}}`), present even when
+  the answer is empty. Ours carry no such key on any tag route.
+
+- **Disposition.** Docs-only, no code. Recorded separately from
+  `traceql-intrinsic-scope-on-empty-store`, which cross-references it, so
+  the two are not read as one difference.
+
+### `traceql-intrinsic-scope-on-empty-store` (issue #475) — **a reference-side fact, recorded because our contract would have gone wrong silently**
+
+- **Route.** `GET /api/v2/search/tags?scope=intrinsic` and the unscoped
+  `GET /api/v2/search/tags`, against a store holding no spans.
+
+- **What was measured.** During plan review on 2026-08-30, against an
+  EMPTY store, the pinned reference build returned `200` with `scopes` =
+  one entry named `intrinsic` carrying the 25 names, and answered the
+  unscoped route with the same intrinsic-only body; `?scope=resource` and
+  `?scope=span` each returned `{"scopes":[],"metrics":{}}`, and
+  `/api/v2/search/tag/name/values` returned `{"tagValues":[],"metrics":{}}`.
+
+- **Ours.** The same 25 names in the same order, without the `metrics`
+  object — whose absence is the separate row
+  `traceql-tag-routes-metrics-object-absent` above.
+
+- **Why the row exists.** Our static lists are unconditional by design, so
+  an empty store still returns them. That was our own contract before this
+  measurement and would have become wrong, with nothing failing to say so,
+  if the reference had gated its list on store contents. It does not.
+  **No code change.** The empty-database cells in
+  `crates/pulsus-server/tests/api_conformance.rs` are what hold our half.

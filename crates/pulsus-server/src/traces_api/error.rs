@@ -956,7 +956,7 @@ mod tests {
                 "TagsParam",
                 ApiError::TagsParam(TagsParamError::UnsupportedScope("bogus".to_string())),
                 StatusCode::BAD_REQUEST,
-                r#"unsupported scope "bogus": expected "resource" or "span" (or omit the parameter for both scopes)"#,
+                r#"unsupported scope "bogus": expected "event", "instrumentation", "intrinsic", "link", "resource", "span", "trace" or "none" (or omit the parameter for every scope)"#,
                 None,
             ),
             (

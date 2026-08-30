@@ -9,6 +9,8 @@
 
 use thiserror::Error;
 
+use pulsus_read::traces::tags_sql::ATTR_SCOPES;
+
 use super::querytext::{QueryTextError, TraceQlText, validate_traceql_query};
 
 /// Errors from parsing the `{traceId}` path parameter — mapped to `400`
@@ -435,8 +437,9 @@ pub(crate) fn parse_graph_params(raw: &str, now_s: i64) -> Result<RawGraphParams
 #[derive(Debug, Error)]
 pub(crate) enum TagsParamError {
     #[error(
-        "unsupported scope {0:?}: expected \"resource\" or \"span\" (or omit the parameter \
-         for both scopes)"
+        "unsupported scope {0:?}: expected \"event\", \"instrumentation\", \"intrinsic\", \
+         \"link\", \"resource\", \"span\", \"trace\" or \"none\" (or omit the parameter \
+         for every scope)"
     )]
     UnsupportedScope(String),
 }
@@ -449,6 +452,28 @@ pub(crate) enum TagPathError {
     EmptyKey,
 }
 
+/// Scope keywords accepted on the three names routes that name no
+/// catalog scope and therefore carry no tags (issue #475): answered
+/// `200` with an EMPTY scope list and NO catalog read. Disjoint from
+/// `pulsus_read::traces::tags_sql::{ATTR_SCOPES, RESERVED_INTRINSIC_SCOPES}`
+/// by construction and by unit test — a keyword here can never reach the
+/// SQL `IN` list.
+pub(crate) const EMPTY_SCOPES: [&str; 1] = ["trace"];
+
+/// What a `scope=` value selects on the three names routes (issue #475).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TagScope {
+    /// Absent, `none`, or empty — every attribute scope, plus the
+    /// intrinsic scope on the routes that carry it.
+    All,
+    /// One member of `pulsus_read::traces::tags_sql::ATTR_SCOPES`.
+    Attribute(&'static str),
+    /// `intrinsic` — the static vocabulary only, no catalog read.
+    Intrinsic,
+    /// A member of [`EMPTY_SCOPES`] — an empty list, no catalog read.
+    NoTags,
+}
+
 /// The parsed `/api/traces/v1/tags` request: only `scope` filters.
 /// `start`/`end` are accepted for client compatibility and IGNORED —
 /// `trace_tag_catalog` has no timestamp column, so tag discovery is
@@ -456,29 +481,106 @@ pub(crate) enum TagPathError {
 /// resolution); any other parameter is likewise ignored.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TagsParams {
-    pub scope: Option<String>,
+    pub scope: TagScope,
 }
 
-/// Parses the `/api/traces/v1/tags` query string (docs/api.md §4.3):
-/// `scope` ∈ {`resource`, `span`, absent} — anything else (including
-/// `intrinsic`/`none` and the empty string) is an explicit `400`, never
-/// silently widened to "all scopes" (task-manager adjudication 4 on
-/// issue #58).
+/// Parses the `/api/traces/v1/tags` query string (docs/api.md §4.3, as
+/// widened by issue #475). Accepts, case-sensitively: absent, `none` or
+/// the empty string → [`TagScope::All`]; any [`ATTR_SCOPES`] member →
+/// [`TagScope::Attribute`]; `intrinsic` → [`TagScope::Intrinsic`]; any
+/// [`EMPTY_SCOPES`] member → [`TagScope::NoTags`]. Anything else — a
+/// different casing included — is an explicit `400`, never silently
+/// widened to "all scopes" (adjudication 4 on issue #58).
+///
+/// The accept list is DERIVED from `ATTR_SCOPES`, so the scope keywords
+/// accepted here and the scopes the SQL can be confined to are one
+/// constant and cannot drift apart.
 pub(crate) fn parse_tags_params(raw: &str) -> Result<TagsParams, TagsParamError> {
     let pairs = parse_pairs(raw);
     let scope = match get(&pairs, "scope") {
-        None => None,
-        Some(s @ ("resource" | "span")) => Some(s.to_string()),
-        Some(other) => return Err(TagsParamError::UnsupportedScope(other.to_string())),
+        None | Some("" | "none") => TagScope::All,
+        Some("intrinsic") => TagScope::Intrinsic,
+        Some(other) => {
+            if let Some(attr) = ATTR_SCOPES.iter().find(|s| **s == other) {
+                TagScope::Attribute(attr)
+            } else if EMPTY_SCOPES.contains(&other) {
+                TagScope::NoTags
+            } else {
+                return Err(TagsParamError::UnsupportedScope(other.to_string()));
+            }
+        }
     };
     Ok(TagsParams { scope })
 }
 
-/// Splits the `{tag}` path parameter into `(scope, key)` (docs/api.md
-/// §4.3): a `resource.`/`span.` prefix scopes the lookup; a leading `.`
-/// or a bare key is unscoped (both scopes). The remainder after the
-/// prefix is the verbatim attribute key (`resource.service.name` →
-/// scope `resource`, key `service.name`); an empty remainder is a `400`.
+/// What a `{tag}` path segment resolves to on the native and v2 values
+/// routes (issue #475).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TagLookup {
+    /// An intrinsic spelling — answered from the static vocabulary, with
+    /// no catalog read.
+    Intrinsic(pulsus_traceql::Intrinsic),
+    /// An attribute key, optionally confined to one attribute scope.
+    Attribute { scope: Option<String>, key: String },
+}
+
+/// Resolves the `{tag}` path parameter of the native and v2 values
+/// routes (issue #475).
+///
+/// Resolution order, and it is load-bearing: a `<s>.` prefix for any `s`
+/// in [`ATTR_SCOPES`], or a leading `.`, makes it an ATTRIBUTE lookup —
+/// so `span.name` is the attribute keyed `name` while `span:name` is the
+/// intrinsic. Otherwise an intrinsic spelling (bare or colon-scoped,
+/// resolved by `Intrinsic::from_discovery_spelling`), which is answered
+/// without reading the store. Otherwise a bare attribute key, read
+/// across the five attribute scopes. An empty key is a `400` in every
+/// branch.
+pub(crate) fn parse_tag_lookup(raw_tag: &str) -> Result<TagLookup, TagPathError> {
+    for scope in ATTR_SCOPES {
+        if let Some(rest) = raw_tag.strip_prefix(scope)
+            && let Some(key) = rest.strip_prefix('.')
+        {
+            return Ok(TagLookup::Attribute {
+                scope: Some(scope.to_string()),
+                key: non_empty_key(key)?,
+            });
+        }
+    }
+    if let Some(key) = raw_tag.strip_prefix('.') {
+        return Ok(TagLookup::Attribute {
+            scope: None,
+            key: non_empty_key(key)?,
+        });
+    }
+    if let Some(intrinsic) = pulsus_traceql::Intrinsic::from_discovery_spelling(raw_tag) {
+        return Ok(TagLookup::Intrinsic(intrinsic));
+    }
+    Ok(TagLookup::Attribute {
+        scope: None,
+        key: non_empty_key(raw_tag)?,
+    })
+}
+
+fn non_empty_key(key: &str) -> Result<String, TagPathError> {
+    if key.is_empty() {
+        return Err(TagPathError::EmptyKey);
+    }
+    Ok(key.to_string())
+}
+
+/// Splits the `{tag}` path parameter into `(scope, key)` for the v1 FLAT
+/// alias only (docs/api.md §8.1): a `resource.`/`span.` prefix scopes the
+/// lookup; a leading `.` or a bare key is unscoped, which since issue
+/// #475 means the five attribute scopes of `ATTR_SCOPES` — never the
+/// writer-reserved intrinsic ones. The remainder after the prefix is the
+/// verbatim attribute key (`resource.service.name` → scope `resource`,
+/// key `service.name`); an empty remainder is a `400`.
+///
+/// Deliberately NOT intrinsic-aware: the v1 flat route keeps the
+/// attribute-only reading, matching the reference, which answers the
+/// same lookup differently on its v1 and v2 routes (ledger row
+/// `traceql-v1-tag-values-statics-unimplemented`). The native and v2
+/// routes use [`parse_tag_lookup`].
 pub(crate) fn parse_tag_path(raw_tag: &str) -> Result<(Option<String>, String), TagPathError> {
     let (scope, key) = if let Some(key) = raw_tag.strip_prefix("resource.") {
         (Some("resource".to_string()), key)
@@ -555,6 +657,8 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeSet;
 
     #[test]
     fn a_32_char_lowercase_hex_id_passes_through_unchanged() {
@@ -1347,26 +1451,67 @@ mod tests {
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
     }
 
-    // -- tags params (issue #58) -------------------------------------------
+    // -- tags params (issue #58, widened by #475) --------------------------
 
     #[test]
-    fn tags_scope_resource_and_span_parse() {
-        assert_eq!(
-            parse_tags_params("scope=resource")
-                .unwrap()
-                .scope
-                .as_deref(),
-            Some("resource")
-        );
-        assert_eq!(
-            parse_tags_params("scope=span").unwrap().scope.as_deref(),
-            Some("span")
-        );
+    fn every_attribute_scope_parses_to_its_own_keyword() {
+        // Derived from the constant, so a scope added to `ATTR_SCOPES`
+        // without an accept arm fails here rather than 400-ing at
+        // runtime. `assert_eq` on the resolved keyword, not on
+        // membership: two arms SWAPPED would keep the accepted set the
+        // same and this still fails.
+        for scope in ATTR_SCOPES {
+            assert_eq!(
+                parse_tags_params(&format!("scope={scope}")).unwrap().scope,
+                TagScope::Attribute(scope),
+                "scope={scope}"
+            );
+        }
     }
 
     #[test]
-    fn tags_absent_scope_means_both_scopes() {
-        assert_eq!(parse_tags_params("").unwrap().scope, None);
+    fn absent_none_and_empty_scope_all_mean_every_scope() {
+        for raw in ["", "scope=none", "scope="] {
+            assert_eq!(
+                parse_tags_params(raw).unwrap().scope,
+                TagScope::All,
+                "{raw} must select every scope"
+            );
+        }
+    }
+
+    #[test]
+    fn the_intrinsic_and_empty_scopes_parse_to_their_own_variants() {
+        assert_eq!(
+            parse_tags_params("scope=intrinsic").unwrap().scope,
+            TagScope::Intrinsic
+        );
+        for scope in EMPTY_SCOPES {
+            assert_eq!(
+                parse_tags_params(&format!("scope={scope}")).unwrap().scope,
+                TagScope::NoTags,
+                "scope={scope}"
+            );
+        }
+    }
+
+    /// A keyword that carries no tags must never reach the SQL `IN`
+    /// list: if `trace` were appended to `ATTR_SCOPES` instead, every
+    /// response body would still be right and a catalog read would be
+    /// issued.
+    #[test]
+    fn the_empty_scopes_are_disjoint_from_every_catalog_scope() {
+        for scope in EMPTY_SCOPES {
+            assert!(!ATTR_SCOPES.contains(&scope), "{scope} is a catalog scope");
+            assert!(
+                !pulsus_read::traces::tags_sql::RESERVED_INTRINSIC_SCOPES.contains(&scope),
+                "{scope} is a reserved scope"
+            );
+            assert!(
+                !["intrinsic", "none", ""].contains(&scope),
+                "{scope} collides with a reserved keyword"
+            );
+        }
     }
 
     #[test]
@@ -1374,17 +1519,138 @@ mod tests {
         // The catalog is time-less: the bounds parse away without effect
         // (docs/api.md §4.3).
         let p = parse_tags_params("scope=span&start=100&end=200").unwrap();
-        assert_eq!(p.scope.as_deref(), Some("span"));
+        assert_eq!(p.scope, TagScope::Attribute("span"));
     }
 
     #[test]
     fn tags_unknown_scope_is_rejected_never_widened() {
-        for raw in ["scope=bogus", "scope=intrinsic", "scope=none", "scope="] {
+        // Case-sensitive and closed: accepting `trace` and `intrinsic`
+        // makes their near-misses newly interesting, so they are checked
+        // rather than assumed.
+        for raw in [
+            "scope=bogus",
+            "scope=Intrinsic",
+            "scope=TRACE",
+            "scope=trace ",
+            "scope=Resource",
+            "scope=event:intrinsic",
+        ] {
             assert!(
                 matches!(
                     parse_tags_params(raw),
                     Err(TagsParamError::UnsupportedScope(_))
                 ),
+                "{raw} must be rejected"
+            );
+        }
+    }
+
+    /// The `400` body lists exactly the keywords the parser accepts.
+    /// Relational, not a second copy of the literal: the tokens are
+    /// extracted from the RENDERED message and compared with the
+    /// constants, so widening `ATTR_SCOPES` without touching the message
+    /// is a compile-green test failure.
+    #[test]
+    fn the_unsupported_scope_message_lists_exactly_the_accepted_keywords() {
+        let rendered = TagsParamError::UnsupportedScope("bogus".to_string()).to_string();
+        let (subject, tail) = rendered
+            .split_once("\": expected ")
+            .expect("the message names the offending value, then the accepted set");
+        assert_eq!(subject, "unsupported scope \"bogus");
+        let listed: BTreeSet<&str> = tail
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let expected: BTreeSet<&str> = ATTR_SCOPES
+            .iter()
+            .copied()
+            .chain(EMPTY_SCOPES)
+            .chain(["intrinsic", "none"])
+            .collect();
+        assert_eq!(listed, expected, "message: {rendered}");
+    }
+
+    // -- the `{tag}` lookup (issue #475) ------------------------------------
+
+    #[test]
+    fn a_scope_prefixed_tag_is_an_attribute_lookup_even_when_the_key_is_an_intrinsic() {
+        for scope in ATTR_SCOPES {
+            assert_eq!(
+                parse_tag_lookup(&format!("{scope}.name")).unwrap(),
+                TagLookup::Attribute {
+                    scope: Some(scope.to_string()),
+                    key: "name".to_string(),
+                },
+                "{scope}.name"
+            );
+        }
+        assert_eq!(
+            parse_tag_lookup(".status").unwrap(),
+            TagLookup::Attribute {
+                scope: None,
+                key: "status".to_string(),
+            }
+        );
+    }
+
+    /// One character apart, two different resolvers, two different
+    /// answers — the confusion this issue exists to remove.
+    #[test]
+    fn the_dot_and_colon_forms_of_one_name_resolve_differently() {
+        assert_eq!(
+            parse_tag_lookup("link.spanID").unwrap(),
+            TagLookup::Attribute {
+                scope: Some("link".to_string()),
+                key: "spanID".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_tag_lookup("link:spanID").unwrap(),
+            TagLookup::Intrinsic(pulsus_traceql::Intrinsic::LinkSpanId)
+        );
+    }
+
+    #[test]
+    fn every_served_intrinsic_spelling_resolves_to_an_intrinsic_lookup() {
+        for intrinsic in pulsus_traceql::Intrinsic::ALL {
+            for spelling in intrinsic.discovery_spellings() {
+                assert_eq!(
+                    parse_tag_lookup(spelling).unwrap(),
+                    TagLookup::Intrinsic(intrinsic),
+                    "{spelling}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_non_intrinsic_key_is_an_unscoped_attribute_lookup() {
+        // `spanID` is a reserved intrinsic KEY but not an intrinsic
+        // SPELLING, so it stays an attribute lookup — and the SQL's
+        // `scope IN` list is what keeps the reserved rows out of it.
+        assert_eq!(
+            parse_tag_lookup("spanID").unwrap(),
+            TagLookup::Attribute {
+                scope: None,
+                key: "spanID".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_tag_lookup("service.name").unwrap(),
+            TagLookup::Attribute {
+                scope: None,
+                key: "service.name".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_key_is_rejected_in_every_branch() {
+        for raw in ["", ".", "resource.", "span.", "event."] {
+            assert!(
+                matches!(parse_tag_lookup(raw), Err(TagPathError::EmptyKey)),
                 "{raw} must be rejected"
             );
         }

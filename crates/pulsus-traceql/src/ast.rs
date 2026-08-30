@@ -520,6 +520,120 @@ pub enum Intrinsic {
 }
 
 impl Intrinsic {
+    /// Every variant, declaration order. Hand-maintained and NOT
+    /// compiler-gated: the exhaustive matches below force a decision when
+    /// a variant is added, but nothing forces it into this array (issue
+    /// #475, stated as a limit rather than claimed closed).
+    pub const ALL: [Intrinsic; 21] = [
+        Self::Name,
+        Self::Duration,
+        Self::Status,
+        Self::Kind,
+        Self::NestedSetParent,
+        Self::NestedSetLeft,
+        Self::NestedSetRight,
+        Self::StatusMessage,
+        Self::ChildCount,
+        Self::SpanId,
+        Self::ParentId,
+        Self::TraceId,
+        Self::TraceDuration,
+        Self::RootName,
+        Self::RootServiceName,
+        Self::InstrumentationName,
+        Self::InstrumentationVersion,
+        Self::EventName,
+        Self::EventTimeSinceStart,
+        Self::LinkSpanId,
+        Self::LinkTraceId,
+    ];
+
+    /// The tag-discovery spellings this intrinsic is offered under, or an
+    /// EMPTY slice when it is deliberately not offered (issue #475).
+    ///
+    /// **No `_` arm**: a new variant fails to compile until it is given
+    /// spellings or an explicit empty slice, so a variant can never go
+    /// silently unserved. Every string here is one of the 29 spellings
+    /// [`Intrinsic::from_ident`] and [`Intrinsic::from_scoped`] accept;
+    /// `from_discovery_spelling` round-trips each back to `self`.
+    pub fn discovery_spellings(self) -> &'static [&'static str] {
+        match self {
+            Self::Name => &["name", "span:name"],
+            Self::Duration => &["duration", "span:duration"],
+            Self::Status => &["status", "span:status"],
+            Self::Kind => &["kind", "span:kind"],
+            // The nested-set structural intrinsics (issue #181) and
+            // `span:childCount` are query-time span properties, not
+            // discoverable tags: offered nowhere, so an explicit empty
+            // slice rather than an omission.
+            Self::NestedSetParent => &[],
+            Self::NestedSetLeft => &[],
+            Self::NestedSetRight => &[],
+            Self::StatusMessage => &["statusMessage", "span:statusMessage"],
+            Self::ChildCount => &[],
+            Self::SpanId => &["span:id"],
+            Self::ParentId => &["span:parentID"],
+            Self::TraceId => &["trace:id"],
+            Self::TraceDuration => &["traceDuration", "trace:duration"],
+            Self::RootName => &["rootName", "trace:rootName"],
+            Self::RootServiceName => &["rootServiceName", "trace:rootService"],
+            Self::InstrumentationName => &["instrumentation:name"],
+            Self::InstrumentationVersion => &["instrumentation:version"],
+            Self::EventName => &["event:name"],
+            Self::EventTimeSinceStart => &["event:timeSinceStart"],
+            Self::LinkSpanId => &["link:spanID"],
+            Self::LinkTraceId => &["link:traceID"],
+        }
+    }
+
+    /// The closed value set tag discovery serves for this intrinsic, or
+    /// `None` when the values are not a closed set (issue #475). `None`
+    /// is served as an EMPTY list: an intrinsic value lookup NEVER reads
+    /// the store, so an open-valued intrinsic answers `[]` rather than
+    /// falling through to a catalog read that would answer with attribute
+    /// rows of the same name.
+    ///
+    /// **No `_` arm**, for the same reason as
+    /// [`Intrinsic::discovery_spellings`].
+    pub fn discovery_values(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Status => Some(&INTRINSIC_STATUS_VALUES),
+            Self::Kind => Some(&INTRINSIC_KIND_VALUES),
+            Self::Name => None,
+            Self::Duration => None,
+            Self::NestedSetParent => None,
+            Self::NestedSetLeft => None,
+            Self::NestedSetRight => None,
+            Self::StatusMessage => None,
+            Self::ChildCount => None,
+            Self::SpanId => None,
+            Self::ParentId => None,
+            Self::TraceId => None,
+            Self::TraceDuration => None,
+            Self::RootName => None,
+            Self::RootServiceName => None,
+            Self::InstrumentationName => None,
+            Self::InstrumentationVersion => None,
+            Self::EventName => None,
+            Self::EventTimeSinceStart => None,
+            Self::LinkSpanId => None,
+            Self::LinkTraceId => None,
+        }
+    }
+
+    /// Resolves any accepted intrinsic spelling — bare
+    /// ([`Intrinsic::from_ident`]) or colon-scoped
+    /// ([`Intrinsic::from_scoped`]) — for tag discovery (issue #475). A
+    /// spelling containing `:` splits on the FIRST colon; anything else
+    /// goes to `from_ident`. Returns `None` for a name that is not an
+    /// intrinsic spelling, which is what makes it an attribute lookup.
+    pub fn from_discovery_spelling(tag: &str) -> Option<Self> {
+        match tag.split_once(':') {
+            Some((scope, ident)) => Self::from_scoped(scope, ident),
+            None => Self::from_ident(tag),
+        }
+    }
+
     /// Resolves a bare intrinsic keyword (`name`, `duration`, the legacy
     /// trace-level spellings `statusMessage`/`traceDuration`/`rootName`/
     /// `rootServiceName`, …). Colon-scoped spellings resolve via
@@ -711,6 +825,10 @@ pub enum StatusValue {
 }
 
 impl StatusValue {
+    /// Every member, declaration order — the order tag discovery serves
+    /// them in (issue #475). Kept immediately beside the enum.
+    pub const ALL: [StatusValue; 3] = [Self::Ok, Self::Error, Self::Unset];
+
     pub(crate) fn from_ident(name: &str) -> Option<Self> {
         match name {
             "ok" => Some(Self::Ok),
@@ -720,7 +838,9 @@ impl StatusValue {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    /// `const` so [`INTRINSIC_STATUS_VALUES`] is COMPUTED from
+    /// [`StatusValue::ALL`] rather than transcribed (issue #475).
+    pub const fn as_str(self) -> &'static str {
         match self {
             StatusValue::Ok => "ok",
             StatusValue::Error => "error",
@@ -766,6 +886,17 @@ pub enum SpanKindValue {
 }
 
 impl SpanKindValue {
+    /// Every member, declaration order — the order tag discovery serves
+    /// them in (issue #475), `Unspecified` first (issue #335).
+    pub const ALL: [SpanKindValue; 6] = [
+        Self::Unspecified,
+        Self::Internal,
+        Self::Server,
+        Self::Client,
+        Self::Producer,
+        Self::Consumer,
+    ];
+
     pub(crate) fn from_ident(name: &str) -> Option<Self> {
         match name {
             "unspecified" => Some(Self::Unspecified),
@@ -778,7 +909,9 @@ impl SpanKindValue {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    /// `const` so [`INTRINSIC_KIND_VALUES`] is COMPUTED from
+    /// [`SpanKindValue::ALL`] rather than transcribed (issue #475).
+    pub const fn as_str(self) -> &'static str {
         match self {
             SpanKindValue::Unspecified => "unspecified",
             SpanKindValue::Internal => "internal",
@@ -795,6 +928,32 @@ impl fmt::Display for SpanKindValue {
         write!(f, "{}", self.as_str())
     }
 }
+
+/// The closed value set `status` is served under by tag discovery
+/// (issue #475), COMPUTED from [`StatusValue::ALL`] in a `const` block —
+/// never transcribed, so a member added to the enum is served without
+/// anyone editing a second list.
+pub const INTRINSIC_STATUS_VALUES: [&str; StatusValue::ALL.len()] = {
+    let mut out = [""; StatusValue::ALL.len()];
+    let mut i = 0;
+    while i < StatusValue::ALL.len() {
+        out[i] = StatusValue::ALL[i].as_str();
+        i += 1;
+    }
+    out
+};
+
+/// The closed value set `kind` is served under by tag discovery
+/// (issue #475), COMPUTED from [`SpanKindValue::ALL`] the same way.
+pub const INTRINSIC_KIND_VALUES: [&str; SpanKindValue::ALL.len()] = {
+    let mut out = [""; SpanKindValue::ALL.len()];
+    let mut i = 0;
+    while i < SpanKindValue::ALL.len() {
+        out[i] = SpanKindValue::ALL[i].as_str();
+        i += 1;
+    }
+    out
+};
 
 /// A pipeline stage after `|`. M4 implements the search aggregate
 /// filters, `select`, and (issue #59, T7) the metrics functions.
@@ -1563,5 +1722,112 @@ mod tests {
             hints: vec![],
         };
         assert_eq!(query.to_string(), "{ (.a = 1 && (.b = 1 || .c = 1)) }");
+    }
+
+    /// Issue #475 AC4 (vocabulary half): every served spelling resolves
+    /// back to the SAME variant that offers it.
+    ///
+    /// The assertion is `resolved == variant`, not `spellings.contains`:
+    /// a set-membership check cannot see two variants' spellings SWAPPED,
+    /// and a swap is the failure this mapping actually risks. With
+    /// `Name => ["kind", ...]` and `Kind => ["name", ...]` the served set
+    /// is unchanged and this test still fails, because
+    /// `from_discovery_spelling("kind")` resolves to `Kind`.
+    #[test]
+    fn every_served_spelling_resolves_back_to_its_own_variant() {
+        let mut served = 0usize;
+        for variant in Intrinsic::ALL {
+            for spelling in variant.discovery_spellings() {
+                served += 1;
+                assert_eq!(
+                    Intrinsic::from_discovery_spelling(spelling),
+                    Some(variant),
+                    "{spelling} is served under {variant:?} but resolves elsewhere"
+                );
+            }
+        }
+        assert_eq!(served, 25, "the served spelling count");
+    }
+
+    /// Issue #475 AC4: the four intrinsics deliberately not offered.
+    #[test]
+    fn the_unserved_intrinsics_carry_an_explicit_empty_slice() {
+        for variant in [
+            Intrinsic::ChildCount,
+            Intrinsic::NestedSetParent,
+            Intrinsic::NestedSetLeft,
+            Intrinsic::NestedSetRight,
+        ] {
+            assert!(
+                variant.discovery_spellings().is_empty(),
+                "{variant:?} must not be offered"
+            );
+        }
+    }
+
+    /// Issue #475 AC1/AC2 (vocabulary half): the two closed value sets,
+    /// as literals, in order. Literals typed here rather than derived, so
+    /// a `Status`/`Kind` SWAP in `discovery_values` fails even though the
+    /// union of the two lists is unchanged.
+    #[test]
+    fn the_two_closed_value_sets_are_served_under_the_right_intrinsic() {
+        assert_eq!(
+            Intrinsic::Status.discovery_values(),
+            Some(&["ok", "error", "unset"][..])
+        );
+        assert_eq!(
+            Intrinsic::Kind.discovery_values(),
+            Some(
+                &[
+                    "unspecified",
+                    "internal",
+                    "server",
+                    "client",
+                    "producer",
+                    "consumer"
+                ][..]
+            )
+        );
+        for variant in Intrinsic::ALL {
+            if !matches!(variant, Intrinsic::Status | Intrinsic::Kind) {
+                assert_eq!(
+                    variant.discovery_values(),
+                    None,
+                    "{variant:?} has no closed value set"
+                );
+            }
+        }
+    }
+
+    /// Issue #475 AC5: neither discovery match may carry a wildcard arm.
+    /// A `_ => &[]` would let a new variant go silently unserved, which
+    /// is the completeness property these two matches exist to give.
+    ///
+    /// The header must be found EXACTLY once, so a mistyped header makes
+    /// the scan fail loudly instead of passing vacuously.
+    #[test]
+    fn neither_discovery_match_has_a_wildcard_arm() {
+        let src = include_str!("ast.rs");
+        // The header is ASSEMBLED, never written whole: a literal copy of
+        // it in this test would itself match the scan and make the
+        // exactly-once check fail for the wrong reason.
+        for (name, ret) in [
+            ("discovery_spellings", "&'static [&'static str]"),
+            ("discovery_values", "Option<&'static [&'static str]>"),
+        ] {
+            let header = format!("pub fn {name}(self) -> {ret} {{");
+            let header = header.as_str();
+            assert_eq!(
+                src.matches(header).count(),
+                1,
+                "expected exactly one `{header}`"
+            );
+            let body = &src[src.find(header).expect("header") + header.len()..];
+            let end = body.find("\n    }\n").expect("end of fn body");
+            assert!(
+                !body[..end].contains("_ =>"),
+                "`{header}` must have no wildcard arm"
+            );
+        }
     }
 }
