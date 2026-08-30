@@ -87,85 +87,9 @@ use std::path::{Path, PathBuf};
 
 use manifest::{DocRef, Gate, Method, RouteStatus, Surface, route_manifest};
 use source_scan::{
-    line_of, preprocess_views, rs_files_under, skip_literal_or_comment, workspace_root,
+    blank_spans, cfg_test_mod_spans, line_of, preprocess_views, rs_files_under,
+    skip_literal_or_comment, workspace_root,
 };
-
-/// Every `#[cfg(test)]\nmod <ident> { ... }` block's inclusive byte span
-/// in `stripped` (the comment-blanked, literals-intact view — comments
-/// are already gone, so a `#[cfg(test)]` inside a doc comment cannot
-/// false-match; the brace-depth scan skips literals via
-/// [`skip_literal_or_comment`], since this codebase's own test modules
-/// build JSON fixture strings with plenty of unbalanced `{`/`}` inside
-/// string literals). The caller blanks these spans in *both* views, so
-/// test-only code is invisible to route extraction and policy passes
-/// alike (plan v2 finding 1: "the only `.route(` calls in
-/// `pulsus-write/src/ingest/http.rs` today are test-only routers" — this
-/// is what excludes them).
-fn cfg_test_mod_spans(stripped: &str) -> Vec<(usize, usize)> {
-    let marker = "#[cfg(test)]";
-    let bytes = stripped.as_bytes();
-    let mut spans = Vec::new();
-    let mut search_from = 0usize;
-    while let Some(rel) = stripped[search_from..].find(marker) {
-        let attr_start = search_from + rel;
-        let Some(brace_rel) = stripped[attr_start..].find('{') else {
-            break;
-        };
-        let open = attr_start + brace_rel;
-        let between = &stripped[attr_start + marker.len()..open];
-        if !between.trim_start().starts_with("mod ") {
-            // Not a `#[cfg(test)] mod ... {` shape (e.g. `#[cfg(test)]` on
-            // a single item) — this codebase does not use that pattern
-            // today; skip past this attribute rather than mis-stripping.
-            search_from = attr_start + marker.len();
-            continue;
-        }
-        let mut depth = 0i32;
-        let mut close = None;
-        let mut i = open;
-        while i < bytes.len() {
-            if let Some(next) = skip_literal_or_comment(bytes, i) {
-                i = next;
-                continue;
-            }
-            match bytes[i] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        let close = close.unwrap_or_else(|| {
-            panic!(
-                "unterminated #[cfg(test)] mod block starting at line {}",
-                line_of(stripped, attr_start)
-            )
-        });
-        spans.push((attr_start, close));
-        search_from = close + 1;
-    }
-    spans
-}
-
-/// Blanks each inclusive `(start, end)` span in `text` (non-newline bytes
-/// to spaces), preserving byte offsets.
-fn blank_spans(text: String, spans: &[(usize, usize)]) -> String {
-    let mut bytes = text.into_bytes();
-    for &(start, end) in spans {
-        for b in &mut bytes[start..=end] {
-            if *b != b'\n' {
-                *b = b' ';
-            }
-        }
-    }
-    String::from_utf8(bytes).expect("blanking preserves UTF-8 validity")
-}
 
 /// Every route-mounting method axum 0.7/0.8's `Router` exposes (verified
 /// against the axum docs: `route`, `route_service`, `nest`, `nest_service`,

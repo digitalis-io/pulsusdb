@@ -2205,4 +2205,61 @@ mod tests {
         let err = parse(&req, 0).expect_err("over-depth span attribute is rejected whole-request");
         assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
+
+    /// Issue #475: every scope constant this module declares is
+    /// REACHABLE from parse output.
+    ///
+    /// What this proves that `trace_scope_vocabulary.rs` cannot: that
+    /// each declared constant is actually emitted, not merely declared.
+    /// What that gate proves that this cannot: that the string VALUES
+    /// match the reader's. Neither substitutes for the other, and this
+    /// one is deliberately written against the constants rather than a
+    /// second literal list, so it is a reachability check and not a
+    /// spelling check.
+    #[test]
+    fn every_declared_scope_constant_is_emitted_by_parse() {
+        let mut span = valid_span();
+        span.attributes = vec![kv("status", Value::StringValue("degraded".to_string()))];
+        span.events = vec![Event {
+            time_unix_nano: 1_700_000_000_005_000_000,
+            name: "exception".to_string(),
+            attributes: vec![kv("kind", Value::StringValue("retry".to_string()))],
+            dropped_attributes_count: 0,
+        }];
+        span.links = vec![Link {
+            trace_id: vec![7; 16],
+            span_id: vec![9; 8],
+            trace_state: String::new(),
+            attributes: vec![kv(
+                "spanID",
+                Value::StringValue("from-attribute".to_string()),
+            )],
+            dropped_attributes_count: 0,
+            flags: 0,
+        }];
+        let scope = InstrumentationScope {
+            name: "checkout-lib".to_string(),
+            version: "1.0.0".to_string(),
+            attributes: vec![kv("sdk", Value::StringValue("rust".to_string()))],
+            dropped_attributes_count: 0,
+        };
+        let req = request_with(Some(checkout_resource()), Some(scope), vec![span]);
+
+        let parsed = parse(&req, 0).expect("the corpus parses");
+        let mut emitted: Vec<&str> = parsed.attrs.iter().map(|a| a.scope.as_str()).collect();
+        emitted.sort_unstable();
+        emitted.dedup();
+
+        let mut declared = [
+            SCOPE_EVENT,
+            SCOPE_EVENT_INTRINSIC,
+            SCOPE_INSTRUMENTATION,
+            SCOPE_LINK,
+            SCOPE_LINK_INTRINSIC,
+            SCOPE_RESOURCE,
+            SCOPE_SPAN,
+        ];
+        declared.sort_unstable();
+        assert_eq!(emitted, declared, "every declared scope must be reachable");
+    }
 }
