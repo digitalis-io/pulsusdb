@@ -30,7 +30,11 @@
 //!    pinned-set entry (set equality does not see the duplicate), hiding a
 //!    real mode-gating change. This check pins the coarser, load-bearing
 //!    unit instead — the **whole body** of every function that contains a
-//!    composition token or a route-mounting-helper call
+//!    composition token or a route-mounting-helper call, plus every
+//!    `(file, function)` pair named in
+//!    `support::manifest::EXPLICITLY_PINNED_FUNCTIONS` (issue #474: a
+//!    function pinned for what its body must not silently become, where
+//!    the wire it produces cannot tell the two shapes apart)
 //!    (`support::manifest::pinned_function_bodies()`, `(file, fn,
 //!    whitespace-normalized full body text)`) — and requires the *live
 //!    source* to produce exactly that same set, both directions. Occurrence
@@ -904,8 +908,10 @@ fn body_contains_call(body: &str, name: &str) -> bool {
 }
 
 /// Every `(file, fn_name, normalized_whole_body_text)` triple for a
-/// function in `src` whose body contains a [`COMPOSITION_TOKENS`] token
-/// or a call to one of [`manifest::ROUTE_MOUNTING_HELPERS`] — round-5
+/// function in `src` whose body contains a [`COMPOSITION_TOKENS`] token,
+/// or a call to one of [`manifest::ROUTE_MOUNTING_HELPERS`], or whose
+/// `(file, name)` pair is listed in
+/// [`manifest::EXPLICITLY_PINNED_FUNCTIONS`] — round-5
 /// finding: pinning the *whole function body* (not a per-call-site
 /// sub-expression, round 4's grain) makes occurrence count, match-arm
 /// placement, and every other control-flow detail part of the pinned
@@ -929,7 +935,14 @@ fn extract_pinned_function_bodies(
         let has_helper_call = manifest::ROUTE_MOUNTING_HELPERS
             .iter()
             .any(|h| body_contains_call(blanked_body, h));
-        if has_composition || has_helper_call {
+        // The third selector (issue #474): a `(file, function)` pair named
+        // outright in `manifest::EXPLICITLY_PINNED_FUNCTIONS`. The file
+        // half is load-bearing — `encode_protobuf` exists in two files
+        // under `traces_api/` and only the v2 envelope encoder is pinned.
+        let is_explicit = manifest::EXPLICITLY_PINNED_FUNCTIONS
+            .iter()
+            .any(|(f, n)| *f == file_rel && *n == span.name);
+        if has_composition || has_helper_call || is_explicit {
             out.insert((
                 file_rel.to_string(),
                 span.name.clone(),
@@ -1081,14 +1094,28 @@ fn every_pinned_function_body_matches_the_snapshot_exactly() {
         source_bodies.extend(extract_pinned_function_bodies(&stripped, &blanked, &rel));
     }
 
+    // Fail-closed for the explicit list (issue #474): a renamed, moved or
+    // deleted target would otherwise show up only as a set difference,
+    // which reads like an ordinary body edit. Named here instead.
+    for (file, function) in manifest::EXPLICITLY_PINNED_FUNCTIONS {
+        assert!(
+            source_bodies
+                .iter()
+                .any(|(f, n, _)| f == file && n == function),
+            "explicitly pinned function {file}::{function} was not found in source — it was \
+             renamed, moved, or deleted; update EXPLICITLY_PINNED_FUNCTIONS and re-derive its \
+             PinnedFunctionBody entry"
+        );
+    }
+
     let snapshot = manifest_pinned_function_bodies();
     let missing_from_snapshot: Vec<_> = source_bodies.difference(&snapshot).collect();
     let missing_from_source: Vec<_> = snapshot.difference(&source_bodies).collect();
 
     assert!(
         missing_from_snapshot.is_empty() && missing_from_source.is_empty(),
-        "the pinned-function-body snapshot has drifted from the router-composition-bearing \
-         functions actually in source — re-derive the snapshot \
+        "the pinned-function-body snapshot has drifted from the selected functions actually in \
+         source — re-derive the snapshot \
          (`support::manifest::pinned_function_bodies()`) AND reconcile the route manifest (a \
          changed function body can mean a route moved, was added, or was removed — even a \
          textually-identical second composition call under a different match arm changes the \
@@ -1137,6 +1164,10 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             Surface::TracesFetch | Surface::TracesSearch | Surface::TracesMetrics => {
                 matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader)
             }
+            // Issue #474: the v2 fetch envelope has no native twin — it
+            // exists only as a compat alias, so `CompatAndReader` is the
+            // only gate it may carry.
+            Surface::TracesFetchV2 => spec.gate == Gate::CompatAndReader,
             // Only the native tag-discovery routes use TracesTags — the
             // aliases are reshaping surfaces, compat-gated by definition.
             Surface::TracesTags => spec.gate == Gate::ReaderMode,
@@ -1532,6 +1563,63 @@ mod pinned_function_body_tests {
             "}\n",
         );
         assert_eq!(extract(one_line), extract(reformatted));
+    }
+
+    /// Issue #474 AC-8e: the forbidden shape for the v2 fetch envelope's
+    /// protobuf encoder — an `Option`-typed envelope populated
+    /// `Some(<default>)` — emits the same 4 bytes empty and the same 96
+    /// bytes populated as the encoder that ships, so no wire witness can
+    /// separate the two. This test proves the mechanism that does: the
+    /// explicit selector extracts that shape's body from a synthetic
+    /// source labelled with the real file path, and the extracted text is
+    /// NOT the pinned one, so
+    /// `every_pinned_function_body_matches_the_snapshot_exactly` reports a
+    /// drift for it.
+    ///
+    /// It goes red two ways: remove the explicit selector and the
+    /// extracted set is empty (the "exactly one triple" half fails); edit
+    /// the pinned snapshot entry to this shape's text and the inequality
+    /// half fails. It proves nothing about the real `fetch_v2.rs` — that
+    /// is `every_pinned_function_body_matches_the_snapshot_exactly`'s job.
+    #[test]
+    fn the_optional_envelope_form_does_not_match_the_pinned_v2_encoder_body() {
+        let src = concat!(
+            "pub(super) fn encode_protobuf(trace: &AssembledTrace) -> Vec<u8> {\n",
+            "    let envelope = TraceFetchEnvelope {\n",
+            "        trace: Some(trace.as_traces_data().clone()),\n",
+            "        metrics: Some(TraceFetchMetrics::default()),\n",
+            "    };\n",
+            "    envelope.encode_to_vec()\n",
+            "}\n",
+        );
+        let blanked = preprocess_views(src).1;
+        let extracted = extract_pinned_function_bodies(
+            src,
+            &blanked,
+            "crates/pulsus-server/src/traces_api/fetch_v2.rs",
+        );
+        let triples: Vec<_> = extracted
+            .iter()
+            .filter(|(_, name, _)| name == "encode_protobuf")
+            .collect();
+        assert_eq!(
+            triples.len(),
+            1,
+            "the explicit selector must extract exactly one triple"
+        );
+
+        let pinned = manifest::pinned_function_bodies()
+            .iter()
+            .find(|f| {
+                f.file == "crates/pulsus-server/src/traces_api/fetch_v2.rs"
+                    && f.function == "encode_protobuf"
+            })
+            .expect("the v2 envelope encoder must be pinned");
+        assert_ne!(
+            triples[0].2.as_str(),
+            pinned.body,
+            "the optional envelope form must differ from the pinned direct encoder body"
+        );
     }
 
     /// Round-5 finding 1: a non-literal `mount_log_query_routes(...)`

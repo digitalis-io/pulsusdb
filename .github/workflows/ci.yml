@@ -748,6 +748,19 @@ jobs:
           PULSUSDB_METRICS_FILTER_OTLP_URL: "http://localhost:4318"
         run: cargo test -p pulsus-read --test traces_metrics_filter_differential
 
+      # Issue #474: the byte-frozen capture of what the reference answers
+      # for a trace whose sender omitted `resource`, `scope` or `status`,
+      # and for the v2 fetch envelope. Replays the committed artifact
+      # against the SAME digest-pinned oracle, so the capture cannot go
+      # stale unnoticed. Pushes its own four-span fixture through the
+      # container's OTLP receiver; needs no ClickHouse. FAIL-CLOSED: both
+      # endpoint gates panic if this env block is dropped (the #320 class).
+      - name: Nullable-submessage wire capture (oracle leg)
+        env:
+          PULSUSDB_NULLABLE_WIRE_DIFF_URL: "http://localhost:13200"
+          PULSUSDB_NULLABLE_WIRE_OTLP_URL: "http://localhost:4318"
+        run: cargo test -p pulsus-server --test trace_nullable_wire_differential
+
       - name: Stop Tempo differential oracle
         if: always()
         run: docker rm -f pulsus-tempo-diff || true

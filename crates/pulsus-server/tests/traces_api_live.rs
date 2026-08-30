@@ -31,13 +31,22 @@
 //! (hermetic) enumerates every declaration under `crates/*/tests` and
 //! fails if two collide.
 
+#[path = "support/live_db.rs"]
+mod live_db;
+#[path = "support/wire_capture.rs"]
+mod wire_capture;
+
+use live_db::drop_db;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use prost::Message;
+use pulsus_clickhouse::{ChClient, QuerySettings, Row};
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -72,6 +81,26 @@ const TRACE_ENVELOPE_PORT: u16 = 31_209;
 /// `logs_api_live.rs` before it merged; `live_port_uniqueness.rs` is
 /// what caught the collision and named this replacement.
 const WIRE_DOMAIN_PORT: u16 = 31_214;
+/// The issue #474 absent-submessage wire suite's own spawn. `31_211` (the
+/// plan's first choice) was taken by `logs_api_live.rs` before this
+/// branched; `live_port_uniqueness.rs` is what settles it.
+const NULLABLE_WIRE_PORT: u16 = 31_215;
+
+/// Retention for the issue #474 spawn only. The fixture's timestamps are
+/// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
+/// delete-TTL `apply_ttl` installs is
+/// `min(s + retention_days * 86400, 4294967295)` (docs/schemas.md §4.1) —
+/// under the default 7 days that expiry is in the past, ClickHouse drops
+/// the part, and all four fetches answer `404` for a reason that has
+/// nothing to do with this issue. 3650 days puts it a decade out. Not a
+/// schema-identity input (`crates/pulsus-schema/src/render.rs` substitutes
+/// a sentinel for `{{retention_days}}` in the identity DDL), so a
+/// non-default value on this one throwaway database disturbs nothing.
+const FIXTURE_RETENTION_DAYS: u32 = 3650;
+
+/// The fixture's `startTimeUnixNano`, frozen — the same value every probe
+/// in `tests/fixtures/trace_nullable_wire/capture.json` carries.
+const FIXTURE_START_NS: u64 = 1_700_000_000_000_000_000;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,
@@ -429,7 +458,16 @@ impl Drop for ChildGuard {
 }
 
 fn spawn_ready(port: u16, db: &str) -> ChildGuard {
-    let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+    spawn_ready_with_env(port, db, &[])
+}
+
+/// [`spawn_ready`] plus extra environment variables for the one suite that
+/// needs them (issue #474's frozen fixture needs a retention that covers
+/// its 2023 timestamps). Same parameter shape as
+/// `traces_search_live.rs`'s own `spawn_ready`.
+fn spawn_ready_with_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
+    let command = command
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
         .env(
@@ -444,9 +482,11 @@ fn spawn_ready(port: u16, db: &str) -> ChildGuard {
         // Issue #61 (T9): mount the Tempo compat aliases — needed by the
         // alias byte-identity suite; a no-op for the native assertions
         // (router-build-time merging only, no per-request behavior).
-        .env("PULSUS_COMPAT_ENDPOINTS", "true")
-        .spawn()
-        .expect("spawn pulsusdb");
+        .env("PULSUS_COMPAT_ENDPOINTS", "true");
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let child = command.spawn().expect("spawn pulsusdb");
     let guard = ChildGuard(child);
 
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1944,4 +1984,241 @@ async fn the_trace_level_start_and_duration_are_the_trace_envelope_on_the_wire()
              span's width, body {json}"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #474: absent nullable submessages, and the v2 fetch envelope.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug)]
+struct SpanCountRow {
+    n: u64,
+}
+
+/// Wall-clock seconds, for the TTL arithmetic guard below.
+fn now_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after the epoch")
+        .as_secs()
+}
+
+/// Issue #474, the PulsusDB leg. Pushes the committed capture's exact
+/// `ExportTraceServiceRequest` bytes through the product ingest path, then
+/// asserts, over the wire:
+///
+/// * **Part 1** — each of the four probes' `GET /api/traces/{id}` protobuf
+///   body is byte-equal to what the pinned reference build answers for the
+///   same trace (the capture's own strings, replayed against the reference
+///   by `trace_nullable_wire_differential.rs`). T1/T2/T4 move because the
+///   fill materialises what the sender left absent; **T3 must not move** —
+///   it carries a non-default status, and an implementation that assigned
+///   the default instead of filling only `None` answers 117 bytes there
+///   instead of 125.
+/// * **Part 2** — `GET /api/v2/traces/{absent}` is `200` with exactly
+///   `0a 00 12 00` (protobuf) and exactly `{"trace":{},"metrics":{}}`
+///   (JSON), and a populated v2 fetch is field 1 byte-equal to the
+///   reference's field 1 followed by exactly `12 00`.
+/// * The v1 absent-trace `404 trace not found` is unchanged.
+///
+/// The push uses `request` directly rather than the `ingest` helper: that
+/// helper injects a fixed resource and scope, which would destroy the very
+/// absences this fixture exists to carry.
+#[tokio::test(flavor = "multi_thread")]
+async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+
+    // Hermetic arithmetic guard, before anything is spawned: the frozen
+    // fixture must sit comfortably inside the retention this spawn sets,
+    // or the rows are dropped by the delete-TTL and every assertion below
+    // fails for a reason unrelated to the fill.
+    let expiry_s = FIXTURE_START_NS / 1_000_000_000 + u64::from(FIXTURE_RETENTION_DAYS) * 86_400;
+    assert!(
+        expiry_s > now_s() + 365 * 86_400,
+        "the frozen fixture's TTL expiry ({expiry_s}) is less than a year away — raise \
+         FIXTURE_RETENTION_DAYS (the delete-TTL saturates at 4294967295, docs/schemas.md §4.1)"
+    );
+
+    let capture = wire_capture::load();
+    let db = pulsus_testkit::test_db("pulsus_traces_nullable_wire_it_live");
+    // A re-run against a server still holding the previous run's rows must
+    // not be able to make the count assertion pass or fail for the wrong
+    // reason.
+    drop_db(&db).await;
+    let _guard = spawn_ready_with_env(
+        NULLABLE_WIRE_PORT,
+        &db,
+        &[("PULSUS_RETENTION_DAYS", &FIXTURE_RETENTION_DAYS.to_string())],
+    );
+
+    let push_body = wire_capture::from_hex(&capture.push_body_hex);
+    let res = request(
+        NULLABLE_WIRE_PORT,
+        "POST",
+        "/v1/traces",
+        &[],
+        Some(("application/x-protobuf", &push_body)),
+    )
+    .expect("push must be reachable");
+    assert_eq!(
+        res.status,
+        200,
+        "sync push must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+
+    // The rows survived retention. A sync `200` means they are flushed and
+    // read-visible, so a count of 0 here is the delete-TTL, not a race.
+    let client = ChClient::new(live_db::conn_config(&db))
+        .await
+        .expect("connect to count stored spans");
+    let mut stored = 0u64;
+    {
+        let mut stream = client
+            .query_stream::<SpanCountRow>(
+                &format!("SELECT count() AS n FROM {db}.trace_spans"),
+                &QuerySettings::new(),
+            )
+            .await
+            .expect("count trace_spans");
+        while let Some(row) = stream.next().await {
+            stored = row.expect("decode count row").n;
+        }
+    }
+    assert_eq!(
+        stored, 4,
+        "the four fixture spans must be inside retention — a count of 0 here is the delete-TTL \
+         dropping the frozen 2023 fixture, not a defect in the fill (spawn sets \
+         PULSUS_RETENTION_DAYS={FIXTURE_RETENTION_DAYS})"
+    );
+
+    // -- Part 1: the four probes over the v1 fetch route -----------------
+    for probe in &capture.probes {
+        let ctx = format!("[#474] probe {} ({})", probe.name, probe.absent);
+        let path = format!("/api/traces/{}", probe.trace_id);
+        let res = get(
+            NULLABLE_WIRE_PORT,
+            &path,
+            &[("Accept", "application/protobuf")],
+            &ctx,
+        );
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: status (body {:?})",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_eq!(
+            res.content_type(),
+            Some("application/protobuf"),
+            "{ctx}: content-type"
+        );
+        assert_eq!(
+            wire_capture::to_hex(&res.body),
+            probe.v1_protobuf_hex,
+            "{ctx}: the protobuf body must be byte-equal to the pinned reference build's answer"
+        );
+        assert!(has_vary_accept(&res), "{ctx}: must Vary: accept");
+    }
+
+    // -- Part 2: the v2 envelope -----------------------------------------
+    let absent_path = format!("/api/v2/traces/{}", capture.absent_trace_id);
+
+    let ctx = "[#474] v2 absent protobuf";
+    let res = get(
+        NULLABLE_WIRE_PORT,
+        &absent_path,
+        &[("Accept", "application/protobuf")],
+        ctx,
+    );
+    assert_eq!(res.status, 200, "{ctx}: an absent trace is 200, never 404");
+    assert_eq!(
+        res.content_type(),
+        Some("application/protobuf"),
+        "{ctx}: content-type"
+    );
+    assert_eq!(
+        res.headers.get("content-length").map(String::as_str),
+        Some("4"),
+        "{ctx}: content-length"
+    );
+    assert_eq!(
+        wire_capture::to_hex(&res.body),
+        capture.v2_absent_protobuf_hex,
+        "{ctx}: the envelope must carry a length-zero field 1 AND a length-zero field 2"
+    );
+    assert!(has_vary_accept(&res), "{ctx}: must Vary: accept");
+
+    let ctx = "[#474] v2 absent JSON";
+    let res = get(
+        NULLABLE_WIRE_PORT,
+        &absent_path,
+        &[("Accept", "application/json")],
+        ctx,
+    );
+    assert_eq!(res.status, 200, "{ctx}: status");
+    assert_eq!(
+        res.content_type(),
+        Some("application/json"),
+        "{ctx}: content-type"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&res.body),
+        capture.v2_absent_json,
+        "{ctx}: the `trace` key must be present and empty, not skipped and not `resourceSpans: []`"
+    );
+    assert!(has_vary_accept(&res), "{ctx}: must Vary: accept");
+
+    // Populated: field 1 byte-equal to the reference's, then exactly the
+    // two constant bytes of our own always-empty metrics block. The
+    // reference's field 2 is never compared (its counter is not stable —
+    // ledger row `traces-v2-fetch-metrics-not-populated`).
+    let probe = capture.probe("T1");
+    let expected_field1 = wire_capture::from_hex(
+        probe
+            .v2_trace_field_hex
+            .as_deref()
+            .expect("T1 carries a v2 trace field in the capture"),
+    );
+    let ctx = "[#474] v2 populated";
+    let res = get(
+        NULLABLE_WIRE_PORT,
+        &format!("/api/v2/traces/{}", probe.trace_id),
+        &[("Accept", "application/protobuf")],
+        ctx,
+    );
+    assert_eq!(res.status, 200, "{ctx}: status");
+    let mut expected = vec![0x0a, 0x5c];
+    expected.extend_from_slice(&expected_field1);
+    expected.extend_from_slice(&[0x12, 0x00]);
+    assert_eq!(
+        wire_capture::to_hex(&res.body),
+        wire_capture::to_hex(&expected),
+        "{ctx}: field 1 must equal the reference's field 1 and the tail must be exactly `1200`"
+    );
+
+    // -- The v1 absent-trace 404 must not move ----------------------------
+    let ctx = "[#474] v1 absent 404 unchanged";
+    let res = get(
+        NULLABLE_WIRE_PORT,
+        &format!("/api/traces/{}", capture.absent_trace_id),
+        &[("Accept", "application/protobuf")],
+        ctx,
+    );
+    assert_eq!(res.status, 404, "{ctx}: status");
+    assert_eq!(
+        res.content_type(),
+        Some("text/plain; charset=utf-8"),
+        "{ctx}: content-type"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&res.body),
+        "trace not found",
+        "{ctx}: the v1 body is this surface's only live mounting oracle"
+    );
+
+    drop_db(&db).await;
 }

@@ -170,6 +170,22 @@ pub enum Surface {
     /// sibling-404 suffix trick would mutate the trailing `{traceId}` param
     /// into a 400, not an unrouted 404).
     TracesFetch,
+    /// `GET /api/v2/traces/{traceId}` (issue #474) — the same point read
+    /// as [`TracesFetch`], wrapped in the v2 envelope
+    /// (`traces_api/fetch_v2.rs`). The one behavioural difference is the
+    /// whole reason the route exists: an absent trace is `200` with a
+    /// present-but-empty trace, not `404`. Against this suite's empty
+    /// databases the "success" of a well-formed request is therefore a
+    /// `200` whose protobuf body is exactly `0a 00 12 00` and whose JSON
+    /// body is exactly `{"trace":{},"metrics":{}}` — that non-empty body
+    /// is the mounting oracle (an unmounted path returns axum's empty
+    /// `404`). Errors are the bare `text/plain` body of
+    /// [`PlainTextWriter::TempoFrontendResponse`], as on the v1 twin.
+    /// Asserted by the dedicated `assert_traces_fetch_v2_route` for the
+    /// same reason `TracesFetch` needs one: the generic matrix's
+    /// sibling-404 suffix trick mutates the trailing `{traceId}` param
+    /// into a 400, not an unrouted 404.
+    TracesFetchV2,
     /// `GET /api/traces/v1/search` (issue #57) — success is the
     /// documented docs/api.md §4.2 envelope
     /// (`{"traces":[...],"metrics":{"completedJobs","totalJobs"}}` —
@@ -2402,7 +2418,7 @@ static MANIFEST: &[RouteSpec] = &[
         cases: TRACES_GRAPH_CASES,
     },
     // -- Tempo compat aliases (CompatAndReader, issue #61) ----------------
-    // 13 routes, all GET, all mounted iff `PULSUS_COMPAT_ENDPOINTS=true`
+    // 14 routes, all GET, all mounted iff `PULSUS_COMPAT_ENDPOINTS=true`
     // AND Reader is mounted (the M1 Loki precedent). Eight are pure route
     // bindings onto the native traces handlers — reusing the native
     // surface, `success_status`, `base_query`, and exact `CaseClass` list
@@ -2410,7 +2426,10 @@ static MANIFEST: &[RouteSpec] = &[
     // this matrix, not just a byte-identity smoke test); byte-identity on
     // seeded data is proven in `traces_api_live.rs`. Four reshape to
     // Tempo's v1 flat / v2 (no `truncated`) tag shapes (own surfaces);
-    // `/api/echo` is a constant.
+    // `/api/echo` is a constant. The fourteenth, `/api/v2/traces/{traceId}`
+    // (issue #474), is neither: it reuses the native point read but wraps
+    // it in its own envelope and answers 200-with-an-empty-trace where the
+    // v1 twin answers 404, so it carries its own surface.
     RouteSpec {
         path: "/api/traces/{traceId}",
         methods: &[Method::Get],
@@ -2441,6 +2460,17 @@ static MANIFEST: &[RouteSpec] = &[
         status: RouteStatus::Mounted,
         doc_ref: DocRef::Verbatim,
         success_status: 404,
+        base_query: "",
+        cases: TRACE_FETCH_CASES,
+    },
+    RouteSpec {
+        path: "/api/v2/traces/{traceId}",
+        methods: &[Method::Get],
+        surface: Surface::TracesFetchV2,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
         base_query: "",
         cases: TRACE_FETCH_CASES,
     },
@@ -2645,6 +2675,23 @@ pub fn route_manifest() -> &'static [RouteSpec] {
 /// called for both the native and `/loki/api/v1` prefixes).
 pub const ROUTE_MOUNTING_HELPERS: &[&str] = &["mount_log_query_routes", "mount_detected_routes"];
 
+/// Functions pinned by NAME rather than by a body token (issue #474). The
+/// pair is `(workspace-relative file, function name)`; the file half is
+/// load-bearing, because `encode_protobuf` also exists in `assemble.rs`
+/// and only the v2 envelope encoder is pinned here.
+///
+/// `traces_api/fetch_v2.rs::encode_protobuf` writes the two envelope
+/// fields directly, with no message type, no `Option`, and no branch.
+/// That shape is not observable in the bytes it emits: an envelope whose
+/// fields are `Option` and are populated `Some(<default>)` produces the
+/// same 4 bytes empty and the same 96 bytes populated, so no wire
+/// witness can separate the two. Pinning the body text is what separates
+/// them.
+pub const EXPLICITLY_PINNED_FUNCTIONS: &[(&str, &str)] = &[(
+    "crates/pulsus-server/src/traces_api/fetch_v2.rs",
+    "encode_protobuf",
+)];
+
 /// One pinned function whose *entire body* is exact-pinned — round-5
 /// finding: per-call-site pinning (round 4) collapsed distinct call sites
 /// with identical text onto one set entry, hiding a second, textually-
@@ -2661,7 +2708,10 @@ pub const ROUTE_MOUNTING_HELPERS: &[&str] = &["mount_log_query_routes", "mount_d
 /// Every non-test function in either scanned tree whose body contains a
 /// `.merge(`/`.nest(`/`.nest_service(`/`.fallback(`/
 /// `.method_not_allowed_fallback(` token, or a call to a
-/// [`ROUTE_MOUNTING_HELPERS`] name, needs an entry here — re-derive
+/// [`ROUTE_MOUNTING_HELPERS`] name, needs an entry here — as does every
+/// `(file, function)` pair listed in [`EXPLICITLY_PINNED_FUNCTIONS`],
+/// which is the third selector: a function pinned for what its body text
+/// must NOT become rather than for a token it contains. Re-derive it
 /// (and reconcile [`route_manifest`] alongside it) whenever
 /// `every_pinned_function_body_matches_the_snapshot_exactly` reports a
 /// drift. Any edit to one of these few load-bearing functions — even one
@@ -2749,6 +2799,17 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
         file: "crates/pulsus-write/src/protocols/remote_write.rs",
         function: "merge",
         body: "let mut bounded = BoundedWriteRequest::seeded_from(std::mem::take(&mut self.timeseries), std::mem::take(&mut self.metadata)); let result = bounded.merge(buf); self.timeseries = bounded.timeseries; self.metadata = bounded.metadata; result",
+    },
+    // Issue #474: pinned by NAME (`EXPLICITLY_PINNED_FUNCTIONS`), not by a
+    // body token — this function composes no routes. The v2 fetch
+    // envelope's two fields are written directly, with no message type, no
+    // `Option` and no branch; an `Option`-typed envelope populated
+    // `Some(<default>)` emits identical bytes on every input, so the body
+    // text is the only thing that separates the two shapes.
+    PinnedFunctionBody {
+        file: "crates/pulsus-server/src/traces_api/fetch_v2.rs",
+        function: "encode_protobuf",
+        body: "let trace_bytes = trace.as_traces_data().encode_to_vec(); let mut out = Vec::with_capacity(trace_bytes.len() + 8); prost::encoding::encode_key(1, prost::encoding::WireType::LengthDelimited, &mut out); prost::encoding::encode_varint(trace_bytes.len() as u64, &mut out); out.extend_from_slice(&trace_bytes); out.extend_from_slice(&[0x12, 0x00]); out",
     },
 ];
 

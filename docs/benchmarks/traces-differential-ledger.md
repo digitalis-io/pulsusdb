@@ -1120,3 +1120,168 @@ when we are asking it to slow down, so we keep `429`; recorded as
   cannot reach this response — but `{ traceDuration > 1h }` would
   evaluate a negative width for a trace whose end overflows. Different
   surface, different rule; noted so the next person on that code finds it.
+
+### `traces-v2-fetch-metrics-not-populated` (issue #474)
+
+- **What:** `GET /api/v2/traces/{traceId}` returns an envelope whose
+  field 2 (`metrics`) PulsusDB always emits present and at its default,
+  encoding as the two bytes `12 00`. The reference populates it with a
+  byte counter. Measured on the CI-pinned oracle
+  (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad5870
+  0aa96880653c3d8f7`, the digest at `.github/workflows/ci.yml:648`),
+  booted on this repository's own `ci/tempo/tempo-compare.yaml`.
+
+- **Why this is an exclusion and not a frozen value.** The reference's
+  own number is not stable, and — this is the part that matters — it does
+  not vary per request either. It moves in **plateaus**: several adjacent
+  fetches of the same trace, with no ingest in between, return the
+  identical value, and a later fetch returns a different one. Values
+  observed across three machines and three runs, all on the same single
+  trace: `1204089baf03`, `120408b2de01` (twice, on two machines),
+  `120408c8f906`, `120408acb60a`, `120408969b05`, `120408e4bc03`.
+  **Two adjacent fetches agreeing therefore proves nothing about
+  stability** — a check that sampled the value twice and saw agreement
+  would have concluded, wrongly, that it could be frozen. The plateau, not
+  the spread, is why the field is excluded from comparison rather than
+  pinned.
+
+- **What a consumer sees.** The Grafana Tempo datasource reads this block
+  only to report bytes inspected for a trace fetch; PulsusDB has no
+  equivalent read-accounting to report, so the number is zero rather than
+  wrong. The block is **present and empty**, never absent — the
+  datasource dereferences it without a nil check, which is the whole
+  subject of issue #474.
+
+- **How it is gated.** Every v2 comparison in the suite compares field 1
+  (the trace) byte-for-byte and asserts our field 2 is exactly `12 00`;
+  the reference's field 2 is **never** compared.
+  `crates/pulsus-server/tests/trace_nullable_wire_differential.rs`
+  (`the_committed_capture_matches_the_live_reference`) parses field 1 out
+  of the reference's envelope and drops the rest;
+  `crates/pulsus-server/tests/traces_api_live.rs`
+  (`absent_submessages_are_materialized_present_and_empty_on_the_wire`)
+  asserts our own whole body, tail included.
+
+- **Precedent.** `traceql-search-metrics-completed-jobs` above already
+  omits the same class of counter on the search surface, for the same
+  reason.
+
+### `traces-v2-fetch-get-only` (issue #474)
+
+- **What:** `POST /api/v2/traces/{traceId}` is `405` with
+  `Allow: GET,HEAD` for PulsusDB. The reference answers `200` with the
+  same envelope a `GET` returns — measured on the same pinned oracle:
+  `POST /api/v2/traces/<absent id>` → `200`, `Content-Length: 25`, body
+  `{"trace":{},"metrics":{}}`. Its v1 twin, by contrast, answers `404` for
+  the same `POST`, so the reference routes the verb on both routes and the
+  difference between them is only the empty-trace status.
+
+- **Why we do not match it.** The whole Tempo-compat alias surface is
+  `GET`-only, and `api_conformance` already pins `405 Allow: GET,HEAD` on
+  the v1 twin. Matching the reference here would make one route of
+  fourteen answer a verb its thirteen siblings refuse, for no consumer:
+  the datasource issues `GET` on trace-by-ID, and no named client sends
+  `POST` to this path.
+
+- **What a consumer sees.** Nothing, unless it sends a verb no known
+  client sends. A caller that did would get `405` with an `Allow` header
+  naming the verbs that work, rather than a body.
+
+- **How it is gated.** `crates/pulsus-server/tests/api_conformance.rs`,
+  `assert_traces_fetch_v2_route`'s `undocumented-method-405` cell, which
+  also asserts the router-generated `405` carries no `Vary: accept`.
+
+### `traces-fetch-json-emits-proto3-defaults` (issue #474) — **a representation difference on two named routes, recorded because nothing recorded it**
+
+- **The routes.** `GET /api/traces/v1/trace/{traceId}`, its three aliases
+  (`/api/traces/{traceId}`, `/api/traces/{traceId}/json`,
+  `/tempo/api/traces/{traceId}`), and `GET /api/v2/traces/{traceId}` —
+  in every case under `Accept: application/json`, and on the `/json`
+  suffix route unconditionally. **The protobuf representation of all of
+  these is unaffected**: it is byte-identical to the reference's, which
+  is what issue #474 changed and what the wire tests gate.
+
+- **What:** our JSON emits proto3 default values; the reference omits
+  them. Measured on the CI-pinned oracle
+  (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad5870
+  0aa96880653c3d8f7`, the digest at `.github/workflows/ci.yml:648`) and
+  on a `pulsusdb` spawn, both fed the identical four-span fixture in
+  `crates/pulsus-server/tests/fixtures/trace_nullable_wire/capture.json`.
+  For the probe whose sender omitted `status` entirely, the span object
+  reads:
+
+  | | reference | PulsusDB |
+  |---|---|---|
+  | `status` | `{}` | `{"message":"","code":0}` |
+  | `traceState`, `parentSpanId`, `flags` | omitted | `""`, `""`, `0` |
+  | `attributes`, `events`, `links` | omitted | `[]`, `[]`, `[]` |
+  | `droppedAttributesCount`, `droppedEventsCount`, `droppedLinksCount` | omitted | `0`, `0`, `0` |
+  | `schemaUrl` (both levels) | omitted | `""` |
+  | `resource`, `scope` | `{}` | every field spelled out at its default |
+
+  Three further differences on the same bodies, measured at the same
+  time and recorded here so a future JSON comparison uses the right
+  expectations rather than rediscovering them: ids are **base64** on the
+  reference and **hex** for us (`"uwAAAAAAAAE="` vs `"bb00000000000001"`);
+  `kind` is the **enum name** on the reference and the **number** for us
+  (`"SPAN_KIND_INTERNAL"` vs `1`), and likewise `status.code`
+  (`"STATUS_CODE_ERROR"` vs `2` on the probe whose sender set a real
+  status); and on the **v1** route only, the reference's top-level key is
+  `batches` where ours is `resourceSpans` — on the **v2** route the
+  reference uses `resourceSpans`, the same as ours. That last one is why
+  this row names the route for every claim: the reference answers the
+  same trace with two different key names depending on which of its own
+  routes you ask.
+
+- **Why we do not match it.** No consumer branches on the difference: a
+  client decoding either body reads the same values, because an omitted
+  proto3 field and a field present at its default are the same value by
+  definition. The bar here is consumer impact, not byte identity.
+  Matching would mean changing the JSON representation of the whole §4.1
+  trace-fetch surface — the ids, the enums, the omission rule, and the v1
+  top-level key — which moves an established response shape for every
+  existing consumer of that route. That is a separate piece of work with
+  its own measurement, and issue #474 put it out of scope explicitly.
+
+- **What issue #474 did and did not change here.** Default emission is
+  **pre-existing**, and that is checkable rather than asserted: the
+  fields above that #474 never touches — `traceState`, `flags`,
+  `droppedAttributesCount`, `schemaUrl` — are emitted at their defaults
+  on the same bodies. (`kind` is deliberately NOT in that list: the
+  fixture sets it to `1` and the proto3 default is `0`, so a body
+  carrying `kind` shows a field with a value, not a default being
+  emitted. Its numeric-versus-enum-name difference is real and is
+  recorded above.) What #474 changed is three keys that
+  previously serialised as JSON `null` (`resource`, `scope`, `status`,
+  measured directly on an unfilled `TracesData`) and now serialise as
+  default-valued objects. **`null` was further from the reference's `{}`
+  than the default-valued object is**, so the change moves this
+  representation toward the reference on those three keys while leaving
+  the omission rule itself untouched.
+
+- **Not documented before this row, and the prior claim was wrong.** An
+  earlier draft of `docs/api.md` §8.1 justified our populated JSON body
+  by citing "§4.1's OTLP protojson convention (hex ids, no default
+  omission)". §4.1 documents the hex ids, the camelCase keys and the
+  64-bit-integers-as-strings rule; **it has never documented a
+  default-emission rule**, and the repository documents us *following*
+  protojson default omission elsewhere (a zero sample `value`, a zero
+  `completedJobs` — `docs/api.md` §4.4 and §4.2). The citation was
+  circular: the only text in the tree saying "no default omission" was
+  the §8.1 sentence doing the citing. §4.1 now states the actual
+  behaviour and points here.
+
+- **How it is gated.** Nothing gates the populated JSON body against the
+  reference, and that is deliberate rather than an omission: there is no
+  captured reference JSON to compare against, because this row exists to
+  say the two are not comparable. What **is** gated is the part that must
+  match — the absent-trace v2 JSON body, byte-exact at 25 bytes, in
+  `crates/pulsus-server/tests/trace_nullable_wire_differential.rs`
+  (against the live reference) and in
+  `crates/pulsus-server/tests/api_conformance.rs`
+  (`assert_traces_fetch_v2_route`, against a live spawn) — and our own
+  populated JSON shape, in
+  `crates/pulsus-server/src/traces_api/fetch_v2.rs`
+  (`the_populated_json_envelope_nests_resource_spans_under_trace`), which
+  asserts the `status` object this row describes so a change to the
+  serializer reddens rather than passing silently.

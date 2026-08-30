@@ -820,6 +820,25 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 ctx,
             );
         }
+        (Surface::TracesFetchV2, _) => {
+            // Issue #474: the v2 envelope answers an absent trace `200`
+            // with a present-but-empty trace, never `404`. Against this
+            // suite's empty databases that IS the well-formed outcome, and
+            // the exact 25-byte JSON body is the mounting oracle — an
+            // unmounted path returns axum's empty `404`. The bytes are the
+            // reference's own; `trace` present with no `resourceSpans`,
+            // `metrics` present and empty.
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: v2 fetch envelope content-type"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&res.body),
+                r#"{"trace":{},"metrics":{}}"#,
+                "{ctx}: the absent-trace v2 JSON envelope is the reference's exact 25 bytes"
+            );
+        }
         (Surface::TracesSearch, _) => {
             // Issue #57: success is the documented docs/api.md §4.2
             // envelope, not the `{"status","data"}` query envelope.
@@ -1535,6 +1554,138 @@ fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
     }
 }
 
+/// The v2 fetch alias (issue #474). Same dedicated shape as
+/// [`assert_traces_fetch_route`] and for the same reason — the generic
+/// matrix's sibling-404 suffix trick mutates the trailing `{traceId}`
+/// param rather than producing an unrouted path — but every absent-trace
+/// cell here expects `200` with an envelope, not `404`. Cells: absent
+/// 32-hex → `200` with the exact 25-byte JSON envelope (the mounting
+/// oracle, via [`assert_success_envelope`]); absent 32-hex under
+/// `Accept: application/protobuf` → `200` with exactly `0a 00 12 00`;
+/// 16-hex short id → the same `200` (accepted, left-padded, not `400`);
+/// `Accept: text/plain` → `406` with the plain-text body; malformed hex →
+/// `400`; `POST` → `405 Allow: GET,HEAD` with no `Vary`; extra-segment
+/// sibling → empty `404` with no `Vary`; plus the manifest's
+/// `CaseClass`es.
+fn assert_traces_fetch_v2_route(port: u16, spec: &RouteSpec, spawn: &str) {
+    let path = resolve_path(spec.path);
+
+    // Every response `trace_by_id_v2` itself returns carries `Vary:
+    // accept`; the two axum-generated ones below must not.
+    let assert_vary = |res: &RawResponse, ctx: &str| {
+        assert!(res.has_vary_accept(), "{ctx}: must Vary: accept");
+    };
+
+    for &method in spec.methods {
+        let ctx = format!(
+            "[{spawn}] {} {} case=documented-method-absent-200-envelope",
+            method.as_str(),
+            spec.path
+        );
+        let req = manifest::Req::new(method.as_str(), path.clone());
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(
+            res.status,
+            spec.success_status,
+            "{ctx}: status (body: {:?})",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_success_envelope(spec, &res, &ctx);
+        assert_vary(&res, &ctx);
+    }
+
+    // The protobuf representation of the same absent trace: the four bytes
+    // the reference answers — a length-zero field 1 and a length-zero
+    // field 2. An envelope that omitted field 1 would be two bytes, and
+    // one that omitted both would be zero.
+    for accept in ["application/protobuf", "application/x-protobuf"] {
+        let ctx = format!(
+            "[{spawn}] GET {} case=absent-200-protobuf-four-bytes accept={accept}",
+            spec.path
+        );
+        let mut req = manifest::Req::new("GET", path.clone());
+        req.headers.push(("accept", accept.to_string()));
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(res.status, 200, "{ctx}: status");
+        assert_eq!(
+            res.content_type(),
+            Some("application/protobuf"),
+            "{ctx}: content-type"
+        );
+        assert_eq!(
+            res.body,
+            vec![0x0a, 0x00, 0x12, 0x00],
+            "{ctx}: the absent-trace envelope is exactly `0a 00 12 00`"
+        );
+        assert_vary(&res, &ctx);
+    }
+
+    // A 16-hex short id is accepted (left-padded to 32) and absent — the
+    // same 200 envelope, never a 400.
+    let ctx = format!("[{spawn}] GET {} case=short-16-hex-absent-200", spec.path);
+    let short_path = path.replace(manifest::ABSENT_TRACE_ID, "feedfacefeedface");
+    let res = get(port, &short_path, &ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: a 16-hex id must be accepted and resolve to the empty envelope, got {} (body: {:?})",
+        res.status,
+        String::from_utf8_lossy(&res.body)
+    );
+    assert_success_envelope(spec, &res, &ctx);
+    assert_vary(&res, &ctx);
+
+    // Negotiation is §4.1's, unchanged: no acceptable representation is a
+    // 406 with the plain-text body, not a JSON fallback.
+    let ctx = format!("[{spawn}] GET {} case=unacceptable-accept-406", spec.path);
+    let mut req = manifest::Req::new("GET", path.clone());
+    req.headers.push(("accept", "text/plain".to_string()));
+    let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_eq!(res.status, 406, "{ctx}: status");
+    assert_case_envelope(
+        &res,
+        &ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+        &ctx,
+    );
+    assert_vary(&res, &ctx);
+
+    let ctx = format!("[{spawn}] GET {} case=malformed-hex-400-vary", spec.path);
+    let malformed_path = path.replace(
+        manifest::ABSENT_TRACE_ID,
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    );
+    let res = get(port, &malformed_path, &ctx);
+    assert_eq!(res.status, 400, "{ctx}: status");
+    assert_vary(&res, &ctx);
+
+    let ctx = format!("[{spawn}] POST {} case=undocumented-method-405", spec.path);
+    let post = manifest::Req::new("POST", path.clone());
+    let res = raw_request(port, &post).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_405_with_allow(&res, &ctx, spec.methods);
+    assert!(
+        !res.has_vary_accept(),
+        "{ctx}: axum-generated 405 must not carry the handler's Vary"
+    );
+
+    // The `/json` suffix is deliberately not mounted on v2, so the suffix
+    // path is the extra-segment sibling: an unrouted, empty 404.
+    let ctx = format!(
+        "[{spawn}] GET {} case=json-suffix-not-mounted-404",
+        spec.path
+    );
+    let suffix = format!("{path}/json");
+    let res = get(port, &suffix, &ctx);
+    assert_404_empty(&res, &ctx);
+    assert!(
+        !res.has_vary_accept(),
+        "{ctx}: axum-generated sibling-404 must not carry the handler's Vary"
+    );
+
+    for case in spec.cases {
+        run_case(port, spec, case, spawn);
+    }
+}
+
 /// Attempts a WebSocket handshake (`Connection: Upgrade` — the one shape
 /// [`raw_request`]'s hardcoded `Connection: close` cannot express) and
 /// returns the HTTP response. On `101` the body is empty and the still-
@@ -2087,6 +2238,9 @@ async fn all_mode_auth_off_compat_on_full_matrix() {
             Surface::Ingest => assert_ingest_route(port, spec, "spawn=all,auth=off,compat=on"),
             Surface::TracesFetch => {
                 assert_traces_fetch_route(port, spec, "spawn=all,auth=off,compat=on")
+            }
+            Surface::TracesFetchV2 => {
+                assert_traces_fetch_v2_route(port, spec, "spawn=all,auth=off,compat=on")
             }
             Surface::LogsTail => assert_tail_route(port, spec, "spawn=all,auth=off,compat=on"),
             _ => assert_full_route_matrix(port, spec, "spawn=all,auth=off,compat=on"),
