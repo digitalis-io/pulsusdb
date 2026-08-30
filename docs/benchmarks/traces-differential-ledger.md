@@ -1246,8 +1246,12 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **What issue #474 did and did not change here.** Default emission is
   **pre-existing**, and that is checkable rather than asserted: the
   fields above that #474 never touches — `traceState`, `flags`,
-  `droppedAttributesCount`, `schemaUrl`, `kind` — are emitted at their
-  defaults on the same bodies. What #474 changed is three keys that
+  `droppedAttributesCount`, `schemaUrl` — are emitted at their defaults
+  on the same bodies. (`kind` is deliberately NOT in that list: the
+  fixture sets it to `1` and the proto3 default is `0`, so a body
+  carrying `kind` shows a field with a value, not a default being
+  emitted. Its numeric-versus-enum-name difference is real and is
+  recorded above.) What #474 changed is three keys that
   previously serialised as JSON `null` (`resource`, `scope`, `status`,
   measured directly on an unfilled `TracesData`) and now serialise as
   default-valued objects. **`null` was further from the reference's `{}`
