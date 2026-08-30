@@ -1693,17 +1693,44 @@ mod tests {
             arch.contains(SATURATION_COUNTER),
             "docs/architecture.md §8 must name {SATURATION_COUNTER}"
         );
+        let bullet = arch
+            .lines()
+            .find(|line| line.contains(SATURATION_COUNTER))
+            .unwrap_or_else(|| {
+                panic!("docs/architecture.md §8 must carry a bullet naming {SATURATION_COUNTER}")
+            });
+        // Scoped to the VOCABULARY clause — not the whole document, and
+        // not even the whole bullet. Measured: the bullet's own closing
+        // sentence explains what a `below` sample means, so a search over
+        // the file, or over the line, stayed green when the vocabulary
+        // clause itself was edited to a different label. The domain the
+        // assertion checks now matches the domain its message claims.
+        let (vocabulary, rest) = bullet
+            .split_once("Incremented once per")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the {SATURATION_COUNTER} bullet must keep its `Incremented once per …` \
+                 sentence: it is what bounds the label vocabulary clause, and without it this \
+                 check silently widens to the whole bullet"
+                )
+            });
+        assert!(
+            !rest.trim().is_empty(),
+            "the bullet must say what the counter counts after its vocabulary clause"
+        );
         for field in WireField::ALL {
             assert!(
-                arch.contains(field.label()),
-                "docs/architecture.md §8 must name the field label {:?}",
+                vocabulary.contains(&format!("`{}`", field.label())),
+                "the {SATURATION_COUNTER} bullet's label vocabulary must name the field label \
+                 {:?}, got {vocabulary:?}",
                 field.label()
             );
         }
         for bound in Bound::ALL {
             assert!(
-                arch.contains(&format!("`{}`", bound.label())),
-                "docs/architecture.md §8 must name the bound label {:?}",
+                vocabulary.contains(&format!("`{}`", bound.label())),
+                "the {SATURATION_COUNTER} bullet's label vocabulary must name the bound label \
+                 {:?}, got {vocabulary:?}",
                 bound.label()
             );
         }
