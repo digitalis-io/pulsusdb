@@ -37,12 +37,46 @@
 //! keys did not degrade trace search through that client, they disabled
 //! it. [`render`] documents where the truncation signal went.
 //!
-//! Removing them is not sufficient for a strict client, and nothing here
-//! claims it is: `durationMs` is `uint32` in the same message and we
-//! emit an unwrapped `i64`, so one trace over ~49.7 days fails the same
-//! decode and takes the whole response with it. That is one mechanism —
-//! an integer emitted outside its proto field's domain — tracked
-//! separately and deliberately not fixed field-by-field here.
+//! **Every integer this module emits is projected into the domain of the
+//! wire field it lands in** (issue #473). Removing the invented keys was
+//! not sufficient for a strict client: three of these fields are
+//! narrower on the wire than the Rust type feeding them, and a strict
+//! protobuf-JSON decoder has no per-field recovery — it returns on the
+//! first out-of-domain number and the caller gets that error instead of
+//! results, so one bad row discards every row of the response. The
+//! projection is SATURATION: below `0` becomes `0`, above the target
+//! maximum becomes that maximum. Saturation is monotonic and preserves a
+//! lower bound; wrapping does not, and a wrapped 60-day trace reads as
+//! an ordinary 10.3-day one that no reader can tell from a genuinely
+//! short trace. The same rule for the same reason is already recorded
+//! for the logs surface (`docs/benchmarks/logs-differential-ledger.md`,
+//! `detected-fields-limit-saturates-not-wraps`); this one is
+//! `traceql-search-duration-ms-saturates-not-wraps` in
+//! `docs/benchmarks/traces-differential-ledger.md`.
+//!
+//! **The projected sites are an ENUMERATION of four, not a count**:
+//! [`trace_json`]'s `startTimeUnixNano` (`uint64`) and `durationMs`
+//! (`uint32`), and [`span_json`]'s `startTimeUnixNano` (`uint64`) and
+//! `durationNanos` (`uint64`). Each goes through [`duration_ms`] or
+//! [`wire_nanos`], which RETURN the wire type — so at those four call
+//! sites an out-of-domain `durationMs` and a minus-signed nanosecond
+//! string are unconstructible, whatever the caller does. The other five
+//! integers [`render`] emits are in domain by their Rust type and are
+//! deliberately NOT projected: the two `matched` counts and the two job
+//! counters are already `u32`, and [`group_value_json`]'s `intValue` is
+//! a SIGNED 64-bit integer on the wire, which is exactly the `i64` we
+//! hold. Returning the wire type is construction, not proof — it says
+//! nothing about a FIFTH call site written without a projection, which
+//! is what `every_integer_the_response_emits_lies_in_its_wire_domain`
+//! exists to catch.
+//!
+//! **A saturation is surfaced off the response, not on it.** A negative
+//! stored start or width can only arrive from a write that bypassed
+//! `pulsus-write`, and that must surface — but a body a strict client
+//! discards whole is not a diagnostic anyone can act on, and the
+//! decoder's own error names neither the field nor the trace.
+//! [`DomainReport`] carries one `tracing::warn!` per response and one
+//! [`SATURATION_COUNTER`] increment per (field, bound) instead.
 
 use serde_json::{Value, json};
 
@@ -56,20 +90,218 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// The reference's own substitute for an EMPTY root service on a search
+/// response — `RootSpanNotYetReceivedText` (`pkg/search/util.go:15` @
+/// v3.0.2), applied to every trace of a response by
+/// `addRootSpanNotReceivedText` (`modules/frontend/combiner/search.go:141-147`,
+/// called at `:83` and `:119`). It substitutes `RootServiceName` and
+/// nothing else: `rootTraceName` is never substituted, and neither is a
+/// `by(rootServiceName)` group value, which is a different field
+/// produced by a different code path (issue #473).
+///
+/// **A hand transcription, and nothing in CI can check it** — the same
+/// standing caveat as `SEARCH_METRICS_FIELDS` below. The reference is
+/// not vendored and this workspace has no Go step, so a typo here would
+/// ship green; it is checkable by a human against the checkout.
+const ROOT_SPAN_NOT_YET_RECEIVED: &str = "<root span not yet received>";
+
+/// The counter [`DomainReport::surface`] increments, labelled `field`
+/// and `bound` (docs/architecture.md §8).
+const SATURATION_COUNTER: &str = "pulsus_traceql_search_wire_domain_saturations_total";
+
+/// The four integers this module projects into an unsigned wire domain
+/// (issue #473). See the module doc for why the other five integers
+/// [`render`] emits are not projected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WireField {
+    TraceStartTimeUnixNano,
+    TraceDurationMs,
+    SpanStartTimeUnixNano,
+    SpanDurationNanos,
+}
+
+impl WireField {
+    /// Every variant, in [`WireField::index`] order — the enumeration
+    /// [`DomainReport::surface`] walks and the one the tests iterate, so
+    /// a fifth field cannot be added without both seeing it.
+    const ALL: [WireField; 4] = [
+        WireField::TraceStartTimeUnixNano,
+        WireField::TraceDurationMs,
+        WireField::SpanStartTimeUnixNano,
+        WireField::SpanDurationNanos,
+    ];
+
+    /// The `field` label value. **Level-qualified on purpose**:
+    /// `startTimeUnixNano` exists at both the trace and the span level,
+    /// and one shared label value could not tell a trace-level event
+    /// from a span-level one.
+    fn label(self) -> &'static str {
+        match self {
+            WireField::TraceStartTimeUnixNano => "trace.startTimeUnixNano",
+            WireField::TraceDurationMs => "trace.durationMs",
+            WireField::SpanStartTimeUnixNano => "span.startTimeUnixNano",
+            WireField::SpanDurationNanos => "span.durationNanos",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            WireField::TraceStartTimeUnixNano => 0,
+            WireField::TraceDurationMs => 1,
+            WireField::SpanStartTimeUnixNano => 2,
+            WireField::SpanDurationNanos => 3,
+        }
+    }
+}
+
+/// Which side of a wire field's domain a value was clamped from — the
+/// `bound` label value, and the [`DomainReport::counts`] slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Bound {
+    /// Clamped up from under the field's minimum.
+    Below,
+    /// Clamped down from over the field's maximum.
+    Above,
+}
+
+impl Bound {
+    /// Both variants, in [`Bound::index`] order — the enumeration
+    /// [`DomainReport::surface`] walks.
+    const ALL: [Bound; 2] = [Bound::Below, Bound::Above];
+
+    fn label(self) -> &'static str {
+        match self {
+            Bound::Below => "below",
+            Bound::Above => "above",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Bound::Below => 0,
+            Bound::Above => 1,
+        }
+    }
+}
+
+/// Per-response record of every integer moved into its wire field's
+/// domain (issue #473).
+///
+/// O(1) memory and no allocation on a healthy response: `counts` is
+/// inline and `first` stays `None`.
+#[derive(Default, Debug)]
+struct DomainReport {
+    /// `[field.index()][bound.index()]`, so one slot per (field, bound)
+    /// pair.
+    counts: [[u64; 2]; 4],
+    /// The first event, for the log line: the field, the id that names
+    /// the trace or the span it came from, and the value the renderer
+    /// was asked to emit.
+    first: Option<(WireField, String, i64)>,
+}
+
+impl DomainReport {
+    fn record(&mut self, field: WireField, id: &str, value: i64, bound: Bound) {
+        self.counts[field.index()][bound.index()] += 1;
+        if self.first.is_none() {
+            self.first = Some((field, id.to_string(), value));
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.counts.iter().flatten().sum()
+    }
+
+    /// One `tracing::warn!` per RESPONSE — never per row, so a store
+    /// full of negative widths cannot flood the log — plus one
+    /// [`SATURATION_COUNTER`] increment per (field, bound) that actually
+    /// fired. A no-op when nothing saturated.
+    fn surface(&self) {
+        let Some((first_field, first_id, first_value)) = &self.first else {
+            return;
+        };
+        tracing::warn!(
+            field = first_field.label(),
+            id = %first_id,
+            value = *first_value,
+            saturations = self.total(),
+            "traceql search: an integer was outside its wire field's domain and was saturated \
+             into it; a value below zero means a stored start or width is negative, which no \
+             mounted ingest route can produce"
+        );
+        for field in WireField::ALL {
+            for bound in Bound::ALL {
+                let n = self.counts[field.index()][bound.index()];
+                if n != 0 {
+                    metrics::counter!(
+                        SATURATION_COUNTER,
+                        "field" => field.label(),
+                        "bound" => bound.label(),
+                    )
+                    .increment(n);
+                }
+            }
+        }
+    }
+}
+
+/// Projects an `i64` into a wire 64-bit UNSIGNED NANOSECOND domain by
+/// saturation (issue #473). Every non-negative `i64` fits a `u64`, so
+/// the upper clamp is inert and the operation here is exactly
+/// "below `0` -> `0`" — which is what stops a minus-signed protojson
+/// string, the form a strict decoder refuses, from ever being built.
+///
+/// `id` is the hex id of the trace or span the value came from,
+/// recorded on `report` so the log line names what the decoder's own
+/// error message cannot.
+fn wire_nanos(value: i64, field: WireField, id: &str, report: &mut DomainReport) -> u64 {
+    match u64::try_from(value) {
+        Ok(nanos) => nanos,
+        Err(_) => {
+            report.record(field, id, value, Bound::Below);
+            0
+        }
+    }
+}
+
 /// Trace-level milliseconds only — `TraceSearchMetadata.durationMs`
 /// (`pkg/tempopb/tempo.proto:139` @ v3.0.2). A span never carries this,
 /// and the nanoseconds fed in are the TRACE's envelope width, not the
 /// root span's (issue #464).
 ///
-/// **Not truncated to `uint32`.** The reference computes
-/// `uint32(spanset.DurationNanos / 1_000_000)` (`engine.go:295`), so any
-/// trace longer than ~49.7 days wraps: measured on the pinned container,
-/// a 2^53 + 1 ns trace comes back `durationMs: 417264662` and an
-/// `i64::MAX` one `2077252342`, against our 9007199254 and 9223372036854.
-/// That wrap is the reference being wrong and is deliberately not copied
-/// (recorded on issue #458 as out of scope, with both numbers).
-fn duration_ms(duration_ns: i64) -> i64 {
-    duration_ns / 1_000_000
+/// **Projected into the wire's 32-bit UNSIGNED domain by SATURATION**
+/// (issue #473): a millisecond count below `0` renders `0`, one above
+/// `u32::MAX` renders `u32::MAX`. Returning `u32` is what makes an
+/// out-of-domain `durationMs` unconstructible at the call site.
+///
+/// The reference computes `uint32(spanset.DurationNanos / 1_000_000)`
+/// (`pkg/traceql/engine.go:295` @ v3.0.2), so a trace longer than ~49.7
+/// days WRAPS there: captured on the pinned reference build, a 2^53 + 1
+/// ns trace comes back `durationMs: 417264662` and an `i64::MAX` one
+/// `2077252342`. We answer `4294967295` for BOTH — the same number for
+/// two different inputs, which is what saturation means and what
+/// wrapping cannot produce. Neither answer is the true duration;
+/// saturated is at least a true lower bound a consumer can act on,
+/// while wrapped is an ordinary-looking number indistinguishable from a
+/// genuinely short trace. Recorded as
+/// `traceql-search-duration-ms-saturates-not-wraps` in
+/// docs/benchmarks/traces-differential-ledger.md.
+///
+/// `id` is the trace's hex id, recorded on `report` so the log line
+/// names the trace that a strict decoder's own error message cannot.
+fn duration_ms(duration_ns: i64, id: &str, report: &mut DomainReport) -> u32 {
+    let ms = duration_ns / 1_000_000;
+    match u32::try_from(ms) {
+        Ok(ms) => ms,
+        Err(_) if ms < 0 => {
+            report.record(WireField::TraceDurationMs, id, ms, Bound::Below);
+            0
+        }
+        Err(_) => {
+            report.record(WireField::TraceDurationMs, id, ms, Bound::Above);
+            u32::MAX
+        }
+    }
 }
 
 /// One `SpanSet.spans[]` entry. `durationNanos` is the reference's
@@ -80,19 +312,41 @@ fn duration_ms(duration_ns: i64) -> i64 {
 /// part company, so it is the one the tests must carry (see the module
 /// doc for the captured bytes).
 ///
-/// `duration_ns` is non-negative by ingest construction
+/// `start_ns` and `duration_ns` are non-negative by ingest construction
 /// (`otlp_traces::resolve_duration_ns` clamps `end < start` and
-/// `end == 0` to `0`), and deliberately NOT re-clamped here: a negative
-/// value must surface a writer regression, not be hidden by the renderer.
-/// A negative therefore renders — it is not zero, so it is not omitted.
-fn span_json(span: &SpanSummary) -> Value {
+/// `end == 0` to `0`), but both wire fields are `uint64` and both are
+/// projected through [`wire_nanos`] anyway (issue #473): a value from a
+/// write that bypassed `pulsus-write` would otherwise render a
+/// minus-signed protojson string, which a strict decoder refuses,
+/// discarding the whole response. **The omission test moves onto the
+/// PROJECTED value**, so a negative width omits `durationNanos` exactly
+/// as a zero does rather than emitting `"-5"`.
+///
+/// The intent this replaces — that a negative must surface a writer
+/// regression rather than be hidden by the renderer — survives, off the
+/// response: [`DomainReport`] logs it and counts it. A poisoned body
+/// names no span.
+fn span_json(span: &SpanSummary, report: &mut DomainReport) -> Value {
+    let span_id = hex(&span.span_id);
+    let start = wire_nanos(
+        span.start_ns,
+        WireField::SpanStartTimeUnixNano,
+        &span_id,
+        report,
+    );
+    let nanos = wire_nanos(
+        span.duration_ns,
+        WireField::SpanDurationNanos,
+        &span_id,
+        report,
+    );
     let mut obj = json!({
-        "spanID": hex(&span.span_id),
+        "spanID": span_id,
         "name": span.name,
-        "startTimeUnixNano": span.start_ns.to_string(),
+        "startTimeUnixNano": start.to_string(),
     });
-    if span.duration_ns != 0 {
-        obj["durationNanos"] = Value::String(span.duration_ns.to_string());
+    if nanos != 0 {
+        obj["durationNanos"] = Value::String(nanos.to_string());
     }
     if !span.attributes.is_empty() {
         obj["attributes"] = Value::Array(
@@ -122,15 +376,21 @@ fn group_value_json(value: &GroupValue) -> Value {
 /// One `by()`-produced spanSet (issue #193): the typed group-key
 /// `attributes` plus the per-group `matched` count and `spss`-capped span
 /// summaries.
-fn group_json(group: &SpanSetGroup) -> Value {
+fn group_json(group: &SpanSetGroup, report: &mut DomainReport) -> Value {
+    let attributes = group
+        .attributes
+        .iter()
+        .map(|(key, value)| json!({"key": key, "value": group_value_json(value)}))
+        .collect::<Vec<_>>();
+    let spans = group
+        .spans
+        .iter()
+        .map(|span| span_json(span, report))
+        .collect::<Vec<_>>();
     json!({
-        "attributes": group
-            .attributes
-            .iter()
-            .map(|(key, value)| json!({"key": key, "value": group_value_json(value)}))
-            .collect::<Vec<_>>(),
+        "attributes": attributes,
         "matched": group.matched,
-        "spans": group.spans.iter().map(span_json).collect::<Vec<_>>(),
+        "spans": spans,
     })
 }
 
@@ -157,31 +417,60 @@ fn group_json(group: &SpanSetGroup) -> Value {
 /// `"durationMs":42`. The unit is what the omission tests, so the test is
 /// on `duration_ms(...)`, never on `duration_ns`.
 ///
-/// The one place this can still part company with the reference is a
-/// trace whose millisecond count is an exact multiple of 2^32 (~49.7
-/// days): the reference's `uint32` wraps that to `0` and omits the field,
-/// and we emit the true value. That is a consequence of NOT copying the
-/// overflow, and it is the better answer.
-fn trace_json(trace: &TraceSearchResult) -> Value {
+/// `durationMs` and `startTimeUnixNano` are projected into their wire
+/// domains (issue #473) — see [`duration_ms`] and [`wire_nanos`]. Above
+/// ~49.7 days the reference's `uint32` WRAPS and we SATURATE, so the two
+/// part company for every such trace rather than only at exact multiples
+/// of 2^32 ms; that divergence is
+/// `traceql-search-duration-ms-saturates-not-wraps` in
+/// docs/benchmarks/traces-differential-ledger.md. The omission rule runs
+/// on the projected value, so a negative width omits the key.
+///
+/// **An EMPTY `rootServiceName` renders [`ROOT_SPAN_NOT_YET_RECEIVED`]**
+/// (issue #473), which is what the reference substitutes for every trace
+/// of a search response. `rootTraceName` is not substituted, on either
+/// system, and neither is a `by(rootServiceName)` group value — that one
+/// goes through [`group_value_json`], where the marker must never
+/// appear.
+fn trace_json(trace: &TraceSearchResult, report: &mut DomainReport) -> Value {
     // Issue #193: when a `by()` grouping is active (`groups` is `Some`),
     // emit one spanSet per group carrying typed `attributes`; otherwise
     // the flat single-spanSet path is byte-identical to the pre-#193
     // response.
+    let trace_id = hex(&trace.trace_id);
     let span_sets = match &trace.groups {
-        Some(groups) => groups.iter().map(group_json).collect::<Vec<_>>(),
+        Some(groups) => groups
+            .iter()
+            .map(|group| group_json(group, report))
+            .collect::<Vec<_>>(),
         None => vec![json!({
             "matched": trace.matched,
-            "spans": trace.spans.iter().map(span_json).collect::<Vec<_>>(),
+            "spans": trace
+                .spans
+                .iter()
+                .map(|span| span_json(span, report))
+                .collect::<Vec<_>>(),
         })],
     };
+    let start = wire_nanos(
+        trace.trace_start_ns,
+        WireField::TraceStartTimeUnixNano,
+        &trace_id,
+        report,
+    );
+    let ms = duration_ms(trace.trace_duration_ns, &trace_id, report);
+    let root_service = if trace.root.service.is_empty() {
+        ROOT_SPAN_NOT_YET_RECEIVED
+    } else {
+        trace.root.service.as_str()
+    };
     let mut obj = json!({
-        "traceID": hex(&trace.trace_id),
-        "rootServiceName": trace.root.service,
+        "traceID": trace_id,
+        "rootServiceName": root_service,
         "rootTraceName": trace.root.name,
-        "startTimeUnixNano": trace.trace_start_ns.to_string(),
+        "startTimeUnixNano": start.to_string(),
         "spanSets": span_sets,
     });
-    let ms = duration_ms(trace.trace_duration_ns);
     if ms != 0 {
         obj["durationMs"] = Value::from(ms);
     }
@@ -213,14 +502,23 @@ fn trace_json(trace: &TraceSearchResult) -> Value {
 /// `(metrics.completedJobs || 0) / (metrics.totalJobs || 1)`
 /// (`src/streaming.ts:316`) reads it.
 pub(crate) fn render(output: &SearchOutput) -> Value {
-    let mut metrics = serde_json::Map::new();
+    // Issue #473: one report for the whole response, so a store full of
+    // out-of-domain values logs once rather than once per row.
+    let mut report = DomainReport::default();
+    let traces = output
+        .traces
+        .iter()
+        .map(|trace| trace_json(trace, &mut report))
+        .collect::<Vec<_>>();
+    let mut search_metrics = serde_json::Map::new();
     if !output.partial {
-        metrics.insert("completedJobs".to_string(), Value::from(1u32));
+        search_metrics.insert("completedJobs".to_string(), Value::from(1u32));
     }
-    metrics.insert("totalJobs".to_string(), Value::from(1u32));
+    search_metrics.insert("totalJobs".to_string(), Value::from(1u32));
+    report.surface();
     json!({
-        "traces": output.traces.iter().map(trace_json).collect::<Vec<_>>(),
-        "metrics": Value::Object(metrics),
+        "traces": traces,
+        "metrics": Value::Object(search_metrics),
     })
 }
 
@@ -257,11 +555,10 @@ mod tests {
     /// **This is not "every branch of `render`".** `render` reaches at
     /// least five other branch points, all of them inside the `traces`
     /// array and none of them able to move a `metrics` key:
-    /// `trace_json`'s `groups` split (`:137`) and its zero-`durationMs`
-    /// omission (`:152`), `span_json`'s zero-`durationNanos` omission
-    /// (`:75`) and its empty-`attributes` omission (`:78`), and
-    /// `group_value_json`'s type match (`:94`). The constant covers the
-    /// metrics projection only.
+    /// [`trace_json`]'s `groups` split and its zero-`durationMs`
+    /// omission, [`span_json`]'s zero-`durationNanos` omission and its
+    /// empty-`attributes` omission, and [`group_value_json`]'s type
+    /// match. The constant covers the metrics projection only.
     const METRICS_PARTIALITY_BRANCHES: [bool; 2] = [false, true];
 
     fn sample_output() -> SearchOutput {
@@ -458,17 +755,20 @@ mod tests {
                     u8::from_str_radix(hex, 16).expect("hex byte")
                 })
                 .collect();
-            let got = span_json(&SpanSummary {
-                span_id: span_id.try_into().expect("8 bytes"),
-                name: want["name"].as_str().expect("name").to_string(),
-                start_ns: want["startTimeUnixNano"]
-                    .as_str()
-                    .expect("startTimeUnixNano")
-                    .parse()
-                    .expect("i64 nanos"),
-                duration_ns,
-                attributes: vec![],
-            });
+            let got = span_json(
+                &SpanSummary {
+                    span_id: span_id.try_into().expect("8 bytes"),
+                    name: want["name"].as_str().expect("name").to_string(),
+                    start_ns: want["startTimeUnixNano"]
+                        .as_str()
+                        .expect("startTimeUnixNano")
+                        .parse()
+                        .expect("i64 nanos"),
+                    duration_ns,
+                    attributes: vec![],
+                },
+                &mut DomainReport::default(),
+            );
             assert_eq!(
                 got, want,
                 "{duration_ns} ns: our span object must be the reference's, key set and all \
@@ -499,11 +799,21 @@ mod tests {
     ///
     /// **Where we deliberately differ, and it is pinned rather than
     /// skipped.** The reference truncates to `uint32`
-    /// (`engine.go:295`), so a trace over ~49.7 days wraps. Two captured
-    /// widths wrap and their values are asserted on BOTH sides, so the
-    /// divergence cannot drift unnoticed:
-    /// 2^53 + 1 ns is `417264662` there and `9007199254` here, and
-    /// `i64::MAX` is `2077252342` there and `9223372036854` here.
+    /// (`engine.go:295`), so a trace over ~49.7 days wraps; we SATURATE
+    /// (issue #473). Two captured widths are above that boundary, and
+    /// they are the only rows in the fixture whose reference value
+    /// differs from ours: 2^53 + 1 ns is `417264662` there and
+    /// `4294967295` here, and `i64::MAX` is `2077252342` there and
+    /// `4294967295` here.
+    ///
+    /// **Those two rows are compared as a PAIR, after the loop, and no
+    /// whole-object equality can express what they prove.** The
+    /// reference's two values DIFFER from each other; ours are EQUAL to
+    /// each other and equal to `u32::MAX`. The same number for two
+    /// different inputs is the saturation property: a wrapping renderer
+    /// answers `417264662` and `2077252342`, and the unclamped `i64`
+    /// this module used to emit answers `9007199254` and
+    /// `9223372036854` — both unequal pairs, so both redden here.
     #[test]
     fn every_trace_width_renders_the_reference_captured_trace_object() {
         let captures: [(i64, &str); 7] = [
@@ -547,15 +857,16 @@ mod tests {
                 "the captured set must carry the {required} ns width"
             );
         }
-        // DO NOT DELETE either of the two over-`u32::MAX` rows. They are
-        // the only captures whose reference value differs from ours, and
-        // therefore the only rows that can tell a truncating `durationMs`
-        // from a non-truncating one; the rest agree under both rules and
-        // would stay green if we started copying the overflow. Issue #464
-        // makes this field carry the TRACE's width rather than the root
-        // span's, which can only ENLARGE the set of stores that reach
-        // them. If a later change makes these two rows behave
-        // differently, make them pass — never remove them.
+        // DO NOT DELETE either of the two over-`u32::MAX` rows, and DO
+        // NOT edit either captured value to match ours. They are the only
+        // captures whose reference value differs from ours, and therefore
+        // the only rows that can tell saturation from wrapping and both
+        // from an unclamped `i64`; the rest agree under all three rules.
+        // Issue #464 makes this field carry the TRACE's width rather than
+        // the root span's, which can only ENLARGE the set of stores that
+        // reach them. Issue #473 is the "later change" the previous
+        // version of this comment anticipated: these two rows were made
+        // to PASS under saturation, not removed.
         let over_u32: Vec<i64> = widths
             .iter()
             .copied()
@@ -566,6 +877,11 @@ mod tests {
             2,
             "exactly the two widths above u32::MAX milliseconds must remain — they are the only rows that can tell a truncating durationMs from a non-truncating one, got {over_u32:?}"
         );
+
+        // (duration_ns, the reference's value, ours) for every row above
+        // the 32-bit millisecond maximum — compared as a pair after the
+        // loop, because the property is a RELATION between the two rows.
+        let mut saturating: Vec<(i64, i64, u32)> = Vec::new();
 
         for (duration_ns, captured) in captures {
             let want: serde_json::Value =
@@ -581,43 +897,41 @@ mod tests {
                 .expect("startTimeUnixNano")
                 .parse()
                 .expect("i64 nanos");
-            let mut got = trace_json(&TraceSearchResult {
-                trace_id: trace_id.try_into().expect("16 bytes"),
-                // Issue #464: the widths under test are the TRACE's, so
-                // the root span is given a deliberately different window —
-                // 7 s later, 1 ns wide. If `trace_json` ever reads the
-                // root span again, every row here fails.
-                root: RootSummary {
-                    service: want["rootServiceName"].as_str().expect("svc").to_string(),
-                    name: want["rootTraceName"].as_str().expect("name").to_string(),
-                    start_ns: trace_start_ns.saturating_add(7_000_000_000),
-                    duration_ns: 1,
+            let mut got = trace_json(
+                &TraceSearchResult {
+                    trace_id: trace_id.try_into().expect("16 bytes"),
+                    // Issue #464: the widths under test are the TRACE's, so
+                    // the root span is given a deliberately different window —
+                    // 7 s later, 1 ns wide. If `trace_json` ever reads the
+                    // root span again, every row here fails.
+                    root: RootSummary {
+                        service: want["rootServiceName"].as_str().expect("svc").to_string(),
+                        name: want["rootTraceName"].as_str().expect("name").to_string(),
+                        start_ns: trace_start_ns.saturating_add(7_000_000_000),
+                        duration_ns: 1,
+                    },
+                    trace_start_ns,
+                    trace_duration_ns: duration_ns,
+                    matched: 1,
+                    spans: vec![],
+                    groups: None,
                 },
-                trace_start_ns,
-                trace_duration_ns: duration_ns,
-                matched: 1,
-                spans: vec![],
-                groups: None,
-            });
+                &mut DomainReport::default(),
+            );
             got.as_object_mut().expect("object").remove("spanSets");
 
-            let ours_ms = duration_ns / 1_000_000;
-            let wraps = ours_ms > i64::from(u32::MAX);
-            if wraps {
-                // The `uint32` overflow: the VALUES differ by design, so
-                // assert both, plus that the key is present on both sides.
+            if duration_ns / 1_000_000 > i64::from(u32::MAX) {
+                assert!(
+                    got.get("durationMs").is_some() && want.get("durationMs").is_some(),
+                    "{duration_ns} ns: both sides must carry the key — the divergence is the \
+                     VALUE, and an absent key on either side would hide it"
+                );
                 let theirs = want["durationMs"].as_i64().expect("reference durationMs");
-                assert_eq!(
-                    theirs,
-                    ours_ms % (i64::from(u32::MAX) + 1), // 2^32
-                    "{duration_ns} ns: the reference's value must be our value wrapped to uint32 \
-                     — if it is not, the divergence is no longer the overflow we recorded"
-                );
-                assert_eq!(
-                    got["durationMs"].as_i64(),
-                    Some(ours_ms),
-                    "{duration_ns} ns: we emit the UNWRAPPED value on purpose"
-                );
+                let raw = got["durationMs"].as_u64().expect("our durationMs");
+                let ours = u32::try_from(raw).unwrap_or_else(|_| {
+                    panic!("{duration_ns} ns: durationMs must fit the wire uint32, got {raw}")
+                });
+                saturating.push((duration_ns, theirs, ours));
             } else {
                 assert_eq!(
                     got, want,
@@ -626,6 +940,36 @@ mod tests {
                 );
             }
         }
+
+        // The saturation identity, on the two captured over-maximum rows.
+        assert_eq!(
+            saturating.len(),
+            2,
+            "both over-maximum captures must have been compared, got {saturating:?}"
+        );
+        assert_ne!(
+            saturating[0].1, saturating[1].1,
+            "the two CAPTURED reference values must differ from each other — a pair that agrees \
+             cannot discriminate anything: {saturating:?}"
+        );
+        for (duration_ns, theirs, ours) in &saturating {
+            assert_ne!(
+                *theirs,
+                i64::from(*ours),
+                "{duration_ns} ns: the CAPTURE is evidence and is never edited to match us — a \
+                 captured value equal to ours means the fixture was changed, not the reference"
+            );
+        }
+        assert_eq!(
+            saturating[0].2, saturating[1].2,
+            "ours must be the SAME number for two different inputs: that is what saturation \
+             means, and neither wrapping nor an unclamped i64 can produce it: {saturating:?}"
+        );
+        assert_eq!(
+            saturating[0].2,
+            u32::MAX,
+            "and that shared value is the wire field's maximum: {saturating:?}"
+        );
     }
 
     /// Issue #464: the trace level's `startTimeUnixNano` and `durationMs`
@@ -722,20 +1066,23 @@ mod tests {
                     u8::from_str_radix(hex, 16).expect("hex byte")
                 })
                 .collect();
-            let mut got = trace_json(&TraceSearchResult {
-                trace_id: trace_id.try_into().expect("16 bytes"),
-                root: RootSummary {
-                    service: want["rootServiceName"].as_str().expect("svc").to_string(),
-                    name: want["rootTraceName"].as_str().expect("name").to_string(),
-                    start_ns: root_start_ns,
-                    duration_ns: root_duration_ns,
+            let mut got = trace_json(
+                &TraceSearchResult {
+                    trace_id: trace_id.try_into().expect("16 bytes"),
+                    root: RootSummary {
+                        service: want["rootServiceName"].as_str().expect("svc").to_string(),
+                        name: want["rootTraceName"].as_str().expect("name").to_string(),
+                        start_ns: root_start_ns,
+                        duration_ns: root_duration_ns,
+                    },
+                    trace_start_ns,
+                    trace_duration_ns,
+                    matched: 1,
+                    spans: vec![],
+                    groups: None,
                 },
-                trace_start_ns,
-                trace_duration_ns,
-                matched: 1,
-                spans: vec![],
-                groups: None,
-            });
+                &mut DomainReport::default(),
+            );
             got.as_object_mut().expect("object").remove("spanSets");
             assert_eq!(
                 got, want,
@@ -930,6 +1277,550 @@ mod tests {
         assert_eq!(sets[0]["spans"][0]["spanID"], "0101010101010101");
         assert_eq!(sets[1]["matched"], 3);
         assert_eq!(sets[1]["spans"].as_array().expect("spans").len(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #473: the wire domains of the four projected integers, the
+    // empty-root-service marker, and the off-response surfacing.
+    // ------------------------------------------------------------------
+
+    /// A one-trace, one-span output whose four PROJECTED integers are the
+    /// four arguments, and whose every string is free of the `-` byte —
+    /// so the minus-sign assertion in
+    /// [`negative_widths_and_starts_render_inside_the_wire_domain`] is
+    /// about the NUMBERS and cannot be satisfied, or defeated, by a name.
+    fn extreme_output(
+        trace_start_ns: i64,
+        trace_duration_ns: i64,
+        span_start_ns: i64,
+        span_duration_ns: i64,
+    ) -> SearchOutput {
+        SearchOutput {
+            traces: vec![TraceSearchResult {
+                trace_id: [0xab; 16],
+                root: RootSummary {
+                    service: "checkout".to_string(),
+                    name: "charge".to_string(),
+                    start_ns: span_start_ns,
+                    duration_ns: span_duration_ns,
+                },
+                trace_start_ns,
+                trace_duration_ns,
+                matched: 1,
+                spans: vec![SpanSummary {
+                    span_id: [0xcd; 8],
+                    name: "charge".to_string(),
+                    start_ns: span_start_ns,
+                    duration_ns: span_duration_ns,
+                    attributes: vec![],
+                }],
+                groups: None,
+            }],
+            partial: false,
+            returned: 1,
+            limit: 20,
+        }
+    }
+
+    /// Issue #473 AC 1: [`duration_ms`] returns the WIRE type and
+    /// saturates into it.
+    ///
+    /// Returning `u32` is what makes an out-of-domain `durationMs`
+    /// unconstructible at the call site; the values below are what make
+    /// the operation saturation rather than a wrap. `4294967296000000` ns
+    /// is `4294967296` ms — the exact first out-of-domain width, one past
+    /// the maximum, chosen because it is the boundary and not a
+    /// comfortable round number. A wrapping body answers `0` there.
+    #[test]
+    fn duration_ms_saturates_into_the_wire_uint32_domain() {
+        let mut report = DomainReport::default();
+        assert_eq!(
+            duration_ms(4_294_967_296_000_000, "t", &mut report),
+            4_294_967_295,
+            "the first out-of-domain width saturates at the wire maximum; a wrap answers 0"
+        );
+        assert_eq!(
+            duration_ms(4_294_967_295_999_999, "t", &mut report),
+            4_294_967_295,
+            "one nanosecond below the boundary is IN domain and must be unchanged"
+        );
+        assert_eq!(duration_ms(i64::MIN, "t", &mut report), 0);
+        assert_eq!(duration_ms(-1, "t", &mut report), 0);
+        // The saturation identity: two very different inputs, one output.
+        // A wrapping body gives 417264662 and 2077252342 here; the
+        // unclamped i64 this module used to return does not even fit the
+        // type.
+        assert_eq!(
+            duration_ms(9_007_199_254_740_993, "t", &mut report),
+            duration_ms(i64::MAX, "t", &mut report),
+            "saturation is the SAME number for two different over-maximum inputs"
+        );
+        assert_eq!(
+            u32::MAX,
+            4_294_967_295,
+            "the wire field is a 32-bit unsigned integer"
+        );
+    }
+
+    /// Issue #473 AC 2: [`wire_nanos`] clamps below zero and is the
+    /// identity above it. Every non-negative `i64` fits a `u64`, so the
+    /// upper clamp is inert by construction and `i64::MAX` must survive
+    /// exactly — a blanket "clamp everything to 32 bits" fix is wrong
+    /// here, and this is the case that says so.
+    #[test]
+    fn wire_nanos_clamps_below_zero_and_is_the_identity_above_it() {
+        let mut report = DomainReport::default();
+        for field in WireField::ALL {
+            assert_eq!(
+                wire_nanos(-1, field, "i", &mut report),
+                0,
+                "{}",
+                field.label()
+            );
+            assert_eq!(
+                wire_nanos(i64::MIN, field, "i", &mut report),
+                0,
+                "{}",
+                field.label()
+            );
+            assert_eq!(
+                wire_nanos(0, field, "i", &mut report),
+                0,
+                "{}",
+                field.label()
+            );
+            assert_eq!(
+                wire_nanos(i64::MAX, field, "i", &mut report),
+                9_223_372_036_854_775_807,
+                "{}: the upper clamp is inert, so i64::MAX must be the identity",
+                field.label()
+            );
+        }
+    }
+
+    /// Issue #473 AC 4 / AC 6 (the plan's Q6): a trace whose stored start
+    /// and width are NEGATIVE still renders, inside the wire domain, and
+    /// is still RETURNED — a wrong rejection is as bad as a wrong answer.
+    ///
+    /// The whole body is asserted byte-for-byte, so an added key, a
+    /// dropped trace and a changed value all fail here. The `-`-byte
+    /// assertion is the registry-free half: no field name, no key list,
+    /// nothing that has to be kept in step with the renderer. The fixture
+    /// carries no `-` in any string precisely so that byte can be the
+    /// subject.
+    ///
+    /// **This body reaches the changed code but not through HTTP.** The
+    /// negative branch is not reachable through any mounted write route:
+    /// all three funnel through `otlp_traces::resolve_duration_ns`, which
+    /// returns `0` for `end == 0` and for `end < start`, and the trace
+    /// envelope is folded in Rust with `saturating_add`. This case is
+    /// therefore unit-level by necessity, and the lower clamp has no live
+    /// coverage anywhere — stated rather than implied.
+    #[test]
+    fn negative_widths_and_starts_render_inside_the_wire_domain() {
+        let output = extreme_output(i64::MIN, -1, -1, i64::MIN);
+        let body = serde_json::to_string(&render(&output)).expect("render to JSON");
+        assert!(
+            !body.contains('-'),
+            "no integer this response emits may carry a minus sign — every one of them lands in \
+             an UNSIGNED wire field: {body}"
+        );
+        assert_eq!(
+            body,
+            r#"{"metrics":{"completedJobs":1,"totalJobs":1},"traces":[{"rootServiceName":"checkout","rootTraceName":"charge","spanSets":[{"matched":1,"spans":[{"name":"charge","spanID":"cdcdcdcdcdcdcdcd","startTimeUnixNano":"0"}]}],"startTimeUnixNano":"0","traceID":"abababababababababababababababab"}]}"#,
+            "the clamped-to-zero fields are OMITTED (protojson drops a default scalar) and the \
+             trace itself is still present: an absent FIELD is not an absent TRACE"
+        );
+        let v = render(&output);
+        assert!(v["traces"][0].get("durationMs").is_none());
+        assert!(
+            v["traces"][0]["spanSets"][0]["spans"][0]
+                .get("durationNanos")
+                .is_none()
+        );
+        assert_eq!(v["traces"][0]["startTimeUnixNano"], "0");
+        assert_eq!(
+            v["traces"][0]["spanSets"][0]["spans"][0]["startTimeUnixNano"],
+            "0"
+        );
+        assert_eq!(
+            v["traces"].as_array().expect("traces array").len(),
+            1,
+            "the trace is still returned"
+        );
+    }
+
+    /// The uint64-STRING keys the walk below knows about.
+    ///
+    /// **A registry of two names, and it cannot see a third.** A new
+    /// `uint64` field rendered as a protojson string under a key not
+    /// listed here would pass this test silently. The NUMBER half of the
+    /// walk is registry-free and has no such gap; this half is the
+    /// stated limit of the criterion, not an oversight.
+    const UINT64_STRING_KEYS: [&str; 2] = ["startTimeUnixNano", "durationNanos"];
+
+    /// Recursively asserts every integer-backed JSON number and every
+    /// listed uint64-string in `value` lies in its wire domain. `key` is
+    /// the object key `value` was found under, if any.
+    fn assert_wire_domains(value: &Value, key: Option<&str>, body: &str) {
+        match value {
+            // A `doubleValue` is a JSON float and is not the subject: its
+            // wire type is `double`, which has no integer domain.
+            Value::Number(n) if !n.is_f64() => {
+                let v = n.as_u64().unwrap_or_else(|| {
+                    panic!("{key:?}: {n} is not a non-negative integer, body {body}")
+                });
+                assert!(
+                    v <= u64::from(u32::MAX),
+                    "{key:?}: {v} is outside every unsigned integer domain this response \
+                     declares, body {body}"
+                );
+            }
+            Value::String(s) if key.is_some_and(|k| UINT64_STRING_KEYS.contains(&k)) => {
+                assert!(
+                    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()),
+                    "{key:?}: {s:?} must be ASCII digits only — a protojson uint64 is a STRING \
+                     and a minus sign in it is what a strict decoder refuses, body {body}"
+                );
+                s.parse::<u64>().unwrap_or_else(|e| {
+                    panic!("{key:?}: {s:?} must parse as u64: {e}, body {body}")
+                });
+            }
+            Value::Array(items) => {
+                for item in items {
+                    assert_wire_domains(item, key, body);
+                }
+            }
+            Value::Object(map) => {
+                for (k, v) in map {
+                    assert_wire_domains(v, Some(k.as_str()), body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Issue #473 AC 5: the response-wide domain walk.
+    ///
+    /// The projections return the wire type, which makes an out-of-domain
+    /// value unconstructible **at the four call sites that use them**.
+    /// That is construction, not proof: it says nothing about a FIFTH
+    /// call site written without a projection. This walk is what catches
+    /// that — for JSON numbers it is registry-free, naming no field and
+    /// needing no list, so `obj["durationMs"] = Value::from(raw_ns /
+    /// 1_000_000)` written directly fails it. For uint64 STRINGS it is a
+    /// registry of two key names and cannot see a new one; see
+    /// [`UINT64_STRING_KEYS`].
+    #[test]
+    fn every_integer_the_response_emits_lies_in_its_wire_domain() {
+        for output in [
+            extreme_output(i64::MIN, i64::MIN, i64::MIN, i64::MIN),
+            extreme_output(i64::MAX, i64::MAX, i64::MAX, i64::MAX),
+            sample_output(),
+        ] {
+            let v = render(&output);
+            let body = serde_json::to_string(&v).expect("render to JSON");
+            assert_wire_domains(&v, None, &body);
+        }
+    }
+
+    /// Issue #473 AC 6: the report counts one event per PROJECTED FIELD,
+    /// not one per response and not one per row.
+    ///
+    /// Dropping the `report` argument at any one of the four call sites
+    /// leaves three; recording once per response leaves one.
+    #[test]
+    fn the_domain_report_counts_one_event_per_projected_field() {
+        let output = extreme_output(i64::MIN, i64::MIN, i64::MIN, i64::MIN);
+        let mut report = DomainReport::default();
+        let _ = trace_json(&output.traces[0], &mut report);
+        assert_eq!(
+            report.total(),
+            4,
+            "all four projected integers are out of domain here: {report:?}"
+        );
+        for field in WireField::ALL {
+            assert_eq!(
+                report.counts[field.index()].iter().sum::<u64>(),
+                1,
+                "{} recorded no event: {report:?}",
+                field.label()
+            );
+        }
+
+        let mut healthy = DomainReport::default();
+        let _ = trace_json(&sample_output().traces[0], &mut healthy);
+        assert_eq!(
+            healthy.total(),
+            0,
+            "an ordinary response records nothing and allocates nothing: {healthy:?}"
+        );
+        assert!(healthy.first.is_none());
+    }
+
+    /// Renders `f` against a local Prometheus recorder and returns the
+    /// exposition text (the `ops.rs` pattern).
+    fn render_local(f: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    /// Asserts the exposition carries a `SATURATION_COUNTER` sample with
+    /// both label pairs, without depending on the exporter's label order.
+    fn assert_saturation_sample(rendered: &str, field: WireField, bound: Bound) {
+        let name = format!("{SATURATION_COUNTER}{{");
+        let field_label = format!("field=\"{}\"", field.label());
+        let bound_label = format!("bound=\"{}\"", bound.label());
+        assert!(
+            rendered.lines().any(|line| line.starts_with(&name)
+                && line.contains(&field_label)
+                && line.contains(&bound_label)),
+            "missing sample {SATURATION_COUNTER}{{{field_label},{bound_label}}} in:\n{rendered}"
+        );
+    }
+
+    /// Issue #473 AC 7: the surfacing is a counter and a log line, not a
+    /// field of the response body. A poisoned body names no span; a
+    /// labelled counter names the field and the bound.
+    #[test]
+    fn the_saturation_counter_is_emitted_once_per_projected_field() {
+        let below = extreme_output(i64::MIN, i64::MIN, i64::MIN, i64::MIN);
+        let above = extreme_output(i64::MAX, i64::MAX, i64::MAX, i64::MAX);
+        let rendered = render_local(|| {
+            render(&below);
+            render(&above);
+        });
+        for field in WireField::ALL {
+            assert_saturation_sample(&rendered, field, Bound::Below);
+        }
+        // `i64::MAX` ns is 9223372036854 ms, above the 32-bit maximum —
+        // the only one of the four whose UPPER clamp any `i64` can reach.
+        assert_saturation_sample(&rendered, WireField::TraceDurationMs, Bound::Above);
+
+        let healthy = render_local(|| {
+            render(&sample_output());
+        });
+        assert!(
+            !healthy.contains(SATURATION_COUNTER),
+            "an ordinary response emits no sample at all: {healthy}"
+        );
+    }
+
+    /// Issue #473 AC 8: the empty-root-service marker, and only where the
+    /// reference puts it. `rootTraceName` is never substituted, a
+    /// non-empty service is never substituted, and a
+    /// `by(rootServiceName)` group VALUE is never substituted — that is a
+    /// different field on a different code path, and the marker reaching
+    /// it would invent a group key nothing grouped by.
+    #[test]
+    fn an_empty_root_service_renders_the_reference_marker() {
+        let mut empty_service = sample_output();
+        empty_service.traces[0].root.service = String::new();
+        assert_eq!(
+            render(&empty_service)["traces"][0]["rootServiceName"],
+            "<root span not yet received>"
+        );
+
+        let mut empty_name = sample_output();
+        empty_name.traces[0].root.name = String::new();
+        assert_eq!(
+            render(&empty_name)["traces"][0]["rootTraceName"],
+            "",
+            "the reference substitutes the root SERVICE and nothing else"
+        );
+
+        assert_eq!(
+            render(&sample_output())["traces"][0]["rootServiceName"],
+            "checkout",
+            "a present service is never substituted"
+        );
+
+        let mut grouped = sample_output();
+        grouped.traces[0].groups = Some(vec![SpanSetGroup {
+            attributes: vec![(
+                "by(rootServiceName)".to_string(),
+                GroupValue::Str(String::new()),
+            )],
+            matched: 1,
+            spans: vec![],
+        }]);
+        assert_eq!(
+            render(&grouped)["traces"][0]["spanSets"][0]["attributes"][0]["value"],
+            serde_json::json!({"stringValue": ""}),
+            "a by(rootServiceName) group value is a different field on a different path and the \
+             marker must not reach it"
+        );
+    }
+
+    fn read_doc(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    }
+
+    /// Issue #473 AC 11(b): the saturation value documented in
+    /// docs/api.md §4.2 is DERIVED from [`duration_ms`], never restated.
+    /// Changing the documented number without changing the code fails
+    /// here, and so does the reverse.
+    #[test]
+    fn the_documented_saturation_value_is_derived_from_the_code() {
+        let api = read_doc("docs/api.md");
+        let saturated = duration_ms(i64::MAX, "", &mut DomainReport::default());
+        assert!(
+            api.contains(&format!("saturates** at `{saturated}` ms")),
+            "docs/api.md §4.2 must document the value duration_ms() actually returns"
+        );
+    }
+
+    /// Issue #473 AC 11(c): the new metric family is named in
+    /// docs/architecture.md §8, from the constant rather than a copy of
+    /// it — renaming the metric without touching the document fails here.
+    ///
+    /// The LABEL VOCABULARY is pinned the same way, and for a reason
+    /// worth stating: [`assert_saturation_sample`] builds its needles
+    /// from [`WireField::label`] and [`Bound::label`], so a renamed label
+    /// value would move the code and the assertion together and stay
+    /// green. The document is the independent side. A label rename now
+    /// has to be a deliberate documented change, which is what a metric
+    /// label is.
+    #[test]
+    fn the_saturation_counter_is_documented_in_the_architecture_metric_families() {
+        let arch = read_doc("docs/architecture.md");
+        assert!(
+            arch.contains(SATURATION_COUNTER),
+            "docs/architecture.md §8 must name {SATURATION_COUNTER}"
+        );
+        let bullet = arch
+            .lines()
+            .find(|line| line.contains(SATURATION_COUNTER))
+            .unwrap_or_else(|| {
+                panic!("docs/architecture.md §8 must carry a bullet naming {SATURATION_COUNTER}")
+            });
+        // Scoped to the VOCABULARY clause — not the whole document, and
+        // not even the whole bullet. Measured: the bullet's own closing
+        // sentence explains what a `below` sample means, so a search over
+        // the file, or over the line, stayed green when the vocabulary
+        // clause itself was edited to a different label. The domain the
+        // assertion checks now matches the domain its message claims.
+        let (vocabulary, rest) = bullet
+            .split_once("Incremented once per")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the {SATURATION_COUNTER} bullet must keep its `Incremented once per …` \
+                 sentence: it is what bounds the label vocabulary clause, and without it this \
+                 check silently widens to the whole bullet"
+                )
+            });
+        assert!(
+            !rest.trim().is_empty(),
+            "the bullet must say what the counter counts after its vocabulary clause"
+        );
+        for field in WireField::ALL {
+            assert!(
+                vocabulary.contains(&format!("`{}`", field.label())),
+                "the {SATURATION_COUNTER} bullet's label vocabulary must name the field label \
+                 {:?}, got {vocabulary:?}",
+                field.label()
+            );
+        }
+        for bound in Bound::ALL {
+            assert!(
+                vocabulary.contains(&format!("`{}`", bound.label())),
+                "the {SATURATION_COUNTER} bullet's label vocabulary must name the bound label \
+                 {:?}, got {vocabulary:?}",
+                bound.label()
+            );
+        }
+    }
+
+    /// Issue #473, review round 1: every label is pinned to its OWN
+    /// variant, as a literal.
+    ///
+    /// **A permutation is what the other two checks cannot see, and it is
+    /// a wrong answer rather than a cosmetic one.** Exchange
+    /// [`Bound::Below`]'s and [`Bound::Above`]'s labels and every
+    /// saturation event is reported under the opposite bound — a `below`
+    /// sample would mean a value clamped down from over the maximum,
+    /// which is the reverse of what the metric family documents, and an
+    /// operator reading `bound="below"` would conclude a stored value was
+    /// negative when it was enormous. Neither existing check fires on it:
+    /// [`assert_saturation_sample`] builds its needles from
+    /// [`WireField::label`] and [`Bound::label`], so the code and the
+    /// assertion move together, and
+    /// [`the_saturation_counter_is_documented_in_the_architecture_metric_families`]
+    /// tests only that each label STRING appears in the document, which a
+    /// permutation leaves true. Measured before this test existed: all 22
+    /// tests in this module passed with the two bound labels exchanged.
+    ///
+    /// The general form, since it has cost this issue two rounds: a check
+    /// that lists which values appear cannot see a change that reorders
+    /// which value goes with which. The claim here is a MAPPING — this
+    /// variant carries that label — so the test has to be a mapping too,
+    /// and the break that exercises it is a permutation, never a rename.
+    /// A rename is the break a membership check can still catch, which is
+    /// exactly why passing it proved less than it looked.
+    ///
+    /// [`WireField`] has the same shape and is pinned the same way: its
+    /// four labels are level-qualified precisely so a trace-level event
+    /// can be told from a span-level one, and a permutation would report
+    /// each event under the wrong level while leaving all four strings
+    /// present everywhere they are checked.
+    #[test]
+    fn every_label_belongs_to_its_own_variant() {
+        assert_eq!(Bound::Below.label(), "below");
+        assert_eq!(Bound::Above.label(), "above");
+
+        assert_eq!(
+            WireField::TraceStartTimeUnixNano.label(),
+            "trace.startTimeUnixNano"
+        );
+        assert_eq!(WireField::TraceDurationMs.label(), "trace.durationMs");
+        assert_eq!(
+            WireField::SpanStartTimeUnixNano.label(),
+            "span.startTimeUnixNano"
+        );
+        assert_eq!(WireField::SpanDurationNanos.label(), "span.durationNanos");
+
+        // The labels must also be DISTINCT, or a mapping that collapsed
+        // two variants onto one label would satisfy every equality above
+        // if both literals were edited to match. Cheap, and it closes the
+        // one edit that could make the block self-consistent and wrong.
+        let bounds: std::collections::BTreeSet<&str> =
+            Bound::ALL.iter().map(|b| b.label()).collect();
+        assert_eq!(bounds.len(), Bound::ALL.len(), "bound labels must differ");
+        let fields: std::collections::BTreeSet<&str> =
+            WireField::ALL.iter().map(|f| f.label()).collect();
+        assert_eq!(
+            fields.len(),
+            WireField::ALL.len(),
+            "field labels must differ"
+        );
+    }
+
+    /// Issue #473 AC 12: the ledger row exists and carries the content it
+    /// is load-bearing for — both the reference's values, the wrapped
+    /// 60-day number that makes the lower-bound argument concrete, the
+    /// cross-reference that makes this a rule rather than a one-off call,
+    /// and the route, without which the row goes stale invisibly.
+    #[test]
+    fn the_saturation_divergence_is_recorded_in_the_traces_ledger() {
+        let ledger = read_doc("docs/benchmarks/traces-differential-ledger.md");
+        for needle in [
+            "traceql-search-duration-ms-saturates-not-wraps",
+            "detected-fields-limit-saturates-not-wraps",
+            "889032704",
+            "2077252342",
+            "417264662",
+            "/api/search",
+        ] {
+            assert!(
+                ledger.contains(needle),
+                "docs/benchmarks/traces-differential-ledger.md must carry {needle:?}"
+            );
+        }
     }
 
     /// Issue #193: numeric / double / bool / nil group-key values render

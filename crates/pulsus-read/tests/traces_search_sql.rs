@@ -698,6 +698,13 @@ fn shipped_shapes_and_limits_are_documented() {
         "8192-byte",
         "2048 UTF-8 code points",
         "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
+        // Issue #473: the two search-response rules that are values
+        // rather than shapes — the empty-root-service marker, and the
+        // saturation identity (the same durationMs for two different
+        // over-maximum widths, which is what tells saturation from the
+        // reference's wrap).
+        "<root span not yet received>",
+        "the same number for two different inputs",
     ] {
         assert!(
             api.contains(needle),
