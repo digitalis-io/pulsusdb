@@ -440,6 +440,18 @@ async fn prom_request_deadline_answers_503_with_the_error_envelope() {
     // The negative half: the two kinds of excluded path keep the
     // byte-identical bare `408`. `/api/v1/write` is the one that would
     // catch a bare prefix test, and it is not optional.
+    //
+    // **Why these assert presence and absence rather than an exact header
+    // set**, unlike the hermetic twin in `middleware.rs`: a response off a
+    // real server has also passed through the globally-applied CORS and
+    // trace layers, so it additionally carries `access-control-allow-
+    // origin: *` and a `vary:` line — on **every** route, before and after
+    // issue #471 alike, and on the `405`s and `200`s too. Those are not
+    // this change's to pin, and pinning them here would make an unrelated
+    // CORS default a failure of the deadline suite. What is load-bearing
+    // is what the deadline layer itself contributes: the status, an empty
+    // body, and the ABSENCE of `Content-Type` — the last being what kept
+    // this response out of the set a client parses a body for.
     // -----------------------------------------------------------------
     let rw = valid_remote_write_body();
     let (status, headers, body) = request(

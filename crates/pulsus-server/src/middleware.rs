@@ -187,6 +187,11 @@ where
                 // exceeded 3s` where it had answered the bare `408`. The
                 // LogQL and TraceQL surfaces must stay byte-identical
                 // (issue #264), so the ordering is reproduced exactly.
+                //
+                // Pinned deterministically by
+                // `tests::the_deadline_wins_a_tie_against_an_inner_timeout_of_the_same_duration`:
+                // invert these two polls and it fails `left: 504, right:
+                // 408`, every run.
                 if sleep.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(Ok(match class {
                         DeadlineClass::PromApiEnvelope => {
@@ -616,7 +621,11 @@ mod tests {
         );
         for (path, want_status, want_body) in [
             ("/api/logs/v1/labels", StatusCode::REQUEST_TIMEOUT, ""),
-            ("/api/v1/query", StatusCode::SERVICE_UNAVAILABLE, prom_envelope),
+            (
+                "/api/v1/query",
+                StatusCode::SERVICE_UNAVAILABLE,
+                prom_envelope,
+            ),
         ] {
             let router: axum::Router = axum::Router::new()
                 .route("/api/logs/v1/labels", get(inner_deadline))
