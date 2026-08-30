@@ -234,15 +234,10 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
 
     let resource = ch_string("resource");
     let key = ch_string("k3");
-    let scoped_names = tag_names_sql("trace_tag_catalog", Some(&resource), TAG_NAMES_MAX + 1);
-    let unscoped_names = tag_names_sql("trace_tag_catalog", None, TAG_NAMES_MAX + 1);
-    let scoped_values = tag_values_sql(
-        "trace_tag_catalog",
-        &key,
-        Some(&resource),
-        TAG_VALUES_MAX + 1,
-    );
-    let unscoped_values = tag_values_sql("trace_tag_catalog", &key, None, TAG_VALUES_MAX + 1);
+    let scoped_names = tag_names_sql(Some(&resource), TAG_NAMES_MAX + 1);
+    let unscoped_names = tag_names_sql(None, TAG_NAMES_MAX + 1);
+    let scoped_values = tag_values_sql(&key, Some(&resource), TAG_VALUES_MAX + 1);
+    let unscoped_values = tag_values_sql(&key, None, TAG_VALUES_MAX + 1);
 
     // ---- Gate 1 (strict): scoped tag-names prune on the (scope) PK
     // prefix — selected strictly below the catalog total. ----------------
@@ -402,7 +397,6 @@ fn tight_budget_config() -> TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         spans_table: "trace_spans".to_string(),
         attrs_table: "trace_attrs_idx".to_string(),
-        catalog_table: "trace_tag_catalog".to_string(),
         edges_table: "trace_edges".to_string(),
         max_candidates: 100,
         scan_budget_rows: TIGHT_BUDGET_ROWS,

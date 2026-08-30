@@ -228,7 +228,6 @@ fn engine_config(scan_budget_rows: u64) -> TraceReadConfig {
         read_max_memory_bytes: 8 * 1024 * 1024 * 1024,
         spans_table: "trace_spans".to_string(),
         attrs_table: "trace_attrs_idx".to_string(),
-        catalog_table: "trace_tag_catalog".to_string(),
         edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows,

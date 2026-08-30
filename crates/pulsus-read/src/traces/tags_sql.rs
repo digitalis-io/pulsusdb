@@ -17,13 +17,28 @@
 //! [`crate::logql::escape::ch_string`] (quotes included) before they
 //! reach these builders — that is the injection boundary, not this
 //! module.
+//!
+//! The table name is a compile-time constant of this module
+//! ([`CATALOG_TABLE`]), not an input (issue #475): the only free strings
+//! either builder accepts are the two pre-escaped literal positions
+//! inside `WHERE`, so no caller can put a table, an alias or a subquery
+//! into the `FROM` clause.
+
+/// The one table both tag-discovery reads target. NEVER `_dist`-suffixed:
+/// migration 18 is `Replication::Global, family: None`, so no `_dist`
+/// wrapper exists to name and every catalog read is a local-replica
+/// primary-key-prefix scan with no coordinator fan-out (docs/schemas.md
+/// §4.1/§7). It is a constant of this module rather than a parameter or a
+/// config field precisely so that no caller can put anything else — a
+/// table, an alias, or a subquery — into the `FROM` clause.
+const CATALOG_TABLE: &str = "trace_tag_catalog";
 
 /// The `GET /api/traces/v1/tags` read: distinct `(scope, key)` pairs,
 /// optionally confined to one scope (a `(scope)` primary-key-prefix
 /// prune; the unscoped form is a full — small — catalog scan,
 /// docs/schemas.md §4.1).
-pub fn tag_names_sql(catalog_table: &str, scope_literal: Option<&str>, limit: usize) -> String {
-    let mut sql = format!("SELECT DISTINCT scope, key\nFROM {catalog_table}\n");
+pub fn tag_names_sql(scope_literal: Option<&str>, limit: usize) -> String {
+    let mut sql = format!("SELECT DISTINCT scope, key\nFROM {CATALOG_TABLE}\n");
     if let Some(scope) = scope_literal {
         sql.push_str(&format!("WHERE scope = {scope}\n"));
     }
@@ -35,13 +50,8 @@ pub fn tag_names_sql(catalog_table: &str, scope_literal: Option<&str>, limit: us
 /// one key, optionally scope-confined (a `(scope, key)` prefix prune;
 /// the unscoped form cannot prune the leading `scope` column and is
 /// documented as a full — small — catalog scan, docs/schemas.md §4.1).
-pub fn tag_values_sql(
-    catalog_table: &str,
-    key_literal: &str,
-    scope_literal: Option<&str>,
-    limit: usize,
-) -> String {
-    let mut sql = format!("SELECT DISTINCT val\nFROM {catalog_table}\nWHERE key = {key_literal}");
+pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usize) -> String {
+    let mut sql = format!("SELECT DISTINCT val\nFROM {CATALOG_TABLE}\nWHERE key = {key_literal}");
     if let Some(scope) = scope_literal {
         sql.push_str(&format!(" AND scope = {scope}"));
     }
@@ -61,11 +71,7 @@ mod tests {
     #[test]
     fn scoped_tag_names_sql_is_byte_exact() {
         assert_eq!(
-            tag_names_sql(
-                "trace_tag_catalog",
-                Some(&ch_string("resource")),
-                TAG_NAMES_MAX + 1
-            ),
+            tag_names_sql(Some(&ch_string("resource")), TAG_NAMES_MAX + 1),
             "SELECT DISTINCT scope, key\n\
              FROM trace_tag_catalog\n\
              WHERE scope = 'resource'\n\
@@ -77,7 +83,7 @@ mod tests {
     #[test]
     fn unscoped_tag_names_sql_is_byte_exact() {
         assert_eq!(
-            tag_names_sql("trace_tag_catalog", None, TAG_NAMES_MAX + 1),
+            tag_names_sql(None, TAG_NAMES_MAX + 1),
             "SELECT DISTINCT scope, key\n\
              FROM trace_tag_catalog\n\
              ORDER BY scope, key\n\
@@ -89,7 +95,6 @@ mod tests {
     fn scoped_tag_values_sql_is_byte_exact() {
         assert_eq!(
             tag_values_sql(
-                "trace_tag_catalog",
                 &ch_string("service.name"),
                 Some(&ch_string("resource")),
                 TAG_VALUES_MAX + 1
@@ -105,12 +110,7 @@ mod tests {
     #[test]
     fn unscoped_tag_values_sql_is_byte_exact() {
         assert_eq!(
-            tag_values_sql(
-                "trace_tag_catalog",
-                &ch_string("service.name"),
-                None,
-                TAG_VALUES_MAX + 1
-            ),
+            tag_values_sql(&ch_string("service.name"), None, TAG_VALUES_MAX + 1),
             "SELECT DISTINCT val\n\
              FROM trace_tag_catalog\n\
              WHERE key = 'service.name'\n\
@@ -123,15 +123,27 @@ mod tests {
     /// and stays inside its string literal.
     #[test]
     fn a_pre_escaped_hostile_key_stays_a_string_literal() {
-        let sql = tag_values_sql(
-            "trace_tag_catalog",
-            &ch_string("k'; DROP TABLE x; --"),
-            None,
-            TAG_VALUES_MAX + 1,
-        );
+        let sql = tag_values_sql(&ch_string("k'; DROP TABLE x; --"), None, TAG_VALUES_MAX + 1);
         assert!(
             sql.contains("WHERE key = 'k\\'; DROP TABLE x; --'"),
             "{sql}"
         );
+    }
+
+    /// The property the deleted `chconfig` test used to assert about a
+    /// config field, stated about the emitted SQL instead (issue #475):
+    /// no argument list makes either builder name a `_dist` table.
+    #[test]
+    fn neither_builder_can_name_a_dist_table() {
+        let scope = ch_string("resource");
+        let key = ch_string("service.name");
+        for sql in [
+            tag_names_sql(Some(&scope), TAG_NAMES_MAX + 1),
+            tag_names_sql(None, TAG_NAMES_MAX + 1),
+            tag_values_sql(&key, Some(&scope), TAG_VALUES_MAX + 1),
+            tag_values_sql(&key, None, TAG_VALUES_MAX + 1),
+        ] {
+            assert!(!sql.contains("_dist"), "{sql}");
+        }
     }
 }

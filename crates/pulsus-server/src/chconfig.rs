@@ -359,12 +359,6 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
     TraceReadConfig {
         spans_table: format!("trace_spans{dist}"),
         attrs_table: format!("trace_attrs_idx{dist}"),
-        // `trace_tag_catalog` NEVER carries a `_dist` suffix (issue #58):
-        // it is a global catalog table (migration 18, `Replication::Global`,
-        // `family: None` — no `_dist` wrapper exists to name), so tag
-        // discovery reads the local replica without fan-out — the
-        // `metric_metadata` carve-out pattern.
-        catalog_table: "trace_tag_catalog".to_string(),
         // `trace_edges` (M7-E1, issue #173) co-shards with `trace_spans` on
         // `cityHash64(trace_id)`, so it is `_dist`-aware exactly like
         // `spans_table`/`attrs_table` (the dist-suffix rule, not the catalog
@@ -825,7 +819,6 @@ mod tests {
         let cfg = trace_read_config_from(&config);
         assert_eq!(cfg.spans_table, "trace_spans");
         assert_eq!(cfg.attrs_table, "trace_attrs_idx");
-        assert_eq!(cfg.catalog_table, "trace_tag_catalog");
         assert_eq!(cfg.edges_table, "trace_edges");
         assert!(!cfg.distributed);
     }
@@ -841,20 +834,6 @@ mod tests {
         assert_eq!(cfg.attrs_table, "trace_attrs_idx_dist");
         assert_eq!(cfg.edges_table, "trace_edges_dist");
         assert!(cfg.distributed);
-    }
-
-    #[test]
-    fn trace_read_config_from_never_dist_suffixes_the_tag_catalog_when_clustered() {
-        let config = Config {
-            cluster: Some("prod".to_string()),
-            ..Config::default()
-        };
-        let cfg = trace_read_config_from(&config);
-        assert_eq!(
-            cfg.catalog_table, "trace_tag_catalog",
-            "trace_tag_catalog is a global catalog table (Replication::Global, no _dist \
-             wrapper) and must never carry a _dist suffix"
-        );
     }
 
     #[test]
