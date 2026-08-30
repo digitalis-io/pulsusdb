@@ -42,6 +42,7 @@ mod error;
 mod fetch_v2;
 mod graph;
 mod handlers;
+mod intrinsics;
 mod legacy;
 mod metrics;
 mod metrics_response;

@@ -21,7 +21,9 @@ use crate::app::AppState;
 
 use super::error::ApiError;
 use super::handlers::engine_for;
-use super::{params, tags_response};
+use super::params::{TagLookup, TagScope};
+use super::tags_response::{TagNamesAnswer, TagValuesAnswer};
+use super::{intrinsics, params, tags_response};
 
 /// `GET /api/traces/v1/tags` — scoped tag-name discovery.
 pub(crate) async fn tags(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
@@ -35,13 +37,45 @@ async fn tags_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
     // Parse before the pool: `scope=bogus` resolves 400 without
     // ClickHouse — the search surface's parse-before-engine ordering.
     let params = params::parse_tags_params(raw)?;
-    let engine = engine_for(&state).await?;
-    let names = engine.list_tag_names(params.scope.as_deref()).await?;
-    Ok((
-        StatusCode::OK,
-        Json(tags_response::render_tag_names(&names)),
-    )
-        .into_response())
+    // The two static scopes short-circuit before `engine_for`: they issue
+    // NO ClickHouse query at all (issue #475), which is what the
+    // zero-delta gate in `traces_tags_live.rs` measures.
+    let names = match params.scope {
+        TagScope::Intrinsic => {
+            return Ok(ok_json(tags_response::render_tag_names(
+                &TagNamesAnswer::IntrinsicOnly,
+            )));
+        }
+        TagScope::NoTags => {
+            return Ok(ok_json(tags_response::render_tag_names(
+                &TagNamesAnswer::NoTags,
+            )));
+        }
+        scope => {
+            let engine = engine_for(&state).await?;
+            engine.list_tag_names(attribute_scope(scope)).await?
+        }
+    };
+    Ok(ok_json(tags_response::render_tag_names(
+        &TagNamesAnswer::Catalog {
+            names: &names,
+            with_intrinsic: matches!(params.scope, TagScope::All),
+        },
+    )))
+}
+
+/// The catalog-read scope for the two scopes that reach the engine.
+/// `All` reads every attribute scope (the builder's own `IN` list);
+/// `Attribute` confines to one.
+pub(super) fn attribute_scope(scope: TagScope) -> Option<&'static str> {
+    match scope {
+        TagScope::Attribute(s) => Some(s),
+        TagScope::All | TagScope::Intrinsic | TagScope::NoTags => None,
+    }
+}
+
+pub(super) fn ok_json(body: serde_json::Value) -> Response {
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// `GET /api/traces/v1/tag/{tag}/values` — typed value discovery for one
@@ -55,14 +89,23 @@ pub(crate) async fn tag_values(State(state): State<AppState>, Path(tag): Path<St
 }
 
 async fn tag_values_impl(state: AppState, raw_tag: &str) -> Result<Response, ApiError> {
-    let (scope, key) = params::parse_tag_path(raw_tag)?;
-    let engine = engine_for(&state).await?;
-    let values = engine.list_tag_values(&key, scope.as_deref()).await?;
-    Ok((
-        StatusCode::OK,
-        Json(tags_response::render_tag_values(&values)),
-    )
-        .into_response())
+    // An intrinsic spelling is answered from the static vocabulary with
+    // no ClickHouse query (issue #475) — bypassing the catalog rather
+    // than unioning with it is what stops a bare `name` or `status`
+    // lookup answering out of a reserved intrinsic scope or a
+    // same-named user attribute.
+    match params::parse_tag_lookup(raw_tag)? {
+        TagLookup::Intrinsic(intrinsic) => Ok(ok_json(tags_response::render_tag_values(
+            &TagValuesAnswer::Static(intrinsics::intrinsic_tag_values(intrinsic)),
+        ))),
+        TagLookup::Attribute { scope, key } => {
+            let engine = engine_for(&state).await?;
+            let values = engine.list_tag_values(&key, scope.as_deref()).await?;
+            Ok(ok_json(tags_response::render_tag_values(
+                &TagValuesAnswer::Catalog(&values),
+            )))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,11 @@
 //! reach these builders — that is the injection boundary, not this
 //! module.
 //!
+//! A read is confined to ONE scope or to [`ATTR_SCOPES`]; there is no
+//! form that reads every scope in the table, so the writer-reserved
+//! intrinsic scopes ([`RESERVED_INTRINSIC_SCOPES`]) can never answer an
+//! attribute lookup or appear in a tag listing (issue #475).
+//!
 //! The table name is a compile-time constant of this module
 //! ([`CATALOG_TABLE`]), not an input (issue #475): the only free strings
 //! either builder accepts are the two pre-escaped literal positions
@@ -33,27 +38,55 @@
 /// table, an alias, or a subquery — into the `FROM` clause.
 const CATALOG_TABLE: &str = "trace_tag_catalog";
 
+/// The five scopes `trace_attrs_idx` carries for sender-supplied
+/// ATTRIBUTES, ascending (issue #475). This constant is the single source
+/// of truth for the whole scope surface: the SQL `IN` list below, the
+/// `scope=` accept list (`traces_api::params::parse_tags_params`) and the
+/// `{tag}` prefix set (`parse_tag_lookup`) all derive from it.
+pub const ATTR_SCOPES: [&str; 5] = ["event", "instrumentation", "link", "resource", "span"];
+
+/// The two scopes the writer reserves for INTRINSIC rows
+/// (`pulsus-write`'s `otlp_traces`), ascending. Their rows hold intrinsic
+/// values under reserved keys (`name`, `timeSinceStart`, `spanID`,
+/// `traceID`), so an attribute lookup must never answer out of them —
+/// which is what a bare-key read did before issue #475. Declared here,
+/// rather than implied by absence, so `trace_scope_vocabulary.rs` can
+/// state the writer/reader relation as an equality instead of two
+/// presence checks.
+pub const RESERVED_INTRINSIC_SCOPES: [&str; 2] = ["event:intrinsic", "link:intrinsic"];
+
+/// The rendered SQL `IN` list for [`ATTR_SCOPES`]. A literal, so the
+/// builders stay pure concatenation; pinned against the constant by
+/// `attr_scopes_in_list_matches_the_constant`.
+const ATTR_SCOPES_IN: &str = "('event', 'instrumentation', 'link', 'resource', 'span')";
+
 /// The `GET /api/traces/v1/tags` read: distinct `(scope, key)` pairs,
-/// optionally confined to one scope (a `(scope)` primary-key-prefix
-/// prune; the unscoped form is a full — small — catalog scan,
-/// docs/schemas.md §4.1).
+/// either confined to one scope (a `(scope)` primary-key-prefix prune) or
+/// to [`ATTR_SCOPES`] (an `IN` list on the same leading column, so the
+/// unscoped form prunes too and the writer-reserved intrinsic scopes can
+/// never be listed as attribute tags — issue #475).
 pub fn tag_names_sql(scope_literal: Option<&str>, limit: usize) -> String {
     let mut sql = format!("SELECT DISTINCT scope, key\nFROM {CATALOG_TABLE}\n");
-    if let Some(scope) = scope_literal {
-        sql.push_str(&format!("WHERE scope = {scope}\n"));
+    match scope_literal {
+        Some(scope) => sql.push_str(&format!("WHERE scope = {scope}\n")),
+        None => sql.push_str(&format!("WHERE scope IN {ATTR_SCOPES_IN}\n")),
     }
     sql.push_str(&format!("ORDER BY scope, key\nLIMIT {limit}"));
     sql
 }
 
 /// The `GET /api/traces/v1/tag/{tag}/values` read: distinct `val`s for
-/// one key, optionally scope-confined (a `(scope, key)` prefix prune;
-/// the unscoped form cannot prune the leading `scope` column and is
-/// documented as a full — small — catalog scan, docs/schemas.md §4.1).
+/// one key, either confined to one scope (a `(scope, key)` prefix prune)
+/// or to [`ATTR_SCOPES`] (issue #475). A bare-key lookup answers out of
+/// the five attribute scopes ONLY: the two reserved intrinsic scopes hold
+/// intrinsic values under keys a sender can also use (`name`, `spanID`),
+/// and before this predicate existed those rows answered attribute
+/// lookups.
 pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usize) -> String {
     let mut sql = format!("SELECT DISTINCT val\nFROM {CATALOG_TABLE}\nWHERE key = {key_literal}");
-    if let Some(scope) = scope_literal {
-        sql.push_str(&format!(" AND scope = {scope}"));
+    match scope_literal {
+        Some(scope) => sql.push_str(&format!(" AND scope = {scope}")),
+        None => sql.push_str(&format!(" AND scope IN {ATTR_SCOPES_IN}")),
     }
     sql.push_str(&format!("\nORDER BY val\nLIMIT {limit}"));
     sql
@@ -86,6 +119,7 @@ mod tests {
             tag_names_sql(None, TAG_NAMES_MAX + 1),
             "SELECT DISTINCT scope, key\n\
              FROM trace_tag_catalog\n\
+             WHERE scope IN ('event', 'instrumentation', 'link', 'resource', 'span')\n\
              ORDER BY scope, key\n\
              LIMIT 10001"
         );
@@ -113,7 +147,8 @@ mod tests {
             tag_values_sql(&ch_string("service.name"), None, TAG_VALUES_MAX + 1),
             "SELECT DISTINCT val\n\
              FROM trace_tag_catalog\n\
-             WHERE key = 'service.name'\n\
+             WHERE key = 'service.name' AND scope IN ('event', 'instrumentation', 'link', \
+             'resource', 'span')\n\
              ORDER BY val\n\
              LIMIT 1001"
         );
@@ -128,6 +163,32 @@ mod tests {
             sql.contains("WHERE key = 'k\\'; DROP TABLE x; --'"),
             "{sql}"
         );
+    }
+
+    /// Issue #475 AC17: the rendered `IN` list is the constant, not a
+    /// second hand-maintained list. Reordering or editing [`ATTR_SCOPES`]
+    /// without editing [`ATTR_SCOPES_IN`] fails here rather than silently
+    /// widening or narrowing what a bare-key lookup reads.
+    #[test]
+    fn attr_scopes_in_list_matches_the_constant() {
+        let rendered = ATTR_SCOPES
+            .iter()
+            .map(|s| ch_string(s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(ATTR_SCOPES_IN, format!("({rendered})"));
+    }
+
+    /// Issue #475: the two reader scope lists are disjoint, so a scope
+    /// keyword can never be both an attribute scope and a reserved one.
+    #[test]
+    fn the_two_scope_lists_are_disjoint() {
+        for reserved in RESERVED_INTRINSIC_SCOPES {
+            assert!(
+                !ATTR_SCOPES.contains(&reserved),
+                "{reserved} is in both scope lists"
+            );
+        }
     }
 
     /// The property the deleted `chconfig` test used to assert about a

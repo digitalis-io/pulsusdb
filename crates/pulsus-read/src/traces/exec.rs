@@ -1484,9 +1484,11 @@ impl TraceEngine {
     /// Bounded by the SQL `LIMIT` cap + 1 probe: at most
     /// [`TAG_NAMES_MAX`] rows return, and the probe row (row cap + 1)
     /// flips `truncated` instead of shipping a silent subset. The `LIMIT`
-    /// bounds *returned* rows only — an unscoped read has no `WHERE`
-    /// predicate, so it is a full catalog scan; [`catalog_settings`]
-    /// (issue #58 re-review) bounds *scanned* rows: a breach maps through
+    /// bounds *returned* rows only; an unscoped read carries the
+    /// `scope IN (…)` attribute-scope predicate on the catalog's leading
+    /// primary-key column (issue #475), so it prunes rather than scanning
+    /// the whole table, and [`catalog_settings`] (issue #58 re-review)
+    /// bounds *scanned* rows regardless: a breach maps through
     /// [`map_trace_read_error`] to `422 query_too_broad` instead of
     /// running unbounded.
     pub async fn list_tag_names(&self, scope: Option<&str>) -> Result<TagNames, ReadError> {
@@ -1516,9 +1518,11 @@ impl TraceEngine {
     /// one key, optionally scope-confined — same catalog-only,
     /// escape-at-the-engine, `LIMIT` cap + 1 probe, and [`catalog_settings`]
     /// read-budget contract as [`Self::list_tag_names`], capped at
-    /// [`TAG_VALUES_MAX`]. A bare-key lookup (no `scope`) cannot prune the
-    /// catalog's leading `(scope, key, val)` primary-key column, so it is
-    /// a full scan bounded only by the budget.
+    /// [`TAG_VALUES_MAX`]. A bare-key lookup (no `scope`) prunes the
+    /// catalog's leading `(scope, key, val)` primary-key column on the
+    /// `scope IN (…)` attribute-scope list (issue #475), so it reads the
+    /// five attribute scopes and never the writer-reserved intrinsic
+    /// ones.
     pub async fn list_tag_values(
         &self,
         key: &str,

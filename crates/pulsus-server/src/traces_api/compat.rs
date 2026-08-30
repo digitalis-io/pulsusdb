@@ -12,7 +12,6 @@
 //! differs, per renderer (`tags_response.rs`). Mounting is
 //! `compat_router()`'s job (`mod.rs`), gated by `crate::compat`.
 
-use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -23,20 +22,71 @@ use crate::app::AppState;
 
 use super::error::ApiError;
 use super::handlers::engine_for;
-use super::{params, tags_response};
+use super::params::{TagLookup, TagScope};
+use super::tags::{attribute_scope, ok_json};
+use super::tags_response::{TagNamesAnswer, TagValuesAnswer};
+use super::{intrinsics, params, tags_response};
 
-/// Shared fetch for both tag-name reshapings — parse-before-pool, then
-/// the exact catalog read `tags::tags` performs.
-async fn tag_names_for(state: AppState, raw: &str) -> Result<TagNames, ApiError> {
-    let params = params::parse_tags_params(raw)?;
-    let engine = engine_for(&state).await?;
-    Ok(engine.list_tag_names(params.scope.as_deref()).await?)
+/// What a names alias must render: either a static answer that issued no
+/// query, or the catalog rows plus the scope that selected them.
+enum NamesSource {
+    Static(TagScope),
+    Catalog { names: TagNames, scope: TagScope },
 }
 
-/// Shared fetch for both tag-value reshapings — parse-before-pool, then
+/// Shared fetch for both tag-name reshapings — parse-before-pool, then
+/// the exact catalog read `tags::tags` performs, EXCEPT for the two
+/// static scopes, which return without touching the pool (issue #475).
+async fn tag_names_for(state: AppState, raw: &str) -> Result<NamesSource, ApiError> {
+    let params = params::parse_tags_params(raw)?;
+    match params.scope {
+        scope @ (TagScope::Intrinsic | TagScope::NoTags) => Ok(NamesSource::Static(scope)),
+        scope => {
+            let engine = engine_for(&state).await?;
+            let names = engine.list_tag_names(attribute_scope(scope)).await?;
+            Ok(NamesSource::Catalog { names, scope })
+        }
+    }
+}
+
+impl NamesSource {
+    /// `with_intrinsic` is the caller's, because the two scoped aliases
+    /// carry the intrinsic scope on an unscoped listing and the v1 flat
+    /// alias never does.
+    fn answer(&self, with_intrinsic: bool) -> TagNamesAnswer<'_> {
+        match self {
+            Self::Static(TagScope::Intrinsic) => TagNamesAnswer::IntrinsicOnly,
+            Self::Static(_) => TagNamesAnswer::NoTags,
+            Self::Catalog { names, scope } => TagNamesAnswer::Catalog {
+                names,
+                with_intrinsic: with_intrinsic && matches!(scope, TagScope::All),
+            },
+        }
+    }
+}
+
+/// Shared fetch for the v2 tag-value reshaping — parse-before-pool, then
 /// the exact catalog read `tags::tag_values` performs (the query string
-/// is ignored entirely, same contract as native).
-async fn tag_values_for(state: AppState, raw_tag: &str) -> Result<TagValues, ApiError> {
+/// is ignored entirely, same contract as native), or the static
+/// vocabulary with no query at all.
+async fn tag_values_for(
+    state: AppState,
+    raw_tag: &str,
+) -> Result<Result<TagValues, pulsus_traceql::Intrinsic>, ApiError> {
+    match params::parse_tag_lookup(raw_tag)? {
+        TagLookup::Intrinsic(intrinsic) => Ok(Err(intrinsic)),
+        TagLookup::Attribute { scope, key } => {
+            let engine = engine_for(&state).await?;
+            Ok(Ok(engine.list_tag_values(&key, scope.as_deref()).await?))
+        }
+    }
+}
+
+/// The v1 FLAT values alias keeps the attribute-only reading
+/// (`parse_tag_path`): it serves no static values, matching the
+/// reference, which answers the same lookup differently on its v1 and v2
+/// routes (ledger row `traceql-v1-tag-values-statics-unimplemented`).
+async fn tag_values_v1_for(state: AppState, raw_tag: &str) -> Result<TagValues, ApiError> {
     let (scope, key) = params::parse_tag_path(raw_tag)?;
     let engine = engine_for(&state).await?;
     Ok(engine.list_tag_values(&key, scope.as_deref()).await?)
@@ -45,11 +95,7 @@ async fn tag_values_for(state: AppState, raw_tag: &str) -> Result<TagValues, Api
 /// `GET /api/search/tags` — Tempo v1 flat `{"tagNames":[…]}`.
 pub(crate) async fn tags_v1(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     match tag_names_for(state, raw.as_deref().unwrap_or("")).await {
-        Ok(names) => (
-            StatusCode::OK,
-            Json(tags_response::render_tag_names_flat(&names)),
-        )
-            .into_response(),
+        Ok(source) => ok_json(tags_response::render_tag_names_flat(&source.answer(false))),
         Err(e) => e.into_response(),
     }
 }
@@ -60,12 +106,8 @@ pub(crate) async fn tag_values_v1(
     State(state): State<AppState>,
     Path(tag): Path<String>,
 ) -> Response {
-    match tag_values_for(state, &tag).await {
-        Ok(values) => (
-            StatusCode::OK,
-            Json(tags_response::render_tag_values_flat(&values)),
-        )
-            .into_response(),
+    match tag_values_v1_for(state, &tag).await {
+        Ok(values) => ok_json(tags_response::render_tag_values_flat(&values)),
         Err(e) => e.into_response(),
     }
 }
@@ -74,11 +116,9 @@ pub(crate) async fn tag_values_v1(
 /// `truncated`.
 pub(crate) async fn tags_v2(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
     match tag_names_for(state, raw.as_deref().unwrap_or("")).await {
-        Ok(names) => (
-            StatusCode::OK,
-            Json(tags_response::render_tag_names_scoped_v2(&names)),
-        )
-            .into_response(),
+        Ok(source) => ok_json(tags_response::render_tag_names_scoped_v2(
+            &source.answer(true),
+        )),
         Err(e) => e.into_response(),
     }
 }
@@ -90,11 +130,12 @@ pub(crate) async fn tag_values_v2(
     Path(tag): Path<String>,
 ) -> Response {
     match tag_values_for(state, &tag).await {
-        Ok(values) => (
-            StatusCode::OK,
-            Json(tags_response::render_tag_values_typed_v2(&values)),
-        )
-            .into_response(),
+        Ok(Ok(values)) => ok_json(tags_response::render_tag_values_typed_v2(
+            &TagValuesAnswer::Catalog(&values),
+        )),
+        Ok(Err(intrinsic)) => ok_json(tags_response::render_tag_values_typed_v2(
+            &TagValuesAnswer::Static(intrinsics::intrinsic_tag_values(intrinsic)),
+        )),
         Err(e) => e.into_response(),
     }
 }
