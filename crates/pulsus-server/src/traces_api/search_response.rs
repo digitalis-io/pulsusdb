@@ -172,8 +172,9 @@ struct DomainReport {
 }
 
 impl DomainReport {
-    /// `below` is `true` for the lower clamp and `false` for the upper
-    /// one. (This signature is the one the issue #473 plan specifies.)
+    /// `below` is `true` when the value was clamped up from under the
+    /// field's minimum and `false` when it was clamped down from over
+    /// its maximum.
     fn record(&mut self, field: WireField, id: &str, value: i64, below: bool) {
         self.counts[field.index()][usize::from(!below)] += 1;
         if self.first.is_none() {
