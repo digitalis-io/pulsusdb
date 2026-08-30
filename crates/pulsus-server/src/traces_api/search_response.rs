@@ -923,9 +923,16 @@ mod tests {
         assert_ne!(
             saturating[0].1, saturating[1].1,
             "the two CAPTURED reference values must differ from each other — a pair that agrees \
-             cannot discriminate anything, and editing either capture to match us destroys the \
-             only evidence in this fixture: {saturating:?}"
+             cannot discriminate anything: {saturating:?}"
         );
+        for (duration_ns, theirs, ours) in &saturating {
+            assert_ne!(
+                *theirs,
+                i64::from(*ours),
+                "{duration_ns} ns: the CAPTURE is evidence and is never edited to match us — a \
+                 captured value equal to ours means the fixture was changed, not the reference"
+            );
+        }
         assert_eq!(
             saturating[0].2, saturating[1].2,
             "ours must be the SAME number for two different inputs: that is what saturation \
