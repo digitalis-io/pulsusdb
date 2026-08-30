@@ -80,8 +80,8 @@
 //! explicitly is what makes the duplicate-`Content-Type` trap testable.
 //!
 //! **What this does NOT cover: the routing layer.** Rejections made above
-//! the handlers — axum's own 404/405, and the server-wide `TimeoutLayer`'s
-//! 408 — are not written by this module. They diverge from the reference,
+//! the handlers — axum's own 404/405, and the server-wide request-deadline
+//! layer's 408 — are not written by this module. They diverge from the reference,
 //! they pre-date #384, and it neither changed nor covers them (the same
 //! boundary #264 drew for LogQL).
 //!
@@ -128,8 +128,8 @@ use super::params::{
 /// `graph.rs`, `compat.rs`) and, at this commit, every route handler
 /// either cannot fail (`compat::echo`, a constant 200) or renders its
 /// error through this enum. Responses made ABOVE the handlers are not
-/// `ApiError`s and are not in the table — the server-wide `TimeoutLayer`'s
-/// 408 (`middleware.rs`) and axum's own 404/405 for an unmounted path or
+/// `ApiError`s and are not in the table — the server-wide request-deadline
+/// layer's 408 (`middleware.rs`) and axum's own 404/405 for an unmounted path or
 /// method.
 ///
 /// Issue #384 dropped the machine-readable type column with the JSON
@@ -375,7 +375,7 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
         // NOT a malformed request — which is why it is split out of the
         // uniform 400 below. A cancelled evaluation means the awaiting
         // request future was already dropped: a client disconnect, or the
-        // server-wide `TimeoutLayer` firing first (`middleware.rs`, itself
+        // server-wide request-deadline layer firing first (`middleware.rs`, itself
         // a 408). 400 would accuse the client of a bad query. 408 is this
         // surface's documented status for the ClickHouse read timeout
         // (docs/api.md §4.1-§4.3). Pinned by
@@ -393,7 +393,8 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, String) {
         // differ here: `prom_api` splits the same eleven `PromqlError`
         // inners three ways — read `prom_api::error::promql_error_parts`;
         // as read at this commit, three on 400 `bad_data`, seven on 422
-        // `execution`, `Cancelled` on 408. This surface keeps the uniform
+        // `execution`, `Cancelled` on 503 (issue #471 M2 moved it off 408
+        // when that surface's deadline moved). This surface keeps the uniform
         // 400 on purpose, and puts its declined-query class on 422 in the
         // arms above (docs/api.md §4.2/§4.3/§4.4).
         ReadError::Parse(_)
@@ -705,7 +706,7 @@ mod tests {
 
     /// Issue #266 review round 1: a cancelled PromQL evaluation is a
     /// dropped request future (client disconnect, or the server's own 408
-    /// `TimeoutLayer`), never malformed input — 408, not the uniform 400
+    /// request-deadline layer), never malformed input — 408, not the uniform 400
     /// of the arm below it.
     #[tokio::test]
     async fn a_cancelled_promql_evaluation_maps_to_408_not_400() {

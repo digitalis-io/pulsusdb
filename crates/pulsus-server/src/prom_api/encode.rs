@@ -638,30 +638,48 @@ pub(crate) fn query_response_annotated(
 // amendment: "emitted ... on the two query endpoints only").
 // ---------------------------------------------------------------------
 
+/// The truncation warning for the three discovery endpoints (issue #471
+/// M4) — the reference's own string, byte-for-byte.
+pub(crate) const TRUNCATION_WARNING: &str = "results truncated due to limit";
+
+/// The `]}`/`],"warnings":[...]}` suffix for the discovery encoders (issue
+/// #471 M4). `None` produces today's bytes exactly, so every existing body
+/// assertion stays green; `Some` appends `warnings` as a **top-level
+/// sibling of `data`** — the position the client looks in, and the one
+/// [`annotations_suffix`] already uses on the query path.
+fn array_suffix(warning: Option<&'static str>) -> Vec<u8> {
+    match warning {
+        None => b"]}".to_vec(),
+        Some(w) => format!("],\"warnings\":[{}]}}", json_string(w)).into_bytes(),
+    }
+}
+
 /// Encodes a `labels`/`label/{name}/values` result: `{"status":"success",
-/// "data":["name1",...]}`.
-pub(crate) fn string_array_response(items: Vec<String>) -> Response {
+/// "data":["name1",...]}`, plus a top-level `warnings` array when the
+/// discovery `limit` actually truncated the result (issue #471 M4).
+pub(crate) fn string_array_response(items: Vec<String>, warning: Option<&'static str>) -> Response {
     let prefix = b"{\"status\":\"success\",\"data\":[".to_vec();
-    let suffix = b"]}".to_vec();
     json_response(stream_array(
         prefix,
         items,
         |s: &String| json_string(s).into_bytes(),
-        suffix,
+        array_suffix(warning),
     ))
 }
 
 /// Encodes a `series` result: `{"status":"success","data":[{k:v...},...]}`
 /// — each item is a full label-pair vector, `__name__` already spliced in
-/// by `MetricsEngine::series`.
-pub(crate) fn series_response(items: Vec<Vec<(String, String)>>) -> Response {
+/// by `MetricsEngine::series`. `warning` as in [`string_array_response`].
+pub(crate) fn series_response(
+    items: Vec<Vec<(String, String)>>,
+    warning: Option<&'static str>,
+) -> Response {
     let prefix = b"{\"status\":\"success\",\"data\":[".to_vec();
-    let suffix = b"]}".to_vec();
     json_response(stream_array(
         prefix,
         items,
         |pairs: &Vec<(String, String)>| labels_object_json(pairs).into_bytes(),
-        suffix,
+        array_suffix(warning),
     ))
 }
 
@@ -1350,28 +1368,75 @@ mod tests {
 
     #[tokio::test]
     async fn string_array_envelope_is_byte_exact() {
-        let res = string_array_response(vec!["__name__".to_string(), "job".to_string()]);
+        let res = string_array_response(vec!["__name__".to_string(), "job".to_string()], None);
         let body = body_string(res).await;
         assert_eq!(body, r#"{"status":"success","data":["__name__","job"]}"#);
     }
 
     #[tokio::test]
     async fn empty_string_array_response_renders_an_empty_data_array() {
-        let res = string_array_response(vec![]);
+        let res = string_array_response(vec![], None);
         let body = body_string(res).await;
         assert_eq!(body, r#"{"status":"success","data":[]}"#);
     }
 
     #[tokio::test]
     async fn series_envelope_is_byte_exact_for_a_single_series() {
-        let res = series_response(vec![vec![
-            ("__name__".to_string(), "up".to_string()),
-            ("job".to_string(), "api".to_string()),
-        ]]);
+        let res = series_response(
+            vec![vec![
+                ("__name__".to_string(), "up".to_string()),
+                ("job".to_string(), "api".to_string()),
+            ]],
+            None,
+        );
         let body = body_string(res).await;
         assert_eq!(
             body,
             r#"{"status":"success","data":[{"__name__":"up","job":"api"}]}"#
+        );
+    }
+
+    /// Issue #471 M4, criterion 19: the truncation warning is a TOP-LEVEL
+    /// sibling of `data`, never nested inside it, and `None` keeps today's
+    /// bytes exactly.
+    #[tokio::test]
+    async fn string_array_response_appends_the_warning_as_a_top_level_sibling() {
+        let res = string_array_response(vec!["a".to_string()], Some(TRUNCATION_WARNING));
+        assert_eq!(
+            body_string(res).await,
+            r#"{"status":"success","data":["a"],"warnings":["results truncated due to limit"]}"#
+        );
+        let res = string_array_response(vec!["a".to_string()], None);
+        assert_eq!(
+            body_string(res).await,
+            r#"{"status":"success","data":["a"]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn series_response_appends_the_warning_as_a_top_level_sibling() {
+        let res = series_response(
+            vec![vec![("__name__".to_string(), "up".to_string())]],
+            Some(TRUNCATION_WARNING),
+        );
+        assert_eq!(
+            body_string(res).await,
+            concat!(
+                r#"{"status":"success","data":[{"__name__":"up"}],"#,
+                r#""warnings":["results truncated due to limit"]}"#
+            )
+        );
+    }
+
+    /// An empty `data` array still carries the warning outside it — the
+    /// suffix is the only place the bytes can come from, so a `limit` that
+    /// truncated everything cannot silently lose the warning.
+    #[tokio::test]
+    async fn an_empty_array_still_carries_the_warning_outside_data() {
+        let res = string_array_response(vec![], Some(TRUNCATION_WARNING));
+        assert_eq!(
+            body_string(res).await,
+            r#"{"status":"success","data":[],"warnings":["results truncated due to limit"]}"#
         );
     }
 
@@ -1609,7 +1674,7 @@ mod tests {
     #[tokio::test]
     async fn gzip_series_response_matches_identity_byte_for_byte() {
         fn build() -> Response {
-            series_response(vec![vec![("__name__".to_string(), "up".to_string())]])
+            series_response(vec![vec![("__name__".to_string(), "up".to_string())]], None)
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
     }
@@ -2107,36 +2172,42 @@ mod tests {
         #[tokio::test]
         async fn labels_with_match_matches_the_captured_prometheus_response() {
             let fixture = include_str!("../../tests/fixtures/prom_api/labels.with_match_get.json");
-            let res = string_array_response(vec![
-                "__name__".to_string(),
-                "instance".to_string(),
-                "job".to_string(),
-            ]);
+            let res = string_array_response(
+                vec![
+                    "__name__".to_string(),
+                    "instance".to_string(),
+                    "job".to_string(),
+                ],
+                None,
+            );
             assert_eq!(body_string(res).await, fixture);
         }
 
         #[tokio::test]
         async fn label_values_job_matches_the_captured_prometheus_response() {
             let fixture = include_str!("../../tests/fixtures/prom_api/label_values.job_get.json");
-            let res = string_array_response(vec!["api".to_string(), "node".to_string()]);
+            let res = string_array_response(vec!["api".to_string(), "node".to_string()], None);
             assert_eq!(body_string(res).await, fixture);
         }
 
         #[tokio::test]
         async fn series_with_match_matches_the_captured_prometheus_response() {
             let fixture = include_str!("../../tests/fixtures/prom_api/series.with_match_get.json");
-            let res = series_response(vec![
+            let res = series_response(
                 vec![
-                    ("__name__".to_string(), "up".to_string()),
-                    ("instance".to_string(), "localhost:9100".to_string()),
-                    ("job".to_string(), "node".to_string()),
+                    vec![
+                        ("__name__".to_string(), "up".to_string()),
+                        ("instance".to_string(), "localhost:9100".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    vec![
+                        ("__name__".to_string(), "up".to_string()),
+                        ("instance".to_string(), "localhost:9101".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
                 ],
-                vec![
-                    ("__name__".to_string(), "up".to_string()),
-                    ("instance".to_string(), "localhost:9101".to_string()),
-                    ("job".to_string(), "node".to_string()),
-                ],
-            ]);
+                None,
+            );
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -2147,22 +2218,25 @@ mod tests {
         #[tokio::test]
         async fn series_name_regex_matches_the_captured_prometheus_response() {
             let fixture = include_str!("../../tests/fixtures/prom_api/series.name_regex_get.json");
-            let res = series_response(vec![
+            let res = series_response(
                 vec![
-                    ("__name__".to_string(), "up".to_string()),
-                    ("instance".to_string(), "localhost:9100".to_string()),
-                    ("job".to_string(), "node".to_string()),
+                    vec![
+                        ("__name__".to_string(), "up".to_string()),
+                        ("instance".to_string(), "localhost:9100".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    vec![
+                        ("__name__".to_string(), "up".to_string()),
+                        ("instance".to_string(), "localhost:9101".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    vec![
+                        ("__name__".to_string(), "up_alias".to_string()),
+                        ("instance".to_string(), "localhost:9100".to_string()),
+                    ],
                 ],
-                vec![
-                    ("__name__".to_string(), "up".to_string()),
-                    ("instance".to_string(), "localhost:9101".to_string()),
-                    ("job".to_string(), "node".to_string()),
-                ],
-                vec![
-                    ("__name__".to_string(), "up_alias".to_string()),
-                    ("instance".to_string(), "localhost:9100".to_string()),
-                ],
-            ]);
+                None,
+            );
             assert_eq!(body_string(res).await, fixture);
         }
 

@@ -27,8 +27,8 @@
 //! @ v3.7.4.
 //!
 //! **What that does NOT cover: the routing layer.** Rejections made above
-//! the handlers — axum's own 404/405, and the server-wide `TimeoutLayer`'s
-//! 408 — are not written by this module. They diverge from the reference,
+//! the handlers — axum's own 404/405, and the server-wide request-deadline
+//! layer's 408 — are not written by this module. They diverge from the reference,
 //! they pre-date #264, and it neither changed nor covers them
 //! (docs/api.md §2.3).
 //!

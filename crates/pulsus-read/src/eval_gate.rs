@@ -17,7 +17,10 @@
 //!
 //! **Exhaustion is a bounded wait**, not a fail-fast rejection: a caller
 //! past the limit `acquire().await`s and queues, bounded by the existing
-//! per-request `TimeoutLayer` (408, `query_timeout`). This deliberately
+//! per-request deadline (`middleware::RequestDeadlineLayer`,
+//! `query_timeout`). The gate is reached only from the metrics engine, so
+//! a breach of that deadline is `503`/`timeout` (issue #471 M2), not the
+//! `408` this comment used to name. This deliberately
 //! differs from the tail slot's fail-fast `try_acquire_owned`/`429` (a tail
 //! holds its slot for the connection's whole lifetime; an eval permit for
 //! ~hundreds of ms), so there is no new 429/503 status and no new timeout
@@ -80,8 +83,9 @@ pub struct EvalGateSnapshot {
 }
 
 /// Decrements `waiting` on drop — including the drop that happens when the
-/// awaiting request future is cancelled mid-wait (408 timeout / client
-/// disconnect), so the `waiting` gauge can never leak.
+/// awaiting request future is cancelled mid-wait (the request deadline
+/// expiring — `503`/`timeout` since issue #471 — or a client disconnect),
+/// so the `waiting` gauge can never leak.
 struct WaitGuard<'a>(&'a AtomicU64);
 
 impl Drop for WaitGuard<'_> {

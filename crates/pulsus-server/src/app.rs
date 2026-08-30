@@ -153,8 +153,11 @@ pub(crate) fn build_router(state: AppState, config: &Config) -> Result<Router, S
     authed = compat::apply_aliases(authed, config);
 
     // The generic per-request deadline. `/ready`/`/metrics` never pass
-    // through this stack at all (amendment F2), so its 408 response can
-    // never race the readiness 503 contract.
+    // through this stack at all (amendment F2), so its timeout response —
+    // `503` + the PromQL error envelope on the twelve mounted `/api/v1/*`
+    // query routes, the bare `408` everywhere else (issue #471 M2,
+    // `middleware::deadline_class`) — can never race the readiness `503`
+    // contract.
     authed = authed.layer(middleware::timeout_layer(config));
 
     if let Some(auth) = middleware::auth_layer(config) {

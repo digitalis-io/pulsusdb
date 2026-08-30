@@ -330,7 +330,7 @@ message, as the reference's line/column does.
 
 **Scope of that claim: handler-written errors only.** Rejections made
 *above* the handlers — the router's own `404`/`405`, and the server-wide
-`TimeoutLayer`'s `408` — are not written by this container. They diverge
+request-deadline layer's `408` — are not written by this container. They diverge
 from the reference, they are pre-existing, and #264 neither changed nor
 covers them.
 
@@ -598,25 +598,31 @@ The standard Prometheus API is PulsusDB's native metrics API — its paths are p
 |-------|-------|
 | `query` | PromQL, required |
 | `time` | evaluation time (RFC3339 or unix); default now |
-| `timeout` | overrides server default up to the hard cap |
+| `timeout` | an additional, strictly shorter deadline for this request. A bare (possibly fractional) seconds literal (`60`, `0.001`) or a duration string (`1ms`, `1m30s`); `ns` is not an accepted unit. Installed only when it is **strictly shorter** than `PULSUS_QUERY_TIMEOUT` — an equal or longer value leaves the server deadline governing, so the two are never installed at once. A breach is `503` `timeout` with `query exceeded the requested timeout of <duration> (timeout parameter)`. Unparseable, zero or negative is `400 bad_data`. Read on `/api/v1/query` and `/api/v1/query_range` only |
 
 Response: `{"status":"success","data":{"resultType":"vector"|"scalar"|"matrix","result":[...]}}`. Values formatted as Prometheus does (shortest round-trip float; `NaN`, `+Inf`, `-Inf` as strings).
 
 ### 3.2 `GET|POST /api/v1/query_range`
 
-`query`, `start`, `end`, `step` (required). Hard cap 11,000 points per series. Long ranges are transparently served from downsampling tiers (M3); the segmentation is visible via `X-Pulsus-Explain`.
+`query`, `start`, `end`, `step` (required), plus §3.1's `timeout`. **Hard resolution cap: `(end - start) / step` must not exceed 11,000 step intervals.** 11,000 intervals — 11,001 grid points — is served; 11,001 intervals is `400 bad_data` with `exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)`. The rule counts **intervals** even though its message says *points*: that is the reference's own predicate, and implementing its sentence instead rejected one step early (issue #471). Long ranges are transparently served from downsampling tiers (M3); the segmentation is visible via `X-Pulsus-Explain`.
 
 ### 3.3 Metadata & discovery
 
 ```
-GET|POST /api/v1/labels                    ?match[]=&start=&end=
-GET      /api/v1/label/{name}/values       ?match[]=&start=&end=
-GET|POST /api/v1/series                    ?match[]=&start=&end=   (match[] required)
+GET|POST /api/v1/labels                    ?match[]=&start=&end=&limit=
+GET      /api/v1/label/{name}/values       ?match[]=&start=&end=&limit=
+GET|POST /api/v1/series                    ?match[]=&start=&end=&limit=  (match[] required)
 GET      /api/v1/metadata                  ?metric=&limit=
 GET|POST /api/v1/query_exemplars           (empty-success stub in v1)
 ```
 
 `__name__` is always present in labels responses. Metadata is sourced from `metric_metadata` (populated from remote-write metadata and OTLP).
+
+**`limit` on the three discovery endpoints** (`/labels`, `/label/{name}/values`, `/series`): absent, empty and `0` all mean *no limit*; a negative value is `400 bad_data` with `invalid parameter "limit": limit must be non-negative`; a non-integer or out-of-range value is `400 bad_data` with `invalid parameter "limit": cannot parse "<raw>" to an integer` (our own wording — the reference emits its runtime's integer-parse text there, which we deliberately do not reproduce; the status and `errorType` are identical). When the limit actually cuts the result the response carries `"warnings":["results truncated due to limit"]` as a **top-level sibling of `data`**, and when it does not there is no `warnings` key at all. Truncation is applied last, to the already-sorted, already-deduplicated result — it is a **response-size** cap, never a scan bound (`PULSUS_PROMQL_MAX_METRIC_FANOUT` and `PULSUS_PROMQL_MAX_CACHE_SCAN` remain the scan bounds).
+
+**`limit` on `/metadata` is a different rule and is unchanged:** there `limit=0` means *return nothing* (`{"status":"success","data":{}}`), on this server and on the reference alike. The two meanings are not unified.
+
+**A `U__`-escaped label name is unescaped before any storage lookup** (`/api/v1/label/{name}/values`). Clients escape a label name into the URL path when it is not legacy-legal: a `U__` prefix, `_` → `__`, valid legacy runes kept, anything else `_<hex>_` (at most five hex digits). The unescape happens at the HTTP boundary, so `/api/v1/label/U__job/values` answers exactly what `/api/v1/label/job/values` answers. Any malformed escape — a non-hex byte, a missing closing `_`, a six-digit hex escape, a surrogate — returns the path segment **unchanged** rather than erroring, and reaches the engine as written. `U__` alone unescapes to the empty string and is `400 bad_data` with `invalid label name: ""`; a name that is merely not legacy-legal (`a-b`, no prefix) is not rejected at all.
 
 `match[]` selectors accept the full discovery selector surface: a concrete metric name (`up`), a matcher-only selector (`{job="api"}`), and a regex/negated `__name__` matcher (`{__name__=~"up.*"}`, `{__name__!="up",job="api"}`) — the last at parity with the query path. A regex/negated-`__name__` selector resolves its candidate metric names through the resident label cache under `PULSUS_PROMQL_MAX_METRIC_FANOUT`, then fetches with one flat `metric_name IN (…) AND fingerprint IN (…)` query against `metric_series`. When the resident cache is **degraded/cold** (cold / stale / out-of-window / regex-cache-full) the discovery path falls back to a bounded two-stage `metric_series` read: a `SELECT DISTINCT metric_name` probe (the name matchers pushed as `metric_name` predicates, `LIMIT PULSUS_PROMQL_MAX_METRIC_FANOUT + 1`) followed by the same flat `metric_name IN (…)` fetch with the label matchers applied in SQL — so a degraded regex/negated-`__name__` selector now **resolves** rather than returning a named `422`. A resolved (warm) or probed (degraded) candidate-name set past the cap is `422 execution` (`QueryTooBroad`), never an unbounded scan. The degraded probe caps on **names matching the name predicate** — a superset of the warm cap, which counts names with ≥1 label-matching series — so at the cap boundary the degraded path may `422` where warm would serve; below the cap the two results are byte-identical. A non-vector-selector `match[]` value (e.g. `sum(up)`) or brace-level `or` remains a parse-time rejection (`422 execution` / `400 bad_data` respectively). A broad regex/negated-`__name__` discovery selector can also independently exceed `PULSUS_PROMQL_MAX_CACHE_SCAN` (a selector whose matchers match few or no metric names can still *examine* the entire resident label cache) — this is `422 execution` too, on a **warm** cache, and never falls back to the degraded-cache probe; narrow the `__name__` matcher or use a metric-scoped/matcher-only selector instead.
 
@@ -640,10 +646,10 @@ GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 
 | Cause | HTTP | `errorType` |
 |-------|------|-------------|
-| Malformed params, malformed PromQL (parser position **in the message**), 11,000-point cap exceeded | `400` | `bad_data` |
+| Malformed params, malformed PromQL (parser position **in the message**), 11,000-interval resolution cap exceeded, invalid `limit`/`timeout`, an escaped label name that unescapes to the empty string | `400` | `bad_data` |
 | A label-matcher regex **RE2 rejects** (issues #280, #309, #316) — see the note below | `400` | `bad_data` |
 | Out-of-subset construct / binary-op matching failure / histogram-bucket error | `422` | `execution` |
-| ClickHouse read timed out | `503` | `timeout` |
+| A deadline expired: the server request deadline (`PULSUS_QUERY_TIMEOUT`), the `timeout` request parameter, the ClickHouse stream deadline, the ClickHouse pool-permit wait, or ClickHouse's own server-side `max_execution_time` | `503` | `timeout` |
 | Pool or label cache not yet ready, ClickHouse unreachable | `503` | `unavailable` |
 | Unclassified internal failure | `500` | `internal` |
 
@@ -726,7 +732,7 @@ surface — there is no `errorType` field (the reference has none either).
 
 **Scope of that claim: handler-written errors only.** Rejections made
 *above* the handlers — the router's own `404`/`405`, and the server-wide
-`TimeoutLayer`'s `408` — are not written by this container. They diverge
+request-deadline layer's `408` — are not written by this container. They diverge
 from the reference, they are pre-existing, and #384 neither changed nor
 covers them (the same boundary #264 drew for §2).
 

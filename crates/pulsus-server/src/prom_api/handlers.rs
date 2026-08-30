@@ -16,7 +16,7 @@ use crate::app::AppState;
 use crate::chconfig;
 
 use super::encode;
-use super::error::ApiError;
+use super::error::{ApiError, DeadlineProducer};
 use super::params::{self, ParamError};
 
 /// `X-Pulsus-Explain: 1` (docs/api.md "Request headers"). Emitted at
@@ -52,8 +52,26 @@ async fn engine_for(state: &AppState) -> Result<MetricsEngine, ApiError> {
         .map_err(|_| ApiError::Unavailable)
 }
 
+/// Issue #471 M1: a POST's parameters are read from a MERGED view of the
+/// form body and the URL query string, body values first.
+///
+/// The four POST handlers used to read the body alone, so a parameterised
+/// POST whose parameters live in the URL was answered as if it had none —
+/// a well-formed `200` with the wrong answer and no warning. That request
+/// shape is not hypothetical: a client that builds a resource request
+/// carrying a URL and no body sends it under its configured HTTP method,
+/// and POST is the default when that method is unset, so the parameters
+/// are all in the URL, the body is empty, and the content type is still
+/// `application/x-www-form-urlencoded`.
+///
+/// The order is the reference's: body pairs before URL pairs, so
+/// [`params::get`] yields the BODY value for a key present in both and
+/// [`params::get_all`] yields body matches followed by URL matches.
+///
+/// The content-type check is unchanged — a non-form POST is still `400`.
 async fn read_form_pairs(
     headers: &HeaderMap,
+    raw_query: Option<&str>,
     body: Bytes,
 ) -> Result<Vec<(String, String)>, ApiError> {
     let content_type = headers
@@ -67,7 +85,9 @@ async fn read_form_pairs(
     }
     let text =
         std::str::from_utf8(&body).map_err(|_| ApiError::Param(ParamError::InvalidFormBody))?;
-    Ok(params::parse_pairs(text))
+    let mut pairs = params::parse_pairs(text);
+    pairs.extend(params::parse_pairs(raw_query.unwrap_or("")));
+    Ok(pairs)
 }
 
 /// Parses `start`/`end` for the discovery endpoints (defaults: `end =
@@ -132,9 +152,10 @@ pub(crate) async fn query(
 pub(crate) async fn query_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match query_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -154,21 +175,40 @@ async fn query_impl(
         Some(v) => params::parse_time(v)?,
         None => params::now_ms(),
     };
+    // Issue #471 M2: the `timeout` request parameter, read on `/query`
+    // and `/query_range` only. Parsed here, before any engine work, so an
+    // unparseable value is a `400 bad_data` rather than a slow query.
+    let requested = match params::get(&pairs, "timeout") {
+        Some(v) => Some(params::parse_timeout(v)?),
+        None => None,
+    };
     let query_params = MetricQueryParams {
         start_ms: at_ms,
         end_ms: at_ms,
         step_ms: 0,
     };
-    let engine = engine_for(&state).await?;
-    run_query(
-        &engine,
-        &expr,
-        query,
-        &query_params,
-        wants_explain(headers),
-        at_ms,
-    )
-    .await
+    let server_deadline = state.config.query_timeout.0;
+    let work = async {
+        let engine = engine_for(&state).await?;
+        run_query(
+            &engine,
+            &expr,
+            query,
+            &query_params,
+            wants_explain(headers),
+            at_ms,
+        )
+        .await
+    };
+    // `run_under_request_deadline` owns the strictly-shorter rule; the
+    // handler cannot read a `Duration` out of a `RequestedTimeout`, so it
+    // cannot install one itself.
+    match params::run_under_request_deadline(requested, server_deadline, work).await {
+        Ok(res) => res,
+        Err(expired) => Err(ApiError::Deadline(DeadlineProducer::RequestedTimeout(
+            expired,
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -190,9 +230,10 @@ pub(crate) async fn query_range(
 pub(crate) async fn query_range_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match query_range_impl(state, &headers, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -216,21 +257,35 @@ async fn query_range_impl(
         params::parse_step(params::get(&pairs, "step").ok_or(ParamError::MissingParam("step"))?)?;
     // Checked before any engine/ClickHouse call (architect plan AC).
     params::check_range(start_ms, end_ms, step_ms)?;
+    // Issue #471 M2 — see `query_impl` for why this is parsed here.
+    let requested = match params::get(&pairs, "timeout") {
+        Some(v) => Some(params::parse_timeout(v)?),
+        None => None,
+    };
     let query_params = MetricQueryParams {
         start_ms,
         end_ms,
         step_ms,
     };
-    let engine = engine_for(&state).await?;
-    run_query(
-        &engine,
-        &expr,
-        query,
-        &query_params,
-        wants_explain(headers),
-        end_ms,
-    )
-    .await
+    let server_deadline = state.config.query_timeout.0;
+    let work = async {
+        let engine = engine_for(&state).await?;
+        run_query(
+            &engine,
+            &expr,
+            query,
+            &query_params,
+            wants_explain(headers),
+            end_ms,
+        )
+        .await
+    };
+    match params::run_under_request_deadline(requested, server_deadline, work).await {
+        Ok(res) => res,
+        Err(expired) => Err(ApiError::Deadline(DeadlineProducer::RequestedTimeout(
+            expired,
+        ))),
+    }
 }
 
 /// Shared success path for `query`/`query_range`: run with or without the
@@ -291,9 +346,10 @@ pub(crate) async fn labels(State(state): State<AppState>, RawQuery(raw): RawQuer
 pub(crate) async fn labels_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match labels_impl(state, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -305,11 +361,39 @@ pub(crate) async fn labels_post(
 async fn labels_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Response, ApiError> {
     let (start_ms, end_ms) = parse_bounds(&pairs)?;
     let window = DataWindow { start_ms, end_ms };
+    // Issue #471 M4: parsed before the engine call so an invalid value is
+    // a `400 bad_data` rather than a served-then-discarded answer.
+    let limit = params::parse_discovery_limit(params::get(&pairs, "limit"))?;
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
     let names = engine.label_names(&filters, window).await?;
-    Ok(encode::string_array_response(names))
+    let warn = truncated(&names, limit);
+    Ok(encode::string_array_response(
+        truncate(names, limit),
+        warning_for(warn),
+    ))
+}
+
+/// Issue #471 M4. `true` iff the discovery `limit` actually cut the
+/// result, which is the only case the reference warns in.
+fn truncated<T>(items: &[T], limit: Option<usize>) -> bool {
+    matches!(limit, Some(n) if items.len() > n)
+}
+
+/// Truncation is applied **last**, to the already-sorted, already-deduped
+/// result: the ordering is the engine's `BTreeSet`/`sort`+`dedup` order,
+/// not the SQL's, so "the first N" only means anything after that ordering
+/// exists. It is a response-size cap, never a scan bound.
+fn truncate<T>(mut items: Vec<T>, limit: Option<usize>) -> Vec<T> {
+    if let Some(n) = limit {
+        items.truncate(n);
+    }
+    items
+}
+
+fn warning_for(truncated: bool) -> Option<&'static str> {
+    truncated.then_some(encode::TRUNCATION_WARNING)
 }
 
 // ---------------------------------------------------------------------
@@ -322,6 +406,14 @@ pub(crate) async fn label_values(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let pairs = params::parse_pairs(raw.as_deref().unwrap_or(""));
+    // Issue #471 M6: unescape the path segment BEFORE any storage lookup,
+    // exactly as the reference does. Without this a `U__`-escaped
+    // non-legacy label name never matched a stored key and the endpoint
+    // silently returned the empty list.
+    let name = params::unescape_label_name(&name);
+    if name.is_empty() {
+        return ApiError::Param(ParamError::EmptyLabelName).into_response();
+    }
     match label_values_impl(state, &name, pairs).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
@@ -335,11 +427,16 @@ async fn label_values_impl(
 ) -> Result<Response, ApiError> {
     let (start_ms, end_ms) = parse_bounds(&pairs)?;
     let window = DataWindow { start_ms, end_ms };
+    let limit = params::parse_discovery_limit(params::get(&pairs, "limit"))?;
     let matches = params::get_all(&pairs, "match[]");
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
     let values = engine.label_values(name, &filters, window).await?;
-    Ok(encode::string_array_response(values))
+    let warn = truncated(&values, limit);
+    Ok(encode::string_array_response(
+        truncate(values, limit),
+        warning_for(warn),
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -357,9 +454,10 @@ pub(crate) async fn series(State(state): State<AppState>, RawQuery(raw): RawQuer
 pub(crate) async fn series_post(
     State(state): State<AppState>,
     headers: HeaderMap,
+    RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Response {
-    match read_form_pairs(&headers, body).await {
+    match read_form_pairs(&headers, raw.as_deref(), body).await {
         Ok(pairs) => match series_impl(state, pairs).await {
             Ok(res) => res,
             Err(e) => e.into_response(),
@@ -375,10 +473,15 @@ async fn series_impl(state: AppState, pairs: Vec<(String, String)>) -> Result<Re
     }
     let (start_ms, end_ms) = parse_bounds(&pairs)?;
     let window = DataWindow { start_ms, end_ms };
+    let limit = params::parse_discovery_limit(params::get(&pairs, "limit"))?;
     let filters = parse_match_selectors(&matches)?;
     let engine = engine_for(&state).await?;
     let data = engine.series(&filters, window).await?;
-    Ok(encode::series_response(data))
+    let warn = truncated(&data, limit);
+    Ok(encode::series_response(
+        truncate(data, limit),
+        warning_for(warn),
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -1039,7 +1142,13 @@ mod tests {
     async fn query_post_rejects_a_non_form_content_type() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        let res = query_post(State(test_state()), headers, Bytes::from_static(b"{}")).await;
+        let res = query_post(
+            State(test_state()),
+            headers,
+            RawQuery(None),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
@@ -1058,30 +1167,42 @@ mod tests {
         assert_eq!(json["errorType"], "bad_data");
     }
 
+    /// Issue #471 M3: the boundary moved by one step. `end=11001` is
+    /// 11,001 step intervals — one past the cap — and the `error` string
+    /// is asserted byte-for-byte against the metrics reference's own
+    /// sentence, not by a `contains` over the bare number, which is what
+    /// let the old point-rule wording look right while the predicate was
+    /// wrong.
     #[tokio::test]
-    async fn query_range_rejects_more_than_11000_points_before_any_pool_check() {
+    async fn query_range_rejects_one_interval_past_the_cap_before_any_pool_check() {
         // No pool established at all — if this were 503 instead of 400, the
-        // 11k cap would not be "checked before any engine/DB call".
+        // cap would not be "checked before any engine/DB call".
         let res = query_range(
             State(test_state()),
             HeaderMap::new(),
-            RawQuery(Some("query=up&start=0&end=11000&step=1".to_string())),
+            RawQuery(Some("query=up&start=0&end=11001&step=1".to_string())),
         )
         .await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
-        assert!(json["error"].as_str().unwrap().contains("11000"));
+        assert_eq!(
+            json["error"],
+            "exceeded maximum resolution of 11,000 points per timeseries. \
+             Try decreasing the query resolution (?step=XX)"
+        );
     }
 
     #[tokio::test]
     async fn query_range_at_exactly_the_cap_passes_param_validation() {
-        // 11,000 points exactly: (10999-0)/1 + 1 == 11000, must pass
-        // `check_range` and reach the (missing) pool -> 503, not 400.
+        // Issue #471 M3: 11,000 step INTERVALS exactly — (11000-0)/1 ==
+        // 11000, 11,001 grid points — must pass `check_range` and reach
+        // the (missing) pool -> 503, not 400. This is the request the
+        // reference serves and we used to reject.
         let res = query_range(
             State(test_state()),
             HeaderMap::new(),
-            RawQuery(Some("query=up&start=0&end=10999&step=1".to_string())),
+            RawQuery(Some("query=up&start=0&end=11000&step=1".to_string())),
         )
         .await;
         let (status, _) = status_and_body(res).await;
@@ -1262,7 +1383,13 @@ mod tests {
     async fn series_post_rejects_a_non_form_content_type() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        let res = series_post(State(test_state()), headers, Bytes::from_static(b"{}")).await;
+        let res = series_post(
+            State(test_state()),
+            headers,
+            RawQuery(None),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
@@ -1361,5 +1488,237 @@ mod tests {
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #471 M1 — a POST reads the URL query string too
+    // -----------------------------------------------------------------
+
+    fn form_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        headers
+    }
+
+    /// The merge order is the reference's: body pairs first, then URL
+    /// pairs. That is what makes `get` yield the BODY value for a key
+    /// present in both, and `get_all` yield body matches before URL
+    /// matches.
+    #[tokio::test]
+    async fn read_form_pairs_orders_body_before_url() {
+        let pairs = read_form_pairs(
+            &form_headers(),
+            Some("match%5B%5D=b&time=200"),
+            Bytes::from_static(b"match%5B%5D=a&time=100"),
+        )
+        .await
+        .expect("form pairs");
+        assert_eq!(
+            pairs,
+            vec![
+                ("match[]".to_string(), "a".to_string()),
+                ("time".to_string(), "100".to_string()),
+                ("match[]".to_string(), "b".to_string()),
+                ("time".to_string(), "200".to_string()),
+            ]
+        );
+        assert_eq!(params::get(&pairs, "time"), Some("100"));
+        assert_eq!(params::get_all(&pairs, "match[]"), vec!["a", "b"]);
+    }
+
+    /// The shape the defect was about: an empty body with every parameter
+    /// in the URL. Before M1 this produced an empty pair vector.
+    #[tokio::test]
+    async fn read_form_pairs_reads_the_url_when_the_body_is_empty() {
+        let pairs = read_form_pairs(
+            &form_headers(),
+            Some("match%5B%5D=up%7Bjob%3D%22api%22%7D&start=1&end=2"),
+            Bytes::new(),
+        )
+        .await
+        .expect("form pairs");
+        assert_eq!(params::get_all(&pairs, "match[]"), vec![r#"up{job="api"}"#]);
+        assert_eq!(params::get(&pairs, "start"), Some("1"));
+    }
+
+    /// The URL half must not defeat the content-type rejection: a
+    /// non-form POST is still `400`, parameters in the URL or not.
+    #[tokio::test]
+    async fn a_non_form_post_is_still_rejected_even_with_url_parameters() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        let res = query_post(
+            State(test_state()),
+            headers,
+            RawQuery(Some("query=up".to_string())),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+    }
+
+    /// A POST whose parameters live in the URL now reaches the same
+    /// parameter validation a GET does: `query` is found, and the request
+    /// gets as far as the (missing) pool. Before M1 it was
+    /// `400 missing required parameter 'query'`.
+    #[tokio::test]
+    async fn a_post_with_url_only_parameters_reaches_the_pool_check() {
+        let res = query_post(
+            State(test_state()),
+            form_headers(),
+            RawQuery(Some("query=up".to_string())),
+            Bytes::new(),
+        )
+        .await;
+        let (status, _) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// `/series` requires `match[]`; supplying it in the URL alone is now
+    /// enough, on every one of the four POST routes' shared reader.
+    #[tokio::test]
+    async fn a_series_post_with_a_url_only_match_reaches_the_pool_check() {
+        let res = series_post(
+            State(test_state()),
+            form_headers(),
+            RawQuery(Some("match%5B%5D=up".to_string())),
+            Bytes::new(),
+        )
+        .await;
+        let (status, _) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #471 M2 — the `timeout` request parameter's rejections
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_unparseable_timeout_is_400_bad_data_before_any_pool_check() {
+        for raw in ["abc", "1ns", "0", "-1"] {
+            let res = query(
+                State(test_state()),
+                HeaderMap::new(),
+                RawQuery(Some(format!("query=up&timeout={raw}"))),
+            )
+            .await;
+            let (status, json) = status_and_body(res).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "timeout={raw}");
+            assert_eq!(json["errorType"], "bad_data", "timeout={raw}");
+        }
+        for raw in ["abc", "1ns"] {
+            let res = query_range(
+                State(test_state()),
+                HeaderMap::new(),
+                RawQuery(Some(format!(
+                    "query=up&start=0&end=100&step=1&timeout={raw}"
+                ))),
+            )
+            .await;
+            let (status, json) = status_and_body(res).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "timeout={raw}");
+            assert_eq!(json["errorType"], "bad_data", "timeout={raw}");
+        }
+    }
+
+    /// A well-formed `timeout` is not itself an error: the request gets as
+    /// far as the (missing) pool, so an implementation that answers the
+    /// requested-timeout envelope eagerly whenever the parameter is
+    /// present reddens here without needing a live server.
+    #[tokio::test]
+    async fn a_valid_timeout_does_not_short_circuit_the_request() {
+        let res = query(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some("query=up&timeout=0.001".to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["errorType"], "unavailable");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #471 M4/M6 — `limit` and `U__` rejections at the boundary
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_invalid_discovery_limit_is_400_before_any_pool_check() {
+        for (path_pairs, want) in [
+            (
+                "limit=-1",
+                "invalid parameter \"limit\": limit must be non-negative",
+            ),
+            (
+                "limit=abc",
+                "invalid parameter \"limit\": cannot parse \"abc\" to an integer",
+            ),
+        ] {
+            let res = labels(State(test_state()), RawQuery(Some(path_pairs.to_string()))).await;
+            let (status, json) = status_and_body(res).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path_pairs}");
+            assert_eq!(json["errorType"], "bad_data", "{path_pairs}");
+            assert_eq!(json["error"], want, "{path_pairs}");
+
+            let res = label_values(
+                State(test_state()),
+                Path("job".to_string()),
+                RawQuery(Some(path_pairs.to_string())),
+            )
+            .await;
+            let (status, json) = status_and_body(res).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path_pairs}");
+            assert_eq!(json["error"], want, "{path_pairs}");
+
+            let res = series(
+                State(test_state()),
+                RawQuery(Some(format!("match%5B%5D=up&{path_pairs}"))),
+            )
+            .await;
+            let (status, json) = status_and_body(res).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path_pairs}");
+            assert_eq!(json["error"], want, "{path_pairs}");
+        }
+    }
+
+    /// A valid `limit` reaches the (missing) pool rather than being an
+    /// error in itself — including `limit=0`, which means *no limit* on
+    /// these three routes.
+    #[tokio::test]
+    async fn a_valid_discovery_limit_reaches_the_pool_check() {
+        for raw in ["limit=0", "limit=1", "limit=%2B2", "limit="] {
+            let res = labels(State(test_state()), RawQuery(Some(raw.to_string()))).await;
+            let (status, _) = status_and_body(res).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{raw}");
+        }
+    }
+
+    /// Issue #471 M6: `U__` alone unescapes to the empty string, which is
+    /// `400 bad_data` with the reference's own literal — and it is decided
+    /// before the pool is ever consulted.
+    #[tokio::test]
+    async fn an_empty_unescaped_label_name_is_400_bad_data() {
+        let res = label_values(State(test_state()), Path("U__".to_string()), RawQuery(None)).await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(json["error"], "invalid label name: \"\"");
+    }
+
+    /// A name that is merely not legacy-legal is not rejected at all — it
+    /// reaches the engine unchanged, exactly as on the reference.
+    #[tokio::test]
+    async fn a_non_legacy_label_name_without_the_prefix_is_not_rejected() {
+        for name in ["a-b", "U__bad_zz"] {
+            let res =
+                label_values(State(test_state()), Path(name.to_string()), RawQuery(None)).await;
+            let (status, _) = status_and_body(res).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{name}");
+        }
     }
 }

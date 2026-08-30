@@ -6,7 +6,7 @@
 //! with graceful shutdown.
 //!
 //! Data flow: req → CORS → gzip → TraceLayer(span) → [ops-authed group:
-//! TimeoutLayer(query_timeout) → auth(opt) → subsystem/compat routes], with
+//! RequestDeadlineLayer(query_timeout) → auth(opt) → subsystem/compat routes], with
 //! `/ready`/`/metrics` mounted outside the bracketed group entirely (see
 //! `app::build_router`).
 

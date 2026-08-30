@@ -222,7 +222,8 @@ pub fn evaluate(
 
 /// [`evaluate`] with a live cancellation token (issue #93): the offloaded
 /// read path passes a token that fires when the awaiting request future is
-/// dropped (client disconnect / `TimeoutLayer` 408), so a still-running
+/// dropped (client disconnect, or the server's request deadline expiring
+/// — `503`/`timeout` on this surface since issue #471), so a still-running
 /// `spawn_blocking` eval bails at its next checkpoint instead of burning a
 /// full evaluation for a caller that is already gone.
 pub fn evaluate_cancellable(
