@@ -82,7 +82,20 @@ static DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_t
 /// granularity: enough for granule-level discrimination on every shape.
 const VALS_PER_KEY: u64 = 10_000;
 const KEYS_PER_SCOPE: u64 = 10;
-const TOTAL_ROWS: u64 = 2 * KEYS_PER_SCOPE * VALS_PER_KEY;
+/// The two ATTRIBUTE scopes' half of the fixture — what a bare-key or
+/// unscoped read is allowed to touch after issue #475.
+const ATTR_SCOPE_ROWS: u64 = 2 * KEYS_PER_SCOPE * VALS_PER_KEY;
+/// The two writer-RESERVED intrinsic scopes' half. Same size, so the
+/// prune has something substantial to exclude and a read that forgot the
+/// `scope IN` predicate doubles its row count instead of moving it
+/// slightly.
+const RESERVED_SCOPE_ROWS: u64 = 2 * KEYS_PER_SCOPE * VALS_PER_KEY;
+const TOTAL_ROWS: u64 = ATTR_SCOPE_ROWS + RESERVED_SCOPE_ROWS;
+/// One ClickHouse granule. `index_granularity` is unset in the catalog's
+/// DDL (`crates/pulsus-schema/src/catalog.rs`), so the default 8192
+/// applies; the unscoped read may cross ONE boundary between the
+/// contiguous reserved range and the attribute range.
+const GRANULE_ROWS: u64 = 8_192;
 
 async fn exec(client: &ChClient, sql: &str) {
     client
@@ -97,14 +110,23 @@ async fn exec(client: &ChClient, sql: &str) {
 /// multi-key fixture where a scoped read genuinely has something to
 /// prune away (the other scope's half).
 async fn seed_catalog(client: &ChClient, db: &str) {
-    for scope in ["resource", "span"] {
+    // The two writer-reserved intrinsic scopes carry the same key/value
+    // shape, with values prefixed `a` so they sort BEFORE the attribute
+    // scopes' `v` values: a read that failed to exclude them returns
+    // their rows first, which the content checks below can see.
+    for scope in ["event:intrinsic", "link:intrinsic", "resource", "span"] {
+        let prefix = if scope.ends_with(":intrinsic") {
+            'a'
+        } else {
+            'v'
+        };
         exec(
             client,
             &format!(
                 "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
                  SELECT '{scope}', \
                         concat('k', toString(number % {KEYS_PER_SCOPE})), \
-                        concat('v', leftPad(toString(intDiv(number, {KEYS_PER_SCOPE})), 7, '0')) \
+                        concat('{prefix}', leftPad(toString(intDiv(number, {KEYS_PER_SCOPE})), 7, '0')) \
                  FROM numbers({})",
                 KEYS_PER_SCOPE * VALS_PER_KEY
             ),
@@ -175,23 +197,47 @@ async fn drain_names(client: &ChClient, sql: &str, query_id: &str) -> usize {
     n
 }
 
-async fn drain_values(client: &ChClient, sql: &str, query_id: &str) -> usize {
+/// Returns the VALUES, not just the count: issue #475's content check
+/// asks which rows came back, and a count alone cannot see a reserved
+/// scope's row substituted for an attribute one.
+async fn drain_values(client: &ChClient, sql: &str, query_id: &str) -> Vec<String> {
     let settings = QuerySettings::new().set("query_id", query_id);
-    let mut n = 0usize;
+    let mut out = Vec::new();
     let mut stream = client
         .query_stream::<TagValueRow>(sql, &settings)
         .await
         .unwrap_or_else(|e| panic!("tagged values query failed: {e}\nSQL:\n{sql}"));
     while let Some(row) = stream.next().await {
-        row.expect("decode tag value row");
-        n += 1;
+        out.push(row.expect("decode tag value row").val);
     }
-    n
+    out
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct QueryLogRow {
     read_rows: u64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CountRow {
+    n: u64,
+}
+
+/// The fixture's own row count, read directly rather than derived from
+/// the row constants.
+async fn catalog_count(client: &ChClient) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow>(
+            "SELECT toUInt64(count()) AS n FROM trace_tag_catalog",
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("catalog count");
+    let mut n = 0;
+    while let Some(row) = stream.next().await {
+        n = row.expect("decode count row").n;
+    }
+    n
 }
 
 /// The `QueryFinish` `read_rows` for an exact `query_id`.
@@ -268,18 +314,47 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
     // ---- Gate 3 (two-shape + query_log, the #53 AC3b idiom): the scoped
     // reads' physical row footprint stays strictly under the full-catalog
     // baseline's. ----------------------------------------------------------
+    // The fixture really holds the reserved rows — asserted against a
+    // literal, separately from every ratio below, so a redefinition of
+    // the row constants cannot make the prune assertions vacuous.
+    assert_eq!(
+        catalog_count(&client).await,
+        400_000,
+        "the fixture seeds four scopes: two attribute, two reserved"
+    );
+    assert_eq!(TOTAL_ROWS, 400_000, "the constants describe the fixture");
+
     let n = drain_names(&client, &scoped_names, "tags-scoped-names").await;
     assert_eq!(n, KEYS_PER_SCOPE as usize, "one scope's distinct keys");
+    // CONTENT check (issue #475): the unscoped listing carries the two
+    // ATTRIBUTE scopes' keys only. With the reserved scopes included it
+    // would be 40.
     let n = drain_names(&client, &unscoped_names, "tags-unscoped-names").await;
-    assert_eq!(n, 2 * KEYS_PER_SCOPE as usize, "both scopes' distinct keys");
-    let n = drain_values(&client, &scoped_values, "tags-scoped-values").await;
     assert_eq!(
         n,
+        2 * KEYS_PER_SCOPE as usize,
+        "the two attribute scopes' distinct keys, and NOT the two reserved scopes'"
+    );
+    let values = drain_values(&client, &scoped_values, "tags-scoped-values").await;
+    assert_eq!(
+        values.len(),
         TAG_VALUES_MAX + 1,
         "k3 holds VALS_PER_KEY > cap distinct values; the SQL LIMIT ships cap + 1 (the probe)"
     );
-    let n = drain_values(&client, &unscoped_values, "tags-unscoped-values").await;
-    assert_eq!(n, TAG_VALUES_MAX + 1);
+    let values = drain_values(&client, &unscoped_values, "tags-unscoped-values").await;
+    assert_eq!(values.len(), TAG_VALUES_MAX + 1);
+    // CONTENT check: the reserved scopes' values are prefixed `a` and
+    // sort first, so a bare-key read that forgot the `scope IN`
+    // predicate returns them at the head of this very list.
+    assert!(
+        values.iter().all(|v| !v.starts_with('a')),
+        "a reserved-scope value reached a bare-key lookup: {:?}",
+        values
+            .iter()
+            .filter(|v| v.starts_with('a'))
+            .take(5)
+            .collect::<Vec<_>>()
+    );
     exec(&client, "SYSTEM FLUSH LOGS").await;
 
     let scoped_names_rows = read_rows_by_id(&client, "tags-scoped-names").await;
@@ -297,9 +372,11 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
          baseline (scoped {scoped_values_rows} vs baseline {baseline_rows})"
     );
 
-    // ---- Gate 4 (recorded, not gated as a prune): the two degraded
-    // paths. Unscoped tag-names has no predicate — the full catalog scan
-    // by nature, asserted exactly. Unscoped values has no (scope) prefix
+    // ---- Gate 4: the unscoped shapes. Since issue #475 the unscoped
+    // tag-names read carries `WHERE scope IN (…)` on the catalog's
+    // LEADING primary-key column, so it prunes the two reserved scopes
+    // away instead of scanning the whole table — bounded below by the
+    // attribute half and above by one granule of boundary overshoot. Unscoped values has no (scope) prefix
     // to prune on — measured 24.8 physics on this fixture: ClickHouse's
     // generic granule-exclusion still skips granules OPPORTUNISTICALLY
     // (within ranges where the leading `scope` is constant, `key` is
@@ -309,10 +386,16 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
     // rows". The contract stays "treat it as a full (small) catalog
     // scan" — the opportunistic exclusion is layout-dependent, not a
     // guarantee. Granule ratio + read_rows RECORDED (eprintln below). ----
-    assert_eq!(
-        baseline_rows, TOTAL_ROWS,
-        "unscoped tag-names is a full catalog scan — it reads every distinct \
-         (scope, key, val) tuple"
+    assert!(
+        baseline_rows >= ATTR_SCOPE_ROWS && baseline_rows <= ATTR_SCOPE_ROWS + GRANULE_ROWS,
+        "the unscoped tag-names read prunes to the attribute scopes: it must read their \
+         rows and at most one granule more, never the whole catalog \
+         (read {baseline_rows}, attribute half {ATTR_SCOPE_ROWS}, catalog {TOTAL_ROWS})"
+    );
+    assert!(
+        baseline_rows < TOTAL_ROWS,
+        "the unscoped tag-names read must not be a full catalog scan \
+         (read {baseline_rows} of {TOTAL_ROWS})"
     );
     let raw = explain_raw(&client, &unscoped_values).await;
     let (unscoped_sel, unscoped_total) = primary_key_granules(&raw);
