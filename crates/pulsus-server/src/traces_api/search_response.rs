@@ -154,6 +154,36 @@ impl WireField {
     }
 }
 
+/// Which side of a wire field's domain a value was clamped from — the
+/// `bound` label value, and the [`DomainReport::counts`] slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Bound {
+    /// Clamped up from under the field's minimum.
+    Below,
+    /// Clamped down from over the field's maximum.
+    Above,
+}
+
+impl Bound {
+    /// Both variants, in [`Bound::index`] order — the enumeration
+    /// [`DomainReport::surface`] walks.
+    const ALL: [Bound; 2] = [Bound::Below, Bound::Above];
+
+    fn label(self) -> &'static str {
+        match self {
+            Bound::Below => "below",
+            Bound::Above => "above",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Bound::Below => 0,
+            Bound::Above => 1,
+        }
+    }
+}
+
 /// Per-response record of every integer moved into its wire field's
 /// domain (issue #473).
 ///
@@ -161,9 +191,8 @@ impl WireField {
 /// inline and `first` stays `None`.
 #[derive(Default, Debug)]
 struct DomainReport {
-    /// `[field.index()][0]` — clamped up from below zero.
-    /// `[field.index()][1]` — clamped down from above the field's
-    /// maximum.
+    /// `[field.index()][bound.index()]`, so one slot per (field, bound)
+    /// pair.
     counts: [[u64; 2]; 4],
     /// The first event, for the log line: the field, the id that names
     /// the trace or the span it came from, and the value the renderer
@@ -172,11 +201,8 @@ struct DomainReport {
 }
 
 impl DomainReport {
-    /// `below` is `true` when the value was clamped up from under the
-    /// field's minimum and `false` when it was clamped down from over
-    /// its maximum.
-    fn record(&mut self, field: WireField, id: &str, value: i64, below: bool) {
-        self.counts[field.index()][usize::from(!below)] += 1;
+    fn record(&mut self, field: WireField, id: &str, value: i64, bound: Bound) {
+        self.counts[field.index()][bound.index()] += 1;
         if self.first.is_none() {
             self.first = Some((field, id.to_string(), value));
         }
@@ -204,13 +230,13 @@ impl DomainReport {
              mounted ingest route can produce"
         );
         for field in WireField::ALL {
-            for (slot, bound) in [(0usize, "below"), (1usize, "above")] {
-                let n = self.counts[field.index()][slot];
+            for bound in Bound::ALL {
+                let n = self.counts[field.index()][bound.index()];
                 if n != 0 {
                     metrics::counter!(
                         SATURATION_COUNTER,
                         "field" => field.label(),
-                        "bound" => bound,
+                        "bound" => bound.label(),
                     )
                     .increment(n);
                 }
@@ -232,7 +258,7 @@ fn wire_nanos(value: i64, field: WireField, id: &str, report: &mut DomainReport)
     match u64::try_from(value) {
         Ok(nanos) => nanos,
         Err(_) => {
-            report.record(field, id, value, true);
+            report.record(field, id, value, Bound::Below);
             0
         }
     }
@@ -268,11 +294,11 @@ fn duration_ms(duration_ns: i64, id: &str, report: &mut DomainReport) -> u32 {
     match u32::try_from(ms) {
         Ok(ms) => ms,
         Err(_) if ms < 0 => {
-            report.record(WireField::TraceDurationMs, id, ms, true);
+            report.record(WireField::TraceDurationMs, id, ms, Bound::Below);
             0
         }
         Err(_) => {
-            report.record(WireField::TraceDurationMs, id, ms, false);
+            report.record(WireField::TraceDurationMs, id, ms, Bound::Above);
             u32::MAX
         }
     }
@@ -1543,10 +1569,10 @@ mod tests {
 
     /// Asserts the exposition carries a `SATURATION_COUNTER` sample with
     /// both label pairs, without depending on the exporter's label order.
-    fn assert_saturation_sample(rendered: &str, field: &str, bound: &str) {
+    fn assert_saturation_sample(rendered: &str, field: WireField, bound: Bound) {
         let name = format!("{SATURATION_COUNTER}{{");
-        let field_label = format!("field=\"{field}\"");
-        let bound_label = format!("bound=\"{bound}\"");
+        let field_label = format!("field=\"{}\"", field.label());
+        let bound_label = format!("bound=\"{}\"", bound.label());
         assert!(
             rendered.lines().any(|line| line.starts_with(&name)
                 && line.contains(&field_label)
@@ -1567,11 +1593,11 @@ mod tests {
             render(&above);
         });
         for field in WireField::ALL {
-            assert_saturation_sample(&rendered, field.label(), "below");
+            assert_saturation_sample(&rendered, field, Bound::Below);
         }
         // `i64::MAX` ns is 9223372036854 ms, above the 32-bit maximum —
         // the only one of the four whose UPPER clamp any `i64` can reach.
-        assert_saturation_sample(&rendered, WireField::TraceDurationMs.label(), "above");
+        assert_saturation_sample(&rendered, WireField::TraceDurationMs, Bound::Above);
 
         let healthy = render_local(|| {
             render(&sample_output());
@@ -1652,6 +1678,14 @@ mod tests {
     /// Issue #473 AC 11(c): the new metric family is named in
     /// docs/architecture.md §8, from the constant rather than a copy of
     /// it — renaming the metric without touching the document fails here.
+    ///
+    /// The LABEL VOCABULARY is pinned the same way, and for a reason
+    /// worth stating: [`assert_saturation_sample`] builds its needles
+    /// from [`WireField::label`] and [`Bound::label`], so a renamed label
+    /// value would move the code and the assertion together and stay
+    /// green. The document is the independent side. A label rename now
+    /// has to be a deliberate documented change, which is what a metric
+    /// label is.
     #[test]
     fn the_saturation_counter_is_documented_in_the_architecture_metric_families() {
         let arch = read_doc("docs/architecture.md");
@@ -1659,6 +1693,20 @@ mod tests {
             arch.contains(SATURATION_COUNTER),
             "docs/architecture.md §8 must name {SATURATION_COUNTER}"
         );
+        for field in WireField::ALL {
+            assert!(
+                arch.contains(field.label()),
+                "docs/architecture.md §8 must name the field label {:?}",
+                field.label()
+            );
+        }
+        for bound in Bound::ALL {
+            assert!(
+                arch.contains(&format!("`{}`", bound.label())),
+                "docs/architecture.md §8 must name the bound label {:?}",
+                bound.label()
+            );
+        }
     }
 
     /// Issue #473 AC 12: the ledger row exists and carries the content it
