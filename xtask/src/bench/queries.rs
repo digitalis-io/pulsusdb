@@ -1317,6 +1317,10 @@ async fn run_discovery_shape(
     let sql = sql::label_names(
         &tables.streams_idx,
         &months,
+        // The bench issues the UNSCOPED form — no `query=` — which is
+        // the shape this evidence has always measured (issue #482 added
+        // the parameter; it did not change this statement's text).
+        None,
         &tables.rollup,
         TimeWindow {
             start_ns: dataset.start_ns,

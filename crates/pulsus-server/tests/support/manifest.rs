@@ -134,6 +134,18 @@ pub enum Surface {
     /// mounting from the `X-Pulsus-Explain` fingerprint instead. Errors
     /// are the LogsQuery bare `text/plain` body.
     LogsDetectedFields,
+    /// `GET|POST /api/logs/v1/detected_field/{name}/values` and its
+    /// `/loki/api/v1/detected_field/{name}/values` alias (issue #482,
+    /// docs/api.md §2.6.5) — success is the bare
+    /// `{"limit":N,"values":[...]}` object; against this suite's empty
+    /// databases the exact body is the bare `{}`, the same empty shape
+    /// `/detected_fields` uses (`values` is only ever emitted alongside
+    /// `limit`, and neither appears when nothing was found). That body is
+    /// NOT the mounting oracle — `{}` identifies no handler — so
+    /// `api_conformance::assert_detected_field_values_handler_identity`
+    /// proves mounting from the `X-Pulsus-Explain` fingerprint instead.
+    /// Errors are the LogsQuery bare `text/plain` body.
+    LogsDetectedFieldValues,
     /// `/api/v1/*` — the Prometheus HTTP API JSON query envelope
     /// (`{"status","errorType","error"}`, no `position`). The one query
     /// surface that keeps a JSON error envelope, because upstream
@@ -620,12 +632,29 @@ const LOGS_QUERY_LIKE_CASES: &[CaseClass] = &[
     },
 ];
 
-const LOGS_LABELS_CASES: &[CaseClass] = &[CaseClass {
-    name: "malformed_content_type",
-    build: logs_malformed_content_type,
-    expect_status: 400,
-    expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
-}];
+/// Issue #482: `/labels` and `/label/{name}/values` now parse `query=` as
+/// an optional matchers-only selector, so a malformed one is a `400` on
+/// both — it was a silent `200` with the full label set before.
+const LOGS_LABELS_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "malformed_logql",
+        build: logs_malformed_logql,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+    CaseClass {
+        name: "pipeline_in_query_rejected",
+        build: logs_detected_labels_pipeline_in_query,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+    CaseClass {
+        name: "malformed_content_type",
+        build: logs_malformed_content_type,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+];
 
 // -- logs stats (issue #74, docs/api.md §2.5) ---------------------------
 
@@ -835,6 +864,49 @@ const LOGS_DETECTED_LABELS_CASES: &[CaseClass] = &[
 ];
 
 const LOGS_DETECTED_FIELDS_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "missing_query",
+        build: logs_missing_query,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+    CaseClass {
+        name: "malformed_logql",
+        build: logs_malformed_logql,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+    CaseClass {
+        name: "metric_query_rejected",
+        build: logs_stats_metric_query,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+    CaseClass {
+        name: "line_limit_zero",
+        build: logs_detected_fields_line_limit_zero,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+    CaseClass {
+        name: "field_limit_zero",
+        build: logs_detected_fields_field_limit_zero,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+    CaseClass {
+        name: "malformed_content_type",
+        build: logs_malformed_content_type,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::LogqlWriteError),
+    },
+];
+
+/// Issue #482: `/detected_field/{name}/values` reuses `/detected_fields`'
+/// parameter handling verbatim, so it reuses its reject classes verbatim
+/// too — `limit=0` caps the VALUE set here rather than the field set, but
+/// the parser and the message are the same one.
+const LOGS_DETECTED_FIELD_VALUES_CASES: &[CaseClass] = &[
     CaseClass {
         name: "missing_query",
         build: logs_missing_query,
@@ -1718,7 +1790,7 @@ static MANIFEST: &[RouteSpec] = &[
         doc_ref: DocRef::Verbatim,
         success_status: 200,
         base_query: "",
-        cases: &[],
+        cases: LOGS_LABELS_CASES,
     },
     RouteSpec {
         path: "/api/logs/v1/series",
@@ -1828,6 +1900,21 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_DETECTED_FIELDS_CASES,
+    },
+    // Issue #482: the third route in `mount_detected_routes`. `{name}` is
+    // not trailing, so the generic matrix's sibling-404 suffix lands on a
+    // genuinely unrouted path (the `/label/{name}/values` precedent) and
+    // this route needs no dedicated dispatch.
+    RouteSpec {
+        path: "/api/logs/v1/detected_field/{name}/values",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::LogsDetectedFieldValues,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_DETECTED_FIELD_VALUES_CASES,
     },
     // -- Logs query, `/loki/api/v1` compat alias (CompatAndReader) -------
     RouteSpec {
@@ -1977,6 +2064,17 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_DETECTED_FIELDS_CASES,
+    },
+    RouteSpec {
+        path: "/loki/api/v1/detected_field/{name}/values",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::LogsDetectedFieldValues,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_DETECTED_FIELD_VALUES_CASES,
     },
     // -- Logs patterns, M7 compat alias (CompatAndReader, M7-C3 #171) -----
     // A pure prefix swap of the native `/patterns` (docs/api.md §8.1's M7

@@ -287,8 +287,8 @@ The tie rule is a PulsusDB determinism pin, not a mirror of the reference, which
 ### 2.3 Labels & series
 
 ```
-GET|POST /api/logs/v1/labels                 ?start=&end=&since=
-GET|POST /api/logs/v1/label/{name}/values    ?start=&end=&since=
+GET|POST /api/logs/v1/labels                 ?query=<selector>&start=&end=&since=
+GET|POST /api/logs/v1/label/{name}/values    ?query=<selector>&start=&end=&since=
 GET|POST /api/logs/v1/series                 ?match[]=<selector>&start=&end=&since=
 ```
 
@@ -306,13 +306,24 @@ Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values
 
 `/label/{name}/values` accepts `GET|POST` from issue #406 Part B2 (the reference registers it `Methods("GET","POST")`, `pkg/loki/modules.go:687` @ v3.7.4 `b318f282`).
 
-**`label/{name}/values` M1 scope:** returns every distinct value of `name` within `[start, end]`; `query=`-selector narrowing (restricting to values seen only on streams matching a selector) is deferred to M6 parity.
+**`query=` narrows `/labels` and `/label/{name}/values` (issue #482).** It is **optional and matchers only**, with exactly the acceptance and the error text §2.6.2's `/detected_labels` has — the three share one parse seam, so they cannot drift apart:
+
+| `query` | Behaviour |
+|---------|-----------|
+| absent, or present but empty | the unscoped form — every label/value of every stream active in the window, byte-identical to what these two endpoints answered before |
+| a stream selector | stage-1 resolution first, then the same index scan restricted to the matched fingerprints. `/labels` returns the union of those streams' label names; `/label/{name}/values` returns `name`'s distinct values on those streams — a key present in the store but absent from every matched stream yields `[]` |
+| a selector matching no stream | `{"status":"success","data":[]}`, answered without a second statement |
+| a pipeline stage, or a metric expression, or unparseable text | `400`, the bare `text/plain` parse error of §2.3's error table |
+
+The scoped form costs **one extra round trip** (stage-1 resolution) and reads strictly less at stage 2: the fingerprint list is pushed *inside* the activity semi-join, which turns its whole-bucket-range scan into primary-key point ranges. The stage-1 read is capped at `reader.logql_max_streams` like every other stream resolution. The unscoped path issues exactly what it issued before and pays nothing new.
+
+The accept surface moved with it: `?query=<garbage>` on these two routes was a silent `200` with the full label set and is now a `400`.
 
 **All three answer the requested window, not the month containing it (issue #399).** `log_streams_idx` carries no time column, so `[start, end]` is applied as a semi-join against the log rollup (`log_metrics_<res>`) — `fingerprint IN (SELECT DISTINCT fingerprint FROM log_metrics_5s WHERE bucket_ns >= … AND bucket_ns <= …)` — alongside the month predicate, which stays where it is as the partition-pruning bound. A stream with no log line in the window is absent from all three answers. `/series` applies it as its own statement after the `max_streams` cap, so the cap keeps counting the pre-window union.
 
 The lower bound is the rollup **bucket containing** `start`, not `start` itself (the rollup stores `bucket_ns = intDiv(timestamp_ns, res) * res`), so the filter can over-include by at most one rollup resolution — 5s by default — at each edge, and can never drop a stream with a line in the window. The reference is looser here, not tighter: its `/labels` and `/label/{name}/values` ignore `from`/`through` entirely and are bounded only by which index files overlap the window, while its `/series` is chunk-granular. Registered as `detected-labels-window-scoped-to-rollup-bucket` in `docs/benchmarks/logs-differential-ledger.md`.
 
-Because the rollup read is window-proportional and `/labels` and `/label/{name}/values` accept no selector to narrow it, a very broad window on those two can now exhaust `reader.logql_scan_budget_bytes` and answer `422 query_too_broad` where it previously answered `200`. The work is window-proportional, which is the correct direction.
+Because the rollup read is window-proportional, a very broad **unscoped** window on `/labels` or `/label/{name}/values` can exhaust `reader.logql_scan_budget_bytes` and answer `422 query_too_broad` where it previously answered `200`. The work is window-proportional, which is the correct direction — and a `query=` selector is now the way to narrow it (above).
 
 #### Errors (§2.1-2.3)
 
@@ -501,6 +512,8 @@ Delivery: tail polls ClickHouse (there is no push channel) with a deterministic 
 GET|POST /api/logs/v1/volume             ?query=&start=&end=&since=&limit=&targetLabels=&aggregateBy=
 GET|POST /api/logs/v1/detected_labels    ?query=&start=&end=&since=
 GET|POST /api/logs/v1/detected_fields    ?query=&start=&end=&since=&line_limit=&limit=
+GET|POST /api/logs/v1/detected_field/{name}/values
+                                         ?query=&start=&end=&since=&line_limit=&limit=
 GET|POST /api/logs/v1/patterns           ?query=&start=&end=&since=&step=
 ```
 
@@ -571,6 +584,23 @@ Response `200`: `{"fields":[{"label":"…","type":"…","cardinality":N,"parsers
 With `X-Pulsus-Explain: 1`, `explain` is added as a sibling key — its `detected_fields_read` stage carries the single stage-3 scan (note `single-scan: no unpushed dropping stage`) or the first keyset page (note `paged: unpushed dropping stage`).
 
 Errors: `400` (missing/malformed `query`, metric query, invalid `line_limit`/`limit`), `422`, and `503`/`504`/`500` per §2.3's table.
+
+#### 2.6.5 `GET|POST /api/logs/v1/detected_field/{name}/values`
+
+The distinct **values** of one detected field, over the same bounded sample §2.6.3 describes — the drilldown UI's per-field value picker, and the one resource call whose errors that UI surfaces rather than swallows. Identical read path to §2.6.3: stage-1 resolution, stage-2 hydration, one bounded stage-3 sample scan with line filters pushed down. No new SQL shape, no new index, no extra round trip.
+
+| Param | Notes |
+|-------|-------|
+| `query` | **required** — the same full LogQL log-selector grammar §2.6.3 accepts, including pipeline stages; metric queries are rejected `400` |
+| `start`, `end`, `since` | §2.1 defaults |
+| `line_limit` | entries sampled — §2.6.3's parameter, same parser, same bounds |
+| `limit` (legacy alias `field_limit`) | max distinct **values** of `{name}` retained. Absent or empty → 1000. §2.6.3's parser and error text; on this route it caps the value axis rather than the field-name axis. The cap is checked **between sampled entries**: everything one entry contributes is added before it is consulted again, so a response may carry more than `limit` values when a single entry contributed several |
+
+Response `200`: `{"limit":N,"values":["…",…]}` — `limit` first, then `values`, **sorted ascending by byte order**. The empty result (an unknown `{name}`, or a selector matching no stream) is the bare `{}`: `limit` is emitted only alongside a populated `values`, exactly as §2.6.3's zero-field body works. The empty string is a real value and appears when observed.
+
+The reference emits `values` in Go map iteration order, so there is no reproducible order to mirror; the ascending pin is a clause of the `detected-fields-array-order-pinned` entry in docs/benchmarks/logs-differential-ledger.md. The additive `pulsus_partial` and `explain` keys behave exactly as in §2.6.3 and survive into the empty body; the `explain` `result_type` is `detected_field_values`.
+
+Errors: `400` (missing/malformed `query`, metric query, invalid `line_limit`/`limit`, `end < start`), `422`, and `503`/`504`/`500` per §2.3's table.
 
 #### 2.6.4 `GET|POST /api/logs/v1/patterns`
 
@@ -1152,7 +1182,7 @@ When `PULSUS_AUTH_*` is set, the perimeter returns 401 to every unauthenticated 
 | `/loki/api/v1/query_range`, `/query`, `/labels`, `/label/{name}/values`, `/series` (all `GET|POST`) | `/api/logs/v1/{query_range,query,labels,label/*/values,series}` | M1 |
 | `/loki/api/v1/tail` (`GET`), `/loki/api/v1/index/stats` (`GET|POST`) | `/api/logs/v1/{tail,stats}` | M6 |
 | `/loki/api/v1/index/volume` (`GET|POST`) | `/api/logs/v1/volume` | M7 |
-| `/loki/api/v1/detected_labels`, `/loki/api/v1/detected_fields` | `/api/logs/v1/detected_labels`, `/api/logs/v1/detected_fields` (pure prefix swaps, `GET|POST` like native) | M7 |
+| `/loki/api/v1/detected_labels`, `/loki/api/v1/detected_fields`, `/loki/api/v1/detected_field/{name}/values` | `/api/logs/v1/detected_labels`, `/api/logs/v1/detected_fields`, `/api/logs/v1/detected_field/{name}/values` (pure prefix swaps, `GET|POST` like native) | M7 |
 | `/loki/api/v1/patterns` (`GET|POST`) | `/api/logs/v1/patterns` | M7 |
 | `/api/traces/{traceId}`, `/api/traces/{traceId}/json`, `/tempo/api/traces/{traceId}` | `/api/traces/v1/trace/{traceId}`, `/api/traces/v1/trace/{traceId}/json` | M4 |
 | `/api/search` | `/api/traces/v1/search` | M4 |

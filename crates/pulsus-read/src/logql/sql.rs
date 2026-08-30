@@ -302,12 +302,22 @@ pub fn probe(
 /// fingerprint`), so the window arrives as the
 /// [`active_fingerprints`] semi-join over the log rollup. The month
 /// predicate is kept exactly where it was: it is the partition-pruning
-/// bound, and the semi-join narrows within it. **M1 scope, unchanged:**
-/// `label_names` takes no fingerprints — `query=`-selector narrowing is
-/// deferred (docs/api.md §2.3), so this form is always unscoped.
+/// bound, and the semi-join narrows within it.
+///
+/// **Issue #482:** `fingerprints` = `None` is the unscoped form (no
+/// `query=` on the request); `Some` is the caller's stage-1 resolution of
+/// `query=`, pushed **into** the [`active_fingerprints`] subquery rather
+/// than added as a second outer `IN` — the same composition
+/// [`detected_labels`] uses, and for the same reason (the subquery's
+/// result is already a subset of the list, so rendering the list once
+/// inside it is equivalent and turns a whole-bucket-range scan into
+/// primary-key point ranges). `Some(&[])` never reaches here: the caller
+/// returns its empty result before building any statement
+/// (`super::exec::LogQlEngine::run_discovery`).
 pub fn label_names(
     streams_idx_table: &str,
     months: &[MonthLiteral],
+    fingerprints: Option<&[u64]>,
     rollup_table: &str,
     window: TimeWindow,
     rollup_res_ns: u64,
@@ -315,24 +325,29 @@ pub fn label_names(
     format!(
         "SELECT DISTINCT key AS name\nFROM {streams_idx_table}\nWHERE {}\n  AND fingerprint IN ({})\nORDER BY name",
         month_clause(months),
-        active_fingerprints(rollup_table, None, window, rollup_res_ns)
+        active_fingerprints(rollup_table, fingerprints, window, rollup_res_ns)
     )
 }
 
 /// Label-values discovery (#13 `GET /api/logs/v1/label/{{name}}/values`):
 /// every distinct value of one key, over the streams ACTIVE within
 /// `window`, ascending. `key_literal` is a pre-escaped ClickHouse string
-/// literal (see [`super::escape::ch_string`]). **M1 scope:** returns the
-/// key's full distinct-value set over that window; `query=`-selector
-/// narrowing is deferred to M6 parity (docs/api.md §2.3).
+/// literal (see [`super::escape::ch_string`]).
 ///
 /// **Issue #399:** same shape and same reason as [`label_names`] — the
 /// month predicate prunes partitions, the [`active_fingerprints`]
 /// semi-join applies the request's own window.
+///
+/// **Issue #482:** `fingerprints` carries `query=`'s stage-1 resolution
+/// with exactly the placement and the `Some(&[])` precondition
+/// [`label_names`] documents. The key predicate keeps its place in the
+/// primary-key prefix either way — the semi-join sits on its own line
+/// beside it, not inside it.
 pub fn label_values(
     streams_idx_table: &str,
     months: &[MonthLiteral],
     key_literal: &CheckedLiteral,
+    fingerprints: Option<&[u64]>,
     rollup_table: &str,
     window: TimeWindow,
     rollup_res_ns: u64,
@@ -341,7 +356,7 @@ pub fn label_values(
     format!(
         "SELECT DISTINCT val AS value\nFROM {streams_idx_table}\nWHERE {} AND key = {key_literal}\n  AND fingerprint IN ({})\nORDER BY value",
         month_clause(months),
-        active_fingerprints(rollup_table, None, window, rollup_res_ns)
+        active_fingerprints(rollup_table, fingerprints, window, rollup_res_ns)
     )
 }
 
@@ -1175,6 +1190,7 @@ mod tests {
             label_names(
                 "log_streams_idx",
                 &[month_literal(2026, 7)],
+                None,
                 "log_metrics_5s",
                 DISCOVERY_WINDOW,
                 RES_5S
@@ -1190,6 +1206,7 @@ mod tests {
         let sql = label_names(
             "log_streams_idx",
             &[month_literal(2026, 7), month_literal(2026, 8)],
+            None,
             "log_metrics_5s",
             DISCOVERY_WINDOW,
             RES_5S,
@@ -1204,6 +1221,7 @@ mod tests {
                 "log_streams_idx",
                 &[month_literal(2026, 7)],
                 &literal("env"),
+                None,
                 "log_metrics_5s",
                 DISCOVERY_WINDOW,
                 RES_5S

@@ -47,7 +47,7 @@ gzip/snappy/zstd request decompression · sync/async insert selection per reques
 | Index stats | `GET /api/logs/v1/stats` | M6 |
 | Compat query aliases (`/loki/api/v1/{query_range,query,labels,label/*/values,series}`) | flag-gated | M1 (tail/stats M6, drilldown M7) |
 | Log volume | `GET /api/logs/v1/volume` | M7 |
-| Detected labels / fields | `GET /api/logs/v1/detected_labels`, `/detected_fields` | M7 |
+| Detected labels / fields | `GET /api/logs/v1/detected_labels`, `/detected_fields`, `/detected_field/{name}/values` | M7 |
 | Log patterns | `GET /api/logs/v1/patterns` (ingest-time pattern extraction) | M7 |
 
 **LogQL — M1 proof subset:** stream selectors with `=`, `!=`, `=~`, `!~`; line filters `|=`, `!=`, `|~`, `!~`; range aggregations `rate`, `count_over_time`, `bytes_rate`, `bytes_over_time`; vector aggregations `sum`, `avg`, `min`, `max`, `count` with `by`/`without`. This subset is exactly what's needed to prove the read path: index-served stream resolution, skip-index line filters, and rollup-served counts.

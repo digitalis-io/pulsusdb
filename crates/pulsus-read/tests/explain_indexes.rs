@@ -1602,6 +1602,12 @@ async fn series_without_a_selector_prunes_the_rollup_and_hits_the_streams_primar
 
 /// Issue #399 AC15 — `/labels` and `/label/{name}/values` keep their
 /// month partition pruning and gain the same activity semi-join.
+///
+/// Issue #482 AC 3 extends it with the SCOPED forms: `query=`'s
+/// fingerprints are pushed inside the activity subquery, so the outer
+/// scan's `index_usage` extract must be IDENTICAL to the unscoped
+/// form's, asserted as an equality against the unscoped extract rather
+/// than against a second copy of the expected list.
 #[tokio::test]
 async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_bucket_range() {
     skip_unless_live!();
@@ -1638,7 +1644,7 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         "Condition: (month in [#, #])",
     ];
 
-    let names_sql = sql::label_names(&idx, &months, &rollup, window, ROLLUP_RES_NS);
+    let names_sql = sql::label_names(&idx, &months, None, &rollup, window, ROLLUP_RES_NS);
     let mut expected: Vec<&str> = month_blocks.to_vec();
     expected.extend([
         "PrimaryKey",
@@ -1646,12 +1652,33 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         "fingerprint",
         "Condition: (fingerprint in #-element set)",
     ]);
-    assert_eq!(explain(&client, &names_sql).await, v(&expected));
+    let names_usage = explain(&client, &names_sql).await;
+    assert_eq!(names_usage, v(&expected));
+
+    // Issue #482 AC 3 — the SCOPED form. `query=`'s stage-1 fingerprints
+    // go INSIDE the activity subquery, so the OUTER scan's index usage
+    // must be identical to the unscoped form's: same month MinMax and
+    // Partition blocks, same primary-key condition. A fingerprint list
+    // added as a second outer conjunct instead would change this extract.
+    let scoped_names_sql = sql::label_names(
+        &idx,
+        &months,
+        Some(&[7, 11]),
+        &rollup,
+        window,
+        ROLLUP_RES_NS,
+    );
+    assert_eq!(
+        explain(&client, &scoped_names_sql).await,
+        names_usage,
+        "the scoped /labels outer scan must analyse exactly as the unscoped one"
+    );
 
     let values_sql = sql::label_values(
         &idx,
         &months,
         &literal("env"),
+        None,
         &rollup,
         window,
         ROLLUP_RES_NS,
@@ -1670,7 +1697,23 @@ async fn label_discovery_scans_prune_on_the_month_partition_and_the_activity_buc
         // primary key, only about the order the extract prints them in.
         "Condition: and((fingerprint in #-element set), (key in ['env', 'env']))",
     ]);
-    assert_eq!(explain(&client, &values_sql).await, v(&expected));
+    let values_usage = explain(&client, &values_sql).await;
+    assert_eq!(values_usage, v(&expected));
+
+    let scoped_values_sql = sql::label_values(
+        &idx,
+        &months,
+        &literal("env"),
+        Some(&[7, 11]),
+        &rollup,
+        window,
+        ROLLUP_RES_NS,
+    );
+    assert_eq!(
+        explain(&client, &scoped_values_sql).await,
+        values_usage,
+        "the scoped /label/{{name}}/values outer scan must analyse exactly as the unscoped one"
+    );
 
     // What embedding the semi-join must NOT cost: the outer scan's month
     // partition pruning. `index_usage` drops `Parts:` counts, so assert

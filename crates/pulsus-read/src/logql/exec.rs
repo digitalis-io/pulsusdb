@@ -7,7 +7,9 @@
 //! database; this module's own test coverage is the error-mapping unit
 //! tests (architect plan amendment §4).
 
-use super::detected::{self, DetectedFields, DetectedLabelOut, FieldAccumulator};
+use super::detected::{
+    self, DetectedFieldValues, DetectedFields, DetectedLabelOut, FieldAccumulator,
+};
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, ResponseOptions, TimeBounds};
@@ -289,6 +291,36 @@ pub enum QueryResult {
     MatrixHist(Vec<HistMatrixSeries>),
 }
 
+/// Which statement [`LogQlEngine::run_discovery`] renders at stage 2, and
+/// under which `X-Pulsus-Explain` stage name. This is the ONLY thing a
+/// caller says about the stage-2 SQL. There is no parameter, closure
+/// argument or return value through which a caller receives a fingerprint
+/// list, so a caller has no expression in which to ignore, replace or
+/// fabricate one (issue #482).
+#[derive(Debug)]
+enum DiscoveryQuery<'a> {
+    /// `/labels` -> [`super::sql::label_names`].
+    LabelNames,
+    /// `/label/{name}/values` -> [`super::sql::label_values`]. `name` is
+    /// minted into a `CheckedLiteral` by `super::predicate::literal`
+    /// INSIDE the helper; the caller passes the raw name.
+    LabelValues { name: &'a str },
+    /// `/detected_labels` -> [`super::sql::detected_labels`].
+    DetectedLabels,
+}
+
+impl DiscoveryQuery<'_> {
+    /// The stage-2 explain stage name — the three literals those three
+    /// paths pushed before issue #482 folded them into one helper.
+    fn stage_name(&self) -> &'static str {
+        match self {
+            DiscoveryQuery::LabelNames => "label_names",
+            DiscoveryQuery::LabelValues { .. } => "label_values",
+            DiscoveryQuery::DetectedLabels => "detected_labels",
+        }
+    }
+}
+
 pub struct LogQlEngine {
     client: ChClient,
     config: EngineConfig,
@@ -409,60 +441,64 @@ impl LogQlEngine {
     /// Labels discovery (#13 `GET|POST /api/logs/v1/labels`): distinct
     /// `log_streams_idx` keys within `b`'s months. Budget-capped like
     /// every other index scan in this module.
-    pub async fn label_names(&self, b: TimeBounds) -> Result<Vec<String>, ReadError> {
-        self.label_names_inner(b, None).await
+    ///
+    /// **Issue #482:** `selector` is `query=`'s matchers-only narrowing —
+    /// `None` is the unscoped form (byte-identical to what this endpoint
+    /// answered before), `Some` resolves the selector to a fingerprint
+    /// set first and reads only those streams' keys.
+    pub async fn label_names(
+        &self,
+        selector: Option<&Expr>,
+        b: TimeBounds,
+    ) -> Result<Vec<String>, ReadError> {
+        self.label_names_inner(selector, b, None).await
     }
 
     /// [`LogQlEngine::label_names`] plus its `X-Pulsus-Explain` trace, in
     /// the same single pass (no second scan).
     pub async fn label_names_explained(
         &self,
+        selector: Option<&Expr>,
         b: TimeBounds,
     ) -> Result<(Vec<String>, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("labels");
-        let names = self.label_names_inner(b, Some(&mut explain)).await?;
+        let names = self
+            .label_names_inner(selector, b, Some(&mut explain))
+            .await?;
         Ok((names, explain))
     }
 
     async fn label_names_inner(
         &self,
+        selector: Option<&Expr>,
         b: TimeBounds,
-        mut explain: Option<&mut PlanExplain>,
+        explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<String>, ReadError> {
-        let months = plan::months_overlapping(b.start_ns, b.end_ns);
-        let sql = super::sql::label_names(
-            &self.config.streams_idx,
-            &months,
-            &self.config.rollup_table,
-            self.activity_window(b),
-            self.config.rollup_res_ns,
-        );
-        if let Some(e) = explain.as_mut() {
-            e.push("label_names", sql.clone(), None);
-        }
-        let mut names = Vec::new();
-        let mut stream = self
-            .query_stream::<LabelNameRow>(&sql, &self.activity_settings())
-            .await?;
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| {
-                map_read_error(
-                    e,
-                    self.config.scan_budget_bytes,
-                    self.config.read_max_memory_bytes,
-                )
-            })?;
-            names.push(row.name);
-        }
-        Ok(names)
+        self.run_discovery::<LabelNameRow, String>(
+            DiscoveryQuery::LabelNames,
+            selector,
+            b,
+            explain,
+            "labels requires a log stream selector (matchers only)",
+            |r| Some(r.name),
+        )
+        .await
     }
 
     /// Label-values discovery (#13 `GET /api/logs/v1/label/{name}/values`):
-    /// distinct values of `name` within `b`'s months. **M1 scope:** returns
-    /// the key's full distinct-value set; `query=`-selector narrowing is
-    /// deferred to M6 parity (docs/api.md §2.3).
-    pub async fn label_values(&self, name: &str, b: TimeBounds) -> Result<Vec<String>, ReadError> {
-        self.label_values_inner(name, b, None).await
+    /// distinct values of `name` within `b`'s months.
+    ///
+    /// **Issue #482:** `selector` narrows exactly as it does for
+    /// [`LogQlEngine::label_names`] — the key filter is applied on top of
+    /// the narrowed stream set, so a key that exists on some other stream
+    /// contributes nothing.
+    pub async fn label_values(
+        &self,
+        name: &str,
+        selector: Option<&Expr>,
+        b: TimeBounds,
+    ) -> Result<Vec<String>, ReadError> {
+        self.label_values_inner(name, selector, b, None).await
     }
 
     /// [`LogQlEngine::label_values`] plus its `X-Pulsus-Explain` trace, in
@@ -470,35 +506,148 @@ impl LogQlEngine {
     pub async fn label_values_explained(
         &self,
         name: &str,
+        selector: Option<&Expr>,
         b: TimeBounds,
     ) -> Result<(Vec<String>, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("label_values");
-        let values = self.label_values_inner(name, b, Some(&mut explain)).await?;
+        let values = self
+            .label_values_inner(name, selector, b, Some(&mut explain))
+            .await?;
         Ok((values, explain))
     }
 
     async fn label_values_inner(
         &self,
         name: &str,
+        selector: Option<&Expr>,
+        b: TimeBounds,
+        explain: Option<&mut PlanExplain>,
+    ) -> Result<Vec<String>, ReadError> {
+        self.run_discovery::<LabelValueRow, String>(
+            DiscoveryQuery::LabelValues { name },
+            selector,
+            b,
+            explain,
+            "label values requires a log stream selector (matchers only)",
+            |r| Some(r.value),
+        )
+        .await
+    }
+
+    /// Runs a matchers-only discovery request end to end — the ONE
+    /// stage-1 block for `/labels`, `/label/{name}/values` and
+    /// `/detected_labels` (issue #482).
+    ///
+    /// **The no-stream case is owned here.** When `selector` is `Some`
+    /// and stage 1 resolves to nothing, this returns `Ok(Vec::new())`
+    /// from inside the helper, before any stage-2 statement is built or
+    /// issued. The fingerprint list is a local of this function and is
+    /// passed only to the [`super::sql`] builder selected by `query`.
+    ///
+    /// **No caller receives a fingerprint list in any form** — not as a
+    /// parameter, not as a closure argument, not as a return value — so a
+    /// caller has no expression in which to ignore, replace or fabricate
+    /// one. Because the empty check precedes the build, the
+    /// `Option<&[u64]>` reaching [`super::sql::active_fingerprints`] from
+    /// these three paths is `None` or a NON-EMPTY slice, never
+    /// `Some(&[])`.
+    ///
+    /// Two things it does not prevent, stated rather than implied:
+    /// `R` is not bound to the [`DiscoveryQuery`] variant (a mismatch is
+    /// a row-decode error, not a wrong answer — the projections have
+    /// disjoint column names), and a future fourth discovery path could
+    /// bypass the helper and render a builder itself.
+    ///
+    /// `metric_rejection` is the endpoint's own `PipelineInvalid` reason:
+    /// unreachable through the API layer (all three parse `query` with
+    /// `parse_selector`), kept as a structured rejection, never a panic.
+    async fn run_discovery<R: ChRow, T>(
+        &self,
+        query: DiscoveryQuery<'_>,
+        selector: Option<&Expr>,
         b: TimeBounds,
         mut explain: Option<&mut PlanExplain>,
-    ) -> Result<Vec<String>, ReadError> {
+        metric_rejection: &str,
+        mut keep_row: impl FnMut(R) -> Option<T>,
+    ) -> Result<Vec<T>, ReadError> {
+        // Always >= 1 literal (`months_overlapping` never returns empty),
+        // so the stage-2 month IN-list has no empty-IN hazard.
         let months = plan::months_overlapping(b.start_ns, b.end_ns);
-        let key_literal = super::predicate::literal(name);
-        let sql = super::sql::label_values(
-            &self.config.streams_idx,
-            &months,
-            &key_literal,
-            &self.config.rollup_table,
-            self.activity_window(b),
-            self.config.rollup_res_ns,
-        );
+        let fingerprints: Option<Vec<u64>> = match selector {
+            None => None,
+            Some(expr) => {
+                let ctx = self.config.plan_ctx();
+                // `limit`/`direction`/`step` are unused placeholders —
+                // none of these three endpoints reads samples (the stats
+                // idiom).
+                let qp = QueryParams {
+                    spec: QuerySpec::Range {
+                        start_ns: b.start_ns,
+                        end_ns: b.end_ns,
+                        step_ns: 1_000_000_000,
+                    },
+                    limit: 1,
+                    direction: Direction::Forward,
+                };
+                let sp = match plan::plan(expr, &qp, &ctx)? {
+                    Plan::Streams(sp) => sp,
+                    // Unreachable via the API layer (it parses `query`
+                    // with `parse_selector`) — kept as a structured
+                    // rejection, never a panic.
+                    Plan::Metric(_) | Plan::MetricBinary(_) => {
+                        return Err(ReadError::PipelineInvalid {
+                            reason: metric_rejection.to_string(),
+                        });
+                    }
+                };
+                if let Some(e) = explain.as_mut() {
+                    e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
+                }
+                let fps = self.resolve_fingerprints(&sp.stage1_sql).await?;
+                if fps.is_empty() {
+                    // No matching streams — return before stage 2 is
+                    // built, so no statement is issued and no empty
+                    // fingerprint IN-list can render.
+                    return Ok(Vec::new());
+                }
+                Some(fps)
+            }
+        };
+        let fps = fingerprints.as_deref();
+        let window = self.activity_window(b);
+        let sql = match query {
+            DiscoveryQuery::LabelNames => super::sql::label_names(
+                &self.config.streams_idx,
+                &months,
+                fps,
+                &self.config.rollup_table,
+                window,
+                self.config.rollup_res_ns,
+            ),
+            DiscoveryQuery::LabelValues { name } => super::sql::label_values(
+                &self.config.streams_idx,
+                &months,
+                &super::predicate::literal(name),
+                fps,
+                &self.config.rollup_table,
+                window,
+                self.config.rollup_res_ns,
+            ),
+            DiscoveryQuery::DetectedLabels => super::sql::detected_labels(
+                &self.config.streams_idx,
+                &months,
+                fps,
+                &self.config.rollup_table,
+                window,
+                self.config.rollup_res_ns,
+            ),
+        };
         if let Some(e) = explain.as_mut() {
-            e.push("label_values", sql.clone(), None);
+            e.push(query.stage_name(), sql.clone(), None);
         }
-        let mut values = Vec::new();
+        let mut out = Vec::new();
         let mut stream = self
-            .query_stream::<LabelValueRow>(&sql, &self.activity_settings())
+            .query_stream::<R>(&sql, &self.activity_settings())
             .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| {
@@ -508,9 +657,11 @@ impl LogQlEngine {
                     self.config.read_max_memory_bytes,
                 )
             })?;
-            values.push(row.value);
+            if let Some(kept) = keep_row(row) {
+                out.push(kept);
+            }
         }
-        Ok(values)
+        Ok(out)
     }
 
     /// Series discovery (#13 `GET|POST /api/logs/v1/series`): the union of
@@ -2568,85 +2719,26 @@ impl LogQlEngine {
         &self,
         selector: Option<&Expr>,
         b: TimeBounds,
-        mut explain: Option<&mut PlanExplain>,
+        explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<DetectedLabelOut>, ReadError> {
-        // Always >= 1 literal (`months_overlapping` never returns empty),
-        // so the aggregation's month IN-list has no empty-IN hazard.
-        let months = plan::months_overlapping(b.start_ns, b.end_ns);
-        let fingerprints: Option<Vec<u64>> = match selector {
-            None => None,
-            Some(expr) => {
-                let ctx = self.config.plan_ctx();
-                // `limit`/`direction`/`step` are unused placeholders —
-                // detected_labels never reads samples (the stats idiom).
-                let qp = QueryParams {
-                    spec: QuerySpec::Range {
-                        start_ns: b.start_ns,
-                        end_ns: b.end_ns,
-                        step_ns: 1_000_000_000,
+        self.run_discovery::<DetectedLabelRow, DetectedLabelOut>(
+            DiscoveryQuery::DetectedLabels,
+            selector,
+            b,
+            explain,
+            "detected_labels requires a log stream selector (matchers only)",
+            |row| {
+                // The reference keep rule: static labels always; anything
+                // else only when NOT every value is float-or-UUID.
+                (detected::is_static_detected_label(&row.key) || row.non_id_values > 0).then_some(
+                    DetectedLabelOut {
+                        label: row.key,
+                        cardinality: row.cardinality,
                     },
-                    limit: 1,
-                    direction: Direction::Forward,
-                };
-                let sp = match plan::plan(expr, &qp, &ctx)? {
-                    Plan::Streams(sp) => sp,
-                    // Unreachable via the API layer (it parses `query`
-                    // with `parse_selector`) — kept as a structured
-                    // rejection, never a panic.
-                    Plan::Metric(_) | Plan::MetricBinary(_) => {
-                        return Err(ReadError::PipelineInvalid {
-                            reason: "detected_labels requires a log stream selector (matchers \
-                                     only)"
-                                .to_string(),
-                        });
-                    }
-                };
-                if let Some(e) = explain.as_mut() {
-                    e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
-                }
-                let fps = self.resolve_fingerprints(&sp.stage1_sql).await?;
-                if fps.is_empty() {
-                    // No matching streams — skip the aggregation query
-                    // entirely (an empty fingerprint IN-list must never
-                    // render).
-                    return Ok(Vec::new());
-                }
-                Some(fps)
-            }
-        };
-        let sql = super::sql::detected_labels(
-            &self.config.streams_idx,
-            &months,
-            fingerprints.as_deref(),
-            &self.config.rollup_table,
-            self.activity_window(b),
-            self.config.rollup_res_ns,
-        );
-        if let Some(e) = explain.as_mut() {
-            e.push("detected_labels", sql.clone(), None);
-        }
-        let mut out = Vec::new();
-        let mut stream = self
-            .query_stream::<DetectedLabelRow>(&sql, &self.activity_settings())
-            .await?;
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| {
-                map_read_error(
-                    e,
-                    self.config.scan_budget_bytes,
-                    self.config.read_max_memory_bytes,
                 )
-            })?;
-            // The reference keep rule: static labels always; anything
-            // else only when NOT every value is float-or-UUID.
-            if detected::is_static_detected_label(&row.key) || row.non_id_values > 0 {
-                out.push(DetectedLabelOut {
-                    label: row.key,
-                    cardinality: row.cardinality,
-                });
-            }
-        }
-        Ok(out)
+            },
+        )
+        .await
     }
 
     /// `/api/logs/v1/detected_fields` (issue #170, docs/api.md §2.6):
@@ -2699,8 +2791,116 @@ impl LogQlEngine {
         b: TimeBounds,
         line_limit: u32,
         field_limit: u32,
-        mut explain: Option<&mut PlanExplain>,
+        explain: Option<&mut PlanExplain>,
     ) -> Result<DetectedFields, ReadError> {
+        let mut acc = FieldAccumulator::new(field_limit);
+        let Some(truncated) = self
+            .detected_fields_scan(expr, b, line_limit, &mut acc, explain)
+            .await?
+        else {
+            return Ok(DetectedFields {
+                fields: Vec::new(),
+                truncated: false,
+                retention_capped: false,
+            });
+        };
+        let (fields, retention_capped) = acc.finish();
+        Ok(DetectedFields {
+            fields,
+            truncated,
+            retention_capped,
+        })
+    }
+
+    /// `/api/logs/v1/detected_field/{name}/values` (issue #482): the
+    /// `/detected_fields` sampling with the accumulator restricted to ONE
+    /// field name and its value set capped at `value_limit`, checked
+    /// BETWEEN entries — everything one sampled entry contributes is
+    /// added before the cap is consulted again, so a single entry can
+    /// carry the total past `value_limit`.
+    pub async fn detected_field_values(
+        &self,
+        field: &str,
+        expr: &Expr,
+        b: TimeBounds,
+        line_limit: u32,
+        value_limit: u32,
+    ) -> Result<DetectedFieldValues, ReadError> {
+        self.detected_field_values_inner(field, expr, b, line_limit, value_limit, None)
+            .await
+    }
+
+    /// [`LogQlEngine::detected_field_values`] plus its
+    /// `X-Pulsus-Explain` trace, in the same single pass (no second scan)
+    /// — the `query_explained` contract.
+    pub async fn detected_field_values_explained(
+        &self,
+        field: &str,
+        expr: &Expr,
+        b: TimeBounds,
+        line_limit: u32,
+        value_limit: u32,
+    ) -> Result<(DetectedFieldValues, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("detected_field_values");
+        let out = self
+            .detected_field_values_inner(
+                field,
+                expr,
+                b,
+                line_limit,
+                value_limit,
+                Some(&mut explain),
+            )
+            .await?;
+        Ok((out, explain))
+    }
+
+    async fn detected_field_values_inner(
+        &self,
+        field: &str,
+        expr: &Expr,
+        b: TimeBounds,
+        line_limit: u32,
+        value_limit: u32,
+        explain: Option<&mut PlanExplain>,
+    ) -> Result<DetectedFieldValues, ReadError> {
+        let mut acc = FieldAccumulator::for_field_values(field, value_limit);
+        let Some(truncated) = self
+            .detected_fields_scan(expr, b, line_limit, &mut acc, explain)
+            .await?
+        else {
+            return Ok(DetectedFieldValues {
+                values: Vec::new(),
+                truncated: false,
+                retention_capped: false,
+            });
+        };
+        let (values, retention_capped) = acc.into_field_values();
+        Ok(DetectedFieldValues {
+            values,
+            truncated,
+            retention_capped,
+        })
+    }
+
+    /// The stage-1/2/3 sampling half shared by `/detected_fields` and
+    /// `/detected_field/{name}/values` (issue #482): identical plan,
+    /// identical statements, identical paging — the two routes differ
+    /// only in which [`FieldAccumulator`] they feed and in how they
+    /// project it afterwards.
+    ///
+    /// `Ok(None)` = stage 1 matched no stream, so nothing was scanned and
+    /// the caller returns its own empty result; `Ok(Some(truncated))`
+    /// otherwise, with `truncated` carrying the paged loop's
+    /// budget-exhaustion terminal.
+    async fn detected_fields_scan(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+        line_limit: u32,
+        acc: &mut FieldAccumulator,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<Option<bool>, ReadError> {
         let ctx = self.config.plan_ctx();
         // `limit = line_limit` drives the plan's scan/result sizing
         // exactly as a `/query_range` with the same limit would
@@ -2734,11 +2934,7 @@ impl LogQlEngine {
         }
         let fingerprints = self.resolve_fingerprints(&sp.stage1_sql).await?;
         if fingerprints.is_empty() {
-            return Ok(DetectedFields {
-                fields: Vec::new(),
-                truncated: false,
-                retention_capped: false,
-            });
+            return Ok(None);
         }
         if let Some(e) = explain.as_mut() {
             e.push(
@@ -2759,8 +2955,6 @@ impl LogQlEngine {
             start_ns: sp.start_ns,
             end_ns: sp.end_ns,
         };
-        let mut acc = FieldAccumulator::new(field_limit);
-
         if !sp.fetch_until_limit {
             // Fast path — provably complete, not just fast: with no
             // unpushed dropping stage the pipeline cannot drop a line the
@@ -2806,8 +3000,13 @@ impl LogQlEngine {
                             self.config.read_max_memory_bytes,
                         )
                     })?;
-                    if matched >= line_limit {
+                    if matched >= line_limit || acc.value_cap_reached() {
                         // `line_limit` stops FEEDING, never DRAINING.
+                        // Issue #482's value cap is the second feeding
+                        // stop and is checked here, between entries —
+                        // inert on `/detected_fields`, whose accumulator
+                        // leaves both `name_filter` and `value_limit`
+                        // `None`.
                         continue;
                     }
                     if feeder.feed_row(
@@ -2817,18 +3016,13 @@ impl LogQlEngine {
                         &row.structured_metadata,
                         &base_labels,
                         &compiled,
-                        &mut acc,
+                        acc,
                     )? {
                         matched += 1;
                     }
                 }
             }
-            let (fields, retention_capped) = acc.finish();
-            return Ok(DetectedFields {
-                fields,
-                truncated: false,
-                retention_capped,
-            });
+            return Ok(Some(false));
         }
 
         // Dropping sub-case: the pipeline can drop lines in-engine, so a
@@ -2861,15 +3055,10 @@ impl LogQlEngine {
                 &services,
                 &fingerprints,
                 line_limit,
-                &mut acc,
+                acc,
             )
             .await?;
-        let (fields, retention_capped) = acc.finish();
-        Ok(DetectedFields {
-            fields,
-            truncated,
-            retention_capped,
-        })
+        Ok(Some(truncated))
     }
 
     /// The detected_fields fetch-until-limit paging loop (issue #170 plan

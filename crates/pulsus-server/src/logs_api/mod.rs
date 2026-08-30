@@ -36,6 +36,7 @@ mod volume;
 
 use axum::Router;
 use axum::routing::get;
+use pulsus_logql::{Expr, LogExpr};
 
 use crate::app::AppState;
 
@@ -91,6 +92,31 @@ fn mount_detected_routes(router: Router<AppState>, prefix: &str) -> Router<AppSt
             &format!("{prefix}/detected_fields"),
             get(detected::detected_fields).post(detected::detected_fields_post),
         )
+        .route(
+            &format!("{prefix}/detected_field/{{name}}/values"),
+            get(detected::detected_field_values).post(detected::detected_field_values_post),
+        )
+}
+
+/// `query=` as an OPTIONAL matchers-only selector — the ONE parse-and-
+/// shape seam shared by `/labels`, `/label/{name}/values` and
+/// `/detected_labels` (issue #482), so the three cannot drift in what
+/// they accept or in the error text they emit. `None` and `Some("")` are
+/// both the unscoped form (§2's present-but-empty rule).
+///
+/// Callers must run this BEFORE `parse_bounds_ordered`: a request bad in
+/// both ways must answer the selector error, or the cross-endpoint
+/// identity fails on exactly that input.
+pub(crate) fn parse_optional_selector(
+    pairs: &[(String, String)],
+) -> Result<Option<Expr>, error::ApiError> {
+    match params::get(pairs, "query") {
+        None | Some("") => Ok(None),
+        Some(q) => Ok(Some(Expr::Log(LogExpr {
+            selector: pulsus_logql::parse_selector(q)?,
+            pipeline: Vec::new(),
+        }))),
+    }
 }
 
 /// Parses a LogQL query and admits its iterative walks (issue #272).
@@ -504,7 +530,59 @@ mod tests {
             base: SELECTOR_QUERY,
             param: "since",
         },
+        // /detected_field/{name}/values (issue #482) — the same parameter
+        // set as /detected_fields.
+        EmptyParamCase {
+            path: DETECTED_FIELD_VALUES,
+            base: "",
+            param: "query",
+        },
+        EmptyParamCase {
+            path: DETECTED_FIELD_VALUES,
+            base: SELECTOR_QUERY,
+            param: "line_limit",
+        },
+        EmptyParamCase {
+            path: DETECTED_FIELD_VALUES,
+            base: SELECTOR_QUERY,
+            param: "limit",
+        },
+        EmptyParamCase {
+            path: DETECTED_FIELD_VALUES,
+            base: SELECTOR_QUERY,
+            param: "field_limit",
+        },
+        EmptyParamCase {
+            path: DETECTED_FIELD_VALUES,
+            base: SELECTOR_QUERY,
+            param: "start",
+        },
+        EmptyParamCase {
+            path: DETECTED_FIELD_VALUES,
+            base: SELECTOR_QUERY,
+            param: "end",
+        },
+        EmptyParamCase {
+            path: DETECTED_FIELD_VALUES,
+            base: SELECTOR_QUERY,
+            param: "since",
+        },
+        // /labels and /label/{name}/values gained `query` in issue #482.
+        EmptyParamCase {
+            path: "/api/logs/v1/labels",
+            base: "",
+            param: "query",
+        },
+        EmptyParamCase {
+            path: "/api/logs/v1/label/env/values",
+            base: "",
+            param: "query",
+        },
     ];
+
+    /// The issue #482 route, with `{name}` resolved — every routed table
+    /// below names it.
+    const DETECTED_FIELD_VALUES: &str = "/api/logs/v1/detected_field/level/values";
 
     /// `query={env="prod"}` percent-encoded — a bare stream selector, so
     /// it is accepted by every route in the table including `/volume` and
@@ -553,6 +631,7 @@ mod tests {
         "/api/logs/v1/series",
         "/api/logs/v1/detected_labels",
         "/api/logs/v1/detected_fields",
+        DETECTED_FIELD_VALUES,
         // Issue #406 Part B2: these four gained `POST` with the same
         // form-decode core, so the #391 identity has to hold on them too.
         "/api/logs/v1/stats",
@@ -648,6 +727,94 @@ mod tests {
                 String::from_utf8_lossy(&empty_body),
                 String::from_utf8_lossy(&absent_body),
             );
+        }
+    }
+
+    /// **Issue #482, the cross-endpoint identity.** `/labels` and
+    /// `/label/{name}/values` gained `query=` as an optional
+    /// matchers-only selector, and they must answer a bad one exactly as
+    /// `/detected_labels` — which has accepted the same parameter, with
+    /// the same parser and the same error family, since issue #170.
+    ///
+    /// The pin is the IDENTITY, not the literal text: our parse-error
+    /// wording is already ours rather than the reference's on
+    /// `/detected_labels`, so pinning the two new endpoints to a string
+    /// we do not match elsewhere would pin the wrong property. What must
+    /// hold is that all three answer the same input the same way, which
+    /// is what having one `parse_optional_selector` seam buys.
+    ///
+    /// Against the POOLLESS `test_state()`: all four inputs are rejected
+    /// before pool acquisition, so no database is involved. The
+    /// selector parse runs BEFORE `parse_bounds_ordered` on all three, so
+    /// a request bad in both ways answers the selector error — that
+    /// ordering is what the `since=bogus` companion row checks.
+    #[tokio::test]
+    async fn a_bad_query_selector_answers_identically_on_all_three_discovery_routes() {
+        // Raw, then percent-encoded: a truncated matcher, a pipeline
+        // stage (rejected because these routes are matchers-only), a bare
+        // brace, and a metric expression.
+        let inputs: &[&str] = &[
+            "%7Bbroken",
+            "%7Bapp%3D%22frontend%22%7D%20%7C%3D%20%60x%60",
+            "%7B",
+            "count_over_time%28%7Bapp%3D%22a%22%7D%5B1h%5D%29",
+        ];
+        const BOUNDS: &str = "start=1786342706000000000&end=1786346306000000000";
+        for input in inputs {
+            let suffix = format!("query={input}&{BOUNDS}");
+            let (ref_status, ref_body) = routed(
+                router(),
+                get_req(&format!("/api/logs/v1/detected_labels?{suffix}")),
+            )
+            .await;
+            assert_eq!(
+                ref_status,
+                StatusCode::BAD_REQUEST,
+                "the reference row itself must be a 400 for query={input}, else the identity \
+                 below asserts nothing: {}",
+                String::from_utf8_lossy(&ref_body)
+            );
+            assert!(
+                !ref_body.is_empty(),
+                "the reference row's body must be non-empty for query={input}"
+            );
+            for path in ["/api/logs/v1/labels", "/api/logs/v1/label/env/values"] {
+                let (status, body) = routed(router(), get_req(&format!("{path}?{suffix}"))).await;
+                assert_eq!(
+                    status,
+                    ref_status,
+                    "GET {path} with query={input} must answer as /detected_labels does: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                assert_eq!(
+                    body,
+                    ref_body,
+                    "GET {path} with query={input} must answer BYTE-identically to \
+                     /detected_labels\nours: {}\ndetected_labels: {}",
+                    String::from_utf8_lossy(&body),
+                    String::from_utf8_lossy(&ref_body),
+                );
+            }
+        }
+
+        // The ordering half: a request bad in BOTH ways answers the
+        // SELECTOR error, not the bounds one — on all three routes.
+        let both_bad = "query=%7Bbroken&since=bogus";
+        let (ref_status, ref_body) = routed(
+            router(),
+            get_req(&format!("/api/logs/v1/detected_labels?{both_bad}")),
+        )
+        .await;
+        assert_eq!(ref_status, StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&ref_body).starts_with("unexpected end of query"),
+            "the selector error must win over the `since` one: {}",
+            String::from_utf8_lossy(&ref_body)
+        );
+        for path in ["/api/logs/v1/labels", "/api/logs/v1/label/env/values"] {
+            let (status, body) = routed(router(), get_req(&format!("{path}?{both_bad}"))).await;
+            assert_eq!(status, ref_status, "GET {path} both-bad status");
+            assert_eq!(body, ref_body, "GET {path} both-bad body");
         }
     }
 
@@ -1002,6 +1169,12 @@ mod tests {
     fn post_base_query(path: &str) -> &'static str {
         if path.ends_with("/series") {
             SELECTOR_MATCH
+        } else if path == DETECTED_FIELD_VALUES {
+            // Issue #482: this path also ends `/values`, but unlike
+            // `/label/{name}/values` it REQUIRES `query`. Matched before
+            // the suffix arm below, or the POST-merge table would send it
+            // an empty query and expect a non-400.
+            SELECTOR_QUERY
         } else if path.ends_with("/labels")
             || path.ends_with("/values")
             || path.ends_with("/detected_labels")
@@ -1290,6 +1463,7 @@ mod tests {
             ("/api/logs/v1/volume", SELECTOR_QUERY, true),
             ("/api/logs/v1/detected_labels", "", true),
             ("/api/logs/v1/detected_fields", SELECTOR_QUERY, true),
+            (DETECTED_FIELD_VALUES, SELECTOR_QUERY, true),
             // The two the reference deliberately does NOT check, each
             // backed by the control in this test's doc comment (a
             // right-way-round window serving identically on both stores)
@@ -1377,6 +1551,7 @@ mod tests {
             ("/api/logs/v1/patterns", SELECTOR_QUERY),
             ("/api/logs/v1/detected_labels", ""),
             ("/api/logs/v1/detected_fields", SELECTOR_QUERY),
+            (DETECTED_FIELD_VALUES, SELECTOR_QUERY),
         ];
         for &(path, base) in routes {
             let build = |start: &str, end: &str| {
@@ -1519,7 +1694,7 @@ mod tests {
         );
     }
 
-    /// **Part C, routed.** `since` is read on the nine routes that carry a
+    /// **Part C, routed.** `since` is read on every route that carries a
     /// `start`/`end` pair and rejected rather than ignored: `since=bogus`
     /// moves from a silent `200` to a `400`. `/query` is the reference's
     /// exemption (it has only `time`) and is asserted as such.
@@ -1535,6 +1710,7 @@ mod tests {
             ("/api/logs/v1/patterns", SELECTOR_QUERY),
             ("/api/logs/v1/detected_labels", ""),
             ("/api/logs/v1/detected_fields", SELECTOR_QUERY),
+            (DETECTED_FIELD_VALUES, SELECTOR_QUERY),
         ];
         for &(path, base) in bounded {
             let q = if base.is_empty() {

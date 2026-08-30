@@ -1173,3 +1173,221 @@ async fn detected_labels_keeps_a_sample_in_the_bucket_that_contains_start() {
 
     drop_db(db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #482: /detected_field/{name}/values.
+// ---------------------------------------------------------------------
+
+/// **Issue #482 AC 11, fixture V.** The new route end to end, as WHOLE
+/// response bodies on both the native and the `/loki/api/v1` prefix.
+///
+/// The fixture's point is that ONE sampled entry contributes TWO
+/// distinct values of `level`: the structured-metadata re-parse observes
+/// `level=<x>2` unattributed and the json auto-parse observes
+/// `level=<x>1`, both onto the same accumulator field. Sampling is
+/// newest-first.
+///
+/// **V2 is the discriminating witness.** `limit=3` returns FOUR values,
+/// which no other cap placement produces on this fixture: no cap at all
+/// gives six; sorting then truncating to `limit` gives three
+/// (`a1,a2,b1`); refusing a value once the set reaches `limit` WITHIN an
+/// entry gives three (`b2,c1,c2`). Only the specified between-entries
+/// stop gives `b1,b2,c1,c2`. V1 alone passes on "no cap"; V3 alone
+/// passes on "truncate"; the pair is required.
+///
+/// V7 is the value-shape case on a second service: the empty string is a
+/// real value and must appear, non-ASCII is emitted raw rather than
+/// `\u`-escaped, and the order is byte-ascending.
+#[tokio::test(flavor = "multi_thread")]
+async fn detected_field_values_end_to_end() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_213;
+    let db = &pulsus_testkit::test_db("pulsus_detected_it_field_values");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
+    let client = data_client(db).await;
+
+    let now = now_ns();
+    seed_stream(
+        &client,
+        db,
+        now,
+        20,
+        "fieldvals",
+        r#"{"service_name":"fieldvals"}"#,
+    )
+    .await;
+    seed_stream(
+        &client,
+        db,
+        now,
+        21,
+        "fieldvals2",
+        r#"{"service_name":"fieldvals2"}"#,
+    )
+    .await;
+
+    let mut rows: Vec<SeedSampleRow> = Vec::new();
+    for (i, tag) in ["a", "b", "c"].iter().enumerate() {
+        rows.push(SeedSampleRow {
+            service: "fieldvals".to_string(),
+            fingerprint: 20,
+            timestamp_ns: now - (3 - i as i64) * 1_000_000_000,
+            severity: 0,
+            body: format!(r#"{{"level":"{tag}1"}}"#),
+            structured_metadata: format!(r#"{{"level":"{tag}2"}}"#),
+        });
+    }
+    for (i, (body_tag, sm_tag)) in [("", "héllo"), ("a b", "日本語"), ("a,b", "a")]
+        .iter()
+        .enumerate()
+    {
+        rows.push(SeedSampleRow {
+            service: "fieldvals2".to_string(),
+            fingerprint: 21,
+            timestamp_ns: now - (3 - i as i64) * 1_000_000_000,
+            severity: 0,
+            body: serde_json::json!({ "tag": body_tag }).to_string(),
+            structured_metadata: serde_json::json!({ "tag": sm_tag }).to_string(),
+        });
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("seed fixture V log_samples");
+
+    let start = now - 3_600_000_000_000;
+    let end = now + 3_600_000_000_000;
+    let url = |prefix: &str, field: &str, service: &str, extra: &str| {
+        format!(
+            "{prefix}/detected_field/{field}/values?query=%7Bservice_name%3D%22{service}%22%7D\
+             &start={start}&end={end}{extra}"
+        )
+    };
+
+    // V1 — the full value set, ascending.
+    let v1 = http_get(port, &url("/api/logs/v1", "level", "fieldvals", ""), false);
+    assert_eq!(v1.status, 200, "body: {}", v1.body);
+    assert_eq!(
+        v1.body,
+        r#"{"limit":1000,"values":["a1","a2","b1","b2","c1","c2"]}"#
+    );
+
+    // V2 — the cap BITES between entries: four values, not six, not three.
+    let v2 = http_get(
+        port,
+        &url("/api/logs/v1", "level", "fieldvals", "&limit=3"),
+        false,
+    );
+    assert_eq!(v2.status, 200, "body: {}", v2.body);
+    assert_eq!(v2.body, r#"{"limit":3,"values":["b1","b2","c1","c2"]}"#);
+
+    // V3 — one entry's worth.
+    let v3 = http_get(
+        port,
+        &url("/api/logs/v1", "level", "fieldvals", "&limit=1"),
+        false,
+    );
+    assert_eq!(v3.status, 200, "body: {}", v3.body);
+    assert_eq!(v3.body, r#"{"limit":1,"values":["c1","c2"]}"#);
+
+    // V4 — an unknown field name is the bare `{}`.
+    let v4 = http_get(
+        port,
+        &url("/api/logs/v1", "nosuchfield", "fieldvals", ""),
+        false,
+    );
+    assert_eq!(v4.status, 200, "body: {}", v4.body);
+    assert_eq!(v4.body, "{}");
+
+    // V5 — the alias answers byte-identically. This is the shape the
+    // dashboard datasource actually requests.
+    let v5 = http_get(port, &url("/loki/api/v1", "level", "fieldvals", ""), false);
+    assert_eq!(v5.status, 200, "body: {}", v5.body);
+    assert_eq!(
+        v5.body, v1.body,
+        "detected_field_values alias byte-identity"
+    );
+
+    // V6 — a selector matching no stream is the bare `{}` too.
+    let v6 = http_get(port, &url("/api/logs/v1", "level", "absent", ""), false);
+    assert_eq!(v6.status, 200, "body: {}", v6.body);
+    assert_eq!(v6.body, "{}");
+
+    // V7 — the adversarial value shapes.
+    let v7 = http_get(port, &url("/api/logs/v1", "tag", "fieldvals2", ""), false);
+    assert_eq!(v7.status, 200, "body: {}", v7.body);
+    assert_eq!(
+        v7.body,
+        r#"{"limit":1000,"values":["","a","a b","a,b","héllo","日本語"]}"#
+    );
+
+    // V8-V11 — the rejections, on both prefixes, bare `text/plain`.
+    for prefix in ["/api/logs/v1", "/loki/api/v1"] {
+        let no_query = http_get(
+            port,
+            &format!("{prefix}/detected_field/level/values?start={start}&end={end}"),
+            false,
+        );
+        assert_eq!(no_query.status, 400, "body: {}", no_query.body);
+        assert_eq!(no_query.body, "missing required parameter 'query'");
+
+        let metric = http_get(
+            port,
+            &format!(
+                "{prefix}/detected_field/level/values?query=count_over_time%28%7Bservice_name%3D%22fieldvals%22%7D%5B1h%5D%29&start={start}&end={end}"
+            ),
+            false,
+        );
+        assert_eq!(metric.status, 400, "body: {}", metric.body);
+        assert_eq!(
+            metric.body,
+            "'query' must be a log stream selector query: detected_field_values does not support \
+             metric queries"
+        );
+
+        let bad_line_limit = http_get(
+            port,
+            &url(prefix, "level", "fieldvals", "&line_limit=0"),
+            false,
+        );
+        assert_eq!(bad_line_limit.status, 400, "body: {}", bad_line_limit.body);
+        assert_eq!(
+            bad_line_limit.body,
+            r#"invalid 'line_limit' "0": expected a positive integer"#
+        );
+
+        let bad_limit = http_get(port, &url(prefix, "level", "fieldvals", "&limit=0"), false);
+        assert_eq!(bad_limit.status, 400, "body: {}", bad_limit.body);
+        assert_eq!(
+            bad_limit.body,
+            r#"invalid 'limit' "0": expected a positive integer"#
+        );
+    }
+
+    // The rejections are byte-identical to `/detected_fields`' — the two
+    // routes share `params::parse_line_limit` / `parse_field_limit`.
+    let df_line_limit = http_get(
+        port,
+        &format!(
+            "/api/logs/v1/detected_fields?query=%7Bservice_name%3D%22fieldvals%22%7D&start={start}&end={end}&line_limit=0"
+        ),
+        false,
+    );
+    assert_eq!(
+        df_line_limit.body,
+        r#"invalid 'line_limit' "0": expected a positive integer"#
+    );
+
+    // The explain fingerprint — the mounting oracle for a route whose
+    // empty body is the shape-identical bare `{}`.
+    let explained = http_get(port, &url("/api/logs/v1", "level", "fieldvals", ""), true);
+    assert_eq!(explained.status, 200, "body: {}", explained.body);
+    let json: serde_json::Value = serde_json::from_str(&explained.body).expect("explain JSON");
+    assert_eq!(json["explain"]["result_type"], "detected_field_values");
+
+    drop_db(db).await;
+}
