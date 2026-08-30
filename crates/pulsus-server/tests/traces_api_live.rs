@@ -67,8 +67,11 @@ const ULP_PORT: u16 = 31_193;
 const SPAN_DURATION_PORT: u16 = 31_208;
 /// The issue #464 trace-envelope wire suite's own spawn.
 const TRACE_ENVELOPE_PORT: u16 = 31_209;
-/// The issue #473 search wire-domain suite's own spawn.
-const WIRE_DOMAIN_PORT: u16 = 31_211;
+/// The issue #473 search wire-domain suite's own spawn. `31_211` was
+/// free when this suite was written and was taken by
+/// `logs_api_live.rs` before it merged; `live_port_uniqueness.rs` is
+/// what caught the collision and named this replacement.
+const WIRE_DOMAIN_PORT: u16 = 31_214;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,
