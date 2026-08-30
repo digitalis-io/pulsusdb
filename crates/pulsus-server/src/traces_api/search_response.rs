@@ -1709,6 +1709,70 @@ mod tests {
         }
     }
 
+    /// Issue #473, review round 1: every label is pinned to its OWN
+    /// variant, as a literal.
+    ///
+    /// **A permutation is what the other two checks cannot see, and it is
+    /// a wrong answer rather than a cosmetic one.** Exchange
+    /// [`Bound::Below`]'s and [`Bound::Above`]'s labels and every
+    /// saturation event is reported under the opposite bound — a `below`
+    /// sample would mean a value clamped down from over the maximum,
+    /// which is the reverse of what the metric family documents, and an
+    /// operator reading `bound="below"` would conclude a stored value was
+    /// negative when it was enormous. Neither existing check fires on it:
+    /// [`assert_saturation_sample`] builds its needles from
+    /// [`WireField::label`] and [`Bound::label`], so the code and the
+    /// assertion move together, and
+    /// [`the_saturation_counter_is_documented_in_the_architecture_metric_families`]
+    /// tests only that each label STRING appears in the document, which a
+    /// permutation leaves true. Measured before this test existed: all 22
+    /// tests in this module passed with the two bound labels exchanged.
+    ///
+    /// The general form, since it has cost this issue two rounds: a check
+    /// that lists which values appear cannot see a change that reorders
+    /// which value goes with which. The claim here is a MAPPING — this
+    /// variant carries that label — so the test has to be a mapping too,
+    /// and the break that exercises it is a permutation, never a rename.
+    /// A rename is the break a membership check can still catch, which is
+    /// exactly why passing it proved less than it looked.
+    ///
+    /// [`WireField`] has the same shape and is pinned the same way: its
+    /// four labels are level-qualified precisely so a trace-level event
+    /// can be told from a span-level one, and a permutation would report
+    /// each event under the wrong level while leaving all four strings
+    /// present everywhere they are checked.
+    #[test]
+    fn every_label_belongs_to_its_own_variant() {
+        assert_eq!(Bound::Below.label(), "below");
+        assert_eq!(Bound::Above.label(), "above");
+
+        assert_eq!(
+            WireField::TraceStartTimeUnixNano.label(),
+            "trace.startTimeUnixNano"
+        );
+        assert_eq!(WireField::TraceDurationMs.label(), "trace.durationMs");
+        assert_eq!(
+            WireField::SpanStartTimeUnixNano.label(),
+            "span.startTimeUnixNano"
+        );
+        assert_eq!(WireField::SpanDurationNanos.label(), "span.durationNanos");
+
+        // The labels must also be DISTINCT, or a mapping that collapsed
+        // two variants onto one label would satisfy every equality above
+        // if both literals were edited to match. Cheap, and it closes the
+        // one edit that could make the block self-consistent and wrong.
+        let bounds: std::collections::BTreeSet<&str> =
+            Bound::ALL.iter().map(|b| b.label()).collect();
+        assert_eq!(bounds.len(), Bound::ALL.len(), "bound labels must differ");
+        let fields: std::collections::BTreeSet<&str> =
+            WireField::ALL.iter().map(|f| f.label()).collect();
+        assert_eq!(
+            fields.len(),
+            WireField::ALL.len(),
+            "field labels must differ"
+        );
+    }
+
     /// Issue #473 AC 12: the ledger row exists and carries the content it
     /// is load-bearing for — both the reference's values, the wrapped
     /// 60-day number that makes the lower-bound argument concrete, the
