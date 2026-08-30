@@ -1592,6 +1592,18 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run prom_api_live -p pulsus-server --test prom_api_live
 
+      # Issue #471 M2: spawns the real `pulsusdb` binary behind a TCP
+      # proxy that stops forwarding, so a request cannot complete and the
+      # request deadline is observed on the wire — `503` + the PromQL
+      # error envelope on the query surface, the byte-identical bare `408`
+      # on `/api/v1/write` and on the LogQL surface. Reuses this job's
+      # ClickHouse container.
+      - name: Live PromQL request-deadline suite (issue #471)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run prom_deadline_live -p pulsus-server --test prom_deadline_live
+
       # Issue #55: spawns the real `pulsusdb` binary and drives the
       # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
       # OTLP ingest seed, JSON/protobuf negotiation (incl. the 406

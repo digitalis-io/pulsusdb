@@ -582,7 +582,8 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     }
     // Issue #101: a zero eval-concurrency bound would admit no eval at all
     // (the semaphore starts with 0 permits — every query would queue
-    // forever until the 408 timeout).
+    // forever until the request deadline expires — `503`/`timeout` on the
+    // metrics query surface since issue #471).
     positive_u64(
         "reader.query_eval_concurrency",
         cfg.reader.query_eval_concurrency as u64,

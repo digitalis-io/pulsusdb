@@ -902,10 +902,12 @@ fn prom_missing_start(req: &mut Req) {
 }
 
 fn prom_points_cap_exceeded(req: &mut Req) {
-    // `parse_time` reads a plain integer as unix **seconds**; one point
-    // past the 11,000-point cap (mirrors `prom_api/handlers.rs`'s own unit
-    // test fixture for this exact shape).
-    req.query = "query=up&start=0&end=11000&step=1".to_string();
+    // `parse_time` reads a plain integer as unix **seconds**; one STEP
+    // INTERVAL past the 11,000-interval resolution cap — `(11001-0)/1 ==
+    // 11001` (mirrors `prom_api/handlers.rs`'s own unit test fixture for
+    // this exact shape). Issue #471 M3 moved this from `end=11000`, which
+    // the corrected predicate serves.
+    req.query = "query=up&start=0&end=11001&step=1".to_string();
 }
 
 fn prom_wrong_content_type(req: &mut Req) {
@@ -2067,10 +2069,14 @@ static MANIFEST: &[RouteSpec] = &[
         status: RouteStatus::Mounted,
         doc_ref: DocRef::Verbatim,
         success_status: 200,
-        // Exactly at the 11,000-point cap (`(10999-0)/1 + 1 == 11000`) —
-        // proven by `prom_api/handlers.rs`'s own
-        // `query_range_at_exactly_the_cap_passes_param_validation`.
-        base_query: "query=up&start=0&end=10999&step=1",
+        // Exactly at the 11,000-step-interval resolution cap
+        // (`(11000-0)/1 == 11000`, 11,001 grid points) — proven by
+        // `prom_api/handlers.rs`'s own
+        // `query_range_at_exactly_the_cap_passes_param_validation`. Issue
+        // #471 M3 moved this from `end=10999`, which after the fix is
+        // 10,999 intervals: it still answers `200`, so the fixture would
+        // have kept passing while claiming a boundary it no longer sat on.
+        base_query: "query=up&start=0&end=11000&step=1",
         cases: PROM_QUERY_RANGE_CASES,
     },
     RouteSpec {

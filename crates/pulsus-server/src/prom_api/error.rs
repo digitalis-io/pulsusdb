@@ -44,6 +44,55 @@ pub(crate) enum ApiError {
     /// (mirrors `logs_api::error::ApiError::PoolUnavailable` / `/ready`'s
     /// 503 — `ops::ready`).
     Unavailable,
+    /// Issue #471 M2: a request deadline expired. `503`/`timeout`, with a
+    /// message naming which deadline it was — see [`DeadlineProducer`].
+    Deadline(DeadlineProducer),
+}
+
+/// Which deadline expired (issue #471 M2). One message per producer, each
+/// true on **every** path that can produce it.
+///
+/// The reference's own sentence attributes the expiry to expression
+/// evaluation, which is true for it because it is handed the phase that
+/// expired. Ours can expire in parameter parsing, PromQL parsing,
+/// planning, the ClickHouse round trip, client-side evaluation or
+/// encoding — so that sentence would be a guess that reads like a fact.
+/// A message that is false some of the time is worse than one that differs
+/// from the reference, and `errorType`, the field a client branches on, is
+/// identical either way. Ledgered as
+/// `promql-timeout-message-names-the-layer`
+/// (docs/benchmarks/metrics-differential-ledger.md).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DeadlineProducer {
+    /// `middleware::timeout_layer` — the whole-request deadline.
+    ///
+    /// Says **request**, not **query**: five of the twelve classified
+    /// paths are `status/*`, and `/api/v1/status/tsdb` is served entirely
+    /// from the resident label-cache snapshot with zero ClickHouse and no
+    /// actual await (`pulsus_read`'s `MetricsEngine::tsdb_status`).
+    /// Narrowing the classification instead would be worse — a timeout on
+    /// `status/*` would revert to the bare `408` this entry exists to
+    /// remove — so the message widens rather than the path set narrowing.
+    ServerRequest(std::time::Duration),
+    /// The `timeout` request parameter — `/query`, `/query_range` only.
+    /// Keeps "query" because both of those genuinely are queries.
+    RequestedTimeout(std::time::Duration),
+}
+
+impl DeadlineProducer {
+    pub(crate) fn message(self) -> String {
+        match self {
+            // `{:?}` on a `std::time::Duration` renders `120s` / `1.5s` /
+            // `20ms`. NEVER `pulsus_config::HumanDuration`'s `Display`,
+            // which renders the same 120 s as `120000ms`.
+            Self::ServerRequest(d) => {
+                format!("request exceeded the server deadline of {d:?} (PULSUS_QUERY_TIMEOUT)")
+            }
+            Self::RequestedTimeout(d) => {
+                format!("query exceeded the requested timeout of {d:?} (timeout parameter)")
+            }
+        }
+    }
 }
 
 impl From<ParamError> for ApiError {
@@ -85,6 +134,11 @@ impl IntoResponse for ApiError {
                 "unavailable",
                 "clickhouse pool or label cache not yet established".to_string(),
             ),
+            ApiError::Deadline(producer) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "timeout",
+                producer.message(),
+            ),
         };
         let body = ErrorEnvelope {
             status: "error",
@@ -105,8 +159,10 @@ impl IntoResponse for ApiError {
 /// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet,ScalarOp,ExtendedHistogram}` | 422 | `execution` |
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
-/// | `ChError::{Io,Server,Decode,Config,InsertUncertain}` | 500 | `internal` |
-/// | `PromqlError::Cancelled` (issue #93, unreachable in practice) | 408 | `timeout` |
+/// | `ChError::Server { code: 159 }` (ClickHouse `TIMEOUT_EXCEEDED`, issue #471 M2) | 503 | `timeout` |
+/// | `ChError::{Io,Server(other),Decode,Config,InsertUncertain}` | 500 | `internal` |
+/// | `PromqlError::Cancelled` (issue #93, unreachable in practice) | 503 | `timeout` |
+/// | `ApiError::Deadline` (issue #471 M2) | 503 | `timeout` |
 fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
     match e {
         // Issue #280: an RE2-rejected label-matcher regex. Upstream
@@ -159,12 +215,21 @@ fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
         }
         // Issue #93: a live `CancelToken` fired because the awaiting
         // request future was already dropped (client disconnect, or the
-        // `TimeoutLayer` firing first — `middleware.rs`'s own 408
-        // `query_timeout`). Matched for exhaustiveness only — by the time
-        // this variant exists, the future that would encode this response
-        // is gone, so this arm is unreachable in practice. `408`/`timeout`
-        // mirrors the same convention rather than inventing a new status.
-        PromqlError::Cancelled => (StatusCode::REQUEST_TIMEOUT, "timeout", e.to_string()),
+        // request-deadline layer firing first — `middleware.rs`'s
+        // `RequestDeadlineLayer`, `query_timeout`). Matched for
+        // exhaustiveness only — by the time this variant exists, the
+        // future that would encode this response is gone, so this arm is
+        // unreachable in practice.
+        //
+        // Issue #471 M2 moved this from `408` to `503`: the arm existed to
+        // mirror the middleware's `408` convention, and M2 replaced that
+        // convention on this surface. After M2 a `408` under `/api/v1/`
+        // means the deadline layer on an excluded path and nothing else,
+        // which is what makes the bare/envelope assertions unambiguous.
+        // `errorType` stays `timeout`. (The reference answers a cancelled
+        // query `499`/`canceled`; that pre-existing, unledgered gap is
+        // neither created nor closed here.)
+        PromqlError::Cancelled => (StatusCode::SERVICE_UNAVAILABLE, "timeout", e.to_string()),
     }
 }
 
@@ -173,6 +238,18 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         ReadError::Promql(inner) => promql_error_parts(inner),
         ReadError::Clickhouse(ch) => match ch {
             ChError::Timeout(_) => (StatusCode::SERVICE_UNAVAILABLE, "timeout", e.to_string()),
+            // Issue #471 M2. ClickHouse's own server-side
+            // `max_execution_time` breach never reaches `ChError::Timeout`
+            // — the server returns it as an exception body, which
+            // `pulsus_clickhouse::error` routes to `ChError::Server` with
+            // code 159 (`TIMEOUT_EXCEEDED`, already named as such in that
+            // module's `RETRYABLE_SERVER_CODES`). It is a timeout, so it
+            // answers `503`/`timeout` like the other four producers rather
+            // than falling through to the `500`/`internal` arm below.
+            // Guarded on the exact code: the class must not widen.
+            ChError::Server { code: 159, .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "timeout", e.to_string())
+            }
             ChError::Connect(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
@@ -565,15 +642,17 @@ mod tests {
         );
     }
 
-    /// Issue #93 (plan-review note 1): a cancelled offloaded eval maps to
-    /// 408, `errorType: "timeout"` — matching `middleware.rs`'s existing
-    /// `TimeoutLayer` 408 convention, not `503`/`unavailable` (the
-    /// `ChError::Timeout` mapping above) and not a made-up `499`.
+    /// Issue #93 (plan-review note 1), restated by issue #471 M2: a
+    /// cancelled offloaded eval maps to `503`, `errorType: "timeout"`.
+    /// It used to be `408` to mirror the middleware's convention; M2
+    /// replaced that convention on this surface, so after M2 a `408` under
+    /// `/api/v1/` means the deadline layer on an excluded path and nothing
+    /// else. Not `503`/`unavailable`, and not a made-up `499`.
     #[tokio::test]
-    async fn promql_cancelled_error_maps_to_408_timeout() {
+    async fn promql_cancelled_error_maps_to_503_timeout() {
         let err = PromqlError::Cancelled;
         let (status, json) = envelope(ApiError::Promql(err)).await;
-        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "timeout");
     }
 
@@ -667,15 +746,77 @@ mod tests {
         assert_eq!(json["errorType"], "unavailable");
     }
 
+    /// Issue #471 M3: the cap sentence is the metrics reference's own,
+    /// byte-for-byte — not a `contains` over the bare number, which is
+    /// what let the old point-rule wording pass while the predicate was
+    /// wrong, and not the LogQL sibling's different spelling.
     #[tokio::test]
-    async fn too_many_points_param_error_names_the_cap() {
-        let err = ParamError::TooManyPoints {
-            points: 11_001,
-            cap: 11_000,
-        };
-        let (status, json) = envelope(ApiError::Param(err)).await;
+    async fn max_resolution_param_error_carries_the_reference_sentence() {
+        let (status, json) = envelope(ApiError::Param(ParamError::MaxResolutionExceeded)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
-        assert!(json["error"].as_str().unwrap().contains("11000"));
+        assert_eq!(
+            json["error"],
+            "exceeded maximum resolution of 11,000 points per timeseries. \
+             Try decreasing the query resolution (?step=XX)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #471 M2 — the deadline producers
+    // -----------------------------------------------------------------
+
+    /// The two producer messages, pinned as literals. `{:?}` on a
+    /// `std::time::Duration` renders `120s`; `HumanDuration`'s `Display`
+    /// renders the same duration `120000ms`, so using it reddens here.
+    #[test]
+    fn deadline_producer_messages_are_the_two_pinned_literals() {
+        assert_eq!(
+            DeadlineProducer::ServerRequest(std::time::Duration::from_secs(120)).message(),
+            "request exceeded the server deadline of 120s (PULSUS_QUERY_TIMEOUT)"
+        );
+        assert_eq!(
+            DeadlineProducer::RequestedTimeout(std::time::Duration::from_millis(1)).message(),
+            "query exceeded the requested timeout of 1ms (timeout parameter)"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_maps_to_503_timeout_with_the_producer_message() {
+        let (status, json) = envelope(ApiError::Deadline(DeadlineProducer::ServerRequest(
+            std::time::Duration::from_secs(3),
+        )))
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["errorType"], "timeout");
+        assert_eq!(
+            json["error"],
+            "request exceeded the server deadline of 3s (PULSUS_QUERY_TIMEOUT)"
+        );
+    }
+
+    /// Issue #471 M2: ClickHouse's server-side `max_execution_time` breach
+    /// arrives as `ChError::Server { code: 159 }` and is a timeout, not an
+    /// internal error. The two neighbouring codes are the control — the
+    /// class must not widen into a range.
+    #[tokio::test]
+    async fn clickhouse_server_timeout_code_is_503_timeout_and_the_class_does_not_widen() {
+        let err = ReadError::Clickhouse(ChError::Server {
+            code: 159,
+            message: "Timeout exceeded".to_string(),
+        });
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["errorType"], "timeout");
+
+        for code in [158i32, 160i32] {
+            let err = ReadError::Clickhouse(ChError::Server {
+                code,
+                message: "other".to_string(),
+            });
+            let (status, json) = envelope(ApiError::Read(err)).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "code {code}");
+            assert_eq!(json["errorType"], "internal", "code {code}");
+        }
     }
 }

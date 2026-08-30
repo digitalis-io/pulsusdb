@@ -67,7 +67,7 @@ fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
     stream.read_to_string(&mut buf).ok()?;
     let mut parts = buf.splitn(2, "\r\n\r\n");
     let head = parts.next()?;
-    let body = parts.next().unwrap_or("").to_string();
+    let body = decode_body(head, parts.next().unwrap_or(""));
     let status = head
         .lines()
         .next()?
@@ -76,6 +76,67 @@ fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
         .parse()
         .ok()?;
     Some((status, body))
+}
+
+/// Bare HTTP/1.1 POST with an `application/x-www-form-urlencoded` body —
+/// the exact shape issue #471 M1 is about, including the empty-body case
+/// (`Content-Length: 0`) that carries every parameter in the URL.
+fn http_post_form(port: u16, path: &str, body: &str) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).ok()?;
+    let mut parts = buf.splitn(2, "\r\n\r\n");
+    let head = parts.next()?;
+    let body = decode_body(head, parts.next().unwrap_or(""));
+    let status = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some((status, body))
+}
+
+/// Undoes `Transfer-Encoding: chunked` framing. The `/api/v1/*` encoders
+/// stream their bodies (issue #24), so a discovery/query response arrives
+/// chunked and a byte-exact assertion against the raw socket text would be
+/// asserting the framing rather than the envelope.
+fn decode_body(head: &str, raw: &str) -> String {
+    if !head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(nl) = rest.find("\r\n") {
+        let Ok(size) = usize::from_str_radix(rest[..nl].split(';').next().unwrap_or("").trim(), 16)
+        else {
+            break;
+        };
+        rest = &rest[nl + 2..];
+        if size == 0 {
+            break;
+        }
+        if rest.len() < size {
+            out.push_str(rest);
+            break;
+        }
+        out.push_str(&rest[..size]);
+        rest = rest[size..].strip_prefix("\r\n").unwrap_or(&rest[size..]);
+    }
+    out
 }
 
 struct ChildGuard(Child);
@@ -751,4 +812,430 @@ async fn promql_memory_breach_is_422_and_actually_dispatched() {
     );
 
     drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #471 — the PromQL query-surface bundle, end to end
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedMetadataRow {
+    metric_name: String,
+    metric_type: String,
+    help: String,
+    unit: String,
+    updated_ns: i64,
+}
+
+/// Issue #471, M1/M2(parse+controls)/M3/M4/M6 against a live server.
+///
+/// **One fixture, chosen so no assertion can pass vacuously.** Four
+/// series over three metric names, carrying four distinct label keys:
+///
+/// | series | label keys it contributes |
+/// |---|---|
+/// | `up{job="api"}` | `__name__`, `job` |
+/// | `up{job="web"}` | `__name__`, `job` |
+/// | `http_requests_total{handler="/api",job="api"}` | `handler` |
+/// | `dashed{a-b="dash"}` | `a-b` |
+///
+/// So the unscoped label-name set is exactly `["__name__","a-b","handler",
+/// "job"]` and the `up{job="api"}`-scoped set is exactly
+/// `["__name__","job"]` — **different**, which is what makes M1's
+/// POST-equals-GET assertion mean something. And `match[]=up` matches two
+/// series while `match[]=http_requests_total` matches one, so body-only,
+/// URL-only and merged `/series` answers are 2, 1 and 3 — pairwise
+/// distinct, so asserting three separates every partial implementation at
+/// once, the URL-only one included.
+#[tokio::test(flavor = "multi_thread")]
+async fn prom_api_query_surface_bundle_issue_471() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+
+    let db = pulsus_testkit::test_db("pulsus_prom_471_it");
+    let port: u16 = 31_300;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("PULSUS_CACHE_TTL", "1s")
+        .env(
+            "CLICKHOUSE_SERVER",
+            std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        )
+        .env(
+            "CLICKHOUSE_HTTP_PORT",
+            std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
+        )
+        .env("CLICKHOUSE_DB", &db)
+        .spawn()
+        .expect("spawn pulsusdb");
+    let _guard = ChildGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut became_ready = false;
+    while Instant::now() < deadline {
+        if let Some((200, _)) = http_get(port, "/ready") {
+            became_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(became_ready, "/ready never reached 200 within 60s");
+
+    let client = ChClient::new(test_ch_config(&db))
+        .await
+        .expect("connect to seed data");
+    let bucket_ms: i64 = 3_600_000;
+    let now = now_ms();
+    let recent_bucket = (now / bucket_ms) * bucket_ms;
+    let series = [
+        ("up", 1u64, r#"{"job":"api"}"#),
+        ("up", 2, r#"{"job":"web"}"#),
+        (
+            "http_requests_total",
+            3,
+            r#"{"handler":"/api","job":"api"}"#,
+        ),
+        ("dashed", 4, r#"{"a-b":"dash"}"#),
+    ];
+    client
+        .insert_block(
+            "metric_series",
+            &series
+                .iter()
+                .map(|(name, fp, labels)| SeedSeriesRow {
+                    metric_name: (*name).to_string(),
+                    fingerprint: *fp,
+                    unix_milli: recent_bucket,
+                    labels: (*labels).to_string(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block(
+            "metric_samples",
+            &series
+                .iter()
+                .map(|(name, fp, _)| SeedSampleRow {
+                    metric_name: (*name).to_string(),
+                    fingerprint: *fp,
+                    unix_milli: now,
+                    value: 1.0,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("seed metric_samples");
+    // Seeded so M4's `/metadata?limit=0` assertion is not vacuous: with an
+    // empty table `{}` would be the answer under every rule.
+    client
+        .insert_block(
+            "metric_metadata",
+            &[
+                SeedMetadataRow {
+                    metric_name: "up".to_string(),
+                    metric_type: "gauge".to_string(),
+                    help: "up".to_string(),
+                    unit: String::new(),
+                    updated_ns: now * 1_000_000,
+                },
+                SeedMetadataRow {
+                    metric_name: "http_requests_total".to_string(),
+                    metric_type: "counter".to_string(),
+                    help: "requests".to_string(),
+                    unit: String::new(),
+                    updated_ns: now * 1_000_000,
+                },
+            ],
+        )
+        .await
+        .expect("seed metric_metadata");
+
+    // -----------------------------------------------------------------
+    // M1 — a POST reads the URL query string
+    // -----------------------------------------------------------------
+
+    let scoped_url = "/api/v1/labels?match%5B%5D=up%7Bjob%3D%22api%22%7D";
+    let (status, get_scoped) = http_get(port, scoped_url).expect("GET scoped /labels");
+    assert_eq!(status, 200, "{get_scoped}");
+    let (status, unscoped) = http_get(port, "/api/v1/labels").expect("GET unscoped /labels");
+    assert_eq!(status, 200, "{unscoped}");
+    assert_eq!(
+        unscoped.trim(),
+        r#"{"status":"success","data":["__name__","a-b","handler","job"]}"#
+    );
+    // The two-metric fixture is what stops the equality below passing
+    // vacuously: the scoped and unscoped answers differ.
+    assert_ne!(get_scoped.trim(), unscoped.trim());
+
+    let (status, post_scoped) =
+        http_post_form(port, scoped_url, "").expect("POST scoped /labels, empty body");
+    assert_eq!(status, 200, "{post_scoped}");
+    assert_eq!(
+        post_scoped.trim(),
+        get_scoped.trim(),
+        "a POST carrying its parameters in the URL must answer exactly what the GET does"
+    );
+    assert_ne!(post_scoped.trim(), unscoped.trim());
+
+    // Body and URL are MERGED, not one or the other: 2 + 1 = 3.
+    let (status, merged) = http_post_form(
+        port,
+        "/api/v1/series?match%5B%5D=http_requests_total",
+        "match%5B%5D=up",
+    )
+    .expect("POST /series with body and URL match[]");
+    assert_eq!(status, 200, "{merged}");
+    let merged_json: serde_json::Value = serde_json::from_str(merged.trim()).expect("json");
+    assert_eq!(
+        merged_json["data"].as_array().expect("data array").len(),
+        3,
+        "body-only is 2 and URL-only is 1, so three is the only merged answer: {merged}"
+    );
+
+    // Body wins for a single-valued key repeated in both halves.
+    let (status, body_wins) = http_post_form(
+        port,
+        "/api/v1/query?time=200",
+        "query=vector%281%29&time=100",
+    )
+    .expect("POST /query with time in both halves");
+    assert_eq!(status, 200, "{body_wins}");
+    assert!(
+        body_wins.contains("[100,\"1\"]"),
+        "the body's `time` must win over the URL's: {body_wins}"
+    );
+
+    // -----------------------------------------------------------------
+    // M3 — the resolution cap counts step intervals
+    // -----------------------------------------------------------------
+
+    const CAP_SENTENCE: &str = "exceeded maximum resolution of 11,000 points per timeseries. \
+                                Try decreasing the query resolution (?step=XX)";
+    for (query, want_status) in [
+        // 11,000 intervals, reached three ways — whole seconds, a
+        // fractional `end`, and a sub-second `step`. The last two are what
+        // discriminate a fix that special-cases whole-second inputs.
+        ("query=up&start=0&end=11000&step=1", 200),
+        ("query=up&start=0&end=11000.5&step=1", 200),
+        ("query=up&start=0&end=5500&step=0.5", 200),
+        // 11,001 intervals.
+        ("query=up&start=0&end=11001&step=1", 400),
+        ("query=up&start=0&end=5500.5&step=0.5", 400),
+    ] {
+        let (status, body) =
+            http_get(port, &format!("/api/v1/query_range?{query}")).expect("query_range");
+        assert_eq!(status, want_status, "{query}: {body}");
+        let json: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+        if want_status == 200 {
+            assert_eq!(json["data"]["resultType"], "matrix", "{query}");
+        } else {
+            assert_eq!(json["errorType"], "bad_data", "{query}");
+            assert_eq!(json["error"], CAP_SENTENCE, "{query}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // M4 — `limit` on the three discovery endpoints
+    // -----------------------------------------------------------------
+
+    const WARNED: &str =
+        r#"{"status":"success","data":["__name__"],"warnings":["results truncated due to limit"]}"#;
+    let (status, body) = http_get(port, "/api/v1/labels?limit=1").expect("/labels?limit=1");
+    assert_eq!(status, 200);
+    assert_eq!(body.trim(), WARNED);
+
+    // Exactly at the count: all four, and NO `warnings` key at all.
+    for raw in ["limit=4", "limit=0", "limit="] {
+        let (status, body) = http_get(port, &format!("/api/v1/labels?{raw}")).expect("/labels");
+        assert_eq!(status, 200, "{raw}: {body}");
+        assert_eq!(body.trim(), unscoped.trim(), "{raw}");
+        assert!(!body.contains("warnings"), "{raw}: {body}");
+    }
+
+    let (status, body) =
+        http_get(port, "/api/v1/label/job/values?limit=1").expect("/label/job/values?limit=1");
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.trim(),
+        r#"{"status":"success","data":["api"],"warnings":["results truncated due to limit"]}"#
+    );
+    let (status, body) =
+        http_get(port, "/api/v1/label/job/values?limit=2").expect("/label/job/values?limit=2");
+    assert_eq!(status, 200);
+    assert_eq!(body.trim(), r#"{"status":"success","data":["api","web"]}"#);
+
+    let (status, body) =
+        http_get(port, "/api/v1/series?match%5B%5D=up&limit=1").expect("/series?limit=1");
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert_eq!(json["data"].as_array().expect("data").len(), 1, "{body}");
+    assert_eq!(json["warnings"][0], "results truncated due to limit");
+    let (status, body) =
+        http_get(port, "/api/v1/series?match%5B%5D=up&limit=2").expect("/series?limit=2");
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("warnings"), "{body}");
+
+    // Both rejection strings, as literals rather than by status.
+    for (path, raw, want) in [
+        (
+            "/api/v1/labels",
+            "limit=-1",
+            "invalid parameter \"limit\": limit must be non-negative",
+        ),
+        (
+            "/api/v1/labels",
+            "limit=abc",
+            "invalid parameter \"limit\": cannot parse \"abc\" to an integer",
+        ),
+    ] {
+        let (status, body) = http_get(port, &format!("{path}?{raw}")).expect("bad limit");
+        assert_eq!(status, 400, "{raw}: {body}");
+        let json: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+        assert_eq!(json["errorType"], "bad_data", "{raw}");
+        assert_eq!(json["error"], want, "{raw}");
+    }
+
+    // `/metadata` is the OTHER rule and must not be unified: `limit=0`
+    // means *return nothing* there, on both servers. Non-vacuous because
+    // the unlimited answer below is not empty.
+    let (status, body) = http_get(port, "/api/v1/metadata").expect("/metadata");
+    assert_eq!(status, 200);
+    assert!(body.contains("\"up\""), "{body}");
+    let (status, body) = http_get(port, "/api/v1/metadata?limit=0").expect("/metadata?limit=0");
+    assert_eq!(status, 200);
+    assert_eq!(body.trim(), r#"{"status":"success","data":{}}"#);
+
+    // -----------------------------------------------------------------
+    // M6 — `U__` unescaping
+    // -----------------------------------------------------------------
+
+    let (status, plain_ab) = http_get(port, "/api/v1/label/a-b/values").expect("/label/a-b/values");
+    assert_eq!(status, 200);
+    assert_eq!(plain_ab.trim(), r#"{"status":"success","data":["dash"]}"#);
+    let (status, plain_job) =
+        http_get(port, "/api/v1/label/job/values").expect("/label/job/values");
+    assert_eq!(status, 200);
+    assert_eq!(
+        plain_job.trim(),
+        r#"{"status":"success","data":["api","web"]}"#
+    );
+
+    for (escaped, plain) in [
+        // A naive `strip_prefix("U__")` answers `[]` here.
+        ("/api/v1/label/U__a_2d_b/values", &plain_ab),
+        // A case-sensitive hex decoder answers `[]` here (`_6F_` is `o`).
+        ("/api/v1/label/U__j_6F_b/values", &plain_job),
+        // An escape at position 0.
+        ("/api/v1/label/U___6a_ob/values", &plain_job),
+        // An escaped LEGACY name: holds regardless of what data exists.
+        ("/api/v1/label/U__job/values", &plain_job),
+    ] {
+        let (status, body) = http_get(port, escaped).expect("escaped label name");
+        assert_eq!(status, 200, "{escaped}: {body}");
+        assert_eq!(body.trim(), plain.trim(), "{escaped}");
+        // The second clause: an empty fixture would make the first pass
+        // vacuously.
+        assert_ne!(
+            body.trim(),
+            r#"{"status":"success","data":[]}"#,
+            "{escaped} must not be the empty list"
+        );
+    }
+
+    let (status, body) = http_get(port, "/api/v1/label/U__/values").expect("/label/U__/values");
+    assert_eq!(status, 400, "{body}");
+    let json: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert_eq!(json["errorType"], "bad_data");
+    assert_eq!(json["error"], "invalid label name: \"\"");
+
+    // A malformed escape reaches the engine unchanged — `200`, empty, not
+    // an error. Same for a name that is merely not legacy-legal.
+    for path in [
+        "/api/v1/label/U__bad_zz/values",
+        "/api/v1/label/U__x_/values",
+        "/api/v1/label/U__U__job/values",
+        // Six hex digits bail out even though five decode.
+        "/api/v1/label/U__x_10ffff_y/values",
+    ] {
+        let (status, body) = http_get(port, path).expect("malformed escape");
+        assert_eq!(status, 200, "{path}: {body}");
+        assert_eq!(body.trim(), r#"{"status":"success","data":[]}"#, "{path}");
+    }
+
+    // -----------------------------------------------------------------
+    // M2 — the `timeout` parameter's parse-time half, plus the two
+    // positive controls (12a/12b): a healthy short-but-sufficient timeout
+    // must return a real answer, not an eager timeout envelope.
+    // -----------------------------------------------------------------
+
+    for raw in ["abc", "1ns", "0", "-1"] {
+        let (status, body) =
+            http_get(port, &format!("/api/v1/query?query=up&timeout={raw}")).expect("bad timeout");
+        assert_eq!(status, 400, "timeout={raw}: {body}");
+        let json: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+        assert_eq!(json["errorType"], "bad_data", "timeout={raw}");
+    }
+
+    // `/query` needs the label cache to have swept the seeded series in.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((200, body)) = http_get(port, "/api/v1/query?query=up&timeout=5")
+            && body.contains("\"job\":\"api\"")
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("label cache never warmed with the seeded series within 30s");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // 12a: `/query` with a strictly-shorter-but-sufficient timeout returns
+    // a NON-EMPTY result. An implementation that answers the
+    // requested-timeout envelope whenever the parameter is present fails
+    // here.
+    let (status, body) =
+        http_get(port, "/api/v1/query?query=up&timeout=5").expect("/query?timeout=5");
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert!(
+        !json["data"]["result"]
+            .as_array()
+            .expect("result")
+            .is_empty(),
+        "{body}"
+    );
+
+    // 12b: the same control on `/query_range`, because the branch is
+    // written twice and one control would let the second site be eager.
+    // `end` is deliberately AFTER the seeded sample, not at it: `now /
+    // 1000` truncates the millisecond part, so an `end` of exactly that
+    // second can land before the sample and the grid's last point then
+    // has nothing to look back at. Measured: that fixture returned an
+    // empty matrix under the per-test process model.
+    let start = (now / 1000) - 60;
+    let end = (now / 1000) + 60;
+    let (status, body) = http_get(
+        port,
+        &format!("/api/v1/query_range?query=up&start={start}&end={end}&step=15&timeout=5"),
+    )
+    .expect("/query_range?timeout=5");
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert_eq!(json["data"]["resultType"], "matrix", "{body}");
+    assert!(
+        !json["data"]["result"]
+            .as_array()
+            .expect("result")
+            .is_empty(),
+        "{body}"
+    );
+
+    drop_db(&db).await;
 }

@@ -173,11 +173,12 @@ dropped — but this changes nothing versus the pre-#93 synchronous path:
   `max_blocking_threads` (default **512**) — a bounded constant, the
   offloaded analogue of the old synchronous ceiling of `worker_threads`.
 - **Queued** (not-yet-started) evals are bounded only by request arrival
-  rate / the upstream `TimeoutLayer` — which is **already true today**:
+  rate / the upstream request-deadline layer — which is **already true today**:
   pending query tasks queue on the tokio scheduler identically.
 - A request future can only be dropped **between** polls, and the
   synchronous `evaluate` ran inside a single await-free poll, so on client
-  disconnect or the 408 timeout it **already ran to completion** before the
+  disconnect or the request-deadline timeout (`503`/`timeout` on this
+  surface since issue #471) it **already ran to completion** before the
   drop was observed. `spawn_blocking` does not introduce this.
 
 `spawn_blocking`'s only genuine deltas are (i) evals no longer pin a
@@ -198,8 +199,9 @@ atomic, no waker), so a query that fits under the limit is never serialized
 or slowed; the default 256 sits below tokio's 512 blocking-pool ceiling so
 evals can never monopolize the pool, yet above realistic heavy-query
 fan-in. Exhaustion is a bounded wait (`acquire().await`) bounded by the
-existing per-request `TimeoutLayer` (`408`, `query_timeout`) — no new
-429/503 status and no new timeout knob (this deliberately differs from the
+existing per-request deadline (`middleware::RequestDeadlineLayer`,
+`query_timeout`, whose breach on this surface is `503`/`timeout` since
+issue #471) — no new 429 status and no new timeout knob (this deliberately differs from the
 tail slot's fail-fast `429`, which holds a slot for a connection's whole
 lifetime). The gate exports six `pulsus_query_eval_*` metrics on
 `/metrics`: gauges `pulsus_query_eval_permits_limit`,

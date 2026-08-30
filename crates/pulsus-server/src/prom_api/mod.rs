@@ -79,6 +79,19 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/v1/status/tsdb", get(handlers::status_tsdb))
 }
 
+/// The one seam `middleware::RequestDeadline` uses to answer a
+/// request-deadline breach on the PromQL query surface (issue #471 M2):
+/// `503` with `Content-Type: application/json` and the same three-field
+/// error envelope every other error on this surface carries.
+///
+/// `error` stays a private module — this keeps the envelope's shape in one
+/// place rather than letting the middleware hand-build a body that would
+/// then be free to drift from `ApiError`'s.
+pub(crate) fn deadline_response(budget: std::time::Duration) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    error::ApiError::Deadline(error::DeadlineProducer::ServerRequest(budget)).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

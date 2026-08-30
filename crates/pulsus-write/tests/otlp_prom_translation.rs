@@ -2231,6 +2231,35 @@ const LEDGER_ROWS: &[LedgerRow] = &[
         their_status: "`200`",
         required: &["bad_data", "40af9c2cdc0eda00f3622e867a27f6359f7295f3"],
     },
+    // Issue #471 M2. The `Limit` cell is `—` deliberately: the divergence
+    // has no constant. It is about which string a timeout carries, at
+    // whatever deadline the operator configured, and across five
+    // producers — writing the documented default there would present a
+    // configurable value as the row's constant.
+    LedgerRow {
+        id: "`promql-timeout-message-names-the-layer`",
+        limit: "—",
+        our_route: "`GET /api/v1/query`",
+        our_status: "`503`",
+        their_route: "`GET /api/v1/query`",
+        their_status: "`503`",
+        required: &[
+            // Both new producer messages, so neither can be dropped or
+            // silently reworded without reddening this test.
+            "request exceeded the server deadline of",
+            "query exceeded the requested timeout of",
+            // The two producers the row promises are left byte-unchanged.
+            "clickhouse: timeout:",
+            // The field that matches the reference, named as matching.
+            "errorType",
+            // The span of the divergence, and its one exclusion.
+            "twelve",
+            "/api/v1/write",
+            // The reason row one says "request" rather than "query".
+            "status/tsdb",
+            "#471",
+        ],
+    },
 ];
 
 /// The id retired by issue #461: the divergence covers metric-name AND

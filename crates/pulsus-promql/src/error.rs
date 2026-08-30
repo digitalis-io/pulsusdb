@@ -139,7 +139,7 @@ pub enum PromqlError {
     /// The evaluation was cancelled by a live [`crate::eval::CancelToken`]
     /// (issue #93) — observed at a per-step/per-grid-point checkpoint after
     /// the awaiting request future was dropped (client disconnect, or the
-    /// server's `TimeoutLayer` firing first). `evaluate` (the `never()`
+    /// server's request-deadline layer firing first). `evaluate` (the `never()`
     /// token) can never produce this variant.
     #[error("query evaluation cancelled")]
     Cancelled,

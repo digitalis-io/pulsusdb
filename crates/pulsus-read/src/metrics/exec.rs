@@ -740,9 +740,11 @@ impl MetricsEngine {
         // fully drained every `ChRowStream`, so no pooled-connection lease
         // is ever held across the offload — and released only when the
         // blocking eval finishes. Exhaustion is a bounded wait
-        // (`acquire().await`), bounded by the upstream `TimeoutLayer` (408,
-        // `query_timeout`); a timed-out/disconnected waiter releases its
-        // queued reservation cleanly. No 429/503 and no new timeout knob.
+        // (`acquire().await`), bounded by the upstream request deadline
+        // (`middleware::RequestDeadlineLayer`, `query_timeout`), whose
+        // breach on this surface is `503`/`timeout` since issue #471; a
+        // timed-out/disconnected waiter releases its queued reservation
+        // cleanly. No 429 and no new timeout knob.
         //
         // Cooperative cancellation (issue #93, follow-up): a disconnected/
         // timed-out client's eval used to still run to completion once
@@ -1698,7 +1700,7 @@ fn concrete_name(sel: &SelectorSpec) -> Result<&str, ReadError> {
 /// N+k evals ran, so the over-admission must be counted at the eval itself).
 ///
 /// Issue #93: tokio does not cancel a running `spawn_blocking` when its
-/// awaiter is dropped (client disconnect, or the server's `TimeoutLayer`
+/// awaiter is dropped (client disconnect, or the server's request-deadline layer
 /// firing first) — the CPU-bound eval would otherwise burn a full
 /// evaluation for a caller already gone. `flag`/`token` are a fresh
 /// per-call pair: `token` rides into the blocking closure via `eval`'s

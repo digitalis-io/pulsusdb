@@ -417,7 +417,9 @@ pub struct ReaderConfig {
     /// Issue #101: process-wide bound on concurrent CPU-bound PromQL
     /// evaluations offloaded onto tokio's blocking pool (the read path's
     /// one `spawn_blocking(evaluate)` site). A query past the limit waits
-    /// (bounded by `query_timeout`, 408), never a hard rejection. Default
+    /// (bounded by `query_timeout`; a breach is `503`/`timeout` on the
+    /// metrics query surface since issue #471), never a hard rejection.
+    /// Default
     /// 256 — below tokio's 512 blocking-pool ceiling (so evals cannot
     /// monopolize the pool) yet above realistic heavy-query fan-in (so the
     /// uncontended fast path is the norm). Must be >= 1 (validated at
