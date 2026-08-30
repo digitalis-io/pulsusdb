@@ -135,7 +135,12 @@ Out of this ledger's scope by design:
   completeness gate — the OTLP `differential.json` / `CASE_IDS` id-lock above
   is untouched. Every SM case is **`gated`** (SM behavior is byte-exact vs
   `grafana/loki:3.4.2` under this file's `allow_structured_metadata: true` /
-  `discover_log_levels: false` — no informational entry, no ledger id) and
+  `discover_log_levels: false` — no informational entry, no ledger id; and
+  since 2026-08-30, issue #483, PulsusDB synthesizes a `detected_level` pair
+  per entry BY DEFAULT, so that harness now also sets
+  `PULSUS_DISCOVER_LOG_LEVELS: "false"` on its own side to keep the two
+  configurations the same — see `deploy/e2e/loki.yaml` for why the setting
+  stays off there rather than being turned on) and
   rides the existing nightly `e2e-metrics-full` lane. **Stream-fingerprint
   invariance stays hermetic-only:** a `query_range` response is label-driven
   and SM fans into response labels, so an SM entry and a non-SM entry on the
@@ -576,7 +581,11 @@ distinct (`Distinct (Preliminary DISTINCT)` in the measured plan), so the
 - **Measured** (2026-08-07, `grafana/loki:3.7.4` single-binary, default
   `limits_config` plus `allow_structured_metadata: true` /
   `discover_log_levels: false` / `split_queries_by_interval: 0`; one
-  stream of 30 JSON entries carrying 41 distinct field names):
+  stream of 30 JSON entries carrying 41 distinct field names). The
+  `discover_log_levels: false` half of that configuration is no longer the
+  product default on our side — since 2026-08-30 (issue #483) PulsusDB
+  synthesizes a `detected_level` pair per entry by default, and a re-probe
+  of this row would see one more field on both stores:
 
   | `limit` | reference status | reference `fields` | reference `"limit"` echo | PulsusDB effective `field_limit` |
   |---|---|---|---|---|
@@ -2686,6 +2695,11 @@ clients only display it).
   | default (JSON) frontend encoding | `HTTP 500 could not write JSON response: 1:4: parse error: invalid UTF-8 rune` |
   | `frontend.encoding: protobuf` (what `ci/logql/config.yaml` sets) | `200`, `o="{"k":"x y"}"` — U+FFFD mapped to a space |
   | `discover_log_levels` either way | no effect (probed both) |
+
+  The `discover_log_levels` row is about the REFERENCE's own answer to this
+  query and still reads true: the setting changes what the entry carries,
+  not how the U+FFFD value is rendered. Re-checked 2026-08-30 against issue
+  #483, which turned the equivalent knob on by default on our side.
 
   So the reference either fails to answer its own query or rewrites the
   bytes it just promised to copy, depending on a transport setting.
@@ -6271,7 +6285,10 @@ gated by
 
 - **The query route is deliberately NOT changed, and that is the control
   that makes this safe.** Measured on the pinned reference at
-  `discover_log_levels: false`, on ONE container at one moment: the same
+  `discover_log_levels: false` — a setting that is no longer our own default
+  (issue #483, 2026-08-30) but was the one this measurement ran under, and
+  which does not bear on how many stream objects a route emits — on ONE
+  container at one moment: the same
   interleaved fixture comes back as three objects on
   `/loki/api/v1/tail` and as two on `/loki/api/v1/query_range`. So
   splitting is a property of the tail wire surface, not a global rule,

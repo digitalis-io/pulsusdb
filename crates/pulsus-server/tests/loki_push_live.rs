@@ -430,12 +430,25 @@ fn labels_of_stream_carrying(
 }
 
 /// The expected COMPLETE label map for a stream pushed by the test builders
-/// (`service_name=<service>`, `env=prod`) — nothing else.
+/// (`service_name=<service>`, `env=prod`, plus the ingest-time
+/// `detected_level`) — nothing else.
+///
+/// **2026-08-30 (issue #483): `detected_level` is new here and its presence
+/// is the point.** Every log entry now gets an ingest-time level pair, and
+/// on the unflagged read path structured metadata merges into the returned
+/// stream label set, so it shows up in a query_range result's labels. The
+/// value is `unknown` for these builders because their lines carry no level
+/// token; a stream whose lines DO carry one is the three-transport case
+/// [`each_ingest_transport_supplies_its_own_detected_level_series`].
 fn expected_pushed_labels(service: &str) -> std::collections::BTreeMap<String, String> {
-    [("env", "prod"), ("service_name", service)]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+    [
+        ("env", "prod"),
+        ("service_name", service),
+        ("detected_level", "unknown"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
 }
 
 /// Polls `query_range` until `line` shows up for `service` or the deadline
@@ -744,6 +757,9 @@ async fn structured_metadata_double_collision_overwrites_the_extracted_slot_once
         ("service_name", service),
         ("env", "prod"),
         ("env_extracted", "smval"), // SM value wins the single _extracted slot
+        // 2026-08-30 (issue #483): the ingest-time level pair, which merges
+        // into the returned label set on the unflagged read path.
+        ("detected_level", "unknown"),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -995,37 +1011,46 @@ async fn empty_valued_structured_metadata_is_never_stored() {
     let client = ch_client(db).await;
     let stored = stored_samples_by_body(&client, db, service, 8).await;
 
+    // 2026-08-30 (issue #483): every expectation below gained the
+    // ingest-time `detected_level` pair, `unknown` because these lines carry
+    // no level token. The empty-value rule itself did not move — that is
+    // what each message still describes; the level pair is added AFTER the
+    // resolve seam, so it can neither be deleted by that rule nor reordered
+    // by the collision one. The two rows that stored `""` now store the
+    // level alone, which is the visible half of "every entry gets a value".
     assert_eq!(
-        stored[mixed].structured_metadata, r#"{"b":"v"}"#,
+        stored[mixed].structured_metadata, r#"{"b":"v","detected_level":"unknown"}"#,
         "the empty-valued pair must not be in the STORED JSON"
     );
     assert_eq!(
-        stored[collides].structured_metadata, "",
-        "`a.b=\"\"` normalizes onto `a_b` and deletes it, so nothing is stored"
+        stored[collides].structured_metadata, r#"{"detected_level":"unknown"}"#,
+        "`a.b=\"\"` normalizes onto `a_b` and deletes it, so nothing but the \
+         ingest-time level is stored"
     );
     assert_eq!(
-        stored[collides_proto].structured_metadata, "",
+        stored[collides_proto].structured_metadata, r#"{"detected_level":"unknown"}"#,
         "…identically on the protobuf encoding"
     );
     assert_eq!(
-        stored[resurrects].structured_metadata, r#"{"a_b":"keep"}"#,
+        stored[resurrects].structured_metadata, r#"{"a_b":"keep","detected_level":"unknown"}"#,
         "a renamed non-empty pair outranks the delete its empty twin recorded"
     );
     assert_eq!(
-        stored[resurrects_proto].structured_metadata, r#"{"a_b":"keep"}"#,
+        stored[resurrects_proto].structured_metadata,
+        r#"{"a_b":"keep","detected_level":"unknown"}"#,
         "…and a duplicate renameable name resurrects in this order too"
     );
     assert_eq!(
-        stored[mixed_proto].structured_metadata, r#"{"b":"v"}"#,
+        stored[mixed_proto].structured_metadata, r#"{"b":"v","detected_level":"unknown"}"#,
         "protobuf stores byte-identically to JSON"
     );
     assert_eq!(
-        stored[all_empty].structured_metadata, "",
-        "an all-empty-valued set stores as the empty string (not `{{}}`), and the \
-         entry itself is still stored"
+        stored[all_empty].structured_metadata, r#"{"detected_level":"unknown"}"#,
+        "an all-empty-valued set stores nothing of the client's own, and the entry \
+         itself is still stored"
     );
     assert_eq!(
-        stored[whitespace].structured_metadata, "{\"a\":\" \"}",
+        stored[whitespace].structured_metadata, "{\"a\":\" \",\"detected_level\":\"unknown\"}",
         "only an exactly-empty value is dropped — no trimming"
     );
 
@@ -1075,6 +1100,14 @@ async fn colliding_structured_metadata_is_stored_as_the_reference_resolves_it() 
 
     /// One capture row: its id, the pairs pushed in wire order, and the
     /// value the pinned reference stores for them.
+    ///
+    /// 2026-08-30 (issue #483): every `expected` gained the ingest-time
+    /// `detected_level` pair, `unknown` because the probe lines carry no
+    /// level token. The collision resolution itself did not move — the
+    /// reference appends its own level pair to these very entries, which is
+    /// why the hermetic twin of this table
+    /// (`crates/pulsus-write/tests/structured_metadata_collisions.rs`) now
+    /// compares the FULL captured string rather than eliding the name.
     struct CollisionRow {
         id: &'static str,
         sm: &'static [(&'static str, &'static str)],
@@ -1084,22 +1117,22 @@ async fn colliding_structured_metadata_is_stored_as_the_reference_resolves_it() 
         CollisionRow {
             id: "c01",
             sm: &[("a.b", "x"), ("a_b", "keep")],
-            expected: r#"{"a_b":"x"}"#,
+            expected: r#"{"a_b":"x","detected_level":"unknown"}"#,
         },
         CollisionRow {
             id: "c03",
             sm: &[("a.b", "1"), ("a-b", "2")],
-            expected: r#"{"a_b":"2"}"#,
+            expected: r#"{"a_b":"2","detected_level":"unknown"}"#,
         },
         CollisionRow {
             id: "c06",
             sm: &[("a_b", "2"), ("a_b", "1")],
-            expected: r#"{"a_b":"1"}"#,
+            expected: r#"{"a_b":"1","detected_level":"unknown"}"#,
         },
         CollisionRow {
             id: "c16",
             sm: &[("a_b", ""), ("a.b", "x"), ("a-b", "y")],
-            expected: r#"{"a_b":"y"}"#,
+            expected: r#"{"a_b":"y","detected_level":"unknown"}"#,
         },
     ];
 
@@ -1267,11 +1300,11 @@ async fn inadmissible_structured_metadata_names_are_refused_and_nothing_is_store
         stored.keys().collect::<Vec<_>>()
     );
     assert_eq!(
-        stored[ok_line].structured_metadata, r#"{"a_b":"v"}"#,
+        stored[ok_line].structured_metadata, r#"{"a_b":"v","detected_level":"unknown"}"#,
         "an admissible dotted name is canonicalized, not rejected"
     );
     assert_eq!(
-        stored[naive_line].structured_metadata, r#"{"na_ve":"v"}"#,
+        stored[naive_line].structured_metadata, r#"{"detected_level":"unknown","na_ve":"v"}"#,
         "an admissible non-ASCII name is canonicalized per character"
     );
 }
@@ -1955,9 +1988,17 @@ async fn an_empty_valued_label_does_not_split_the_stream() {
     assert_eq!(both.len(), 1, "both pushes belong to one stream: {both:?}");
     assert_eq!(
         both[0].0,
-        [("service_name".to_string(), service.to_string())]
-            .into_iter()
-            .collect::<std::collections::BTreeMap<_, _>>()
+        // 2026-08-30 (issue #483): `detected_level` is the ingest-time level
+        // pair, merged into the label set on the unflagged read path. It is
+        // the SAME value on both entries, so it cannot be what keeps them in
+        // one stream — the assertions above already pinned that on the
+        // stored `log_streams` rows, where structured metadata never goes.
+        [
+            ("service_name".to_string(), service.to_string()),
+            ("detected_level".to_string(), "unknown".to_string()),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>()
     );
 }
 
@@ -2405,7 +2446,9 @@ async fn the_discovered_service_name_reaches_the_service_column_on_both_receiver
         [
             ("app", discovered),
             ("name", "nn-379"),
-            ("service_name", discovered)
+            ("service_name", discovered),
+            // 2026-08-30 (issue #483): the ingest-time level pair.
+            ("detected_level", "unknown"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2832,5 +2875,183 @@ async fn a_superseded_over_cap_value_is_accepted_and_the_final_one_is_stored() {
         .await,
         3,
         "exactly the three final lines are stored"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Issue #483: the ingest-time level, bound to the ingest transport.
+// ---------------------------------------------------------------------
+
+/// **The composition gate for ingest-time level detection.**
+///
+/// Three streams under one `run_id`, each carrying a DIFFERENT level and
+/// each arriving on a DIFFERENT ingest transport — push-protocol JSON,
+/// snappy protobuf, and OTLP. The log-volume panel's supplementary query
+/// then has to come back with three series keyed by `detected_level`.
+///
+/// Binding the level to the transport is the point. A plain "three series"
+/// check is a gate weaker than its claim: one working transport supplying
+/// three levels satisfies it while the other two are broken. Here a missing
+/// path deletes an identifiable series.
+///
+/// Before this change the same query returned ONE series with `metric: {}`,
+/// because no entry carried the label the client groups on.
+///
+/// The `/detected_fields` half is asserted as a SET. Repeated probes against
+/// the pinned reference returned the same fields in a different array order
+/// on each probe, so an order-sensitive assertion would pass here, pass in
+/// review, and fail later at a rate nobody can reproduce on demand.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_ingest_transport_supplies_its_own_detected_level_series() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_701;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_level_series_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let run_id = "lvlrun";
+
+    // JSON push -> `error`.
+    let json = format!(
+        r#"{{"streams":[{{"stream":{{"service_name":"lvl-json","run_id":"{run_id}"}},"values":[["{}","level=error msg=x"]]}}]}}"#,
+        base_ns
+    );
+    let res = push(port, "application/json", json.as_bytes());
+    assert_eq!(res.status, 204, "json push (body {})", res.body);
+
+    // Protobuf push -> `warn`.
+    let req = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: format!(r#"{{service_name="lvl-proto", run_id="{run_id}"}}"#),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: (base_ns + 1) / 1_000_000_000,
+                    nanos: ((base_ns + 1) % 1_000_000_000) as i32,
+                }),
+                line: "level=warn msg=x".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        }],
+    };
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &snap::raw::Encoder::new()
+            .compress_vec(&req.encode_to_vec())
+            .expect("snappy"),
+    );
+    assert_eq!(res.status, 204, "protobuf push (body {})", res.body);
+
+    // OTLP -> `info`, from the severity NUMBER: the body carries no level
+    // token at all, so a path that only read the line would answer
+    // `unknown` and this series would go missing.
+    let otlp = serde_json::json!({"resourceLogs": [{
+        "resource": {"attributes": [
+            {"key": "service.name", "value": {"stringValue": "lvl-otlp"}},
+            {"key": "run_id", "value": {"stringValue": run_id}},
+        ]},
+        "scopeLogs": [{"logRecords": [{
+            "timeUnixNano": (base_ns + 2).to_string(),
+            "severityNumber": 9,
+            "body": {"stringValue": "no level token in this body"},
+        }]}],
+    }]});
+    let res = otlp_push(
+        port,
+        serde_json::to_vec(&otlp).expect("otlp body").as_slice(),
+    );
+    assert_eq!(res.status, 200, "otlp push (body {})", res.body);
+
+    // All three visible before the metric query runs.
+    for service in ["lvl-json", "lvl-proto", "lvl-otlp"] {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if !query_lines(port, "/api/logs/v1", service, base_ns).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{service} never became visible");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    // The literal supplementary query the log-volume panel's datasource
+    // generates, with the interval substituted.
+    let query = format!(
+        r#"sum by (level, detected_level) (count_over_time({{run_id="{run_id}"}} | drop __error__[5m]))"#
+    );
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    let path = format!(
+        "/api/logs/v1/query_range?query={}&start={start}&end={end}&step=300",
+        urlencode(&query)
+    );
+    let res = http_get(port, &path).expect("volume query reachable");
+    assert_eq!(res.status, 200, "volume query (body {})", res.body);
+    let json: serde_json::Value = serde_json::from_str(&res.body).expect("volume JSON");
+    assert_eq!(json["status"].as_str(), Some("success"));
+    assert_eq!(json["data"]["resultType"].as_str(), Some("matrix"));
+    let mut got: Vec<serde_json::Value> = json["data"]["result"]
+        .as_array()
+        .expect("result array")
+        .iter()
+        .map(|series| series["metric"].clone())
+        .collect();
+    got.sort_by_key(|m| m.to_string());
+    let mut want = vec![
+        serde_json::json!({"detected_level": "error"}),
+        serde_json::json!({"detected_level": "info"}),
+        serde_json::json!({"detected_level": "warn"}),
+    ];
+    want.sort_by_key(|m| m.to_string());
+    assert_eq!(
+        got, want,
+        "one series per transport-supplied level, and nothing else: {}",
+        res.body
+    );
+
+    // `/detected_fields` over the same selector lists the name as a string
+    // field. Compared as a SET — see this test's doc comment.
+    let path = format!(
+        "/api/logs/v1/detected_fields?query={}&start={start}&end={end}",
+        urlencode(&format!(r#"{{run_id="{run_id}"}}"#))
+    );
+    let res = http_get(port, &path).expect("detected_fields reachable");
+    assert_eq!(res.status, 200, "detected_fields (body {})", res.body);
+    let json: serde_json::Value = serde_json::from_str(&res.body).expect("detected_fields JSON");
+    let fields: std::collections::BTreeMap<String, String> = json["fields"]
+        .as_array()
+        .expect("fields array")
+        .iter()
+        .filter_map(|f| {
+            Some((
+                f["label"].as_str()?.to_string(),
+                f["type"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    assert_eq!(
+        fields.get("detected_level").map(String::as_str),
+        Some("string"),
+        "detected_fields must list the ingest-time level as a string field: {}",
+        res.body
+    );
+
+    // The neighbouring endpoint must NOT grow the name: structured metadata
+    // never enters `log_streams_idx` (docs/api.md §2), and the reference's
+    // label discovery reads its label index only.
+    let path = format!(
+        "/api/logs/v1/detected_labels?query={}&start={start}&end={end}",
+        urlencode(&format!(r#"{{run_id="{run_id}"}}"#))
+    );
+    let res = http_get(port, &path).expect("detected_labels reachable");
+    assert_eq!(res.status, 200, "detected_labels (body {})", res.body);
+    assert!(
+        !res.body.contains("detected_level"),
+        "detected_labels must not list a structured-metadata name: {}",
+        res.body
     );
 }

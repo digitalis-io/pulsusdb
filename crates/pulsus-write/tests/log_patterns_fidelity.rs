@@ -258,7 +258,12 @@ async fn otlp_and_loki_push_land_identical_hand_derived_pattern_rows() {
     ));
     let client = fresh_db(&otlp_db).await;
     let fp = ch_fingerprint(&client).await;
-    let otlp_batch = pulsus_write::parse(&otlp_request(ts_ns), ts_ns).expect("otlp parse");
+    let otlp_batch = pulsus_write::parse(
+        &otlp_request(ts_ns),
+        ts_ns,
+        pulsus_write::LogIngestSettings::default(),
+    )
+    .expect("otlp parse");
     admit_and_drain(&otlp_db, otlp_batch).await;
     let otlp_rows = read_patterns(&client, &otlp_db).await;
 
@@ -268,8 +273,12 @@ async fn otlp_and_loki_push_land_identical_hand_derived_pattern_rows() {
         std::process::id()
     ));
     let loki_client = fresh_db(&loki_db).await;
-    let loki_batch =
-        pulsus_write::parse_loki_json(&loki_push_json(ts_ns), ts_ns).expect("loki parse");
+    let loki_batch = pulsus_write::parse_loki_json(
+        &loki_push_json(ts_ns),
+        ts_ns,
+        pulsus_write::LevelDiscovery::On,
+    )
+    .expect("loki parse");
     admit_and_drain(&loki_db, loki_batch).await;
     let loki_rows = read_patterns(&loki_client, &loki_db).await;
 
@@ -311,7 +320,12 @@ async fn re_admitting_an_identical_batch_sums_counts_at_log_metrics_parity() {
 
     // Client re-send simulation: admit the SAME OTLP batch twice.
     for _ in 0..2 {
-        let batch = pulsus_write::parse(&otlp_request(ts_ns), ts_ns).expect("otlp parse");
+        let batch = pulsus_write::parse(
+            &otlp_request(ts_ns),
+            ts_ns,
+            pulsus_write::LogIngestSettings::default(),
+        )
+        .expect("otlp parse");
         admit_and_drain(&db, batch).await;
     }
     // Force the rollup MV's parts to merge so the sum is observable.

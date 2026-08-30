@@ -349,6 +349,13 @@ const ARTIFACT_REVISION: &str = "b318f282";
 /// says the leg is pointed at the right container:
 /// [`no_captured_projection_carries_an_ingest_added_level`] fails
 /// immediately if it is not.
+///
+/// **Issue #483 makes this leg the knob's live proof.** PulsusDB now
+/// synthesizes the same pair by default, so OUR side has to be told to stop
+/// as well or its projections grow a name the container's cannot have:
+/// [`spawn_pulsus`] sets `PULSUS_DISCOVER_LOG_LEVELS=0`. An
+/// accepted-and-ignored knob therefore fails this suite rather than passing
+/// silently — the assertion below is what observes it.
 const FORBIDDEN_NAMES: &[&str] = &["detected_level"];
 
 #[derive(Serialize, Deserialize)]
@@ -1802,6 +1809,13 @@ fn spawn_pulsus(db: &str, port: u16) -> ChildGuard {
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
         .env("PULSUS_COMPAT_ENDPOINTS", "1")
+        // Issue #483: this leg's reference container boots on
+        // `ci/logql/config-463.yaml`, which turns level discovery off, so
+        // our side must be off too — a differential between one store that
+        // synthesizes a per-entry level and one that does not is a broken
+        // comparison, not a test. This is also the live proof that the knob
+        // does something: with it ignored, `FORBIDDEN_NAMES` goes red.
+        .env("PULSUS_DISCOVER_LOG_LEVELS", "0")
         .env(
             "CLICKHOUSE_SERVER",
             std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),

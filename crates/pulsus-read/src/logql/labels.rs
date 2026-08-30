@@ -198,7 +198,13 @@ pub(in crate::logql) fn parse_flat_labels_into(json: &str, out: &mut Vec<(String
 /// reserved SM value contributes nothing at all. Live-probed at v3.7.4 across
 /// eleven SM shapes (`discover_log_levels: false` — with it on, every stream
 /// carries a `detected_level` SM entry and the clean-builder fast paths are
-/// unreachable).
+/// unreachable). **Since 2026-08-30 (issue #483) that is PulsusDB's own
+/// default**: every newly written log row carries a `detected_level` pair, so
+/// those fast paths no longer fire for new data. They are kept because they
+/// still fire for pre-#483 rows and for rows written with
+/// `PULSUS_DISCOVER_LOG_LEVELS=false`, and because the cost they save is
+/// per-row on rows the query already materializes — no plan, index or
+/// pushdown changes.
 #[derive(Debug, Default, Clone)]
 pub struct StructuredMetadataCtx {
     /// SM `__error__` (post-suffix), routed to the err slot. "" == absent.

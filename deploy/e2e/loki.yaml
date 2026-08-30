@@ -31,6 +31,43 @@
 #     `detected_level` structured-metadata field per entry, which its
 #     query results surface as an extra label and which PulsusDB
 #     deliberately does not synthesize.
+#
+#     REVERSED 2026-08-30 (issue #483), and the setting is STILL off here.
+#     Two separate facts, both of which a future reader needs:
+#
+#     (a) The product position above is reversed. PulsusDB now synthesizes
+#     a `detected_level` pair on every log-ingest path by default, because
+#     the field is not decoration: it is what makes level colouring in the
+#     log view and the breakdown in the log-volume histogram work at all
+#     for the ordinary push and OTLP shape, where the level lives in the
+#     line body rather than in a stream label. The earlier decision was
+#     made about stream-label-set equality in this differential harness and
+#     did not have that consumer fact. The knob is
+#     `PULSUS_DISCOVER_LOG_LEVELS`, default `true`.
+#
+#     (b) This harness keeps the setting off, on BOTH sides — the
+#     `pulsusdb` service in `compose.single.yaml` and `compose.cluster.yaml`
+#     sets `PULSUS_DISCOVER_LOG_LEVELS: "false"` to match. The reason is
+#     not the old position: it is that the container pinned here is an
+#     OLDER reference build whose level rule differs materially from the
+#     build the rule was captured against — 9 allowed field names against
+#     14, no normalization of a value taken from a stream label, no
+#     in-place normalization of a pre-existing pair, and an unbounded
+#     substring scan with a different precedence instead of an
+#     earliest-word-bounded scan. Agreement on today's corpus would be a
+#     coincidence, and a differential that agrees by coincidence goes red
+#     one day for a reason that has nothing to do with our correctness.
+#
+#     What would have to be true to turn it on: this harness's reference
+#     container is moved to the same build the case table was captured
+#     from; `crates/pulsus-write/tests/fixtures/detected_level/
+#     reference_cases.json` is re-captured against it and comes back
+#     byte-identical; and the corpus expectations are regenerated to carry
+#     a per-record `detected_level`. Until all three hold, enabling it
+#     compares our implementation of one rule against a different rule.
+#
+#     The rule itself is proved against the pinned reference build by
+#     `crates/pulsus-write/tests/detected_level_reference_cases.rs`.
 #   - `split_queries_by_interval: 0` (issue #301, upheld by the owner
 #     ruling of 2026-08-12 on issue #425) — the oracle must evaluate the
 #     range query it was ASKED, not the step-aligned one its

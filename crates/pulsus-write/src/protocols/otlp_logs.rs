@@ -23,7 +23,10 @@ use pulsus_model::{
 use crate::error::LogsIngestError;
 use crate::protocols::label_name::validate_otlp_attribute_names;
 use crate::protocols::log_label_limits;
-use crate::protocols::loki_push::structured_metadata_json;
+use crate::protocols::log_level::{
+    self, AttributeLookup, DETECTED_LEVEL, LevelDiscovery, MetadataView, OtlpView,
+};
+use crate::protocols::loki_push::render_structured_metadata;
 use crate::protocols::service_name;
 
 /// A `SeverityNumber` outside this range (including the `0`/unset default)
@@ -31,6 +34,37 @@ use crate::protocols::service_name;
 /// if `1..=24` else `0`) — the valid `SeverityNumber` enum range per the
 /// OTLP logs data model (`TRACE`=1 .. `FATAL4`=24).
 const VALID_SEVERITY_RANGE: std::ops::RangeInclusive<i32> = 1..=24;
+
+/// The log-ingest knobs the server threads into every log receiver, the
+/// structural mirror of
+/// [`MetricIngestSettings`](crate::protocols::otlp_metrics::MetricIngestSettings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogIngestSettings {
+    /// `writer.discover_log_levels` / `PULSUS_DISCOVER_LOG_LEVELS` (issue
+    /// #483): whether a `detected_level` structured-metadata pair is
+    /// synthesized for every entry.
+    pub discover_log_levels: bool,
+}
+
+impl Default for LogIngestSettings {
+    /// The reference's own default: level discovery is ON.
+    fn default() -> Self {
+        LogIngestSettings {
+            discover_log_levels: true,
+        }
+    }
+}
+
+impl LogIngestSettings {
+    /// The knob in the form the rule takes it.
+    pub fn discovery(&self) -> LevelDiscovery {
+        if self.discover_log_levels {
+            LevelDiscovery::On
+        } else {
+            LevelDiscovery::Off
+        }
+    }
+}
 
 /// One `log_samples` row (docs/schemas.md §3.1), produced by [`parse`].
 #[derive(Debug, Clone, PartialEq)]
@@ -155,7 +189,11 @@ pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestEr
 /// `400`, not the `422` (see the body). Malformed
 /// per-record timestamps stay per-record partial-success rejections inside
 /// the `Ok`.
-pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
+pub fn parse(
+    req: &ExportLogsServiceRequest,
+    now_ns: i64,
+    settings: LogIngestSettings,
+) -> Result<ParsedLogs, LogsIngestError> {
     // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
     // maliciously deep body/attribute tree before any value is rendered or a
     // row materialized, so the recursive `any_value_to_string` render below
@@ -278,7 +316,24 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
             let service = labels.service().to_string();
             // The scope's per-entry structured metadata, computed once per
             // ScopeLogs and cloned onto every record it contains.
-            let structured_metadata = build_scope_structured_metadata(scope_logs)?;
+            // Issue #483: with level discovery on the stored string is
+            // per-RECORD, so a single shared string is no longer reusable.
+            // The shape is a SPLICE — the sorted JSON is rendered once per
+            // scope with a hole where the `detected_level` member belongs,
+            // and each record fills the hole. Rebuilding the resolved pair
+            // list and re-canonicalizing per record was the alternative;
+            // `otlp_level_alloc.rs` is the measurement that chose between
+            // them, not an assertion that one is faster.
+            let scope_pairs = build_scope_metadata_pairs(scope_logs)?;
+            let scope_metadata = match settings.discovery() {
+                LevelDiscovery::Off => {
+                    ScopeMetadata::Shared(render_structured_metadata(scope_pairs))
+                }
+                LevelDiscovery::On => ScopeMetadata::Spliced {
+                    splice: LevelSplice::for_scope(&scope_pairs),
+                    pairs: scope_pairs,
+                },
+            };
 
             for record in &scope_logs.log_records {
                 // A log record's attribute KEYS are validated even though
@@ -355,15 +410,43 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
                     });
                 }
 
+                let body = any_value_to_string(record.body.as_ref());
+                let record_metadata = match &scope_metadata {
+                    // The scope's structured metadata (issue #109), shared by
+                    // every record in this ScopeLogs.
+                    ScopeMetadata::Shared(shared) => shared.clone(),
+                    ScopeMetadata::Spliced { pairs, splice } => {
+                        let view = OtlpView {
+                            scope_pairs: pairs,
+                            severity_text: record.severity_text.as_str(),
+                            record_attributes: RecordAttributes(&record.attributes),
+                        };
+                        // The RAW severity number, not the stored `i8`:
+                        // `resolve_severity` collapses everything outside
+                        // `1..=24` to `0`, which would merge "absent, read the
+                        // line" (o1, o12) with "25 or 30, answer `unknown` and
+                        // never read the line" (p1, p2).
+                        let outcome =
+                            log_level::resolve(&labels, &view, &body, Some(record.severity_number));
+                        // `LeaveStored` carries no value: the reference
+                        // rewrote a `detected_level` pair this entry does not
+                        // store (a record attribute) and left the scope's own
+                        // pair alone, so the stored value is the scope's,
+                        // un-normalized (cases p10, p11).
+                        let level = outcome
+                            .value()
+                            .or_else(|| view.stored_level())
+                            .unwrap_or(log_level::UNKNOWN);
+                        splice.render(level)
+                    }
+                };
                 out.rows.push(LogRow {
                     service: service.clone(),
                     fingerprint,
                     timestamp_ns: UnixNano(timestamp_ns),
                     severity: resolve_severity(record.severity_number),
-                    body: any_value_to_string(record.body.as_ref()),
-                    // The scope's structured metadata (issue #109), shared by
-                    // every record in this ScopeLogs.
-                    structured_metadata: structured_metadata.clone(),
+                    body,
+                    structured_metadata: record_metadata,
                 });
             }
         }
@@ -492,7 +575,7 @@ fn build_stream_labels(
 ///   `empty-value-oracle-version-skew` for the measured three-store matrix
 ///   and the close condition. No rule on this path changed for it.
 ///
-/// All three rules are now the [`structured_metadata_json`] seam's own —
+/// All three rules are now the shared canonicalization seam's own —
 /// `pulsus_model::resolve_structured_metadata`, the reference's
 /// `labels.Builder`, over keys this path has ALREADY renamed exactly as the
 /// reference's `attributeToLabels` renames them (issue #381). This function
@@ -511,9 +594,20 @@ fn build_stream_labels(
 /// Loki-push representation). The surviving asymmetry — push hands the builder
 /// RAW names, this path hands it renamed ones — is the reference's own
 /// asymmetry, at the same place.
-fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, LogsIngestError> {
+///
+/// The resolution half of that seam, split out
+/// (issue #483) so the level detector can read the scope's RESOLVED pairs —
+/// canonical names, no empty values — and so the per-record splice can be
+/// planned from them once per `ScopeLogs` instead of per record. The
+/// rendering half is
+/// [`render_structured_metadata`](crate::protocols::loki_push::render_structured_metadata),
+/// which the pre-issue-#483 caller reached through one combined function.
+///
+fn build_scope_metadata_pairs(
+    scope_logs: &ScopeLogs,
+) -> Result<Vec<(String, String)>, LogsIngestError> {
     let Some(scope) = scope_logs.scope.as_ref() else {
-        return Ok(String::new());
+        return Ok(Vec::new());
     };
     // Ordered (sanitized_key, value): attributes in wire order, then identity
     // appended last so it overwrites any colliding attribute (rule (a)); each
@@ -547,7 +641,144 @@ fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> Result<String, Log
     //   Appending them AFTER the attributes is what keeps rule (a) true for
     //   non-empty values: nothing is deleted, and among pairs the builder
     //   treats alike the last wins.
-    Ok(structured_metadata_json(ordered))
+    Ok(pulsus_model::resolve_structured_metadata(ordered))
+}
+
+/// How one `ScopeLogs`' per-record structured-metadata string is produced.
+enum ScopeMetadata {
+    /// Level discovery off: one shared string, cloned onto every record —
+    /// the pre-issue-#483 behaviour, byte-identical.
+    Shared(String),
+    /// Level discovery on: the scope's resolved pairs (what the rule reads)
+    /// beside the splice plan (what the rule's answer is written into).
+    Spliced {
+        pairs: Vec<(String, String)>,
+        splice: LevelSplice,
+    },
+}
+
+/// The canonical structured-metadata JSON for one scope, rendered once with
+/// a hole where the `detected_level` member belongs.
+///
+/// The stored string is `LabelSet::to_canonical_json` over the scope's
+/// resolved pairs plus one more pair, and that rendering is sorted by key
+/// with `serde_json` string escaping. Because the key is a constant, its
+/// position in the sorted order is a constant too, so everything either side
+/// of it can be built once per scope. `otlp_level_alloc.rs` asserts the
+/// spliced string equals `render_structured_metadata` over the same pair
+/// list — an identity between two of our own functions, not evidence of
+/// reference agreement.
+struct LevelSplice {
+    /// `{` plus every member sorted before `detected_level`, comma-terminated.
+    prefix: String,
+    /// Every member sorted after `detected_level`, comma-prefixed, plus `}`.
+    suffix: String,
+}
+
+impl LevelSplice {
+    fn for_scope(pairs: &[(String, String)]) -> LevelSplice {
+        // A scope pair already named `detected_level` is REPLACED, not
+        // duplicated (case p6), so it is left out of both sides of the hole.
+        let mut sorted: Vec<&(String, String)> = pairs
+            .iter()
+            .filter(|(name, _)| name != DETECTED_LEVEL)
+            .collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        // Members before the hole are comma-TERMINATED, members after it
+        // comma-PREFIXED, so the hole always sits against a brace or between
+        // two commas and the result is one well-formed object either way.
+        let mut prefix = String::from("{");
+        let mut suffix = String::new();
+        for (name, value) in sorted {
+            let before = name.as_str() < DETECTED_LEVEL;
+            let target = if before { &mut prefix } else { &mut suffix };
+            if !before {
+                target.push(',');
+            }
+            push_json_string(target, name);
+            target.push(':');
+            push_json_string(target, value);
+            if before {
+                target.push(',');
+            }
+        }
+        suffix.push('}');
+        LevelSplice { prefix, suffix }
+    }
+
+    /// The stored string for one record, given the rule's answer.
+    fn render(&self, level: &str) -> String {
+        let mut out = String::with_capacity(
+            self.prefix.len() + self.suffix.len() + DETECTED_LEVEL.len() + level.len() + 4,
+        );
+        out.push_str(&self.prefix);
+        push_json_string(&mut out, DETECTED_LEVEL);
+        out.push(':');
+        push_json_string(&mut out, level);
+        out.push_str(&self.suffix);
+        out
+    }
+}
+
+/// Appends `value` as a JSON string, byte-identical to
+/// `serde_json::to_string(value)` — which is what
+/// `LabelSet::to_canonical_json` uses, and what
+/// `otlp_level_alloc.rs`'s identity assertion compares against.
+///
+/// The fast path is taken exactly when `serde_json` would emit the bytes
+/// verbatim between quotes: no `"`, no `\` and no control byte. `serde_json`
+/// escapes nothing else — not `/`, not DEL, not any non-ASCII scalar.
+fn push_json_string(out: &mut String, value: &str) {
+    if value.bytes().all(|b| b != b'"' && b != b'\\' && b >= 0x20) {
+        out.push('"');
+        out.push_str(value);
+        out.push('"');
+        return;
+    }
+    out.push_str(
+        &serde_json::to_string(value)
+            .expect("a &str is always encodable as a JSON string: encoding cannot fail"),
+    );
+}
+
+/// An [`AttributeLookup`] over an OTLP record's own attributes, read lazily:
+/// a value is rendered only for the name the rule actually asks about, and
+/// the rule stops at its first hit, so a record carrying many attributes
+/// does not pay to render them all.
+struct RecordAttributes<'a>(&'a [KeyValue]);
+
+impl AttributeLookup for RecordAttributes<'_> {
+    fn get(&self, canonical_name: &str) -> Option<std::borrow::Cow<'_, str>> {
+        self.0
+            .iter()
+            .find(|kv| canonical_key_eq(&kv.key, canonical_name))
+            .map(|kv| std::borrow::Cow::Owned(any_value_to_string(kv.value.as_ref())))
+    }
+}
+
+/// `canonicalize_label_key(raw) == canonical`, without building the
+/// canonical form. The reference reaches record attributes through the same
+/// key sanitizer every other attribute goes through
+/// (`pkg/loghttp/push/otlp.go:488-499 @ v3.7.4`), so the comparison has to
+/// be on the canonical name — but the rule asks about at most fifteen names
+/// per record, and allocating a canonical key per attribute per name to
+/// answer them would be the whole cost of the feature.
+///
+/// `canonical_key_eq_matches_canonicalize_label_key` pins the two against
+/// each other.
+fn canonical_key_eq(raw: &str, canonical: &str) -> bool {
+    let mut want = canonical.chars();
+    for c in raw.chars() {
+        let mapped = if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        };
+        if want.next() != Some(mapped) {
+            return false;
+        }
+    }
+    want.next().is_none()
 }
 
 /// Renders a `KeyValue` list to `(key, value)` label pairs, using the same
@@ -730,13 +961,37 @@ mod tests {
     use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
     use opentelemetry_proto::tonic::resource::v1::Resource;
 
+    /// `super::parse` with level discovery OFF. Every assertion in this
+    /// module predates ingest-time level detection (issue #483) and pins a
+    /// stored structured-metadata string that carries no `detected_level`
+    /// pair; routing them all through one off-path helper keeps those
+    /// expectations exactly what they were.
+    ///
+    /// The cost is that this module then exercises the OFF path only. The ON
+    /// path is covered by
+    /// `crates/pulsus-write/tests/detected_level_reference_cases.rs`, which
+    /// drives `super::parse` with discovery on over the whole captured OTLP
+    /// table, and by `crates/pulsus-write/tests/otlp_level_alloc.rs`.
+    fn parse_off(
+        req: &ExportLogsServiceRequest,
+        now_ns: i64,
+    ) -> Result<ParsedLogs, LogsIngestError> {
+        super::parse(
+            req,
+            now_ns,
+            LogIngestSettings {
+                discover_log_levels: false,
+            },
+        )
+    }
+
     /// The `AnyValue` depth guard (finding #54) made `super::parse` fallible.
     /// Every legacy assertion below constructs shallow, in-bounds requests, so
     /// this shim unwraps the whole-request result to keep those cases reading
     /// against `ParsedLogs` unchanged; the dedicated depth tests call
     /// `super::parse` directly to observe the `Err`.
     fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
-        super::parse(req, now_ns).expect("test request is within the AnyValue depth cap")
+        parse_off(req, now_ns).expect("test request is within the AnyValue depth cap")
     }
 
     fn kv(key: &str, value: Value) -> KeyValue {
@@ -789,7 +1044,7 @@ mod tests {
     /// where the old contract was written down.
     #[test]
     fn parse_of_empty_request_is_a_stream_less_request() {
-        let err = super::parse(&request(vec![]), 1_000).expect_err("no log records");
+        let err = parse_off(&request(vec![]), 1_000).expect_err("no log records");
         assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
     }
 
@@ -909,7 +1164,7 @@ mod tests {
             }],
             schema_url: String::new(),
         }]);
-        match super::parse(&request, 0) {
+        match parse_off(&request, 0) {
             Err(LogsIngestError::InvalidLabelName(message)) => message,
             other => panic!("expected InvalidLabelName, got {other:?}"),
         }
@@ -977,7 +1232,7 @@ mod tests {
     /// attributes (a resource and scope that are both admissible), returning
     /// the whole-request rejection message.
     fn record_attribute_reject_message(record_attrs: Vec<KeyValue>) -> String {
-        match super::parse(&record_attribute_request(record_attrs), 0) {
+        match parse_off(&record_attribute_request(record_attrs), 0) {
             Err(LogsIngestError::InvalidLabelName(message)) => message,
             other => panic!("expected InvalidLabelName, got {other:?}"),
         }
@@ -1043,7 +1298,7 @@ mod tests {
     /// #109's placement decision (record attributes are not stored).
     #[test]
     fn an_admissible_otlp_record_attribute_key_is_accepted_and_its_value_still_discarded() {
-        let out = super::parse(
+        let out = parse_off(
             &record_attribute_request(vec![
                 kv("http.method", Value::StringValue("GET".to_string())),
                 kv("naïve", Value::StringValue("yes".to_string())),
@@ -1088,7 +1343,7 @@ mod tests {
             }],
             schema_url: String::new(),
         }]);
-        let out = super::parse(&request, 0).expect("admissible attribute keys");
+        let out = parse_off(&request, 0).expect("admissible attribute keys");
         assert_eq!(
             out.rows[0].structured_metadata,
             r#"{"http_method":"GET","na_ve":"yes","scope_name":"N"}"#
@@ -2195,7 +2450,7 @@ mod tests {
         ));
         // Calls the real fallible `parse` (not the unwrap shim): an at-cap
         // body renders and yields exactly one row, unchanged by the guard.
-        let out = super::parse(&req, 0).expect("at-cap body is within the depth guard");
+        let out = parse_off(&req, 0).expect("at-cap body is within the depth guard");
         assert_eq!(out.rows.len(), 1);
     }
 
@@ -2208,7 +2463,7 @@ mod tests {
         let req = request_with_body(nested_body(
             crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1,
         ));
-        let err = super::parse(&req, 0).expect_err("over-depth body is rejected whole-request");
+        let err = parse_off(&req, 0).expect_err("over-depth body is rejected whole-request");
         assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
 
@@ -2234,7 +2489,7 @@ mod tests {
             }])],
             schema_url: String::new(),
         }]);
-        let err = super::parse(&req, 0).expect_err("over-depth resource attribute is rejected");
+        let err = parse_off(&req, 0).expect_err("over-depth resource attribute is rejected");
         assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
 
@@ -2332,7 +2587,7 @@ mod tests {
             request(vec![empty_scope.clone()]),
             request(vec![empty_scope.clone(), empty_scope]),
         ] {
-            let err = super::parse(&req, 0).expect_err("no log records");
+            let err = parse_off(&req, 0).expect_err("no log records");
             assert!(matches!(err, LogsIngestError::MissingStreams), "{err:?}");
             assert_eq!(
                 err.to_string(),
@@ -2365,7 +2620,7 @@ mod tests {
             }])],
             schema_url: String::new(),
         };
-        let out = super::parse(&request(vec![empty, full]), 0).unwrap();
+        let out = parse_off(&request(vec![empty, full]), 0).unwrap();
         assert_eq!(out.rows.len(), 1);
     }
 
@@ -2404,7 +2659,7 @@ mod tests {
                 schema_url: String::new(),
             }])
         };
-        let err = super::parse(
+        let err = parse_off(
             &over_deep(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1),
             0,
         )
@@ -2413,7 +2668,7 @@ mod tests {
             matches!(err, LogsIngestError::OversizeMessage { .. }),
             "depth cap must win over MissingStreams, got {err:?}"
         );
-        let err = super::parse(
+        let err = parse_off(
             &over_deep(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH),
             0,
         )
@@ -2425,7 +2680,7 @@ mod tests {
     fn parse_rejects_an_indexed_attribute_value_over_2048_bytes() {
         let value = "b".repeat(2049);
         let req = logs_with_resource_attrs(vec![attr("k8s.pod.name", &value)]);
-        let out = super::parse(&req, 0).unwrap();
+        let out = parse_off(&req, 0).unwrap();
         // The rendered set is the POST-synthesis one, on this transport too:
         // the reference validates the `streamLabels` map after writing the
         // `service_name` slot into it (`otlp.go:174-244` ->
@@ -2443,7 +2698,7 @@ mod tests {
     #[test]
     fn parse_accepts_an_indexed_attribute_value_at_2048_bytes() {
         let req = logs_with_resource_attrs(vec![attr("k8s.pod.name", &"b".repeat(2048))]);
-        assert_eq!(super::parse(&req, 0).unwrap().rows.len(), 1);
+        assert_eq!(parse_off(&req, 0).unwrap().rows.len(), 1);
     }
 
     /// The other half, and the one that made the previous implementation
@@ -2458,13 +2713,13 @@ mod tests {
             ("a".repeat(1025), "v".to_string()),
         ] {
             let req = logs_with_resource_attrs(vec![attr(&key, &value)]);
-            let out = super::parse(&req, 0).unwrap();
+            let out = parse_off(&req, 0).unwrap();
             assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
             assert_eq!(out.rows.len(), 1);
         }
         // ...and 16 arbitrary attributes is a `204` upstream, not a `400`.
         let attrs: Vec<KeyValue> = (0..16).map(|i| attr(&format!("l{i}"), "v")).collect();
-        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        let out = parse_off(&logs_with_resource_attrs(attrs), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         assert_eq!(out.rows.len(), 1);
     }
@@ -2475,27 +2730,27 @@ mod tests {
     #[test]
     fn a_non_indexed_attribute_is_still_stored_as_a_stream_label() {
         let req = logs_with_resource_attrs(vec![attr("app", "checkout")]);
-        let out = super::parse(&req, 0).unwrap();
+        let out = parse_off(&req, 0).unwrap();
         assert_eq!(out.streams[0].labels.get("app"), Some("checkout"));
     }
 
     #[test]
     fn parse_rejects_sixteen_indexed_attributes_and_accepts_fifteen() {
         assert_eq!(
-            super::parse(&logs_with_resource_attrs(indexed(15)), 0)
+            parse_off(&logs_with_resource_attrs(indexed(15)), 0)
                 .unwrap()
                 .rows
                 .len(),
             1
         );
-        let out = super::parse(&logs_with_resource_attrs(indexed(16)), 0).unwrap();
+        let out = parse_off(&logs_with_resource_attrs(indexed(16)), 0).unwrap();
         assert!(only_stream_error(&out).ends_with("' has 16 label names; limit 15"));
         // `service.name` canonicalizes to `service_name`, which is indexed but
         // not counted (`validator.go:169-174 @ v3.7.4`).
         let mut with_service = indexed(15);
         with_service.push(attr("service.name", "checkout"));
         assert_eq!(
-            super::parse(&logs_with_resource_attrs(with_service), 0)
+            parse_off(&logs_with_resource_attrs(with_service), 0)
                 .unwrap()
                 .rows
                 .len(),
@@ -2510,7 +2765,7 @@ mod tests {
     fn non_indexed_attributes_do_not_count_towards_the_label_bound() {
         let mut attrs = indexed(15);
         attrs.extend((0..40).map(|i| attr(&format!("extra{i}"), "v")));
-        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        let out = parse_off(&logs_with_resource_attrs(attrs), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         // 15 indexed + 40 others + the discovered `service_name` (issue #379,
         // from `container.name` — one of the 15 indexed here).
@@ -2549,7 +2804,7 @@ mod tests {
                 schema_url: String::new(),
             },
         ]);
-        let out = super::parse(&req, 0).unwrap();
+        let out = parse_off(&req, 0).unwrap();
         assert_eq!(out.rows.len(), 1);
         assert!(out.stream_errors.is_empty());
     }
@@ -2577,7 +2832,7 @@ mod tests {
             }],
             schema_url: String::new(),
         }]);
-        assert_eq!(super::parse(&req, 0).unwrap().rows.len(), 1);
+        assert_eq!(parse_off(&req, 0).unwrap().rows.len(), 1);
     }
 
     /// `WithoutEmpty` reaches this transport too — the reference's OTLP
@@ -2588,7 +2843,7 @@ mod tests {
     /// since the drop is about storage, not about the bounds.
     #[test]
     fn an_empty_valued_resource_attribute_is_absent_from_the_stored_stream() {
-        let with_empty = super::parse(
+        let with_empty = parse_off(
             &logs_with_resource_attrs(vec![
                 attr("service.name", "checkout"),
                 attr("ignored", ""),
@@ -2597,7 +2852,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let without = super::parse(
+        let without = parse_off(
             &logs_with_resource_attrs(vec![attr("service.name", "checkout")]),
             0,
         )
@@ -2619,7 +2874,7 @@ mod tests {
         let mut attrs = indexed(15);
         attrs.push(attr("k8s.job.name", ""));
         attrs.push(attr("service.name", ""));
-        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        let out = parse_off(&logs_with_resource_attrs(attrs), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         assert_eq!(out.streams[0].labels.len(), 15);
     }
@@ -2635,7 +2890,7 @@ mod tests {
         for internal in ["__aggregated_metric__", "__pattern__"] {
             let mut attrs = indexed(16);
             attrs.push(attr(internal, "x"));
-            let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+            let out = parse_off(&logs_with_resource_attrs(attrs), 0).unwrap();
             assert!(
                 only_stream_error(&out).ends_with("' has 16 label names; limit 15"),
                 "{internal}"
@@ -2666,7 +2921,7 @@ mod tests {
             resource(&"b".repeat(2049)),
             resource("also_good"),
         ]);
-        let out = super::parse(&req, 0).unwrap();
+        let out = parse_off(&req, 0).unwrap();
         assert_eq!(out.rows.len(), 2);
         assert_eq!(out.streams.len(), 2);
         assert_eq!(out.stream_errors.len(), 1);
@@ -2690,7 +2945,7 @@ mod tests {
             "cloud-region",
         ] {
             let req = logs_with_resource_attrs(vec![attr(spelling, &value)]);
-            let out = super::parse(&req, 0).unwrap();
+            let out = parse_off(&req, 0).unwrap();
             assert!(
                 out.stream_errors.is_empty(),
                 "{spelling}: {:?}",
@@ -2709,7 +2964,7 @@ mod tests {
         let mut raw_index = INDEXED.to_vec();
         raw_index.push("service.name");
         for raw in raw_index {
-            let out = super::parse(&logs_with_resource_attrs(vec![attr(raw, &value)]), 0).unwrap();
+            let out = parse_off(&logs_with_resource_attrs(vec![attr(raw, &value)]), 0).unwrap();
             assert_eq!(out.stream_errors.len(), 1, "{raw} must be bounded");
             assert!(
                 out.stream_errors[0].contains("has label value too long"),
@@ -2718,7 +2973,7 @@ mod tests {
 
             let canonical = raw.replace('.', "_");
             let out =
-                super::parse(&logs_with_resource_attrs(vec![attr(&canonical, &value)]), 0).unwrap();
+                parse_off(&logs_with_resource_attrs(vec![attr(&canonical, &value)]), 0).unwrap();
             assert!(
                 out.stream_errors.is_empty(),
                 "{canonical} must not be bounded: {:?}",
@@ -2739,7 +2994,7 @@ mod tests {
                 .map(|k| attr(&k.replace('.', "_"), "v"))
                 .collect::<Vec<_>>(),
         );
-        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        let out = parse_off(&logs_with_resource_attrs(attrs), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         // The 15 raw and the 17 underscored spellings canonicalize onto the
         // same 17 label names, plus the discovered `service_name` (issue
@@ -2779,7 +3034,7 @@ mod tests {
 
         // -- the surviving gap: `k8s.pod.name`, which the slot does not
         // govern. The near-miss value is stored and fixes the identity.
-        let out = super::parse(
+        let out = parse_off(
             &logs_with_resource_attrs(vec![
                 attr("k8s.pod.name", "ok"),
                 attr("k8s_pod_name", &wide),
@@ -2795,7 +3050,7 @@ mod tests {
                 > Some(log_label_limits::MAX_LABEL_VALUE_BYTES),
             "an indexed, stored label wider than the bound this module introduces"
         );
-        let near_miss_alone = super::parse(
+        let near_miss_alone = parse_off(
             &logs_with_resource_attrs(vec![attr("k8s_pod_name", &wide)]),
             0,
         )
@@ -2808,7 +3063,7 @@ mod tests {
         // -- the closed case: `service_name`. The slot wins, so the stored
         // value is the one the bound was charged on and the identity follows
         // the VALIDATED attribute instead.
-        let out = super::parse(
+        let out = parse_off(
             &logs_with_resource_attrs(vec![
                 attr("service.name", "ok"),
                 attr("service_name", &wide),
@@ -2821,7 +3076,7 @@ mod tests {
         assert_eq!(stored.len(), 1, "the near-miss is not stored at all");
         assert_eq!(stored.get("service_name"), Some("ok"));
 
-        let validated = super::parse(
+        let validated = parse_off(
             &logs_with_resource_attrs(vec![attr("service.name", "ok")]),
             0,
         )
@@ -2833,7 +3088,7 @@ mod tests {
         // ...and NOT the stream a bare over-wide `service_name` produces,
         // which is the assertion that discriminates: were `from_normalized`
         // still deciding this name, these two would be one stream.
-        let near_miss_alone = super::parse(
+        let near_miss_alone = parse_off(
             &logs_with_resource_attrs(vec![attr("service_name", &wide)]),
             0,
         )
@@ -2876,7 +3131,7 @@ mod tests {
             "",
             vec![kv("team", Value::StringValue("pay".to_string()))],
         ));
-        let out = super::parse(&request, 0).unwrap();
+        let out = parse_off(&request, 0).unwrap();
         assert_eq!(out.rows[0].structured_metadata, r#"{"team":"pay"}"#);
         assert_eq!(out.streams[0].service, "checkout");
         assert_eq!(
@@ -2898,7 +3153,7 @@ mod tests {
                 Value::StringValue("from-scope".to_string()),
             )],
         ));
-        let out = super::parse(&request, 0).unwrap();
+        let out = parse_off(&request, 0).unwrap();
         assert_eq!(
             out.rows[0].structured_metadata,
             r#"{"service_name":"from-scope"}"#
@@ -2926,7 +3181,7 @@ mod tests {
                 kv("a_b", Value::StringValue("keep".to_string())),
             ],
         ));
-        let out = super::parse(&request, 0).unwrap();
+        let out = parse_off(&request, 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         assert_eq!(out.rows.len(), 1, "the entry is still stored");
         assert_eq!(
@@ -2944,7 +3199,7 @@ mod tests {
     /// required per stream`.
     #[test]
     fn an_empty_index_attribute_value_empties_the_stream() {
-        let out = super::parse(
+        let out = parse_off(
             &logs_with_resource_attrs(vec![attr("container.name", "")]),
             0,
         )
@@ -2965,7 +3220,7 @@ mod tests {
     /// metadata).
     #[test]
     fn a_resource_with_no_index_attributes_still_validates() {
-        let out = super::parse(&logs_with_resource_attrs(vec![attr("zzz", "v")]), 0).unwrap();
+        let out = parse_off(&logs_with_resource_attrs(vec![attr("zzz", "v")]), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         assert_eq!(
             out.streams[0].labels.to_canonical_json(),
@@ -2981,7 +3236,7 @@ mod tests {
     #[test]
     fn the_stored_otlp_stream_follows_the_slot_including_when_it_is_empty() {
         let stored = |attrs: Vec<KeyValue>| {
-            let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+            let out = parse_off(&logs_with_resource_attrs(attrs), 0).unwrap();
             assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
             out.streams[0].labels.to_canonical_json()
         };
@@ -3014,7 +3269,7 @@ mod tests {
     #[test]
     fn near_miss_spellings_store_labels_past_the_name_and_count_bounds() {
         let long_name = format!("k8s.{}", "n".repeat(1025));
-        let out = super::parse(
+        let out = parse_off(
             &logs_with_resource_attrs(vec![attr("service.name", "ok"), attr(&long_name, "v")]),
             0,
         )
@@ -3032,7 +3287,7 @@ mod tests {
         // 15 raw ones either — the stored set is 17 wide.
         let mut attrs = indexed(15);
         attrs.extend(INDEXED.iter().map(|k| attr(&k.replace('.', "_"), "v")));
-        let out = super::parse(&logs_with_resource_attrs(attrs), 0).unwrap();
+        let out = parse_off(&logs_with_resource_attrs(attrs), 0).unwrap();
         assert!(out.stream_errors.is_empty(), "{:?}", out.stream_errors);
         assert!(
             out.streams[0].labels.len() > log_label_limits::MAX_LABEL_NAMES_PER_STREAM,
@@ -3064,7 +3319,7 @@ mod tests {
             ],
             schema_url: String::new(),
         }]);
-        let out = super::parse(&req, 0).unwrap();
+        let out = parse_off(&req, 0).unwrap();
         assert_eq!(out.stream_errors.len(), 1);
         assert!(out.rows.is_empty());
     }
