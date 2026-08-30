@@ -189,13 +189,29 @@ pub(crate) fn render_tag_values_typed_v2(answer: &TagValuesAnswer<'_>) -> Value 
 /// by name (`scope=intrinsic`): an unscoped v1 flat listing carries the
 /// catalog keys alone, matching the reference (issue #475).
 pub(crate) fn render_tag_names_flat(answer: &TagNamesAnswer<'_>) -> Value {
-    let names = match answer {
+    let (names, with_intrinsic) = match answer {
         TagNamesAnswer::IntrinsicOnly => return json!({"tagNames": intrinsic_scope_tags()}),
         TagNamesAnswer::NoTags => return json!({"tagNames": Vec::<&str>::new()}),
-        TagNamesAnswer::Catalog { names, .. } => *names,
+        TagNamesAnswer::Catalog {
+            names,
+            with_intrinsic,
+        } => (*names, *with_intrinsic),
     };
     let mut seen: HashSet<&str> = HashSet::new();
     let mut keys: Vec<&str> = Vec::new();
+    // `with_intrinsic` is honoured here rather than ignored, so that the
+    // flag is the SINGLE control over the injection on all three shapes.
+    // The v1 handler passes `false`; if it ever stopped doing so, the
+    // empty-database cell in `api_conformance.rs` reddens. A renderer
+    // that silently dropped the flag would make that cell unable to see
+    // the change.
+    if with_intrinsic {
+        for tag in intrinsic_scope_tags() {
+            if seen.insert(tag) {
+                keys.push(tag);
+            }
+        }
+    }
     for (_, key) in &names.names {
         if seen.insert(key.as_str()) {
             keys.push(key.as_str());
@@ -361,6 +377,23 @@ mod tests {
                 with_intrinsic: false,
             }),
             json!({"tagNames": ["status"]})
+        );
+        // The flag is the single control: the renderer HONOURS it rather
+        // than dropping it, so the empty-database conformance cell can
+        // see a caller that starts setting it. `status` is deliberately
+        // BOTH a catalog key here and one of the 25 static names, so the
+        // deduplicated list is 25 long, not 26 — the count is measured,
+        // not assumed.
+        let injected = render_tag_names_flat(&TagNamesAnswer::Catalog {
+            names: &names,
+            with_intrinsic: true,
+        });
+        let injected = injected["tagNames"].as_array().expect("tagNames").clone();
+        assert_eq!(injected.len(), 25, "{injected:?}");
+        assert_eq!(injected[0], json!("duration"), "the static names lead");
+        assert!(
+            injected.contains(&json!("status")),
+            "the catalog key survives, deduplicated against the static name"
         );
     }
 
