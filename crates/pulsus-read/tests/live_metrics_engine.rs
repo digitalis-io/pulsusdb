@@ -3889,6 +3889,19 @@ async fn selector_regex_matches_prometheus_on_cold_and_warm_resolution() {
 /// The last filter (`{__name__=~"http_requests.*"}`) is the route this
 /// issue must NOT touch: it takes the name-matcher path in both calls, so
 /// equality there says the partition sent it to the untouched path.
+///
+/// **This test and `pulsus-server`'s `prom_api_live::
+/// prom_api_name_values_bodies_and_narrow_dispatch_issue_472` are the two
+/// that cover that claim — `live_discovery_fallback.rs` does not.** Issue
+/// #472's AC9 attributed it there. Named by breaking rather than by
+/// reading: routing the regex selector through the narrow builder left
+/// `live_discovery_fallback` 2/2 green while the endpoint returned every
+/// metric name, because that suite compares a warm engine against a cold
+/// one and both took the broken path, so they still agreed. Its
+/// warm-equals-cold assertion is a non-regression check of that route's own
+/// semantics, which is real and still passes; it is not a check that the
+/// narrow projection stayed away from it. Under the same break this test
+/// failed 29/30 (the row below) and the HTTP suite 5/6.
 #[tokio::test]
 async fn label_values_name_equals_the_wide_discovery_paths_name_set() {
     skip_unless_live!();

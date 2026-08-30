@@ -1688,7 +1688,7 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
     const IN_FETCH: &str = "query LIKE 'SELECT fingerprint, metric_name, labels\\nFROM \
                             metric_series\\nWHERE metric_name IN (%'";
     let in_fetch_before = statements_matching(&admin, db, IN_FETCH).await;
-    let probes_before = statements_matching(&admin, db, &probe_96).await;
+    let probes_before = statements_matching(&admin, db, probe_96).await;
 
     let regex_end = (h + 2 * 3_600_000) / 1000;
     let name_regex = "%7B__name__%3D~%22http_requests.%2A%22%7D";
@@ -1716,7 +1716,7 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
          semantics are adjudicated (#85/#89/#96, docs/api.md §3.3).\nstatements:\n{statements}"
     );
     assert_eq!(
-        statements_matching(&admin, db, &probe_96).await - probes_before,
+        statements_matching(&admin, db, probe_96).await - probes_before,
         1,
         "the degraded route must run exactly ONE bounded `SELECT DISTINCT metric_name … \
          match(metric_name, …) … LIMIT <cap + 1>` probe. Zero means the cache was treated as \
