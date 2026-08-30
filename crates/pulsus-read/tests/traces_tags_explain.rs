@@ -387,7 +387,7 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
     // scan" — the opportunistic exclusion is layout-dependent, not a
     // guarantee. Granule ratio + read_rows RECORDED (eprintln below). ----
     assert!(
-        baseline_rows >= ATTR_SCOPE_ROWS && baseline_rows <= ATTR_SCOPE_ROWS + GRANULE_ROWS,
+        (ATTR_SCOPE_ROWS..=ATTR_SCOPE_ROWS + GRANULE_ROWS).contains(&baseline_rows),
         "the unscoped tag-names read prunes to the attribute scopes: it must read their \
          rows and at most one granule more, never the whole catalog \
          (read {baseline_rows}, attribute half {ATTR_SCOPE_ROWS}, catalog {TOTAL_ROWS})"
