@@ -561,41 +561,6 @@ fn ingest_rootless(port: u16, spans: Vec<Span>, ctx: &str) {
     );
 }
 
-/// Drops `db` before the server is spawned, so a suite that asserts whole
-/// response bodies starts from an empty store.
-///
-/// `trace_spans` is a plain `MergeTree` with no de-duplication, and this
-/// file's throwaway databases are keyed on the suite name rather than the
-/// run — so a second run against the same ClickHouse would otherwise see
-/// every seeded span twice, and `matched` and the `spans` array of a
-/// byte-exact expected body would both move. The other tests in this file
-/// select by trace id instead and do not need this.
-async fn drop_database(db: &str) {
-    let config = pulsus_clickhouse::ChConnConfig {
-        server: std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
-        http_port: std::env::var("PULSUS_TEST_CH_HTTP_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(19123),
-        database: "default".to_string(),
-        proto: pulsus_clickhouse::ChProto::Http,
-        pool_size: 1,
-        query_timeout: Duration::from_secs(30),
-        ..pulsus_clickhouse::ChConnConfig::default()
-    };
-    let client = pulsus_clickhouse::ChClient::new(config)
-        .await
-        .expect("connect to ClickHouse to drop the throwaway database");
-    client
-        .execute(
-            &format!("DROP DATABASE IF EXISTS {db}"),
-            &pulsus_clickhouse::QuerySettings::new(),
-            pulsus_clickhouse::Idempotency::Idempotent,
-        )
-        .await
-        .expect("drop the throwaway database");
-}
-
 // ---------------------------------------------------------------------
 // Fetch-side assertion helpers.
 // ---------------------------------------------------------------------
@@ -1659,10 +1624,11 @@ async fn search_response_integers_stay_inside_their_wire_domain_on_the_wire() {
         return;
     }
 
-    let db = pulsus_testkit::test_db("pulsus_traces_wire_domain_it_live");
-    drop_database(&db).await;
     let port = WIRE_DOMAIN_PORT;
-    let _guard = spawn_ready(port, &db);
+    let _guard = spawn_ready(
+        port,
+        &pulsus_testkit::test_db("pulsus_traces_wire_domain_it_live"),
+    );
 
     // The file's fixture instant; window math below is in unix SECONDS.
     const START_NS: u64 = 3_100_000_000_000_000_200;
