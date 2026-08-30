@@ -1463,16 +1463,28 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     // `tables` entries begins `<db>.trace_`. Every object the traces
     // schema declares is under that prefix.
     //
-    // WHAT THAT COVERS, and why the coverage is exact rather than
-    // hopeful. Every tag-discovery read the server can issue is built by
-    // `tag_names_sql` or `tag_values_sql`
-    // (`crates/pulsus-read/src/traces/tags_sql.rs`). Both open with
-    // `FROM {CATALOG_TABLE}` against a PRIVATE module constant, and the
-    // only caller-supplied strings they accept land inside `WHERE`. So a
-    // builder-emitted query always names the table in a top-level `FROM`,
-    // and a top-level `FROM` on a real table always populates `tables` —
-    // which is why this predicate sees every read those two functions can
-    // produce, including one whose result is discarded.
+    // WHAT THAT COVERS. Every tag-discovery read the server can issue is
+    // built by `tag_names_sql` or `tag_values_sql`
+    // (`crates/pulsus-read/src/traces/tags_sql.rs`), and between them
+    // those two functions can emit exactly two SQL shapes:
+    // `SELECT DISTINCT scope, key FROM trace_tag_catalog …` and
+    // `SELECT DISTINCT val FROM trace_tag_catalog …`. The table name is a
+    // PRIVATE module constant and the only caller-supplied strings land
+    // inside `WHERE`, so neither shape's `FROM` can be anything else.
+    //
+    // **Those two shapes are OBSERVED to log that table**, which is the
+    // fact this predicate rests on. It is checked, not assumed, and in
+    // two places: the other test in this file asserts `tables` equals
+    // exactly `[<db>.trace_tag_catalog]` for every `SELECT DISTINCT`
+    // discovery row it produces, over both shapes; and step (3) below
+    // re-establishes it for the values shape on this run, which is why a
+    // control that fails to move the count aborts the gate.
+    //
+    // The claim is about THOSE TWO SHAPES and nothing wider. It is NOT
+    // that a top-level `FROM` on a real table always populates `tables` —
+    // that is false, and non-coverage item 1 below is a measured
+    // counterexample to it. Deriving this gate's reach from such a rule
+    // would claim more than the gate has.
     //
     // WHAT IT DOES NOT COVER — a DELIBERATE LIMIT, not an oversight, and
     // recorded here so the next reader finds a decision instead of
