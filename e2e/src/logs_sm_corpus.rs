@@ -23,6 +23,19 @@
 //! (`allow_structured_metadata: true`, `discover_log_levels: false`); the
 //! nightly lane is the permanent pin.
 //!
+//! **2026-08-30 (issue #483): the config that probe was pinned under has
+//! not moved, and the reason it has not has changed.** PulsusDB now
+//! synthesizes a `detected_level` structured-metadata pair on every
+//! log-ingest path by default, so the product no longer "deliberately does
+//! not synthesize" one. This harness still runs with the field off — and
+//! now off on BOTH sides, `PULSUS_DISCOVER_LOG_LEVELS: "false"` on the
+//! `pulsusdb` service in `deploy/e2e/compose.single.yaml` and
+//! `compose.cluster.yaml` — because the container pinned here implements an
+//! older, materially different level rule than the build the rule was
+//! captured against. The probe's provenance is therefore unchanged and
+//! still valid; see `deploy/e2e/loki.yaml` for the four differences and the
+//! three conditions for turning the setting on.
+//!
 //! **Three SM behaviors, in dedicated records:** (a) non-colliding SM keys
 //! (`trace_id`, `user_id`) fan verbatim into response stream labels; (b) a
 //! single-collision SM key (`env`, equal to a base label) surfaces as

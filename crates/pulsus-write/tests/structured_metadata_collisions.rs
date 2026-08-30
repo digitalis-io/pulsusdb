@@ -59,7 +59,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pulsus_write::parse_loki_json;
+use pulsus_write::{LevelDiscovery, parse_loki_json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -151,13 +151,30 @@ const ARTIFACT_REVISION: &str = "b318f282";
 
 /// Structured-metadata names the container ADDS at ingest — `ci/logql/
 /// config.yaml` leaves `discover_log_levels` at its shipped default, which
-/// appends `detected_level` to every entry. Elided from the derived
-/// expectation; the extractor asserts it is PRESENT in every captured entry
-/// (its absence would mean the response is not an ingest capture) and
-/// [`no_probe_name_collides_with_an_elided_ingest_label`] asserts no probe
-/// name can canonicalize onto it, so the elision cannot mask a real
-/// difference.
+/// appends `detected_level` to every entry.
+///
+/// **This list no longer filters the derived expectation** (issue #483).
+/// PulsusDB now appends the same pair, so the full stored string is
+/// comparable and [`the_stored_string_reproduces_the_reference_capture`]
+/// compares it — `"detected_level":"unknown"` included, which every probe
+/// line here answers. The list survives as the extractor's PRESENCE check
+/// (its absence would mean the response is not an ingest capture) and as
+/// what [`no_probe_name_collides_with_an_elided_ingest_label`] asserts no
+/// probe name canonicalizes onto, and it is still applied to the
+/// pre-fix-discrimination count — see
+/// [`the_table_discriminates_the_pre_fix_resolution`] for why that one
+/// comparison must stay on the collision-relevant subset.
 const ELIDED_SM_NAMES: &[&str] = &["detected_level"];
+
+/// Which comparison a derived expectation is for: the whole stored string,
+/// or the collision-relevant subset alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Elision {
+    /// Compare everything the reference stored, `detected_level` included.
+    None,
+    /// Drop the names the container adds at ingest.
+    IngestAdded,
+}
 
 #[derive(Serialize, Deserialize)]
 struct Artifact {
@@ -231,8 +248,8 @@ fn canonical_json(map: &BTreeMap<String, String>) -> String {
 /// The reference's structured metadata for one probe, DERIVED from its raw
 /// response: exactly one stream with exactly one entry echoing the probe's
 /// line, timestamped in wall-clock nanoseconds, carrying the ingest transport
-/// labels and the engine's execution-stats block, minus the elide list.
-fn reference_structured_metadata(sp: &SourceProbe, ap: &ArtifactProbe) -> String {
+/// labels and the engine's execution-stats block, filtered per `elision`.
+fn reference_structured_metadata(sp: &SourceProbe, ap: &ArtifactProbe, elision: Elision) -> String {
     let id = sp.id;
     assert_eq!(
         sp.readable,
@@ -326,7 +343,7 @@ fn reference_structured_metadata(sp: &SourceProbe, ap: &ArtifactProbe) -> String
     }
     let derived: BTreeMap<String, String> = sm
         .iter()
-        .filter(|(k, _)| !ELIDED_SM_NAMES.contains(&k.as_str()))
+        .filter(|(k, _)| elision == Elision::None || !ELIDED_SM_NAMES.contains(&k.as_str()))
         .map(|(k, v)| {
             (
                 k.clone(),
@@ -391,7 +408,11 @@ fn push_body(app: &str, sp: &SourceProbe, ts_ns: u128) -> String {
 /// wire body — not a direct call to the resolution function.
 fn stored(sp: &SourceProbe) -> String {
     let body = push_body("probe", sp, 1_700_000_000_000_000_000u128);
-    let out = parse_loki_json(body.as_bytes(), 0)
+    // Issue #483: level discovery ON, which is the product default and the
+    // configuration `ci/logql/config.yaml` leaves the reference container in
+    // — so the derived expectation and our stored string are compared on the
+    // same terms, `detected_level` included.
+    let out = parse_loki_json(body.as_bytes(), 0, LevelDiscovery::On)
         .unwrap_or_else(|e| panic!("{}: PulsusDB rejected the probe body: {e}", sp.id));
     assert_eq!(out.rows.len(), 1, "{}: expected one row", sp.id);
     out.rows[0].structured_metadata.clone()
@@ -473,7 +494,7 @@ fn the_stored_string_reproduces_the_reference_capture() {
         if sp.readable != Readable::Yes {
             continue;
         }
-        let expected = reference_structured_metadata(&sp, by_id[sp.id]);
+        let expected = reference_structured_metadata(&sp, by_id[sp.id], Elision::None);
         assert_eq!(stored(&sp), expected, "{}: from {:?}", sp.id, sp.sm);
     }
 }
@@ -501,8 +522,13 @@ fn the_row_the_reference_cannot_serve_is_stored_by_us_as_the_last_pair() {
         sp.id
     );
     // Our own side, asserted on our own side: the duplicate collapse keeps
-    // the last pair, which is the one the builder did not rewrite.
-    assert_eq!(stored(sp), format!(r#"{{"a_b":"p{R}"}}"#));
+    // the last pair, which is the one the builder did not rewrite. The
+    // `detected_level` pair beside it is the ingest-time level for the probe
+    // line `line` (issue #483) and is not part of this row's residual.
+    assert_eq!(
+        stored(sp),
+        format!(r#"{{"a_b":"p{R}","detected_level":"unknown"}}"#)
+    );
 }
 
 /// Non-vacuity, and honest about it: the table must contain rows the pre-fix
@@ -523,7 +549,12 @@ fn the_table_discriminates_the_pre_fix_resolution() {
         if sp.readable != Readable::Yes {
             continue;
         }
-        let expected = reference_structured_metadata(&sp, by_id[sp.id]);
+        // Issue #483 keeps this ONE comparison on the collision-relevant
+        // subset. `sp.was` is the pre-fix stored string, captured before
+        // ingest-time level detection existed; comparing it against a
+        // full expectation that now carries `detected_level` would make
+        // every row differ and the count vacuous.
+        let expected = reference_structured_metadata(&sp, by_id[sp.id], Elision::IngestAdded);
         if sp.was == expected {
             agree.push(sp.id);
         } else {
@@ -704,8 +735,8 @@ fn the_committed_capture_matches_the_live_reference() {
     for (ap, sp) in fresh.iter().zip(&sources) {
         match sp.readable {
             Readable::Yes => assert_eq!(
-                reference_structured_metadata(sp, ap),
-                reference_structured_metadata(sp, by_id[sp.id]),
+                reference_structured_metadata(sp, ap, Elision::None),
+                reference_structured_metadata(sp, by_id[sp.id], Elision::None),
                 "{}: the live reference answers differently than the committed capture — if \
                  the reference genuinely changed, regenerate with \
                  PULSUS_REGEN_SM_COLLISION_CAPTURE=1 against {ARTIFACT_IMAGE} and review the \

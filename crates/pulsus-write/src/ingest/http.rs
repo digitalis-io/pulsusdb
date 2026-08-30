@@ -58,6 +58,7 @@ use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
 use crate::ingest::traces::TraceSink;
 use crate::ingest::{Backpressure, LogSink};
+use crate::protocols::otlp_logs::LogIngestSettings;
 use crate::protocols::otlp_metrics::MetricIngestSettings;
 use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write, zipkin};
 
@@ -97,7 +98,12 @@ struct Status {
 /// size cap and its `OversizeBody -> 400/code=3` OTLP error mapping.
 /// `Body` bypasses `DefaultBodyLimit` entirely, so [`read_capped_body`]
 /// becomes the sole bound — no `DefaultBodyLimit::disable()` layer needed.
-pub async fn ingest(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Response {
+pub async fn ingest(
+    sink: &dyn LogSink,
+    headers: HeaderMap,
+    body: Body,
+    settings: LogIngestSettings,
+) -> Response {
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -114,7 +120,7 @@ pub async fn ingest(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Respo
     // maliciously deep body/attribute tree is a whole-request 400/`code = 3`
     // reject, the same classification a decode failure gets. `ingest` returns
     // `Response` (not `Result`), so this matches rather than `?`-propagates.
-    let mut parsed = match otlp_logs::parse(&request, now_ns) {
+    let mut parsed = match otlp_logs::parse(&request, now_ns, settings) {
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
@@ -177,7 +183,11 @@ pub async fn logs<S>(State(sink): State<Arc<S>>, headers: HeaderMap, body: Body)
 where
     S: LogSink + 'static,
 {
-    ingest(sink.as_ref(), headers, body).await
+    // This crate's own generic mount point carries no `Config`; it uses the
+    // defaults (level discovery on, the reference's own default), exactly as
+    // `metrics` below passes `MetricIngestSettings::default()`. The server
+    // threads the configured settings through `pulsus_write::ingest`.
+    ingest(sink.as_ref(), headers, body, LogIngestSettings::default()).await
 }
 
 /// `POST /v1/metrics` (issue #27): the metrics analog of [`ingest`] —
@@ -395,7 +405,12 @@ pub async fn ingest_remote_write(
 /// `pkg/distributor/distributor.go:579-581 @ v3.7.4`) and PulsusDB-contract
 /// where it does not (202 async, 429 backpressure) — see the issue #77 v2
 /// response matrix.
-pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Response {
+pub async fn ingest_loki_push(
+    sink: &dyn LogSink,
+    headers: HeaderMap,
+    body: Body,
+    settings: LogIngestSettings,
+) -> Response {
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -406,7 +421,7 @@ pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body
         Err(err) => return loki_error_response(&err),
     };
 
-    let mut parsed = match decode_loki_push(&headers, &body, now_ns) {
+    let mut parsed = match decode_loki_push(&headers, &body, now_ns, settings) {
         Ok(parsed) => parsed,
         Err(err) => return loki_error_response(&err),
     };
@@ -578,15 +593,16 @@ fn decode_loki_push(
     headers: &HeaderMap,
     body: &[u8],
     now_ns: i64,
+    settings: LogIngestSettings,
 ) -> Result<otlp_logs::ParsedLogs, LogsIngestError> {
     if is_json_content_type(headers) {
         let encoding = content_encoding(headers)?;
         let decompressed = decompress::decompress(encoding, body)?;
-        loki_push::parse_json(&decompressed, now_ns)
+        loki_push::parse_json(&decompressed, now_ns, settings.discovery())
     } else {
         let decompressed = decompress::decompress(Encoding::Snappy, body)?;
         let request = loki_push::decode_protobuf(&decompressed)?;
-        loki_push::parse_protobuf(&request, now_ns)
+        loki_push::parse_protobuf(&request, now_ns, settings.discovery())
     }
 }
 
@@ -2846,7 +2862,18 @@ mod tests {
                 HeaderValue::from_str(value).unwrap(),
             );
         }
-        ingest_loki_push(sink, header_map, Body::from(body)).await
+        // Issue #483: discovery OFF — this module's assertions are about
+        // response codes and admission, and the stored strings its mock sink
+        // records predate ingest-time level detection.
+        ingest_loki_push(
+            sink,
+            header_map,
+            Body::from(body),
+            LogIngestSettings {
+                discover_log_levels: false,
+            },
+        )
+        .await
     }
 
     #[tokio::test]
