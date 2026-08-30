@@ -39,6 +39,7 @@
 mod assemble;
 mod compat;
 mod error;
+mod fetch_v2;
 mod graph;
 mod handlers;
 mod legacy;
@@ -82,13 +83,16 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/traces/v1/service_graph", get(graph::service_graph))
 }
 
-/// The Tempo-compat alias surface (docs/api.md §8.1, issue #61) — 13
+/// The Tempo-compat alias surface (docs/api.md §8.1, issue #61) — 14
 /// `GET` routes, all literal paths (so the #36 drift guard extracts them
 /// directly; no mount helper, no pinning needed). Eight are pure route
 /// bindings onto the native handlers (byte-identical responses by
 /// construction — same fn, same plan); the four tag-discovery aliases
 /// reshape to Tempo's v1 flat / v2 (no `truncated`) wire shapes
-/// (`compat.rs`); `/api/echo` is a constant. Mounting this router at all
+/// (`compat.rs`); `/api/echo` is a constant. The fourteenth,
+/// `/api/v2/traces/{traceId}` (issue #474), carries its own envelope
+/// (`fetch_v2.rs`) and answers `200` with an empty trace where its v1
+/// twin answers `404`. Mounting this router at all
 /// is `crate::compat::apply_aliases`'s job (flag + Reader-mode gated);
 /// this fn just builds the route set. The alias `/api/traces/{traceId}`
 /// coexists with native `/api/traces/v1/...`: the literal `v1` segment
@@ -101,6 +105,7 @@ pub(crate) fn compat_router() -> Router<AppState> {
             get(handlers::trace_by_id_json),
         )
         .route("/tempo/api/traces/{traceId}", get(handlers::trace_by_id))
+        .route("/api/v2/traces/{traceId}", get(handlers::trace_by_id_v2))
         .route("/api/search", get(search::search))
         .route("/api/search/tags", get(compat::tags_v1))
         .route("/api/search/tag/{tag}/values", get(compat::tag_values_v1))

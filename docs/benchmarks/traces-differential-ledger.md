@@ -1120,3 +1120,73 @@ when we are asking it to slow down, so we keep `429`; recorded as
   cannot reach this response — but `{ traceDuration > 1h }` would
   evaluate a negative width for a trace whose end overflows. Different
   surface, different rule; noted so the next person on that code finds it.
+
+### `traces-v2-fetch-metrics-not-populated` (issue #474)
+
+- **What:** `GET /api/v2/traces/{traceId}` returns an envelope whose
+  field 2 (`metrics`) PulsusDB always emits present and at its default,
+  encoding as the two bytes `12 00`. The reference populates it with a
+  byte counter. Measured on the CI-pinned oracle
+  (`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad5870
+  0aa96880653c3d8f7`, the digest at `.github/workflows/ci.yml:648`),
+  booted on this repository's own `ci/tempo/tempo-compare.yaml`.
+
+- **Why this is an exclusion and not a frozen value.** The reference's
+  own number is not stable, and — this is the part that matters — it does
+  not vary per request either. It moves in **plateaus**: several adjacent
+  fetches of the same trace, with no ingest in between, return the
+  identical value, and a later fetch returns a different one. Values
+  observed across three machines and three runs, all on the same single
+  trace: `1204089baf03`, `120408b2de01` (twice, on two machines),
+  `120408c8f906`, `120408acb60a`, `120408969b05`, `120408e4bc03`.
+  **Two adjacent fetches agreeing therefore proves nothing about
+  stability** — a check that sampled the value twice and saw agreement
+  would have concluded, wrongly, that it could be frozen. The plateau, not
+  the spread, is why the field is excluded from comparison rather than
+  pinned.
+
+- **What a consumer sees.** The Grafana Tempo datasource reads this block
+  only to report bytes inspected for a trace fetch; PulsusDB has no
+  equivalent read-accounting to report, so the number is zero rather than
+  wrong. The block is **present and empty**, never absent — the
+  datasource dereferences it without a nil check, which is the whole
+  subject of issue #474.
+
+- **How it is gated.** Every v2 comparison in the suite compares field 1
+  (the trace) byte-for-byte and asserts our field 2 is exactly `12 00`;
+  the reference's field 2 is **never** compared.
+  `crates/pulsus-server/tests/trace_nullable_wire_differential.rs`
+  (`the_committed_capture_matches_the_live_reference`) parses field 1 out
+  of the reference's envelope and drops the rest;
+  `crates/pulsus-server/tests/traces_api_live.rs`
+  (`absent_submessages_are_materialized_present_and_empty_on_the_wire`)
+  asserts our own whole body, tail included.
+
+- **Precedent.** `traceql-search-metrics-completed-jobs` above already
+  omits the same class of counter on the search surface, for the same
+  reason.
+
+### `traces-v2-fetch-get-only` (issue #474)
+
+- **What:** `POST /api/v2/traces/{traceId}` is `405` with
+  `Allow: GET,HEAD` for PulsusDB. The reference answers `200` with the
+  same envelope a `GET` returns — measured on the same pinned oracle:
+  `POST /api/v2/traces/<absent id>` → `200`, `Content-Length: 25`, body
+  `{"trace":{},"metrics":{}}`. Its v1 twin, by contrast, answers `404` for
+  the same `POST`, so the reference routes the verb on both routes and the
+  difference between them is only the empty-trace status.
+
+- **Why we do not match it.** The whole Tempo-compat alias surface is
+  `GET`-only, and `api_conformance` already pins `405 Allow: GET,HEAD` on
+  the v1 twin. Matching the reference here would make one route of
+  fourteen answer a verb its thirteen siblings refuse, for no consumer:
+  the datasource issues `GET` on trace-by-ID, and no named client sends
+  `POST` to this path.
+
+- **What a consumer sees.** Nothing, unless it sends a verb no known
+  client sends. A caller that did would get `405` with an `Allow` header
+  naming the verbs that work, rather than a body.
+
+- **How it is gated.** `crates/pulsus-server/tests/api_conformance.rs`,
+  `assert_traces_fetch_v2_route`'s `undocumented-method-405` cell, which
+  also asserts the router-generated `405` carries no `Vary: accept`.

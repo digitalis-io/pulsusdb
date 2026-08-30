@@ -5,6 +5,11 @@
 //! (`negotiate.rs`; the `/json` route forces JSON before `Accept` is ever
 //! consulted) → encode. Thin by design — SQL/execution stays in
 //! `pulsus-read`, OTLP assembly in `assemble.rs`.
+//!
+//! [`trace_by_id_v2`] (issue #474) serves the `/api/v2/traces/{traceId}`
+//! compat alias through the same steps, wrapping the result in
+//! `fetch_v2.rs`'s envelope and answering `200` with an empty trace where
+//! the v1 handlers answer `404`.
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -15,8 +20,9 @@ use pulsus_read::TraceEngine;
 use crate::app::AppState;
 use crate::chconfig;
 
-use super::assemble::{self, AssembleError};
+use super::assemble::{self, AssembleError, AssembledTrace};
 use super::error::ApiError;
+use super::fetch_v2;
 use super::negotiate::{self, Wants};
 use super::params;
 
@@ -85,7 +91,7 @@ async fn trace_by_id_impl(
     if spans.is_empty() {
         return Err(ApiError::NotFound);
     }
-    let data = assemble::assemble(spans)?;
+    let data = AssembledTrace::from_stored(spans)?;
     let wants = match negotiate_headers {
         None => Wants::Json,
         // `negotiate_from_headers` combines every repeated `Accept` field
@@ -102,6 +108,59 @@ async fn trace_by_id_impl(
         // convention), deliberately asymmetric with ingest's
         // `application/x-protobuf` — docs/api.md §4.1.
         Wants::Protobuf => ("application/protobuf", assemble::encode_protobuf(&data)),
+    };
+    Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response())
+}
+
+/// `GET /api/v2/traces/{traceId}` (issue #474) — the fourteenth compat
+/// alias. Same order of operations as [`trace_by_id_impl`] (pool, then id
+/// parse, then fetch) so error precedence matches the v1 alias exactly;
+/// same `negotiate.rs`; same `Vary: accept` on every response the handler
+/// returns. The ONE difference: an empty fetch is `200` with
+/// [`AssembledTrace::empty`], never `404` — the client dereferences the
+/// envelope's `trace` field without a nil check, and a `404` here is what
+/// made a trace outside the queried time range render as a raw HTTP error
+/// string instead of a sentence about the range.
+///
+/// Query parameters are accepted and ignored, exactly as the v1 fetch
+/// route ignores them: our point read has no time bound, so ignoring
+/// `start`/`end` returns a superset, never a wrong answer.
+pub(crate) async fn trace_by_id_v2(
+    State(state): State<AppState>,
+    Path(trace_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let mut res = match trace_by_id_v2_impl(state, &trace_id, &headers).await {
+        Ok(res) => res,
+        Err(e) => e.into_response(),
+    };
+    res.headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("accept"));
+    res
+}
+
+async fn trace_by_id_v2_impl(
+    state: AppState,
+    raw_trace_id: &str,
+    negotiate_headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let engine = engine_for(&state).await?;
+    let hex32 = params::parse_trace_id(raw_trace_id)?;
+    let spans = engine.fetch_by_id(&hex32).await?;
+    // The empty case is the whole reason this route exists: a present,
+    // empty trace, not a 404.
+    let trace = if spans.is_empty() {
+        AssembledTrace::empty()
+    } else {
+        AssembledTrace::from_stored(spans)?
+    };
+    let wants = negotiate::negotiate_from_headers(negotiate_headers)?;
+    let (content_type, body) = match wants {
+        Wants::Json => (
+            "application/json",
+            fetch_v2::encode_json(&trace).map_err(AssembleError::from)?,
+        ),
+        Wants::Protobuf => ("application/protobuf", fetch_v2::encode_protobuf(&trace)),
     };
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response())
 }
