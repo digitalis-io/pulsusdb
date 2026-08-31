@@ -25,10 +25,13 @@
 //!   client that percent-encodes the same bytes is served: `q=%80` and
 //!   `q=` + `%80` × 4096 both answer `200`. So this rejects a malformed
 //!   request line, not a `q` value.
-//! * **an enormous `q`**: measured, 65,493 bytes answers `200` and 65,494
-//!   is `414` (the 64 KiB request-target bound); from 524,195 it is `431`
-//!   (the header budget). Note that the first of those is TIGHTER than
-//!   the §4.2 search surface's own 128 KiB expression cap
+//! * **an enormous `q`**: measured by bisection, 65,493 bytes answers
+//!   `200` and 65,494 is refused — the 64 KiB request-target bound. The
+//!   LENGTH is the stable part; the refusal's status is `414` or `431`
+//!   depending on how the request bytes arrive, and both were observed
+//!   for the SAME 524,194-byte request on two machines (`414` here,
+//!   `431` in CI). Note the bound is TIGHTER than the §4.2 search
+//!   surface's own 128 KiB expression cap
 //!   (`traces_api::querytext::MAX_QUERY_EXPRESSION_BYTES`), so on this
 //!   route the transport bound is what a client meets first.
 //!

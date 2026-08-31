@@ -596,26 +596,41 @@ async fn the_q_tolerance_stops_at_input_that_is_not_well_formed() {
         assert_eq!(res.status, 200, "{ctx} x4096: body {}", res.text());
     }
 
-    // (4) An enormous `q`. The boundaries are exact and were bisected on
-    //     this tree: the last `200` is 65,493 bytes and 65,494 is `414`
-    //     (the 64 KiB request-target bound); `431` begins at 524,195 (the
-    //     header budget). Asserted as the pair either side of each
-    //     boundary, so a change that moved a limit reddens here rather
-    //     than surfacing as a client's mystery failure.
+    // (4) An enormous `q` is rejected, and the LENGTH boundary is the
+    //     stable part. Bisected on this tree: 65,493 bytes is the last
+    //     `200` and 65,494 is the first rejection — the 64 KiB
+    //     request-target bound.
+    //
+    //     **The rejection's STATUS CODE is not asserted exactly, and
+    //     that is a correction rather than a hedge.** An earlier revision
+    //     pinned `414` up to 524,194 and `431` from 524,195, bisected
+    //     locally. CI answered `431` at 524,194 — same length, same
+    //     binary, different machine. Which of the two the transport
+    //     chooses depends on how the request bytes arrive, not on
+    //     anything this change controls, so pinning it asserted a
+    //     property of a machine. What IS the contract, and is asserted:
+    //     past the bound the request is refused by the transport with one
+    //     of those two statuses — never served `200`, and never the
+    //     handler's `400`, which would mean `q` had been read and
+    //     rejected on its content.
     let route = VALUES_ROUTES[1];
-    for (len, want) in [
-        (16_384usize, 200u16),
-        (65_493, 200),
-        (65_494, 414),
-        (524_194, 414),
-        (524_195, 431),
-    ] {
+    for len in [16_384usize, 65_493] {
         let target = format!("{route}?q={}", "a".repeat(len)).into_bytes();
         let ctx = format!("q of {len} bytes on {route}");
         assert_eq!(
             raw_target_status(port, &target, &ctx),
-            want,
-            "{ctx}: the transport bound moved"
+            200,
+            "{ctx}: inside the request-target bound, so it must be served"
+        );
+    }
+    for len in [65_494usize, 524_194, 1_048_576] {
+        let target = format!("{route}?q={}", "a".repeat(len)).into_bytes();
+        let ctx = format!("q of {len} bytes on {route}");
+        let status = raw_target_status(port, &target, &ctx);
+        assert!(
+            status == 414 || status == 431,
+            "{ctx}: past the request-target bound this must be a transport refusal \
+             (414 or 431), got {status}"
         );
     }
 

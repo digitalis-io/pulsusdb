@@ -33,8 +33,9 @@
 //!   that layer by the HTTP transport, both avoidable and both measured:
 //!   raw invalid UTF-8 in the request target is `400` (the same bytes
 //!   percent-encoded are served `200`), and a `q` past the 64 KiB
-//!   request-target bound is `414`, past the header budget `431`. That
-//!   module's doc carries the measured boundaries.
+//!   request-target bound is refused by the transport with `414` or
+//!   `431`. That module's doc carries the measured length boundary and
+//!   why the status itself is not pinned.
 
 use axum::Json;
 use axum::extract::{Path, RawQuery, State};
