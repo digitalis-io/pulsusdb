@@ -63,6 +63,7 @@ reader:
   logql_pipeline_scan_factor: 10
   traceql_max_candidates: 100000
   traceql_scan_budget_rows: 50000000
+  traceql_tag_lookback: 24h
 
 downsampling:
   enabled: false
@@ -101,4 +102,31 @@ fn golden_yaml_from_configuration_md_section_9_parses_and_matches_defaults() {
 
     let _ = std::fs::remove_file(&path);
     support::clear_all();
+}
+
+/// Issue #478, criterion 20: the documented §9 block carries the tag
+/// lookback key.
+///
+/// **Why a separate presence test at all.** The test above asserts
+/// `cfg == Config::default()`, which an OMITTED key satisfies — it simply
+/// takes its default — so nothing there would notice the line missing
+/// from the documented block. A value assertion does not help for the
+/// same reason. This is a presence claim about one named key in one named
+/// block, which is the whole property; the general question of how far
+/// `GOLDEN_YAML` has drifted from the model is issue #506's and is not
+/// claimed here.
+#[test]
+fn the_documented_block_carries_the_tag_lookback_key() {
+    let doc: serde_norway::Value =
+        serde_norway::from_str(GOLDEN_YAML).expect("§9's YAML must parse");
+    let reader = doc
+        .get("reader")
+        .and_then(|r| r.as_mapping())
+        .expect("§9 has a reader block");
+    assert!(
+        reader
+            .keys()
+            .any(|k| k.as_str() == Some("traceql_tag_lookback")),
+        "docs/configuration.md §9's reader block must document traceql_tag_lookback"
+    );
 }

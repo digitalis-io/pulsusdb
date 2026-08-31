@@ -761,6 +761,49 @@ jobs:
           PULSUSDB_NULLABLE_WIRE_OTLP_URL: "http://localhost:4318"
         run: cargo test -p pulsus-server --test trace_nullable_wire_differential
 
+      # Issue #478: the tag-values oracle leg. TWO fresh reference
+      # containers, and the reason is measured rather than a preference:
+      # on this pinned build the tag-value time filtering is
+      # BLOCK-granular, not span-granular — two corpora pushed 120 s apart
+      # were both returned by a window covering only the later one — so a
+      # window cannot separate two corpora inside one instance. The
+      # #476 sections therefore replay against their own container, with
+      # their own corpus, exactly as they were captured; this plan's
+      # sections replay against the other in the order they were captured.
+      # Neither may be the shared `pulsus-tempo-diff` above, which by this
+      # point in the job holds several other suites' spans. Needs no
+      # ClickHouse. FAIL-CLOSED: all four endpoint gates panic if this env
+      # block is dropped (the #320 class).
+      - name: Start Tempo v3.0.2 (tag-values oracle, two instances)
+        run: |
+          start_one() {
+            docker run -d --name "$1" -p "$2":3200 -p "$3":4318 \
+              -v "$GITHUB_WORKSPACE"/ci/tempo/tempo-compare.yaml:/etc/tempo/tempo.yaml:ro \
+              grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7 \
+              -config.file=/etc/tempo/tempo.yaml
+          }
+          start_one pulsus-tempo-478a 13478 14478
+          start_one pulsus-tempo-478b 13479 14479
+          for port in 13478 13479; do
+            for _ in $(seq 1 40); do
+              [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:$port/ready)" = "200" ] && break
+              sleep 1
+            done
+            curl -sf "http://localhost:$port/ready"
+          done
+
+      - name: Tag-values reference capture (oracle leg)
+        env:
+          PULSUSDB_TAG_VALUES_DIFF_URL: "http://localhost:13478"
+          PULSUSDB_TAG_VALUES_OTLP_URL: "http://localhost:14478"
+          PULSUSDB_TAG_VALUES_476_DIFF_URL: "http://localhost:13479"
+          PULSUSDB_TAG_VALUES_476_OTLP_URL: "http://localhost:14479"
+        run: cargo test -p pulsus-server --test trace_tag_values_differential
+
+      - name: Stop Tempo tag-values oracles
+        if: always()
+        run: docker rm -f pulsus-tempo-478a pulsus-tempo-478b || true
+
       - name: Stop Tempo differential oracle
         if: always()
         run: docker rm -f pulsus-tempo-diff || true
@@ -1696,6 +1739,23 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run traces_tags_live -p pulsus-server --test traces_tags_live
+
+      # Issue #478: our leg of the tag-values narrowing surface. Spawns
+      # the real `pulsusdb` binary and issues every case in
+      # `crates/pulsus-server/tests/fixtures/reference-tag-values.json`
+      # against it — the whole `q` matrix with exact ordered value lists,
+      # the seven range faults with their exact bodies on the values
+      # routes, the two accepting range shapes, the span-name typing
+      # corpus including the over-cap name, and the occupied-day /
+      # empty-day pair with a query_log assertion that the span read
+      # really ran. The reference's half of the same fixture is replayed
+      # by the oracle leg in the differential job. Reuses this job's
+      # ClickHouse 26.3 container.
+      - name: Live tag-values narrowing suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run traces_tag_values_narrow_live -p pulsus-server --test traces_tag_values_narrow_live
 
       # Issue #59 AC3 (Tier 1, scale-invariant): EXPLAIN/query_log gates
       # on the real TraceQL metrics pushdown — service PREWHERE hoist ->

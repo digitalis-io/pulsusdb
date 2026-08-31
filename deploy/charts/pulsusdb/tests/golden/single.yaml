@@ -63,6 +63,7 @@ data:
       promql_max_samples: 50000000
       series_activity_bucket: 1h
       traceql_max_candidates: 100000
+      traceql_tag_lookback: 24h
     retention_days: 7
     rotation_interval: 1h
     ruler:
@@ -212,7 +213,7 @@ spec:
         app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/component: all
       annotations:
-        checksum/config: 74d397ebd3a0b8ebf8be502327e459323de11b294c37e86dd1d534b418f1267d
+        checksum/config: 53a8825b3f30ef88ab0341afdb1ebbb5b67263cee407c32d83cb80b245f8a02a
         checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
     spec:
       serviceAccountName: pulsusdb

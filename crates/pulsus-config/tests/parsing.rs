@@ -56,6 +56,7 @@ reader:
   promql_max_metric_fanout: 123
   logql_scan_budget_bytes: 10GiB
   traceql_max_candidates: 5000
+  traceql_tag_lookback: 3h
 
 downsampling:
   enabled: true
@@ -147,6 +148,10 @@ fn full_fixture_round_trips_into_typed_values() {
     // which a field-level `#[serde(default)]` would have produced.
     assert_eq!(cfg.reader.logql_pipeline_scan_factor, 10);
     assert_eq!(cfg.reader.traceql_max_candidates, 5_000);
+    assert_eq!(
+        cfg.reader.traceql_tag_lookback.0,
+        Duration::from_secs(3 * 3_600)
+    );
 
     assert!(cfg.downsampling.enabled);
     assert_eq!(

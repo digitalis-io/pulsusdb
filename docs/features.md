@@ -124,7 +124,7 @@ it introduces.
 |---------|----------|-----------|
 | Trace by ID | `GET /api/traces/v1/trace/{traceId}` (+ `/json`) | M4 |
 | Search | `GET /api/traces/v1/search` (TraceQL `q` + legacy tag params) | M4 |
-| Tag names / values | `GET /api/traces/v1/tags`, `/tag/{tag}/values` | M4 |
+| Tag names / values | `GET /api/traces/v1/tags`, `/tag/{tag}/values` (values narrow by `q`; `name` is served from the span table) | M4 |
 | TraceQL metrics — range | `GET /api/traces/v1/metrics/query_range` (`q`, `start`/`end`/`since`, `step`) | M4 |
 | TraceQL metrics — instant | `GET /api/traces/v1/metrics/query` | M4 |
 | Compat query aliases (trace-datasource surface) | flag-gated | M4 |

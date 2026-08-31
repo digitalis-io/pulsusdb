@@ -674,8 +674,21 @@ async fn tag_discovery_against_real_clickhouse() {
         "{ctx}: body {json}"
     );
 
-    // -- Δ1: a NON-TRIVIAL q is accepted and ignored — the seeded
-    // superset equivalence (same full set as no q), never a 400. ---------
+    // -- A `q` that contributes NO pushable term leaves the read exactly
+    // as it was: the same full set, off the same catalog query, never a
+    // 400.
+    //
+    // **This case was re-expressed by issue #478**, and the reason is the
+    // point of it. It used to send `q={span.x="y"}` and assert the same
+    // answer as no `q` at all, because `q` was accept-and-ignore. That
+    // `q` now NARROWS — it is a well-formed attribute condition — so the
+    // old assertion would be asserting the defect this issue removed.
+    // What survives is the half that is still true and still load-
+    // bearing: a `q` the lowering cannot use (a half-typed prefix, and
+    // the empty filter the Search tab's own generators emit) widens to
+    // the unnarrowed answer rather than erroring, and stays on the
+    // catalog read. The NARROWED answers are asserted in
+    // `traces_tag_values_narrow_live.rs`, against the reference capture.
     let ctx = "values q superset";
     let no_q = get_json(
         port,
@@ -683,21 +696,22 @@ async fn tag_discovery_against_real_clickhouse() {
         ctx,
         &mut discovered,
     );
-    let with_q = get_json(
-        port,
-        &format!(
-            "{}?q=%7Bspan.x%3D%22y%22%7D&start=1&end=2",
-            values_url("resource.service.name")
-        ),
-        ctx,
-        &mut discovered,
-    );
-    assert_eq!(
-        values_of(&with_q, ctx),
-        values_of(&no_q, ctx),
-        "{ctx}: q cannot be evaluated against the catalog — the result is the same \
-         (superset) set, body {with_q}"
-    );
+    for raw_q in ["%7B%7D", "%7Bspan.http.status_code%3D", "garbage"] {
+        let with_q = get_json(
+            port,
+            &format!(
+                "{}?q={raw_q}&start=1&end=2",
+                values_url("resource.service.name")
+            ),
+            ctx,
+            &mut discovered,
+        );
+        assert_eq!(
+            values_of(&with_q, ctx),
+            values_of(&no_q, ctx),
+            "{ctx}: q={raw_q} contributes no term, so the read is unchanged — body {with_q}"
+        );
+    }
 
     // -- Δ3: the over-cap key truncates non-silently: exactly the cap,
     // ordered, deduped, truncated=true. -----------------------------------
@@ -928,6 +942,20 @@ async fn tag_discovery_against_real_clickhouse() {
     //     any SQL shape whatsoever — touched trace_spans or
     //     trace_attrs_idx (this test never calls search/fetch, so any
     //     hit is a discovery regression by construction).
+    //
+    // **The SUBJECT of both layers is named, not implied** (issue #478).
+    // This test issues exactly two of the six §4.3 request classes: the
+    // tag-NAMES reads (native, v2 and v1 flat) and the attribute-VALUES
+    // read with no narrowing `q`. Those are the classes for which
+    // catalog-only is still the whole truth, and the ban is kept in full
+    // strength for them rather than loosened to accommodate the two
+    // store-backed classes this issue adds. The four remaining classes —
+    // span-name values, and either values shape narrowed by `q` — read
+    // the span tables by design and are asserted with their OWN exact
+    // `tables` arrays in `six_request_classes_read_exactly_these_tables`
+    // below. A gate rewritten as "reads at most these tables" would have
+    // passed a read that silently reverted to the catalog, which is
+    // precisely the regression this ban protects against.
     let admin = ChClient::new(ch_config()).await.expect("connect admin");
     admin
         .execute(
@@ -1266,7 +1294,22 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
     drop_db(db).await;
     let _guard = spawn_ready(port, db);
 
-    ingest_colliding_corpus(port, 1_700_000_000_000_000_000);
+    // **Clock-derived, and it must stay that way** (issue #478). Since
+    // `name` is served from `trace_spans`, this corpus's SPAN rows are
+    // read, not only its catalog rows — and the span tables carry a
+    // retention TTL with `ttl_only_drop_parts = 1` where the catalog
+    // carries none. A literal timestamp older than retention would leave
+    // every catalog assertion below green while the span-name re-gate
+    // silently answered nothing, with no grace window: an entirely
+    // expired part is dropped at insert time.
+    let colliding_base_ns = {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        u64::try_from(now).expect("fits u64") - 30_000_000_000
+    };
+    ingest_colliding_corpus(port, colliding_base_ns);
 
     let admin = ChClient::new(ch_config()).await.expect("connect admin");
 
@@ -1621,12 +1664,19 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
         kind_values,
         "{ctx}: the path extractor percent-decodes before the resolver sees it"
     );
-    // B6-B9: the open-valued intrinsics answer EMPTY rather than falling
-    // through to the catalog. `name` is the one that used to return span
-    // EVENT names; `link:spanID` is one character from `link.spanID`,
-    // which answers `from-attribute` above.
+    // B7-B9: the open-valued intrinsics that STILL answer EMPTY rather
+    // than falling through to the catalog. `link:spanID` is one
+    // character from `link.spanID`, which answers `from-attribute` above.
+    //
+    // **`name` is deliberately absent from this list** (issue #478), and
+    // it is absent BY NAME rather than by a loosened predicate: it is
+    // now served from `trace_spans`, so it reads a trace table and
+    // cannot sit inside the zero-delta window. It is re-gated below,
+    // after the window closes, against the same colliding corpus —
+    // because a change that moves where the names come from is exactly
+    // the change that could bring the #475 defect back, and the old gate
+    // would no longer be watching the same thing.
     for (ctx, path) in [
-        ("B6 name values", "/api/v2/search/tag/name/values"),
         (
             "B7 link:spanID values",
             "/api/v2/search/tag/link:spanID/values",
@@ -1693,6 +1743,88 @@ async fn intrinsic_discovery_answers_from_the_vocabulary_and_reads_no_trace_tabl
         "a static tag-discovery answer must read no trace table; the window moved the count \
          from {b1} to {a1}. Rows: {:#?}",
         trace_read_rows(&admin, db).await
+    );
+
+    // =================================================================
+    // Issue #478: the #475 event-name collision, RE-GATED on the same
+    // colliding corpus rather than assumed dead.
+    //
+    // This corpus is built so a right and a wrong implementation give
+    // DIFFERENT bytes. `trace_spans.name` holds three span names —
+    // `checkout`, `exception`, `payment` — while the catalog holds one
+    // `event:intrinsic`/`name` row, `exception`, from the span EVENT. So:
+    //
+    //   * the old defect (a bare `name` answering out of the catalog's
+    //     reserved intrinsic rows) returns exactly `["exception"]`;
+    //   * an answer from `trace_spans` returns all three.
+    //
+    // The new read is structurally immune — that column holds span names
+    // and nothing else — and this is the check that the claim is true
+    // rather than argued.
+    // =================================================================
+    let ctx = "a bare `name` lookup answers the SPAN names, not the span EVENT name";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/name/values", ctx),
+        serde_json::json!({"tagValues": [
+            {"type": "string", "value": "checkout"},
+            {"type": "string", "value": "exception"},
+            {"type": "string", "value": "payment"},
+        ]}),
+        "{ctx}: an answer of exactly [\"exception\"] is the #475 defect returning"
+    );
+    let ctx = "the colon-scoped spelling resolves to the same intrinsic";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/span%3Aname/values", ctx),
+        serde_json::json!({"tagValues": [
+            {"type": "string", "value": "checkout"},
+            {"type": "string", "value": "exception"},
+            {"type": "string", "value": "payment"},
+        ]}),
+        "{ctx}"
+    );
+    let ctx = "the native twin carries `truncated`";
+    assert_eq!(
+        get_ok_json(port, "/api/traces/v1/tag/name/values", ctx),
+        serde_json::json!({"tagValues": [
+            {"type": "string", "value": "checkout"},
+            {"type": "string", "value": "exception"},
+            {"type": "string", "value": "payment"},
+        ], "truncated": false}),
+        "{ctx}"
+    );
+    // `span.name` is still the ATTRIBUTE keyed `name`, and `.name` and
+    // `resource.name` reach the same row — the resolution order issue
+    // #475 pinned, unchanged by the intrinsic moving to the store.
+    let resource_name = serde_json::json!({"tagValues": [
+        {"type": "string", "value": "resource-name-attr"}
+    ]});
+    for (ctx, path) in [
+        (
+            "an unscoped dot form is the attribute",
+            "/api/v2/search/tag/.name/values",
+        ),
+        (
+            "the resource-scoped form is the attribute",
+            "/api/v2/search/tag/resource.name/values",
+        ),
+    ] {
+        assert_eq!(get_ok_json(port, path, ctx), resource_name, "{ctx}");
+    }
+    let ctx = "the span-scoped attribute form finds no `span`-scoped `name` row";
+    assert_eq!(
+        get_ok_json(port, "/api/v2/search/tag/span.name/values", ctx),
+        serde_json::json!({"tagValues": []}),
+        "{ctx}: the corpus keys `name` under `resource`, so this is empty rather than \
+         the intrinsic's answer"
+    );
+    // The v1 flat route keeps its attribute-only reading: `name` there is
+    // the attribute, never the intrinsic (ledger
+    // `traceql-v1-tag-values-statics-unimplemented`).
+    let ctx = "the v1 flat route answers `name` from the catalog";
+    assert_eq!(
+        get_ok_json(port, "/api/search/tag/name/values", ctx),
+        serde_json::json!({"tagValues": ["resource-name-attr"]}),
+        "{ctx}"
     );
 
     drop_db(db).await;
@@ -1862,13 +1994,20 @@ async fn the_default_trace_memory_ceiling_does_not_refuse_a_catalog_read() {
 
 /// The reference bodies this suite is measured against, captured from a
 /// pinned reference build and committed verbatim (see the file's own
-/// `_provenance` block for the image, the config, the corpus and the
+/// `_provenance` block for the image, the config, the corpora and the
 /// exact requests). Read here rather than re-derived from our own code:
 /// nothing in this file may compare our output against our own
 /// production function.
+///
+/// **One file, not one per issue** (issue #478). It carries this suite's
+/// sections and issue #478's, from the same reference build; two
+/// artifacts describing the same behaviour drift, and the drift is
+/// invisible until something else exposes it. `trace_tag_values_differential.rs`
+/// replays EVERY section against the pinned reference, whichever issue
+/// captured it, which is what stops any of them going stale.
 fn reference_capture() -> serde_json::Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/476-reference-tag-values.json");
+        .join("tests/fixtures/reference-tag-values.json");
     let raw =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&raw)
@@ -2561,6 +2700,217 @@ async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_tr
         "the sorting key must APPEND val_type — without it the ReplacingMergeTree collapses \
          a string and an int sharing the same text"
     );
+
+    drop_db(db).await;
+}
+
+// =====================================================================
+// Issue #478, criterion 4: every store-backed shape reads EXACTLY the
+// tables it should, and issues exactly one Select per request.
+//
+// **Why one test and not six.** The six request classes are asserted in
+// ONE run against ONE database, so the assertions can see each other: two
+// of them expect disjoint `tables` arrays for reads that share a handler,
+// and an implementation that sent everything to one storage layer fails
+// one half or the other. Split into six tests, each would pass against a
+// server that answered every class the same way.
+//
+// The arrays are EQUALITIES, per class. An "at most these tables"
+// predicate would pass for a narrowed read that silently reverted to the
+// catalog — the regression this is here to catch.
+// =====================================================================
+
+/// The four SQL shapes the §4.3 surface can issue, keyed by the
+/// byte-frozen prefix of each (the whole statement is pinned by
+/// `tags_sql`'s own goldens). A shape is identified by its `FROM` as well
+/// as its SELECT list, which is what separates the two `val, val_type`
+/// reads.
+const SHAPE_NAMES: &str = "SELECT DISTINCT scope, key";
+const SHAPE_CATALOG_VALUES: &str = "SELECT DISTINCT val, val_type\nFROM trace_tag_catalog";
+const SHAPE_NARROWED_VALUES: &str = "SELECT DISTINCT val, val_type\nFROM trace_attrs_idx";
+const SHAPE_SPAN_NAMES: &str = "SELECT DISTINCT if(length(name)";
+
+/// Every finished Select in `db` whose text starts with `prefix`, as its
+/// sorted `tables` array.
+async fn shape_rows(admin: &ChClient, db: &str, prefix: &str) -> Vec<Vec<String>> {
+    let escaped = prefix.replace('\'', "\\'").replace('\n', "\\n");
+    let sql = format!(
+        "SELECT arraySort(arrayMap(x -> toString(x), tables)) AS tables \
+         FROM system.query_log \
+         WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+           AND current_database = '{db}' \
+           AND startsWith(query, '{escaped}')"
+    );
+    let mut stream = admin
+        .query_stream::<TablesRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query_log read");
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode query_log row").tables);
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn six_request_classes_read_exactly_these_tables() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_218;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = pulsus_testkit::test_db(&format!("pulsus_traces_tag_shapes_it_{nonce}"));
+    let db = db.as_str();
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db);
+
+    // Clock-derived, for the reason `ac_start_ns` states in full.
+    let base_ns = ac_start_ns();
+    ingest(
+        port,
+        vec![
+            span(
+                7,
+                1,
+                "checkout",
+                base_ns,
+                vec![
+                    kv_str("http.method", "GET"),
+                    kv_int("http.status_code", 200),
+                ],
+            ),
+            span(
+                7,
+                2,
+                "charge",
+                base_ns + 1_000,
+                vec![
+                    kv_str("http.method", "POST"),
+                    kv_int("http.status_code", 201),
+                ],
+            ),
+        ],
+        vec![kv_str("service.name", "cart")],
+        "six-class seed",
+    );
+    let start_s = (base_ns / 1_000_000_000) as i64 - 300;
+    let end_s = (base_ns / 1_000_000_000) as i64 + 300;
+    let window = format!("start={start_s}&end={end_s}");
+    let narrowing = format!("q={}", enc(r#"{span.http.method="GET"}"#));
+
+    let admin = ChClient::new(ch_config()).await.expect("connect admin");
+    assert_query_logging_is_on(&admin).await;
+
+    // The six classes, in one run. Each is issued exactly once, so the
+    // per-shape row counts below are the exact request counts.
+    let requests = [
+        ("1 native tag names", "/api/traces/v1/tags".to_string()),
+        ("2a v2 tag names", "/api/v2/search/tags".to_string()),
+        ("2b v1 flat tag names", "/api/search/tags".to_string()),
+        (
+            "3 attribute values, no narrowing q",
+            format!("/api/v2/search/tag/span.http.status_code/values?{window}"),
+        ),
+        (
+            "4 attribute values, narrowing q",
+            format!("/api/v2/search/tag/span.http.status_code/values?{window}&{narrowing}"),
+        ),
+        (
+            "5 span names, no narrowing q",
+            format!("/api/v2/search/tag/name/values?{window}"),
+        ),
+        (
+            "6 span names, narrowing q with an attribute term",
+            format!("/api/v2/search/tag/name/values?{window}&{narrowing}"),
+        ),
+    ];
+    for (ctx, path) in &requests {
+        let res = get(port, path, ctx);
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: {path} — body {}",
+            String::from_utf8_lossy(&res.body)
+        );
+    }
+
+    admin
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+
+    let catalog = vec![format!("{db}.trace_tag_catalog")];
+    let spans = vec![format!("{db}.trace_spans")];
+    let both = vec![format!("{db}.trace_attrs_idx"), format!("{db}.trace_spans")];
+
+    // Classes 1, 2a and 2b — three name reads, catalog only.
+    assert_eq!(
+        shape_rows(&admin, db, SHAPE_NAMES).await,
+        vec![catalog.clone(), catalog.clone(), catalog.clone()],
+        "the three tag-names classes read exactly the catalog, one Select each"
+    );
+    // Class 3 — the unnarrowed attribute values read, unchanged.
+    assert_eq!(
+        shape_rows(&admin, db, SHAPE_CATALOG_VALUES).await,
+        vec![catalog.clone()],
+        "an unnarrowed attribute-values read is still exactly the catalog read"
+    );
+    // Class 4 — narrowed attribute values: the index intersected with the
+    // matching span set.
+    assert_eq!(
+        shape_rows(&admin, db, SHAPE_NARROWED_VALUES).await,
+        vec![both.clone()],
+        "a narrowed attribute-values read reads the index and the span table"
+    );
+    // Classes 5 and 6 — span names, unnarrowed and narrowed. Two Selects
+    // of the same shape, distinguished by their `tables`.
+    let mut span_name_rows = shape_rows(&admin, db, SHAPE_SPAN_NAMES).await;
+    span_name_rows.sort();
+    let mut want = vec![both.clone(), spans.clone()];
+    want.sort();
+    assert_eq!(
+        span_name_rows, want,
+        "the unnarrowed span-name read is the span table alone; the narrowed one adds the index"
+    );
+
+    // 4a — one Select per request across the six classes, and the total
+    // equals the number of requests made. The original gate's exact-count
+    // property, kept.
+    let total = shape_rows(&admin, db, SHAPE_NAMES).await.len()
+        + shape_rows(&admin, db, SHAPE_CATALOG_VALUES).await.len()
+        + shape_rows(&admin, db, SHAPE_NARROWED_VALUES).await.len()
+        + shape_rows(&admin, db, SHAPE_SPAN_NAMES).await.len();
+    assert_eq!(
+        total,
+        requests.len(),
+        "one Select per request, no more: {} requests produced {total} discovery Selects",
+        requests.len()
+    );
+
+    // 4b — the original ban, restricted to the classes for which it is
+    // still true and NAMED rather than implied by absence: the three
+    // names classes and the unnarrowed values class issue no Select that
+    // touches a span table. Their shapes are the two catalog ones, so the
+    // check is an equality on those shapes' tables, asserted above; this
+    // states the ban in its own terms as well, over the same rows.
+    for shape in [SHAPE_NAMES, SHAPE_CATALOG_VALUES] {
+        for tables in shape_rows(&admin, db, shape).await {
+            assert!(
+                !tables
+                    .iter()
+                    .any(|t| t.ends_with(".trace_spans") || t.ends_with(".trace_attrs_idx")),
+                "a catalog-backed class touched a span table: {tables:?}"
+            );
+        }
+    }
 
     drop_db(db).await;
 }

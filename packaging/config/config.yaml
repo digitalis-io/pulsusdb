@@ -79,6 +79,7 @@ clickhouse:
   #traceql_max_candidates: 100000
   #traceql_scan_budget_rows: 50000000
   #traceql_max_series: 1000
+  #traceql_tag_lookback: 24h
   #traceql_generator_max_memory_bytes: 536870912
   #query_eval_concurrency: 256
   #tail_poll_interval: 1s

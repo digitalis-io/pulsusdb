@@ -580,6 +580,14 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             "the metrics series cap",
         ));
     }
+    // Issue #478: a zero tag lookback would resolve `[now, now]`, which is
+    // still one whole UTC day after the day-grain bound — so it would not
+    // fail loudly, it would silently mean "today" whatever the operator
+    // wrote. Rejecting it keeps the field meaning what it says.
+    positive_duration(
+        "reader.traceql_tag_lookback",
+        cfg.reader.traceql_tag_lookback,
+    )?;
     // Issue #101: a zero eval-concurrency bound would admit no eval at all
     // (the semaphore starts with 0 permits — every query would queue
     // forever until the request deadline expires — `503`/`timeout` on the

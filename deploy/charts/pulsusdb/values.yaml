@@ -125,6 +125,7 @@ pulsusdb:
       promql_lookback: 5m
       logql_scan_budget_bytes: 50GiB
       traceql_max_candidates: 100000
+      traceql_tag_lookback: 24h
 
     downsampling:
       enabled: false

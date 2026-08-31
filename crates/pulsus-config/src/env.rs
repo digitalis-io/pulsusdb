@@ -74,6 +74,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_TRACEQL_MAX_CANDIDATES",
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
     "PULSUS_TRACEQL_MAX_SERIES",
+    "PULSUS_TRACEQL_TAG_LOOKBACK",
     "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
     "PULSUS_LOGQL_READ_MAX_MEMORY_BYTES",
     "PULSUS_PROMQL_READ_MAX_MEMORY_BYTES",
@@ -359,6 +360,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_TRACEQL_MAX_SERIES") {
         cfg.reader.traceql_max_series = parse_int("PULSUS_TRACEQL_MAX_SERIES", &v)?;
     }
+    if let Some(v) = read("PULSUS_TRACEQL_TAG_LOOKBACK") {
+        cfg.reader.traceql_tag_lookback = parse_dur("PULSUS_TRACEQL_TAG_LOOKBACK", &v)?;
+    }
     if let Some(v) = read("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES") {
         cfg.reader.traceql_generator_max_memory_bytes =
             parse_int("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES", &v)?;
@@ -434,8 +438,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            76,
-            "docs/configuration.md §§1-8 document exactly 76 variables"
+            77,
+            "docs/configuration.md §§1-8 document exactly 77 variables"
         );
     }
 

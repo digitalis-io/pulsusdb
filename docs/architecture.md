@@ -127,11 +127,11 @@ Decisions and their reasons:
 
 ### 3.3 Traces
 
-Span payload table (`trace_spans`, ordered `(trace_id, timestamp_ns)` with a `service_time` projection), attribute index (`trace_attrs_idx`, ordered `(key, val, scope, timestamp_ns, trace_id, span_id)` with a typed `val_num` column for numeric comparisons and a `scope` discriminator), and a bounded, scope-aware `trace_tag_catalog` for tag APIs (full DDL and read-path SQL in [schemas.md §4](schemas.md)).
+Span payload table (`trace_spans`, ordered `(trace_id, timestamp_ns)` with `service_time` and `span_name_day` projections), attribute index (`trace_attrs_idx`, ordered `(key, val, scope, timestamp_ns, trace_id, span_id)` with a typed `val_num` column for numeric comparisons and a `scope` discriminator), and a bounded, scope-aware `trace_tag_catalog` for tag APIs (full DDL and read-path SQL in [schemas.md §4](schemas.md)).
 
 Decisions and their reasons:
 
-- **Both access patterns served by one table.** Primary ordering `(trace_id, timestamp_ns)` makes trace-by-ID fetch a point read; the `service_time` **projection** gives service + time-range searches their own physically sorted copy, so "recent traces for service X" never scans by trace ID. Projections cost write amplification; that trade is accepted because trace search is the human-facing slow path.
+- **Three access patterns served by one table.** Primary ordering `(trace_id, timestamp_ns)` makes trace-by-ID fetch a point read; the `service_time` **projection** gives service + time-range searches their own physically sorted copy, so "recent traces for service X" never scans by trace ID; and the `span_name_day` **aggregate projection** (issue #478) holds one row per `(UTC day, span name)`, so the tag-values Span Name dropdown reads the distinct names rather than every span in the window. Projections cost write amplification; that trade is accepted because trace search is the human-facing slow path, and the aggregate one is small by construction.
 - **`timestamp_ns` before `trace_id` in the attribute index ordering** so that TraceQL searches — which are always time-bounded — prune index granules by time within a `(key, val)` (or scoped `(key, val, scope)`) prefix.
 - **Candidate-set discipline.** TraceQL planning caps intermediate trace-ID candidate sets (spill to a bounded top-K by recency) rather than joining unbounded sets against the payload table.
 

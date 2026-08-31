@@ -1382,6 +1382,15 @@ when we are asking it to slow down, so we keep `429`; recorded as
   static map (`status.code`, `error`), and no client of ours reads status
   values off the v1 route.
 
+- **Extended by issue #478.** The same row now also covers `name`: the
+  native and v2 routes answer it from `trace_spans`, and the v1 flat
+  route keeps its attribute-only reading, so `GET /api/search/tag/name/values`
+  answers `{"tagValues":[]}` on a corpus with no attribute keyed `name`
+  where the reference answers with its span names. Measured on the
+  captured corpus. The v1 route also ignores `q`, on both sides.
+
+- **Cases.** `Q-AQ`, `Q-AR`.
+
 - **Disposition.** No code. The split is deliberate parity: a v1 lookup
   conflates an intrinsic with an attribute of the same name, which is
   exactly the defect removed on v2.
@@ -1391,12 +1400,17 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Route.** `GET /api/traces/v1/tag/{tag}/values` and
   `GET /api/v2/search/tag/{tag}/values`.
 
-- **What.** For an intrinsic with no closed value set — `name`,
-  `duration`, `rootName`, `span:id`, every one except `status` and `kind`
-  — we answer `200 {"tagValues":[]}`. Measured during planning on
+- **What.** For an intrinsic with no closed value set — `duration`,
+  `rootName`, `span:id`, every one except `name`, `status` and `kind` —
+  we answer `200 {"tagValues":[]}`. Measured during planning on
   2026-08-30, the pinned reference build answers
   `/api/v2/search/tag/name/values` with the three **span** names its
   store holds.
+
+- **`name` left this row in issue #478**, which is the work the last
+  bullet below anticipated: it is served from `trace_spans` on the native
+  and v2 routes, through a day-grain projection, and the remaining
+  open-valued intrinsics are unchanged. The row stays for them.
 
 - **Why empty rather than a store read.** Before issue #475 that lookup
   fell through to a bare-key catalog read, which answered with span
@@ -1406,10 +1420,10 @@ when we are asking it to slow down, so we keep `429`; recorded as
   by coincidence when an event and a span share a name. An empty list is
   legible; that was not.
 
-- **What remains.** Populating span names correctly needs distinct span
-  names out of a table with no index prefix for them, and is tracked as a
-  separate unit. This row is the placeholder for that work, not a
-  permanent decision.
+- **What remains.** The other open-valued intrinsics. Each would need its
+  own read and its own index story — `span:id` and `duration` in
+  particular enumerate values that are not a discoverable set — so this
+  row is the placeholder for that decision, not a permanent one.
 
 ### `traceql-v1-flat-tag-names-order` (issue #475) — **catalog order, not sorted**
 
@@ -1522,3 +1536,188 @@ when we are asking it to slow down, so we keep `429`; recorded as
   this entry — the divergence is in a status code the differential corpus
   does not exercise, and it is recorded so the next reader does not treat
   the reference's `500` as the target.
+
+### `traceql-tag-values-q-lenient-parse-not-reproduced` (issue #478) — **an unparseable `q` widens here and sometimes narrows there**
+
+- **Route.** `GET /api/traces/v1/tag/{tag}/values` and
+  `GET /api/v2/search/tag/{tag}/values`.
+
+- **What.** Both sides answer `200` to a `q` that does not parse — that
+  much is parity, and it is the load-bearing half: the query editor sends
+  the whole half-typed expression as `q` on every distinct prefix a user
+  types through, so a `400` there would break autocomplete for input the
+  client cannot avoid sending. What differs is the ANSWER. We drop the
+  whole unparseable `q` and return the unnarrowed list. Measured on the
+  captured corpus, the reference sometimes returns a NARROWED list
+  instead — it recovers complete condition groups from the incomplete
+  text and applies them, and once returned an EMPTY list for a prefix we
+  answer in full.
+
+- **Cases.** `Q-I`, `Q-J`, `Q-L`, `Q-M`. (`Q-K` and the fourteen other
+  malformed shapes agree: both sides answer the full list.)
+
+- **Disposition.** Ratify-documented-difference. Reproducing the
+  reference's incomplete-matcher recovery would mean a second, lenient
+  parser beside the real one, whose disagreements with the real one are
+  exactly the bugs a query language cannot afford. Widening is always a
+  superset of the correct answer for a prefix that is still being typed,
+  which is the direction a dropdown can absorb.
+
+- **Gated by.** `crates/pulsus-server/tests/trace_tag_values_differential.rs`
+  (the oracle leg replays the reference side) and
+  `crates/pulsus-server/tests/traces_tag_values_narrow_live.rs` (ours).
+
+### `traceql-tag-values-q-partial-pushdown` (issue #478) — **we push the `&&` spine only, so an `||` widens**
+
+- **Route.** `GET /api/traces/v1/tag/{tag}/values` and
+  `GET /api/v2/search/tag/{tag}/values`.
+
+- **What.** Only positive conjuncts on the root filter's `&&` spine are
+  pushed into the value read. A `||` subtree, a `!`, a negated attribute
+  condition, a structural root (`{a} >> {b}`), a pipeline stage and
+  anything past the eighth term are DROPPED — every drop widens, because
+  a conjunction with a conjunct removed matches a superset. The reference
+  narrows on the `||` case; we return the full list.
+
+- **Cases.** `Q-W`.
+
+- **Disposition.** Ratify-documented-difference, with room to close. The
+  rule that makes it safe is structural rather than case-by-case: a term
+  is only ever taken from the `&&` spine, so no drop can narrow.
+
+- **Gated by.** `crates/pulsus-read/src/traces/tag_narrow.rs`'s own unit
+  tests for the drop rules, plus the two legs above.
+
+### `traceql-tag-values-unscoped-attr-narrows-here` (issue #478) — **the unscoped `.attr` form narrows for us and does not there**
+
+- **Route.** `GET /api/traces/v1/tag/{tag}/values` and
+  `GET /api/v2/search/tag/{tag}/values`.
+
+- **What.** `q={.http.method="GET"}` is an unscoped attribute condition.
+  We push it as an index probe with no `scope` predicate, so it matches
+  the key in every attribute scope and the answer narrows. Measured, the
+  reference returns the unnarrowed list for the same query on the same
+  corpus.
+
+- **Cases.** `Q-X`.
+
+- **Disposition.** Ratify-documented-difference. Narrowing is what the
+  dropdown is for and the unscoped form is the one the editor emits when
+  a user types a bare key; answering it unnarrowed would be the defect
+  this issue exists to remove.
+
+### `traceql-tag-values-requested-tag-condition-applied` (issue #478) — **a condition on the tag being listed applies here**
+
+- **Route.** `GET /api/traces/v1/tag/{tag}/values` and
+  `GET /api/v2/search/tag/{tag}/values`.
+
+- **What.** When `q` carries a condition on the very tag whose values are
+  being listed — `/tag/name/values?q={name="pay"}` — we apply it like any
+  other conjunct, so the answer is the values that satisfy it (none, for
+  a name no span carries). Measured, the reference ECHOES the requested
+  condition's operand instead: it answered `["pay"]` for a corpus holding
+  no span of that name, and answered the unnarrowed list for the regex
+  form `{name=~".*charge.*"}` where we answer the two matching names.
+
+- **Cases.** `Q-Y`, `Q-Z`.
+
+- **Disposition.** Ratify-documented-difference. Offering a value no span
+  carries is a dropdown entry that matches nothing when picked.
+
+### `traceql-tag-values-window-is-day-granular` (issue #478) — **the window resolves to whole UTC days**
+
+- **Route.** `GET /api/traces/v1/tag/{tag}/values` and
+  `GET /api/v2/search/tag/{tag}/values`, for the reads that touch the
+  span tables — the span-`name` values and any `q`-narrowed values. An
+  unnarrowed attribute-value read is still the time-less catalog read and
+  ignores the window entirely.
+
+- **What.** A supplied `start`/`end` is widened to the UTC days it
+  touches, and an absent one resolves to `reader.traceql_tag_lookback`
+  (24 h). A sub-day window therefore answers over its whole day here. The
+  sharpest instance is a zero-width range (`start == end`): the reference
+  answers `[]`, we answer that day's values.
+
+- **Why day-granular.** A sub-day `timestamp_ns` predicate prunes nothing
+  on `trace_spans` — the sorting key is `(trace_id, timestamp_ns)`, so
+  with `trace_id` unconstrained the second key column cannot prune — and
+  it would defeat the `span_name_day` projection, whose own key is the
+  day expression. So the finer predicate costs the same and buys a
+  narrower answer only by accident of where a day boundary falls.
+
+- **Cases.** `Q-AZ`.
+
+- **Disposition.** Ratify-documented-difference. Over-reporting inside a
+  day is the safe direction for a dropdown: a value that exists is
+  offered.
+
+### `traceql-tag-values-span-name-byte-cap` (issue #478) — **an over-long span name is reported capped**
+
+- **Route.** `GET /api/traces/v1/tag/{tag}/values` and
+  `GET /api/v2/search/tag/{tag}/values`, for `name`/`span:name`.
+
+- **What.** A span name longer than 8,192 bytes is reported as its first
+  2,048 code points — the same byte cap every other string column on this
+  surface carries, so one cap rule covers the search results and the tag
+  values. Measured on a 9,000-character name, the reference returns the
+  whole name.
+
+- **Cases.** `T-CAP`.
+
+- **Disposition.** Ratify-documented-difference. The cap is the shipped
+  rule for string columns on this surface; exempting one read would make
+  the same name render two lengths in one product.
+
+### `traceql-tag-values-range-error-text` (issue #478) — **same status and content type on a range fault, our own wording**
+
+- **Route.** All six §4.3 routes: `GET /api/traces/v1/tags`,
+  `GET /api/v2/search/tags`, `GET /api/search/tags`,
+  `GET /api/traces/v1/tag/{tag}/values`,
+  `GET /api/v2/search/tag/{tag}/values` and
+  `GET /api/search/tag/{tag}/values`.
+
+- **What.** A malformed timestamp, a half-supplied range and an inverted
+  range are `400 text/plain; charset=utf-8` on both sides — measured, on
+  every one of the reference's four tag routes. The BODY text is ours: it
+  follows the §4.2 range grammar this product already ships, where the
+  reference's ends in its runtime's own integer-parse error for one shape
+  and names a configured maximum-window-width setting for another. The
+  reference's bodies are deliberately not quoted in the fixture; the
+  status and the content type are what is asserted against it.
+
+- **Also.** We have no maximum-window-width rule, so a window wider than
+  the reference's configured maximum is answered here and rejected
+  there. The bound that exists instead is the reader row budget
+  (`reader.traceql_scan_budget_rows`), which is a `422 query_too_broad`.
+
+- **Cases.** `/api/search/tag/name/values|half_end`, `/api/search/tag/name/values|half_start`, `/api/search/tag/name/values|inverted`, `/api/search/tag/name/values|malformed_end`, `/api/search/tag/name/values|malformed_start`, `/api/search/tag/name/values|zero_end`, `/api/search/tag/name/values|zero_start`, `/api/search/tags|half_end`, `/api/search/tags|half_start`, `/api/search/tags|inverted`, `/api/search/tags|malformed_end`, `/api/search/tags|malformed_start`, `/api/search/tags|zero_end`, `/api/search/tags|zero_start`, `/api/v2/search/tag/name/values|half_end`, `/api/v2/search/tag/name/values|half_start`, `/api/v2/search/tag/name/values|inverted`, `/api/v2/search/tag/name/values|malformed_end`, `/api/v2/search/tag/name/values|malformed_start`, `/api/v2/search/tag/name/values|zero_end`, `/api/v2/search/tag/name/values|zero_start`, `/api/v2/search/tags|half_end`, `/api/v2/search/tags|half_start`, `/api/v2/search/tags|inverted`, `/api/v2/search/tags|malformed_end`, `/api/v2/search/tags|malformed_start`, `/api/v2/search/tags|zero_end`, `/api/v2/search/tags|zero_start`.
+
+- **Disposition.** Ratify-documented-difference. Matching the status is
+  what a client can act on; reproducing another runtime's parse-error
+  text is not parity, it is imitation.
+
+### `traceql-tag-values-narrowed-set-complete-here` (issue #478) — **the reference under-reports a narrowed value list; we return the complete set**
+
+- **Route.** `GET /api/v2/search/tag/{tag}/values`.
+
+- **What was measured.** On the captured corpus, with the same window:
+  `/api/v2/search/tag/span.http.status_code/values?q={resource.service.name="pay"}`
+  returned `[201]` from the reference, while its own
+  `/api/v2/search/tag/name/values` for the SAME condition listed the span
+  named `a`, and `/api/v2/search/tag/span.http.status_code/values?q={name="a"}`
+  returned `[200]`. So a value the condition matches was absent from the
+  narrowed list. The same shape appeared for the `checkout` service (only
+  `500`, with `200` missing) and did not appear for `cart`. Reproduced on
+  two independent container runs.
+
+- **Ours.** Both values, `200` and `201`: the narrowed read is a `DISTINCT`
+  over the index rows of the matching span set, so it cannot omit a value
+  that set carries.
+
+- **Cases.** `Q-AM`.
+
+- **Disposition.** Deliberate divergence — the reference is wrong here.
+  A dropdown that omits a value present on a matching span sends the user
+  to a query that returns nothing. **The mechanism behind the reference's
+  omission was not established**, only the observation; recorded so the
+  next reader does not treat its answer as the target.

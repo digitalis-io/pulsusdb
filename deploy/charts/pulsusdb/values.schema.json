@@ -410,7 +410,8 @@
             "promql_max_samples": { "type": "integer", "minimum": 1 },
             "promql_lookback": { "$ref": "#/definitions/humanDuration" },
             "logql_scan_budget_bytes": { "$ref": "#/definitions/byteSize" },
-            "traceql_max_candidates": { "type": "integer", "minimum": 1 }
+            "traceql_max_candidates": { "type": "integer", "minimum": 1 },
+            "traceql_tag_lookback": { "$ref": "#/definitions/humanDuration" }
           }
         },
         "downsampling": {
