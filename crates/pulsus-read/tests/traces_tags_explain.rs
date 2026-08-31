@@ -135,6 +135,13 @@ async fn seed_catalog(client: &ChClient, db: &str) {
     }
 }
 
+/// `system.tables`'s two key columns (issue #476 AC6).
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct KeysRow {
+    primary_key: String,
+    sorting_key: String,
+}
+
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct ExplainRow {
     #[serde(with = "serde_bytes")]
@@ -277,6 +284,37 @@ async fn tag_discovery_prunes_scoped_shapes_and_records_the_degraded_paths() {
     cfg.database = DB.to_string();
     let client = ChClient::new(cfg).await.expect("connect data client");
     seed_catalog(&client, &DB).await;
+
+    // ---- Issue #476 AC6: migration 41 APPENDS to the sorting key and
+    // leaves the primary key alone. Asserted here, immediately before the
+    // prune gates below, because the prune gates are exactly what a
+    // replacing (rather than appending) `MODIFY ORDER BY` would destroy —
+    // and asserted as TWO separate string comparisons, so a change that
+    // moved both would have to move both to exactly these values. ---------
+    let mut stream = client
+        .query_stream::<KeysRow>(
+            &format!(
+                "SELECT primary_key, sorting_key FROM system.tables \
+                 WHERE database = '{DB}' AND name = 'trace_tag_catalog'"
+            ),
+            &QuerySettings::default(),
+        )
+        .await
+        .expect("read system.tables");
+    let keys = stream
+        .next()
+        .await
+        .expect("trace_tag_catalog must exist")
+        .expect("decode system.tables row");
+    drop(stream);
+    assert_eq!(
+        keys.primary_key, "scope, key, val",
+        "migration 41 must leave the primary key alone — it is what prunes every tag read"
+    );
+    assert_eq!(
+        keys.sorting_key, "scope, key, val, val_type",
+        "migration 41 must APPEND val_type to the sorting key"
+    );
 
     let resource = ch_string("resource");
     let key = ch_string("k3");

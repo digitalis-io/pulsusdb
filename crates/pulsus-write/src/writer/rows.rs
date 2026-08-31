@@ -788,6 +788,11 @@ pub struct TraceAttrRow {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub duration_ns: i64,
+    /// The OTLP kind `val` was rendered from (issue #476), one of
+    /// `string`/`int`/`float`/`bool`. LAST field on purpose: the derived
+    /// `Row` insert names its columns positionally from this struct, and
+    /// migration 39 appends the column at the end of `trace_attrs_idx`.
+    pub val_type: String,
 }
 
 impl From<&AttrRecord> for TraceAttrRow {
@@ -802,6 +807,7 @@ impl From<&AttrRecord> for TraceAttrRow {
             trace_id: record.trace_id,
             span_id: record.span_id,
             duration_ns: record.duration_ns,
+            val_type: record.val_type.as_str().to_string(),
         }
     }
 }
@@ -822,7 +828,11 @@ impl TraceAttrRow {
     fn estimate(key: &str, val: &str, scope: &str) -> u64 {
         (key.len() + val.len() + scope.len()
             + 2 /* date */ + 9 /* val_num (tag + f64) */ + 8 /* timestamp_ns */
-            + 16 /* trace_id */ + 8 /* span_id */ + 8/* duration_ns */) as u64
+            + 16 /* trace_id */ + 8 /* span_id */ + 8/* duration_ns */
+            + 6/* val_type: a constant, the longest of the four spellings
+        is `string`; a fixed term keeps `est_bytes` and
+        `est_source_bytes` equal, which is the
+        reserve-before-materialize invariant */) as u64
     }
 }
 
@@ -842,6 +852,7 @@ impl SpoolEncode for TraceAttrRow {
             "trace_id": hex_lower(&self.trace_id),
             "span_id": hex_lower(&self.span_id),
             "duration_ns": self.duration_ns,
+            "val_type": self.val_type,
         })
     }
 }
@@ -849,8 +860,8 @@ impl SpoolEncode for TraceAttrRow {
 /// `trace_attrs_idx` backfill identity (issue #139): keyed on the full
 /// `ReplacingMergeTree ORDER BY (key, val, scope, timestamp_ns, trace_id,
 /// span_id)` tuple. VERSIONLESS (constant `0`): the non-key columns
-/// (`date`, `val_num`, `duration_ns`) are deterministic functions of the
-/// same attr record/span, so a re-inserted row is the same logical row
+/// (`date`, `val_num`, `duration_ns`, `val_type`) are deterministic
+/// functions of the same attr record/span, so a re-inserted row is the same logical row
 /// (`FINAL` collapses to 1) and the equal-version mid-attempt removal is
 /// safe — see `MetricSeriesRow`'s impl note. Byte-accounting caveat: the
 /// backlog map key clones this row's three strings, so the true footprint
@@ -896,6 +907,7 @@ mod tests {
     use pulsus_model::{Date, LabelSet, NativeHistogram, STALE_NAN_BITS, Span, UnixNano};
 
     use super::*;
+    use crate::ingest::traces::AttrValueType;
 
     #[test]
     fn log_sample_row_from_log_row_copies_every_field() {
@@ -1348,6 +1360,7 @@ mod tests {
             key: "http.status_code".to_string(),
             scope: "span".to_string(),
             val: "500".to_string(),
+            val_type: AttrValueType::Int,
             val_num: Some(500.0),
             timestamp_ns: 1_700_000_000_000_000_000,
             trace_id: [0xAB; 16],
@@ -1447,7 +1460,42 @@ mod tests {
                 "trace_id": "abababababababababababababababab",
                 "span_id": "0101010101010101",
                 "duration_ns": 1_000_000_000,
+                "val_type": "int",
             })
+        );
+    }
+
+    /// Issue #476: the stored type reaches `TraceAttrRow` from the
+    /// `AttrRecord`'s enum, spelled by `AttrValueType::as_str`. Every
+    /// spelling is asserted with its own arm, so swapping two arms of
+    /// `as_str` fails here rather than passing a check that only looks
+    /// for four known strings somewhere.
+    #[test]
+    fn trace_attr_row_carries_the_records_stored_type_spelling() {
+        for (kind, spelling) in [
+            (AttrValueType::String, "string"),
+            (AttrValueType::Int, "int"),
+            (AttrValueType::Float, "float"),
+            (AttrValueType::Bool, "bool"),
+        ] {
+            let mut record = attr_record();
+            record.val_type = kind;
+            assert_eq!(
+                TraceAttrRow::from(&record).val_type,
+                spelling,
+                "{kind:?} must store {spelling:?}"
+            );
+        }
+    }
+
+    /// The estimate stays equal on both sides of materialization — the
+    /// reserve-before-materialize invariant the writer's queue depends on.
+    #[test]
+    fn trace_attr_row_estimates_match_across_materialization() {
+        let record = attr_record();
+        assert_eq!(
+            TraceAttrRow::est_source_bytes(&record),
+            TraceAttrRow::from(&record).est_bytes()
         );
     }
 }

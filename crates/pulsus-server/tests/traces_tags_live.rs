@@ -7,9 +7,10 @@
 //!
 //! - the bounded, deduplicated, `(scope, key)`-ordered scoped tag-name
 //!   set, with and without `scope=`, with `start`/`end` proven ignored;
-//! - the bounded, deduplicated, ordered typed value sets (string / int /
-//!   duration / bool inference live, incl. the unscoped dual-scope key
-//!   forms);
+//! - the bounded, deduplicated, ordered typed value sets, whose `type` is
+//!   the type the SENDER sent (issue #476 — a string attribute whose text
+//!   reads as a duration or a boolean reports `string`), incl. the
+//!   unscoped dual-scope key forms;
 //! - the adjudicated `q=` superset semantics: a non-trivial `q` returns
 //!   the SAME full value set as no `q` (accept-and-ignore, never a 400);
 //! - the Δ3 truncation contract on BOTH caps: an over-cap key returns
@@ -608,7 +609,7 @@ async fn tag_discovery_against_real_clickhouse() {
     let body = assert_error_body(&res, 400, ctx);
     assert!(body.contains("bogus"), "{ctx}: {body:?}");
 
-    // -- Values: typed inference live (string/int/duration/bool). --------
+    // -- Values: the STORED type live (issue #476). ---------------------
     let ctx = "values resource.service.name";
     let json = get_json(
         port,
@@ -649,7 +650,11 @@ async fn tag_discovery_against_real_clickhouse() {
         assert_eq!(values_of(&json, ctx).len(), 2, "{ctx} ({tag}): body {json}");
     }
 
-    let ctx = "values span.latency.bucket (duration inference)";
+    // Issue #476: both of these are STRING attributes whose text reads
+    // as something else. They were reported `duration` and `bool` while
+    // the type was inferred from the characters; the stored type is what
+    // the sender sent.
+    let ctx = "values span.latency.bucket (a string that reads as a duration)";
     let json = get_json(
         port,
         &values_url("span.latency.bucket"),
@@ -658,14 +663,14 @@ async fn tag_discovery_against_real_clickhouse() {
     );
     assert_eq!(
         values_of(&json, ctx),
-        vec![("duration".to_string(), "1.5s".to_string())],
+        vec![("string".to_string(), "1.5s".to_string())],
         "{ctx}: body {json}"
     );
-    let ctx = "values span.cache.hit (bool inference)";
+    let ctx = "values span.cache.hit (a string that reads as a bool)";
     let json = get_json(port, &values_url("span.cache.hit"), ctx, &mut discovered);
     assert_eq!(
         values_of(&json, ctx),
-        vec![("bool".to_string(), "true".to_string())],
+        vec![("string".to_string(), "true".to_string())],
         "{ctx}: body {json}"
     );
 
@@ -1841,6 +1846,721 @@ async fn the_default_trace_memory_ceiling_does_not_refuse_a_catalog_read() {
             String::from_utf8_lossy(&res.body)
         );
     }
+
+    drop_db(db).await;
+}
+
+// =====================================================================
+// Issue #476: the stored attribute type, end to end.
+//
+// The composed symptom this closes: pick a value out of our own
+// tag-values response whose text reads as a number, build the query a
+// client builds from it, and get the trace back. Wave A makes the wire
+// `type` the stored type (so the client quotes it); Wave B stops the
+// cross-type form being a 400.
+// =====================================================================
+
+/// The reference bodies this suite is measured against, captured from a
+/// pinned reference build and committed verbatim (see the file's own
+/// `_provenance` block for the image, the config, the corpus and the
+/// exact requests). Read here rather than re-derived from our own code:
+/// nothing in this file may compare our output against our own
+/// production function.
+fn reference_capture() -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/476-reference-tag-values.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()))
+}
+
+fn kv_bool(key: &str, value: bool) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::BoolValue(value)),
+        }),
+        key_strindex: 0,
+    }
+}
+
+fn kv_double(key: &str, value: f64) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(Value::DoubleValue(value)),
+        }),
+        key_strindex: 0,
+    }
+}
+
+/// Hex ids, the ONLY literals the acceptance corpus carries.
+const AC_TRACE_1: &str = "1111111111111111aaaaaaaaaaaaaaaa";
+const AC_SPAN_1: &str = "aaaaaaaaaaaaaaa1";
+const AC_TRACE_2: &str = "2222222222222222bbbbbbbbbbbbbbbb";
+const AC_SPAN_2: &str = "bbbbbbbbbbbbbbb2";
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// Percent-encoding for a `q=` value (the search suite's `enc`).
+fn enc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// One acceptance-corpus resource group: a single span under a single
+/// resource, described by value so the push helper takes one parameter
+/// instead of a positional list nobody can read at the call site.
+struct AcSpan {
+    service: &'static str,
+    trace_hex: &'static str,
+    span_hex: &'static str,
+    name: &'static str,
+    start_ns: u64,
+    attrs: Vec<KeyValue>,
+}
+
+/// Pushes one [`AcSpan`] with an instrumentation scope (the two
+/// `instrumentation:*` intrinsics need one).
+fn ac_ingest(port: u16, span: AcSpan, ctx: &str) {
+    let AcSpan {
+        service,
+        trace_hex,
+        span_hex,
+        name,
+        start_ns,
+        attrs,
+    } = span;
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv_str("service.name", service)],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "io.otel.http".to_string(),
+                    version: "1.2.3".to_string(),
+                    ..Default::default()
+                }),
+                spans: vec![Span {
+                    trace_id: unhex(trace_hex),
+                    span_id: unhex(span_hex),
+                    name: name.to_string(),
+                    start_time_unix_nano: start_ns,
+                    end_time_unix_nano: start_ns + 1_000_000,
+                    attributes: attrs,
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let res = request(
+        port,
+        "POST",
+        "/v1/traces",
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+    )
+    .unwrap_or_else(|| panic!("{ctx}: ingest must be reachable"));
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: sync ingest must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+}
+
+/// The returned trace-id set of a `/api/traces/v1/search` response.
+fn trace_ids(json: &serde_json::Value) -> Vec<String> {
+    json["traces"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|t| t["traceID"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **The acceptance corpus's timestamps are derived from the clock at run
+/// time and MUST stay that way.** A literal date, a parsed date string, a
+/// value read from a committed JSON file and a snapshot-frozen value are
+/// all forbidden here; only the trace and span ids above are literals.
+///
+/// This is not a style preference, and the failure it prevents is silent.
+/// `trace_spans` and `trace_attrs_idx` carry
+/// `TTL … + INTERVAL {{retention_days}} DAY DELETE` with
+/// `ttl_only_drop_parts = 1` (`crates/pulsus-schema/src/catalog.rs`, the
+/// `trace_attrs_idx` migration; `retention_days` defaults to 7 in
+/// `crates/pulsus-config/src/model.rs`), while `trace_tag_catalog` carries
+/// no TTL at all. A corpus older than retention is therefore HALF
+/// visible: the materialized view fires on the insert block so every
+/// tag-values assertion below still passes, while the span rows are
+/// dropped at insert time — measured on this tree,
+/// `{"spans":0,"attrs":0,"catalog":12}` with search answering
+/// `{"traces":[]}` at `200`. There is no grace window and no polling that
+/// recovers it, and it behaves identically on a developer machine and in
+/// CI, so it can never present as a flake: it presents as Wave B being
+/// broken. A hard-coded timestamp is a defect here **even on the day it
+/// passes**.
+fn ac_start_ns() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    u64::try_from(now).expect("fits u64") - 30_000_000_000
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stored_attribute_type_reaches_the_wire_and_its_query_returns_the_trace() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_216;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = pulsus_testkit::test_db(&format!("pulsus_traces_valtype_it_{nonce}"));
+    let db = db.as_str();
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db);
+
+    let start_ns = ac_start_ns();
+    let start_s = (start_ns / 1_000_000_000) as i64 - 300;
+    let end_s = (start_ns / 1_000_000_000) as i64 + 300;
+
+    // -- The corpus. Adversarial by construction: a service whose name is
+    // digits, a leading-zero string, a duration-shaped string, a
+    // bool-shaped string, two float-shaped strings, an empty string, and
+    // one key (`port`) that is a STRING in one span and an INT in another
+    // with identical text.
+    ac_ingest(
+        port,
+        AcSpan {
+            service: "12345",
+            trace_hex: AC_TRACE_1,
+            span_hex: AC_SPAN_1,
+            name: "checkout",
+            start_ns,
+            attrs: vec![
+                kv_str("build", "007"),
+                kv_str("timeout", "2s"),
+                kv_str("enabled", "true"),
+                kv_str("ratio", "1.5"),
+                kv_str("slo", "1.5"),
+                kv_str("note", ""),
+                kv_int("http.status_code", 500),
+                kv_bool("sampled", true),
+                kv_double("cpu", 1.5),
+                kv_str("port", "8080"),
+            ],
+        },
+        "ac corpus trace 1",
+    );
+    ac_ingest(
+        port,
+        AcSpan {
+            service: "checkout",
+            trace_hex: AC_TRACE_2,
+            span_hex: AC_SPAN_2,
+            name: "charge",
+            start_ns,
+            attrs: vec![kv_int("port", 8080)],
+        },
+        "ac corpus trace 2",
+    );
+
+    // =================================================================
+    // AC2 — the stored type replaces the guess, against reference bytes.
+    // =================================================================
+    let capture = reference_capture();
+    let expected = capture["v2_tag_values"]
+        .as_object()
+        .expect("v2_tag_values object");
+    assert_eq!(
+        expected.len(),
+        11,
+        "the capture must cover every corpus key"
+    );
+    for (key, want) in expected {
+        let ctx = format!("AC2 {key}");
+        let res = get(port, &format!("/api/v2/search/tag/{key}/values"), &ctx);
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        let got = res.json(&ctx);
+        let want_entries = want["tagValues"].as_array().expect("reference tagValues");
+        let got_entries = got["tagValues"].as_array().expect("our tagValues");
+        if want_entries.len() > 1 {
+            // The reference does not sort tag values (ledger
+            // `traceql-tag-discovery-ordering`), so multi-value keys are
+            // compared as SETS. Measured on the capture run: it returned
+            // `span.port` as string-then-int where we return
+            // int-then-string.
+            let norm = |v: &Vec<serde_json::Value>| {
+                let mut s: Vec<String> = v.iter().map(|e| e.to_string()).collect();
+                s.sort();
+                s
+            };
+            assert_eq!(
+                norm(got_entries),
+                norm(want_entries),
+                "{ctx}: entry set must equal the reference's, body {got}"
+            );
+        } else {
+            assert_eq!(
+                got["tagValues"], want["tagValues"],
+                "{ctx}: exact array, body {got}"
+            );
+        }
+        assert!(
+            got.get("truncated").is_none(),
+            "{ctx}: the v2 alias carries no truncated key, body {got}"
+        );
+    }
+
+    // =================================================================
+    // AC4 — one key at two types is two entries. Without `val_type` in
+    // the sorting key the ReplacingMergeTree collapses the pair and
+    // which row survives depends on insertion order.
+    //
+    // The catalog is MERGED first, and that is load-bearing rather than
+    // tidy. The two rows arrive in separate insert blocks, so they sit in
+    // separate parts, and the tag-values read is `SELECT DISTINCT val,
+    // val_type` with no `FINAL` — it returns both rows from unmerged
+    // parts whether or not the sorting key can keep them apart. Measured:
+    // on a tree whose migration 41 omits `MODIFY ORDER BY`, this
+    // assertion PASSED without the merge and fails with it. An assertion
+    // that cannot fail on the defect it names is worse than none.
+    // =================================================================
+    let mut cfg = ch_config();
+    cfg.database = db.to_string();
+    let client = ChClient::new(cfg).await.expect("connect data client");
+    client
+        .execute(
+            "OPTIMIZE TABLE trace_tag_catalog FINAL",
+            &QuerySettings::default(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge the catalog");
+    let ctx = "AC4 span.port";
+    let got = get_ok_json(port, "/api/v2/search/tag/span.port/values", ctx);
+    let mut entries = values_of(&got, ctx);
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            ("int".to_string(), "8080".to_string()),
+            ("string".to_string(), "8080".to_string()),
+        ],
+        "{ctx}: the same text at two types is two entries, body {got}"
+    );
+
+    // =================================================================
+    // AC5 — the v1 flat route deduplicates that pair back to one.
+    // =================================================================
+    let ctx = "AC5 v1 flat port";
+    let got = get_ok_json(port, "/api/search/tag/port/values", ctx);
+    assert_eq!(
+        got, capture["v1_flat_port_values"],
+        "{ctx}: the reference's flat body, body {got}"
+    );
+
+    // =================================================================
+    // AC7b — the same numeric-looking string through the real ingest
+    // path. `slo` is the string "1.5", whose `val_num` is Some(1.5), so
+    // this fails for any implementation that consults `val_num` on the
+    // NEW path as well as on the legacy one.
+    // =================================================================
+    let ctx = "AC7b span.slo native route";
+    let got = get_ok_json(port, "/api/traces/v1/tag/span.slo/values", ctx);
+    assert_eq!(
+        got,
+        serde_json::json!({
+            "tagValues": [{"type": "string", "value": "1.5"}],
+            "truncated": false,
+        }),
+        "{ctx}: body {got}"
+    );
+
+    // =================================================================
+    // AC1 — the composed close condition. Read our OWN tag-values
+    // response, derive the quoting a client derives (quote iff the type
+    // is `string`), and feed the resulting query back to /api/search.
+    // A hard-coded quoted query cannot satisfy this.
+    // =================================================================
+    let ctx = "AC1 derive the query from our own response";
+    let listed = get_ok_json(port, "/api/v2/search/tag/resource.service.name/values", ctx);
+    let entry = listed["tagValues"]
+        .as_array()
+        .expect("tagValues")
+        .iter()
+        .find(|e| e["value"].as_str() == Some("12345"))
+        .unwrap_or_else(|| panic!("{ctx}: no entry for 12345, body {listed}"));
+    let ty = entry["type"].as_str().expect("type");
+    let operand = if ty == "string" {
+        format!("\"{}\"", entry["value"].as_str().expect("value"))
+    } else {
+        entry["value"].as_str().expect("value").to_string()
+    };
+    let q = format!("{{resource.service.name={operand}}}");
+    assert_eq!(
+        q, "{resource.service.name=\"12345\"}",
+        "{ctx}: the client quotes a `string`-typed value; type was {ty:?}"
+    );
+    let res = get(
+        port,
+        &format!(
+            "/api/traces/v1/search?q={}&start={start_s}&end={end_s}",
+            enc(&q)
+        ),
+        ctx,
+    );
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(ctx);
+    assert_eq!(
+        trace_ids(&json),
+        vec![AC_TRACE_1.to_string()],
+        "{ctx}: the query built from our own response must return the trace, body {json}"
+    );
+
+    // =================================================================
+    // AC8 — the three untyped fields accept a cross-type `=`/`!=` and
+    // match nothing. The corpus holds a service literally NAMED `12345`,
+    // so an implementation that stringified the operand would return
+    // trace 1 here and fail the id-set assertion; one that errored would
+    // fail the status assertion.
+    // =================================================================
+    for q in [
+        "{resource.service.name=12345}",
+        "{resource.service.name!=12345}",
+        "{resource.service.name=true}",
+        "{resource.service.name=1.5}",
+        "{resource.service.name=2s}",
+        "{instrumentation:name=5}",
+        "{instrumentation:version=5}",
+        "{instrumentation:name!=5}",
+    ] {
+        let ctx = format!("AC8 {q}");
+        let res = get(
+            port,
+            &format!(
+                "/api/traces/v1/search?q={}&start={start_s}&end={end_s}",
+                enc(q)
+            ),
+            &ctx,
+        );
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: must be accepted, body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        let json = res.json(&ctx);
+        assert_eq!(
+            trace_ids(&json),
+            Vec::<String>::new(),
+            "{ctx}: must match no span, body {json}"
+        );
+    }
+
+    // A STRING operand on the same fields still matches: without this,
+    // "accept and never match" would satisfy AC8 vacuously.
+    let ctx = "AC8 control: the string operand still matches";
+    let res = get(
+        port,
+        &format!(
+            "/api/traces/v1/search?q={}&start={start_s}&end={end_s}",
+            enc("{instrumentation:name=\"io.otel.http\"}")
+        ),
+        ctx,
+    );
+    assert_eq!(res.status, 200, "{ctx}");
+    let mut got = trace_ids(&res.json(ctx));
+    got.sort();
+    assert_eq!(
+        got,
+        vec![AC_TRACE_1.to_string(), AC_TRACE_2.to_string()],
+        "{ctx}: both corpus traces carry that scope name"
+    );
+
+    // =================================================================
+    // AC9 — the five typed sites still REJECT at the wire. This half
+    // proves the validator (the `400` comes from `validate`, not from
+    // the planner); the gate on the changed planner code is the unit
+    // test `typed_string_sites_still_reject_a_non_string_operand` in
+    // `crates/pulsus-read/src/traces/filter.rs`.
+    // =================================================================
+    for (q, want) in [
+        (
+            "{name=5}",
+            "invalid TraceQL query: binary operations must operate on the same type: name = 5",
+        ),
+        (
+            "{trace:id=5}",
+            "invalid TraceQL query: binary operations must operate on the same type: trace:id = 5",
+        ),
+        (
+            "{span:id=5}",
+            "invalid TraceQL query: binary operations must operate on the same type: span:id = 5",
+        ),
+        (
+            "{rootName=5}",
+            "invalid TraceQL query: binary operations must operate on the same type: rootName = 5",
+        ),
+        (
+            "{span:statusMessage=5}",
+            "invalid TraceQL query: binary operations must operate on the same type: statusMessage = 5",
+        ),
+    ] {
+        let ctx = format!("AC9 {q}");
+        let res = get(
+            port,
+            &format!(
+                "/api/traces/v1/search?q={}&start={start_s}&end={end_s}",
+                enc(q)
+            ),
+            &ctx,
+        );
+        let body = assert_error_body(&res, 400, &ctx);
+        assert_eq!(body, want, "{ctx}");
+    }
+
+    // =================================================================
+    // AC10 — bare truthiness. `{ .a }` compiles as `.a = true`, so the
+    // two untyped fields fold to no match while the string-typed
+    // intrinsics stay a validator `400`.
+    // =================================================================
+    for q in ["{ resource.service.name }", "{ instrumentation:name }"] {
+        let ctx = format!("AC10 {q}");
+        let res = get(
+            port,
+            &format!(
+                "/api/traces/v1/search?q={}&start={start_s}&end={end_s}",
+                enc(q)
+            ),
+            &ctx,
+        );
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_eq!(
+            trace_ids(&res.json(&ctx)),
+            Vec::<String>::new(),
+            "{ctx}: matches nothing"
+        );
+    }
+    for (q, want) in [
+        (
+            "{ name }",
+            "invalid TraceQL query: span filter field expressions must resolve to a boolean: { name }",
+        ),
+        (
+            "{ rootName }",
+            "invalid TraceQL query: span filter field expressions must resolve to a boolean: { rootName }",
+        ),
+        (
+            "{ span:statusMessage }",
+            "invalid TraceQL query: span filter field expressions must resolve to a boolean: { statusMessage }",
+        ),
+    ] {
+        let ctx = format!("AC10 reject {q}");
+        let res = get(
+            port,
+            &format!(
+                "/api/traces/v1/search?q={}&start={start_s}&end={end_s}",
+                enc(q)
+            ),
+            &ctx,
+        );
+        let body = assert_error_body(&res, 400, &ctx);
+        assert_eq!(body, want, "{ctx}");
+    }
+
+    // =================================================================
+    // AC11 — the metrics route agrees. Wave B applied only in
+    // `search_plan` would leave this a `400`; the captured `400` it used
+    // to return was `type mismatch: resource.service.name requires a
+    // string value`, not a missing-range error, so the range below is
+    // supplied and the criterion cannot pass for the wrong reason.
+    // =================================================================
+    let ctx = "AC11 metrics query_range";
+    let res = get(
+        port,
+        &format!(
+            "/api/metrics/query_range?q={}&start={}&end={}&step=60s",
+            enc("{resource.service.name=12345} | rate()"),
+            start_s * 1_000_000_000,
+            end_s * 1_000_000_000
+        ),
+        ctx,
+    );
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+
+    // =================================================================
+    // AC7a and AC19 — the LEGACY row shapes, written straight into the
+    // catalog because a single binary cannot produce an old-writer row
+    // through the real path. What proves the shape is reachable is the
+    // migration itself: `val_type` is added with NO default, so every
+    // pre-existing row reads back the empty string.
+    // =================================================================
+    client
+        .execute(
+            "INSERT INTO trace_tag_catalog (scope, key, val, val_type) VALUES \
+             ('span', 'legacy_numeric_text', '1.5', ''), \
+             ('span', 'legacy_plain', 'alpha', ''), \
+             ('span', 'legacy_upgrade', '500', ''), \
+             ('span', 'legacy_upgrade', '500', 'int')",
+            &QuerySettings::default(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed legacy catalog rows");
+    client
+        .execute(
+            "OPTIMIZE TABLE trace_tag_catalog FINAL",
+            &QuerySettings::default(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge the catalog");
+
+    // AC7a. `1.5` is the whole criterion: a text parse says `float`, so
+    // did the text classifier this issue deleted, and so does any rule
+    // sourced from the catalog's numeric companion column, which is that
+    // same parse taken at write time. Only "report the stored type, and
+    // `string` when there is none" says `string`.
+    // `alpha` is a CONTROL, not a gate —
+    // it is `string` under every defective implementation too, and is
+    // here only so a failure separates "the rule is wrong" from "the
+    // empty string leaked out as `{\"type\":\"\"}`".
+    let ctx = "AC7a legacy_numeric_text native";
+    let got = get_ok_json(
+        port,
+        "/api/traces/v1/tag/span.legacy_numeric_text/values",
+        ctx,
+    );
+    assert_eq!(
+        got,
+        serde_json::json!({
+            "tagValues": [{"type": "string", "value": "1.5"}],
+            "truncated": false,
+        }),
+        "{ctx}: body {got}"
+    );
+    let ctx = "AC7a legacy_numeric_text v2";
+    let got = get_ok_json(
+        port,
+        "/api/v2/search/tag/span.legacy_numeric_text/values",
+        ctx,
+    );
+    assert_eq!(
+        got,
+        serde_json::json!({"tagValues": [{"type": "string", "value": "1.5"}]}),
+        "{ctx}: the v2 alias carries no truncated key, body {got}"
+    );
+    let ctx = "AC7a legacy_plain control";
+    let got = get_ok_json(port, "/api/traces/v1/tag/span.legacy_plain/values", ctx);
+    assert_eq!(
+        got,
+        serde_json::json!({
+            "tagValues": [{"type": "string", "value": "alpha"}],
+            "truncated": false,
+        }),
+        "{ctx}: body {got}"
+    );
+
+    // AC19 — the rolling-upgrade duplicate. Both rows survive the merge
+    // (AC4 proves the sorting key keeps them), so the single entry can
+    // only come from the renderer's run rule.
+    let ctx = "AC19 rolling upgrade native";
+    let got = get_ok_json(port, "/api/traces/v1/tag/span.legacy_upgrade/values", ctx);
+    assert_eq!(
+        got,
+        serde_json::json!({
+            "tagValues": [{"type": "int", "value": "500"}],
+            "truncated": false,
+        }),
+        "{ctx}: the untyped sibling must be dropped, body {got}"
+    );
+    let ctx = "AC19 rolling upgrade v2";
+    let got = get_ok_json(port, "/api/v2/search/tag/span.legacy_upgrade/values", ctx);
+    assert_eq!(
+        got,
+        serde_json::json!({"tagValues": [{"type": "int", "value": "500"}]}),
+        "{ctx}: body {got}"
+    );
+
+    // AC6's schema half: `MODIFY ORDER BY` APPENDED. Two separate string
+    // comparisons, so a change that moved both would have to move both
+    // to exactly these values.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct KeysRow {
+        primary_key: String,
+        sorting_key: String,
+    }
+    let mut stream = client
+        .query_stream::<KeysRow>(
+            &format!(
+                "SELECT primary_key, sorting_key FROM system.tables \
+                 WHERE database = '{db}' AND name = 'trace_tag_catalog'"
+            ),
+            &QuerySettings::default(),
+        )
+        .await
+        .expect("read system.tables");
+    let keys = stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode system.tables row");
+    drop(stream);
+    assert_eq!(
+        keys.primary_key, "scope, key, val",
+        "the primary key must be UNCHANGED by migration 41 — it is what prunes every \
+         tag-values read"
+    );
+    assert_eq!(
+        keys.sorting_key, "scope, key, val, val_type",
+        "the sorting key must APPEND val_type — without it the ReplacingMergeTree collapses \
+         a string and an int sharing the same text"
+    );
 
     drop_db(db).await;
 }

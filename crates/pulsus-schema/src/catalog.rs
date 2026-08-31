@@ -799,6 +799,77 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- the attribute value's stored OTLP type (issue #476) ---
+    // Before this column the tag-values wire `type` was inferred from
+    // `val`'s TEXT, so a string attribute reading `12345` was reported
+    // `int` and a client that quotes only `string`-typed values built a
+    // query that matched nothing. The type is now carried from ingest.
+    // Additive `ADD COLUMN IF NOT EXISTS`, never a mutation of id 17's
+    // frozen CREATE; pre-existing rows read back `''`, which the reader
+    // reports as `string` (it cannot be corrected from what is stored —
+    // `val` is the text and `val_num` is a parse of that text, so neither
+    // records the sender's type).
+    Migration {
+        id: 39,
+        name: "trace_attrs_idx",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_attrs_idx{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS val_type LowCardinality(String) DEFAULT '';",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 39 — cluster-gated
+    // (`StaticClusterOnly`), skipped and unrecorded on a single node,
+    // applied the first time clustering is enabled. Mirrors id 22/26/32/36/38.
+    Migration {
+        id: 40,
+        name: "trace_attrs_idx",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_attrs_idx{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS val_type LowCardinality(String) DEFAULT '';",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The catalog's own copy, plus the sorting-key extension it needs.
+    //
+    // `val_type` MUST be in the sorting key: the type is per VALUE, not per
+    // key — one key can hold a string `"8080"` and an int `8080`, whose
+    // `val` bytes are identical. Without the extension the
+    // `ReplacingMergeTree` collapses the pair, and WHICH of the two
+    // survives depends on insertion order, so the wrong answer is also
+    // nondeterministic.
+    //
+    // `val_type` carries NO DEFAULT here, and the three clauses are ONE
+    // statement, because ClickHouse rejects both alternatives: a defaulted
+    // key column gives "Newly added column val_type has a default
+    // expression, so adding expressions that use it to the sorting key is
+    // forbidden", and a standalone `MODIFY ORDER BY` after the column
+    // exists gives "Existing column val_type is used ... You can add
+    // expressions that use only the newly added columns".
+    //
+    // `MODIFY ORDER BY` APPENDS: `primary_key` stays `scope, key, val`, so
+    // the prefix prune that serves every tag-values read is unchanged
+    // (`crates/pulsus-read/tests/traces_tags_explain.rs` gates the prune;
+    // `crates/pulsus-schema/tests/live_traces.rs` gates the two keys).
+    //
+    // No `_dist` twin: id 18 is `Replication::Global, family: None`, so no
+    // `_dist` wrapper of `trace_tag_catalog` exists to alter.
+    Migration {
+        id: 41,
+        name: "trace_tag_catalog",
+        family: None,
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_tag_catalog{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS val_type LowCardinality(String),\n\
+             MODIFY ORDER BY (scope, key, val, val_type);",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::Global,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -827,13 +898,18 @@ pub const MVS: &[MvDef] = &[
                GROUP BY fingerprint, bucket_ns;",
     },
     // Fires per shard in cluster mode; every shard writes the same Global
-    // replica set and `ReplacingMergeTree(scope, key, val)` +
+    // replica set and `ReplacingMergeTree(scope, key, val, val_type)` +
     // duplicate-tolerant reads absorb the redundancy (docs/schemas.md §8) —
     // the established catalog pattern (`metric_metadata`).
+    //
+    // `val_type` (issue #476) rides the projection: the checksum change
+    // makes `controller::reconcile_mvs` DROP and re-CREATE the view, and
+    // `reconcile()` runs every migration before the MVs, so migration 41
+    // has added the target column by then.
     MvDef {
         name: "trace_tag_catalog_mv",
         tmpl: "CREATE MATERIALIZED VIEW {{db}}.trace_tag_catalog_mv{{on_cluster}} TO {{db}}.trace_tag_catalog AS\n\
-               SELECT scope, key, val\n\
+               SELECT scope, key, val, val_type\n\
                FROM {{db}}.trace_attrs_idx;",
     },
     // The service-graph edge ledger MV (M7-E1, issue #173): a pure per-row
@@ -1603,10 +1679,12 @@ mod tests {
     /// Issue #5 fix plan F2 (+ issue #53): only the catalog/bookkeeping
     /// tables — `schema_migrations`, `mv_checksums`, `metric_metadata`, and
     /// `trace_tag_catalog` — join the shard-less, cluster-wide replica set.
+    /// Id 41 is `trace_tag_catalog`'s own `ALTER` (issue #476), so it
+    /// carries the same replication as the `CREATE` it amends.
     #[test]
     fn only_catalog_and_bookkeeping_migrations_are_globally_replicated() {
         for m in MIGRATIONS {
-            let expected = matches!(m.id, 1..=3 | 18);
+            let expected = matches!(m.id, 1..=3 | 18 | 41);
             assert_eq!(
                 m.replication == Replication::Global,
                 expected,

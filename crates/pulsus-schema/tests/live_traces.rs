@@ -475,6 +475,131 @@ async fn run_init_creates_trace_tables_and_mv_and_round_trips_via_the_catalog_mv
         "the MV must populate trace_tag_catalog with the deduplicated (scope, key, val) set — \
          the dual-scope pair stays two rows, separated only by scope"
     );
+
+    // -- Issue #476: `val_type` is in the SORTING KEY and not in the
+    // primary key. Two separate string comparisons, so a change that
+    // moved both would have to move both to exactly these values.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct KeysRow {
+        primary_key: String,
+        sorting_key: String,
+    }
+    let mut stream = client
+        .query_stream::<KeysRow>(
+            &format!(
+                "SELECT primary_key, sorting_key FROM system.tables \
+                 WHERE database = '{db}' AND name = 'trace_tag_catalog'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("select system.tables");
+    let keys = stream
+        .next()
+        .await
+        .expect("trace_tag_catalog must exist")
+        .expect("decode system.tables row");
+    drop(stream);
+    assert_eq!(
+        keys.primary_key, "scope, key, val",
+        "migration 41 must leave the primary key alone — it is the prefix every tag-values \
+         read prunes on"
+    );
+    assert_eq!(
+        keys.sorting_key, "scope, key, val, val_type",
+        "migration 41 must APPEND val_type to the sorting key"
+    );
+
+    // ...and the property that key is FOR: one key holding the same text
+    // at two types keeps BOTH rows through a merge. The type is per
+    // value, not per key — a sender may send `port` as the string
+    // "8080" from one service and as the integer 8080 from another.
+    // Without `val_type` in the key the ReplacingMergeTree collapses the
+    // pair and which row survives depends on insertion order, so the
+    // wrong answer is also nondeterministic.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_attrs_idx \
+                     (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns, val_type) \
+                 VALUES \
+                     (toDate(fromUnixTimestamp64Nano({ts})), 'port', '8080', 'span', 8080, {ts}, \
+                      '0123456789abcdef', 'span0003', 1000000, 'string'), \
+                     (toDate(fromUnixTimestamp64Nano({ts})), 'port', '8080', 'span', 8080, {ts}, \
+                      '0123456789abcdef', 'span0004', 1000000, 'int')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert the two-typed pair");
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.trace_tag_catalog FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge the catalog");
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    struct TypedTagRow {
+        val: String,
+        val_type: String,
+    }
+    let mut stream = client
+        .query_stream::<TypedTagRow>(
+            &format!(
+                "SELECT val, val_type FROM {db}.trace_tag_catalog FINAL \
+                 WHERE scope = 'span' AND key = 'port' ORDER BY val, val_type"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("select the two-typed pair");
+    let mut typed = Vec::new();
+    while let Some(row) = stream.next().await {
+        typed.push(row.expect("decode typed tag row"));
+    }
+    assert_eq!(
+        typed,
+        vec![
+            TypedTagRow {
+                val: "8080".to_string(),
+                val_type: "int".to_string(),
+            },
+            TypedTagRow {
+                val: "8080".to_string(),
+                val_type: "string".to_string(),
+            },
+        ],
+        "both typed rows must survive the merge — without val_type in the sorting key the \
+         ReplacingMergeTree collapses them to one, insertion-order dependent"
+    );
+
+    // A pre-migration row reads back the EMPTY string: migration 41 adds
+    // the column with NO default, which is what makes the legacy shape
+    // the renderer handles actually reachable.
+    let mut stream = client
+        .query_stream::<TypedTagRow>(
+            &format!(
+                "SELECT val, val_type FROM {db}.trace_tag_catalog FINAL \
+                 WHERE scope = 'span' AND key = 'http.status_code' AND val = '404'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("select the untyped row");
+    let legacy = stream
+        .next()
+        .await
+        .expect("the untyped row must exist")
+        .expect("decode untyped tag row");
+    drop(stream);
+    assert_eq!(
+        legacy.val_type, "",
+        "a row inserted without val_type reads back the empty string"
+    );
 }
 
 /// AC3a (issue #53): on the seeded ≥100k-span corpus, the docs/schemas.md
@@ -1680,6 +1805,274 @@ async fn migration_shared_add_column_survives_a_populated_projection_table() {
         svc3, 625,
         "5000 rows spread over 8 services => 625 per service"
     );
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #476: migrations 39 and 41 add `val_type` to `trace_attrs_idx`
+/// and `trace_tag_catalog`. `run_init` on a fresh database lands both
+/// columns with the DIFFERENT defaults they must carry, a second run is a
+/// no-op, and `trace_tag_catalog`'s sorting key gains the column while its
+/// primary key does not.
+///
+/// The two defaults differ on purpose and the difference is the whole
+/// reason migration 41 is written the way it is. On `trace_attrs_idx` the
+/// column is `DEFAULT ''`, like every other additive column here. On
+/// `trace_tag_catalog` it carries NO default, because ClickHouse refuses
+/// to put a defaulted column into a sorting key in the same statement and
+/// equally refuses a standalone `MODIFY ORDER BY` afterwards — the
+/// single-statement, no-default form is the only one it accepts.
+#[tokio::test]
+async fn migrations_39_41_add_val_type_idempotently_and_extend_only_the_sorting_key() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_val_type");
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init (first run)");
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct ColumnRow {
+        table: String,
+        r#type: String,
+        default_expression: String,
+    }
+    let sql = format!(
+        "SELECT table, type, default_expression FROM system.columns \
+         WHERE database = '{db}' AND name = 'val_type' ORDER BY table"
+    );
+    let mut stream = client
+        .query_stream::<ColumnRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.columns");
+    let mut cols = Vec::new();
+    while let Some(row) = stream.next().await {
+        cols.push(row.expect("decode column row"));
+    }
+    drop(stream);
+    assert_eq!(
+        cols.iter().map(|c| c.table.as_str()).collect::<Vec<_>>(),
+        vec![
+            "trace_attrs_idx",
+            "trace_tag_catalog",
+            "trace_tag_catalog_mv"
+        ],
+        "val_type must exist on the source table, the catalog, AND the view that projects it \
+         — the view's entry is what would disappear if the MV template stopped selecting the \
+         column: {cols:?}"
+    );
+    assert!(
+        cols.iter().all(|c| c.r#type == "LowCardinality(String)"),
+        "every copy is LowCardinality(String): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].default_expression, "''",
+        "the attribute index's copy carries the ordinary '' default"
+    );
+    assert_eq!(
+        cols[1].default_expression, "",
+        "the catalog's copy carries NO default expression — a defaulted column cannot enter a \
+         sorting key in the same ALTER"
+    );
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct KeysRow {
+        primary_key: String,
+        sorting_key: String,
+    }
+    let mut stream = client
+        .query_stream::<KeysRow>(
+            &format!(
+                "SELECT primary_key, sorting_key FROM system.tables \
+                 WHERE database = '{db}' AND name = 'trace_tag_catalog'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query system.tables");
+    let keys = stream
+        .next()
+        .await
+        .expect("trace_tag_catalog must exist")
+        .expect("decode system.tables row");
+    drop(stream);
+    assert_eq!(keys.primary_key, "scope, key, val");
+    assert_eq!(keys.sorting_key, "scope, key, val, val_type");
+
+    // Idempotence: the second run neither drifts nor duplicates.
+    run_init(&client, &ctx)
+        .await
+        .expect("run_init (second run, no-op)");
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #476, the UPGRADE path: migration 41's single `ALTER` runs
+/// against a POPULATED pre-#476 `trace_tag_catalog` — the three-column
+/// `ReplacingMergeTree ORDER BY (scope, key, val)` shape with rows already
+/// in it. Afterwards the existing rows read back `val_type = ''`, the
+/// sorting key has grown and the primary key has not, and a newly written
+/// typed row coexists with its untyped sibling through a merge.
+///
+/// The last part is what the reader's run rule exists for: on a rolling
+/// upgrade an un-upgraded node keeps writing untyped rows beside an
+/// upgraded node's typed ones, and both survive here BY DESIGN — the
+/// store cannot collapse them once `val_type` is in the key, so dropping
+/// the untyped one is the renderer's job (gated in
+/// `crates/pulsus-server/src/traces_api/tags_response.rs`).
+#[tokio::test]
+async fn migration_41_alters_a_populated_pre_migration_catalog() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = &pulsus_testkit::test_db("pulsus_schema_it_traces_catalog_upgrade");
+    drop_database(&client, db).await;
+    client
+        .execute(
+            &format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create db");
+
+    // The pre-#476 catalog shape (migration 18's frozen CREATE), populated.
+    client
+        .execute(
+            &format!(
+                "CREATE TABLE {db}.trace_tag_catalog (\
+                     scope LowCardinality(String), key LowCardinality(String), val String\
+                 ) ENGINE = ReplacingMergeTree ORDER BY (scope, key, val)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create the pre-migration catalog");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) VALUES \
+                     ('span', 'port', '8080'), ('resource', 'service.name', '12345')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("seed pre-migration rows");
+
+    // The migration itself, exactly as the catalog declares it.
+    client
+        .execute(
+            &format!(
+                "ALTER TABLE {db}.trace_tag_catalog \
+                 ADD COLUMN IF NOT EXISTS val_type LowCardinality(String), \
+                 MODIFY ORDER BY (scope, key, val, val_type)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("migration 41 must apply to a populated catalog");
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+    struct TypedRow {
+        val: String,
+        val_type: String,
+    }
+    let read = |sql: String| {
+        let client = &client;
+        async move {
+            let mut stream = client
+                .query_stream::<TypedRow>(&sql, &QuerySettings::new())
+                .await
+                .expect("select typed rows");
+            let mut out = Vec::new();
+            while let Some(row) = stream.next().await {
+                out.push(row.expect("decode typed row"));
+            }
+            out
+        }
+    };
+
+    assert_eq!(
+        read(format!(
+            "SELECT val, val_type FROM {db}.trace_tag_catalog FINAL \
+             WHERE scope = 'span' AND key = 'port'"
+        ))
+        .await,
+        vec![TypedRow {
+            val: "8080".to_string(),
+            val_type: String::new(),
+        }],
+        "a pre-migration row reads back the empty string — the column has no default"
+    );
+
+    // The typed sibling of an existing untyped row: both survive FINAL.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_tag_catalog (scope, key, val, val_type) VALUES \
+                     ('span', 'port', '8080', 'int')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert the typed sibling");
+    client
+        .execute(
+            &format!("OPTIMIZE TABLE {db}.trace_tag_catalog FINAL"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("merge");
+    assert_eq!(
+        read(format!(
+            "SELECT val, val_type FROM {db}.trace_tag_catalog FINAL \
+             WHERE scope = 'span' AND key = 'port' ORDER BY val, val_type"
+        ))
+        .await,
+        vec![
+            TypedRow {
+                val: "8080".to_string(),
+                val_type: String::new(),
+            },
+            TypedRow {
+                val: "8080".to_string(),
+                val_type: "int".to_string(),
+            },
+        ],
+        "the rolling-upgrade pair survives the merge, untyped row FIRST — which is what makes \
+         the reader's contiguous-run rule well defined"
+    );
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct KeysRow {
+        primary_key: String,
+        sorting_key: String,
+    }
+    let mut stream = client
+        .query_stream::<KeysRow>(
+            &format!(
+                "SELECT primary_key, sorting_key FROM system.tables \
+                 WHERE database = '{db}' AND name = 'trace_tag_catalog'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("query system.tables");
+    let keys = stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode system.tables row");
+    drop(stream);
+    assert_eq!(
+        keys.primary_key, "scope, key, val",
+        "the ALTER must leave the primary key of a populated table alone"
+    );
+    assert_eq!(keys.sorting_key, "scope, key, val, val_type");
 
     drop_database(&client, db).await;
 }

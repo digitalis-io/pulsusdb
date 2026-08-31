@@ -1684,4 +1684,49 @@ mod tests {
             "no probe compiled at all — the enumeration proves nothing"
         );
     }
+
+    /// Issue #476 Wave B: a cross-type `=`/`!=` on one of the three
+    /// untyped fields must LOWER on the metrics route, not be refused.
+    ///
+    /// The enumeration above cannot see this. It classifies each variant
+    /// against a hand-written table and checks that `compile_leaf` never
+    /// produces a variant marked dead; it never calls `lower_leaf`. So a
+    /// tree that put `LeafEval::Const` back in the refusal arm passes it —
+    /// measured: with that arm restored, every test in this module stayed
+    /// green and only the live `traces_tags_live` AC11 request reddened.
+    /// This test calls the lowering directly so the gate is hermetic.
+    #[test]
+    fn a_cross_type_operand_on_an_untyped_field_lowers_to_a_constant() {
+        let window = SnappedWindow {
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_010_800_000_000_000,
+        };
+        for (field, name) in [
+            (
+                Field::Attribute {
+                    scope: AttrScope::Resource,
+                    key: "service.name".to_string(),
+                },
+                "resource.service.name",
+            ),
+            (
+                Field::Intrinsic(Intrinsic::InstrumentationName),
+                "instrumentation:name",
+            ),
+            (
+                Field::Intrinsic(Intrinsic::InstrumentationVersion),
+                "instrumentation:version",
+            ),
+        ] {
+            let leaf = filter::compile_leaf(
+                &field,
+                ComparisonOp::Eq,
+                &Value::Number("12345".to_string()),
+            )
+            .unwrap_or_else(|e| panic!("{name} must compile: {e}"));
+            let sql = lower_leaf(&leaf, "trace_attrs_idx", window)
+                .unwrap_or_else(|e| panic!("{name} must lower on the metrics route: {e}"));
+            assert_eq!(sql, "0", "{name} must lower to the match-nothing constant");
+        }
+    }
 }

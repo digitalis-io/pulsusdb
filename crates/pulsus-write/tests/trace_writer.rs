@@ -18,7 +18,7 @@ use pulsus_config::WriterConfig;
 use pulsus_write::writer::{
     BackfillMetricsSnapshot, BlockInserter, TraceWriter, TraceWriterTables,
 };
-use pulsus_write::{AttrRecord, ParsedTraces, SpanRecord, TraceSink};
+use pulsus_write::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord, TraceSink};
 
 #[derive(Clone, Copy, Debug)]
 enum MockBehavior {
@@ -149,6 +149,7 @@ fn attr_record(trace_seed: u8, key: &str, val: &str) -> AttrRecord {
         key: key.to_string(),
         scope: "span".to_string(),
         val: val.to_string(),
+        val_type: AttrValueType::String,
         val_num: None,
         timestamp_ns: TS_NS,
         trace_id: [trace_seed; 16],

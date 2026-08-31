@@ -1,0 +1,118 @@
+{
+  "_provenance": {
+    "captured_from": "grafana/tempo:3.0.2, /api/status/buildinfo reported {\"version\":\"v3.0.2\",\"revision\":\"0c4b926d0\",\"branch\":\"HEAD\",\"goVersion\":\"go1.26.3\"}",
+    "image_repo_digest": "docker.io/grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7",
+    "image_pinned_as": "grafana/tempo:3.0.2@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3 (deploy/e2e/compose.single.yaml); the RepoDigest above is what the local store records for the same image after pull",
+    "config": "deploy/e2e/tempo.yaml, unmodified",
+    "captured_on": "2026-08-31 (issue #476)",
+    "how": "One OTLP/HTTP JSON push of the issue #476 acceptance corpus (two resource groups, timestamps derived from the clock at push time), then GET /api/v2/search/tag/{key}/values per key and GET /api/search/tag/port/values.",
+    "metrics_object_removed": "The reference's trailing \"metrics\" object is stripped from every body here: we emit no such key on any tag route. That difference is ledgered as traceql-tag-routes-metrics-object-absent and is not what this fixture is for.",
+    "ordering": "The reference does not sort tag values (ledger traceql-tag-discovery-ordering). Its span.port order here is string-then-int; ours is int-then-string. The test compares the entry SET for keys with more than one value and the exact array for single-value keys.",
+    "corpus": {
+      "trace_1": "1111111111111111aaaaaaaaaaaaaaaa / span aaaaaaaaaaaaaaa1 \"checkout\"; resource service.name = STRING \"12345\"; scope io.otel.http 1.2.3; span attrs build=\"007\", timeout=\"2s\", enabled=\"true\", ratio=\"1.5\", slo=\"1.5\", note=\"\" (all STRINGS), http.status_code=int 500, sampled=bool true, cpu=double 1.5, port=STRING \"8080\"",
+      "trace_2": "2222222222222222bbbbbbbbbbbbbbbb / span bbbbbbbbbbbbbbb2 \"charge\"; resource service.name = string \"checkout\"; span attr port=INT 8080"
+    }
+  },
+  "v2_tag_values": {
+    "resource.service.name": {
+      "tagValues": [
+        {
+          "type": "string",
+          "value": "12345"
+        },
+        {
+          "type": "string",
+          "value": "checkout"
+        }
+      ]
+    },
+    "span.build": {
+      "tagValues": [
+        {
+          "type": "string",
+          "value": "007"
+        }
+      ]
+    },
+    "span.timeout": {
+      "tagValues": [
+        {
+          "type": "string",
+          "value": "2s"
+        }
+      ]
+    },
+    "span.enabled": {
+      "tagValues": [
+        {
+          "type": "string",
+          "value": "true"
+        }
+      ]
+    },
+    "span.ratio": {
+      "tagValues": [
+        {
+          "type": "string",
+          "value": "1.5"
+        }
+      ]
+    },
+    "span.slo": {
+      "tagValues": [
+        {
+          "type": "string",
+          "value": "1.5"
+        }
+      ]
+    },
+    "span.note": {
+      "tagValues": [
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "span.http.status_code": {
+      "tagValues": [
+        {
+          "type": "int",
+          "value": "500"
+        }
+      ]
+    },
+    "span.sampled": {
+      "tagValues": [
+        {
+          "type": "bool",
+          "value": "true"
+        }
+      ]
+    },
+    "span.cpu": {
+      "tagValues": [
+        {
+          "type": "float",
+          "value": "1.5"
+        }
+      ]
+    },
+    "span.port": {
+      "tagValues": [
+        {
+          "type": "string",
+          "value": "8080"
+        },
+        {
+          "type": "int",
+          "value": "8080"
+        }
+      ]
+    }
+  },
+  "v1_flat_port_values": {
+    "tagValues": [
+      "8080"
+    ]
+  }
+}

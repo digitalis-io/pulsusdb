@@ -64,7 +64,7 @@ use prost::Message;
 use pulsus_model::Date;
 
 use crate::error::LogsIngestError;
-use crate::ingest::traces::{AttrRecord, ParsedTraces, SpanRecord};
+use crate::ingest::traces::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord};
 
 /// The `scope` discriminator value for a resource attribute row.
 const SCOPE_RESOURCE: &str = "resource";
@@ -517,6 +517,8 @@ fn parse_span(
             key: EVENT_INTRINSIC_NAME_KEY.to_string(),
             scope: SCOPE_EVENT_INTRINSIC.to_string(),
             val: event.name.clone(),
+            // An event name is an OTLP `string` field.
+            val_type: AttrValueType::String,
             val_num: numeric_val_num(&event.name),
             timestamp_ns,
             trace_id,
@@ -532,6 +534,8 @@ fn parse_span(
             key: EVENT_INTRINSIC_TIME_SINCE_START_KEY.to_string(),
             scope: SCOPE_EVENT_INTRINSIC.to_string(),
             val: time_since_start.to_string(),
+            // A nanosecond count, computed as an `i64`.
+            val_type: AttrValueType::Int,
             val_num: Some(time_since_start as f64),
             timestamp_ns,
             trace_id,
@@ -566,6 +570,8 @@ fn parse_span(
             key: LINK_INTRINSIC_SPAN_ID_KEY.to_string(),
             scope: SCOPE_LINK_INTRINSIC.to_string(),
             val: hex_lower(&link.span_id),
+            // Lowercase hex text.
+            val_type: AttrValueType::String,
             val_num: None,
             timestamp_ns,
             trace_id,
@@ -579,6 +585,8 @@ fn parse_span(
             key: LINK_INTRINSIC_TRACE_ID_KEY.to_string(),
             scope: SCOPE_LINK_INTRINSIC.to_string(),
             val: hex_lower(&link.trace_id),
+            // Lowercase hex text.
+            val_type: AttrValueType::String,
             val_num: None,
             timestamp_ns,
             trace_id,
@@ -688,6 +696,7 @@ fn attr_record(
         key: kv.key.clone(),
         scope: scope.to_string(),
         val,
+        val_type: any_value_type(kv.value.as_ref()),
         val_num,
         timestamp_ns,
         trace_id,
@@ -931,6 +940,34 @@ fn any_value_to_string(value: Option<&AnyValue>) -> String {
         // its presence as a non-fatal issue and process the value as
         // absent/empty (mirrors `otlp_logs::any_value_to_string`).
         Value::StringValueStrindex(_) => String::new(),
+    }
+}
+
+/// The stored type discriminator for an OTLP `AnyValue` (issue #476) —
+/// the companion of [`any_value_to_string`], and deliberately written
+/// beside it so the two cannot classify the same `AnyValue` differently.
+///
+/// Array, kvlist and bytes values RENDER to a string
+/// ([`any_value_to_string`] JSON-encodes the first two and base64s the
+/// third), so they are [`AttrValueType::String`] here: the column states
+/// the type of what we stored, which is what it means. An absent or
+/// entirely unspecified `AnyValue` renders `""` and is likewise a string.
+///
+/// The reference emits no tag-value row at all for a bytes or
+/// heterogeneous-array attribute; that is a difference in row PRESENCE,
+/// not in `type`, and is out of scope here.
+fn any_value_type(value: Option<&AnyValue>) -> AttrValueType {
+    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
+        return AttrValueType::String;
+    };
+    match value {
+        Value::StringValue(_) => AttrValueType::String,
+        Value::BoolValue(_) => AttrValueType::Bool,
+        Value::IntValue(_) => AttrValueType::Int,
+        Value::DoubleValue(_) => AttrValueType::Float,
+        Value::ArrayValue(_) | Value::KvlistValue(_) => AttrValueType::String,
+        Value::BytesValue(_) => AttrValueType::String,
+        Value::StringValueStrindex(_) => AttrValueType::String,
     }
 }
 
@@ -2261,5 +2298,152 @@ mod tests {
         ];
         declared.sort_unstable();
         assert_eq!(emitted, declared, "every declared scope must be reachable");
+    }
+
+    // -- issue #476: the stored OTLP type ---------------------------------
+
+    /// AC3 — the ORDERED `(key, val_type)` list for one attribute of every
+    /// OTLP `AnyValue` kind, plus the adversarial string cases the issue
+    /// names: a string whose text is digits, a duration literal, a boolean
+    /// word, a float, and the empty string.
+    ///
+    /// This is a PERMUTATION break, not a rename check. The expected list
+    /// pairs each key with its own spelling, so swapping two arms of
+    /// `AttrValueType::as_str` (`Int` <-> `Float`, say) moves `port` to
+    /// `float` and `cpu` to `int` and fails here. A test that asserted only
+    /// that the SET `{string,int,float,bool}` appears would pass under that
+    /// swap and must not be written.
+    #[test]
+    fn every_otlp_value_kind_stores_its_own_type_spelling() {
+        let mut s = valid_span();
+        s.attributes = vec![
+            // Strings whose TEXT reads as something else — the whole point
+            // of the column. Before it, `build` was reported `int`,
+            // `timeout` `duration`, `enabled` `bool` and `ratio` `float`.
+            kv("build", Value::StringValue("007".to_string())),
+            kv("timeout", Value::StringValue("2s".to_string())),
+            kv("enabled", Value::StringValue("true".to_string())),
+            kv("ratio", Value::StringValue("1.5".to_string())),
+            kv("note", Value::StringValue(String::new())),
+            // Genuine scalars.
+            kv("status_code", Value::IntValue(500)),
+            kv("sampled", Value::BoolValue(true)),
+            kv("cpu", Value::DoubleValue(1.5)),
+            // Composite values RENDER to a string, so `string` is the truth
+            // about what we stored.
+            kv(
+                "tags",
+                Value::ArrayValue(ArrayValue {
+                    values: vec![AnyValue {
+                        value: Some(Value::StringValue("a".to_string())),
+                    }],
+                }),
+            ),
+            kv(
+                "meta",
+                Value::KvlistValue(KeyValueList {
+                    values: vec![kv("k", Value::StringValue("v".to_string()))],
+                }),
+            ),
+            kv("blob", Value::BytesValue(vec![0xDE, 0xAD])),
+        ];
+        // An attribute carrying NO value at all renders `""` and is a
+        // string; it cannot be spelled through `kv`.
+        s.attributes.push(KeyValue {
+            key: "absent".to_string(),
+            value: None,
+            key_strindex: 0,
+        });
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        let got: Vec<(&str, &str)> = out
+            .attrs
+            .iter()
+            .map(|a| (a.key.as_str(), a.val_type.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("build", "string"),
+                ("timeout", "string"),
+                ("enabled", "string"),
+                ("ratio", "string"),
+                ("note", "string"),
+                ("status_code", "int"),
+                ("sampled", "bool"),
+                ("cpu", "float"),
+                ("tags", "string"),
+                ("meta", "string"),
+                ("blob", "string"),
+                ("absent", "string"),
+            ]
+        );
+    }
+
+    /// The type is NOT a function of the rendered text: a string `"1.5"`
+    /// and a double `1.5` store identical `val` bytes and different types.
+    /// This is the pair no read-side rule could ever separate, which is
+    /// why the column exists.
+    #[test]
+    fn a_string_and_a_double_with_identical_text_store_different_types() {
+        let mut s = valid_span();
+        s.attributes = vec![
+            kv("as_text", Value::StringValue("1.5".to_string())),
+            kv("as_double", Value::DoubleValue(1.5)),
+        ];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        let rows: Vec<(&str, &str, &str)> = out
+            .attrs
+            .iter()
+            .map(|a| (a.key.as_str(), a.val.as_str(), a.val_type.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("as_text", "1.5", "string"), ("as_double", "1.5", "float")]
+        );
+        // `val_num` is populated for BOTH — it is a parse of the text, so
+        // it cannot tell them apart. Asserted so the next reader does not
+        // reach for it as a type source (issue #493 owns its own limits).
+        assert_eq!(out.attrs[0].val_num, Some(1.5));
+        assert_eq!(out.attrs[1].val_num, Some(1.5));
+    }
+
+    /// The writer-synthesised intrinsic rows carry a type too: an event
+    /// name and the two link hex ids are strings, `timeSinceStart` is the
+    /// integer nanosecond count.
+    #[test]
+    fn writer_synthesised_intrinsic_rows_carry_their_own_types() {
+        let mut s = valid_span();
+        s.events = vec![Event {
+            time_unix_nano: 1_700_000_000_500_000_000,
+            name: "cache.miss".to_string(),
+            attributes: vec![],
+            dropped_attributes_count: 0,
+        }];
+        s.links = vec![Link {
+            trace_id: vec![0x0a; 16],
+            span_id: vec![0x0b; 8],
+            trace_state: String::new(),
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            flags: 0,
+        }];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        let rows: Vec<(&str, &str, &str)> = out
+            .attrs
+            .iter()
+            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val_type.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("event:intrinsic", "name", "string"),
+                ("event:intrinsic", "timeSinceStart", "int"),
+                ("link:intrinsic", "spanID", "string"),
+                ("link:intrinsic", "traceID", "string"),
+            ]
+        );
     }
 }

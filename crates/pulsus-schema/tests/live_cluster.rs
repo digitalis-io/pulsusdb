@@ -293,6 +293,39 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         );
     }
 
+    // Issue #476, and this is the ONLY place it can be checked. Migration
+    // 41's `ADD COLUMN … , MODIFY ORDER BY …` runs `ON CLUSTER` against
+    // the `Replicated*` engine, which a single local ClickHouse cannot
+    // even create (it refuses without ZooKeeper), so nothing about the
+    // clustered form of that ALTER is exercised anywhere else. Asserted on
+    // BOTH shards, and as two separate string comparisons per shard: the
+    // prune that serves every tag-values read depends on the primary key
+    // staying `scope, key, val`, and the two-types-per-value answer
+    // depends on `val_type` reaching the sorting key.
+    //
+    // Migration 40's `_dist` twin of the attribute index is covered by the
+    // same reasoning one table over: it is asserted here because the
+    // wrapper is created from a `CREATE … AS` that does not inherit the
+    // base table's ALTERs.
+    for (shard, label) in [(&shard1, "shard1"), (&shard2, "shard2")] {
+        let keys = table_keys(shard, &TEST_DB_DIST, "trace_tag_catalog").await;
+        assert_eq!(
+            keys.primary_key, "scope, key, val",
+            "{label}: the clustered ALTER must leave the primary key alone"
+        );
+        assert_eq!(
+            keys.sorting_key, "scope, key, val, val_type",
+            "{label}: the clustered ALTER must append val_type to the sorting key"
+        );
+        for table in ["trace_attrs_idx", "trace_attrs_idx_dist"] {
+            let ddl = create_table_query(shard, &TEST_DB_DIST, table).await;
+            assert!(
+                ddl.contains("val_type"),
+                "{label}: {table} must carry val_type after migrations 39/40: {ddl}"
+            );
+        }
+    }
+
     // Write/read-back through `_dist`: insert into `log_samples_dist` via a
     // client bound directly to `TEST_DB_DIST` (see live_schema.rs's module doc:
     // `insert_block` cannot take a qualified name), then read the row back
@@ -381,6 +414,38 @@ struct TraceTagRow {
     scope: String,
     key: String,
     val: String,
+    /// Issue #476: the stored OTLP type. Read here as well as written so
+    /// the cross-shard identity check covers the new column rather than
+    /// agreeing on the three it already had.
+    val_type: String,
+}
+
+/// `system.tables`'s two key columns for one table on one shard (issue
+/// #476).
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct TableKeysRow {
+    primary_key: String,
+    sorting_key: String,
+}
+
+async fn table_keys(client: &ChClient, db: &str, table: &str) -> TableKeysRow {
+    let mut stream = client
+        .query_stream::<TableKeysRow>(
+            &format!(
+                "SELECT primary_key, sorting_key FROM system.tables \
+                 WHERE database = '{db}' AND name = '{table}'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("query system.tables for {db}.{table}: {e}"));
+    let row = stream
+        .next()
+        .await
+        .unwrap_or_else(|| panic!("{db}.{table} must exist"))
+        .expect("decode system.tables row");
+    drop(stream);
+    row
 }
 
 /// Reads `table` `FINAL` (bookkeeping/catalog tables are `ReplacingMergeTree`
@@ -549,8 +614,9 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
     shard1
         .execute(
             &format!(
-                "INSERT INTO {TEST_DB_BOOKKEEPING}.trace_tag_catalog (scope, key, val) \
-                 VALUES ('span', 'http.status_code', '500')"
+                "INSERT INTO {TEST_DB_BOOKKEEPING}.trace_tag_catalog \
+                     (scope, key, val, val_type) \
+                 VALUES ('span', 'http.status_code', '500', 'int')"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,
@@ -563,14 +629,14 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
                 &shard1,
                 &TEST_DB_BOOKKEEPING,
                 "trace_tag_catalog",
-                "scope, key, val",
+                "scope, key, val, val_type",
             )
             .await,
             bookkeeping_rows::<TraceTagRow>(
                 &shard2,
                 &TEST_DB_BOOKKEEPING,
                 "trace_tag_catalog",
-                "scope, key, val",
+                "scope, key, val, val_type",
             )
             .await,
         )

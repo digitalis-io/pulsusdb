@@ -38,7 +38,7 @@ use pulsus_clickhouse::{
 use pulsus_config::WriterConfig;
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::writer::{BlockInserter, ChBlockInserter, TraceWriter, TraceWriterTables};
-use pulsus_write::{AttrRecord, ParsedTraces, SpanRecord, TraceAttrRow, TraceSink};
+use pulsus_write::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord, TraceAttrRow, TraceSink};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -210,6 +210,7 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             key: ATTR_KEY.to_string(),
             scope: ATTR_SCOPE.to_string(),
             val: ATTR_VAL.to_string(),
+            val_type: AttrValueType::Int,
             val_num: Some(500.0),
             timestamp_ns: ts_ns,
             trace_id: TRACE_ID,
@@ -402,6 +403,7 @@ async fn l_t1_lost_attr_index_heals_and_the_primary_key_probe_finds_the_span() {
         trace_id: TRACE_ID,
         span_id: SPAN_ID,
         duration_ns: 1_000_000_000,
+        val_type: "int".to_string(),
     };
     client
         .insert_block("trace_attrs_idx", &[duplicate])

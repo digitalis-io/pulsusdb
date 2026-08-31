@@ -15,16 +15,39 @@
 //! all projected away). Pure in-memory projections over the same
 //! already-computed `TagNames`/`TagValues`; no extra query work.
 //!
-//! **Type inference is best-effort by contract** (task-manager
-//! adjudication 2 on issue #58): `trace_tag_catalog` stores `val` as a
-//! bare `String` with no type column (the #54 amendment window is
-//! closed), so the wire `type` is inferred from the stored text — a
-//! numeric- or duration-*looking* string attribute infers as
-//! numeric/duration. The `duration` category delegates to
-//! `pulsus_traceql::is_duration_literal`, the SINGLE SOURCE OF TRUTH for
-//! the normative §4.2 duration grammar (final amendment: no second
-//! implementation exists to drift — `.5s` infers as duration, `0.1ns`
-//! does not).
+//! **The wire `type` is the STORED type, never a reading of the value's
+//! text** (issue #476). `trace_tag_catalog.val_type` carries the OTLP kind
+//! the sender sent, put there at ingest by
+//! `pulsus_write::ingest::traces::AttrValueType` and projected by
+//! `trace_tag_catalog_mv`. Nothing in this module inspects a character of
+//! `val` to decide a type. The text-classifying helper that used to —
+//! `bool` for `"true"`, `duration` for anything the duration-literal
+//! parser accepted, `int` for digits, `float` for an `f64` parse — is
+//! DELETED, not kept for legacy rows, along with the `duration` category,
+//! which the catalog can no longer emit and which the reference never
+//! emits for an attribute either. Nothing replaced it: see
+//! `pulsus_read::TagValue` for why the stored columns cannot type a
+//! legacy row either.
+//!
+//! **The legacy window, stated where the code is.** A row written before
+//! migration 41 has `val_type = ""`. It is reported as `string`, and it
+//! CANNOT be corrected from what is stored — a string `"1.5"` and a
+//! double `1.5` are byte-identical in the catalog, and the numeric
+//! companion column is itself a parse of that same text rather than a
+//! record of the sender's type (`pulsus_read::TagValue`). Reporting
+//! `string` invents nothing and is what those rows already reported for
+//! non-numeric text. The window has no end on its
+//! own: `trace_tag_catalog` has NO TTL, so legacy rows never age out. It
+//! closes when
+//!
+//! ```sql
+//! SELECT count() FROM trace_tag_catalog WHERE val_type = ''
+//! ```
+//!
+//! returns `0` on every deployment — at which point the empty-`val_type`
+//! branch of [`entry_type`] and the run rule's drop of an untyped sibling
+//! are dead code. Getting there needs a catalog rebuild-or-clear
+//! mechanism, which is deliberately not designed here.
 
 use std::collections::HashSet;
 
@@ -62,7 +85,7 @@ pub(crate) enum TagValuesAnswer<'a> {
     /// The static vocabulary: every value typed `keyword`, never
     /// truncated, never read from the store.
     Static(&'a [&'static str]),
-    /// A catalog read: type inferred per value, `truncated` carried.
+    /// A catalog read: the stored type per value, `truncated` carried.
     Catalog(&'a TagValues),
 }
 
@@ -123,15 +146,49 @@ fn scopes_json(answer: &TagNamesAnswer<'_>) -> Vec<Value> {
     out
 }
 
+/// The wire `type` for one catalog row (issue #476): the stored type, or
+/// `string` when the row predates migration 41 and carries none. See the
+/// module doc for why no better answer exists for such a row and for the
+/// query that decides when this branch is dead.
+fn entry_type(val_type: &str) -> &str {
+    if val_type.is_empty() {
+        STRING_TYPE
+    } else {
+        val_type
+    }
+}
+
+/// The wire spelling an untyped legacy row reports.
+const STRING_TYPE: &str = "string";
+
 /// The shared typed `tagValues` array — values stay strings on the wire
-/// (Tempo shape); `type` is the inferred category, or `keyword` for a
-/// static answer (issue #475), which is what makes the datasource emit
-/// the value unquoted.
+/// (Tempo shape); `type` is the STORED type, or `keyword` for a static
+/// answer (issue #475), which is what makes the datasource emit the value
+/// unquoted.
 ///
 /// An EMPTY value omits the `value` key entirely: the canonical protobuf
 /// JSON mapping omits a default-valued scalar, so the reference sends
 /// `{"type":"string"}` with no `value`. Same omission rule
 /// `search_response.rs` already applies to `durationNanos`/`durationMs`.
+///
+/// **The run rule** (issue #476). Rows arrive `ORDER BY val, val_type`, so
+/// rows sharing a `val` are contiguous and the empty `val_type` sorts
+/// FIRST inside its run. For each run: if any row carries a non-empty
+/// `val_type`, emit one entry per distinct non-empty type and DROP the
+/// empty-`val_type` row; otherwise emit one `string` entry. Without it a
+/// rolling upgrade — an un-upgraded node still writing rows with no
+/// `val_type` beside an upgraded node writing typed ones — shows the same
+/// value twice, `{"type":"string","value":"500"}` beside
+/// `{"type":"int","value":"500"}`, for one attribute. Migration 41 puts
+/// `val_type` in the sorting key precisely so both rows SURVIVE the merge,
+/// so the store cannot collapse them and this pass is the only thing that
+/// can.
+///
+/// Stated edge: if the `LIMIT cap + 1` probe splits a run, the tail is
+/// missing and `truncated` is already `true`; that is not chased further.
+///
+/// One pass over at most `TAG_VALUES_MAX` entries, no extra query, and no
+/// character of `val` is read.
 fn typed_values_json(answer: &TagValuesAnswer<'_>) -> Vec<Value> {
     fn entry(ty: &str, val: &str) -> Value {
         let mut obj = serde_json::Map::new();
@@ -143,11 +200,34 @@ fn typed_values_json(answer: &TagValuesAnswer<'_>) -> Vec<Value> {
     }
     match answer {
         TagValuesAnswer::Static(values) => values.iter().map(|v| entry(KEYWORD_TYPE, v)).collect(),
-        TagValuesAnswer::Catalog(values) => values
-            .values
-            .iter()
-            .map(|v| entry(infer_type(v), v))
-            .collect(),
+        TagValuesAnswer::Catalog(values) => {
+            let mut out: Vec<Value> = Vec::with_capacity(values.values.len());
+            let mut i = 0;
+            while i < values.values.len() {
+                let val = values.values[i].val.as_str();
+                let mut run_end = i;
+                while run_end < values.values.len() && values.values[run_end].val == val {
+                    run_end += 1;
+                }
+                let run = &values.values[i..run_end];
+                let mut emitted = 0;
+                for v in run {
+                    // An untyped row is DROPPED when a typed sibling
+                    // shares its value, and answered by the fallback
+                    // below when it does not.
+                    if v.val_type.is_empty() {
+                        continue;
+                    }
+                    out.push(entry(entry_type(&v.val_type), val));
+                    emitted += 1;
+                }
+                if emitted == 0 {
+                    out.push(entry(entry_type(""), val));
+                }
+                i = run_end;
+            }
+            out
+        }
     }
 }
 
@@ -223,40 +303,43 @@ pub(crate) fn render_tag_names_flat(answer: &TagNamesAnswer<'_>) -> Value {
 /// Tempo v1 alias (`/api/search/tag/{tag}/values`): flat
 /// `{"tagValues":[…]}` — bare value strings; type and `truncated`
 /// dropped.
-pub(crate) fn render_tag_values_flat(values: &TagValues) -> Value {
-    json!({"tagValues": &values.values})
-}
-
-/// Deterministic best-effort type inference over the stored string, in
-/// this order (issue #58 plan v2 Δ2 as amended):
 ///
-/// 1. exact `true`/`false` (case-sensitive, documented) → `bool`;
-/// 2. a valid §4.2 TraceQL duration literal, by the normative parser's
-///    own verdict (`pulsus_traceql::is_duration_literal` — single
-///    source of truth, no second grammar) → `duration`;
-/// 3. all ASCII digits with an optional leading `-` → `int`;
-/// 4. `f64`-parseable → `float`;
-/// 5. everything else → `string`.
-pub(crate) fn infer_type(val: &str) -> &'static str {
-    if val == "true" || val == "false" {
-        return "bool";
+/// Deduplicates on `val` ALONE (issue #476): the underlying read now
+/// returns one row per `(value, type)` pair, so a key holding a string
+/// `"8080"` and an int `8080` yields two rows whose flat projection would
+/// otherwise be `["8080","8080"]`. Rows sharing a `val` are contiguous by
+/// the read's `ORDER BY`, so this is a first-occurrence pass, not a set.
+pub(crate) fn render_tag_values_flat(values: &TagValues) -> Value {
+    let mut flat: Vec<&str> = Vec::with_capacity(values.values.len());
+    for v in &values.values {
+        if flat.last() != Some(&v.val.as_str()) {
+            flat.push(v.val.as_str());
+        }
     }
-    if pulsus_traceql::is_duration_literal(val) {
-        return "duration";
-    }
-    let digits = val.strip_prefix('-').unwrap_or(val);
-    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-        return "int";
-    }
-    if val.parse::<f64>().is_ok() {
-        return "float";
-    }
-    "string"
+    json!({"tagValues": flat})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use pulsus_read::TagValue;
+
+    /// `(value, stored type)` pairs as the engine hands them over —
+    /// ALREADY in the read's `ORDER BY val, val_type` order, which the run
+    /// rule depends on. An empty type is a pre-migration-41 row.
+    fn tag_values(pairs: &[(&str, &str)], truncated: bool) -> TagValues {
+        TagValues {
+            values: pairs
+                .iter()
+                .map(|(val, val_type)| TagValue {
+                    val: (*val).to_string(),
+                    val_type: (*val_type).to_string(),
+                })
+                .collect(),
+            truncated,
+        }
+    }
 
     /// A catalog answer that does NOT carry the intrinsic scope — the
     /// shape every scoped-request test wants.
@@ -312,10 +395,7 @@ mod tests {
 
     #[test]
     fn render_tag_values_emits_typed_values_and_the_flag() {
-        let values = TagValues {
-            values: vec!["checkout".to_string(), "500".to_string()],
-            truncated: false,
-        };
+        let values = tag_values(&[("checkout", "string"), ("500", "int")], false);
         assert_eq!(
             render_tag_values(&TagValuesAnswer::Catalog(&values)),
             json!({
@@ -326,10 +406,7 @@ mod tests {
                 "truncated": false,
             })
         );
-        let empty = TagValues {
-            values: vec![],
-            truncated: false,
-        };
+        let empty = tag_values(&[], false);
         assert_eq!(
             render_tag_values(&TagValuesAnswer::Catalog(&empty)),
             json!({"tagValues": [], "truncated": false})
@@ -452,10 +529,7 @@ mod tests {
     /// mapping omits a default-valued scalar. The type is still emitted.
     #[test]
     fn an_empty_tag_value_omits_the_value_key() {
-        let values = TagValues {
-            values: vec!["".to_string(), "x".to_string()],
-            truncated: false,
-        };
+        let values = tag_values(&[("", "string"), ("x", "string")], false);
         assert_eq!(
             render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
             json!({"tagValues": [{"type": "string"}, {"type": "string", "value": "x"}]})
@@ -508,10 +582,7 @@ mod tests {
 
     #[test]
     fn render_tag_values_typed_v2_is_the_native_typed_values_without_a_truncated_key() {
-        let values = TagValues {
-            values: vec!["checkout".to_string(), "500".to_string()],
-            truncated: true,
-        };
+        let values = tag_values(&[("checkout", "string"), ("500", "int")], true);
         let v2 = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values));
         assert_eq!(
             v2,
@@ -526,10 +597,7 @@ mod tests {
             v2.get("truncated").is_none(),
             "the v2 alias must drop `truncated` even when the native flag is true: {v2}"
         );
-        let empty = TagValues {
-            values: vec![],
-            truncated: false,
-        };
+        let empty = tag_values(&[], false);
         assert_eq!(
             render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&empty)),
             json!({"tagValues": []})
@@ -564,66 +632,136 @@ mod tests {
 
     #[test]
     fn render_tag_values_flat_emits_bare_strings_without_type_or_truncated() {
-        let values = TagValues {
-            values: vec!["checkout".to_string(), "500".to_string()],
-            truncated: true,
-        };
+        let values = tag_values(&[("checkout", "string"), ("500", "int")], true);
         assert_eq!(
             render_tag_values_flat(&values),
             json!({"tagValues": ["checkout", "500"]})
         );
-        let empty = TagValues {
-            values: vec![],
-            truncated: false,
-        };
+        let empty = tag_values(&[], false);
         assert_eq!(render_tag_values_flat(&empty), json!({"tagValues": []}));
     }
 
-    /// AC3 (plan v2 Δ2 as amended): the pinned inference vectors,
-    /// including the ambiguous ones.
+    // -- issue #476: the stored type, the legacy window, the run rule ----
+
+    /// AC7a's hermetic half. A legacy row whose text READS as a number is
+    /// `string`. `1.5` is the whole assertion: a text parse says `float`,
+    /// so did the classifier this issue deleted, and so does any rule
+    /// sourced from the catalog's numeric companion column, which is
+    /// itself that same parse taken at write time. Only "report the stored
+    /// type, and `string` when there is none" says `string`.
     #[test]
-    fn infer_type_covers_the_pinned_vectors() {
-        for (val, expected) in [
-            ("123", "int"),
-            ("-7", "int"),
-            ("1.5", "float"),
-            ("-1.5", "float"),
-            ("1h", "duration"),
-            ("1h30m", "string"), // compound literals are not in the grammar
-            ("123ms", "duration"),
-            ("1.5s", "duration"),
-            ("5m", "duration"),
-            ("true", "bool"),
-            ("false", "bool"),
-            ("TRUE", "string"), // case-sensitive, documented
-            ("trueish", "string"),
-            ("", "string"),
-        ] {
-            assert_eq!(infer_type(val), expected, "vector {val:?}");
+    fn a_legacy_row_reports_string_however_its_text_reads() {
+        for text in ["1.5", "12345", "-7", "true", "2s", "alpha", ""] {
+            let values = tag_values(&[(text, "")], false);
+            let rendered = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values));
+            let expected = if text.is_empty() {
+                json!({"tagValues": [{"type": "string"}]})
+            } else {
+                json!({"tagValues": [{"type": "string", "value": text}]})
+            };
+            assert_eq!(rendered, expected, "legacy row {text:?}");
         }
     }
 
-    /// AC3 (final amendment): the duration category agrees with the
-    /// normative parser's verdict on the corpus-adjacent cases — `.5s`
-    /// is grammar-valid, `0.1ns` rejects (fractional nanoseconds), `1d`
-    /// rejects (unsupported unit), `1h30m` rejects (compound).
+    /// The stored type is reported verbatim for every spelling the writer
+    /// can produce — a permutation break, not a presence check: swapping
+    /// two arms of `AttrValueType::as_str` moves a value here.
     #[test]
-    fn duration_inference_agrees_with_the_normative_parser_verdict() {
-        for val in [".5s", "0.5s", "1d", "0.1ns", "1h30m", "2s", "500µs"] {
-            let parser_says = pulsus_traceql::is_duration_literal(val);
-            assert_eq!(
-                infer_type(val) == "duration",
-                parser_says,
-                "inference must agree with the parser on {val:?}"
-            );
+    fn a_typed_row_reports_its_stored_type_verbatim() {
+        let values = tag_values(
+            &[
+                ("1.5", "float"),
+                ("12345", "string"),
+                ("2s", "string"),
+                ("500", "int"),
+                ("true", "bool"),
+            ],
+            false,
+        );
+        assert_eq!(
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            json!({"tagValues": [
+                {"type": "float", "value": "1.5"},
+                {"type": "string", "value": "12345"},
+                {"type": "string", "value": "2s"},
+                {"type": "int", "value": "500"},
+                {"type": "bool", "value": "true"},
+            ]})
+        );
+    }
+
+    /// AC4's renderer half: one key at two types is TWO entries. The
+    /// sorting-key half — that both rows survive the merge at all — is
+    /// gated live in `crates/pulsus-schema/tests/live_traces.rs`.
+    #[test]
+    fn one_value_at_two_types_renders_two_entries() {
+        let values = tag_values(&[("8080", "int"), ("8080", "string")], false);
+        assert_eq!(
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            json!({"tagValues": [
+                {"type": "int", "value": "8080"},
+                {"type": "string", "value": "8080"},
+            ]})
+        );
+    }
+
+    /// AC5: the v1 flat route collapses that pair back to ONE element.
+    #[test]
+    fn the_flat_route_deduplicates_a_value_stored_at_two_types() {
+        let values = tag_values(&[("8080", "int"), ("8080", "string")], false);
+        assert_eq!(
+            render_tag_values_flat(&values),
+            json!({"tagValues": ["8080"]})
+        );
+    }
+
+    /// AC19's renderer half: the rolling-upgrade shape. An un-upgraded
+    /// node writes `('span','http.status_code','500','')`; an upgraded one
+    /// writes the same value as `int`. Both rows survive the merge (the
+    /// sorting key keeps them), so only this rule can stop the wire
+    /// showing `500` twice.
+    ///
+    /// The INTEGER fixture is the discriminating one. A pair of legacy
+    /// STRING rows renders `[string, string]` without the rule, which any
+    /// later output deduplication would also collapse — so that fixture
+    /// cannot tell the rule from a dedupe. `[string, int]` is not
+    /// collapsible by value, so only the run rule produces one entry.
+    #[test]
+    fn a_rolling_upgrade_duplicate_collapses_to_the_typed_row() {
+        let values = tag_values(&[("500", ""), ("500", "int")], false);
+        assert_eq!(
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            json!({"tagValues": [{"type": "int", "value": "500"}]})
+        );
+        // ...and the untyped row is dropped, not merely reordered.
+        let rendered = render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values));
+        assert_eq!(rendered["tagValues"].as_array().expect("array").len(), 1);
+    }
+
+    /// The run rule keeps runs apart: a legacy row for one value must not
+    /// be silenced by a typed row for a DIFFERENT value.
+    #[test]
+    fn the_run_rule_does_not_leak_across_values() {
+        let values = tag_values(&[("a", ""), ("b", ""), ("b", "int"), ("c", "")], false);
+        assert_eq!(
+            render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values)),
+            json!({"tagValues": [
+                {"type": "string", "value": "a"},
+                {"type": "int", "value": "b"},
+                {"type": "string", "value": "c"},
+            ]})
+        );
+    }
+
+    /// The empty string never reaches the wire as a `type`.
+    #[test]
+    fn no_rendered_entry_carries_an_empty_type() {
+        let values = tag_values(&[("x", ""), ("y", "int"), ("y", "")], false);
+        for entry in render_tag_values_typed_v2(&TagValuesAnswer::Catalog(&values))["tagValues"]
+            .as_array()
+            .expect("array")
+        {
+            assert_ne!(entry["type"], json!(""), "{entry}");
         }
-        assert_eq!(infer_type(".5s"), "duration");
-        assert_eq!(infer_type("0.5s"), "duration");
-        assert_eq!(infer_type("1d"), "string");
-        assert_eq!(infer_type("1h30m"), "string");
-        // `0.1ns` is lexically duration-shaped but does not resolve to
-        // whole nanoseconds (FractionalNanoseconds reject), and its unit
-        // suffix defeats the int/float parses — it is a plain string.
-        assert_eq!(infer_type("0.1ns"), "string");
     }
 }

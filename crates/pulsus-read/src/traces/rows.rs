@@ -321,10 +321,16 @@ pub struct TagNameRow {
 }
 
 /// One `trace_tag_catalog` row of the §4.3 tag-values read
-/// (`tags_sql::tag_values_sql` — `SELECT DISTINCT val`, issue #58).
+/// (`tags_sql::tag_values_sql` — `SELECT DISTINCT val, val_type`, issues
+/// #58 and #476). Field order matches the SELECT list exactly (RowBinary
+/// is positional).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct TagValueRow {
     pub val: String,
+    /// The stored OTLP type (`string`/`int`/`float`/`bool`), or the EMPTY
+    /// string for a row written before issue #476's migration 41 added the
+    /// column. The renderer reports an empty one as `string`.
+    pub val_type: String,
 }
 
 /// What [`super::exec::TraceEngine::fetch_by_id`] hands to callers: the
