@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 27)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 27)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -157,7 +157,15 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 49), ("traces_metrics", 2
 /// hope — `git diff --stat crates/pulsus-read/tests/golden/` shows one
 /// addition and no modification, and this digest would move if it did
 /// not. The digest moves because the corpus grew.
-const PINNED_SQL_CORPUS: u64 = 0xbe0b_7a21_b436_ac7b;
+///
+/// 76 -> 77 (issue #476 Wave B): ONE added `traces_search` golden,
+/// `service_name_cross_type_eq.sql` — the cross-type `=` on
+/// `resource.service.name` that Wave B turns from a planner `400` into an
+/// accepted query matching no span. **No pre-existing golden moved:** the
+/// new lowering is reached only where the old code returned `Err`, so
+/// `git diff --stat crates/pulsus-read/tests/golden/` shows one addition
+/// and no modification. The digest moves because the corpus grew.
+const PINNED_SQL_CORPUS: u64 = 0x5cfb_2b8b_0af8_817a;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -289,7 +297,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 76, "the frozen SQL corpus is 49 + 27 = 76 entries");
+    assert_eq!(total, 77, "the frozen SQL corpus is 50 + 27 = 77 entries");
 }
 
 #[test]
@@ -334,7 +342,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     }
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 75 frozen SQL goldens changed. This is not a constant to refresh: it means the \
+        "the 77 frozen SQL goldens changed. This is not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
          PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \

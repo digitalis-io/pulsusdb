@@ -623,6 +623,80 @@ fn string_op_leaf(
     }
 }
 
+/// The outcome of [`untyped_string_op_leaf`]: a field the reference gives
+/// NO concrete type still lowers to an ordinary string comparison when the
+/// operand IS a string; a cross-type `=`/`!=` there is a query the
+/// reference's own validator accepts, so it must not be a plan error.
+#[derive(Debug)]
+enum UntypedLeaf {
+    /// String operand — identical to [`string_op_leaf`]'s success.
+    String(ComparisonOp, String),
+    /// Cross-type `=`/`!=` — matches no span.
+    Never,
+}
+
+/// The operand rule for the three fields the reference's `impliedType`
+/// has no arm for: `resource.service.name`, `instrumentation:name` and
+/// `instrumentation:version` (issue #476 Wave B). `validate.rs`'s
+/// `field_type` already types all three as `Attribute`, so a cross-type
+/// comparison passes semantic validation and reaches the planner — where
+/// [`string_op_leaf`] used to reject it as a `400`. The reference answers
+/// such a query, so a plan error was our own divergence.
+///
+/// The rules, each with its own unit test below:
+///
+/// | operand | operator | outcome |
+/// |---|---|---|
+/// | `Value::String` | `= != =~ !~` | [`UntypedLeaf::String`] |
+/// | `Value::String` | ordered | `TypeMismatch("{f} supports only = != =~ !~")` |
+/// | non-string | `=` `!=` | [`UntypedLeaf::Never`] |
+/// | non-string | `=~` `!~` | `TypeMismatch("{f} requires a string value")` |
+/// | non-string | ordered | `TypeMismatch("{f} supports only = != =~ !~")` |
+///
+/// The `=~`/`!~` refusal is unreachable from the wire — `validate` rejects
+/// a non-string regex operand with the reference's own `illegal operation
+/// for the given types` first — and is kept so the AST-constructed path
+/// stays total.
+///
+/// The five OTHER [`string_op_leaf`] call sites are deliberately NOT moved
+/// here: `name`, `trace:id`, `span:id`, `span:parentID`, `rootName`,
+/// `rootServiceName` and `statusMessage` map to intrinsics the reference
+/// types as strings, so it rejects a non-string operand there too. A
+/// blanket relaxation would be the wrong fix; see
+/// `typed_string_sites_still_reject_a_non_string_operand`.
+fn untyped_string_op_leaf(
+    field_name: &str,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<UntypedLeaf, PlanError> {
+    if !matches!(
+        op,
+        ComparisonOp::Eq | ComparisonOp::Neq | ComparisonOp::Re | ComparisonOp::Nre
+    ) {
+        return Err(PlanError::TypeMismatch(format!(
+            "{field_name} supports only = != =~ !~"
+        )));
+    }
+    match value {
+        Value::String(s) => Ok(UntypedLeaf::String(op, s.clone())),
+        _ if matches!(op, ComparisonOp::Eq | ComparisonOp::Neq) => Ok(UntypedLeaf::Never),
+        _ => Err(PlanError::TypeMismatch(format!(
+            "{field_name} requires a string value"
+        ))),
+    }
+}
+
+/// The leaf a [`UntypedLeaf::Never`] compiles to: the leaf shape issue
+/// #351 already established for `{ "x" = "y" }` — a complete time-range
+/// generator and a plan-time-folded `false`. No new plan kind, no new SQL
+/// stage; the constant is decided once per query, never per candidate span.
+fn never_matching_leaf() -> CompiledLeaf {
+    CompiledLeaf {
+        generator: LeafGenerator::time_range(),
+        eval: LeafEval::Const(false),
+    }
+}
+
 /// The ONE regex→SQL renderer on the TraceQL path (issue #282): the
 /// checked escaper compiles `^(?:pat)$` — byte-for-byte the string it
 /// escapes — so an uncompilable pattern is a plan-time [`PlanError`]
@@ -999,8 +1073,18 @@ fn attr_generator_predicate(probe: &AttrProbe, _class: GenClass) -> Result<Strin
 
 /// Compiles the `resource.service.name` fast path (adjudication 5: only
 /// the resource-scoped form lowers to the physical `service` column).
+///
+/// The operand rule is [`untyped_string_op_leaf`]'s (issue #476 Wave B):
+/// the reference gives this field no concrete type, so `{
+/// resource.service.name = 12345 }` — the query a client builds from an
+/// unquoted tag value — is an accepted query that matches no span, not a
+/// `400`. A service literally NAMED `12345` must still not be returned:
+/// the operand is a number, and a number is not the string it renders as.
 fn compile_service_leaf(op: ComparisonOp, value: &Value) -> Result<CompiledLeaf, PlanError> {
-    let (op, s) = string_op_leaf("resource.service.name", op, value)?;
+    let (op, s) = match untyped_string_op_leaf("resource.service.name", op, value)? {
+        UntypedLeaf::String(op, s) => (op, s),
+        UntypedLeaf::Never => return Ok(never_matching_leaf()),
+    };
     let physical = PhysicalPredicate::Service {
         op,
         value: s.clone(),
@@ -1338,8 +1422,19 @@ pub fn compile_leaf(
         }
         // -- issue #192: the instrumentation-scope intrinsics — hydrated
         // physical columns, the `statusMessage` precedent -----------------
+        //
+        // Both take [`untyped_string_op_leaf`]'s operand rule (issue #476
+        // Wave B): `validate.rs`'s `field_type` deliberately types them
+        // as attributes because the reference's `impliedType` has no arm
+        // for them, so its validator accepts `{ instrumentation:name = 5 }`
+        // — and a query the validator accepted must not then be a planner
+        // `400`. Ledger `traceql-untyped-intrinsic-cross-type-operand`
+        // records the three measured answers and why ours is a `200`.
         Field::Intrinsic(Intrinsic::InstrumentationName) => {
-            let (op, s) = string_op_leaf("instrumentation:name", op, value)?;
+            let (op, s) = match untyped_string_op_leaf("instrumentation:name", op, value)? {
+                UntypedLeaf::String(op, s) => (op, s),
+                UntypedLeaf::Never => return Ok(never_matching_leaf()),
+            };
             let physical = PhysicalPredicate::InstrumentationName { op, value: s };
             Ok(CompiledLeaf {
                 generator: spans_generator_for(&physical)?,
@@ -1347,7 +1442,10 @@ pub fn compile_leaf(
             })
         }
         Field::Intrinsic(Intrinsic::InstrumentationVersion) => {
-            let (op, s) = string_op_leaf("instrumentation:version", op, value)?;
+            let (op, s) = match untyped_string_op_leaf("instrumentation:version", op, value)? {
+                UntypedLeaf::String(op, s) => (op, s),
+                UntypedLeaf::Never => return Ok(never_matching_leaf()),
+            };
             let physical = PhysicalPredicate::InstrumentationVersion { op, value: s };
             Ok(CompiledLeaf {
                 generator: spans_generator_for(&physical)?,
@@ -3630,6 +3728,182 @@ mod tests {
             7,
             "the pre-check must actually fire on this list, or the relation above is the old \
              equality wearing a new name: {precheck_refused:?}"
+        );
+    }
+
+    // -- issue #476 Wave B: the three fields the reference gives no
+    // concrete type -----------------------------------------------------
+
+    /// The three fields that MOVED to [`untyped_string_op_leaf`], as
+    /// `(Field, field_name)` pairs. The pairing is the point: the error
+    /// messages below are built from the second element, so a site wired
+    /// to the wrong name fails rather than passing on a near-miss string.
+    /// A `Value` lifted out of a parsed query, so the test never needs a
+    /// constructor the AST keeps crate-private (`Duration::from_nanos`).
+    fn literal_operand(q: &str) -> Value {
+        let f = first_filter(q);
+        let FieldExpr::Binary { rhs, .. } = f.body.as_ref().expect("a filter body") else {
+            panic!("expected a binary comparison in {q}");
+        };
+        let FieldExpr::Literal(v) = rhs.as_ref() else {
+            panic!("expected a literal RHS in {q}");
+        };
+        v.clone()
+    }
+
+    fn untyped_fields() -> Vec<(Field, &'static str)> {
+        vec![
+            (
+                Field::Attribute {
+                    scope: AttrScope::Resource,
+                    key: "service.name".to_string(),
+                },
+                "resource.service.name",
+            ),
+            (
+                Field::Intrinsic(Intrinsic::InstrumentationName),
+                "instrumentation:name",
+            ),
+            (
+                Field::Intrinsic(Intrinsic::InstrumentationVersion),
+                "instrumentation:version",
+            ),
+        ]
+    }
+
+    /// AC8's unit half: a cross-type `=`/`!=` at each of the three sites
+    /// compiles to the plan-time `false`, never to a `PlanError` and never
+    /// to a leaf that stringifies the operand.
+    ///
+    /// The `Number("12345")` case is the load-bearing one — the acceptance
+    /// corpus holds a service literally NAMED `12345`, so an implementation
+    /// that rendered the number as a string would match it and this
+    /// assertion would see `LeafEval::Physical` instead of `Const(false)`.
+    #[test]
+    fn the_three_untyped_fields_fold_a_cross_type_operand_to_no_match() {
+        for (field, name) in untyped_fields() {
+            for value in [
+                Value::Number("12345".to_string()),
+                Value::Number("1.5".to_string()),
+                Value::Bool(true),
+                literal_operand("{ .a = 2s }"),
+            ] {
+                for op in [ComparisonOp::Eq, ComparisonOp::Neq] {
+                    let leaf = compile_leaf(&field, op, &value)
+                        .unwrap_or_else(|e| panic!("{name} {op:?} {value}: {e}"));
+                    assert_eq!(
+                        leaf.eval,
+                        LeafEval::Const(false),
+                        "{name} {op:?} {value} must match no span"
+                    );
+                    assert_eq!(
+                        leaf.generator,
+                        LeafGenerator::time_range(),
+                        "{name} {op:?} {value} keeps the time-range generator"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC10's unit half: bare truthiness routes through
+    /// `compile_leaf(field, Eq, Bool(true))`, so all three fold the same
+    /// way rather than erroring.
+    #[test]
+    fn bare_truthiness_on_an_untyped_field_folds_to_no_match() {
+        for (field, name) in untyped_fields() {
+            let leaf = compile_leaf(&field, ComparisonOp::Eq, &Value::Bool(true))
+                .unwrap_or_else(|e| panic!("{{ {name} }}: {e}"));
+            assert_eq!(leaf.eval, LeafEval::Const(false), "{{ {name} }}");
+        }
+    }
+
+    /// A STRING operand at the three sites is untouched: the same leaf the
+    /// field compiled to before this issue. Without this, "accept
+    /// everything" would pass the criterion above.
+    #[test]
+    fn a_string_operand_on_an_untyped_field_still_compiles_its_own_leaf() {
+        let leaf = compile_leaf(
+            &Field::Attribute {
+                scope: AttrScope::Resource,
+                key: "service.name".to_string(),
+            },
+            ComparisonOp::Eq,
+            &Value::String("12345".to_string()),
+        )
+        .expect("string operand compiles");
+        assert_eq!(leaf.generator.class, GenClass::ServiceEq);
+        assert_eq!(
+            leaf.eval,
+            LeafEval::Physical(PhysicalPredicate::Service {
+                op: ComparisonOp::Eq,
+                value: "12345".to_string(),
+            })
+        );
+        for (field, _) in untyped_fields().into_iter().skip(1) {
+            let leaf = compile_leaf(&field, ComparisonOp::Eq, &Value::String("x".to_string()))
+                .expect("string operand compiles");
+            assert!(
+                matches!(leaf.eval, LeafEval::Physical(_)),
+                "{:?}",
+                leaf.eval
+            );
+        }
+    }
+
+    /// AC9's unit half — the gate on the CHANGED code. At the wire these
+    /// seven are a `validate` `400` (`binary operations must operate on
+    /// the same type`), so a wire test would pass for a tree that relaxed
+    /// `string_op_leaf` wholesale. This calls the planner directly.
+    #[test]
+    fn typed_string_sites_still_reject_a_non_string_operand() {
+        for (field, name) in [
+            (Field::Intrinsic(Intrinsic::Name), "name"),
+            (Field::Intrinsic(Intrinsic::TraceId), "trace:id"),
+            (Field::Intrinsic(Intrinsic::SpanId), "span:id"),
+            (Field::Intrinsic(Intrinsic::ParentId), "span:parentID"),
+            (Field::Intrinsic(Intrinsic::RootName), "rootName"),
+            (
+                Field::Intrinsic(Intrinsic::RootServiceName),
+                "rootServiceName",
+            ),
+            (Field::Intrinsic(Intrinsic::StatusMessage), "statusMessage"),
+        ] {
+            let err = compile_leaf(&field, ComparisonOp::Eq, &Value::Number("5".to_string()))
+                .expect_err("a typed string site must reject a number");
+            assert_eq!(
+                err,
+                PlanError::TypeMismatch(format!("{name} requires a string value")),
+                "{name}"
+            );
+        }
+    }
+
+    /// The rule table in [`untyped_string_op_leaf`]'s doc comment, one row
+    /// per assertion, so a reordering of the two guards is visible.
+    #[test]
+    fn untyped_string_op_leaf_matches_its_documented_rule_table() {
+        let s = Value::String("x".to_string());
+        let n = Value::Number("5".to_string());
+        assert!(matches!(
+            untyped_string_op_leaf("f", ComparisonOp::Re, &s),
+            Ok(UntypedLeaf::String(ComparisonOp::Re, _))
+        ));
+        assert_eq!(
+            untyped_string_op_leaf("f", ComparisonOp::Gt, &s).unwrap_err(),
+            PlanError::TypeMismatch("f supports only = != =~ !~".to_string())
+        );
+        assert!(matches!(
+            untyped_string_op_leaf("f", ComparisonOp::Neq, &n),
+            Ok(UntypedLeaf::Never)
+        ));
+        assert_eq!(
+            untyped_string_op_leaf("f", ComparisonOp::Nre, &n).unwrap_err(),
+            PlanError::TypeMismatch("f requires a string value".to_string())
+        );
+        assert_eq!(
+            untyped_string_op_leaf("f", ComparisonOp::Lte, &n).unwrap_err(),
+            PlanError::TypeMismatch("f supports only = != =~ !~".to_string())
         );
     }
 }

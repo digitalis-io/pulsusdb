@@ -343,10 +343,11 @@ fn render_expr(
 /// arm reaches the same dispatch — one leaf lowering, not two that can
 /// drift.
 ///
-/// The six `LeafEval` variants that are not lowered here are
+/// The five `LeafEval` variants that are not lowered here are
 /// **unreachable from `filter::compile_leaf`**, which constructs only
-/// `Physical`, `Attr`, `NestedSet` and `TraceCtx`. That claim is a gate,
-/// not a reading: `dead_leaf_eval_variants_are_unreachable_from_compile_leaf`
+/// `Physical`, `Attr`, `NestedSet`, `TraceCtx` and — since issue #476
+/// Wave B — `Const`. That claim is a gate, not a reading:
+/// `dead_leaf_eval_variants_are_unreachable_from_compile_leaf`
 /// below enumerates the whole `Field × ComparisonOp × Value` product with
 /// exhaustive matches, so adding a variant to any of those enums fails to
 /// compile rather than silently narrowing the checked domain.
@@ -373,6 +374,17 @@ fn lower_leaf(
         LeafEval::TraceCtx(_) => Err(PlanError::TypeMismatch(
             "trace-level intrinsics are not supported in metrics filters".to_string(),
         )),
+        // Issue #476 Wave B: `compile_leaf` now folds a cross-type
+        // `=`/`!=` on the three fields the reference gives no concrete
+        // type to `Const(false)`, so this variant IS reachable here and
+        // must lower rather than refuse — otherwise
+        // `{resource.service.name=12345} | rate()` stays the `400` this
+        // issue exists to remove while the search route returns `200`.
+        // The lowering is the one this file already applies to the
+        // two-static fold sixty lines above (`fold_static_compare` ->
+        // `static_bool_sql`): a plan-time constant, decided once per
+        // query, never per span.
+        LeafEval::Const(b) => Ok(static_bool_sql(*b)),
         // Issue #458 collapsed six separately-worded refusals into this
         // one arm. Every variant it covers is unreachable from
         // `filter::compile_leaf` (gated, see the doc comment above), so
@@ -381,7 +393,6 @@ fn lower_leaf(
         LeafEval::BoolTruth { .. }
         | LeafEval::FieldCompare { .. }
         | LeafEval::Arith { .. }
-        | LeafEval::Const(_)
         | LeafEval::BoolCompare { .. }
         | LeafEval::EventSetCompare { .. } => Err(PlanError::TypeMismatch(
             "unsupported metrics filter leaf".to_string(),
@@ -1639,10 +1650,13 @@ mod tests {
                         | LeafEval::Attr { .. }
                         | LeafEval::NestedSet { .. }
                         | LeafEval::TraceCtx(_) => false,
+                        // Issue #476 Wave B: the cross-type fold on the
+                        // three untyped fields. Lowered by `lower_leaf`,
+                        // so it is NOT a dead variant here.
+                        LeafEval::Const(_) => false,
                         LeafEval::BoolTruth { .. } => true,
                         LeafEval::FieldCompare { .. } => true,
                         LeafEval::Arith { .. } => true,
-                        LeafEval::Const(_) => true,
                         LeafEval::BoolCompare { .. } => true,
                         LeafEval::EventSetCompare { .. } => true,
                     };
