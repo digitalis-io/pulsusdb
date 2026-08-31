@@ -1502,10 +1502,16 @@ const TRACES_GRAPH_CASES: &[CaseClass] = &[
 // -- traces tags (issue #58, docs/api.md §4.3) --------------------------
 
 /// The non-trivial `q=` the values route's `base_query` carries —
-/// `{span.x="y"}`, URL-encoded. Accept-and-ignore (adjudication 1 on
-/// issue #58): the cell asserts a 200 empty envelope, proving `q` never
-/// 400s; the seeded superset-equivalence assertion lives in
-/// `traces_tags_live.rs`.
+/// `{span.x="y"}`, URL-encoded.
+///
+/// **What this cell proves changed with issue #478.** It used to assert
+/// accept-and-ignore; `q` now NARROWS the value read on the native and v2
+/// routes. What the cell still proves — and it is the property this
+/// matrix is for — is that a `q` never turns into a `400`: the response is
+/// a well-formed `200` envelope against this suite's empty database
+/// whether the query narrows or not. The narrowed answers themselves are
+/// asserted in `traces_tag_values_narrow_live.rs`, and the
+/// unparseable-`q` tolerance in `traces_api::tags`'s own route test.
 pub const TRACES_TAG_VALUES_BASE_QUERY: &str = "q=%7Bspan.x%3D%22y%22%7D";
 
 fn traces_tags_bogus_scope(req: &mut Req) {
@@ -1516,12 +1522,29 @@ fn traces_tags_bogus_scope(req: &mut Req) {
     req.query = "scope=bogus".to_string();
 }
 
-const TRACES_TAGS_CASES: &[CaseClass] = &[CaseClass {
-    name: "unsupported_scope",
-    build: traces_tags_bogus_scope,
-    expect_status: 400,
-    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-}];
+/// Issue #478: a `start` with no `end` — one of the three range FAULTS
+/// that are a `400` on all six §4.3 routes. Driven through this matrix
+/// rather than only through the live tag suite because the matrix is what
+/// crosses the fault with every mounted route, including the four
+/// aliases.
+fn traces_half_range(req: &mut Req) {
+    req.query = "start=1700000000".to_string();
+}
+
+const TRACES_TAGS_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "unsupported_scope",
+        build: traces_tags_bogus_scope,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+    },
+    CaseClass {
+        name: "half_range",
+        build: traces_half_range,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+    },
+];
 
 fn traces_tag_values_empty_key(req: &mut Req) {
     // `resource.` — a scope prefix with an empty key: still one path
@@ -1530,12 +1553,20 @@ fn traces_tag_values_empty_key(req: &mut Req) {
     req.query.clear();
 }
 
-const TRACES_TAG_VALUES_CASES: &[CaseClass] = &[CaseClass {
-    name: "empty_key",
-    build: traces_tag_values_empty_key,
-    expect_status: 400,
-    expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
-}];
+const TRACES_TAG_VALUES_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "empty_key",
+        build: traces_tag_values_empty_key,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+    },
+    CaseClass {
+        name: "half_range",
+        build: traces_half_range,
+        expect_status: 400,
+        expect: ExpectedError::PlainText(PlainTextWriter::TempoFrontendResponse),
+    },
+];
 
 fn rw_bad_snappy(req: &mut Req) {
     req.body = b"\xFF\xFF\xFF not snappy".to_vec();

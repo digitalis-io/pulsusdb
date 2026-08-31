@@ -35,10 +35,14 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
+use pulsus_read::SpanFilterCtx;
 use pulsus_read::logql::escape::ch_string;
 use pulsus_read::logql::{ReadError, TooBroadReason};
 use pulsus_read::traces::rows::{TagNameRow, TagValueRow};
-use pulsus_read::traces::tags_sql::{tag_names_sql, tag_values_sql};
+use pulsus_read::traces::tag_narrow::narrowing_from_query;
+use pulsus_read::traces::tags_sql::{
+    DaySpan, attr_values_narrowed_sql, span_name_values_sql, tag_names_sql, tag_values_sql,
+};
 use pulsus_read::{TAG_NAMES_MAX, TAG_VALUES_MAX, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 
@@ -618,7 +622,10 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
              {TIGHT_BUDGET_ROWS}-row budget, got {other:?}"
         ),
     }
-    match engine.list_tag_values("k3", None).await {
+    match engine
+        .list_tag_values("k3", None, unnarrowed_values_request())
+        .await
+    {
         Err(ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { budget_rows })) => {
             assert_eq!(budget_rows, TIGHT_BUDGET_ROWS);
         }
@@ -637,7 +644,7 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
     assert!(!names.truncated);
 
     let values = engine
-        .list_tag_values("k3", Some("resource"))
+        .list_tag_values("k3", Some("resource"), unnarrowed_values_request())
         .await
         .expect("scoped values prune to the 5-row resource/k3 partition, well under budget");
     assert_eq!(values.values.len(), RESOURCE_VALS_PER_KEY as usize);
@@ -694,4 +701,432 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
         assert_eq!(finished.read_rows, resource_partition_rows, "{finished:?}");
         assert!(finished.read_rows <= TIGHT_BUDGET_ROWS);
     }
+}
+
+/// Issue #478 added a request argument to `list_tag_values`. With no `q`
+/// the read is byte-identical to the pre-#478 catalog read, so the window
+/// is inert here; it is still a real one rather than zeros so nothing
+/// depends on an unrepresentable value.
+fn unnarrowed_values_request() -> pulsus_read::TagValuesRequest<'static> {
+    pulsus_read::TagValuesRequest {
+        q: None,
+        start_ns: 1_700_000_000_000_000_000,
+        end_ns: 1_700_003_600_000_000_000,
+    }
+}
+
+// ============================================================================
+// Issue #478 (Tier-1, scale-invariant): the two STORE-BACKED tag-value
+// reads.
+//
+// Every assertion here is a RELATION — a plan node's identity, a strict
+// inequality, an equality between two plans, or an identity between two
+// counts. No absolute granule count, byte count or ratio is pinned:
+// denominators move with part layout and with corpus, and the
+// architect's own controls moved from 733 to 1223 on the same query when
+// the corpus grew. The identities are the finding.
+// ============================================================================
+
+static SPAN_DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_spans_it");
+
+/// Spans seeded for the store-backed gates: enough rows to cross several
+/// granules at the default 8192 granularity, so a prune has something to
+/// exclude.
+const SPAN_ROWS: u64 = 400_000;
+/// Distinct span names, and distinct services.
+const SPAN_NAMES: u64 = 500;
+const SPAN_SERVICES: u64 = 50;
+/// Two index rows per span, so a `(trace_id, span_id)` set built from the
+/// index is non-empty against the span table.
+const ATTR_ROWS: u64 = 2 * SPAN_ROWS;
+const ATTR_KEYS: u64 = 20;
+const ATTR_VALS: u64 = 1_000;
+
+/// One UTC day, an hour ago — derived from the clock, never a literal.
+/// The span tables carry a retention TTL with `ttl_only_drop_parts = 1`,
+/// so a literal timestamp older than retention would be dropped at
+/// INSERT and every gate below would read an empty table and still pass
+/// its "reads fewer granules" comparison vacuously.
+fn span_base_ns() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    (now - 3_600) * 1_000_000_000
+}
+
+async fn seed_spans(client: &ChClient, db: &str, base_ns: i64) {
+    exec(
+        client,
+        &format!(
+            "INSERT INTO {db}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload) \
+             SELECT reinterpretAsFixedString(cityHash64(number)), \
+                    reinterpretAsFixedString(toUInt64(number)), \
+                    reinterpretAsFixedString(toUInt64(0)), \
+                    concat('op.', toString(number % {SPAN_NAMES})), \
+                    concat('svc-', leftPad(toString(number % {SPAN_SERVICES}), 3, '0')), \
+                    {base_ns} + number * 100, 1500000, 1, 2, 0, '' \
+             FROM numbers({SPAN_ROWS})"
+        ),
+    )
+    .await;
+    exec(
+        client,
+        &format!(
+            "INSERT INTO {db}.trace_attrs_idx \
+             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns, \
+              val_type) \
+             SELECT toDate(fromUnixTimestamp64Nano({base_ns})), \
+                    concat('k', toString(number % {ATTR_KEYS})), \
+                    concat('v', toString(number % {ATTR_VALS})), \
+                    'span', NULL, {base_ns}, \
+                    reinterpretAsFixedString(cityHash64(number % {SPAN_ROWS})), \
+                    reinterpretAsFixedString(toUInt64(number % {SPAN_ROWS})), \
+                    1500000, 'string' \
+             FROM numbers({ATTR_ROWS})"
+        ),
+    )
+    .await;
+}
+
+/// The name of the table or projection an `EXPLAIN` plan reads from.
+fn read_source(raw: &str) -> String {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("ReadFromMergeTree (") {
+            return rest.trim_end_matches(')').to_string();
+        }
+    }
+    panic!("no ReadFromMergeTree node in EXPLAIN output:\n{raw}");
+}
+
+/// The PrimaryKey block's `Condition:` line.
+fn primary_key_condition(raw: &str) -> String {
+    const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+    let mut in_pk = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if BLOCK_TITLES.contains(&trimmed) {
+            in_pk = trimmed == "PrimaryKey";
+            continue;
+        }
+        if in_pk && let Some(cond) = trimmed.strip_prefix("Condition: ") {
+            return cond.to_string();
+        }
+    }
+    panic!("no PrimaryKey Condition line in EXPLAIN output:\n{raw}");
+}
+
+/// The MinMax/Partition/PrimaryKey `Granules: k/N` line of whichever
+/// block appears LAST — the count after every index has been applied.
+fn final_granules(raw: &str) -> (u64, u64) {
+    let mut last = None;
+    for line in raw.lines() {
+        if let Some(ratio) = line.trim().strip_prefix("Granules: ") {
+            let (selected, total) = ratio
+                .split_once('/')
+                .unwrap_or_else(|| panic!("unparseable granules {ratio:?}\n{raw}"));
+            last = Some((
+                selected.trim().parse().expect("selected"),
+                total.trim().parse().expect("total"),
+            ));
+        }
+    }
+    last.unwrap_or_else(|| panic!("no Granules line in EXPLAIN output:\n{raw}"))
+}
+
+/// Issue #478, criterion 1. **The day-grain projection serves the
+/// unnarrowed span-name read, and the day expression is what selects
+/// it.**
+///
+/// Two halves, and the second is the discriminator: a plan that named
+/// `span_name_day` for every window would pass the first half alone.
+/// Expressing the same window on `timestamp_ns` instead — the obvious
+/// alternative, and the one a later reader is most likely to try —
+/// defeats the projection, which is exactly why
+/// `tags_sql::span_name_values_sql` carries only the day clause.
+#[tokio::test]
+async fn span_name_projection_is_selected_and_prunes() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see this file's module docs)");
+        return;
+    }
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {SPAN_DB}")).await;
+    run_init(&admin, &test_ctx(&SPAN_DB))
+        .await
+        .expect("run_init");
+    let mut cfg = test_config();
+    cfg.database = SPAN_DB.to_string();
+    let client = ChClient::new(cfg).await.expect("connect data client");
+    let base_ns = span_base_ns();
+    seed_spans(&client, &SPAN_DB, base_ns).await;
+    exec(
+        &client,
+        &format!(
+            "ALTER TABLE {SPAN_DB}.trace_spans MATERIALIZE PROJECTION span_name_day \
+             SETTINGS mutations_sync = 2"
+        ),
+    )
+    .await;
+
+    let ctx = SpanFilterCtx {
+        spans_table: "trace_spans",
+        attrs_table: "trace_attrs_idx",
+    };
+    let days = DaySpan::from_window(base_ns, base_ns);
+    let sql = span_name_values_sql(ctx, days, &[], TAG_VALUES_MAX + 1);
+
+    // (a) the projection is the plan.
+    let raw = explain_raw(&client, &sql).await;
+    assert_eq!(
+        read_source(&raw),
+        "span_name_day",
+        "the unnarrowed span-name read must be served by the day-grain projection:\n{raw}"
+    );
+    let (selected, total) = final_granules(&raw);
+
+    // (b) the same query WITHOUT the projection reads the base table, and
+    //     reads strictly more granules out of the same denominator.
+    let base_raw = explain_raw(
+        &client,
+        &format!("{sql} SETTINGS optimize_use_projections = 0"),
+    )
+    .await;
+    assert_eq!(
+        read_source(&base_raw),
+        format!("{SPAN_DB}.trace_spans"),
+        "the control must read the base table:\n{base_raw}"
+    );
+    let (base_selected, base_total) = final_granules(&base_raw);
+    assert_eq!(
+        total, base_total,
+        "the two plans must share a denominator, or the comparison is not a comparison"
+    );
+    assert!(
+        selected < base_selected,
+        "the projection must select strictly fewer granules ({selected}/{total}) than the \
+         base-table read ({base_selected}/{base_total})"
+    );
+
+    // (c) the discriminator: the same window on `timestamp_ns` is NOT
+    //     served by the projection.
+    // The same read with the window expressed on `timestamp_ns` — the
+    // one line of the builder's output that decides this.
+    let ts_sql = sql
+        .lines()
+        .map(|line| {
+            if line.starts_with("WHERE ") {
+                format!(
+                    "WHERE timestamp_ns >= {base_ns} AND timestamp_ns <= {}",
+                    base_ns + 86_400_000_000_000i64
+                )
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ts_raw = explain_raw(&client, &ts_sql).await;
+    assert_ne!(
+        read_source(&ts_raw),
+        "span_name_day",
+        "a window expressed on timestamp_ns must NOT select the day-grain projection — that \
+         is why the builder carries only the day clause:\n{ts_raw}"
+    );
+
+    // Criterion 13: the projection's row count is the distinct
+    // `(day, name)` count of the base table. An identity, so it holds at
+    // any scale; perturbing either side breaks it.
+    exec(
+        &client,
+        &format!("OPTIMIZE TABLE {SPAN_DB}.trace_spans FINAL"),
+    )
+    .await;
+    let projected = scalar(
+        &client,
+        &format!(
+            "SELECT toUInt64(sum(rows)) AS n FROM system.projection_parts \
+             WHERE database = '{SPAN_DB}' AND table = 'trace_spans' \
+               AND name = 'span_name_day' AND active"
+        ),
+    )
+    .await;
+    let distinct = scalar(
+        &client,
+        &format!(
+            "SELECT toUInt64(uniqExact((toDate(fromUnixTimestamp64Nano(timestamp_ns)), name))) \
+             AS n FROM {SPAN_DB}.trace_spans"
+        ),
+    )
+    .await;
+    assert_eq!(
+        projected, distinct,
+        "the projection holds one row per distinct (UTC day, name) pair"
+    );
+    assert_eq!(
+        distinct, SPAN_NAMES,
+        "the fixture must have the distinct names it claims, or the identity above is vacuous"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {SPAN_DB}")).await;
+}
+
+async fn scalar(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("scalar query failed: {e}\nSQL:\n{sql}"));
+    let mut n = 0;
+    while let Some(row) = stream.next().await {
+        n = row.expect("decode count row").n;
+    }
+    n
+}
+
+/// Issue #478, criterion 2. **What prunes a narrowed read, with the
+/// control that removes each proposed cause.**
+///
+/// The property this replaces was FALSE, and its own control refuted it:
+/// the semi-join was assumed to prune and does not. What it is, is a
+/// CORRECTNESS mechanism — the answer would be wrong without it — and
+/// asserting it as a pruning one would have pinned a claim the plan
+/// cannot keep.
+///
+/// **Scope of the two statements, because they are not the same
+/// statement** (this is the distinction an earlier revision of this plan
+/// got wrong by generalising one table's measurement to the join):
+///
+/// * On `trace_attrs_idx` the set cannot prune STRUCTURALLY, for any
+///   set: the key is `(key, val, scope, timestamp_ns, trace_id, span_id)`,
+///   so with `val` and `timestamp_ns` unconstrained the identifier
+///   columns sit behind an open range.
+/// * On `trace_spans`, `trace_id` LEADS the key and a set CAN exclude
+///   granules — a localised five-trace set read 1/245 and a scattered
+///   five-trace set 5/245, the latter measured independently by plan
+///   review round 6 and by code review round 1 on their own
+///   2,000,000-span corpora. The sets this feature produces do not
+///   exclude anything, because they are large and scattered enough to
+///   intersect every granule (the real 333k-trace set read 245/245).
+///   That is a property of the workload, not of the schema, and this
+///   test asserts nothing about it — deliberately: the scattered figure
+///   is corpus-shaped, and an earlier revision quoted `9/245` from a
+///   third corpus as though it were the property.
+#[tokio::test]
+async fn narrowed_reads_prune_on_key_and_partition_not_on_the_set() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see this file's module docs)");
+        return;
+    }
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    let db = pulsus_testkit::test_db("pulsus_traces_narrow_explain_it");
+    let db = db.as_str();
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    run_init(&admin, &test_ctx(db)).await.expect("run_init");
+    let mut cfg = test_config();
+    cfg.database = db.to_string();
+    let client = ChClient::new(cfg).await.expect("connect data client");
+    let base_ns = span_base_ns();
+    seed_spans(&client, db, base_ns).await;
+    exec(
+        &client,
+        &format!(
+            "ALTER TABLE {db}.trace_spans MATERIALIZE PROJECTION span_name_day \
+             SETTINGS mutations_sync = 2"
+        ),
+    )
+    .await;
+
+    let ctx = SpanFilterCtx {
+        spans_table: "trace_spans",
+        attrs_table: "trace_attrs_idx",
+    };
+    let days = DaySpan::from_window(base_ns, base_ns);
+    let terms = narrowing_from_query("{resource.service.name=\"svc-007\"}");
+    assert!(!terms.is_empty(), "the fixture query must lower to a term");
+    let key = ch_string("k3");
+    let scope = ch_string("span");
+    let narrowed = attr_values_narrowed_sql(
+        ctx,
+        &key,
+        Some(&scope),
+        days,
+        terms.terms(),
+        TAG_VALUES_MAX + 1,
+    );
+
+    // 2c — the set is present in the primary-key Condition. Its absence
+    // would be a CORRECTNESS regression even though its presence buys no
+    // pruning, so it is asserted on the text.
+    let raw = explain_raw(&client, &narrowed).await;
+    let condition = primary_key_condition(&raw);
+    assert!(
+        condition.contains("(trace_id, span_id) in"),
+        "the semi-join must reach the primary-key condition: {condition}"
+    );
+    assert!(
+        condition.contains("element set"),
+        "the set must be a materialized set, not a constant-folded predicate: {condition}"
+    );
+
+    // 2a — the control: remove the set and the granule count does not
+    // move; remove the `key` predicate and it does.
+    let set_free = narrowed
+        .lines()
+        .take_while(|l| !l.trim_start().starts_with("AND (trace_id, span_id) IN ("))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\nORDER BY val, val_type\nLIMIT 1001";
+    let set_free_raw = explain_raw(&client, &set_free).await;
+    let (with_set, total) = final_granules(&raw);
+    let (without_set, total_free) = final_granules(&set_free_raw);
+    assert_eq!(total, total_free, "the two plans must share a denominator");
+    assert_eq!(
+        with_set, without_set,
+        "the semi-join is a correctness mechanism, not a pruning one: adding it must not \
+         change the granule count ({with_set}/{total} against {without_set}/{total_free})"
+    );
+
+    let key_free = narrowed.replace(&format!("WHERE key = {key} AND"), "WHERE");
+    assert_ne!(
+        key_free, narrowed,
+        "the key predicate must have been removed"
+    );
+    let key_free_raw = explain_raw(&client, &key_free).await;
+    let (without_key, total_key_free) = final_granules(&key_free_raw);
+    assert_eq!(total, total_key_free, "same denominator again");
+    assert!(
+        with_set < without_key,
+        "the `(key)` prefix is what prunes: {with_set}/{total} with it against \
+         {without_key}/{total_key_free} without it"
+    );
+
+    // 2b — a physical term selects the `service_time` projection, and
+    // that is where ITS pruning comes from: with projections off, the
+    // same term prunes nothing, because `trace_spans` is ordered
+    // `(trace_id, timestamp_ns)` and `service` leads neither key.
+    let span_narrowed = span_name_values_sql(ctx, days, terms.terms(), TAG_VALUES_MAX + 1);
+    let span_raw = explain_raw(&client, &span_narrowed).await;
+    assert_eq!(
+        read_source(&span_raw),
+        "service_time",
+        "a physical service term must select the service_time projection:\n{span_raw}"
+    );
+    let (with_term, span_total) = final_granules(&span_raw);
+    let base_raw = explain_raw(
+        &client,
+        &format!("{span_narrowed} SETTINGS optimize_use_projections = 0"),
+    )
+    .await;
+    let (base_selected, base_total) = final_granules(&base_raw);
+    assert_eq!(span_total, base_total, "same denominator");
+    assert!(
+        with_term < base_selected,
+        "the projection is what the physical term buys: {with_term}/{span_total} against \
+         {base_selected}/{base_total} with projections disabled"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }

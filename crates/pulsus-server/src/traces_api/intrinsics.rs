@@ -11,6 +11,14 @@
 //! carry that key. Bypassing the catalog is what makes the answer right;
 //! adding the static list on top of a catalog read would leave the
 //! collision in place.
+//!
+//! **The converse case, and why it is not served here** (issue #478).
+//! `name`'s values exist by OBSERVATION, so an empty static list was the
+//! wrong answer for it in the other direction: the dropdown had nothing to
+//! offer. It is served from `trace_spans` instead — not from the catalog,
+//! which holds no span-`name` row at all — and
+//! `traces_api::tags::tag_value_source` is the exhaustive dispatch that
+//! decides which intrinsic goes where.
 
 use std::sync::OnceLock;
 
@@ -41,8 +49,15 @@ pub(crate) fn intrinsic_scope_tags() -> &'static [&'static str] {
 
 /// The static answer for a resolved intrinsic — never a store read. An
 /// intrinsic with no closed value set answers an EMPTY list rather than
-/// falling through to the catalog, which is what stops a bare `name`
-/// lookup returning span-event names.
+/// falling through to the catalog, which is what stops a bare lookup
+/// returning rows of a reserved intrinsic scope.
+///
+/// **`name` no longer reaches this function** (issue #478). It is the one
+/// intrinsic whose values are observed rather than defined, and it is
+/// served from `trace_spans` — `traces_api::tags::tag_value_source` is
+/// the exhaustive dispatch that decides. Calling this with
+/// `Intrinsic::Name` still answers an empty list, which is what it always
+/// did; nothing routes here to do so any more.
 pub(crate) fn intrinsic_tag_values(intrinsic: Intrinsic) -> &'static [&'static str] {
     intrinsic.discovery_values().unwrap_or(&[])
 }
@@ -124,10 +139,13 @@ mod tests {
 
     /// An intrinsic with no closed value set answers empty — including
     /// one that is not offered in the scope list at all.
+    ///
+    /// `Intrinsic::Name` is deliberately NOT in this list since issue
+    /// #478: it no longer routes here at all, so asserting its answer
+    /// would state coverage this function no longer has.
     #[test]
     fn an_open_valued_intrinsic_answers_an_empty_list() {
         for intrinsic in [
-            Intrinsic::Name,
             Intrinsic::Duration,
             Intrinsic::NestedSetLeft,
             Intrinsic::EventName,

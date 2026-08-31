@@ -3906,4 +3906,50 @@ mod tests {
             PlanError::TypeMismatch("f supports only = != =~ !~".to_string())
         );
     }
+
+    /// Issue #478, criterion 7. **The domain is every `AttrScope`
+    /// variant, and it is enumerated from the enum rather than sampled.**
+    ///
+    /// Three things make the sentence "the scope mapping is correct" hold
+    /// over the whole domain rather than over the cases someone thought
+    /// of:
+    ///
+    /// 1. `AttrScope::ALL` is GENERATED from the enum's own token list
+    ///    (`enum_with_all!`), so a variant cannot exist without appearing
+    ///    here — the hand-maintained array this replaced passed green
+    ///    with a variant nobody tested.
+    /// 2. `expected` below is a second exhaustive `match` with NO
+    ///    wildcard, so a new variant fails to compile in the TEST as well
+    ///    as in the source.
+    /// 3. The length is asserted against a literal, so a new variant
+    ///    forces a conscious edit here rather than sliding through.
+    ///
+    /// The break this is paired with is a PERMUTATION — exchange two of
+    /// the `Some` literals in `attr_scope_literal` — which a mapping
+    /// stated only as "every variant maps to something" would survive.
+    #[test]
+    fn attr_scope_literal_maps_every_variant() {
+        fn expected(scope: AttrScope) -> Option<&'static str> {
+            match scope {
+                AttrScope::Span => Some("span"),
+                AttrScope::Resource => Some("resource"),
+                AttrScope::Instrumentation => Some("instrumentation"),
+                AttrScope::Event => Some("event"),
+                AttrScope::Link => Some("link"),
+                AttrScope::Unscoped => None,
+            }
+        }
+        assert_eq!(
+            AttrScope::ALL.len(),
+            6,
+            "a new AttrScope variant must be given a literal above and counted here"
+        );
+        for &scope in AttrScope::ALL {
+            assert_eq!(
+                attr_scope_literal(scope),
+                expected(scope),
+                "{scope:?} maps to the wrong index scope"
+            );
+        }
+    }
 }

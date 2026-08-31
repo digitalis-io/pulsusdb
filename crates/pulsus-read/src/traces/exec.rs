@@ -95,14 +95,16 @@ use super::rows::{
     MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
     MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
     MetricGroupCountRow, MetricLog2BucketInstantRow, MetricLog2BucketRow, MetricQuantileInstantRow,
-    MetricQuantileRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
-    TagValueRow, TraceCtxRow,
+    MetricQuantileRow, NumValueRow, RootRow, SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow,
+    TagNameRow, TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
     self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, SpanKey, SpanSetGroup,
     SpanSummary, TraceCtxInfo, TraceMatch, TraceSpans,
 };
 use super::search_plan::{SearchCtx, SearchPlan};
+use super::tag_narrow::{TagNarrowing, narrowing_from_query};
+use super::tags_sql::DaySpan;
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::exec::escape_query_placeholders;
 use crate::logql::explain::PlanExplain;
@@ -457,6 +459,67 @@ pub struct TagNames {
 pub struct TagValue {
     pub val: String,
     pub val_type: String,
+}
+
+/// The wire type every span name is reported with (issue #478).
+///
+/// A span name is a `String` column, so this is a fact about the schema
+/// rather than a reading of the characters: the reference types the span
+/// names `500`, `1.5s`, `true` and `-3` as `string` too, where a
+/// text-classifying inference would call them `int`, `duration`, `bool`
+/// and `int`.
+pub const SPAN_NAME_VALUE_TYPE: &str = "string";
+
+/// One span name as a [`TagValue`] — the ONE place the span-name type is
+/// decided (issue #478).
+///
+/// A function rather than an inline struct literal because this is the
+/// assertion criterion 5a is about: `entry_type("")` renders `string`
+/// too, so a read that left the type EMPTY would produce byte-identical
+/// wire output while meaning "a legacy row of unknown type" instead of "a
+/// String column". The two are only distinguishable here, at the engine
+/// boundary, which is where the gate has to sit.
+fn span_name_value(val: String) -> TagValue {
+    TagValue {
+        val,
+        val_type: SPAN_NAME_VALUE_TYPE.to_string(),
+    }
+}
+
+/// What a §4.3 value read needs beyond its key and scope (issue #478).
+///
+/// `q` is the client's raw query text, percent-decoded — NOT a parsed
+/// AST, and deliberately so: lowering it is total
+/// ([`crate::traces::tag_narrow::narrowing_from_query`]), so an
+/// unparseable `q` widens the read instead of producing an error the
+/// handler would have to turn into a status code.
+#[derive(Debug, Clone, Copy)]
+pub struct TagValuesRequest<'a> {
+    /// `q` as the client sent it, percent-decoded. `None` when absent or
+    /// empty after decoding.
+    pub q: Option<&'a str>,
+    /// The resolved window. ALWAYS present: the caller substitutes the
+    /// configured lookback when the client sends no usable range, so this
+    /// type cannot represent an unbounded read.
+    pub start_ns: i64,
+    pub end_ns: i64,
+}
+
+impl TagValuesRequest<'_> {
+    /// The terms this request's `q` contributes — empty for an absent
+    /// `q` and for every `q` the lowering cannot handle.
+    fn narrowing(&self) -> TagNarrowing {
+        match self.q {
+            None => TagNarrowing::default(),
+            Some(q) => narrowing_from_query(q),
+        }
+    }
+
+    /// The UTC days the window touches — the bound both store-backed
+    /// reads carry.
+    fn days(&self) -> DaySpan {
+        DaySpan::from_window(self.start_ns, self.end_ns)
+    }
 }
 
 /// [`TraceEngine::list_tag_values`]'s output (issue #58): distinct
@@ -1528,34 +1591,134 @@ impl TraceEngine {
         Ok(TagNames { names, truncated })
     }
 
-    /// Streams the §4.3 tag-values read (issue #58): distinct values for
-    /// one key, optionally scope-confined — same catalog-only,
-    /// escape-at-the-engine, `LIMIT` cap + 1 probe, and [`catalog_settings`]
-    /// read-budget contract as [`Self::list_tag_names`], capped at
-    /// [`TAG_VALUES_MAX`]. A bare-key lookup (no `scope`) prunes the
-    /// catalog's leading `(scope, key, val)` primary-key column on the
-    /// `scope IN (…)` attribute-scope list (issue #475), so it reads the
-    /// five attribute scopes and never the writer-reserved intrinsic
-    /// ones.
+    /// Streams the §4.3 tag-values read for an ATTRIBUTE key (issues #58
+    /// and #478): distinct `(value, type)` pairs for one key, optionally
+    /// scope-confined, capped at [`TAG_VALUES_MAX`] by the `LIMIT` cap + 1
+    /// probe.
+    ///
+    /// **Two reads, chosen by whether `req` narrows anything, and the
+    /// unnarrowed one is unchanged.** With no pushable `q` term this is
+    /// exactly the issue #58 catalog read — same SQL bytes, same
+    /// [`catalog_settings`] budget, same one-part index-served cost — so a
+    /// dropdown that narrows nothing costs what it always did. With at
+    /// least one term it becomes `attr_values_narrowed_sql` over
+    /// `trace_attrs_idx` intersected with the matching span set, carrying
+    /// [`metrics_settings`] (the semi-join budget set, and
+    /// `distributed_product_mode = 'local'` when clustered so the
+    /// membership probe stays shard-local — both tables co-shard on
+    /// `cityHash64(trace_id)`).
+    ///
+    /// A bare-key lookup (no `scope`) prunes the leading
+    /// `scope IN (…)` attribute-scope list on either shape (issue #475),
+    /// so it reads the five attribute scopes and never the
+    /// writer-reserved intrinsic ones. `key`/`scope` are escaped HERE —
+    /// the engine is this read's injection boundary — and a narrowing
+    /// term's own literals are escaped by the builder.
+    ///
+    /// One SQL per request on both shapes: the single-read-per-request
+    /// property of the §4.3 handlers is preserved.
     pub async fn list_tag_values(
         &self,
         key: &str,
         scope: Option<&str>,
+        req: TagValuesRequest<'_>,
     ) -> Result<TagValues, ReadError> {
         let key_literal = crate::logql::escape::ch_string(key);
         let scope_literal = scope.map(crate::logql::escape::ch_string);
-        let sql = super::tags_sql::tag_values_sql(
-            &key_literal,
-            scope_literal.as_deref(),
+        let narrowing = req.narrowing();
+        let (sql, settings) = if narrowing.is_empty() {
+            (
+                super::tags_sql::tag_values_sql(
+                    &key_literal,
+                    scope_literal.as_deref(),
+                    TAG_VALUES_MAX + 1,
+                ),
+                catalog_settings(&self.config),
+            )
+        } else {
+            // A narrowing term can carry a user regex, whose `(?:` the
+            // driver would otherwise read as a bind placeholder — the
+            // same `escape_query_placeholders` every other regex-bearing
+            // read on this path applies. The catalog shape cannot contain
+            // one, and its bytes stay exactly as they were.
+            (
+                escape_query_placeholders(&super::tags_sql::attr_values_narrowed_sql(
+                    self.span_filter_ctx(),
+                    &key_literal,
+                    scope_literal.as_deref(),
+                    req.days(),
+                    narrowing.terms(),
+                    TAG_VALUES_MAX + 1,
+                ))
+                .into_owned(),
+                metrics_settings(&self.config),
+            )
+        };
+        self.stream_tag_values(&sql, &settings).await
+    }
+
+    /// Streams the §4.3 SPAN-NAME values read (issue #478 Part 1) —
+    /// ALWAYS store-backed, never the catalog.
+    ///
+    /// The catalog cannot answer this: `trace_tag_catalog_mv` selects from
+    /// `trace_attrs_idx` alone, so no span-`name` row exists in it. What a
+    /// bare `name` lookup reached before was span EVENT names under a
+    /// reserved intrinsic scope; reading `trace_spans.name` is
+    /// structurally immune to that, because that column holds span names
+    /// and nothing else.
+    ///
+    /// Every value is typed `string` EXPLICITLY rather than left empty:
+    /// `traces_api::tags_response::entry_type` renders an empty
+    /// `val_type` as `string` too, so an unset type would produce
+    /// byte-identical output while meaning something different (issue
+    /// #476's legacy-row branch). The type is set here, where it is a
+    /// fact about the column rather than a fallback.
+    pub async fn list_span_name_values(
+        &self,
+        req: TagValuesRequest<'_>,
+    ) -> Result<TagValues, ReadError> {
+        let narrowing = req.narrowing();
+        // As in `list_tag_values`: a narrowing term can carry a user
+        // regex whose `(?:` the driver would read as a bind placeholder.
+        let sql = escape_query_placeholders(&super::tags_sql::span_name_values_sql(
+            self.span_filter_ctx(),
+            req.days(),
+            narrowing.terms(),
             TAG_VALUES_MAX + 1,
-        );
-        let settings = catalog_settings(&self.config);
+        ))
+        .into_owned();
+        let settings = metrics_settings(&self.config);
         crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut values = Vec::new();
         // Scoped stream: same lease/drain contract as list_tag_names.
         let mut stream = self
             .client
-            .query_stream::<TagValueRow>(&sql, &settings)
+            .query_stream::<SpanNameRow>(&sql, &settings)
+            .await
+            .map_err(|e| map_trace_read_error(e, &self.config))?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
+            values.push(span_name_value(row.val));
+        }
+        let truncated = values.len() > TAG_VALUES_MAX;
+        values.truncate(TAG_VALUES_MAX);
+        Ok(TagValues { values, truncated })
+    }
+
+    /// The `(val, val_type)` streaming both attribute-values shapes share
+    /// — one place that caps, truncates and reports, so the narrowed and
+    /// unnarrowed reads cannot differ in how they bound themselves.
+    async fn stream_tag_values(
+        &self,
+        sql: &str,
+        settings: &QuerySettings,
+    ) -> Result<TagValues, ReadError> {
+        crate::querytext::ensure_query_text_fits(sql).map_err(ReadError::QueryTooBroad)?;
+        let mut values = Vec::new();
+        // Scoped stream: same lease/drain contract as list_tag_names.
+        let mut stream = self
+            .client
+            .query_stream::<TagValueRow>(sql, settings)
             .await
             .map_err(|e| map_trace_read_error(e, &self.config))?;
         while let Some(row) = stream.next().await {
@@ -1568,6 +1731,16 @@ impl TraceEngine {
         let truncated = values.len() > TAG_VALUES_MAX;
         values.truncate(TAG_VALUES_MAX);
         Ok(TagValues { values, truncated })
+    }
+
+    /// The table pair the store-backed tag reads name — the same
+    /// `TraceReadConfig` fields (and therefore the same `_dist` suffixing)
+    /// the whole search path uses.
+    fn span_filter_ctx(&self) -> super::filter::SpanFilterCtx<'_> {
+        super::filter::SpanFilterCtx {
+            spans_table: &self.config.spans_table,
+            attrs_table: &self.config.attrs_table,
+        }
     }
 
     /// Executes a [`SearchPlan`] end to end (module doc for the model).
@@ -4435,5 +4608,71 @@ mod tests {
             BATCH_TRACES,
             sql.len()
         );
+    }
+
+    /// Issue #478, criterion 5a (hermetic half). **Every span name is
+    /// typed `string` EXPLICITLY, never left empty.**
+    ///
+    /// The adversarial names are the ones a text-classifying inference
+    /// would type `int`, `float`, `bool` and `duration`; the reference
+    /// types all of them `string`, because a span name is a String
+    /// column. The empty-type case is the trap this test exists for:
+    /// `tags_response::entry_type("")` also renders `string`, so a read
+    /// that set no type at all would be invisible on the wire — the
+    /// assertion is on `val_type` itself, not on the rendering.
+    #[test]
+    fn a_span_name_value_carries_an_explicit_string_type() {
+        for name in ["500", "1.5", "true", "1.5s", "-3", "checkout", ""] {
+            let value = span_name_value(name.to_string());
+            assert_eq!(value.val, name);
+            assert_eq!(
+                value.val_type, "string",
+                "{name:?} must carry an explicit string type, not an empty one"
+            );
+            assert!(
+                !value.val_type.is_empty(),
+                "an empty val_type renders as `string` too, which is why this is asserted \
+                 separately from the rendering"
+            );
+        }
+    }
+
+    /// The window a request carries resolves to the UTC days it touches
+    /// — the bound both store-backed reads are given.
+    #[test]
+    fn a_tag_values_request_resolves_its_window_to_utc_days() {
+        let req = TagValuesRequest {
+            q: None,
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_010_800_000_000_000,
+        };
+        assert_eq!(
+            req.days(),
+            DaySpan {
+                start_days: 19_675,
+                end_days: 19_676
+            }
+        );
+        assert!(req.narrowing().is_empty(), "no q means no narrowing");
+    }
+
+    /// An unlowerable `q` narrows NOTHING rather than erroring — the
+    /// request type has no error path for it to take.
+    #[test]
+    fn an_unlowerable_q_leaves_the_request_unnarrowed() {
+        for q in ["{span.http.status_code=", "garbage", "{}", ""] {
+            let req = TagValuesRequest {
+                q: Some(q),
+                start_ns: 0,
+                end_ns: 0,
+            };
+            assert!(req.narrowing().is_empty(), "{q:?} must not narrow");
+        }
+        let req = TagValuesRequest {
+            q: Some("{resource.service.name=\"cart\"}"),
+            start_ns: 0,
+            end_ns: 0,
+        };
+        assert!(!req.narrowing().is_empty(), "a well-formed q must narrow");
     }
 }

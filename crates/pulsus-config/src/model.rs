@@ -387,6 +387,20 @@ pub struct ReaderConfig {
     pub template_timezone: TemplateTimezone,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
+    /// Issue #478: the window a §4.3 tag-value read covers when the
+    /// client sends no usable `start`/`end`.
+    ///
+    /// The Span Name dropdown and every `q`-narrowed value dropdown read
+    /// the span tables rather than the time-less catalog, so they need a
+    /// window; the datasource sends `start`/`end` only when its own
+    /// tag time-range setting is non-default. The bound resolves to whole
+    /// UTC days on both tables, so 1 h and 24 h touch the same one or two
+    /// daily partitions and read the same bytes — the choice is about what
+    /// a dropdown shows, not about cost. A one-hour window silently omits
+    /// a service last seen ninety minutes ago and gives the user no way to
+    /// tell "not there" from "not recent"; a day is the interval people
+    /// mean by recent, and it is the unit `cache_window` already uses.
+    pub traceql_tag_lookback: HumanDuration,
     /// Issue #182: the safety cap on the number of distinct output series
     /// a TraceQL metrics `by(...)` query may resolve. Enforced with a
     /// `GROUP BY <by-keys> LIMIT cap+1` distinct-by-key probe issued
@@ -499,6 +513,7 @@ impl Default for ReaderConfig {
             template_timezone: TemplateTimezone::UTC,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
+            traceql_tag_lookback: HumanDuration(Duration::from_secs(24 * 3_600)),
             traceql_max_series: 1_000,
             traceql_generator_max_memory_bytes: 536_870_912,
             // Issue #398: 8 GiB on each of the three read surfaces — the

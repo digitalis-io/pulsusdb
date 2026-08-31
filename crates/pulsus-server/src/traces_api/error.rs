@@ -115,8 +115,8 @@ use pulsus_traceql::TraceQlError;
 use super::assemble::AssembleError;
 use super::legacy::LegacyError;
 use super::params::{
-    GraphParamError, MetricsParamError, SearchParamError, TagPathError, TagsParamError,
-    TraceIdError,
+    GraphParamError, MetricsParamError, RangeParamError, SearchParamError, TagPathError,
+    TagsParamError, TraceIdError,
 };
 
 /// A `/api/traces/v1` handler's failure, converted to the bare plain-text
@@ -139,7 +139,7 @@ use super::params::{
 ///
 /// | variant | HTTP |
 /// |---|---|
-/// | `Param` / `SearchParam` / `MetricsParam` / `GraphParam` / `TagsParam` / `TagPath` / `QueryText` / `Query` / `Legacy` | 400 |
+/// | `Param` / `SearchParam` / `MetricsParam` / `GraphParam` / `TagsParam` / `TagPath` / `RangeParam` / `QueryText` / `Query` / `Legacy` | 400 |
 /// | `Plan` | 400 |
 /// | `Plan(MetricsPointCap)` (issue #59 static pre-execution rejection) | 422 |
 /// | `NotFound` | 404 |
@@ -160,6 +160,10 @@ pub(crate) enum ApiError {
     TagsParam(TagsParamError),
     /// `{tag}` path-parameter failures (issue #58).
     TagPath(TagPathError),
+    /// A `start`/`end` FAULT on a §4.3 values route (issue #478) —
+    /// unparseable, half-supplied, or inverted. A well-formed range never
+    /// reaches this, and neither does an unparseable `q`, which widens.
+    RangeParam(RangeParamError),
     /// Legacy `tags` logfmt failures (issue #57).
     Legacy(LegacyError),
     /// TraceQL parse failure — `400`. The parser's own byte offset
@@ -235,6 +239,12 @@ impl From<TagPathError> for ApiError {
     }
 }
 
+impl From<RangeParamError> for ApiError {
+    fn from(e: RangeParamError) -> Self {
+        ApiError::RangeParam(e)
+    }
+}
+
 impl From<ReadError> for ApiError {
     fn from(e: ReadError) -> Self {
         ApiError::Read(e)
@@ -280,6 +290,7 @@ impl IntoResponse for ApiError {
             ApiError::GraphParam(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ApiError::TagsParam(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ApiError::TagPath(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            ApiError::RangeParam(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ApiError::Legacy(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ApiError::Query(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             ApiError::QueryText(e) => (StatusCode::BAD_REQUEST, e.to_string()),

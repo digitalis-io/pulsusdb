@@ -1854,7 +1854,11 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
     //        produced the measured 500.
     engine.list_tag_names(None).await.expect("tag names");
     engine
-        .list_tag_values("http.status_code", Some("span"))
+        .list_tag_values(
+            "http.status_code",
+            Some("span"),
+            unnarrowed_values_request(),
+        )
         .await
         .expect("tag values");
 
@@ -2257,4 +2261,16 @@ async fn name_values_narrow_projection_reads_far_fewer_bytes_and_is_blob_invaria
         )
         .await
         .expect("drop test database");
+}
+
+/// Issue #478 added a request argument to `list_tag_values`. With no `q`
+/// the read is byte-identical to the pre-#478 catalog read, so the window
+/// is inert here; it is still a real one rather than zeros so nothing
+/// depends on an unrepresentable value.
+fn unnarrowed_values_request() -> pulsus_read::TagValuesRequest<'static> {
+    pulsus_read::TagValuesRequest {
+        q: None,
+        start_ns: 1_700_000_000_000_000_000,
+        end_ns: 1_700_003_600_000_000_000,
+    }
 }

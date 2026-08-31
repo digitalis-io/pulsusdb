@@ -333,6 +333,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.traceql_max_series == 250,
     },
     Row {
+        var: "PULSUS_TRACEQL_TAG_LOOKBACK",
+        value: "6h",
+        check: |c| c.reader.traceql_tag_lookback.0 == Duration::from_secs(6 * 3_600),
+    },
+    Row {
         var: "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
         value: "1048576",
         check: |c| c.reader.traceql_generator_max_memory_bytes == 1_048_576,
@@ -432,8 +437,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        76,
-        "docs/configuration.md §§1-8 document exactly 76 variables"
+        77,
+        "docs/configuration.md §§1-8 document exactly 77 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

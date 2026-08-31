@@ -442,6 +442,126 @@ pub(crate) enum TagsParamError {
          for every scope)"
     )]
     UnsupportedScope(String),
+    /// A range FAULT on a names route (issue #478). A well-formed range
+    /// is still accepted and ignored there — the catalog has no timestamp
+    /// column — so only the fault shapes reach this.
+    #[error(transparent)]
+    Range(#[from] RangeParamError),
+}
+
+/// The three range faults, rejected on every §4.3 route (issue #478).
+///
+/// **The rule that decides which way each parameter goes, written down
+/// because a later reader extending either behaviour will need it:**
+/// *tolerate what the client cannot avoid sending; reject what indicates
+/// a genuine fault.* The editor emits half-typed text as `q` on every
+/// keystroke, so a `400` there would break autocomplete for input the
+/// user cannot help — `q` is tolerated and widens
+/// (`pulsus_read::traces::tag_narrow`). A malformed `start`, a `start`
+/// with no `end`, and an inverted range are none of those things: no
+/// client sends them in normal operation, and answering them over a
+/// substituted window would return values computed for a range the caller
+/// never asked for with nothing in the response to say so. That is a
+/// silent wrong answer.
+///
+/// [`RangeParamError::MissingRange`] and
+/// [`RangeParamError::InvalidTimestamp`] are BYTE-IDENTICAL to their
+/// [`SearchParamError`] counterparts. [`RangeParamError::InvalidRange`]
+/// deliberately is NOT, and the difference is in the predicate as well as
+/// the words: `/search` rejects `end <= start`, this route rejects
+/// `end < start` only, because a zero-width range is ACCEPTED here —
+/// measured, the reference answers `200` to it, and singling it out would
+/// be arbitrary when every sub-day range is already widened to whole UTC
+/// days by the day-grain bound. So the message may not claim `end` must
+/// be *greater* than `start`; it says what is actually enforced.
+#[derive(Debug, Error)]
+pub(crate) enum RangeParamError {
+    #[error("missing required parameter {0:?}: start and end are required")]
+    MissingRange(&'static str),
+    #[error("invalid timestamp {0:?}: expected unix seconds, unix nanoseconds, or RFC3339")]
+    InvalidTimestamp(String),
+    #[error("invalid range: end ({end}) must not be earlier than start ({start})")]
+    InvalidRange { start: i64, end: i64 },
+}
+
+/// Resolves `start`/`end` for a §4.3 route (issue #478).
+///
+/// A bound is "supplied" when the parameter is present, non-empty, and
+/// does not decode to `0` — measured, the reference treats a zero bound
+/// as absent rather than as 1970. Neither supplied → `Ok(None)`. Exactly
+/// one supplied → [`RangeParamError::MissingRange`]. Unparseable →
+/// [`RangeParamError::InvalidTimestamp`]. `end < start` →
+/// [`RangeParamError::InvalidRange`]. `end == start` is ACCEPTED.
+///
+/// The rendered `{start, end}` are whole SECONDS, matching
+/// [`parse_search_params`]'s own division rather than the parsed
+/// nanoseconds.
+pub(crate) fn parse_range_params(
+    pairs: &[(String, String)],
+) -> Result<Option<(i64, i64)>, RangeParamError> {
+    let supplied = |name: &'static str| -> Result<Option<i64>, RangeParamError> {
+        let Some(raw) = get(pairs, name).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let ns = parse_timestamp_ns(raw)
+            .ok_or_else(|| RangeParamError::InvalidTimestamp(raw.to_string()))?;
+        // A zero bound is "not supplied", not the epoch. Checked AFTER
+        // parsing, so `start=abc` is still a parse failure rather than an
+        // absent bound.
+        Ok(if ns == 0 { None } else { Some(ns) })
+    };
+    let start = supplied("start")?;
+    let end = supplied("end")?;
+    match (start, end) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(RangeParamError::MissingRange("end")),
+        (None, Some(_)) => Err(RangeParamError::MissingRange("start")),
+        (Some(start_ns), Some(end_ns)) => {
+            if end_ns < start_ns {
+                return Err(RangeParamError::InvalidRange {
+                    start: start_ns / 1_000_000_000,
+                    end: end_ns / 1_000_000_000,
+                });
+            }
+            Ok(Some((start_ns, end_ns)))
+        }
+    }
+}
+
+/// The parsed `/api/traces/v1/tag/{tag}/values` request (issue #478):
+/// the client's raw `q` and the resolved window.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TagValuesParams {
+    pub q: Option<String>,
+    pub start_ns: i64,
+    pub end_ns: i64,
+}
+
+/// Parses a §4.3 values-route query string.
+///
+/// `now_ns`/`lookback_ns` are injected, the shape
+/// [`parse_graph_params`] already uses. The window is the supplied range,
+/// or `[now_ns - lookback_ns, now_ns]` when none was supplied; only a
+/// range FAULT fails. `q` is carried through verbatim — it is never
+/// parsed here, because parsing it is total downstream and an
+/// unparseable one must widen rather than reject.
+pub(crate) fn parse_tag_values_params(
+    raw: &str,
+    now_ns: i64,
+    lookback_ns: i64,
+) -> Result<TagValuesParams, RangeParamError> {
+    let pairs = parse_pairs(raw);
+    let (start_ns, end_ns) = match parse_range_params(&pairs)? {
+        Some(window) => window,
+        None => (now_ns.saturating_sub(lookback_ns), now_ns),
+    };
+    Ok(TagValuesParams {
+        q: get(&pairs, "q")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        start_ns,
+        end_ns,
+    })
 }
 
 /// Errors from parsing the `{tag}` path parameter of
@@ -497,6 +617,12 @@ pub(crate) struct TagsParams {
 /// constant and cannot drift apart.
 pub(crate) fn parse_tags_params(raw: &str) -> Result<TagsParams, TagsParamError> {
     let pairs = parse_pairs(raw);
+    // Issue #478: a range FAULT is rejected here too, so the six §4.3
+    // routes answer the same malformed input the same way. A WELL-FORMED
+    // range is still accepted and ignored — the catalog has no timestamp
+    // column, which is the documented time-less contract and the coupling
+    // this issue keeps open.
+    parse_range_params(&pairs)?;
     let scope = match get(&pairs, "scope") {
         None | Some("" | "none") => TagScope::All,
         Some("intrinsic") => TagScope::Intrinsic,
@@ -1614,7 +1740,7 @@ mod tests {
 
     #[test]
     fn every_served_intrinsic_spelling_resolves_to_an_intrinsic_lookup() {
-        for intrinsic in pulsus_traceql::Intrinsic::ALL {
+        for &intrinsic in pulsus_traceql::Intrinsic::ALL {
             for spelling in intrinsic.discovery_spellings() {
                 assert_eq!(
                     parse_tag_lookup(spelling).unwrap(),
@@ -1682,5 +1808,142 @@ mod tests {
                 "{raw:?} must be rejected"
             );
         }
+    }
+
+    // -- issue #478: the §4.3 range contract ---------------------------
+
+    /// One second, in nanoseconds — the unit `parse_range_params` returns.
+    const S: i64 = 1_000_000_000;
+
+    fn pairs(raw: &str) -> Vec<(String, String)> {
+        parse_pairs(raw)
+    }
+
+    /// Criterion 14. **The wording and the boundary are pinned together,
+    /// in one table, so a message that contradicts the predicate cannot
+    /// pass.** Two of the three messages are byte-identical to their
+    /// `/search` counterparts; `InvalidRange` deliberately is not, because
+    /// the two surfaces enforce DIFFERENT predicates — `/search` rejects
+    /// `end <= start`, this route rejects `end < start` only. Asserting
+    /// the literal beside the boundary that produces it is what ties the
+    /// difference in wording to the difference in behaviour: a predicate
+    /// of `<=` fails row 2, and the wording `must be greater than` fails
+    /// row 1.
+    #[test]
+    fn criterion_14_range_wording_and_boundaries() {
+        // Row 1: inverted — rejected, with the exact rendered message.
+        let err = parse_range_params(&pairs("start=100&end=99")).expect_err("inverted rejects");
+        assert_eq!(
+            err.to_string(),
+            "invalid range: end (99) must not be earlier than start (100)"
+        );
+
+        // Row 2: zero-width — ACCEPTED here, rejected on /search.
+        assert_eq!(
+            parse_range_params(&pairs("start=100&end=100")).unwrap(),
+            Some((100 * S, 100 * S))
+        );
+        assert!(
+            parse_search_params("start=100&end=100").is_err(),
+            "/search rejects end == start; this route accepts it, and that is the \
+             difference the wording above records"
+        );
+
+        // Row 3: ordinary.
+        assert_eq!(
+            parse_range_params(&pairs("start=100&end=101")).unwrap(),
+            Some((100 * S, 101 * S))
+        );
+
+        // The two shared wordings, asserted as equalities against the
+        // /search surface rather than as literals, so a change to either
+        // side fails here.
+        assert_eq!(
+            parse_range_params(&pairs("start=abc&end=101"))
+                .expect_err("unparseable")
+                .to_string(),
+            SearchParamError::InvalidTimestamp("abc".to_string()).to_string()
+        );
+        assert_eq!(
+            parse_range_params(&pairs("start=100"))
+                .expect_err("half-supplied")
+                .to_string(),
+            SearchParamError::MissingRange("end").to_string()
+        );
+    }
+
+    /// Criterion 15. **A zero bound is absent only when BOTH are**, and
+    /// the three cases are the exhaustive domain for two bounds each
+    /// either zero or not, minus the both-nonzero case criterion 12
+    /// covers. The pair is the discriminator: a rule that read `0` as 1970
+    /// fails the first case, and one that read any `0` as absent fails the
+    /// other two.
+    #[test]
+    fn criterion_15_a_zero_bound_is_absent_only_when_both_are() {
+        assert_eq!(parse_range_params(&pairs("start=0&end=0")).unwrap(), None);
+        assert!(matches!(
+            parse_range_params(&pairs("start=0&end=101")),
+            Err(RangeParamError::MissingRange("start"))
+        ));
+        assert!(matches!(
+            parse_range_params(&pairs("start=100&end=0")),
+            Err(RangeParamError::MissingRange("end"))
+        ));
+    }
+
+    /// An absent range resolves to `[now - lookback, now]`, and a
+    /// supplied one is carried through unchanged.
+    #[test]
+    fn tag_values_params_substitute_the_lookback_only_when_no_range_is_supplied() {
+        let now = 1_700_000_000 * S;
+        let lookback = 24 * 3_600 * S;
+
+        let p = parse_tag_values_params("", now, lookback).unwrap();
+        assert_eq!(p.start_ns, now - lookback);
+        assert_eq!(p.end_ns, now);
+        assert_eq!(p.q, None);
+
+        let p = parse_tag_values_params("start=100&end=200", now, lookback).unwrap();
+        assert_eq!(p.start_ns, 100 * S);
+        assert_eq!(p.end_ns, 200 * S);
+    }
+
+    /// `q` is carried verbatim and NEVER parsed here — including the
+    /// half-typed shapes the editor sends on every keystroke. An empty
+    /// `q` is the same as an absent one.
+    #[test]
+    fn a_half_typed_q_is_carried_through_rather_than_rejected() {
+        let now = 1_700_000_000 * S;
+        for raw_q in ["%7Bspan.http.status_code%3D", "garbage", "%7B"] {
+            let p = parse_tag_values_params(&format!("q={raw_q}"), now, S).unwrap();
+            assert!(p.q.is_some(), "{raw_q} must be carried, not rejected");
+        }
+        assert_eq!(parse_tag_values_params("q=", now, S).unwrap().q, None);
+    }
+
+    /// A range FAULT reaches the names routes too, so the same malformed
+    /// input is answered the same way on all six §4.3 routes — while a
+    /// WELL-FORMED range is still accepted and ignored there.
+    #[test]
+    fn a_names_route_rejects_a_range_fault_and_ignores_a_well_formed_range() {
+        assert!(matches!(
+            parse_tags_params("start=abc&end=200"),
+            Err(TagsParamError::Range(RangeParamError::InvalidTimestamp(_)))
+        ));
+        assert!(matches!(
+            parse_tags_params("start=100"),
+            Err(TagsParamError::Range(RangeParamError::MissingRange("end")))
+        ));
+        assert!(matches!(
+            parse_tags_params("start=200&end=100"),
+            Err(TagsParamError::Range(RangeParamError::InvalidRange { .. }))
+        ));
+        // Well-formed: still ignored, still `TagScope::All`.
+        assert_eq!(
+            parse_tags_params("start=100&end=200").unwrap(),
+            TagsParams {
+                scope: TagScope::All
+            }
+        );
     }
 }

@@ -870,6 +870,61 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::Global,
     },
+    // --- the span-name day-grain projection (issue #478) ---
+    //
+    // The §4.3 Span Name dropdown reads DISTINCT span names over a window.
+    // `trace_spans` is ordered `(trace_id, timestamp_ns)` and its
+    // `service_time` projection `(service, timestamp_ns)`, so neither
+    // leads with `name` and the read scans every granule in the window.
+    // This projection aggregates to one row per `(UTC day, name)`, which
+    // is the grain the window bound already resolves to.
+    //
+    // The `SELECT` list is the projection's own key expression, so the
+    // read's `toDate(fromUnixTimestamp64Nano(timestamp_ns))` window
+    // predicate matches it. A `timestamp_ns` predicate does NOT — it
+    // defeats the projection and the read falls back to the base table,
+    // which is why `tags_sql::span_name_values_sql` carries only the day
+    // clause.
+    //
+    // Additive `ALTER … ADD PROJECTION IF NOT EXISTS`, never a mutation
+    // of id 16's frozen CREATE — the id 31/35/37/39 precedent.
+    //
+    // No `StaticClusterOnly` sibling, unlike ids 31/32, 35/36, 37/38 and
+    // 39/40: measured, a `Distributed` wrapper's `SHOW CREATE` carries
+    // zero `PROJECTION` lines while the local table carries them, and a
+    // read issued THROUGH the wrapper still uses the local projection. A
+    // wrapper copy would be a DDL error, not a no-op.
+    Migration {
+        id: 42,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD PROJECTION IF NOT EXISTS span_name_day (\n\
+                 SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count()\n\
+                 GROUP BY d, name\n\
+             );",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // Materializing is a separate statement because `ADD PROJECTION`
+    // covers only parts written AFTER it. On a fresh database this is
+    // instant; on an upgraded install it is an asynchronous mutation, so
+    // `--mode init` does not block on it and the read degrades to the
+    // base-table scan until it finishes — never a wrong answer, only a
+    // slower one.
+    Migration {
+        id: 43,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             MATERIALIZE PROJECTION span_name_day;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from

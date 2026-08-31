@@ -15,6 +15,46 @@
 
 use std::fmt;
 
+/// Declares a fieldless enum AND its `ALL` slice from ONE token list, so
+/// a variant cannot exist without being in `ALL` (issue #478).
+///
+/// **Why a macro rather than the hand-written array this crate used
+/// before.** The array form is not compiler-gated: adding a variant and
+/// giving it an arm in every exhaustive `match` compiles and passes while
+/// `ALL` silently omits it, so every test that iterates `ALL` keeps
+/// passing over a variant nobody exercised. Measured on a probe of
+/// exactly that shape — a seventh variant, matched everywhere, absent
+/// from the array — the suite ran `1 passed; 0 failed`. Declaring both
+/// from one token list makes that state unrepresentable.
+///
+/// Local `macro_rules!`, no dependency: `macro_rules!` is already the
+/// established pattern in this workspace (`pulsus-logql`'s own `ast.rs`
+/// among 50 files), so this adds no derive-macro crate.
+///
+/// Per-variant attributes — doc comments included — pass through, which
+/// is what lets the documented enums below adopt it without losing a line
+/// of their documentation.
+macro_rules! enum_with_all {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $($(#[$variant_meta:meta])* $variant:ident),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        $vis enum $name {
+            $($(#[$variant_meta])* $variant),+
+        }
+
+        impl $name {
+            /// Every variant, declaration order — GENERATED from the same
+            /// token list as the variants themselves (issue #478), never
+            /// transcribed, so it cannot omit one.
+            $vis const ALL: &'static [$name] = &[$($name::$variant),+];
+        }
+    };
+}
+
 /// A parsed TraceQL search query: a spanset expression plus its pipeline
 /// of aggregate filters / `select` stages (docs/features.md §4, M4
 /// coverage line).
@@ -454,100 +494,74 @@ fn render_attr_key(key: &str) -> String {
     }
 }
 
-/// The span intrinsics: the four M4 intrinsics (docs/features.md §4) plus
-/// the nested-set structural intrinsics (issue #181) — numeric span
-/// properties used in field comparisons (`{ nestedSetParent < 0 }`), not
-/// new operators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Intrinsic {
-    Name,
-    Duration,
-    Status,
-    Kind,
-    /// `nestedSetParent` — the nested-set `left` value of a span's parent,
-    /// or a negative sentinel for a root span (issue #181).
-    NestedSetParent,
-    /// `nestedSetLeft` — a span's modified-preorder `left` boundary.
-    NestedSetLeft,
-    /// `nestedSetRight` — a span's modified-preorder `right` boundary.
-    NestedSetRight,
-    // -- issue #184: the colon-scoped intrinsic namespace. The bare and
-    // `span:`/`trace:` scoped spellings normalize onto one variant each
-    // (`span:name` ≡ `name`); the canonical `Display` reparses to the same
-    // variant (the round-trip oracle).
-    /// `statusMessage` | `span:statusMessage` — the span status message
-    /// (string).
-    StatusMessage,
-    /// `span:childCount` — the number of direct children of a span
-    /// (integer; no bare spelling).
-    ChildCount,
-    /// `span:id` — the span id (hex string; no bare spelling).
-    SpanId,
-    /// `span:parentID` — the parent span id (hex string; no bare spelling).
-    ParentId,
-    /// `trace:id` — the trace id (hex string; no bare spelling).
-    TraceId,
-    /// `traceDuration` | `trace:duration` — the whole trace's duration.
-    TraceDuration,
-    /// `rootName` | `trace:rootName` — the trace root span's name (string).
-    RootName,
-    /// `rootServiceName` | `trace:rootService` — the trace root span's
-    /// service name (string).
-    RootServiceName,
-    // -- issue #192: the instrumentation-scope intrinsic namespace. Only a
-    // scoped spelling exists (`instrumentation:name`/`instrumentation:version`),
-    // resolved through the `instrumentation` scope keyword.
-    /// `instrumentation:name` — the OTLP instrumentation scope name (string).
-    InstrumentationName,
-    /// `instrumentation:version` — the OTLP instrumentation scope version
-    /// (string).
-    InstrumentationVersion,
-    // -- issue #192 (PR-B): the span-event intrinsic namespace. Only a
-    // scoped spelling exists (`event:name`/`event:timeSinceStart`), resolved
-    // through the `event` scope keyword.
-    /// `event:name` — a span event's name (string).
-    EventName,
-    /// `event:timeSinceStart` — a span event's timestamp relative to its
-    /// span's start, as a duration (`event.timeUnixNano − span.startTimeUnixNano`).
-    EventTimeSinceStart,
-    // -- issue #192 (PR-C): the span-link intrinsic namespace. Only a
-    // scoped spelling exists (`link:spanID`/`link:traceID`), resolved through
-    // the `link` scope keyword.
-    /// `link:spanID` — a span link's referenced span id (lowercase-hex string).
-    LinkSpanId,
-    /// `link:traceID` — a span link's referenced trace id (lowercase-hex string).
-    LinkTraceId,
+enum_with_all! {
+    /// The span intrinsics: the four M4 intrinsics (docs/features.md §4) plus
+    /// the nested-set structural intrinsics (issue #181) — numeric span
+    /// properties used in field comparisons (`{ nestedSetParent < 0 }`), not
+    /// new operators.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Intrinsic {
+        Name,
+        Duration,
+        Status,
+        Kind,
+        /// `nestedSetParent` — the nested-set `left` value of a span's parent,
+        /// or a negative sentinel for a root span (issue #181).
+        NestedSetParent,
+        /// `nestedSetLeft` — a span's modified-preorder `left` boundary.
+        NestedSetLeft,
+        /// `nestedSetRight` — a span's modified-preorder `right` boundary.
+        NestedSetRight,
+        // -- issue #184: the colon-scoped intrinsic namespace. The bare and
+        // `span:`/`trace:` scoped spellings normalize onto one variant each
+        // (`span:name` ≡ `name`); the canonical `Display` reparses to the same
+        // variant (the round-trip oracle).
+        /// `statusMessage` | `span:statusMessage` — the span status message
+        /// (string).
+        StatusMessage,
+        /// `span:childCount` — the number of direct children of a span
+        /// (integer; no bare spelling).
+        ChildCount,
+        /// `span:id` — the span id (hex string; no bare spelling).
+        SpanId,
+        /// `span:parentID` — the parent span id (hex string; no bare spelling).
+        ParentId,
+        /// `trace:id` — the trace id (hex string; no bare spelling).
+        TraceId,
+        /// `traceDuration` | `trace:duration` — the whole trace's duration.
+        TraceDuration,
+        /// `rootName` | `trace:rootName` — the trace root span's name (string).
+        RootName,
+        /// `rootServiceName` | `trace:rootService` — the trace root span's
+        /// service name (string).
+        RootServiceName,
+        // -- issue #192: the instrumentation-scope intrinsic namespace. Only a
+        // scoped spelling exists (`instrumentation:name`/`instrumentation:version`),
+        // resolved through the `instrumentation` scope keyword.
+        /// `instrumentation:name` — the OTLP instrumentation scope name (string).
+        InstrumentationName,
+        /// `instrumentation:version` — the OTLP instrumentation scope version
+        /// (string).
+        InstrumentationVersion,
+        // -- issue #192 (PR-B): the span-event intrinsic namespace. Only a
+        // scoped spelling exists (`event:name`/`event:timeSinceStart`), resolved
+        // through the `event` scope keyword.
+        /// `event:name` — a span event's name (string).
+        EventName,
+        /// `event:timeSinceStart` — a span event's timestamp relative to its
+        /// span's start, as a duration (`event.timeUnixNano − span.startTimeUnixNano`).
+        EventTimeSinceStart,
+        // -- issue #192 (PR-C): the span-link intrinsic namespace. Only a
+        // scoped spelling exists (`link:spanID`/`link:traceID`), resolved through
+        // the `link` scope keyword.
+        /// `link:spanID` — a span link's referenced span id (lowercase-hex string).
+        LinkSpanId,
+        /// `link:traceID` — a span link's referenced trace id (lowercase-hex string).
+        LinkTraceId,
+    }
 }
 
 impl Intrinsic {
-    /// Every variant, declaration order. Hand-maintained and NOT
-    /// compiler-gated: the exhaustive matches below force a decision when
-    /// a variant is added, but nothing forces it into this array (issue
-    /// #475, stated as a limit rather than claimed closed).
-    pub const ALL: [Intrinsic; 21] = [
-        Self::Name,
-        Self::Duration,
-        Self::Status,
-        Self::Kind,
-        Self::NestedSetParent,
-        Self::NestedSetLeft,
-        Self::NestedSetRight,
-        Self::StatusMessage,
-        Self::ChildCount,
-        Self::SpanId,
-        Self::ParentId,
-        Self::TraceId,
-        Self::TraceDuration,
-        Self::RootName,
-        Self::RootServiceName,
-        Self::InstrumentationName,
-        Self::InstrumentationVersion,
-        Self::EventName,
-        Self::EventTimeSinceStart,
-        Self::LinkSpanId,
-        Self::LinkTraceId,
-    ];
-
     /// The tag-discovery spellings this intrinsic is offered under, or an
     /// EMPTY slice when it is deliberately not offered (issue #475).
     ///
@@ -720,23 +734,25 @@ impl fmt::Display for Intrinsic {
     }
 }
 
-/// Attribute scope: `span.`, `resource.`, or the leading-`.` unscoped
-/// form (searches both scopes — docs/schemas.md §4.1). `parent.` is
-/// recognized and rejected as `NotYetSupported` (M7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AttrScope {
-    Span,
-    Resource,
-    Unscoped,
-    /// `instrumentation.` — the OTLP instrumentation-scope attribute
-    /// namespace (issue #192), index-served under `scope='instrumentation'`.
-    Instrumentation,
-    /// `event.` — the span-event attribute namespace (issue #192 PR-B),
-    /// index-served under `scope='event'`.
-    Event,
-    /// `link.` — the span-link attribute namespace (issue #192 PR-C),
-    /// index-served under `scope='link'`.
-    Link,
+enum_with_all! {
+    /// Attribute scope: `span.`, `resource.`, or the leading-`.` unscoped
+    /// form (searches both scopes — docs/schemas.md §4.1). `parent.` is
+    /// recognized and rejected as `NotYetSupported` (M7).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AttrScope {
+        Span,
+        Resource,
+        Unscoped,
+        /// `instrumentation.` — the OTLP instrumentation-scope attribute
+        /// namespace (issue #192), index-served under `scope='instrumentation'`.
+        Instrumentation,
+        /// `event.` — the span-event attribute namespace (issue #192 PR-B),
+        /// index-served under `scope='event'`.
+        Event,
+        /// `link.` — the span-link attribute namespace (issue #192 PR-C),
+        /// index-served under `scope='link'`.
+        Link,
+    }
 }
 
 impl fmt::Display for AttrScope {
@@ -1736,7 +1752,7 @@ mod tests {
     #[test]
     fn every_served_spelling_resolves_back_to_its_own_variant() {
         let mut served = 0usize;
-        for variant in Intrinsic::ALL {
+        for &variant in Intrinsic::ALL {
             for spelling in variant.discovery_spellings() {
                 served += 1;
                 assert_eq!(
@@ -1788,7 +1804,7 @@ mod tests {
                 ][..]
             )
         );
-        for variant in Intrinsic::ALL {
+        for &variant in Intrinsic::ALL {
             if !matches!(variant, Intrinsic::Status | Intrinsic::Kind) {
                 assert_eq!(
                     variant.discovery_values(),

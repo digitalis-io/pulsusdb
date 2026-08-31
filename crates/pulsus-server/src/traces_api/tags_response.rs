@@ -764,4 +764,71 @@ mod tests {
             assert_ne!(entry["type"], json!(""), "{entry}");
         }
     }
+
+    /// Issue #478, criterion 5b (wire half). **Span names render as
+    /// `string`, whatever they look like**, and the empty name omits the
+    /// `value` key entirely.
+    ///
+    /// The expected body is the reference's captured answer for these
+    /// names, not a rendering of our own rule: it types `500`, `1.5`,
+    /// `true`, `1.5s` and `-3` as `string`, where a text-classifying
+    /// inference would have said `int`, `float`, `bool`, `duration` and
+    /// `int`.
+    ///
+    /// This is the WIRE half only. It cannot see whether the engine set
+    /// the type or left it empty — `entry_type("")` renders `string` too —
+    /// which is why `pulsus_read`'s
+    /// `traces::exec::tests::a_span_name_value_carries_an_explicit_string_type`
+    /// exists beside it.
+    #[test]
+    fn span_names_render_as_string() {
+        // What `list_span_name_values` returns: every name typed `string`.
+        let values = tag_values(
+            &[
+                ("", "string"),
+                ("-3", "string"),
+                ("1.5", "string"),
+                ("1.5s", "string"),
+                ("500", "string"),
+                ("checkout", "string"),
+                ("true", "string"),
+            ],
+            false,
+        );
+        assert_eq!(
+            render_tag_values(&TagValuesAnswer::Catalog(&values)),
+            json!({
+                "tagValues": [
+                    {"type": "string"},
+                    {"type": "string", "value": "-3"},
+                    {"type": "string", "value": "1.5"},
+                    {"type": "string", "value": "1.5s"},
+                    {"type": "string", "value": "500"},
+                    {"type": "string", "value": "checkout"},
+                    {"type": "string", "value": "true"},
+                ],
+                "truncated": false,
+            })
+        );
+    }
+
+    /// The store-backed answer and the static vocabulary answer are
+    /// rendered by DIFFERENT arms, and confusing them is visible: a
+    /// vocabulary value carries `keyword`, which is what makes the
+    /// datasource emit it unquoted, and a span name carries `string`,
+    /// which makes it quoted. Asserted as a pair so exchanging the two
+    /// type constants fails here.
+    #[test]
+    fn a_vocabulary_value_is_keyword_and_a_span_name_is_string() {
+        let statics: [&'static str; 1] = ["error"];
+        assert_eq!(
+            render_tag_values(&TagValuesAnswer::Static(&statics))["tagValues"],
+            json!([{"type": "keyword", "value": "error"}])
+        );
+        let names = tag_values(&[("error", "string")], false);
+        assert_eq!(
+            render_tag_values(&TagValuesAnswer::Catalog(&names))["tagValues"],
+            json!([{"type": "string", "value": "error"}])
+        );
+    }
 }

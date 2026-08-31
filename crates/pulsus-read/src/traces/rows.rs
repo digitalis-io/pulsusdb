@@ -320,6 +320,16 @@ pub struct TagNameRow {
     pub key: String,
 }
 
+/// One `trace_spans` row of the §4.3 span-NAME values read
+/// (`tags_sql::span_name_values_sql` — `SELECT DISTINCT <capped name> AS
+/// val`, issue #478). One column: the type is not read from the store,
+/// because a span name is a `String` column and is always reported
+/// `string`.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct SpanNameRow {
+    pub val: String,
+}
+
 /// One `trace_tag_catalog` row of the §4.3 tag-values read
 /// (`tags_sql::tag_values_sql` — `SELECT DISTINCT val, val_type`, issues
 /// #58 and #476). Field order matches the SELECT list exactly (RowBinary

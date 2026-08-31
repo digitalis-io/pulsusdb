@@ -1,0 +1,3478 @@
+{
+ "_provenance": {
+  "captured_from": "grafana/tempo:3.0.2, /api/status/buildinfo reported {\"version\":\"v3.0.2\",\"revision\":\"0c4b926d0\",\"branch\":\"HEAD\",\"goVersion\":\"go1.26.3\"}",
+  "image_repo_digest": "docker.io/grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7",
+  "image_pinned_as": "grafana/tempo:3.0.2@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3 (deploy/e2e/compose.single.yaml); the RepoDigest above is what the local store records for the same image after pull",
+  "config": "deploy/e2e/tempo.yaml, unmodified",
+  "metrics_object_removed": "The reference's trailing \"metrics\" object is stripped from every body here: we emit no such key on any tag route. That difference is ledgered as traceql-tag-routes-metrics-object-absent and is not what this fixture is for.",
+  "ordering": "The reference does not sort tag values (ledger traceql-tag-discovery-ordering). Its span.port order here is string-then-int; ours is int-then-string. The test compares the entry SET for keys with more than one value and the exact array for single-value keys.",
+  "captures": [
+   {
+    "issue": "#476",
+    "captured_on": "2026-08-31 (issue #476)",
+    "how": "One OTLP/HTTP JSON push of the issue #476 acceptance corpus (two resource groups, timestamps derived from the clock at push time), then GET /api/v2/search/tag/{key}/values per key and GET /api/search/tag/port/values.",
+    "corpus": {
+     "trace_1": "1111111111111111aaaaaaaaaaaaaaaa / span aaaaaaaaaaaaaaa1 \"checkout\"; resource service.name = STRING \"12345\"; scope io.otel.http 1.2.3; span attrs build=\"007\", timeout=\"2s\", enabled=\"true\", ratio=\"1.5\", slo=\"1.5\", note=\"\" (all STRINGS), http.status_code=int 500, sampled=bool true, cpu=double 1.5, port=STRING \"8080\"",
+     "trace_2": "2222222222222222bbbbbbbbbbbbbbbb / span bbbbbbbbbbbbbbb2 \"charge\"; resource service.name = string \"checkout\"; span attr port=INT 8080"
+    },
+    "sections": [
+     "v2_tag_values",
+     "v1_flat_port_values"
+    ]
+   },
+   {
+    "issue": "#478",
+    "captured_on": "2026-08-31",
+    "how": "One OTLP/HTTP JSON push of the C10 corpus below, then the q matrix and the range shapes over GET /api/v2/search/tag/{tag}/values, /api/search/tag/{tag}/values, /api/v2/search/tags and /api/search/tags; then a second push of the C4 typing corpus and one more name-values read over the union. Every timestamp is derived from the clock at push time.",
+    "corpus": {
+     "C10": "ten single-span traces: names GET /api/v1/users, GET /api/v1/users/{id}, HTTP POST, checkout-svc.process, checkout-svc.retry, 派遣クエリ, the empty string, a, pay.charge, pay.charge.retry; services cart/checkout/pay; resource deployment.environment=prod throughout; span attrs http.method (string) and http.status_code (int); status code 2 where http.status_code >= 500, else 1; kind server; duration 1.5 ms",
+     "C4": "six more single-span traces under service typed, named 500, 1.5, true, 1.5s, -3 and checkout — the shapes a text-classifying type inference would call int/float/bool/duration/int/string — plus one name of 9000 ASCII characters, over the 8192-byte string-column cap"
+    },
+    "sections": [
+     "q_matrix",
+     "range_faults",
+     "range_accepted",
+     "span_names"
+    ],
+    "why_two_endpoints": "The two corpora cannot share one reference instance: measured on this build, its tag-value time filtering is BLOCK-granular, not span-granular — two corpora pushed 120 s apart were both returned by a window covering only the later one. So the #476 sections replay against their own endpoint.",
+    "measured_incompleteness": "Case Q-AM: with the same corpus and window, the reference answers {resource.service.name=\"pay\"} on span.http.status_code with [201] alone, while its own name-values answer for the same condition lists the span `a`, whose http.status_code is 200 ({name=\"a\"} returns [200]). The same shape appears for service checkout (500 only, 200 missing) and not for cart. The mechanism was not established; what is recorded is the observation."
+   }
+  ]
+ },
+ "v2_tag_values": {
+  "resource.service.name": {
+   "tagValues": [
+    {
+     "type": "string",
+     "value": "12345"
+    },
+    {
+     "type": "string",
+     "value": "checkout"
+    }
+   ]
+  },
+  "span.build": {
+   "tagValues": [
+    {
+     "type": "string",
+     "value": "007"
+    }
+   ]
+  },
+  "span.timeout": {
+   "tagValues": [
+    {
+     "type": "string",
+     "value": "2s"
+    }
+   ]
+  },
+  "span.enabled": {
+   "tagValues": [
+    {
+     "type": "string",
+     "value": "true"
+    }
+   ]
+  },
+  "span.ratio": {
+   "tagValues": [
+    {
+     "type": "string",
+     "value": "1.5"
+    }
+   ]
+  },
+  "span.slo": {
+   "tagValues": [
+    {
+     "type": "string",
+     "value": "1.5"
+    }
+   ]
+  },
+  "span.note": {
+   "tagValues": [
+    {
+     "type": "string"
+    }
+   ]
+  },
+  "span.http.status_code": {
+   "tagValues": [
+    {
+     "type": "int",
+     "value": "500"
+    }
+   ]
+  },
+  "span.sampled": {
+   "tagValues": [
+    {
+     "type": "bool",
+     "value": "true"
+    }
+   ]
+  },
+  "span.cpu": {
+   "tagValues": [
+    {
+     "type": "float",
+     "value": "1.5"
+    }
+   ]
+  },
+  "span.port": {
+   "tagValues": [
+    {
+     "type": "string",
+     "value": "8080"
+    },
+    {
+     "type": "int",
+     "value": "8080"
+    }
+   ]
+  }
+ },
+ "v1_flat_port_values": {
+  "tagValues": [
+   "8080"
+  ]
+ },
+ "q_matrix": {
+  "Q-A": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-B": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-C": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=\"cart\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ]
+    ]
+   }
+  },
+  "Q-D": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=\"cart\" && span.http.method=\"GET\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ]
+    ]
+   }
+  },
+  "Q-E": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{span.http.status_code=500}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ]
+    ]
+   }
+  },
+  "Q-F": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{name=\"pay.charge\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay.charge"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay.charge"
+     ]
+    ]
+   }
+  },
+  "Q-G": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{name=\"\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ]
+    ]
+   }
+  },
+  "Q-H": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{name=\"派遣クエリ\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-I": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{span.http.status_code=5",
+   "reference": {
+    "status": 200,
+    "values": []
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-q-lenient-parse-not-reproduced"
+  },
+  "Q-J": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=\"cart\" && span.http.status_code=",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-q-lenient-parse-not-reproduced"
+  },
+  "Q-K": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{name=\"pay.charge\" && span.",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      ""
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-L": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{span.http.status_code=200 &&",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-q-lenient-parse-not-reproduced"
+  },
+  "Q-M": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{name=\"pay.charge\" && span.http.",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay.charge"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-q-lenient-parse-not-reproduced"
+  },
+  "Q-N": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "garbage",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-O": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-P": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{span.",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-Q": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=\"",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-R": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "a"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-S": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "   ",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      ""
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-T": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{} | ",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-U": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{.foo=}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-V": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{bogus.x=\"y\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-W": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=\"cart\" || resource.service.name=\"pay\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-q-partial-pushdown"
+  },
+  "Q-X": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{.http.method=\"GET\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-unscoped-attr-narrows-here"
+  },
+  "Q-Y": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{name=\"pay\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   },
+   "ledger": "traceql-tag-values-requested-tag-condition-applied"
+  },
+  "Q-Z": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{name=~\".*charge.*\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-requested-tag-condition-applied"
+  },
+  "Q-AA": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name!=\"cart\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-AB": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=~\"ca.*\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ]
+    ]
+   }
+  },
+  "Q-AC": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=\"cart\"} | select(span.http.method)",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ]
+    ]
+   }
+  },
+  "Q-AD": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=\"cart\"} >> {span.http.method=\"GET\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "a"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-AE": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{status=error}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ]
+    ]
+   }
+  },
+  "Q-AF": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{duration > 1s}",
+   "reference": {
+    "status": 200,
+    "values": []
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   }
+  },
+  "Q-AG": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{kind=server}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-AH": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.service.name=\"nope\"}",
+   "reference": {
+    "status": 200,
+    "values": []
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   }
+  },
+  "Q-AI": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": "{resource.deployment.environment=\"prod\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      ""
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-AJ": {
+   "route": "/api/v2/search/tag/span.http.method/values",
+   "q": "{resource.service.name=\"cart\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET"
+     ],
+     [
+      "string",
+      "POST"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "GET"
+     ],
+     [
+      "string",
+      "POST"
+     ]
+    ]
+   }
+  },
+  "Q-AK": {
+   "route": "/api/v2/search/tag/span.http.method/values",
+   "q": "{name=\"pay.charge\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "POST"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "POST"
+     ]
+    ]
+   }
+  },
+  "Q-AL": {
+   "route": "/api/v2/search/tag/span.http.status_code/values",
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "int",
+      "201"
+     ],
+     [
+      "int",
+      "200"
+     ],
+     [
+      "int",
+      "404"
+     ],
+     [
+      "int",
+      "500"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "int",
+      "200"
+     ],
+     [
+      "int",
+      "201"
+     ],
+     [
+      "int",
+      "404"
+     ],
+     [
+      "int",
+      "500"
+     ]
+    ]
+   }
+  },
+  "Q-AM": {
+   "route": "/api/v2/search/tag/span.http.status_code/values",
+   "q": "{resource.service.name=\"pay\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "int",
+      "201"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "int",
+      "200"
+     ],
+     [
+      "int",
+      "201"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-narrowed-set-complete-here"
+  },
+  "Q-AN": {
+   "route": "/api/v2/search/tag/resource.service.name/values",
+   "q": "{name=\"pay.charge\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "pay"
+     ]
+    ]
+   }
+  },
+  "Q-AO": {
+   "route": "/api/v2/search/tag/span.nope/values",
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": []
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   }
+  },
+  "Q-AP": {
+   "route": "/api/v2/search/tag/span%3Aname/values",
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   }
+  },
+  "Q-AQ": {
+   "route": "/api/search/tag/name/values",
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   },
+   "ledger": "traceql-v1-tag-values-statics-unimplemented"
+  },
+  "Q-AR": {
+   "route": "/api/search/tag/name/values",
+   "q": "{resource.service.name=\"cart\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   },
+   "ledger": "traceql-v1-tag-values-statics-unimplemented"
+  },
+  "Q-AS": {
+   "route": "/api/traces/v1/tag/name/values",
+   "q": null,
+   "reference": null,
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ],
+    "truncated": false
+   }
+  },
+  "Q-AZ": {
+   "route": "/api/v2/search/tag/name/values",
+   "q": null,
+   "params": "start=end (a zero-width range)",
+   "reference": {
+    "status": 200,
+    "values": []
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      ""
+     ],
+     [
+      "string",
+      "GET /api/v1/users"
+     ],
+     [
+      "string",
+      "GET /api/v1/users/{id}"
+     ],
+     [
+      "string",
+      "HTTP POST"
+     ],
+     [
+      "string",
+      "a"
+     ],
+     [
+      "string",
+      "checkout-svc.process"
+     ],
+     [
+      "string",
+      "checkout-svc.retry"
+     ],
+     [
+      "string",
+      "pay.charge"
+     ],
+     [
+      "string",
+      "pay.charge.retry"
+     ],
+     [
+      "string",
+      "派遣クエリ"
+     ]
+    ]
+   },
+   "ledger": "traceql-tag-values-window-is-day-granular"
+  }
+ },
+ "range_faults": {
+  "/api/v2/search/tags|malformed_start": {
+   "route": "/api/v2/search/tags",
+   "shape": "malformed_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid timestamp \"abc\": expected unix seconds, unix nanoseconds, or RFC3339"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tags|malformed_end": {
+   "route": "/api/v2/search/tags",
+   "shape": "malformed_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid timestamp \"abc\": expected unix seconds, unix nanoseconds, or RFC3339"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tags|half_start": {
+   "route": "/api/v2/search/tags",
+   "shape": "half_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"end\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tags|half_end": {
+   "route": "/api/v2/search/tags",
+   "shape": "half_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"start\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tags|zero_start": {
+   "route": "/api/v2/search/tags",
+   "shape": "zero_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"start\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tags|zero_end": {
+   "route": "/api/v2/search/tags",
+   "shape": "zero_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"end\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tags|inverted": {
+   "route": "/api/v2/search/tags",
+   "shape": "inverted",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid range: end ({end}) must not be earlier than start ({start})"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tags|malformed_start": {
+   "route": "/api/search/tags",
+   "shape": "malformed_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid timestamp \"abc\": expected unix seconds, unix nanoseconds, or RFC3339"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tags|malformed_end": {
+   "route": "/api/search/tags",
+   "shape": "malformed_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid timestamp \"abc\": expected unix seconds, unix nanoseconds, or RFC3339"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tags|half_start": {
+   "route": "/api/search/tags",
+   "shape": "half_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"end\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tags|half_end": {
+   "route": "/api/search/tags",
+   "shape": "half_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"start\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tags|zero_start": {
+   "route": "/api/search/tags",
+   "shape": "zero_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"start\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tags|zero_end": {
+   "route": "/api/search/tags",
+   "shape": "zero_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"end\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tags|inverted": {
+   "route": "/api/search/tags",
+   "shape": "inverted",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid range: end ({end}) must not be earlier than start ({start})"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tag/name/values|malformed_start": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "malformed_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid timestamp \"abc\": expected unix seconds, unix nanoseconds, or RFC3339"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tag/name/values|malformed_end": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "malformed_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid timestamp \"abc\": expected unix seconds, unix nanoseconds, or RFC3339"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tag/name/values|half_start": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "half_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"end\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tag/name/values|half_end": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "half_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"start\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tag/name/values|zero_start": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "zero_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"start\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tag/name/values|zero_end": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "zero_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"end\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/v2/search/tag/name/values|inverted": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "inverted",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid range: end ({end}) must not be earlier than start ({start})"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tag/name/values|malformed_start": {
+   "route": "/api/search/tag/name/values",
+   "shape": "malformed_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid timestamp \"abc\": expected unix seconds, unix nanoseconds, or RFC3339"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tag/name/values|malformed_end": {
+   "route": "/api/search/tag/name/values",
+   "shape": "malformed_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid timestamp \"abc\": expected unix seconds, unix nanoseconds, or RFC3339"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tag/name/values|half_start": {
+   "route": "/api/search/tag/name/values",
+   "shape": "half_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"end\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tag/name/values|half_end": {
+   "route": "/api/search/tag/name/values",
+   "shape": "half_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"start\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tag/name/values|zero_start": {
+   "route": "/api/search/tag/name/values",
+   "shape": "zero_start",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"start\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tag/name/values|zero_end": {
+   "route": "/api/search/tag/name/values",
+   "shape": "zero_end",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "missing required parameter \"end\": start and end are required"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  },
+  "/api/search/tag/name/values|inverted": {
+   "route": "/api/search/tag/name/values",
+   "shape": "inverted",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "not quoted: the reference's body ends in its runtime's own integer-parse error, or names a configured maximum-window-width setting we do not have"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8",
+    "body": "invalid range: end ({end}) must not be earlier than start ({start})"
+   },
+   "ledger": "traceql-tag-values-range-error-text"
+  }
+ },
+ "range_accepted": {
+  "/api/v2/search/tags|both_zero": {
+   "route": "/api/v2/search/tags",
+   "shape": "both_zero",
+   "reference": {
+    "status": 200,
+    "content_type": "application/json"
+   },
+   "pulsus": {
+    "status": 200,
+    "content_type": "application/json"
+   }
+  },
+  "/api/v2/search/tags|zero_width": {
+   "route": "/api/v2/search/tags",
+   "shape": "zero_width",
+   "reference": {
+    "status": 200,
+    "content_type": "application/json"
+   },
+   "pulsus": {
+    "status": 200,
+    "content_type": "application/json"
+   }
+  },
+  "/api/search/tags|both_zero": {
+   "route": "/api/search/tags",
+   "shape": "both_zero",
+   "reference": {
+    "status": 200,
+    "content_type": "application/json"
+   },
+   "pulsus": {
+    "status": 200,
+    "content_type": "application/json"
+   }
+  },
+  "/api/search/tags|zero_width": {
+   "route": "/api/search/tags",
+   "shape": "zero_width",
+   "reference": {
+    "status": 200,
+    "content_type": "application/json"
+   },
+   "pulsus": {
+    "status": 200,
+    "content_type": "application/json"
+   }
+  },
+  "/api/v2/search/tag/name/values|both_zero": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "both_zero",
+   "reference": {
+    "status": 200,
+    "content_type": "application/json"
+   },
+   "pulsus": {
+    "status": 200,
+    "content_type": "application/json"
+   }
+  },
+  "/api/v2/search/tag/name/values|zero_width": {
+   "route": "/api/v2/search/tag/name/values",
+   "shape": "zero_width",
+   "reference": {
+    "status": 200,
+    "content_type": "application/json"
+   },
+   "pulsus": {
+    "status": 200,
+    "content_type": "application/json"
+   }
+  },
+  "/api/search/tag/name/values|both_zero": {
+   "route": "/api/search/tag/name/values",
+   "shape": "both_zero",
+   "reference": {
+    "status": 200,
+    "content_type": "application/json"
+   },
+   "pulsus": {
+    "status": 200,
+    "content_type": "application/json"
+   }
+  },
+  "/api/search/tag/name/values|zero_width": {
+   "route": "/api/search/tag/name/values",
+   "shape": "zero_width",
+   "reference": {
+    "status": 200,
+    "content_type": "application/json"
+   },
+   "pulsus": {
+    "status": 200,
+    "content_type": "application/json"
+   }
+  }
+ },
+ "span_names": {
+  "T-TYPES": {
+   "route": "/api/v2/search/tag/name/values",
+   "note": "the adversarial names, over the union of C10 and C4",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "-3"
+     ],
+     [
+      "string",
+      "1.5"
+     ],
+     [
+      "string",
+      "1.5s"
+     ],
+     [
+      "string",
+      "500"
+     ],
+     [
+      "string",
+      "checkout"
+     ],
+     [
+      "string",
+      "true"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "-3"
+     ],
+     [
+      "string",
+      "1.5"
+     ],
+     [
+      "string",
+      "1.5s"
+     ],
+     [
+      "string",
+      "500"
+     ],
+     [
+      "string",
+      "checkout"
+     ],
+     [
+      "string",
+      "true"
+     ]
+    ]
+   }
+  },
+  "T-CAP": {
+   "route": "/api/v2/search/tag/name/values",
+   "note": "one span name built as the ASCII character below repeated `push_len` times",
+   "repeated_char": "L",
+   "push_len": 9000,
+   "reference": {
+    "status": 200,
+    "type": "string",
+    "value_len": 9000
+   },
+   "pulsus": {
+    "status": 200,
+    "type": "string",
+    "value_len": 2048
+   },
+   "ledger": "traceql-tag-values-span-name-byte-cap"
+  }
+ }
+}

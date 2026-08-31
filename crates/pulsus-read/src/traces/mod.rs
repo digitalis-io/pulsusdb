@@ -15,7 +15,9 @@
 //! single-query pushdown builders), [`log2_histogram`] (the reference's
 //! pure `histogram_over_time` bucket rule, issue #252), [`tags_sql`]
 //! (the pure §4.3
-//! tag-discovery builders — catalog-only, issue #58), [`sql`]/[`rows`]
+//! tag-discovery builders — the two catalog-only ones of issue #58 and
+//! the two store-backed ones of issue #478), [`tag_narrow`] (the issue
+//! #478 `q`-to-terms lowering), [`sql`]/[`rows`]
 //! (point-read builder + `ChClient` result-row shapes), and [`exec`]
 //! (`TraceEngine`, the only module here that talks to ClickHouse).
 
@@ -40,14 +42,15 @@ pub mod search_sql;
 // that one is permanent by design.
 
 pub mod sql;
+pub mod tag_narrow;
 pub mod tags_sql;
 
 pub use exec::{
     BATCH_TRACES, CANDIDATE_TUPLE_BYTES, HYDRATION_BYTE_BUDGET, MAX_SPANS_PER_TRACE,
-    RETAINED_ENTRY_OVERHEAD, RootSummary, SearchOutput, ServiceGraph, TAG_NAMES_MAX,
-    TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS,
-    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues, TraceContext, TraceEngine,
-    TraceReadConfig, TraceSearchResult,
+    RETAINED_ENTRY_OVERHEAD, RootSummary, SPAN_NAME_VALUE_TYPE, SearchOutput, ServiceGraph,
+    TAG_NAMES_MAX, TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS,
+    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues, TagValuesRequest, TraceContext,
+    TraceEngine, TraceReadConfig, TraceSearchResult,
 };
 pub use filter::{CompiledLeaf, CompiledSpanFilter, PlanError, SpanFilterCtx, compile_span_filter};
 pub use graph_sql::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, service_graph_sql};
@@ -58,6 +61,6 @@ pub use metrics_plan::{
 pub use metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
-pub use rows::{GraphEdgeRow, StoredSpan, StoredSpanRow, TagNameRow, TagValueRow};
+pub use rows::{GraphEdgeRow, SpanNameRow, StoredSpan, StoredSpanRow, TagNameRow, TagValueRow};
 pub use search_eval::{GroupValue, SpanSetGroup, SpanSummary, canonical_double_bits};
 pub use search_plan::{SearchCtx, SearchParams, SearchPlan, plan_search};

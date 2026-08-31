@@ -22,10 +22,10 @@ use crate::app::AppState;
 
 use super::error::ApiError;
 use super::handlers::engine_for;
-use super::params::{TagLookup, TagScope};
-use super::tags::{attribute_scope, ok_json};
-use super::tags_response::{TagNamesAnswer, TagValuesAnswer};
-use super::{intrinsics, params, tags_response};
+use super::params::TagScope;
+use super::tags::{self, attribute_scope, ok_json};
+use super::tags_response::TagNamesAnswer;
+use super::{params, tags_response};
 
 /// What a names alias must render: either a static answer that issued no
 /// query, or the catalog rows plus the scope that selected them.
@@ -65,31 +65,44 @@ impl NamesSource {
     }
 }
 
-/// Shared fetch for the v2 tag-value reshaping — parse-before-pool, then
-/// the exact catalog read `tags::tag_values` performs (the query string
-/// is ignored entirely, same contract as native), or the static
-/// vocabulary with no query at all.
-async fn tag_values_for(
-    state: AppState,
-    raw_tag: &str,
-) -> Result<Result<TagValues, pulsus_traceql::Intrinsic>, ApiError> {
-    match params::parse_tag_lookup(raw_tag)? {
-        TagLookup::Intrinsic(intrinsic) => Ok(Err(intrinsic)),
-        TagLookup::Attribute { scope, key } => {
-            let engine = engine_for(&state).await?;
-            Ok(Ok(engine.list_tag_values(&key, scope.as_deref()).await?))
-        }
-    }
-}
-
 /// The v1 FLAT values alias keeps the attribute-only reading
 /// (`parse_tag_path`): it serves no static values, matching the
 /// reference, which answers the same lookup differently on its v1 and v2
 /// routes (ledger row `traceql-v1-tag-values-statics-unimplemented`).
-async fn tag_values_v1_for(state: AppState, raw_tag: &str) -> Result<TagValues, ApiError> {
+///
+/// **Issue #478 deliberately left two halves of this route alone**:
+/// measured, the reference ignores `q` here and serves span names here,
+/// and we do neither — both are ledgered, and "fixing" either would break
+/// the v1 row rather than close a gap. What DID change is the range
+/// contract: a range fault is a `400` on all six §4.3 routes, so the same
+/// malformed input is answered the same way everywhere. A well-formed
+/// range is still ignored here, because this route's read is the
+/// time-less catalog one.
+async fn tag_values_v1_for(
+    state: AppState,
+    raw_tag: &str,
+    raw_query: &str,
+) -> Result<TagValues, ApiError> {
     let (scope, key) = params::parse_tag_path(raw_tag)?;
+    let params = params::parse_tag_values_params(
+        raw_query,
+        tags::now_unix_nanos(),
+        tags::tag_lookback_ns(&state),
+    )?;
     let engine = engine_for(&state).await?;
-    Ok(engine.list_tag_values(&key, scope.as_deref()).await?)
+    Ok(engine
+        .list_tag_values(
+            &key,
+            scope.as_deref(),
+            pulsus_read::TagValuesRequest {
+                // `q` is dropped rather than threaded: this route does
+                // not narrow, by ledger.
+                q: None,
+                start_ns: params.start_ns,
+                end_ns: params.end_ns,
+            },
+        )
+        .await?)
 }
 
 /// `GET /api/search/tags` — Tempo v1 flat `{"tagNames":[…]}`.
@@ -105,8 +118,9 @@ pub(crate) async fn tags_v1(State(state): State<AppState>, RawQuery(raw): RawQue
 pub(crate) async fn tag_values_v1(
     State(state): State<AppState>,
     Path(tag): Path<String>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
-    match tag_values_v1_for(state, &tag).await {
+    match tag_values_v1_for(state, &tag, raw.as_deref().unwrap_or("")).await {
         Ok(values) => ok_json(tags_response::render_tag_values_flat(&values)),
         Err(e) => e.into_response(),
     }
@@ -124,18 +138,15 @@ pub(crate) async fn tags_v2(State(state): State<AppState>, RawQuery(raw): RawQue
 }
 
 /// `GET /api/v2/search/tag/{tag}/values` — the native typed shape minus
-/// `truncated`.
+/// `truncated`. Shares `tags::values_for` with the native route, so the
+/// two cannot answer the same request from different sources.
 pub(crate) async fn tag_values_v2(
     State(state): State<AppState>,
     Path(tag): Path<String>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
-    match tag_values_for(state, &tag).await {
-        Ok(Ok(values)) => ok_json(tags_response::render_tag_values_typed_v2(
-            &TagValuesAnswer::Catalog(&values),
-        )),
-        Ok(Err(intrinsic)) => ok_json(tags_response::render_tag_values_typed_v2(
-            &TagValuesAnswer::Static(intrinsics::intrinsic_tag_values(intrinsic)),
-        )),
+    match tags::values_for(&state, &tag, raw.as_deref().unwrap_or("")).await {
+        Ok(source) => ok_json(tags_response::render_tag_values_typed_v2(&source.answer())),
         Err(e) => e.into_response(),
     }
 }
@@ -197,7 +208,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_well_formed_v1_values_request_without_a_pool_is_503() {
-        let res = tag_values_v1(State(test_state()), Path("service.name".to_string())).await;
+        let res = tag_values_v1(
+            State(test_state()),
+            Path("service.name".to_string()),
+            RawQuery(None),
+        )
+        .await;
         let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "clickhouse pool not yet established");
@@ -213,7 +229,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_well_formed_v2_values_request_without_a_pool_is_503() {
-        let res = tag_values_v2(State(test_state()), Path("service.name".to_string())).await;
+        let res = tag_values_v2(
+            State(test_state()),
+            Path("service.name".to_string()),
+            RawQuery(None),
+        )
+        .await;
         let (status, body) = error_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "clickhouse pool not yet established");
@@ -233,7 +254,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_tag_key_on_the_v2_values_alias_is_400_before_the_pool() {
-        let res = tag_values_v2(State(test_state()), Path("resource.".to_string())).await;
+        let res = tag_values_v2(
+            State(test_state()),
+            Path("resource.".to_string()),
+            RawQuery(None),
+        )
+        .await;
         let (status, _) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
