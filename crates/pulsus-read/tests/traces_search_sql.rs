@@ -444,6 +444,19 @@ const CASES: &[Case] = &[
         q: r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s }"#,
         distributed: true,
     },
+    Case {
+        // Issue #476 Wave B: a cross-type `=` on `resource.service.name`
+        // — the query a client builds from an UNQUOTED tag value. The
+        // reference gives the field no concrete type, so this is an
+        // accepted query that matches nothing, not a `400`. The golden
+        // pins that: no `service =` predicate anywhere (a stringifying
+        // implementation would return a service literally named `12345`)
+        // and no `trace_attrs_idx` semi-join, only the time-range
+        // generator that `{ "x" = "y" }` already emits.
+        name: "service_name_cross_type_eq",
+        q: r#"{ resource.service.name = 12345 }"#,
+        distributed: false,
+    },
 ];
 
 fn plan_for(case: &Case) -> SearchPlan {
@@ -847,6 +860,31 @@ fn committed_coload_golden_sections_are_trace_wide() {
             "{file}: the co-load must carry no row cap:\n{section}"
         );
     }
+}
+
+/// Issue #476 AC12: the cross-type golden carries neither of the two
+/// shapes a stringifying implementation would emit. `service =` is the
+/// discriminating one — the acceptance corpus holds a service literally
+/// NAMED `12345`, so an implementation that rendered the number as a
+/// string would return it, and that shape would appear here as a
+/// `PREWHERE service = '12345'`.
+#[test]
+fn the_cross_type_service_golden_carries_no_service_predicate_or_attr_join() {
+    let golden = std::fs::read_to_string(golden_dir().join("service_name_cross_type_eq.sql"))
+        .expect("service_name_cross_type_eq.sql (regenerate goldens)");
+    assert!(
+        !golden.contains("service ="),
+        "a cross-type operand must not be stringified into a service predicate:\n{golden}"
+    );
+    assert!(
+        !golden.contains("trace_attrs_idx"),
+        "the folded leaf reads no attribute index:\n{golden}"
+    );
+    // ...and it is not vacuously empty: the time-range generator IS there.
+    assert!(
+        golden.contains("== phase1 generator[0] =="),
+        "the time-range generator must still be emitted:\n{golden}"
+    );
 }
 
 /// Regenerates every committed golden. `#[ignore]`d: run explicitly

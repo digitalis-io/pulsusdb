@@ -1685,9 +1685,12 @@ jobs:
 
       # Issue #58 AC8: spawns the real `pulsusdb` binary and drives the
       # §4.3 tags/tag-values surface end-to-end — deduped scoped names,
-      # typed value inference, q= superset semantics, the truncation
-      # contract, and the zero-payload query_log proof (catalog-only
-      # reads). Reuses this job's ClickHouse 26.3 container.
+      # the STORED value type (issue #476), q= superset semantics, the
+      # truncation contract, and the zero-payload query_log proof
+      # (catalog-only reads). Reuses this job's ClickHouse 26.3 container.
+      # Issue #476's acceptance case rides this same step: it pushes its
+      # corpus, reads the type back, builds the query a client builds from
+      # it and re-queries /api/search and /api/metrics/query_range.
       - name: Live traces tags suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"

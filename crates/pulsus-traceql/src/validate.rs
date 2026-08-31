@@ -821,8 +821,19 @@ fn check_regex(pattern: &str) -> Result<(), ValidateError> {
 /// for them, so its validator accepts any operator/operand there —
 /// measured: `{ instrumentation:name = duration }` is a reference 200
 /// where `{ event:name = duration }` is a 400. Do NOT "fix" this
-/// toward consistency; mirroring the quirk is the point, and the
-/// planner still rejects what cannot execute).
+/// toward consistency; mirroring the quirk is the point).
+///
+/// The clause that used to close that sentence — "and the planner still
+/// rejects what cannot execute" — was true when it was written and is
+/// no longer (issue #476 Wave B). The planner used to answer a
+/// cross-type `=`/`!=` at these two intrinsics, and at
+/// `resource.service.name`, with a `400`, which made this permissive
+/// typing invisible on the wire. It now folds such a leaf to a
+/// plan-time `false`: the query is accepted and matches no span, which
+/// is what accepting it in the validator was always supposed to mean.
+/// A cross-type `=~`/`!~` is still rejected — by THIS function, before
+/// the planner, with the reference's own `illegal operation for the
+/// given types`.
 fn field_type(field: &Field) -> OperandType {
     match field {
         Field::Attribute { .. } => OperandType::Attribute,

@@ -1494,3 +1494,31 @@ when we are asking it to slow down, so we keep `429`; recorded as
   if the reference had gated its list on store contents. It does not.
   **No code change.** The empty-database cells in
   `crates/pulsus-server/tests/api_conformance.rs` are what hold our half.
+
+### `traceql-untyped-intrinsic-cross-type-operand` (issue #476) — **a cross-type `=`/`!=` on an untyped intrinsic**
+
+- **Route.** `GET /api/search`, and the same leaf on
+  `GET /api/metrics/query_range`.
+
+- **Queries.** `{instrumentation:name=5}`, `{instrumentation:version=5}`
+  and the `!=` forms. The reference's `impliedType` has no arm for either
+  intrinsic, so its own validator accepts them.
+
+- **Three measured answers** (captured during planning on 2026-08-31
+  against the pinned reference build):
+  - the reference, on a store holding a block in range: **`500`**, with a
+    store-internal message;
+  - the same reference, on a time range selecting no block: `200`
+    `{"traces":[]}`;
+  - PulsusDB: `200` with no matching span.
+
+- **Chosen: ours.** The reference's own validator accepts the query, and a
+  `500` for something a server has just validated is not behaviour to
+  reproduce. It is also the answer the surrounding language already gives:
+  a cross-type comparison resolves to "no match" for every other operator
+  here, so our previous `400` was the outlier, not the `200`.
+
+- **Disposition.** Ratify-documented-difference. No fixture case references
+  this entry — the divergence is in a status code the differential corpus
+  does not exercise, and it is recorded so the next reader does not treat
+  the reference's `500` as the target.

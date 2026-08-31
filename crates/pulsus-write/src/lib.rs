@@ -14,7 +14,7 @@ pub use ingest::http::{
 pub use ingest::metrics::{
     HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef,
 };
-pub use ingest::traces::{AttrRecord, ParsedTraces, SpanRecord, TraceSink};
+pub use ingest::traces::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord, TraceSink};
 pub use ingest::{Backpressure, FlushWait, LogSink};
 pub use protocols::log_level::LevelDiscovery;
 pub use protocols::loki_push::{

@@ -445,12 +445,26 @@ pub struct TagNames {
     pub truncated: bool,
 }
 
+/// One catalog tag value and the OTLP type it was stored with (issue
+/// #476).
+///
+/// `val_type` is the EMPTY string for a row written before migration 41
+/// added the column. Nothing stored distinguishes such a row's original
+/// type — `val` is the rendered text and `val_num` is a parse of that
+/// text — so the renderer reports it as `string` and derives nothing from
+/// the characters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagValue {
+    pub val: String,
+    pub val_type: String,
+}
+
 /// [`TraceEngine::list_tag_values`]'s output (issue #58): distinct
-/// values for one key, ordered ascending, at most [`TAG_VALUES_MAX`];
-/// `truncated` as in [`TagNames`].
+/// `(value, type)` pairs for one key, ordered ascending by value then
+/// type, at most [`TAG_VALUES_MAX`]; `truncated` as in [`TagNames`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagValues {
-    pub values: Vec<String>,
+    pub values: Vec<TagValue>,
     pub truncated: bool,
 }
 
@@ -1546,7 +1560,10 @@ impl TraceEngine {
             .map_err(|e| map_trace_read_error(e, &self.config))?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
-            values.push(row.val);
+            values.push(TagValue {
+                val: row.val,
+                val_type: row.val_type,
+            });
         }
         let truncated = values.len() > TAG_VALUES_MAX;
         values.truncate(TAG_VALUES_MAX);

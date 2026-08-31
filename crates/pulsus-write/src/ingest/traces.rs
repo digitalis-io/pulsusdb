@@ -49,6 +49,40 @@ pub struct SpanRecord {
     pub payload: Vec<u8>,
 }
 
+/// The OTLP value kind an attribute arrived as, carried to
+/// `trace_attrs_idx.val_type` and from there, through
+/// `trace_tag_catalog_mv`, to the `type` field of
+/// `GET /api/v2/search/tag/{tag}/values` (issue #476).
+///
+/// The point of the column is that the wire `type` is the type the sender
+/// SENT, not a guess about how `val`'s text reads. Before it existed, a
+/// string attribute whose value was `12345` was reported `int`, and a
+/// client that quotes only `string`-typed values built
+/// `{resource.service.name=12345}` from its own dropdown.
+///
+/// These four spellings ARE the stored values and the wire `type` — the
+/// reference's complete attribute-type domain. Changing one is a wire
+/// change and a stored-data change at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrValueType {
+    String,
+    Int,
+    Float,
+    Bool,
+}
+
+impl AttrValueType {
+    /// The stored/wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttrValueType::String => "string",
+            AttrValueType::Int => "int",
+            AttrValueType::Float => "float",
+            AttrValueType::Bool => "bool",
+        }
+    }
+}
+
 /// One `trace_attrs_idx` row's source data (docs/schemas.md §4.1): one
 /// resource or span attribute of one span, key verbatim (never normalized —
 /// docs/architecture.md §2.3), discriminated by `scope`.
@@ -74,7 +108,16 @@ pub struct AttrRecord {
     /// stay in the span payload.
     pub scope: String,
     pub val: String,
+    /// The OTLP kind [`Self::val`] was rendered FROM (issue #476). Not
+    /// derivable from `val`: the string `"1.5"` and the double `1.5`
+    /// render to the same six bytes.
+    pub val_type: AttrValueType,
     /// `val.parse::<f64>()` when finite, else `None` (`Nullable(Float64)`).
+    ///
+    /// A parse of the RENDERED TEXT, so it is not evidence of the sender's
+    /// type — a string attribute reading `1.5` gets `Some(1.5)`. It serves
+    /// TraceQL numeric filtering and aggregation; [`Self::val_type`] is
+    /// what the tag-values `type` reports.
     pub val_num: Option<f64>,
     pub timestamp_ns: i64,
     pub trace_id: [u8; 16],

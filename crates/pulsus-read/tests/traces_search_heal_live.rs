@@ -42,7 +42,7 @@ use pulsus_read::traces::search_plan::{SearchParams, plan_search};
 use pulsus_read::{SearchPlan, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::writer::{BlockInserter, ChBlockInserter, TraceWriter, TraceWriterTables};
-use pulsus_write::{AttrRecord, ParsedTraces, SpanRecord, TraceAttrRow, TraceSink};
+use pulsus_write::{AttrRecord, AttrValueType, ParsedTraces, SpanRecord, TraceAttrRow, TraceSink};
 
 /// `true` when the gated half of this suite should run. Skips cleanly on a
 /// developer machine with no container; **panics** rather than skipping when
@@ -216,6 +216,7 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             key: ATTR_KEY.to_string(),
             scope: ATTR_SCOPE.to_string(),
             val: ATTR_VAL.to_string(),
+            val_type: AttrValueType::Int,
             val_num: Some(500.0),
             timestamp_ns: ts_ns,
             trace_id: TRACE_ID,
@@ -568,6 +569,7 @@ fn instrumentation_batch(ts_ns: i64, date: u16) -> ParsedTraces {
             key: "telemetry.sdk.language".to_string(),
             scope: "instrumentation".to_string(),
             val: "rust".to_string(),
+            val_type: AttrValueType::String,
             val_num: None,
             timestamp_ns: ts_ns,
             trace_id: [0xC7; 16],

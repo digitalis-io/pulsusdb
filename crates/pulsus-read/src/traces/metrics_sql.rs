@@ -343,10 +343,11 @@ fn render_expr(
 /// arm reaches the same dispatch — one leaf lowering, not two that can
 /// drift.
 ///
-/// The six `LeafEval` variants that are not lowered here are
+/// The five `LeafEval` variants that are not lowered here are
 /// **unreachable from `filter::compile_leaf`**, which constructs only
-/// `Physical`, `Attr`, `NestedSet` and `TraceCtx`. That claim is a gate,
-/// not a reading: `dead_leaf_eval_variants_are_unreachable_from_compile_leaf`
+/// `Physical`, `Attr`, `NestedSet`, `TraceCtx` and — since issue #476
+/// Wave B — `Const`. That claim is a gate, not a reading:
+/// `dead_leaf_eval_variants_are_unreachable_from_compile_leaf`
 /// below enumerates the whole `Field × ComparisonOp × Value` product with
 /// exhaustive matches, so adding a variant to any of those enums fails to
 /// compile rather than silently narrowing the checked domain.
@@ -373,6 +374,17 @@ fn lower_leaf(
         LeafEval::TraceCtx(_) => Err(PlanError::TypeMismatch(
             "trace-level intrinsics are not supported in metrics filters".to_string(),
         )),
+        // Issue #476 Wave B: `compile_leaf` now folds a cross-type
+        // `=`/`!=` on the three fields the reference gives no concrete
+        // type to `Const(false)`, so this variant IS reachable here and
+        // must lower rather than refuse — otherwise
+        // `{resource.service.name=12345} | rate()` stays the `400` this
+        // issue exists to remove while the search route returns `200`.
+        // The lowering is the one this file already applies to the
+        // two-static fold sixty lines above (`fold_static_compare` ->
+        // `static_bool_sql`): a plan-time constant, decided once per
+        // query, never per span.
+        LeafEval::Const(b) => Ok(static_bool_sql(*b)),
         // Issue #458 collapsed six separately-worded refusals into this
         // one arm. Every variant it covers is unreachable from
         // `filter::compile_leaf` (gated, see the doc comment above), so
@@ -381,7 +393,6 @@ fn lower_leaf(
         LeafEval::BoolTruth { .. }
         | LeafEval::FieldCompare { .. }
         | LeafEval::Arith { .. }
-        | LeafEval::Const(_)
         | LeafEval::BoolCompare { .. }
         | LeafEval::EventSetCompare { .. } => Err(PlanError::TypeMismatch(
             "unsupported metrics filter leaf".to_string(),
@@ -1639,10 +1650,13 @@ mod tests {
                         | LeafEval::Attr { .. }
                         | LeafEval::NestedSet { .. }
                         | LeafEval::TraceCtx(_) => false,
+                        // Issue #476 Wave B: the cross-type fold on the
+                        // three untyped fields. Lowered by `lower_leaf`,
+                        // so it is NOT a dead variant here.
+                        LeafEval::Const(_) => false,
                         LeafEval::BoolTruth { .. } => true,
                         LeafEval::FieldCompare { .. } => true,
                         LeafEval::Arith { .. } => true,
-                        LeafEval::Const(_) => true,
                         LeafEval::BoolCompare { .. } => true,
                         LeafEval::EventSetCompare { .. } => true,
                     };
@@ -1669,5 +1683,50 @@ mod tests {
             reached > 0,
             "no probe compiled at all — the enumeration proves nothing"
         );
+    }
+
+    /// Issue #476 Wave B: a cross-type `=`/`!=` on one of the three
+    /// untyped fields must LOWER on the metrics route, not be refused.
+    ///
+    /// The enumeration above cannot see this. It classifies each variant
+    /// against a hand-written table and checks that `compile_leaf` never
+    /// produces a variant marked dead; it never calls `lower_leaf`. So a
+    /// tree that put `LeafEval::Const` back in the refusal arm passes it —
+    /// measured: with that arm restored, every test in this module stayed
+    /// green and only the live `traces_tags_live` AC11 request reddened.
+    /// This test calls the lowering directly so the gate is hermetic.
+    #[test]
+    fn a_cross_type_operand_on_an_untyped_field_lowers_to_a_constant() {
+        let window = SnappedWindow {
+            start_ns: 1_700_000_000_000_000_000,
+            end_ns: 1_700_010_800_000_000_000,
+        };
+        for (field, name) in [
+            (
+                Field::Attribute {
+                    scope: AttrScope::Resource,
+                    key: "service.name".to_string(),
+                },
+                "resource.service.name",
+            ),
+            (
+                Field::Intrinsic(Intrinsic::InstrumentationName),
+                "instrumentation:name",
+            ),
+            (
+                Field::Intrinsic(Intrinsic::InstrumentationVersion),
+                "instrumentation:version",
+            ),
+        ] {
+            let leaf = filter::compile_leaf(
+                &field,
+                ComparisonOp::Eq,
+                &Value::Number("12345".to_string()),
+            )
+            .unwrap_or_else(|e| panic!("{name} must compile: {e}"));
+            let sql = lower_leaf(&leaf, "trace_attrs_idx", window)
+                .unwrap_or_else(|e| panic!("{name} must lower on the metrics route: {e}"));
+            assert_eq!(sql, "0", "{name} must lower to the match-nothing constant");
+        }
     }
 }

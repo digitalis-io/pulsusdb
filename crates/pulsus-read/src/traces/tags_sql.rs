@@ -75,20 +75,33 @@ pub fn tag_names_sql(scope_literal: Option<&str>, limit: usize) -> String {
     sql
 }
 
-/// The `GET /api/traces/v1/tag/{tag}/values` read: distinct `val`s for
-/// one key, either confined to one scope (a `(scope, key)` prefix prune)
-/// or to [`ATTR_SCOPES`] (issue #475). A bare-key lookup answers out of
-/// the five attribute scopes ONLY: the two reserved intrinsic scopes hold
-/// intrinsic values under keys a sender can also use (`name`, `spanID`),
-/// and before this predicate existed those rows answered attribute
-/// lookups.
+/// The `GET /api/traces/v1/tag/{tag}/values` read: distinct
+/// `(val, val_type)` PAIRS for one key, either confined to one scope (a
+/// `(scope, key)` prefix prune) or to [`ATTR_SCOPES`] (issue #475). A
+/// bare-key lookup answers out of the five attribute scopes ONLY: the two
+/// reserved intrinsic scopes hold intrinsic values under keys a sender can
+/// also use (`name`, `spanID`), and before this predicate existed those
+/// rows answered attribute lookups.
+///
+/// The pair, not the value alone (issue #476): the type is per VALUE, and
+/// one key can hold a string `'8080'` and an int `8080`, which the wire
+/// reports as two entries. `ORDER BY val, val_type` is the catalog's own
+/// sorting order inside a fixed `(scope, key)` prefix, so it adds no sort
+/// for the scoped shapes — and it is what makes rows sharing a `val`
+/// CONTIGUOUS, which the renderer's run rule depends on. The empty string
+/// sorts first inside a run, so a legacy row precedes its typed sibling.
+///
+/// Consequence for the cap, documented in docs/api.md §4.3: the
+/// `LIMIT cap + 1` probe and `truncated` now count `(value, type)` pairs,
+/// so a key holding one value at two types spends two of them.
 pub fn tag_values_sql(key_literal: &str, scope_literal: Option<&str>, limit: usize) -> String {
-    let mut sql = format!("SELECT DISTINCT val\nFROM {CATALOG_TABLE}\nWHERE key = {key_literal}");
+    let mut sql =
+        format!("SELECT DISTINCT val, val_type\nFROM {CATALOG_TABLE}\nWHERE key = {key_literal}");
     match scope_literal {
         Some(scope) => sql.push_str(&format!(" AND scope = {scope}")),
         None => sql.push_str(&format!(" AND scope IN {ATTR_SCOPES_IN}")),
     }
-    sql.push_str(&format!("\nORDER BY val\nLIMIT {limit}"));
+    sql.push_str(&format!("\nORDER BY val, val_type\nLIMIT {limit}"));
     sql
 }
 
@@ -133,10 +146,10 @@ mod tests {
                 Some(&ch_string("resource")),
                 TAG_VALUES_MAX + 1
             ),
-            "SELECT DISTINCT val\n\
+            "SELECT DISTINCT val, val_type\n\
              FROM trace_tag_catalog\n\
              WHERE key = 'service.name' AND scope = 'resource'\n\
-             ORDER BY val\n\
+             ORDER BY val, val_type\n\
              LIMIT 1001"
         );
     }
@@ -145,11 +158,11 @@ mod tests {
     fn unscoped_tag_values_sql_is_byte_exact() {
         assert_eq!(
             tag_values_sql(&ch_string("service.name"), None, TAG_VALUES_MAX + 1),
-            "SELECT DISTINCT val\n\
+            "SELECT DISTINCT val, val_type\n\
              FROM trace_tag_catalog\n\
              WHERE key = 'service.name' AND scope IN ('event', 'instrumentation', 'link', \
              'resource', 'span')\n\
-             ORDER BY val\n\
+             ORDER BY val, val_type\n\
              LIMIT 1001"
         );
     }
