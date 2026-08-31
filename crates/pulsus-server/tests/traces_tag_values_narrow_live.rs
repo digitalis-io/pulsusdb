@@ -217,6 +217,18 @@ fn ch_config() -> ChConnConfig {
     }
 }
 
+/// Spawns the real binary and polls `GET /ready` until it answers `200`.
+///
+/// **The `503 Service Unavailable` lines this prints are the readiness
+/// loop working, not a fault.** Until the schema is applied and the pool
+/// is published the server answers every poll `503`, and `tower_http`
+/// logs each one at `ERROR` level; a run therefore emits a handful of
+/// them and then `clickhouse schema ready; pool established`. A reader
+/// meeting that log unprepared reads a broken suite. Requests must still
+/// be issued only after this function RETURNS: one issued earlier gets
+/// the same `503` without reaching ClickHouse, so its request class is
+/// silently never exercised and any query-log count taken over it is
+/// short rather than wrong.
 fn spawn_ready(port: u16, db: &str) -> ChildGuard {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     cmd.env("PULSUS_HOST", "127.0.0.1")

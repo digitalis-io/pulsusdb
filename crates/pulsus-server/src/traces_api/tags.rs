@@ -34,8 +34,12 @@
 //!   raw invalid UTF-8 in the request target is `400` (the same bytes
 //!   percent-encoded are served `200`), and a `q` past the 64 KiB
 //!   request-target bound is refused by the transport with `414` or
-//!   `431`. That module's doc carries the measured length boundary and
-//!   why the status itself is not pinned.
+//!   `431` — **the pair is not arbitrary and must not be narrowed to
+//!   one**: both were observed for the SAME request length on two
+//!   machines (`414` on a developer box, `431` in CI, at 524,194 bytes),
+//!   so the status is the environment answering while the LENGTH is the
+//!   contract. That module's doc carries the measured length boundary
+//!   and why the status itself is not pinned.
 
 use axum::Json;
 use axum::extract::{Path, RawQuery, State};
