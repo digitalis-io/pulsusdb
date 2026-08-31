@@ -1004,11 +1004,16 @@ async fn scalar(client: &ChClient, sql: &str) -> u64 {
 ///   so with `val` and `timestamp_ns` unconstrained the identifier
 ///   columns sit behind an open range.
 /// * On `trace_spans`, `trace_id` LEADS the key and a set CAN exclude
-///   granules — measured during planning, a localised five-trace set read
-///   1/245 and a scattered five-trace set 9/245. The sets this feature
-///   produces do not, because they are large and scattered enough to
-///   intersect every granule. That is a property of the workload, not of
-///   the schema, and this test asserts nothing about it.
+///   granules — a localised five-trace set read 1/245 and a scattered
+///   five-trace set 5/245, the latter measured independently by plan
+///   review round 6 and by code review round 1 on their own
+///   2,000,000-span corpora. The sets this feature produces do not
+///   exclude anything, because they are large and scattered enough to
+///   intersect every granule (the real 333k-trace set read 245/245).
+///   That is a property of the workload, not of the schema, and this
+///   test asserts nothing about it — deliberately: the scattered figure
+///   is corpus-shaped, and an earlier revision quoted `9/245` from a
+///   third corpus as though it were the property.
 #[tokio::test]
 async fn narrowed_reads_prune_on_key_and_partition_not_on_the_set() {
     if !should_run() {

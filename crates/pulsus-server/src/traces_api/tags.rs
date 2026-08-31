@@ -23,12 +23,18 @@
 //!   catalog has no timestamp column) and BOUND the read on the values
 //!   route, defaulting to `reader.traceql_tag_lookback`. A range FAULT —
 //!   unparseable, half-supplied, inverted — is a `400` on every route.
-//! * `q=` on the values route NARROWS, and an unparseable one is
-//!   tolerated rather than rejected: the editor sends half-typed text on
-//!   every keystroke, so a `400` there would break autocomplete for input
-//!   the user cannot avoid sending. Lowering it is total
+//! * `q=` on the values route NARROWS, and a `q` that is well-formed
+//!   input and does not parse as TraceQL is tolerated rather than
+//!   rejected: the editor sends half-typed text on every keystroke, so a
+//!   `400` there would break autocomplete for input the user cannot
+//!   avoid sending. Lowering it is total
 //!   (`pulsus_read::traces::tag_narrow`), so no `q` can become a status
-//!   code at the interpretation layer.
+//!   code at the interpretation layer. Two classes ARE rejected below
+//!   that layer by the HTTP transport, both avoidable and both measured:
+//!   raw invalid UTF-8 in the request target is `400` (the same bytes
+//!   percent-encoded are served `200`), and a `q` past the 64 KiB
+//!   request-target bound is `414`, past the header budget `431`. That
+//!   module's doc carries the measured boundaries.
 
 use axum::Json;
 use axum::extract::{Path, RawQuery, State};

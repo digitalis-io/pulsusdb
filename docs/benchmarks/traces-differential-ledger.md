@@ -1542,11 +1542,19 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Route.** `GET /api/traces/v1/tag/{tag}/values` and
   `GET /api/v2/search/tag/{tag}/values`.
 
-- **What.** Both sides answer `200` to a `q` that does not parse — that
-  much is parity, and it is the load-bearing half: the query editor sends
-  the whole half-typed expression as `q` on every distinct prefix a user
-  types through, so a `400` there would break autocomplete for input the
-  client cannot avoid sending. What differs is the ANSWER. We drop the
+- **What.** Both sides answer `200` to a `q` that is well-formed input
+  and does not parse as TraceQL — that much is parity, and it is the
+  load-bearing half: the query editor sends the whole half-typed
+  expression as `q` on every distinct prefix a user types through, so a
+  `400` there would break autocomplete for input the client cannot avoid
+  sending. (Two classes ARE rejected on our side below the interpretation
+  layer, by the HTTP transport, and neither is a shape an editor emits:
+  raw invalid UTF-8 in the request target is `400`, and a `q` past the
+  64 KiB request-target bound is `414`. Both are bounded and measured in
+  `crates/pulsus-read/src/traces/tag_narrow.rs`'s module doc and pinned
+  by `the_q_tolerance_stops_at_input_that_is_not_well_formed`; the
+  reference was not probed for either, so no parity claim is made about
+  them.) What differs is the ANSWER. We drop the
   whole unparseable `q` and return the unnarrowed list. Measured on the
   captured corpus, the reference sometimes returns a NARROWED list
   instead — it recovers complete condition groups from the incomplete

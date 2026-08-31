@@ -9,10 +9,33 @@
 //! brace and a dangling operator — for every distinct prefix a user types
 //! through. A client cannot avoid that, so an unlowerable `q` NEVER
 //! errors here: it contributes no terms and the read widens.
-//! [`narrowing_from_query`] is TOTAL — it has no error type, so at this
-//! layer no `q` of any shape can become a status code. A malformed
-//! `start`, a `start` without an `end` and an inverted range are the
-//! other half of that rule and are rejected, in
+//! [`narrowing_from_query`] is TOTAL — it has no error type, so nothing
+//! at THIS layer can turn a `q` into a status code, whatever it contains.
+//!
+//! **What that does and does not say, because the absolute form of it is
+//! false and a later reader will otherwise read a regression into two
+//! correct rejections.** The property is: *a `q` that is well-formed
+//! input and does not parse as TraceQL never errors.* Two classes are
+//! rejected BELOW this layer, by the HTTP transport, and both are faults
+//! a client can avoid — measured on this tree against the shipped binary,
+//! on all three values routes:
+//!
+//! * **raw invalid UTF-8 in the request target** — a lone `0x80`, a bare
+//!   `0xFF`, a truncated `0xC3` — is `400` before any handler runs. A
+//!   client that percent-encodes the same bytes is served: `q=%80` and
+//!   `q=` + `%80` × 4096 both answer `200`. So this rejects a malformed
+//!   request line, not a `q` value.
+//! * **an enormous `q`**: measured, 65,493 bytes answers `200` and 65,494
+//!   is `414` (the 64 KiB request-target bound); from 524,195 it is `431`
+//!   (the header budget). Note that the first of those is TIGHTER than
+//!   the §4.2 search surface's own 128 KiB expression cap
+//!   (`traces_api::querytext::MAX_QUERY_EXPRESSION_BYTES`), so on this
+//!   route the transport bound is what a client meets first.
+//!
+//! Neither is a shape an editor emits: it percent-encodes, and the text
+//! it sends is the query a human is typing. A malformed `start`, a
+//! `start` without an `end` and an inverted range are the other half of
+//! the same rule and are rejected in
 //! `traces_api::params::parse_range_params`.
 //!
 //! **Every drop widens, never narrows.** Terms are taken only from the

@@ -19,7 +19,12 @@
 //! - the span-name typing corpus, including the over-cap name;
 //! - the window bound, as an occupied-day / empty-day PAIR with a
 //!   `system.query_log` assertion that the span read actually ran — an
-//!   empty list alone cannot tell a measured absence from a static one.
+//!   empty list alone cannot tell a measured absence from a static one;
+//! - and, in its own test, the BOUNDARY of the `q` tolerance: which
+//!   inputs are rejected below the interpretation layer, and with which
+//!   status. The tolerance is not absolute and stating it absolutely
+//!   invites a later reader to file two correct rejections as
+//!   regressions.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
@@ -159,6 +164,33 @@ fn request(
 fn get(port: u16, path: &str, ctx: &str) -> RawResponse {
     request(port, "GET", path, None)
         .unwrap_or_else(|| panic!("{ctx}: request must be reachable (transport failure)"))
+}
+
+/// A GET whose request TARGET is raw bytes rather than a `&str`, so a
+/// sequence that is not valid UTF-8 can be put on the wire. `request`
+/// above cannot express that — its path is a `&str` — and the whole
+/// point of the case is what happens before any handler sees it.
+///
+/// Returns the status line's code alone: these responses have no body.
+fn raw_target_status(port: u16, target: &[u8], ctx: &str) -> u16 {
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|e| panic!("{ctx}: connect: {e}"));
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    let mut req = b"GET ".to_vec();
+    req.extend_from_slice(target);
+    req.extend_from_slice(b" HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(&req)
+        .unwrap_or_else(|e| panic!("{ctx}: write: {e}"));
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .unwrap_or_else(|e| panic!("{ctx}: read: {e}"));
+    let head = String::from_utf8_lossy(&buf);
+    head.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("{ctx}: no status line in {head:?}"))
 }
 
 struct ChildGuard(Child);
@@ -475,6 +507,117 @@ async fn our_answers_match_the_committed_fixture() {
         long.0, "string",
         "typing: the capped name is still a string"
     );
+
+    drop_db(db).await;
+}
+
+/// The three §4.3 values routes, as mounted.
+const VALUES_ROUTES: [&str; 3] = [
+    "/api/traces/v1/tag/service.name/values",
+    "/api/v2/search/tag/service.name/values",
+    "/api/search/tag/service.name/values",
+];
+
+/// Issue #478: **where the `q` tolerance stops**, pinned so the two
+/// correct rejections below it are not read as regressions later.
+///
+/// The property the feature keeps is *a `q` that is well-formed input and
+/// does not parse as TraceQL never errors* — not "a `q` never errors",
+/// which is false and was measured to be false by code review round 1.
+/// Both rejected classes are HTTP-transport faults a client can avoid,
+/// and neither is a shape the query editor emits: it percent-encodes, and
+/// what it sends is the text a human is typing.
+///
+/// The percent-encoded row is the discriminator. `q=%80` decodes to the
+/// same invalid byte the raw row sends, and it is served `200` — so what
+/// the `400` refuses is a malformed request line, not a `q` VALUE. A test
+/// that asserted only the `400` would have documented the opposite.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_q_tolerance_stops_at_input_that_is_not_well_formed() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_219;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let db = pulsus_testkit::test_db(&format!("pulsus_tag_q_bounds_it_{nonce}"));
+    let db = db.as_str();
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db);
+
+    // (1) Half-typed TraceQL — the case the tolerance exists for — is
+    //     `200` on every values route. Without this the test below would
+    //     be pinning rejections with nothing to contrast them against.
+    for route in VALUES_ROUTES {
+        for raw_q in [
+            "%7Bspan.http.status_code%3D",
+            "%7Bresource.service.name%3D%22",
+            "garbage",
+            "%7D",
+        ] {
+            let ctx = format!("tolerated {route}?q={raw_q}");
+            let res = get(port, &format!("{route}?q={raw_q}"), &ctx);
+            assert_eq!(res.status, 200, "{ctx}: body {}", res.text());
+        }
+    }
+
+    // (2) RAW invalid UTF-8 in the request target: `400`, before any
+    //     handler runs. Three shapes — a lone continuation byte, a byte
+    //     that can never appear in UTF-8, and a truncated two-byte
+    //     sequence.
+    for route in VALUES_ROUTES {
+        for (label, byte) in [
+            ("lone 0x80", 0x80u8),
+            ("bare 0xFF", 0xFF),
+            ("cut 0xC3", 0xC3),
+        ] {
+            let mut target = format!("{route}?q=").into_bytes();
+            target.push(byte);
+            let ctx = format!("raw {label} on {route}");
+            assert_eq!(
+                raw_target_status(port, &target, &ctx),
+                400,
+                "{ctx}: raw invalid UTF-8 in the request target is refused by the transport"
+            );
+        }
+    }
+
+    // (3) THE DISCRIMINATOR: the same invalid byte, percent-encoded, is
+    //     served. So (2) is about the request line, not about `q`.
+    for route in VALUES_ROUTES {
+        let ctx = format!("percent-encoded 0x80 on {route}");
+        let res = get(port, &format!("{route}?q=%80"), &ctx);
+        assert_eq!(res.status, 200, "{ctx}: body {}", res.text());
+        let long = format!("{route}?q={}", "%80".repeat(4_096));
+        let res = get(port, &long, &ctx);
+        assert_eq!(res.status, 200, "{ctx} x4096: body {}", res.text());
+    }
+
+    // (4) An enormous `q`. The boundaries are exact and were bisected on
+    //     this tree: the last `200` is 65,493 bytes and 65,494 is `414`
+    //     (the 64 KiB request-target bound); `431` begins at 524,195 (the
+    //     header budget). Asserted as the pair either side of each
+    //     boundary, so a change that moved a limit reddens here rather
+    //     than surfacing as a client's mystery failure.
+    let route = VALUES_ROUTES[1];
+    for (len, want) in [
+        (16_384usize, 200u16),
+        (65_493, 200),
+        (65_494, 414),
+        (524_194, 414),
+        (524_195, 431),
+    ] {
+        let target = format!("{route}?q={}", "a".repeat(len)).into_bytes();
+        let ctx = format!("q of {len} bytes on {route}");
+        assert_eq!(
+            raw_target_status(port, &target, &ctx),
+            want,
+            "{ctx}: the transport bound moved"
+        );
+    }
 
     drop_db(db).await;
 }

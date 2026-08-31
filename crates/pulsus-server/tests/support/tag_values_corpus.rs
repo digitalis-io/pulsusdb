@@ -4,16 +4,27 @@
 //! pushes them to PulsusDB. A second copy of a corpus is a second thing
 //! to drift.
 //!
-//! **Every timestamp is derived from the clock at push time, and that is
-//! not a style preference.** `trace_spans` and `trace_attrs_idx` carry
-//! `TTL … + INTERVAL {{retention_days}} DAY DELETE` with
-//! `ttl_only_drop_parts = 1` while `trace_tag_catalog` carries none, so a
-//! corpus older than retention is HALF visible: every tag-values
-//! assertion still passes off the catalog while the span rows are dropped
-//! at insert time. There is no grace window, it behaves identically on a
-//! developer machine and in CI, and it presents as the feature being
-//! broken rather than as a flake. A committed literal timestamp would be
-//! a defect here even on the day it passed.
+//! **Every timestamp of a corpus this module PUSHES is derived from the
+//! clock at push time, and that is not a style preference.** `trace_spans`
+//! and `trace_attrs_idx` carry `TTL … + INTERVAL {{retention_days}} DAY
+//! DELETE` with `ttl_only_drop_parts = 1` while `trace_tag_catalog`
+//! carries none, so a corpus older than retention is HALF visible: every
+//! tag-values assertion still passes off the catalog while the span rows
+//! are dropped at insert time. There is no grace window, it behaves
+//! identically on a developer machine and in CI, and it presents as the
+//! feature being broken rather than as a flake.
+//!
+//! **The rule is about corpora, not about digits**, and the difference
+//! decides whether a literal is a defect. What can age out is a
+//! timestamp that is INSERTED as data. A literal that is never inserted
+//! cannot: `tags_sql`'s byte-exact goldens compare rendered SQL text
+//! containing `1_700_000_000`, a conformance case sends
+//! `start=1700003600` to a route that answers `400` before any read, and
+//! this issue's fixture records the date its reference capture was
+//! taken. None of those is a corpus, none feeds an insert, and none of
+//! them ages. Sweeping for date-shaped literals finds all of them and is
+//! the wrong instrument; the question to ask of each is whether a row
+//! carrying it is written to a TTL'd table.
 
 #![allow(dead_code)]
 

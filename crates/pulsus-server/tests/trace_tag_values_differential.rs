@@ -23,8 +23,21 @@
 //! The `#478` sections replay against the other endpoint in the order
 //! they were captured: push C10, replay the `q` matrix and the range
 //! shapes, then push C4 and replay the span-name section over the union.
-//! Re-running the leg against an already-populated instance is NOT
-//! supported — CI starts a fresh container per job.
+//!
+//! # EVERY RUN NEEDS A FRESH REFERENCE. Read this before re-running it
+//!
+//! **This leg is not idempotent against a populated instance, and the
+//! failure does not look like one.** It PUSHES its corpora, and the
+//! reference has no delete: a second run against the same containers
+//! sees the first run's spans as well as its own, so the very first case
+//! — `Q-A`, the unfiltered name list — fails on a count that is too
+//! high, and every later case is unreachable. Code review round 1 met
+//! exactly that and could not verify one break because of it.
+//!
+//! So: **`podman rm -f` both containers and start them again between
+//! runs.** CI is unaffected — it starts a fresh pair per job — and the
+//! symptom to recognise locally is a failure at `Q-A` immediately after a
+//! green run.
 //!
 //! # Gate
 //!

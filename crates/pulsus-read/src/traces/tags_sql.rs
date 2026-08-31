@@ -195,10 +195,21 @@ fn attrs_day_clause(days: DaySpan) -> String {
 /// behind an open range and cannot prune whatever the set looks like. On
 /// `trace_spans` the key is `(trace_id, timestamp_ns)`, so `trace_id`
 /// leads and a set CAN exclude granules — measured, a localised 5-trace
-/// set read 1/245 granules and a scattered 5-trace set 9/245, while the
-/// real 245-granule-wide set read 245/245. The span-side statement is
-/// therefore about the sets this feature produces on that corpus (large
-/// and scattered), not about the schema.
+/// set read 1/245 granules and a scattered 5-trace set 5/245, while the
+/// real 333k-trace set read 245/245. The span-side statement is
+/// therefore about the sets this feature produces (large and scattered),
+/// not about the schema.
+///
+/// **Those three figures are one corpus's, and the scattered one is
+/// corpus-shaped by definition** — how many granules five scattered ids
+/// touch depends on how the ids fell. The scattered figure is `5/245`
+/// as measured independently by plan review round 6 and by code review
+/// round 1, each on its own 2,000,000-span corpus; an earlier revision
+/// of this comment said `9/245`, which was a third corpus's number
+/// carried forward as if it were the property. What is NOT
+/// corpus-shaped, and is what this comment is for, is the ORDERING
+/// argument above it: `trace_id` leads on one table and sits behind an
+/// open range on the other.
 fn term_clauses(ctx: SpanFilterCtx<'_>, terms: &[NarrowTerm], days: DaySpan) -> Vec<String> {
     terms
         .iter()
