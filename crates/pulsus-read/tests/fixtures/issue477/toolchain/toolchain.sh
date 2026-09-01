@@ -54,7 +54,7 @@ echo "exit=$? warnings=$(grep -c '^warning' "$WORK/doc-clean.txt") errors=$(grep
 
 say "Q27(b) cargo doc --no-deps, clean tree"
 code=$(run_json "$WORK/cargodoc-clean.json" doc --no-deps -p pulsus-read -p pulsus-server)
-echo "exit=$code compiler_messages=$(grep -c '"reason":"compiler-message"' "$WORK/cargodoc-clean.json") broken_links=$(grep -c 'broken_intra_doc_links' "$WORK/cargodoc-clean.json")"
+echo "exit=$code $(python3 "$HERE/summarise.py" "$WORK/cargodoc-clean.json" metrics_plan.rs)"
 
 say "Q27(c) the same two commands with ONE stale intra-doc link"
 # A link to a symbol that does not exist. Nothing else in the file moves.
@@ -63,7 +63,7 @@ git diff --stat -- "$PLAN"
 cargo test --workspace --doc > "$WORK/doc-stale.txt" 2>&1
 echo "doctest   exit=$? warnings=$(grep -c '^warning' "$WORK/doc-stale.txt") errors=$(grep -c '^error' "$WORK/doc-stale.txt")"
 code=$(run_json "$WORK/cargodoc-stale.json" doc --no-deps -p pulsus-read -p pulsus-server)
-echo "cargo doc exit=$code compiler_messages=$(grep -c '"reason":"compiler-message"' "$WORK/cargodoc-stale.json") broken_links=$(grep -c 'broken_intra_doc_links' "$WORK/cargodoc-stale.json")"
+echo "cargo doc exit=$code $(python3 "$HERE/summarise.py" "$WORK/cargodoc-stale.json" metrics_plan.rs)"
 restore
 
 say "Q26(a) control D — a unit made WRONG in place, nothing renamed"
@@ -92,6 +92,14 @@ for round in 1 2 3 4 5 6 7 8; do
   echo "  round $round cargo_check_exit=$code guard_exit=$guard $out"
   [ "$code" = "0" ] && break
   [ "$guard" != "0" ] && break
+  # A round that renames nothing will report the same sites for ever:
+  # the compiler is asking for a change this line-level rewrite cannot
+  # make, and spinning would hide that behind a round count.
+  case "$out" in *"occurrences_renamed=0"*)
+    echo "  STALLED — the compiler still demands these sites and the rewrite reached none of them:"
+    sed -n 's/.*/  &/p' "$WORK/ledger.tsv" | head -20
+    break ;;
+  esac
 done
 AFTER=$(git grep -c '\bstep_ms\b' -- crates/pulsus-read/src/traces crates/pulsus-server/src/traces_api | awk -F: '{n+=$2} END {print n+0}')
 echo "step_ms occurrences the compiler never demanded, after: ${AFTER:-0}"
