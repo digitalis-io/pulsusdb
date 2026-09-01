@@ -1083,6 +1083,198 @@ mod tests {
         plan_trace_metrics(&parse(q).expect("parse"), &PARAMS, &ctx()).expect("plan")
     }
 
+    /// AC1 (issue #477 (a)/(b)): the emitted bucket grid, one case per
+    /// geometry row measured against the reference. Class CHANGE — no
+    /// axis exists at `2f78c53`.
+    ///
+    /// Every row is `(start_s, end_s, step_ms) -> (points, first_ms,
+    /// last_ms)`. `first_ms` is `aS`, the right edge of the extra leading
+    /// bucket; `last_ms` is `aE`; `points` is `intervals + 1`.
+    #[test]
+    fn the_range_axis_matches_the_reference_grid() {
+        for (start_s, end_s, step_ms, points, first_ms, last_ms) in [
+            (1_788_182_400i64, 1_788_182_640i64, 30_000i64, 9usize, 1_788_182_400_000i64, 1_788_182_640_000i64),
+            (1_788_182_401, 1_788_182_641, 30_000, 10, 1_788_182_400_000, 1_788_182_670_000),
+            (1_788_182_429, 1_788_182_669, 30_000, 10, 1_788_182_400_000, 1_788_182_670_000),
+            (1_788_182_521, 1_788_182_579, 30_000, 3, 1_788_182_520_000, 1_788_182_580_000),
+            (1_788_182_537, 1_788_182_540, 500, 7, 1_788_182_537_000, 1_788_182_540_000),
+            (1_788_182_535, 1_788_182_541, 1_500, 5, 1_788_182_535_000, 1_788_182_541_000),
+            (1_788_183_390, 1_788_183_410, 20_000, 3, 1_788_183_380_000, 1_788_183_420_000),
+        ] {
+            let params = MetricsParams {
+                start_ns: start_s * NS_PER_S,
+                end_ns: end_s * NS_PER_S,
+                step_ms,
+                exemplars: None,
+            };
+            let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
+                .unwrap_or_else(|e| panic!("{start_s}..{end_s} step {step_ms}ms: {e}"));
+            let axis = p.range_axis();
+            assert_eq!(
+                (axis.points, axis.first_ms, axis.last_ms()),
+                (points, first_ms, last_ms),
+                "{start_s}..{end_s} step {step_ms}ms"
+            );
+            assert_eq!(axis.step_ms, step_ms);
+            // The labels really are `first + i*step`, and the last one is
+            // the snapped right edge.
+            assert_eq!(axis.label_ms(0), first_ms);
+            assert_eq!(axis.label_ms(axis.points - 1), last_ms);
+        }
+    }
+
+    /// AC1, the right-closed lookup: `label_for_ms` is the ceiling, so an
+    /// instant landing exactly on a grid point stays on THAT point.
+    #[test]
+    fn the_axis_label_for_an_instant_is_the_right_closed_ceiling() {
+        let axis = RangeAxis {
+            first_ms: 1_000_000,
+            step_ms: 500,
+            points: 5,
+        };
+        assert_eq!(axis.label_for_ms(1_000_000), 1_000_000, "exactly on a grid point goes LEFT");
+        assert_eq!(axis.label_for_ms(1_000_001), 1_000_500);
+        assert_eq!(axis.label_for_ms(1_000_499), 1_000_500);
+        assert_eq!(axis.label_for_ms(1_000_500), 1_000_500);
+        // Negative epochs (pre-1970) use the same ceiling, not a truncation.
+        let neg = RangeAxis {
+            first_ms: -3_600_000,
+            step_ms: 60_000,
+            points: 2,
+        };
+        assert_eq!(neg.label_for_ms(-3_600_000), -3_600_000);
+        assert_eq!(neg.label_for_ms(-3_599_999), -3_540_000);
+        // `-3_660_001` sits inside `(-3_720_000, -3_660_000]`, so its
+        // label is that bucket's right edge, not the axis's first one.
+        assert_eq!(neg.label_for_ms(-3_660_001), -3_660_000);
+    }
+
+    /// AC5(i): the exemplar budget resolves as ONE rule — hint, then the
+    /// HTTP parameter, then the default — and the budget is what decides
+    /// whether any exemplar SQL is rendered at all.
+    #[test]
+    fn the_exemplar_budget_resolves_hint_then_parameter_then_default() {
+        let plan_ex = |q: &str, exemplars: Option<u32>| {
+            let params = MetricsParams {
+                exemplars,
+                ..PARAMS
+            };
+            plan_trace_metrics(&parse(q).expect("parse"), &params, &ctx()).expect("plan")
+        };
+        // No hint, no parameter: exemplars are ON by default.
+        let d = plan_ex("{} | rate()", None);
+        assert_eq!(d.exemplar_budget(), 100);
+        assert!(d.exemplar_sql().is_some(), "a plain rate() renders exemplar SQL");
+        // The parameter alone.
+        assert_eq!(plan_ex("{} | rate()", Some(5)).exemplar_budget(), 5);
+        // The hint WINS over the parameter, in both directions — this is
+        // the pair that discriminates a precedence swap.
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=1)", Some(5)).exemplar_budget(),
+            1
+        );
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=5)", Some(1)).exemplar_budget(),
+            5
+        );
+        // `false` is expressible and turns them off — it must not fall
+        // through to the default.
+        let off = plan_ex("{} | rate() with(exemplars=false)", None);
+        assert_eq!(off.exemplar_budget(), 0);
+        assert!(off.exemplar_sql().is_none(), "a zero budget renders no exemplar SQL");
+        // …including when the parameter asks for some.
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=false)", Some(9)).exemplar_budget(),
+            0
+        );
+        // `true` means the default, not 1.
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=true)", None).exemplar_budget(),
+            100
+        );
+        // Both inputs are clamped to the ceiling.
+        assert_eq!(plan_ex("{} | rate()", Some(100_000)).exemplar_budget(), MAX_EXEMPLARS);
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=100000)", None).exemplar_budget(),
+            MAX_EXEMPLARS
+        );
+        // The budget is a TOTAL: the per-bucket sample size the SQL asks
+        // for is the budget spread over the grid, floored at 1.
+        assert!(
+            d.exemplar_sql()
+                .expect("rendered")
+                .contains("groupArraySample(1, 1)"),
+            "182 points and a budget of 100 is one sample per bucket: {:?}",
+            d.exemplar_sql()
+        );
+    }
+
+    /// AC13: the interval cap at the new unit, pinned on both sides.
+    #[test]
+    fn the_interval_cap_boundary_holds_in_milliseconds() {
+        // (step_ms, width_ms, expected)
+        for (step_ms, width_ms, want) in [
+            (1_000i64, 11_000_000i64, Ok(11_001usize)),
+            (1_000, 11_001_000, Err(11_001i64)),
+            (1, 11_000, Ok(11_001)),
+            (1, 11_001, Err(11_001)),
+            (500, 5_500_000, Ok(11_001)),
+        ] {
+            let params = MetricsParams {
+                start_ns: 0,
+                end_ns: width_ms * NS_PER_MS,
+                step_ms,
+                exemplars: None,
+            };
+            let got = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx());
+            match (want, got) {
+                (Ok(points), Ok(p)) => {
+                    assert_eq!(p.range_axis().points, points, "step {step_ms}ms / {width_ms}ms")
+                }
+                (Err(buckets), Err(e)) => assert_eq!(
+                    e,
+                    PlanError::MetricsPointCap {
+                        buckets,
+                        cap: MAX_METRICS_POINTS,
+                    },
+                    "step {step_ms}ms / {width_ms}ms"
+                ),
+                (want, got) => panic!("step {step_ms}ms / {width_ms}ms: wanted {want:?}, got {got:?}"),
+            }
+        }
+    }
+
+    /// Issue #477: the two probes are built over DIFFERENT windows, and
+    /// the instant one is the byte-identical pre-change probe.
+    #[test]
+    fn the_two_series_cap_probes_are_over_different_windows() {
+        for q in [
+            "{} | rate() by(resource.service.name)",
+            r#"{} | compare({ span.http.status_code = "500" })"#,
+        ] {
+            let p = plan(q);
+            let range = p.range_probe_sql().expect("a range probe");
+            let instant = p.instant_probe_sql().expect("an instant probe");
+            assert_ne!(range, instant, "{q}: the two probes must not be one probe");
+            assert!(
+                range.contains("timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001"),
+                "{q}: the range probe is over the range window: {range}"
+            );
+            assert!(
+                instant.contains("timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"),
+                "{q}: the instant probe is over the instant window: {instant}"
+            );
+            assert!(
+                !instant.contains("timestamp_ns >= 1699999920000000001"),
+                "{q}: no range bound may leak into the instant probe: {instant}"
+            );
+        }
+        // An ungrouped, non-compare plan renders neither.
+        let p = plan("{} | rate()");
+        assert!(p.range_probe_sql().is_none());
+        assert!(p.instant_probe_sql().is_none());
+    }
+
     #[test]
     fn the_window_snaps_outward_to_epoch_aligned_step_boundaries() {
         let p = plan("{} | rate()");
@@ -1213,7 +1405,11 @@ mod tests {
         let plain = plan("{} | rate()");
         let sampled = plan("{} | rate() with(sample=0.1)");
         assert_eq!(plain.range_sql(), sampled.range_sql());
-        assert!(sampled.exemplar_sql().is_none());
+        // `sample` says nothing about exemplars, so the two plans resolve
+        // the same budget — which since issue #477 (c) is the default,
+        // not none.
+        assert_eq!(sampled.exemplar_budget(), plain.exemplar_budget());
+        assert_eq!(sampled.exemplar_sql(), plain.exemplar_sql());
     }
 
     #[test]
@@ -1222,9 +1418,33 @@ mod tests {
         let ex = p
             .exemplar_sql()
             .expect("exemplars requested → collection SQL");
+        // The hint is a TOTAL of 5 over a 182-point grid (issue #477 (c)),
+        // so the per-bucket sample size floors at 1 and the engine thins
+        // the collected list down to 5.
+        assert_eq!(p.exemplar_budget(), 5);
         assert!(
-            ex.contains("groupArraySample(5, 1)(tuple(trace_id, timestamp_ns))"),
+            ex.contains("groupArraySample(1, 1)(tuple(trace_id, timestamp_ns))"),
             "{ex}"
+        );
+        // A budget larger than the grid asks for more per bucket.
+        let wide = plan_trace_metrics(
+            &parse("{} | rate() with(exemplars=100)").unwrap(),
+            &MetricsParams {
+                start_ns: 0,
+                end_ns: 10 * NS_PER_S,
+                step_ms: 1_000,
+                exemplars: None,
+            },
+            &ctx(),
+        )
+        .expect("plan");
+        assert_eq!(wide.range_axis().points, 11);
+        assert!(
+            wide.exemplar_sql()
+                .expect("rendered")
+                .contains("groupArraySample(9, 1)"),
+            "100 spread over 11 points is 9 per bucket: {:?}",
+            wide.exemplar_sql()
         );
     }
 
@@ -1368,15 +1588,35 @@ mod tests {
         }
     }
 
+    /// Issue #477: the two forms carry DIFFERENT window bounds. The
+    /// instant form keeps `[aS, aE)` byte for byte; the range form reads
+    /// `(aS - step, aE]`, spelled over integer nanoseconds as
+    /// `[aS - step + 1, aE + 1)`.
     #[test]
-    fn the_generated_sql_carries_the_snapped_left_closed_bounds() {
+    fn the_generated_sql_carries_each_forms_own_window_bounds() {
         let p = plan("{} | rate()");
-        assert!(p.range_sql().contains(
-            "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
-        ));
-        assert!(p.instant_sql().contains(
-            "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
-        ));
+        assert!(
+            p.range_sql().contains(
+                "WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001"
+            ),
+            "{}",
+            p.range_sql()
+        );
+        assert!(
+            p.instant_sql().contains(
+                "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
+            ),
+            "{}",
+            p.instant_sql()
+        );
+        assert_eq!(
+            p.range_window_ns(),
+            (1_699_999_920_000_000_001, 1_700_010_840_000_000_001)
+        );
+        assert_eq!(
+            p.snapped_window_ns(),
+            (1_699_999_980_000_000_000, 1_700_010_840_000_000_000)
+        );
     }
 
     #[test]

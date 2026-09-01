@@ -213,3 +213,65 @@ fn the_residual_entry_states_that_it_records_gaps_rather_than_divergences_of_jud
         "the entry heading must say it is a gap record"
     );
 }
+
+/// AC11 (issue #477): the five bucket-geometry/exemplar ledger entries
+/// exist, each names the endpoint it is about, and each carries the fact
+/// its own disposition rests on.
+///
+/// The endpoint is asserted because a ledger row without a route goes
+/// stale invisibly: the reference answers the same query differently on
+/// the range and the instant routes, so "the reference does X" is not a
+/// claim until it says where.
+#[test]
+fn the_five_metrics_geometry_ledger_entries_each_name_their_endpoint() {
+    let ledger = ledger();
+    // (id, a needle from the entry's own measured content)
+    const ENTRIES: [(&str, &str); 5] = [
+        (
+            "traceql-metrics-fractional-ms-step-rejected",
+            // The counterexample that says the bound is "not a whole
+            // millisecond" rather than "sub-millisecond".
+            "`100.25ms` is far above one millisecond",
+        ),
+        (
+            "traceql-metrics-end-cutoff-unadopted",
+            // The transition is not a fixed point, and nothing reads it.
+            "not a fixed point",
+        ),
+        (
+            "traceql-metrics-density-by-function",
+            // Recorded as MATCHED so nobody densifies the aggregations.
+            "so nobody \"fixes\" the value aggregations into density",
+        ),
+        (
+            "traceql-metrics-zero-fill-without-a-block",
+            // Worded as introduced BY this change, not as pre-existing.
+            "introduced deliberately by issue #477",
+        ),
+        (
+            "traceql-metrics-exemplar-count-not-a-parity-surface",
+            // The count is a sampler's output and is not gated.
+            "would make a **correct** implementation fail",
+        ),
+    ];
+    for (id, needle) in ENTRIES {
+        let body = squash(entry_body(&ledger, id));
+        assert!(
+            body.contains("/api/traces/v1/metrics/query_range"),
+            "{id}: a ledger row must name the endpoint it is about"
+        );
+        assert!(
+            body.contains(&squash(needle)),
+            "{id}: the entry does not carry {needle:?}"
+        );
+    }
+    // The hint's unit change is ledgered separately (ruling 1 on issue
+    // #477): it is a behaviour change for existing users, not a
+    // divergence from the reference.
+    let unit = squash(entry_body(&ledger, "traceql-metrics-exemplars-total-budget"));
+    assert!(unit.contains("/api/traces/v1/metrics/query_range"));
+    assert!(
+        unit.contains("used to mean N exemplars **per bucket**"),
+        "the entry must state what changed, not only what is true now"
+    );
+}

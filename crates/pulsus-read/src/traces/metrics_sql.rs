@@ -1437,17 +1437,83 @@ mod tests {
     #[test]
     fn range_sql_pins_the_bucket_wrapper_dedup_count_and_bounds() {
         let f = compile(r#"{ resource.service.name = "checkout" && duration > 2s }"#);
-        let sql = metrics_range_sql("trace_spans", &f, W, 60);
-        assert!(sql.starts_with(
-            "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-             INTERVAL 60000 MILLISECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n\
-             FROM trace_spans\nPREWHERE service = 'checkout'\n"
-        ));
+        let sql = metrics_range_sql("trace_spans", &f, W, 60_000);
+        assert!(
+            sql.starts_with(
+                "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(\
+                 timestamp_ns - 1), INTERVAL 60000 MILLISECOND)) + 60000 AS t,\n       \
+                 uniqExact(trace_id, span_id) AS n\nFROM trace_spans\n\
+                 PREWHERE service = 'checkout'\n"
+            ),
+            "{sql}"
+        );
         assert!(sql.contains(
             "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
         ));
         assert!(sql.ends_with("GROUP BY t\nORDER BY t ASC"));
         assert!(!sql.contains("count()"), "counting is always uniqExact");
+    }
+
+    /// AC2, hermetic half (issue #477 (b)): the exact rendered
+    /// right-closed bucket label.
+    ///
+    /// The `- 1` and the `+ step` are what turn `toStartOfInterval`'s
+    /// floor into a ceiling, which is what puts a grid-point instant on
+    /// ITS OWN point. Deleting either sends every boundary instant one
+    /// step right and moves every sample in every range response.
+    #[test]
+    fn the_range_bucket_expression_is_right_closed() {
+        assert_eq!(
+            range_bucket_expr(500),
+            "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), \
+             INTERVAL 500 MILLISECOND)) + 500"
+        );
+        assert_eq!(
+            range_bucket_expr(60_000),
+            "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), \
+             INTERVAL 60000 MILLISECOND)) + 60000"
+        );
+        // Every range builder renders that same label, and none of them
+        // renders the left-edge form.
+        let f = compile(r#"{ duration > 2s }"#);
+        for sql in [
+            metrics_range_sql("trace_spans", &f, W, 500),
+            metrics_count_range_sql("trace_spans", &f, W, 500, &[]),
+            metrics_agg_range_sql("trace_spans", &f, W, 500, AggFn::Sum, &[]),
+            metrics_quantile_range_sql("trace_spans", &f, W, 500, &[0.9]),
+            metrics_log2_bucket_range_sql("trace_spans", &f, W, 500),
+            metrics_exemplar_range_sql("trace_spans", &f, W, 500, 1),
+        ] {
+            assert!(sql.contains(&range_bucket_expr(500)), "{sql}");
+            assert!(
+                !sql.contains(
+                    "toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 500"
+                ),
+                "a left-edge label survived: {sql}"
+            );
+        }
+    }
+
+    /// AC7(d2): the INSTANT comparison probe's bucket expression is
+    /// frozen at the pre-#477 left-edge form, and it is NOT the range
+    /// form. Class CHANGE — neither function exists at `2f78c53` in this
+    /// shape.
+    #[test]
+    fn the_instant_compare_probe_bucket_expression_is_frozen() {
+        assert_eq!(
+            compare_instant_probe_bucket_expr(60_000),
+            "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+             INTERVAL 60000 MILLISECOND))"
+        );
+        assert_ne!(
+            compare_instant_probe_bucket_expr(60_000),
+            compare_range_bucket_expr(60_000),
+            "pointing the instant compare probe at the range expression moves the instant \
+             route's frozen bytes"
+        );
+        // The comparison range label is the same right-closed label every
+        // other range shape uses — one axis, no carve-out.
+        assert_eq!(compare_range_bucket_expr(60_000), range_bucket_expr(60_000));
     }
 
     #[test]

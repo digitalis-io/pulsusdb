@@ -951,9 +951,12 @@ mod tests {
             ),
             (
                 "MetricsParam",
-                ApiError::MetricsParam(MetricsParamError::InvalidStep("500ms".to_string())),
+                // `500ms` is ACCEPTED since issue #477 (d); `1.5ms` is the
+                // whole-millisecond bound and is what this route rejects
+                // now.
+                ApiError::MetricsParam(MetricsParamError::InvalidStep("1.5ms".to_string())),
                 StatusCode::BAD_REQUEST,
-                r#"invalid 'step' "500ms": expected positive whole seconds (e.g. 60, 60s, 5m, 1h)"#,
+                r#"invalid 'step' "1.5ms": expected a positive whole number of milliseconds (e.g. 60, 60s, 500ms, 1m30s, 1.5s)"#,
                 None,
             ),
             (
@@ -1107,11 +1110,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_metrics_param_error_maps_to_400_naming_the_step() {
-        let err = ApiError::MetricsParam(MetricsParamError::InvalidStep("500ms".to_string()));
+        let err = ApiError::MetricsParam(MetricsParamError::InvalidStep("1.5ms".to_string()));
         let (status, body) = rendered(err).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
-            body.contains("500ms"),
+            body.contains("1.5ms"),
             "message must name the rejected step, got {body}"
         );
     }
