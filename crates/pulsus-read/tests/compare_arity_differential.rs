@@ -320,7 +320,8 @@ async fn pulsus_counts(
         &MetricsParams {
             start_ns: window.0,
             end_ns: window.1,
-            step_s: window_s,
+            step_ms: window_s * 1_000,
+            exemplars: None,
         },
         &engine.metrics_ctx(),
     )

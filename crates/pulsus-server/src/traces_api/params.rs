@@ -321,8 +321,8 @@ pub(crate) fn parse_metrics_params(
             // the planner's static point cap sees the true bucket count.
             let span_s =
                 (i128::from(end_ns) - i128::from(start_ns)) / i128::from(1_000_000_000_i64);
-            let step_s = (span_s / i128::from(pulsus_read::DEFAULT_METRICS_POINTS)).max(1);
-            i64::try_from(step_s * 1_000).unwrap_or(i64::MAX)
+            let step_seconds = (span_s / i128::from(pulsus_read::DEFAULT_METRICS_POINTS)).max(1);
+            i64::try_from(step_seconds * 1_000).unwrap_or(i64::MAX)
         }
     };
 
@@ -1167,14 +1167,17 @@ mod tests {
         assert_eq!(p.q.as_str(), "{} | rate()");
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
-        // Derivation: max(1, 3600 / DEFAULT_METRICS_POINTS(100)) = 36.
-        assert_eq!(p.step_s, 36);
+        // Derivation: max(1, 3600 / DEFAULT_METRICS_POINTS(100)) = 36 s,
+        // carried in milliseconds since issue #477 (d).
+        assert_eq!(p.step_ms, 36_000);
     }
 
     #[test]
     fn a_short_window_derives_the_one_second_step_floor() {
+        // The FLOOR is still one whole second — only an explicit `step`
+        // gained sub-second forms (issue #477 (d)).
         let p = parse_metrics_params("q=%7B%7D&start=100&end=110", NOW_S).unwrap();
-        assert_eq!(p.step_s, 1);
+        assert_eq!(p.step_ms, 1_000);
     }
 
     #[test]
@@ -1549,24 +1552,51 @@ mod tests {
         }
     }
 
+    /// AC6(i), accept half: the complete step spelling set measured
+    /// `200` on the reference, each pinned to its exact millisecond
+    /// value. `500ms` is the spelling the issue was filed on; the
+    /// compound and fractional forms are what the Step box lets a user
+    /// type.
     #[test]
-    fn explicit_step_forms_parse_to_whole_seconds() {
-        for (raw, expected) in [
-            ("60", 60),
-            ("60s", 60),
-            ("5m", 300),
-            ("1h", 3_600),
-            ("60000ms", 60),
+    fn the_step_grammar_accepts_sub_second_and_compound_forms() {
+        for (raw, expected_ms) in [
+            ("30s", 30_000),
+            ("500ms", 500),
+            ("100ms", 100),
+            ("3ms", 3),
+            ("1.5s", 1_500),
+            ("1500ms", 1_500),
+            ("0.5s", 500),
+            (".5s", 500),
+            ("%2B30s", 30_000),
+            ("2.5s", 2_500),
+            ("1m30s", 90_000),
+            ("1s500ms", 1_500),
+            ("1h30m", 5_400_000),
+            ("30", 30_000),
+            ("1m", 60_000),
+            ("1h", 3_600_000),
+            ("60000ms", 60_000),
+            ("5m", 300_000),
         ] {
             let p = parse_metrics_params(&format!("q=%7B%7D&start=1&end=7201&step={raw}"), NOW_S)
-                .unwrap();
-            assert_eq!(p.step_s, expected, "step={raw}");
+                .unwrap_or_else(|e| panic!("step={raw} must be accepted, got {e}"));
+            assert_eq!(p.step_ms, expected_ms, "step={raw}");
         }
     }
 
+    /// AC6(i), reject half. `1.5ms`/`3.5ms`/`100.25ms` are the
+    /// whole-millisecond bound — the reference answers `200` for each
+    /// above its own floor and we deliberately do not
+    /// (`traceql-metrics-fractional-ms-step-rejected`). `100.25ms` is far
+    /// above one millisecond and still rejected, which is why the bound
+    /// is "not a whole number of milliseconds" and not "sub-millisecond".
     #[test]
-    fn non_positive_or_fractional_second_steps_are_rejected() {
-        for raw in ["0", "0s", "abc", "-60", "1.5", "500ms", "1500ms", "2d", ""] {
+    fn non_whole_millisecond_and_malformed_steps_are_rejected() {
+        for raw in [
+            "0", "0s", "abc", "-60", "1.5ms", "3.5ms", "100.25ms", "30S", "5e2ms", "500us", "2d",
+            "",
+        ] {
             let query = format!("q=%7B%7D&start=1&end=7201&step={raw}");
             let result = parse_metrics_params(&query, NOW_S);
             if raw.is_empty() {
@@ -1579,6 +1609,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// AC5(ii): the `exemplars` request parameter is READ, and its
+    /// normalised VALUE is what this asserts.
+    ///
+    /// The value is the point. Before issue #477 the parameter was not
+    /// looked for anywhere, so every one of these requests parsed to a
+    /// `200`-shaped params struct and a status-only assertion would have
+    /// passed at base for the wrong reason.
+    #[test]
+    fn the_exemplars_parameter_normalises_by_value() {
+        let parse = |suffix: &str| {
+            parse_metrics_params(
+                &format!("q=%7B%7D&start=1&end=7201&step=60{suffix}"),
+                NOW_S,
+            )
+            .unwrap_or_else(|e| panic!("exemplars{suffix:?} must not be an error, got {e}"))
+        };
+        assert_eq!(parse("").exemplars, None, "absent");
+        assert_eq!(parse("&exemplars=").exemplars, None, "empty");
+        assert_eq!(parse("&exemplars=0").exemplars, None, "zero");
+        assert_eq!(parse("&exemplars=-1").exemplars, None, "negative");
+        assert_eq!(parse("&exemplars=abc").exemplars, None, "non-numeric");
+        assert_eq!(parse("&exemplars=5").exemplars, Some(5));
+        assert_eq!(parse("&exemplars=100").exemplars, Some(100));
+        // Clamping to the ceiling is the planner's job, not the parser's:
+        // the parameter is carried whole so the precedence rule sees what
+        // the client actually sent.
+        assert_eq!(parse("&exemplars=100000").exemplars, Some(100_000));
     }
 
     #[test]
@@ -1629,8 +1688,8 @@ mod tests {
         .unwrap();
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
-        // Derived step over the ns-precision window: 3600 / 100 = 36.
-        assert_eq!(p.step_s, 36);
+        // Derived step over the ns-precision window: 3600 / 100 = 36 s.
+        assert_eq!(p.step_ms, 36_000);
     }
 
     #[test]
@@ -1643,8 +1702,8 @@ mod tests {
             NOW_S,
         )
         .unwrap();
-        assert!(p.step_s > 0);
-        assert_eq!(p.step_s, ((u64::MAX / 1_000_000_000) / 100) as i64);
+        assert!(p.step_ms > 0);
+        assert_eq!(p.step_ms, ((u64::MAX / 1_000_000_000) / 100) as i64 * 1_000);
     }
 
     #[test]

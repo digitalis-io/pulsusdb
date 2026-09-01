@@ -16,7 +16,8 @@ use pulsus_read::{SpanFilterCtx, TraceMetricsPlan};
 const PARAMS: MetricsParams = MetricsParams {
     start_ns: 1_700_000_000_000_000_000,
     end_ns: 1_700_010_800_000_000_000,
-    step_s: 60,
+    step_ms: 60_000,
+    exemplars: None,
 };
 
 struct Case {
@@ -290,9 +291,15 @@ fn composite(case: &Case) -> String {
              == compare totals (query_range) ==\n{totals}\n",
             case.name, case.q,
         );
-        if let Some(probe) = plan.probe_sql() {
+        // The two cap probes, instant first so the frozen one keeps its
+        // committed position and its committed bytes (issue #477).
+        if let Some(probe) = plan.instant_probe_sql() {
             out.push_str(&format!("\n== compare series probe ==\n{probe}\n"));
         }
+        if let Some(probe) = plan.range_probe_sql() {
+            out.push_str(&format!("\n== compare range series probe ==\n{probe}\n"));
+        }
+        push_exemplars(&mut out, &plan);
         return out;
     }
     let mut out = format!(
@@ -302,15 +309,28 @@ fn composite(case: &Case) -> String {
         plan.range_sql(),
         plan.instant_sql()
     );
-    // Grouped queries also freeze the distinct-by-key series cap probe.
-    if let Some(probe) = plan.probe_sql() {
+    // Grouped queries also freeze both distinct-by-key series cap probes.
+    if let Some(probe) = plan.instant_probe_sql() {
         out.push_str(&format!("\n== series probe ==\n{probe}\n"));
     }
-    // with(exemplars=…) queries freeze the exemplar-collection SQL.
+    if let Some(probe) = plan.range_probe_sql() {
+        out.push_str(&format!("\n== range series probe ==\n{probe}\n"));
+    }
+    push_exemplars(&mut out, &plan);
+    out
+}
+
+/// Appends the exemplar-collection SQL section.
+///
+/// Called from BOTH branches, and deliberately so: issue #477 turns
+/// exemplars on by default, and the compare branch used to return before
+/// this append, so the two comparison goldens would have been the only
+/// two of the 26 without an `exemplars` section. A carve-out in a frozen
+/// corpus is a place for a rule to stop being uniform.
+fn push_exemplars(out: &mut String, plan: &TraceMetricsPlan) {
     if let Some(ex) = plan.exemplar_sql() {
         out.push_str(&format!("\n== exemplars ==\n{ex}\n"));
     }
-    out
 }
 
 fn golden_dir() -> std::path::PathBuf {

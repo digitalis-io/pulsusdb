@@ -1870,7 +1870,8 @@ async fn every_trace_engine_query_carries_the_memory_ceiling() {
         &pulsus_read::traces::metrics_plan::MetricsParams {
             start_ns: (ts_ns / 1_000_000_000 - 300) * 1_000_000_000,
             end_ns: (ts_ns / 1_000_000_000 + 60) * 1_000_000_000,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         },
         &engine.metrics_ctx(),
     )

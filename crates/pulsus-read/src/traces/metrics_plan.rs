@@ -14,10 +14,11 @@ use super::filter::{PlanError, SpanFilterCtx};
 use super::metrics_sql::{self, AggFn, GroupKeySql, SnappedWindow};
 
 /// The auto-derivation target when `step` is omitted (docs/api.md §4.4,
-/// task-manager adjudication 3): `step_s = max(1, ⌊(end_s − start_s) /
-/// DEFAULT_METRICS_POINTS⌋)`. The derivation itself runs server-side in
-/// `parse_metrics_params`; the constant lives here as the committed
-/// contract's single source.
+/// task-manager adjudication 3): the derived step is
+/// `max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)` whole SECONDS,
+/// scaled to the plan's millisecond unit. The derivation itself runs
+/// server-side in `parse_metrics_params`; the constant lives here as the
+/// committed contract's single source.
 pub const DEFAULT_METRICS_POINTS: i64 = 100;
 
 /// The hard bucket-count cap (docs/api.md §4.4): a snapped range
@@ -106,8 +107,9 @@ pub struct MetricsCtx<'a> {
 
 /// The committed M4 metrics functions ([`pulsus_traceql::MetricFn`]'s
 /// read-side twin — the planner owns the value-semantics mapping: `rate`
-/// divides the deduped count by `step_s` client-side at the encode
-/// boundary, `count_over_time` is the count itself).
+/// divides the deduped count by the step, in fractional seconds,
+/// client-side at the encode boundary; `count_over_time` is the count
+/// itself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricFunc {
     Rate,
@@ -1073,7 +1075,8 @@ mod tests {
     const PARAMS: MetricsParams = MetricsParams {
         start_ns: 1_700_000_000_000_000_000,
         end_ns: 1_700_010_800_000_000_000,
-        step_s: 60,
+        step_ms: 60_000,
+        exemplars: None,
     };
 
     fn plan(q: &str) -> TraceMetricsPlan {
@@ -1089,7 +1092,7 @@ mod tests {
             p.snapped_window_ns(),
             (1_699_999_980_000_000_000, 1_700_010_840_000_000_000)
         );
-        assert_eq!(p.window_s(), 10_860);
+        assert_eq!(p.window_seconds(), 10_860.0);
         assert_eq!(p.snapped_end_ms(), 1_700_010_840_000);
     }
 
@@ -1098,7 +1101,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: 1_699_999_980_000_000_000,
             end_ns: 1_700_010_840_000_000_000,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         };
         let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx()).unwrap();
         assert_eq!(
@@ -1136,7 +1140,9 @@ mod tests {
     fn by_resource_service_name_sets_the_group_label_and_probe() {
         let p = plan("{} | rate() by(resource.service.name)");
         assert_eq!(p.group_label(), Some("resource.service.name"));
-        let probe = p.probe_sql().expect("grouped query renders a probe");
+        let probe = p
+            .instant_probe_sql()
+            .expect("grouped query renders an instant probe");
         assert!(probe.contains("GROUP BY g0"), "{probe}");
         assert!(probe.contains("LIMIT 1001"), "cap+1 sentinel: {probe}");
         assert!(p.range_sql().contains("service AS g0"), "{}", p.range_sql());
@@ -1302,7 +1308,9 @@ mod tests {
         assert!(cross.contains("key = 'http.status_code'"), "{cross}");
         assert!(totals.contains("countIf(is_sel) AS sel_total"), "{totals}");
         // The distinct-(key,value) cap probe is reused by the engine.
-        let probe = p.probe_sql().expect("compare renders a cap probe");
+        let probe = p
+            .instant_probe_sql()
+            .expect("compare renders an instant cap probe");
         assert!(probe.contains("GROUP BY akey, aval"), "{probe}");
         assert!(probe.contains("LIMIT 1001"), "cap+1: {probe}");
     }
@@ -1424,8 +1432,8 @@ mod tests {
 
     #[test]
     fn a_non_positive_step_is_a_plan_error() {
-        for step_s in [0, -60] {
-            let params = MetricsParams { step_s, ..PARAMS };
+        for step_ms in [0, -60] {
+            let params = MetricsParams { step_ms, ..PARAMS };
             let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
                 .expect_err("non-positive step");
             assert!(matches!(err, PlanError::TypeMismatch(_)), "{err}");
@@ -1437,7 +1445,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: PARAMS.end_ns,
             end_ns: PARAMS.start_ns,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("inverted window");
@@ -1450,7 +1459,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: 0,
             end_ns: 12_000 * 1_000_000_000,
-            step_s: 1,
+            step_ms: 1_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("over the cap");
@@ -1474,7 +1484,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: i64::MAX - 1_000_000_000,
             end_ns: i64::MAX,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1487,7 +1498,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: i64::MIN,
             end_ns: i64::MIN + 1_000_000_000,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1503,7 +1515,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: -9_000_000_000_000_000_000,
             end_ns: 9_000_000_000_000_000_000,
-            step_s: 1,
+            step_ms: 1_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1521,7 +1534,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: i64::MIN,
             end_ns: i64::MAX,
-            step_s: 1,
+            step_ms: 1_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1530,10 +1544,10 @@ mod tests {
 
     #[test]
     fn a_step_whose_nanos_exceed_i64_is_a_clean_400_not_a_panic() {
-        // step_s = i64::MAX: step_ns only exists in i128; the snapped end
+        // step_ms = i64::MAX: step_ns only exists in i128; the snapped end
         // (one whole step) cannot fit the storable i64 range → 400.
         let params = MetricsParams {
-            step_s: i64::MAX,
+            step_ms: i64::MAX,
             ..PARAMS
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
@@ -1549,11 +1563,12 @@ mod tests {
         let params = MetricsParams {
             start_ns: -8_000_000_000_000_000_000,
             end_ns: 8_000_000_000_000_000_000,
-            step_s: 2_000_000,
+            step_ms: 2_000_000_000,
+            exemplars: None,
         };
         let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect("8000 buckets is under the cap");
-        assert_eq!(p.window_s(), 16_000_000_000);
+        assert_eq!(p.window_seconds(), 16_000_000_000.0);
     }
 
     #[test]
@@ -1561,7 +1576,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: 0,
             end_ns: MAX_METRICS_POINTS * 1_000_000_000,
-            step_s: 1,
+            step_ms: 1_000,
+            exemplars: None,
         };
         assert!(plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx()).is_ok());
     }

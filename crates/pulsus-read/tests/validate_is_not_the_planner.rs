@@ -135,7 +135,8 @@ fn every_plan_error_variant_is_witnessed_by_an_accepted_vector() {
     let huge = MetricsParams {
         start_ns: 0,
         end_ns: 4_000_000_000_000_000_000,
-        step_s: 1,
+        step_ms: 1_000,
+        exemplars: None,
     };
 
     for v in &accepted {

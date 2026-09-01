@@ -779,14 +779,19 @@ impl TraceEngine {
 
     /// Executes a metrics range plan (issue #59): one fully-pushed-down
     /// time-bucketed query — bucketing, replay-deduped counting, and time
-    /// pruning all happen in ClickHouse; the engine only frames at most
-    /// `MAX_METRICS_POINTS` `(t_ms, value)` points (the plan enforced the
-    /// cap statically) and applies the explicit encode-boundary
-    /// conversions (`n as f64`, rate ÷ `step_s`; the row's `t_ms` is
-    /// already the millisecond point unit `prom_api::encode` consumes —
-    /// issue #59 re-audit, `Int64` epoch-milliseconds). Empty result
-    /// → `Matrix(vec![])` (the documented empty-DB oracle); otherwise one
-    /// label-less series (single-series M4 output — `by()` is M7).
+    /// pruning all happen in ClickHouse; the engine frames exactly
+    /// `range_axis().points` `(t_ms, value)` samples per densified series
+    /// (at most `MAX_METRICS_POINTS + 1`; the plan enforced the cap
+    /// statically) and applies the explicit encode-boundary conversions
+    /// (`n as f64`, rate ÷ the step in fractional seconds; the row's
+    /// `t_ms` is already the millisecond point unit the encoder consumes —
+    /// issue #59 re-audit, `Int64` epoch-milliseconds).
+    ///
+    /// Membership follows the function (issue #477 (a)): an ungrouped
+    /// `rate`/`count_over_time` always returns its one series, zero-filled
+    /// where nothing matched; the value aggregations, the grouped shapes,
+    /// `quantile_over_time`, `histogram_over_time` and `compare()` return
+    /// an empty series list when nothing matched.
     pub async fn metrics_range(
         &self,
         plan: &TraceMetricsPlan,
@@ -3700,9 +3705,9 @@ mod tests {
 
     #[test]
     fn metric_values_convert_at_the_encode_boundary() {
-        assert_eq!(count_value(true, 120, 60), 2.0);
-        assert_eq!(count_value(false, 120, 60), 120.0);
-        assert_eq!(count_value(true, 0, 3_600), 0.0);
+        assert_eq!(count_value(true, 120, 60.0), 2.0);
+        assert_eq!(count_value(false, 120, 60.0), 120.0);
+        assert_eq!(count_value(true, 0, 3_600.0), 0.0);
         // Value aggregations scale duration ns → seconds.
         assert_eq!(agg_value(2_000_000_000.0), 2.0);
         assert_eq!(agg_value(0.0), 0.0);

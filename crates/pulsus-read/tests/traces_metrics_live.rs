@@ -2,10 +2,17 @@
 //! identities for the TraceQL metrics endpoints against ClickHouse 26.3,
 //! on a seeded deterministic corpus:
 //!
-//! - **(a)** `Σ_buckets rate·step_s == Σ_buckets count_over_time ==`
+//! - **(a)** `Σ_buckets rate·step == Σ_buckets count_over_time ==`
 //!   an independent deduped `COUNT` of the matching spans — for every
 //!   gated filter shape (service PREWHERE, attr semi-join, negation,
-//!   match-all).
+//!   match-all). The step is carried in MILLISECONDS since issue #477
+//!   (d), so the rate factor is the step's width in fractional seconds.
+//! - **Bucket geometry** (issue #477): the range form labels a bucket by
+//!   its RIGHT edge and reads the right-closed instants
+//!   `(aS - step, aE]`, so a window of `n` steps emits `n + 1` samples —
+//!   one extra LEADING bucket — and a span landing exactly on a grid
+//!   point belongs to THAT point. Every densified shape emits every
+//!   bucket, zero-valued where nothing matched.
 //! - **(b)** instant `/query` == the single bucket of a range with
 //!   `step = window` — on aligned windows, where snap = identity (the
 //!   plan's "AC4 by construction").
@@ -263,7 +270,20 @@ fn plan_for(
     q: &str,
     start_s: i64,
     end_s: i64,
-    step_s: i64,
+    step_ms: i64,
+) -> TraceMetricsPlan {
+    plan_with(engine, q, start_s, end_s, step_ms, None)
+}
+
+/// [`plan_for`] with an explicit HTTP `exemplars` parameter (issue #477
+/// (c)) — the input the datasource sends and the `with()` hint overrides.
+fn plan_with(
+    engine: &TraceEngine,
+    q: &str,
+    start_s: i64,
+    end_s: i64,
+    step_ms: i64,
+    exemplars: Option<u32>,
 ) -> TraceMetricsPlan {
     let query = pulsus_traceql::parse(q).expect("query parses");
     plan_trace_metrics(
@@ -271,11 +291,31 @@ fn plan_for(
         &MetricsParams {
             start_ns: start_s * NS,
             end_ns: end_s * NS,
-            step_s,
+            step_ms,
+            exemplars,
         },
         &engine.metrics_ctx(),
     )
     .expect("query plans")
+}
+
+/// The one window source for every live metrics case this issue adds:
+/// `(now - 60 - width, now - 60)`.
+///
+/// The 60-second margin is fixed and is chosen against the reference's
+/// own 30-second end cutoff, not against any measured transition — a
+/// window ending too close to `now` is clamped there and can invert.
+/// Nothing here depends on where that transition falls; the margin sits
+/// clear of the cutoff itself.
+fn past_window(width_s: i64) -> (i64, i64) {
+    let now_s = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    )
+    .expect("fits i64");
+    (now_s - 60 - width_s, now_s - 60)
 }
 
 /// The samples of an ungrouped result (0 or 1 series).
@@ -304,11 +344,19 @@ fn vector_value(result: &TraceMetricsResult) -> f64 {
 }
 
 /// Asserts the full AC4 identity set for one filter over the aligned
-/// primary window `[base_s(), base_s() + CORPUS_SPANS)`, step 60, against an
-/// independently-computed expected span count.
+/// primary window `[base_s(), base_s() + CORPUS_SPANS)`, step 60 s,
+/// against an independently-computed expected span count.
+///
+/// The identity survives issue #477 unchanged in substance but not in
+/// arithmetic. The range form now reads `(aS - step, aE]` and emits
+/// `intervals + 1` labels, so the corpus's span at exactly `base_s()`
+/// lands in the LEADING bucket rather than in the first interior one,
+/// and every bucket is emitted whether or not it has data. Both sums are
+/// still over the whole emitted axis, and the axis still covers every
+/// corpus span, so both still equal `expected`.
 async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
     let end_s = base_s() + CORPUS_SPANS;
-    let step_s = 60;
+    let step_ms = 60_000;
     let window_s = CORPUS_SPANS;
 
     let rate_plan = plan_for(
@@ -316,17 +364,31 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
         &format!("{filter} | rate()"),
         base_s(),
         end_s,
-        step_s,
+        step_ms,
     );
     let count_plan = plan_for(
         engine,
         &format!("{filter} | count_over_time()"),
         base_s(),
         end_s,
-        step_s,
+        step_ms,
     );
-    // Snap is the identity on this aligned window.
+    // Snap is the identity on this aligned window; the INSTANT window is
+    // what `snapped_window_ns` reports and issue #477 leaves it alone.
     assert_eq!(rate_plan.snapped_window_ns(), (base_s() * NS, end_s * NS));
+    // The range window is one whole step wider on the left and includes
+    // its own right edge.
+    assert_eq!(
+        rate_plan.range_window_ns(),
+        ((base_s() - 60) * NS + 1, end_s * NS + 1)
+    );
+
+    let axis = rate_plan.range_axis();
+    assert_eq!(
+        axis.points,
+        (CORPUS_SPANS / 60 + 1) as usize,
+        "{filter}: intervals + 1 labels"
+    );
 
     let rate_points = matrix_points(&engine.metrics_range(&rate_plan).await.expect("rate range"));
     let count_points = matrix_points(
@@ -336,8 +398,18 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
             .expect("count range"),
     );
 
+    // Issue #477 (a): an ungrouped count/rate emits EVERY bucket, always,
+    // even when nothing matched anywhere in the window.
+    assert_eq!(
+        rate_points.len(),
+        axis.points,
+        "{filter}: the sample count is the interval count from the window and the step"
+    );
+    assert_eq!(count_points.len(), axis.points, "{filter}");
+
     // (a) Σ rate·step == Σ count_over_time == the independent count.
-    let rate_total: f64 = rate_points.iter().map(|(_, v)| v * step_s as f64).sum();
+    let step_seconds = step_ms as f64 / 1_000.0;
+    let rate_total: f64 = rate_points.iter().map(|(_, v)| v * step_seconds).sum();
     let count_total: f64 = count_points.iter().map(|(_, v)| v).sum();
     assert_eq!(
         rate_total.round() as i64,
@@ -348,17 +420,16 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
         count_total as i64, expected,
         "{filter}: Σ count_over_time must equal the independent count ({count_points:?})"
     );
-    // Bucket timestamps are epoch-aligned milliseconds within the window.
-    for (t_ms, _) in &rate_points {
-        assert_eq!(
-            t_ms % (step_s * 1_000),
-            0,
-            "{filter}: unaligned bucket {t_ms}"
-        );
-        assert!(*t_ms >= base_s() * 1_000 && *t_ms < end_s * 1_000);
+    // Bucket timestamps are the axis labels: epoch-aligned milliseconds
+    // from `aS` to `aE` INCLUSIVE (the right edge is a label now).
+    for (i, (t_ms, _)) in rate_points.iter().enumerate() {
+        assert_eq!(*t_ms, axis.label_ms(i), "{filter}: label {i}");
+        assert_eq!(t_ms % step_ms, 0, "{filter}: unaligned bucket {t_ms}");
+        assert!(*t_ms >= base_s() * 1_000 && *t_ms <= end_s * 1_000);
     }
+    assert_eq!(axis.last_ms(), end_s * 1_000, "{filter}: last label is aE");
 
-    // (b) instant == the single bucket of range-with-step = window.
+    // (b) instant == the whole-window range, summed over its axis.
     let instant_rate = vector_value(
         &engine
             .metrics_instant(&rate_plan)
@@ -381,20 +452,23 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
         &format!("{filter} | rate()"),
         base_s(),
         end_s,
-        window_s,
+        window_s * 1_000,
     );
     let whole_points = matrix_points(&engine.metrics_range(&whole_rate_plan).await.expect("whole"));
-    if expected == 0 {
-        assert!(whole_points.is_empty());
-    } else {
-        assert_eq!(whole_points.len(), 1, "step = window is one bucket");
-        assert_eq!(whole_points[0].0, base_s() * 1_000);
-        assert!(
-            (whole_points[0].1 - instant_rate).abs() < 1e-12,
-            "{filter}: instant ({instant_rate}) == the single whole-window bucket ({})",
-            whole_points[0].1
-        );
-    }
+    // Two labels — the leading bucket `(aS - window, aS]` and the window
+    // bucket `(aS, aE]` — not one. The identity is the SUM.
+    assert_eq!(
+        whole_points.len(),
+        2,
+        "{filter}: step = window is the leading bucket plus one interval"
+    );
+    assert_eq!(whole_points[0].0, base_s() * 1_000);
+    assert_eq!(whole_points[1].0, end_s * 1_000);
+    let whole_total: f64 = whole_points.iter().map(|(_, v)| v * window_s as f64).sum();
+    assert!(
+        (whole_total - instant_rate * window_s as f64).abs() < 1e-9,
+        "{filter}: instant ({instant_rate}) accounts for the whole-window axis ({whole_points:?})"
+    );
 }
 
 /// P3 (issue #182): the `*_over_time(duration)` value-aggregation
@@ -407,7 +481,7 @@ async fn assert_aggregation_identities(engine: &TraceEngine) {
     let one_ms_s = 0.001_f64;
 
     // sum_over_time(duration): Σ buckets == CORPUS_SPANS · 0.001.
-    let sum_plan = plan_for(engine, "{} | sum_over_time(duration)", base_s(), end_s, 60);
+    let sum_plan = plan_for(engine, "{} | sum_over_time(duration)", base_s(), end_s, 60_000);
     let sum_points = matrix_points(&engine.metrics_range(&sum_plan).await.expect("sum range"));
     let sum_total: f64 = sum_points.iter().map(|(_, v)| v).sum();
     assert!(
@@ -428,7 +502,7 @@ async fn assert_aggregation_identities(engine: &TraceEngine) {
             &format!("{{}} | {func}(duration)"),
             base_s(),
             end_s,
-            60,
+            60_000,
         );
         let v = vector_value(&engine.metrics_instant(&plan).await.expect("agg instant"));
         assert!(
@@ -457,7 +531,7 @@ async fn assert_by_service_grouping(engine: &TraceEngine) {
         "{} | count_over_time() by(resource.service.name)",
         base_s(),
         end_s,
-        CORPUS_SPANS, // one whole-window bucket
+        CORPUS_SPANS * 1_000, // one whole-window interval, plus the leading bucket
     );
     let result = engine
         .metrics_range(&plan)
@@ -501,7 +575,7 @@ async fn assert_series_cap_rejects() {
         "{} | count_over_time() by(resource.service.name)",
         base_s(),
         end_s,
-        60,
+        60_000,
     );
     let err = capped
         .metrics_range(&plan)
@@ -544,7 +618,7 @@ async fn assert_quantile_and_histogram(engine: &TraceEngine) {
         "{} | quantile_over_time(duration, 0.5, 0.9)",
         base_s(),
         end_s,
-        CORPUS_SPANS,
+        CORPUS_SPANS * 1_000,
     );
     let q_res = engine
         .metrics_instant(&q_plan)
@@ -574,7 +648,7 @@ async fn assert_quantile_and_histogram(engine: &TraceEngine) {
         "{} | histogram_over_time(duration)",
         base_s(),
         end_s,
-        CORPUS_SPANS,
+        CORPUS_SPANS * 1_000,
     );
     let h_res = engine
         .metrics_instant(&h_plan)
@@ -694,7 +768,7 @@ async fn log2_histogram_membership_and_the_sub_two_ns_guard() {
     let instant = |q: String| {
         let engine = &engine;
         async move {
-            let plan = plan_for(engine, &q, base_s(), end_s, CORPUS_SPANS);
+            let plan = plan_for(engine, &q, base_s(), end_s, CORPUS_SPANS * 1_000);
             engine.metrics_instant(&plan).await.expect("instant")
         }
     };
@@ -826,7 +900,7 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
         r#"{} | compare({ span.http.status_code = "500" }) with(exemplars=2)"#,
     ] {
         let res = engine
-            .metrics_range(&plan_for(engine, q, base_s(), end_s, 60))
+            .metrics_range(&plan_for(engine, q, base_s(), end_s, 60_000))
             .await
             .unwrap_or_else(|e| panic!("{q}: {e}"));
         let exs: Vec<&pulsus_read::MetricExemplar> =
@@ -855,7 +929,7 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
             "{} | rate() with(exemplars=2)",
             base_s(),
             end_s,
-            60,
+            60_000,
         ))
         .await
         .expect("instant exemplars");
@@ -871,7 +945,7 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
 
     // with(sample): accepted, exact superset — identical to no sample.
     let plain = engine
-        .metrics_range(&plan_for(engine, "{} | rate()", base_s(), end_s, 60))
+        .metrics_range(&plan_for(engine, "{} | rate()", base_s(), end_s, 60_000))
         .await
         .expect("plain");
     let sampled = engine
@@ -880,30 +954,56 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
             "{} | rate() with(sample=0.1)",
             base_s(),
             end_s,
-            60,
+            60_000,
         ))
         .await
         .expect("sampled");
-    // Samples equal; sampled has no exemplars, plain has none either.
+    // Samples equal. Both now carry exemplars — issue #477 (c) turns them
+    // on by default — and that is not what this gate is about.
     assert_eq!(
         plain.series[0].samples, sampled.series[0].samples,
         "with(sample) returns the exact (superset) result"
     );
 
-    // topk(1) over the two-service grouping keeps only the larger series
-    // per step (svc-x = 480 > checkout = 120); bottomk(1) keeps checkout.
+    // topk(1)/bottomk(1) over the two-service grouping, PER TIMESTAMP.
+    //
+    // Densification (issue #477 (a)) is what makes this a real per-step
+    // test rather than a per-series one. The axis is two labels: the
+    // leading bucket `(aS - 600, aS]`, which holds only the corpus span
+    // at exactly `aS` — a `checkout` span, since `0 % 5 == 0` — and the
+    // window bucket, which holds the other 599. So `checkout` is the
+    // LARGER series at the first label (1 against `svc-x`'s densified 0)
+    // and the smaller at the second (119 against 480), and the reduction
+    // keeps a different series at each. Before densification `svc-x` had
+    // no sample at all in the leading bucket and the answer was one
+    // series; asserting one series now would be asserting the defect.
     let topk = engine
         .metrics_range(&plan_for(
             engine,
             "{} | count_over_time() by(resource.service.name) | topk(1)",
             base_s(),
             end_s,
-            CORPUS_SPANS,
+            CORPUS_SPANS * 1_000,
         ))
         .await
         .expect("topk");
-    assert_eq!(topk.series.len(), 1, "topk(1) keeps one series");
-    assert_eq!(service_label(&topk.series[0]), "svc-x");
+    assert_eq!(
+        topk.series.len(),
+        2,
+        "topk(1) keeps one series PER TIMESTAMP, and they differ: {topk:?}"
+    );
+    assert_eq!(service_label(&topk.series[0]), "checkout");
+    assert_eq!(
+        topk.series[0].samples,
+        vec![(base_s() * 1_000, 1.0)],
+        "checkout wins the leading bucket"
+    );
+    assert_eq!(service_label(&topk.series[1]), "svc-x");
+    assert_eq!(
+        topk.series[1].samples,
+        vec![((base_s() + CORPUS_SPANS) * 1_000, 480.0)],
+        "svc-x wins the window bucket"
+    );
 
     let bottomk = engine
         .metrics_range(&plan_for(
@@ -911,12 +1011,27 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
             "{} | count_over_time() by(resource.service.name) | bottomk(1)",
             base_s(),
             end_s,
-            CORPUS_SPANS,
+            CORPUS_SPANS * 1_000,
         ))
         .await
         .expect("bottomk");
-    assert_eq!(bottomk.series.len(), 1, "bottomk(1) keeps one series");
+    assert_eq!(
+        bottomk.series.len(),
+        2,
+        "bottomk(1) is the mirror image: {bottomk:?}"
+    );
     assert_eq!(service_label(&bottomk.series[0]), "checkout");
+    assert_eq!(
+        bottomk.series[0].samples,
+        vec![((base_s() + CORPUS_SPANS) * 1_000, 119.0)],
+        "checkout loses the window bucket"
+    );
+    assert_eq!(service_label(&bottomk.series[1]), "svc-x");
+    assert_eq!(
+        bottomk.series[1].samples,
+        vec![(base_s() * 1_000, 0.0)],
+        "svc-x loses the leading bucket, where densification gives it a zero"
+    );
 }
 
 /// P6b (issue #182): `compare({selection})` cross-tab meta-series and the
@@ -930,7 +1045,7 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
         r#"{} | compare({ span.http.status_code = "500" })"#,
         base_s(),
         end_s,
-        CORPUS_SPANS, // one whole-window bucket for exact counts
+        CORPUS_SPANS * 1_000, // one whole-window interval for exact counts
     );
     let res = engine.metrics_range(&plan).await.expect("compare executes");
 
@@ -1099,7 +1214,7 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
             "{} | count_over_time() > 50",
             base_s(),
             end_s,
-            60,
+            60_000,
         ))
         .await
         .expect("result-comparison kept");
@@ -1112,7 +1227,7 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
             "{} | count_over_time() > 100",
             base_s(),
             end_s,
-            60,
+            60_000,
         ))
         .await
         .expect("result-comparison dropped");
@@ -1189,7 +1304,7 @@ async fn compare_roots_resolve_trace_wide() {
         r#"{} | compare({ name = "no-match" })"#,
         window_start,
         window_end,
-        CORPUS_SPANS,
+        CORPUS_SPANS * 1_000,
     );
     let res = engine.metrics_range(&plan).await.expect("compare executes");
 
@@ -1316,7 +1431,7 @@ async fn metrics_internal_consistency_identities() {
         r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 } | rate()"#,
         base_s(),
         end_s,
-        60,
+        60_000,
     );
     let before_range = engine.metrics_range(&rate_plan).await.expect("range");
     let before_instant = engine.metrics_instant(&rate_plan).await.expect("instant");
@@ -1340,7 +1455,7 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         base_s() + 30,
         base_s() + 90,
-        60,
+        60_000,
     );
     assert_eq!(
         plan.snapped_window_ns(),
@@ -1350,8 +1465,13 @@ async fn metrics_internal_consistency_identities() {
     let points = matrix_points(&engine.metrics_range(&plan).await.expect("unaligned"));
     assert_eq!(
         points,
-        vec![(base_s() * 1_000, 60.0), ((base_s() + 60) * 1_000, 60.0)],
-        "snapped edge buckets are full-width — no partial denominators"
+        vec![
+            (base_s() * 1_000, 1.0),
+            ((base_s() + 60) * 1_000, 60.0),
+            ((base_s() + 120) * 1_000, 60.0)
+        ],
+        "three labels: the leading bucket `(aS-60, aS]` carrying the span at exactly `aS`, \
+         then the two full-width intervals"
     );
 
     // ---- Exact right boundary: a span at an aligned `end` is excluded
@@ -1361,13 +1481,14 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         base_s(),
         base_s() + 60,
-        60,
+        60_000,
     );
     let points = matrix_points(&engine.metrics_range(&plan).await.expect("boundary"));
     assert_eq!(
         points,
-        vec![(base_s() * 1_000, 60.0)],
-        "spans at seconds 0..=59 count; the span exactly at end (second 60) is excluded"
+        vec![(base_s() * 1_000, 1.0), ((base_s() + 60) * 1_000, 60.0)],
+        "right-closed (issue #477 (b)): the span at exactly `aS` is the leading bucket's, and \
+         the span at exactly `aE` belongs to the LAST label — spans at seconds 1..=60"
     );
     // …and with an UNALIGNED end inside the corpus, the raw-end span IS
     // included in the final snapped bucket.
@@ -1376,28 +1497,28 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         base_s(),
         base_s() + 30,
-        60,
+        60_000,
     );
     let points = matrix_points(&engine.metrics_range(&plan).await.expect("snap end"));
     assert_eq!(
         points,
-        vec![(base_s() * 1_000, 60.0)],
-        "E snaps outward to BASE+60 — the documented over-inclusion, one full bucket"
+        vec![(base_s() * 1_000, 1.0), ((base_s() + 60) * 1_000, 60.0)],
+        "E snaps outward to BASE+60 — the documented over-inclusion, one full bucket plus \
+         the leading one"
     );
 
     // ---- Empty window: range → empty matrix; instant → one "0" sample
     // (the documented empty-DB oracles). ---------------------------------
     let empty_start = base_s() - 86_400;
-    let plan = plan_for(&engine, "{} | rate()", empty_start, empty_start + 600, 60);
-    assert!(
-        engine
-            .metrics_range(&plan)
-            .await
-            .expect("empty range")
-            .series
-            .is_empty(),
-        "an empty range is no series"
-    );
+    let plan = plan_for(&engine, "{} | rate()", empty_start, empty_start + 600, 60_000);
+    let empty_points = matrix_points(&engine.metrics_range(&plan).await.expect("empty range"));
+    // Issue #477 (a): an ungrouped rate over a window with NO matching
+    // data is one series carrying every bucket at zero — the sample-count
+    // identity holds on the all-empty window, which is what says the fill
+    // comes from the window and the step rather than from the rows.
+    assert_eq!(empty_points.len(), plan.range_axis().points);
+    assert_eq!(empty_points.len(), 11, "600 s / 60 s intervals, plus one");
+    assert!(empty_points.iter().all(|(_, v)| *v == 0.0));
     let instant = engine.metrics_instant(&plan).await.expect("empty instant");
     assert_eq!(vector_value(&instant), 0.0);
 
@@ -1426,7 +1547,7 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         EXTREME_PAST_S,
         EXTREME_PAST_S + 60,
-        60,
+        60_000,
     );
     let past_points = matrix_points(
         &extreme_engine
@@ -1436,8 +1557,11 @@ async fn metrics_internal_consistency_identities() {
     );
     assert_eq!(
         past_points,
-        vec![(EXTREME_PAST_S * 1_000, 1.0)],
-        "pre-1970 bucket label must be the exact negative millisecond value, not wrapped"
+        vec![
+            (EXTREME_PAST_S * 1_000, 1.0),
+            ((EXTREME_PAST_S + 60) * 1_000, 0.0)
+        ],
+        "pre-1970 bucket labels must be the exact negative millisecond values, not wrapped"
     );
 
     let future_plan = plan_for(
@@ -1445,7 +1569,7 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         EXTREME_FUTURE_S,
         EXTREME_FUTURE_S + 60,
-        60,
+        60_000,
     );
     let future_points = matrix_points(
         &extreme_engine
@@ -1455,8 +1579,11 @@ async fn metrics_internal_consistency_identities() {
     );
     assert_eq!(
         future_points,
-        vec![(EXTREME_FUTURE_S * 1_000, 1.0)],
-        "post-2106 bucket label must be the exact >UInt32-max millisecond value, not wrapped \
+        vec![
+            (EXTREME_FUTURE_S * 1_000, 1.0),
+            ((EXTREME_FUTURE_S + 60) * 1_000, 0.0)
+        ],
+        "post-2106 bucket labels must be the exact >UInt32-max millisecond values, not wrapped \
          mod 2^32"
     );
 }
@@ -1561,7 +1688,7 @@ async fn duration_seconds_conversion_matches_the_reference() {
             &format!(r#"{{ resource.service.name = "u{i}" }} | max_over_time(duration)"#),
             base_s(),
             end_s,
-            CORPUS_SPANS,
+            CORPUS_SPANS * 1_000,
         );
         let got = vector_value(&engine.metrics_instant(&plan).await.expect("instant"));
         assert_eq!(

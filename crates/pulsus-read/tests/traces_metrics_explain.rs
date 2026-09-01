@@ -304,7 +304,8 @@ fn plan_for(engine: &TraceEngine, q: &str, start_ns: i64, end_ns: i64) -> TraceM
         &MetricsParams {
             start_ns,
             end_ns,
-            step_s: 3_600,
+            step_ms: 3_600_000,
+            exemplars: None,
         },
         &engine.metrics_ctx(),
     )
@@ -604,7 +605,9 @@ async fn metrics_explain_and_budget_gates() {
 
     // The distinct-by-key probe SQL exists for the grouped plan and
     // carries the LIMIT cap+1 sentinel (bucket-count-independent).
-    let probe = by_plan.probe_sql().expect("grouped plans render a probe");
+    let probe = by_plan
+        .range_probe_sql()
+        .expect("grouped plans render a range probe");
     assert!(
         probe.contains("GROUP BY g0") && probe.contains("LIMIT 1001"),
         "the probe counts distinct label-sets under a cap+1 limit:\n{probe}"

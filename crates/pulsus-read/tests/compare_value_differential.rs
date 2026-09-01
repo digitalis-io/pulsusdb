@@ -262,7 +262,9 @@ async fn pulsus_counts(engine: &TraceEngine, window: (i64, i64)) -> Counts {
         &MetricsParams {
             start_ns: window.0,
             end_ns: window.1,
-            step_s: window_s, // one whole-window bucket for exact counts
+            // one whole-window bucket for exact counts
+            step_ms: window_s * 1_000,
+            exemplars: None,
         },
         &engine.metrics_ctx(),
     )
