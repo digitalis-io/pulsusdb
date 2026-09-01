@@ -86,17 +86,18 @@ use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
 use super::graph_sql::{self, GraphWindow};
 use super::log2_histogram;
-use super::metrics_plan::{MetricsCtx, PlanKind, TraceMetricsPlan};
+use super::metrics_plan::{ExemplarSeriesKey, MetricsCtx, PlanKind, TraceMetricsPlan};
 use super::metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 use super::rows::{
     CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, HydrationRow,
     MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
-    MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
-    MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
-    MetricQuantileInstantRow, MetricQuantileRow, NumValueRow, RootRow, SpanNameRow, StoredSpan,
-    StoredSpanRow, StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
+    MetricBucketRow, MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow,
+    MetricGroupCountInstantRow, MetricGroupCountRow, MetricGroupExemplarRow,
+    MetricLog2BucketInstantRow, MetricLog2BucketRow, MetricLog2ExemplarRow,
+    MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow, NumValueRow, RootRow,
+    SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
     self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
@@ -1364,8 +1365,8 @@ impl TraceEngine {
         // stride below is taken over the whole response exactly as it was
         // when every exemplar lived on one series.
         let mut collected: Vec<(usize, MetricExemplar)> = Vec::new();
-        match plan.exemplar_group_label() {
-            None => {
+        match plan.exemplar_key() {
+            ExemplarSeriesKey::Single => {
                 let mut stream = self
                     .client
                     .query_stream::<MetricExemplarRow>(&sql, &settings)
@@ -1376,7 +1377,7 @@ impl TraceEngine {
                     push_bucket_exemplars(&mut collected, 0, &value_at[0], row.t_ms, row.ex);
                 }
             }
-            Some(label) => {
+            ExemplarSeriesKey::Group { label } => {
                 // Group value → the index of the series carrying it. Built
                 // from the framed answer, so a group the answer does not
                 // contain has nowhere to land and its rows are dropped.
@@ -1394,6 +1395,71 @@ impl TraceEngine {
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     let Some(&i) = index.get(row.g0.as_str()) else {
+                        continue;
+                    };
+                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                }
+            }
+            ExemplarSeriesKey::Quantile => {
+                // No index: the join is numeric. Each sampled span goes to
+                // the `p=` series whose value at the span's OWN bucket is
+                // nearest the span's own duration.
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricQuantileExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    push_quantile_exemplars(&mut collected, &value_at, row.t_ms, row.ex);
+                }
+            }
+            ExemplarSeriesKey::HistogramBucket => {
+                // Bucket bound → the index of the `__bucket` series
+                // carrying it. Keyed on the RENDERED label (the seconds
+                // double the framing put on the wire) so the join is the
+                // exact inverse of the construction, not a re-derivation.
+                let index: HashMap<u64, usize> = result
+                    .series
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (bucket_label(s).to_bits(), i))
+                    .collect();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricLog2ExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    let key = log2_histogram::bucket_seconds(row.bucket_ns).to_bits();
+                    let Some(&i) = index.get(&key) else {
+                        continue;
+                    };
+                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                }
+            }
+            ExemplarSeriesKey::CompareSide => {
+                // `(__meta_type, attribute key)` → series index, over the
+                // two TOTAL meta-types only: those are the series the
+                // reference attaches a comparison exemplar to. A key whose
+                // totals series the answer dropped (all-zero) has nowhere
+                // to land and its rows are dropped.
+                let index: HashMap<(&str, &str), usize> = result
+                    .series
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| compare_total_series_key(s).map(|k| (k, i)))
+                    .collect();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricCompareExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    let kind = compare_total_meta_type(row.is_sel);
+                    let Some(&i) = index.get(&(kind, row.akey.as_str())) else {
                         continue;
                     };
                     push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
@@ -2856,6 +2922,100 @@ fn push_bucket_exemplars(
             },
         ));
     }
+}
+
+/// Places each sampled span of a `quantile_over_time` bucket row on the
+/// `p=` series nearest its own duration, and stamps it with that duration
+/// (issue #477 wave 2).
+///
+/// Two rules from the reference, both different from every other shape:
+///
+/// * **Placement** is nearest-value, not nearest-anything-else: the
+///   exemplar goes to the quantile whose value is closest to the span's
+///   duration, ties to the lowest index (`assignExemplarToQuantile`,
+///   `pkg/traceql/engine_metrics.go:2013-2041 @ v3.0.2` — a strict `<`
+///   keeps the first of equals).
+/// * **The value is the span's own duration**, not the series' sample.
+///   `quantile_over_time(duration)` records a real observed value
+///   (`exemplarDuration`, `pkg/traceql/ast_metrics.go:235-239 @ v3.0.2`)
+///   and only the NaN placeholders the counting shapes record are
+///   rewritten to the series sample at the end
+///   (`modules/frontend/combiner/metrics_query_range.go:278-305 @ v3.0.2`).
+///   The ns→seconds conversion is [`agg_value`], the same one the series
+///   values go through, so the comparison is between like units.
+///
+/// The comparison is against the `p` values at the exemplar's OWN bucket,
+/// which is where our distribution differs from the reference's: it pools
+/// every interval into one distribution and compares against that (
+/// `engine_metrics.go:1934-1953 @ v3.0.2`). Pooling would need a second
+/// aggregation over the whole window — a second scan on a statement that
+/// now runs by default — and the per-bucket values are the numbers the
+/// panel actually draws this exemplar beside. Ledgered as
+/// `2026-09-01-traceql-quantile-exemplar-placement-domain`
+/// (docs/api.md §4.4.1).
+///
+/// A bucket no series carries drops the sample, exactly as
+/// [`push_bucket_exemplars`] does.
+fn push_quantile_exemplars(
+    collected: &mut Vec<(usize, MetricExemplar)>,
+    value_at: &[BTreeMap<i64, f64>],
+    t_ms: i64,
+    sampled: Vec<([u8; 16], i64, i64)>,
+) {
+    for (trace_id, ts_ns, duration_ns) in sampled {
+        let value = agg_value(duration_ns as f64);
+        let mut best: Option<(usize, f64)> = None;
+        for (i, series) in value_at.iter().enumerate() {
+            let Some(&q) = series.get(&t_ms) else {
+                continue;
+            };
+            let diff = (value - q).abs();
+            let better = match best {
+                Some((_, b)) => diff < b,
+                None => true,
+            };
+            if better {
+                best = Some((i, diff));
+            }
+        }
+        let Some((i, _)) = best else {
+            continue;
+        };
+        collected.push((
+            i,
+            MetricExemplar {
+                labels: vec![MetricLabel::str("trace:id", hex16(&trace_id))],
+                value,
+                timestamp_ms: ts_ns / 1_000_000,
+            },
+        ));
+    }
+}
+
+/// The `__meta_type` a `compare()` exemplar row's side names (issue #477
+/// wave 2): the reference attaches baseline samples to `baseline_total`
+/// and selection samples to `selection_total`, never to the per-value
+/// `baseline`/`selection` series
+/// (`pkg/traceql/engine_metrics_compare.go:296-301 @ v3.0.2`).
+fn compare_total_meta_type(is_sel: u8) -> &'static str {
+    if is_sel == 0 {
+        "baseline_total"
+    } else {
+        "selection_total"
+    }
+}
+
+/// The `(__meta_type, attribute key)` pair identifying a `compare()`
+/// TOTALS series, or `None` for any other series — the inverse of
+/// `frame_compare`'s `meta("baseline_total", key, "nil")` construction
+/// and the join column for a comparison exemplar row.
+fn compare_total_series_key(series: &TraceMetricSeries) -> Option<(&str, &str)> {
+    let kind = series_label_value(series, "__meta_type")?;
+    if kind != "baseline_total" && kind != "selection_total" {
+        return None;
+    }
+    let key = series.labels.iter().find(|l| l.key != "__meta_type")?;
+    Some((kind, key.key.as_str()))
 }
 
 /// Reduces a bucket-ordered exemplar list to at most `budget` entries by

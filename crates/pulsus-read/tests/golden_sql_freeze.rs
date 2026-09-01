@@ -224,7 +224,23 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// row says which series it belongs to. Nothing else in either file
 /// moves, and the other 24 metrics goldens and all 50 search goldens are
 /// byte-identical to the wave-1 corpus.
-const PINNED_SQL_CORPUS: u64 = 0x0352_4103_5bf4_1227;
+///
+/// **Digest-only a third time, on the wave-2 review's ruling. Still 77
+/// entries; six more of the 26 `traces_metrics` goldens moved and no
+/// other file did** — `quantile_over_time_multi.sql`,
+/// `docs_quantile_worked_example.sql`, `histogram_over_time_duration.sql`,
+/// `docs_histogram_worked_example.sql`, `compare_status.sql` and
+/// `compare_status_window.sql` (six files, three shapes). Only their
+/// `exemplars` section moves, and for one reason: those three shapes
+/// frame MANY series per bucket — one per `p`, one per `__bucket`, one
+/// per `(__meta_type, attribute key)` — while their exemplar statement
+/// returned only the time bucket, so the engine had nothing to join on
+/// and attached every sample to the first series. Each statement now
+/// returns its shape's own identity: the sampled span's duration for
+/// quantile, the log2 bucket bound for histogram, `is_sel` + `akey` for
+/// comparison. The other 20 metrics goldens and all 50 search goldens are
+/// byte-identical to the wave-1-fix corpus.
+const PINNED_SQL_CORPUS: u64 = 0xc47b_293b_c17e_d944;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

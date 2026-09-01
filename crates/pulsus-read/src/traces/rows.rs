@@ -287,6 +287,46 @@ pub struct MetricGroupExemplarRow {
     pub ex: Vec<([u8; 16], i64)>,
 }
 
+/// One per-bucket exemplar-collection row for `quantile_over_time`
+/// (`metrics_quantile_exemplar_range_sql`, issue #477 wave 2): the bucket
+/// start and a bounded `groupArraySample` of `(trace_id, timestamp_ns,
+/// duration_ns)` triples. The duration is what says which `p=` series the
+/// sample belongs to, and it is also the exemplar's own value.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricQuantileExemplarRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub ex: Vec<([u8; 16], i64, i64)>,
+}
+
+/// One per-bucket exemplar-collection row for `histogram_over_time`
+/// (`metrics_log2_bucket_exemplar_range_sql`, issue #477 wave 2): the
+/// bucket start, the log2 duration bucket bound that names the series,
+/// and the bounded `groupArraySample` of `(trace_id, timestamp_ns)`
+/// tuples. Field order matches the SELECT list (RowBinary is positional).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricLog2ExemplarRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    #[serde(rename = "bucket")]
+    pub bucket_ns: u64,
+    pub ex: Vec<([u8; 16], i64)>,
+}
+
+/// One per-bucket exemplar-collection row for `compare()`
+/// (`metrics_compare_exemplar_range_sql`, issue #477 wave 2): the bucket
+/// start, the selection side (`0` baseline, `1` selection), the attribute
+/// key whose `<side>_total` series the sample belongs to, and the bounded
+/// `groupArraySample` of `(trace_id, timestamp_ns)` tuples.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricCompareExemplarRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub is_sel: u8,
+    pub akey: String,
+    pub ex: Vec<([u8; 16], i64)>,
+}
+
 /// One `compare()` cross-tab row (`metrics_compare_sql`, issue #182 P6b):
 /// the bucket start, an attribute `(key, value)`, and its baseline (all
 /// outer spans) and selection (`countIf(is_sel)`) counts.

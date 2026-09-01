@@ -188,14 +188,11 @@ pub struct TraceMetricsPlan {
     /// whenever the resolved TOTAL exemplar budget is non-zero; the engine
     /// runs it and attaches `trace:id` exemplars.
     exemplar_sql: Option<String>,
-    /// The label key the exemplar SQL's `g0` column carries, when the
-    /// plan's shape frames one series per group value (issue #477 wave
-    /// 2). `Some` exactly when [`Self::exemplar_sql`] selects a group
-    /// column, so the engine knows which row shape to decode and which
-    /// series each row belongs to; `None` for every ungrouped shape and
-    /// for `quantile`/`histogram`/`compare`, whose series are not one per
-    /// by-key value.
-    exemplar_group_label: Option<String>,
+    /// What the exemplar statement returns to identify the series each
+    /// sample belongs to (issue #477 wave 2). It says both which row
+    /// shape to decode and how to join a row to a series, so the two can
+    /// never be chosen independently.
+    exemplar_key: ExemplarSeriesKey,
     /// The resolved TOTAL exemplar budget for the whole response (issue
     /// #477 (c) and ruling 1): `0` means none. The engine thins the
     /// collected per-bucket samples down to this many.
@@ -265,12 +262,11 @@ impl TraceMetricsPlan {
         self.exemplar_sql.as_deref()
     }
 
-    /// The label key carried by the exemplar SQL's group column, when
-    /// there is one. `Some` exactly when [`Self::exemplar_sql`] renders
-    /// `g0`, so a caller cannot decode the grouped row shape against an
-    /// ungrouped statement or the other way round.
-    pub fn exemplar_group_label(&self) -> Option<&str> {
-        self.exemplar_group_label.as_deref()
+    /// What the exemplar statement returns to identify a series — the
+    /// row shape to decode AND the join to the framed series, together,
+    /// so a caller cannot pair one shape's decode with another's join.
+    pub fn exemplar_key(&self) -> &ExemplarSeriesKey {
+        &self.exemplar_key
     }
 
     /// The trailing metrics-result comparison post-filter, if present.
@@ -543,10 +539,30 @@ pub fn plan_trace_metrics(
         PlanKind::Compare => (String::new(), String::new()),
     };
 
+    // Issue #477 (c), ONE resolution and not two branches: the `with()`
+    // hint wins if present, otherwise the HTTP `exemplars` parameter,
+    // otherwise `DEFAULT_EXEMPLARS`. The budget is a TOTAL for the whole
+    // response (ruling 1), so the per-bucket sample size is the budget
+    // spread across the grid — at least 1, since `groupArraySample(0, …)`
+    // would collect nothing anywhere — and the engine thins the collected
+    // list down to the budget afterwards.
+    //
+    // Resolved BEFORE the compare() build because the comparison shape's
+    // exemplar statement is built from that block's own range selection
+    // predicate and bucket expression (issue #477 wave 2).
+    let exemplar_budget = match (analysis.exemplar_k, params.exemplars) {
+        (Some(k), _) => k.min(MAX_EXEMPLARS),
+        (None, Some(p)) => p.min(MAX_EXEMPLARS),
+        (None, None) => DEFAULT_EXEMPLARS,
+    };
+    let per_bucket_k = (exemplar_budget / range_axis.points as u32).max(1);
+
     // compare(): build the cross-tab/totals for the range and instant
     // forms, plus the distinct-(key,value) cap probe (reused by
     // `enforce_series_cap`).
-    let (compare_range, compare_instant, compare_probes) = if analysis.kind == PlanKind::Compare {
+    let (compare_range, compare_instant, compare_probes, compare_exemplar_sql) = if analysis.kind
+        == PlanKind::Compare
+    {
         let inner_bool = metrics_sql::compile_filter_bool(
             analysis
                 .compare_selection
@@ -623,13 +639,29 @@ pub fn plan_trace_metrics(
             fixed_series,
             sel_window: analysis.compare_window,
         });
+        // The comparison exemplar statement (issue #477 wave 2): the
+        // RANGE inputs, so its side, its bucket labels and its rows
+        // are the ones the cross-tab counted.
+        let ex = (exemplar_budget > 0).then(|| {
+            metrics_sql::metrics_compare_exemplar_range_sql(&metrics_sql::CompareExemplarSqlInput {
+                spans_table: spans,
+                attrs_table: ctx.filter.attrs_table,
+                outer: &range_filter_sql,
+                inner_bool: &range_inner_bool,
+                window: range_window,
+                bucket_expr: &range_bucket,
+                sel_window: analysis.compare_window,
+                k: per_bucket_k,
+            })
+        });
         (
             Some((r.cross_tab, r.totals)),
             Some((i.cross_tab, i.totals)),
             Some((r.probe, ip.probe)),
+            ex,
         )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     let (range_probe_sql, instant_probe_sql) = match compare_probes {
@@ -655,50 +687,56 @@ pub fn plan_trace_metrics(
 
     // Exemplars are collected for EVERY range shape (issue #182 review
     // Fix 1 — the reference emits exemplars for range rate/count/agg/
-    // quantile/histogram/compare, and none for instant): the per-bucket
-    // sample is taken over the outer filter and attached to the first
-    // series (a range's exemplars are concentrated on one series). The
-    // instant path never attaches.
+    // quantile/histogram/compare, and none for instant). The instant path
+    // never attaches.
     //
-    // Issue #477 (c), ONE resolution and not two branches: the `with()`
-    // hint wins if present, otherwise the HTTP `exemplars` parameter,
-    // otherwise `DEFAULT_EXEMPLARS`. The budget is a TOTAL for the whole
-    // response (ruling 1), so the per-bucket sample size is the budget
-    // spread across the grid — at least 1, since `groupArraySample(0, …)`
-    // would collect nothing anywhere — and the engine thins the collected
-    // list down to the budget afterwards.
-    let exemplar_budget = match (analysis.exemplar_k, params.exemplars) {
-        (Some(k), _) => k.min(MAX_EXEMPLARS),
-        (None, Some(p)) => p.min(MAX_EXEMPLARS),
-        (None, None) => DEFAULT_EXEMPLARS,
+    // **Which series a sample belongs to is a property of the SHAPE**
+    // (issue #477 wave 2, ruling on the wave-2 review). Every range shape
+    // here is multi-series; they differ only in what keys the series
+    // apart, and the statement carries that column back so the engine
+    // never has to guess. See [`ExemplarSeriesKey`] for the enumeration.
+    let (exemplar_sql, exemplar_key) = match exemplar_budget {
+        0 => (None, ExemplarSeriesKey::Single),
+        _ => match analysis.kind {
+            PlanKind::Count { .. } | PlanKind::Agg(_) => (
+                Some(metrics_sql::metrics_exemplar_range_sql(
+                    spans,
+                    &range_filter_sql,
+                    range_window,
+                    params.step_ms,
+                    per_bucket_k,
+                    &keys,
+                )),
+                match keys.first() {
+                    Some(k) => ExemplarSeriesKey::Group {
+                        label: k.label_key.clone(),
+                    },
+                    None => ExemplarSeriesKey::Single,
+                },
+            ),
+            PlanKind::Quantile => (
+                Some(metrics_sql::metrics_quantile_exemplar_range_sql(
+                    spans,
+                    &range_filter_sql,
+                    range_window,
+                    params.step_ms,
+                    per_bucket_k,
+                )),
+                ExemplarSeriesKey::Quantile,
+            ),
+            PlanKind::Histogram => (
+                Some(metrics_sql::metrics_log2_bucket_exemplar_range_sql(
+                    spans,
+                    &range_filter_sql,
+                    range_window,
+                    params.step_ms,
+                    per_bucket_k,
+                )),
+                ExemplarSeriesKey::HistogramBucket,
+            ),
+            PlanKind::Compare => (compare_exemplar_sql, ExemplarSeriesKey::CompareSide),
+        },
     };
-    // The exemplar sample carries the group identity for exactly the
-    // shapes `frame_range_series` frames as one series per by-key value
-    // (issue #477 wave 2). `quantile_over_time` labels its series by `p`,
-    // `histogram_over_time` by `__bucket` and `compare()` by its own
-    // meta-labels, so a `g0` column would name nothing they emit; those
-    // keep the ungrouped statement and the first-series attachment.
-    let exemplar_keys: &[metrics_sql::GroupKeySql] =
-        if matches!(analysis.kind, PlanKind::Count { .. } | PlanKind::Agg(_)) {
-            &keys
-        } else {
-            &[]
-        };
-    let exemplar_sql = (exemplar_budget > 0).then(|| {
-        let per_bucket_k = (exemplar_budget / range_axis.points as u32).max(1);
-        metrics_sql::metrics_exemplar_range_sql(
-            spans,
-            &range_filter_sql,
-            range_window,
-            params.step_ms,
-            per_bucket_k,
-            exemplar_keys,
-        )
-    });
-    let exemplar_group_label = exemplar_sql
-        .is_some()
-        .then(|| exemplar_keys.first().map(|k| k.label_key.clone()))
-        .flatten();
 
     Ok(TraceMetricsPlan {
         kind: analysis.kind,
@@ -709,7 +747,7 @@ pub fn plan_trace_metrics(
         quantiles: analysis.quantiles,
         reduce: analysis.reduce,
         exemplar_sql,
-        exemplar_group_label,
+        exemplar_key,
         exemplar_budget,
         result_filter: analysis.result_filter,
         compare_range,
@@ -723,6 +761,51 @@ pub fn plan_trace_metrics(
         range_sql,
         instant_sql,
     })
+}
+
+/// What the exemplar-collection statement returns so the engine can say
+/// which SERIES each sampled span belongs to (issue #477 wave 2).
+///
+/// **The complete enumeration of what calls the exemplar SQL builders,
+/// and what identifies a series in each caller's output.** Every range
+/// shape but the ungrouped count/aggregation is multi-series; they differ
+/// only in what keys the series apart, so a single "attach to series 0"
+/// rule is wrong for all of them:
+///
+/// | caller (`PlanKind`) | series in the framed answer | identifying column(s) | statement |
+/// |---|---|---|---|
+/// | `Count`/`Agg`, no `by()` | one, `__name__=<fn>` | none needed | [`metrics_sql::metrics_exemplar_range_sql`] with no keys |
+/// | `Count`/`Agg`, `by(k)` | one per group value, `k=<value>` | `g0` | the same builder with the query's own keys |
+/// | `Quantile` | one per requested `p`, `p=<q>` | the sampled span's `duration_ns` | [`metrics_sql::metrics_quantile_exemplar_range_sql`] |
+/// | `Histogram` | one per occupied log2 bucket, `__bucket=<seconds>` | the bucket bound | [`metrics_sql::metrics_log2_bucket_exemplar_range_sql`] |
+/// | `Compare` | one per `(__meta_type, attribute key)` | `is_sel` + `akey` | [`metrics_sql::metrics_compare_exemplar_range_sql`] |
+///
+/// The instant route never attaches exemplars, so it has no row here.
+///
+/// This type carries the row shape and the join TOGETHER on purpose: they
+/// were previously two independent decisions (which builder to call, and
+/// whether to read a group label), and the shapes that answered "no group
+/// label" then fell through to the first series regardless of how many
+/// series they had framed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExemplarSeriesKey {
+    /// The answer has exactly ONE series and the row needs no identity —
+    /// an ungrouped `rate`/`count_over_time`/`*_over_time`.
+    Single,
+    /// One series per `by()` group value, labelled `label`; the row
+    /// carries the group column `g0`.
+    Group { label: String },
+    /// One series per requested quantile (`p=<q>`); the row carries the
+    /// sampled span's own duration, and the engine places it on the
+    /// quantile nearest that duration.
+    Quantile,
+    /// One series per occupied log2 duration bucket (`__bucket=<seconds>`);
+    /// the row carries the bucket bound in nanoseconds.
+    HistogramBucket,
+    /// `compare()`: one series per `(__meta_type, attribute key)`; the row
+    /// carries the selection side and the attribute key, and the sample
+    /// lands on that side's `*_total` series for that key.
+    CompareSide,
 }
 
 /// A second-stage series reduction (issue #182 P5): `topk(n)`/`bottomk(n)`

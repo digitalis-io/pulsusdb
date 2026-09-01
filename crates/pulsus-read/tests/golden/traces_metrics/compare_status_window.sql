@@ -169,10 +169,34 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
 )
 
 == exemplars ==
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
-       groupArraySample(1, 1)(tuple(trace_id, timestamp_ns)) AS ex
-FROM trace_spans
-PREWHERE service = 'checkout'
-WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
-GROUP BY t
-ORDER BY t ASC
+SELECT t, is_sel, akey, groupArraySample(1, 1)(tuple(trace_id, ts)) AS ex
+FROM (
+  SELECT t, is_sel, trace_id, ts, arrayJoin(['name', 'kind', 'status', 'resource.service.name', 'statusMessage', 'instrumentation:name', 'instrumentation:version', 'rootName', 'rootServiceName']) AS akey
+  FROM (
+  SELECT t, trace_id, span_id, any(ts) AS ts, max(is_sel) AS is_sel
+    FROM (
+  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, (((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+      FROM trace_spans
+      PREWHERE service = 'checkout'
+  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    )
+    GROUP BY t, trace_id, span_id
+  )
+  UNION ALL
+  SELECT b.t AS t, b.is_sel AS is_sel, b.trace_id AS trace_id, b.ts AS ts, concat(a.scope, '.', a.key) AS akey
+  FROM (
+  SELECT t, trace_id, span_id, any(ts) AS ts, max(is_sel) AS is_sel
+    FROM (
+  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id, timestamp_ns AS ts, (((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001 AND key = 'http.status_code' AND val = '500' AND scope = 'span')) AND timestamp_ns > 1700000005000000000 AND timestamp_ns <= 1700000008000000000) AS is_sel
+      FROM trace_spans
+      PREWHERE service = 'checkout'
+  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+    )
+    GROUP BY t, trace_id, span_id
+  ) b
+  INNER JOIN (
+    SELECT DISTINCT trace_id, span_id, scope, key FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+  ) a ON b.trace_id = a.trace_id AND b.span_id = a.span_id
+)
+GROUP BY t, is_sel, akey
+ORDER BY t ASC, is_sel, akey

@@ -954,6 +954,90 @@ pub fn metrics_exemplar_range_sql(
     sql
 }
 
+/// The deduped per-bucket duration/timestamp source the two
+/// duration-shaped exemplar statements sample from (issue #477 wave 2).
+///
+/// Byte-for-byte [`metrics_quantile_range_sql`]'s and
+/// [`metrics_log2_bucket_range_sql`]'s own inner subquery plus
+/// `any(timestamp_ns) AS ts`: the exemplar has to be placed by the SAME
+/// deduped `val` the series values are computed from, or a replayed span
+/// could put a trace on a bucket the tally never counted. The extra
+/// projection reads a column the PREWHERE already selected the granule
+/// for, so it costs no additional granule.
+fn exemplar_duration_inner(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_ms: i64,
+) -> String {
+    let mut inner = format!(
+        "SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val, \
+         any(timestamp_ns) AS ts\n  FROM {spans_table}\n  ",
+        range_bucket_expr(step_ms)
+    );
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str("\n  GROUP BY t, trace_id, span_id");
+    inner
+}
+
+/// The per-bucket exemplar collection query for `quantile_over_time`
+/// (issue #477 wave 2).
+///
+/// A quantile answer is one series per requested `p`, so a row that names
+/// only its time bucket cannot say which series it belongs to. What
+/// identifies the series is the sampled span's OWN duration: the
+/// reference places an exemplar on the quantile whose value is closest to
+/// it (`pkg/traceql/engine_metrics.go:1996-2001, 2013-2041 @ v3.0.2`,
+/// `assignExemplarToQuantile`), and carries the duration through as the
+/// exemplar's value (`exemplarDuration`, `pkg/traceql/ast_metrics.go:235-239
+/// @ v3.0.2` — a non-NaN exemplar value is never overwritten by the
+/// series sample, `modules/frontend/combiner/metrics_query_range.go:278-305
+/// @ v3.0.2`). So the sample carries `(trace_id, timestamp_ns, val)` and
+/// the engine does the placement against the `p` values it already has.
+///
+/// Costs no extra scan over the ungrouped form: same rows, same window,
+/// one more column out of the same subquery.
+pub fn metrics_quantile_exemplar_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_ms: i64,
+    k: u32,
+) -> String {
+    let inner = exemplar_duration_inner(spans_table, filter, window, step_ms);
+    format!(
+        "SELECT t, groupArraySample({k}, 1)(tuple(trace_id, ts, val)) AS ex\nFROM (\n  {inner}\n)\n\
+         GROUP BY t\nORDER BY t ASC"
+    )
+}
+
+/// The per-bucket exemplar collection query for `histogram_over_time`
+/// (issue #477 wave 2).
+///
+/// A histogram answer is one series per occupied log2 duration bucket, so
+/// the column that identifies the series is the bucket bound itself —
+/// [`LOG2_BUCKET_EXPR`] over the same deduped `val` the tally is computed
+/// from, with the same `WHERE val >= 2` sub-2ns guard on the same side of
+/// the dedup. The reference records the exemplar on the `__bucket` series
+/// the span's own duration bucketizes to (`bucketizeFnFor` +
+/// `internalLabelBucket`, `pkg/traceql/ast_metrics.go:129-134 @ v3.0.2`);
+/// attaching it anywhere else puts a trace on a duration range it never
+/// had.
+pub fn metrics_log2_bucket_exemplar_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_ms: i64,
+    k: u32,
+) -> String {
+    let inner = exemplar_duration_inner(spans_table, filter, window, step_ms);
+    format!(
+        "SELECT t, {LOG2_BUCKET_EXPR} AS bucket, \
+         groupArraySample({k}, 1)(tuple(trace_id, ts)) AS ex\nFROM (\n  {inner}\n)\n\
+         WHERE val >= 2\nGROUP BY t, bucket\nORDER BY t ASC, bucket ASC"
+    )
+}
+
 /// The distinct-by-key series-cardinality probe (issue #182, review Fix
 /// 2): counts DISTINCT label-sets (never bucket rows) under the same
 /// predicate, bounded by `LIMIT cap+1`. The engine issues it before the
@@ -1168,6 +1252,125 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
         totals,
         probe,
     }
+}
+
+/// The attribute keys [`metrics_compare_sql`]'s intrinsics branch emits
+/// for EVERY span it reads, in that branch's own order (issue #477 wave
+/// 2). Only the KEYS: the intrinsics branch pairs each with a value
+/// expression, and the exemplar statement needs no value — it needs to
+/// know which `<side>_total` series a sampled span contributes to.
+///
+/// Frozen against the cross-tab's text by
+/// `traces_metrics_sql::the_compare_exemplar_keys_are_the_cross_tabs_own_intrinsic_keys`,
+/// so the two branches cannot drift into naming different key universes.
+pub const COMPARE_INTRINSIC_KEYS: [&str; 9] = [
+    "name",
+    "kind",
+    "status",
+    "resource.service.name",
+    "statusMessage",
+    "instrumentation:name",
+    "instrumentation:version",
+    "rootName",
+    "rootServiceName",
+];
+
+/// The inputs to [`metrics_compare_exemplar_range_sql`].
+#[derive(Debug, Clone, Copy)]
+pub struct CompareExemplarSqlInput<'a> {
+    pub spans_table: &'a str,
+    pub attrs_table: &'a str,
+    pub outer: &'a FilterSql,
+    /// The pre-compiled selection predicate (`compile_filter_bool`) — the
+    /// same string [`CompareSqlInput::inner_bool`] carries.
+    pub inner_bool: &'a str,
+    pub window: SnappedWindow,
+    /// The range-form bucket expression aliased `t`.
+    pub bucket_expr: &'a str,
+    /// The `compare(f, n, start, end)` selection window; see
+    /// [`CompareSqlInput::sel_window`] for why it repartitions rather than
+    /// filters.
+    pub sel_window: Option<(i64, i64)>,
+    /// The per-group `groupArraySample` size.
+    pub k: u32,
+}
+
+/// The per-bucket exemplar collection query for `compare()` (issue #477
+/// wave 2).
+///
+/// A comparison answer is one series per `(__meta_type, attribute key)`,
+/// and the reference attaches a sampled span's exemplar to the
+/// `<side>_total` series of EVERY attribute name that span carries — the
+/// side decided by the same selection predicate the cross-tab counts with
+/// (`observeExemplar` and the `addExemplar` loop,
+/// `pkg/traceql/engine_metrics_compare.go:185-207, 281-301 @ v3.0.2`).
+/// So the two columns that identify the series are `is_sel` and `akey`,
+/// and this statement returns both.
+///
+/// The key universe is exactly [`metrics_compare_sql`]'s: the nine
+/// intrinsics every span contributes ([`COMPARE_INTRINSIC_KEYS`]) plus
+/// the span's own scoped index attributes. It carries no VALUE column and
+/// no roots CTE — the root intrinsics' keys are present for every span
+/// regardless of what the root resolves to, so the exemplar side does not
+/// need the trace-wide join the cross-tab needs for its values.
+///
+/// **Cost**: one statement of the cross-tab's shape (the same
+/// `PREWHERE`/`WHERE` over `spans_table`, the same `DISTINCT` semi-join
+/// against `attrs_table`), minus the roots CTE and minus the value
+/// projection. It runs only on a range comparison that framed a non-zero
+/// sample and only while the exemplar budget is non-zero.
+pub fn metrics_compare_exemplar_range_sql(input: &CompareExemplarSqlInput<'_>) -> String {
+    let CompareExemplarSqlInput {
+        spans_table,
+        attrs_table,
+        outer,
+        inner_bool,
+        window,
+        bucket_expr,
+        sel_window,
+        k,
+    } = *input;
+    // Byte-identical construction to `metrics_compare_sql`'s `is_sel`.
+    let is_sel = match sel_window {
+        Some((start_ns, end_ns)) => {
+            format!("(({inner_bool}) AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns})")
+        }
+        None => format!("({inner_bool})"),
+    };
+    let mut raw = format!(
+        "SELECT {bucket_expr} AS t, trace_id, span_id, timestamp_ns AS ts, \
+         {is_sel} AS is_sel\n      FROM {spans_table}\n      "
+    );
+    push_prewhere_where_indented(&mut raw, outer, window);
+    // The same replay dedup the cross-tab applies: one row per
+    // `(t, trace_id, span_id)`, so a replayed span is sampled once.
+    let base = format!(
+        "SELECT t, trace_id, span_id, any(ts) AS ts, max(is_sel) AS is_sel\n    \
+         FROM (\n  {raw}\n    )\n    GROUP BY t, trace_id, span_id"
+    );
+    let keys = COMPARE_INTRINSIC_KEYS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let intrinsics = format!(
+        "SELECT t, is_sel, trace_id, ts, arrayJoin([{keys}]) AS akey\n  \
+         FROM (\n  {base}\n  )"
+    );
+    let index_attrs = format!(
+        "SELECT b.t AS t, b.is_sel AS is_sel, b.trace_id AS trace_id, b.ts AS ts, \
+         concat(a.scope, '.', a.key) AS akey\n  FROM (\n  {base}\n  ) b\n  \
+         INNER JOIN (\n    SELECT DISTINCT trace_id, span_id, scope, key \
+         FROM {attrs_table} WHERE {} AND {}\n  ) a ON b.trace_id = a.trace_id \
+         AND b.span_id = a.span_id",
+        date_clause(window),
+        time_clause(window)
+    );
+    format!(
+        "SELECT t, is_sel, akey, groupArraySample({k}, 1)(tuple(trace_id, ts)) AS ex\n\
+         FROM (\n  {intrinsics}\n  UNION ALL\n  {index_attrs}\n)\n\
+         GROUP BY t, is_sel, akey\nORDER BY t ASC, is_sel, akey"
+    )
 }
 
 /// The window-free per-trace roots read for `compare()` (issue #189): one

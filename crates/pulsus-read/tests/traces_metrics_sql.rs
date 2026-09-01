@@ -6,7 +6,9 @@
 //! by hand — run the `#[ignore]` `regenerate_goldens` test and review
 //! the diff (the byte-frozen-artifact rule).
 
-use pulsus_read::traces::metrics_plan::{MetricsCtx, MetricsParams, plan_trace_metrics};
+use pulsus_read::traces::metrics_plan::{
+    ExemplarSeriesKey, MetricsCtx, MetricsParams, plan_trace_metrics,
+};
 use pulsus_read::{SpanFilterCtx, TraceMetricsPlan};
 
 /// Fixed request window: the search suite's 2023-11-14T22:13:20Z .. +3h
@@ -928,8 +930,15 @@ fn every_added_section_matches_its_own_files_range_predicate() {
             range_pred,
             "{stem}: the exemplar SQL must carry the range query's own predicate"
         );
+        let case = CASES
+            .iter()
+            .find(|c| c.name == stem)
+            .expect("every golden stem is a case");
         assert!(
-            ex.contains("groupArraySample(1, 1)(tuple(trace_id, timestamp_ns)) AS ex"),
+            ex.contains(&format!(
+                "groupArraySample(1, 1)({}) AS ex",
+                exemplar_sample_tuple(plan_for(case).exemplar_key())
+            )),
             "{stem}: {ex}"
         );
 
@@ -954,6 +963,139 @@ fn every_added_section_matches_its_own_files_range_predicate() {
             );
         }
     }
+}
+
+/// Issue #477 wave 2: the comparison exemplar statement's key universe is
+/// the cross-tab's own. The exemplar statement needs only the KEYS (which
+/// `<side>_total` series a span contributes to), so it renders them as a
+/// literal list rather than re-deriving the value expressions; this pins
+/// that list against the cross-tab text it is a projection of, in both
+/// directions, so neither branch can gain or lose an intrinsic alone.
+#[test]
+fn the_compare_exemplar_keys_are_the_cross_tabs_own_intrinsic_keys() {
+    use pulsus_read::traces::metrics_sql::COMPARE_INTRINSIC_KEYS;
+    let case = CASES
+        .iter()
+        .find(|c| c.name == "compare_status")
+        .expect("the comparison case is in the corpus");
+    let plan = plan_for(case);
+    let (cross_tab, _) = plan.compare_range().expect("a comparison plan");
+    // The cross-tab's intrinsics branch is one `arrayJoin([...])` of
+    // `('<key>', <value expr>)` pairs; take the key literals out of it.
+    let branch = cross_tab
+        .split("arrayJoin([")
+        .nth(1)
+        .and_then(|rest| rest.split("]) AS kv").next())
+        .expect("the intrinsics branch is an arrayJoin of (key, value) pairs");
+    let from_cross_tab: Vec<&str> = branch
+        .split("('")
+        .skip(1)
+        .filter_map(|p| p.split("',").next())
+        .collect();
+    assert_eq!(
+        from_cross_tab,
+        COMPARE_INTRINSIC_KEYS.to_vec(),
+        "the exemplar statement's key list and the cross-tab's intrinsics branch have drifted"
+    );
+    // …and every one of them reaches the exemplar statement verbatim.
+    let ex = plan.exemplar_sql().expect("exemplars are on by default");
+    for key in COMPARE_INTRINSIC_KEYS {
+        assert!(
+            ex.contains(&format!("'{key}'")),
+            "the comparison exemplar statement drops the {key} intrinsic:\n{ex}"
+        );
+    }
+}
+
+/// The sampled tuple each exemplar shape collects. `Single`/`Group` read
+/// the span rows directly, so they name the physical `timestamp_ns`; the
+/// two duration shapes read the deduped subquery's `ts`, and the quantile
+/// shape carries the duration that decides its `p=` series as well.
+fn exemplar_sample_tuple(key: &ExemplarSeriesKey) -> &'static str {
+    match key {
+        ExemplarSeriesKey::Single | ExemplarSeriesKey::Group { .. } => {
+            "tuple(trace_id, timestamp_ns)"
+        }
+        ExemplarSeriesKey::Quantile => "tuple(trace_id, ts, val)",
+        ExemplarSeriesKey::HistogramBucket | ExemplarSeriesKey::CompareSide => {
+            "tuple(trace_id, ts)"
+        }
+    }
+}
+
+/// Issue #477 wave 2, ruling finding 1 — the HERMETIC half of "an
+/// exemplar never lands on a series that did not produce it": every
+/// exemplar statement must RETURN the column(s) that identify a series in
+/// the shape it was built for, and must group by them.
+///
+/// This is the criterion that would have caught the wave-2 defect at
+/// plan level: quantile, histogram and compare each rendered a statement
+/// whose only key was the time bucket, while framing many series per
+/// bucket. It cannot pass on a statement that has nothing to join on.
+#[test]
+fn every_exemplar_statement_returns_its_shapes_series_identity() {
+    let mut seen: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for case in CASES {
+        let plan = plan_for(case);
+        let ex = plan
+            .exemplar_sql()
+            .unwrap_or_else(|| panic!("{}: exemplars are on by default", case.name));
+        // Required fragments per shape: what the row returns, and the
+        // grouping that makes the row unique on that identity.
+        let (name, required): (&'static str, Vec<String>) = match plan.exemplar_key() {
+            ExemplarSeriesKey::Single => ("Single", vec!["GROUP BY t\n".to_string()]),
+            ExemplarSeriesKey::Group { .. } => (
+                "Group",
+                vec![" AS g0,".to_string(), "GROUP BY t, g0\n".to_string()],
+            ),
+            ExemplarSeriesKey::Quantile => (
+                "Quantile",
+                vec![
+                    "tuple(trace_id, ts, val)".to_string(),
+                    "GROUP BY t\n".to_string(),
+                ],
+            ),
+            ExemplarSeriesKey::HistogramBucket => (
+                "HistogramBucket",
+                vec![
+                    " AS bucket,".to_string(),
+                    "GROUP BY t, bucket\n".to_string(),
+                ],
+            ),
+            ExemplarSeriesKey::CompareSide => (
+                "CompareSide",
+                vec![
+                    "SELECT t, is_sel, akey, ".to_string(),
+                    "GROUP BY t, is_sel, akey\n".to_string(),
+                ],
+            ),
+        };
+        seen.insert(name);
+        for frag in required {
+            assert!(
+                ex.contains(&frag),
+                "{}: the {name} exemplar statement must carry {frag:?} — without it the \
+                 engine has nothing to join a sample to and falls back to a first-series \
+                 attachment:\n{ex}",
+                case.name
+            );
+        }
+    }
+    // Anti-vacuity: the corpus must actually reach every shape, or this
+    // test proves nothing about the ones it never planned.
+    assert_eq!(
+        seen,
+        [
+            "CompareSide",
+            "Group",
+            "HistogramBucket",
+            "Quantile",
+            "Single"
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>(),
+        "the golden corpus must exercise every exemplar shape"
+    );
 }
 
 /// The DISTINCT `PREWHERE` fragments and window bounds a section reads

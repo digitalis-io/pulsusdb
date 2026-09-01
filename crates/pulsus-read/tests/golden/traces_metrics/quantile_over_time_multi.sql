@@ -23,9 +23,13 @@ FROM (
 )
 
 == exemplars ==
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
-       groupArraySample(1, 1)(tuple(trace_id, timestamp_ns)) AS ex
-FROM trace_spans
-WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+SELECT t, groupArraySample(1, 1)(tuple(trace_id, ts, val)) AS ex
+FROM (
+  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id,
+         any(duration_ns) AS val, any(timestamp_ns) AS ts
+  FROM trace_spans
+  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+  GROUP BY t, trace_id, span_id
+)
 GROUP BY t
 ORDER BY t ASC
