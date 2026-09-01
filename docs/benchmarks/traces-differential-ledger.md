@@ -1943,11 +1943,30 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 - **What was measured.** Over one window with interior *and* edge empty
   buckets, on one corpus: `count_over_time`, `rate`, `quantile_over_time`,
-  `histogram_over_time`, `count_over_time by(name)` and every series of a
-  `compare({…})` come back with a sample in **every** bucket of the grid;
-  `sum_over_time`, `min_over_time`, `avg_over_time` and
-  `sum_over_time by(name)` come back with a sample only where data exists.
-  Density follows the FUNCTION, not the query and not the grouping.
+  `histogram_over_time` and every series of a `compare({…})` come back
+  with a sample in **every** bucket of the grid; `sum_over_time`,
+  `min_over_time` and `avg_over_time` come back with a sample only where
+  data exists. Density follows the FUNCTION, not the query.
+
+- **Grouping does not change it, measured on the by-key we serve.**
+  Re-measured 2026-09-01 on both sides over the same shape of corpus —
+  two services, each occupying two of nine `10s` buckets, disjoint, all
+  spans pushed at once well inside the reference's ingest-visibility
+  budget. `{} | count_over_time() by(resource.service.name)` and
+  `{} | rate() by(resource.service.name)` return **two series of ten
+  samples with two carrying a value** on both systems;
+  `{} | sum_over_time(duration) by(resource.service.name)` and
+  `{} | avg_over_time(duration) by(resource.service.name)` return **two
+  series of two samples, both carrying a value** on both systems. The
+  ungrouped controls in the same run: `count_over_time` ten samples /
+  four values, `sum_over_time` four samples / four values, identically on
+  both.
+
+  This row previously listed `count_over_time by(name)` and
+  `sum_over_time by(name)` among what was measured. Those two are a
+  reference-only measurement — **our side answers `400`** — so they were
+  a parity claim over a query we refuse, and they have moved out of this
+  row into `traceql-metrics-by-key-restricted-to-service-name` below.
 
 - **Ours.** The same split, by construction: densification runs at the
   framing boundary over the count, quantile, histogram and compare shapes
@@ -1957,6 +1976,41 @@ when we are asking it to slow down, so we keep `429`; recorded as
   aggregations into density.** They are already correct. A blanket fill
   would have created four fresh divergences at once, and this row exists
   because the sparse half looks like the bug.
+
+### `traceql-metrics-by-key-restricted-to-service-name` (issues #477, #182) — **the reference groups a metric by any per-span key; we serve one**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range`.
+
+- **What was measured (2026-09-01, both sides, same corpus shape).** Two
+  services with two operation names, four spans, a nine-bucket `10s`
+  window. The reference answers `{} | count_over_time() by(name)` with
+  **two series** labelled `name=opA` / `name=opB`, ten samples each and
+  two carrying a value, and `{} | sum_over_time(duration) by(name)` with
+  two series of two samples each — the same per-function density its
+  `by(resource.service.name)` answers have.
+
+- **Ours.** Both are a clean `400`, body verbatim:
+
+  ```text
+  type mismatch: by() currently supports grouping by resource.service.name only (issue #182); attribute grouping keys route to a follow-up
+  ```
+
+  `by(resource.service.name)` is served and matches the reference sample
+  for sample (the row above). The refusal is the planner's — the by-key
+  resolver accepts exactly that one spelling
+  (`crates/pulsus-read/src/traces/metrics_plan.rs`, the
+  `PlanError::TypeMismatch` arm), and `TypeMismatch` maps to `400` at
+  `crates/pulsus-server/src/traces_api/error.rs`.
+
+- **Disposition.** Deliberate, and **temporary**: widening the metrics
+  `by()` key set is issue #182's, not issue #477's, and it is a `400`
+  rather than a silent flat answer precisely so a client cannot mistake
+  an ungrouped result for a grouped one. Recorded here because the
+  density row above asserted parity on these two queries while we were
+  refusing them — a ledger row that claims a match on a query we answer
+  `400` to is the exact failure the ledger exists to prevent. When #182
+  widens the key set, the two shapes move back into the density row with
+  a fresh measurement, and this row is retired rather than deleted.
 
 ### `traceql-metrics-zero-fill-without-a-block` (issue #477) — **INTRODUCED HERE: we zero-fill a no-match range answer even with nothing stored**
 
