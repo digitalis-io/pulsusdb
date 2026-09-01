@@ -1782,6 +1782,14 @@ static DB_GEX: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_group_exemplar_it");
 static DB_GSPARSE: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_group_sparse_exemplar_it");
+/// Issue #477 wave 2, ruling finding 1: one database per shape-specific
+/// exemplar-attribution criterion, for the same concurrency reason.
+static DB_QEX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_exemplar_it");
+static DB_HEX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_histogram_exemplar_it");
+static DB_CEX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_compare_exemplar_it");
 static DB_CAP: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_metrics_cap_it");
 
 /// Creates `db` fresh and returns an admin client plus an engine bound to
@@ -2438,6 +2446,318 @@ async fn a_grouped_sparse_aggregation_never_stamps_an_exemplar_from_a_missing_bu
     );
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_GSPARSE}")).await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #477 wave 2, ruling finding 1: the shape-specific exemplar
+// attribution criteria.
+//
+// One per multi-series shape that is NOT keyed by a `by()` label. Each is
+// built on the narrowest difference available: every span sits in the SAME
+// time bucket and carries the same sample value on its own series, so the
+// only thing that can distinguish a correct attachment from the pre-fix
+// "attach everything to series 0" is the series identity itself.
+// ---------------------------------------------------------------------------
+
+/// The `trace:id` an exemplar names, as the 32-char hex the framing
+/// renders.
+fn exemplar_trace(ex: &pulsus_read::MetricExemplar) -> String {
+    match &ex
+        .labels
+        .iter()
+        .find(|l| l.key == "trace:id")
+        .unwrap_or_else(|| panic!("every exemplar carries trace:id: {ex:?}"))
+        .value
+    {
+        pulsus_read::MetricLabelValue::Str(hex) => hex.clone(),
+        other => panic!("trace:id must be a string, got {other:?}"),
+    }
+}
+
+/// The value of a numeric series label (`p`, `__bucket`).
+fn double_label(series: &pulsus_read::TraceMetricSeries, key: &str) -> f64 {
+    match series
+        .labels
+        .iter()
+        .find(|l| l.key == key)
+        .unwrap_or_else(|| panic!("series has no {key} label: {series:?}"))
+        .value
+    {
+        pulsus_read::MetricLabelValue::Double(d) => d,
+        ref other => panic!("{key} must be a double, got {other:?}"),
+    }
+}
+
+/// The value of a string series label.
+fn str_label(series: &pulsus_read::TraceMetricSeries, key: &str) -> String {
+    match &series
+        .labels
+        .iter()
+        .find(|l| l.key == key)
+        .unwrap_or_else(|| panic!("series has no {key} label: {series:?}"))
+        .value
+    {
+        pulsus_read::MetricLabelValue::Str(v) => v.clone(),
+        other => panic!("{key} must be a string, got {other:?}"),
+    }
+}
+
+/// **`quantile_over_time` exemplars land on the `p=` series nearest their
+/// own duration, and carry that duration as their value.**
+///
+/// Both traces sit in ONE time bucket, so the bucket cannot tell them
+/// apart, and the criterion is purely which `p` series each landed on.
+/// Before the fix both landed on the first series (`p=0.5`) carrying that
+/// series' value; the reference splits them.
+#[tokio::test]
+async fn quantile_exemplars_land_on_the_quantile_nearest_their_own_duration() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_QEX).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | quantile_over_time(duration, 0.5, 0.9)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    // Two spans, one short and one long, in the SAME bucket.
+    let ts_ns = axis.label_ms(3) * 1_000_000 - 1_000;
+    let short_ns = 1_000_000i64;
+    let long_ns = 16_000_000i64;
+    let rows = vec![
+        span_row(80_000, "qa", ts_ns, short_ns, 0),
+        span_row(80_001, "qa", ts_ns, long_ns, 0),
+    ];
+    let short_trace = format!("{:032x}", 80_000i64);
+    let long_trace = format!("{:032x}", 80_001i64);
+    insert_spans(&admin, &DB_QEX, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the quantile range executes");
+    assert_eq!(
+        result.series.len(),
+        2,
+        "one series per quantile: {result:?}"
+    );
+
+    let label = axis.label_for_ms(ts_ns / 1_000_000);
+    let value_at: Vec<f64> = result
+        .series
+        .iter()
+        .map(|s| {
+            s.samples
+                .iter()
+                .find(|(t, _)| *t == label)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("no sample at {label}: {s:?}"))
+        })
+        .collect();
+    // Anti-vacuity: if the two quantiles coincided at this bucket the
+    // nearest-value rule could not discriminate and this test would pass
+    // on an implementation that ignores the duration entirely.
+    assert_ne!(
+        value_at[0].to_bits(),
+        value_at[1].to_bits(),
+        "the corpus must make p=0.5 and p=0.9 differ at the shared bucket, got {value_at:?}"
+    );
+
+    let mut placed: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for (i, series) in result.series.iter().enumerate() {
+        let p = double_label(series, "p");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            // The value is the span's OWN duration, in seconds.
+            let want_ns = if trace == short_trace {
+                short_ns
+            } else if trace == long_trace {
+                long_ns
+            } else {
+                panic!("unknown trace {trace}");
+            };
+            assert_eq!(
+                ex.value.to_bits(),
+                (want_ns as f64 / 1_000_000_000.0).to_bits(),
+                "p={p}: an exemplar's value must be the sampled span's own duration: {ex:?}"
+            );
+            // …and it sits on the nearest quantile, ties to the lowest.
+            let mut best = 0usize;
+            for (j, v) in value_at.iter().enumerate() {
+                if (ex.value - *v).abs() < (ex.value - value_at[best]).abs() {
+                    best = j;
+                }
+            }
+            assert_eq!(
+                i, best,
+                "trace {trace} (value {}) was attached to p={p} but the nearest quantile at \
+                 this bucket is index {best} of {value_at:?}",
+                ex.value
+            );
+            placed.insert(trace, p);
+        }
+    }
+    assert_eq!(placed.len(), 2, "both traces must be placed: {placed:?}");
+    let ps: std::collections::BTreeSet<u64> = placed.values().map(|p| p.to_bits()).collect();
+    assert_eq!(
+        ps.len(),
+        2,
+        "the short and the long span belong to DIFFERENT quantile series, got {placed:?}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QEX}")).await;
+}
+
+/// **`histogram_over_time` exemplars land on the `__bucket=` series their
+/// own duration falls in.**
+///
+/// Both traces sit in one time bucket and each `__bucket` series carries
+/// the same tally (`1.0`) there, so neither the timestamp nor the value
+/// can distinguish a correct attachment. Before the fix both landed on
+/// the first (smallest) bucket's series.
+#[tokio::test]
+async fn histogram_exemplars_land_on_the_bucket_their_own_duration_falls_in() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_HEX).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | histogram_over_time(duration)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    let ts_ns = axis.label_ms(3) * 1_000_000 - 1_000;
+    // 1 ms bucketizes to 2^20 ns, 16 ms to 2^24 ns.
+    let cases: [(i64, i64, f64); 2] = [
+        (81_000, 1_000_000, 1_048_576.0 / 1e9),
+        (81_001, 16_000_000, 16_777_216.0 / 1e9),
+    ];
+    let rows: Vec<String> = cases
+        .iter()
+        .map(|(idx, dur, _)| span_row(*idx, "ha", ts_ns, *dur, 0))
+        .collect();
+    insert_spans(&admin, &DB_HEX, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the histogram range executes");
+    assert_eq!(
+        result.series.len(),
+        2,
+        "one series per occupied log2 bucket: {result:?}"
+    );
+
+    let mut seen = 0usize;
+    for series in &result.series {
+        let bucket = double_label(series, "__bucket");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            let (_, _, want_bucket) = cases
+                .iter()
+                .find(|(idx, _, _)| format!("{idx:032x}") == trace)
+                .unwrap_or_else(|| panic!("unknown trace {trace}"));
+            assert_eq!(
+                bucket.to_bits(),
+                want_bucket.to_bits(),
+                "trace {trace} was attached to __bucket={bucket}, and its duration falls in \
+                 {want_bucket}"
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 2, "both traces must carry an exemplar: {result:?}");
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_HEX}")).await;
+}
+
+/// **`compare()` exemplars land on their own side's `*_total` series.**
+///
+/// One selection span and one baseline span in the same bucket. Before
+/// the fix every sample landed on the first framed series — a per-value
+/// `baseline` series — so a selection trace appeared under `baseline`.
+#[tokio::test]
+async fn compare_exemplars_land_on_their_own_sides_total_series() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_CEX).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        r#"{} | compare({resource.service.name = "csel"})"#,
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    let ts_ns = axis.label_ms(3) * 1_000_000 - 1_000;
+    let rows = vec![
+        span_row(82_000, "csel", ts_ns, 1_000_000, 0),
+        span_row(82_001, "cbase", ts_ns, 1_000_000, 0),
+    ];
+    let sel_trace = format!("{:032x}", 82_000i64);
+    let base_trace = format!("{:032x}", 82_001i64);
+    insert_spans(&admin, &DB_CEX, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the comparison range executes");
+
+    let mut sides: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let mut attached = 0usize;
+    for series in &result.series {
+        let kind = str_label(series, "__meta_type");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            // Only the two TOTAL meta-types carry exemplars at all.
+            assert!(
+                kind == "baseline_total" || kind == "selection_total",
+                "trace {trace} was attached to a __meta_type={kind} series, and only the \
+                 *_total series carry comparison exemplars: {series:?}"
+            );
+            let want = if trace == sel_trace {
+                "selection_total"
+            } else if trace == base_trace {
+                "baseline_total"
+            } else {
+                panic!("unknown trace {trace}");
+            };
+            assert_eq!(
+                kind, want,
+                "trace {trace} came from the {want} population and was attached to {kind}"
+            );
+            sides.entry(kind.clone()).or_default().insert(trace.clone());
+            attached += 1;
+        }
+    }
+    assert!(attached > 0, "the comparison must carry exemplars");
+    assert_eq!(
+        sides.keys().cloned().collect::<Vec<_>>(),
+        vec!["baseline_total".to_string(), "selection_total".to_string()],
+        "both sides must be represented, got {sides:?}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_CEX}")).await;
 }
 
 /// AC8(iv-b): the RANGE probe counts the groups the range answer can

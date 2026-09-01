@@ -316,6 +316,26 @@ fn the_five_metrics_geometry_ledger_entries_each_name_their_endpoint() {
             "{id}: the entry does not carry {needle:?}"
         );
     }
+    // Issue #477 wave 2: the quantile exemplar's placement domain is a
+    // divergence of its own, and the row has to say WHERE the two rules
+    // differ — a row that only says "we use a different distribution"
+    // cannot be checked against a measurement.
+    let placement = squash(entry_body(
+        &ledger,
+        "traceql-metrics-quantile-exemplar-placement-domain",
+    ));
+    assert!(
+        placement.contains("/api/traces/v1/metrics/query_range"),
+        "the placement row must name the endpoint it is about"
+    );
+    assert!(
+        placement.contains("with one span per bucket"),
+        "the row must name the case where the two rules disagree"
+    );
+    assert!(
+        placement.contains("second scan of the same rows on the read path"),
+        "the row must state the cost that decided it"
+    );
     // The hint's unit change is ledgered separately (ruling 1 on issue
     // #477): it is a behaviour change for existing users, not a
     // divergence from the reference.

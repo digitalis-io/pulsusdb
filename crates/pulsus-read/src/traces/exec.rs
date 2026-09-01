@@ -2951,8 +2951,8 @@ fn push_bucket_exemplars(
 /// aggregation over the whole window — a second scan on a statement that
 /// now runs by default — and the per-bucket values are the numbers the
 /// panel actually draws this exemplar beside. Ledgered as
-/// `2026-09-01-traceql-quantile-exemplar-placement-domain`
-/// (docs/api.md §4.4.1).
+/// `traceql-metrics-quantile-exemplar-placement-domain` in
+/// docs/benchmarks/traces-differential-ledger.md.
 ///
 /// A bucket no series carries drops the sample, exactly as
 /// [`push_bucket_exemplars`] does.
