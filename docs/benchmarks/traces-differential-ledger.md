@@ -1821,7 +1821,8 @@ when we are asking it to slow down, so we keep `429`; recorded as
   variable changed and everything else — the queried spans, the window,
   the request — held identical
   (a throwaway probe: one OTLP/JSON push over the HTTP receiver, then the
-  query read from `/api/search` after the corpus became visible to `{}`):
+  query read from the search route after the corpus became visible to
+  `{}`):
 
   | # | how the key `a` entered the instance | `{}` | `{ .a = nil }` |
   |---|---|---|---|
