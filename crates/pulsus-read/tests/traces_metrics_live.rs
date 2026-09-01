@@ -318,6 +318,21 @@ fn past_window(width_s: i64) -> (i64, i64) {
     (now_s - 60 - width_s, now_s - 60)
 }
 
+/// [`past_window`] floored onto a `step_s` grid, so the snap is the
+/// identity and the emitted axis has a size the test can state.
+///
+/// `past_window` is the only clock source; this only moves its start down
+/// to the nearest step multiple and takes `width_s` from there. Without
+/// it the axis is `intervals + 1` for an `intervals` that depends on where
+/// the current second happens to fall, which is not something a test can
+/// assert against.
+fn aligned_past_window(width_s: i64, step_s: i64) -> (i64, i64) {
+    assert_eq!(width_s % step_s, 0, "the width must be whole steps");
+    let (start_s, _) = past_window(width_s);
+    let aligned = start_s.div_euclid(step_s) * step_s;
+    (aligned, aligned + width_s)
+}
+
 /// The samples of an ungrouped result (0 or 1 series).
 fn matrix_points(result: &TraceMetricsResult) -> Vec<(i64, f64)> {
     assert!(
@@ -1447,11 +1462,28 @@ async fn metrics_internal_consistency_identities() {
         .metrics_instant(&rate_plan)
         .await
         .expect("instant dup");
+    // The SAMPLES are what replay-dedup is about: `uniqExact(trace_id,
+    // span_id)` collapses a replayed row, so every bucket's value is
+    // invariant. The EXEMPLARS are not, and cannot be — `groupArraySample`
+    // draws from raw rows and a replayed row is a real row, so a
+    // duplicated corpus offers the sampler twice as many draws. That was
+    // already true before issue #477; it is newly visible here only
+    // because exemplars used to require a `with()` hint and now attach by
+    // default. Asserting the whole result would be asserting that a
+    // sampler is idempotent, which it is not and which no criterion asks
+    // for (`traceql-metrics-exemplar-count-not-a-parity-surface`).
+    let samples_of = |r: &TraceMetricsResult| -> Vec<(Vec<pulsus_read::MetricLabel>, Vec<(i64, f64)>)> {
+        r.series
+            .iter()
+            .map(|s| (s.labels.clone(), s.samples.clone()))
+            .collect()
+    };
     assert_eq!(
-        before_range, after_range,
+        samples_of(&before_range),
+        samples_of(&after_range),
         "at-least-once replays must never inflate a bucket (uniqExact dedup)"
     );
-    assert_eq!(before_instant, after_instant);
+    assert_eq!(samples_of(&before_instant), samples_of(&after_instant));
 
     // ---- Unaligned window: outward snap, full-width edge buckets ------
     // [BASE+30, BASE+90) at step 60 snaps to [BASE, BASE+120): two
@@ -1726,6 +1758,14 @@ static DB_GEOM: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_geom_it");
 static DB_DENSE: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_dense_it");
+/// The no-match gate's OWN database. Sharing `DB_DENSE` with
+/// `density_follows_the_function_not_the_query` made the two tests race:
+/// they run concurrently in one binary, and the second `run_init` hit
+/// `TABLE_ALREADY_EXISTS` against the first's half-built schema. Nothing
+/// in the tree checks `TestDb` base names for uniqueness — it is a
+/// convention here, not a gate.
+static DB_NOMATCH: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_nomatch_it");
 static DB_EX: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_exemplar_it");
 static DB_CAP: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_metrics_cap_it");
@@ -1787,7 +1827,9 @@ async fn spans_on_a_bucket_boundary_land_on_the_right_edge_label() {
         return;
     }
     let (admin, engine) = fresh_db(&DB_GEOM).await;
-    let (start_s, end_s) = past_window(20);
+    // 500 ms divides every whole second, so a one-second-aligned window is
+    // step-aligned here.
+    let (start_s, end_s) = aligned_past_window(20, 1);
     let step_ms = 500;
 
     let plan = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
@@ -1849,8 +1891,8 @@ async fn a_no_match_range_query_returns_a_zero_filled_series() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
         return;
     }
-    let (admin, engine) = fresh_db(&DB_DENSE).await;
-    let (start_s, end_s) = past_window(20);
+    let (admin, engine) = fresh_db(&DB_NOMATCH).await;
+    let (start_s, end_s) = aligned_past_window(20, 5);
 
     // A control span INSIDE the window that the queried predicate does
     // not match.
@@ -1858,7 +1900,7 @@ async fn a_no_match_range_query_returns_a_zero_filled_series() {
     let axis = plan.range_axis();
     insert_spans(
         &admin,
-        &DB_DENSE,
+        &DB_NOMATCH,
         &[span_row(
             7_001,
             "ac3-control",
@@ -1902,7 +1944,7 @@ async fn a_no_match_range_query_returns_a_zero_filled_series() {
     assert_eq!(res.series[0].samples.len(), empty.range_axis().points);
     assert!(res.series[0].samples.iter().all(|(_, v)| *v == 0.0));
 
-    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_DENSE}")).await;
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_NOMATCH}")).await;
 }
 
 /// AC4: density follows the FUNCTION, not the query.
@@ -1918,7 +1960,7 @@ async fn density_follows_the_function_not_the_query() {
         return;
     }
     let (admin, engine) = fresh_db(&DB_DENSE).await;
-    let (start_s, end_s) = past_window(30);
+    let (start_s, end_s) = aligned_past_window(30, 5);
     let step_ms = 5_000;
 
     let probe = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
@@ -2035,7 +2077,7 @@ async fn exemplars_attach_by_default_and_map_to_the_right_edge_label() {
         return;
     }
     let (admin, engine) = fresh_db(&DB_EX).await;
-    let (start_s, end_s) = past_window(35);
+    let (start_s, end_s) = aligned_past_window(35, 5);
     let step_ms = 5_000;
 
     let probe = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
@@ -2211,8 +2253,7 @@ async fn the_range_probe_rejects_groups_outside_the_instant_window() {
 
     // Two time-disjoint aligned windows, so the two corpora cannot see
     // each other.
-    let (base_start, _) = past_window(600);
-    let aligned = base_start.div_euclid(60) * 60;
+    let (aligned, _) = aligned_past_window(600, 60);
     let step_ms = 60_000;
 
     // E: `a` inside [aS, aE); `b` ONLY at exactly aE.

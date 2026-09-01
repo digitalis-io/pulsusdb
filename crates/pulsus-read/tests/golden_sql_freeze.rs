@@ -189,9 +189,12 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// moves together.
 ///
 /// (1) The range bucket label became RIGHT-CLOSED — `toStartOfInterval(
-/// fromUnixTimestamp64Nano(timestamp_ns - 1), …) + step_ms` in place of
-/// the left-edge form — so a span landing on a grid point belongs to that
-/// point.
+/// fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL step_ns
+/// NANOSECOND) + step_ms` in place of the left-edge millisecond form — so
+/// a span landing on a grid point belongs to that point. The unit moved to
+/// nanoseconds with the shift, because a millisecond interval rounds a
+/// one-nanosecond shift away before it floors (measured on 26.3.17.110;
+/// `metrics_sql::range_bucket_expr` carries the figures).
 ///
 /// (2) The range window widened to `(aS - step, aE]`, rendered as
 /// `>= 1699999920000000001 AND < 1700010840000000001`, one whole step
@@ -211,7 +214,7 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// (still 50 + 27 = 77) nor this digest can see it. Do not "fix" either
 /// by adding it — that would freeze the base copy and defeat the
 /// section-wise inverse the base copy exists for.
-const PINNED_SQL_CORPUS: u64 = 0x03c0_08a1_8a1a_981a;
+const PINNED_SQL_CORPUS: u64 = 0xb359_140a_e92a_1789;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -527,14 +527,40 @@ fn semi_join_sql(
 /// `(L - step, L]` — and it is what makes a bucket boundary go LEFT
 /// (issue #477 (b)).
 ///
+/// **The interval is rendered in NANOSECONDS here, and that is the whole
+/// reason the shift survives.** Measured on ClickHouse 26.3.17.110 — the
+/// minimum version this server accepts
+/// (`crates/pulsus-schema/src/controller.rs:58`):
+/// `toStartOfInterval(DateTime64(9), INTERVAL n MILLISECOND)` converts its
+/// argument to the interval's own unit **by rounding, not truncation**,
+/// before it floors. So under a millisecond interval the one-nanosecond
+/// shift is rounded straight back off and the expression degenerates to
+/// `left_edge + step` for every instant, which puts a grid-point span one
+/// whole step to the RIGHT — exactly the boundary case this function
+/// exists to get right. Measured, `INTERVAL 60000 MILLISECOND`:
+/// `1788262800000000000` (on a minute) yielded `1788262860000`, and
+/// `1788262859999999999` yielded `1788262920000`. The nanosecond interval
+/// yields `1788262800000` and `1788262860000` for the same two, which is
+/// the right-closed answer. Verified on boundaries, one nanosecond either
+/// side, half-millisecond offsets, a 500 ms step, and pre-1970 and
+/// post-2106 epochs.
+///
+/// The module doc's warning about SECOND-and-larger interval units
+/// downgrading a `DateTime64` to a 32-bit `DateTime` still stands and is
+/// why this is not `INTERVAL n SECOND`; nanoseconds are finer than
+/// milliseconds, so they clear that boundary too.
+///
 /// `timestamp_ns - 1` wraps silently at `i64::MIN`; rows there are
 /// excluded by the window predicate before this `GROUP BY` key is
 /// evaluated, and no accepted plan has a range window starting at
 /// `i64::MIN` (`metrics_plan` requires `aS - step + 1` to fit `i64`).
+/// `step_ns` is computed in `i128` because this function is `pub` and its
+/// callers' step has only been bounded by the planner, not by this type.
 pub fn range_bucket_expr(step_ms: i64) -> String {
+    let step_ns = i128::from(step_ms) * 1_000_000;
     format!(
         "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), \
-         INTERVAL {step_ms} MILLISECOND)) + {step_ms}"
+         INTERVAL {step_ns} NANOSECOND)) + {step_ms}"
     )
 }
 
@@ -1441,7 +1467,7 @@ mod tests {
         assert!(
             sql.starts_with(
                 "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(\
-                 timestamp_ns - 1), INTERVAL 60000 MILLISECOND)) + 60000 AS t,\n       \
+                 timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,\n       \
                  uniqExact(trace_id, span_id) AS n\nFROM trace_spans\n\
                  PREWHERE service = 'checkout'\n"
             ),
@@ -1466,12 +1492,12 @@ mod tests {
         assert_eq!(
             range_bucket_expr(500),
             "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), \
-             INTERVAL 500 MILLISECOND)) + 500"
+             INTERVAL 500000000 NANOSECOND)) + 500"
         );
         assert_eq!(
             range_bucket_expr(60_000),
             "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), \
-             INTERVAL 60000 MILLISECOND)) + 60000"
+             INTERVAL 60000000000 NANOSECOND)) + 60000"
         );
         // Every range builder renders that same label, and none of them
         // renders the left-edge form.
@@ -1490,6 +1516,10 @@ mod tests {
                     "toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 500"
                 ),
                 "a left-edge label survived: {sql}"
+            );
+            assert!(
+                !sql.contains("INTERVAL 500 MILLISECOND"),
+                "a MILLISECOND interval rounds the one-nanosecond shift away: {sql}"
             );
         }
     }

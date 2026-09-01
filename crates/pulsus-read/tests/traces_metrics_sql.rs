@@ -368,7 +368,7 @@ fn worked_example_pins_the_documented_fragments() {
     let range = plan.range_sql();
     assert!(range.starts_with(
         "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns \
-         - 1), INTERVAL 60000 MILLISECOND)) + 60000 AS t,\n       \
+         - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,\n       \
          uniqExact(trace_id, span_id) AS n\n"
     ));
     assert!(range.contains("PREWHERE service = 'checkout'"));
@@ -525,7 +525,7 @@ fn shipped_metrics_shapes_and_limits_are_documented() {
     let api = std::fs::read_to_string(root.join("docs/api.md")).expect("read api.md");
 
     for needle in [
-        "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000 MILLISECOND)) + 60000 AS t",
+        "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t",
         // Issue #477 (b): the right-closed reading, and the `- 1` that
         // makes it one, both named where a reader looking at the SQL will
         // find them.
@@ -698,11 +698,13 @@ fn section_body(text: &str, name: &str) -> Option<String> {
 /// section's committed pre-#477 bytes exactly.
 ///
 /// The three are the three things that moved: the bucket instant shifted
-/// back one nanosecond before flooring, the whole step added back to reach
-/// the right edge, and the range window widened by one step on the left
-/// and one nanosecond on the right. All 26 cases plan at `step_ms =
-/// 60_000` over the suite's fixed window, so the literals are constants
-/// here rather than a re-derivation.
+/// back one nanosecond before flooring (and the interval unit with it, to
+/// nanoseconds, because a millisecond interval rounds that shift away —
+/// see `metrics_sql::range_bucket_expr`), the whole step added back to
+/// reach the right edge, and the range window widened by one step on the
+/// left and one nanosecond on the right. All 26 cases plan at
+/// `step_ms = 60_000` over the suite's fixed window, so the literals are
+/// constants here rather than a re-derivation.
 fn undo_axis(section: &str) -> String {
     section
         .replace(
@@ -710,7 +712,7 @@ fn undo_axis(section: &str) -> String {
             "fromUnixTimestamp64Nano(timestamp_ns)",
         )
         .replace(
-            "INTERVAL 60000 MILLISECOND)) + 60000",
+            "INTERVAL 60000000000 NANOSECOND)) + 60000",
             "INTERVAL 60000 MILLISECOND))",
         )
         .replace(

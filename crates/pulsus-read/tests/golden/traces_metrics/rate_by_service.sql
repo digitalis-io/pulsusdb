@@ -2,7 +2,7 @@
 -- q: { duration > 1s } | rate() by(resource.service.name)
 
 == range (query_range) ==
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000 MILLISECOND)) + 60000 AS t, service AS g0,
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, service AS g0,
        uniqExact(trace_id, span_id) AS n
 FROM trace_spans
 WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
@@ -39,7 +39,7 @@ SELECT count() AS n FROM (
 )
 
 == exemplars ==
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000 MILLISECOND)) + 60000 AS t,
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
        groupArraySample(1, 1)(tuple(trace_id, timestamp_ns)) AS ex
 FROM trace_spans
 WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001

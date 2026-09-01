@@ -4,7 +4,7 @@
 == range (query_range) ==
 SELECT t, CAST(quantilesTDigest(0.5, 0.9, 0.99, 1)(val) AS Array(Float64)) AS qs
 FROM (
-  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000 MILLISECOND)) + 60000 AS t, trace_id, span_id,
+  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id,
          any(duration_ns) AS val
   FROM trace_spans
   PREWHERE service = 'checkout'
@@ -25,7 +25,7 @@ FROM (
 )
 
 == exemplars ==
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000 MILLISECOND)) + 60000 AS t,
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
        groupArraySample(1, 1)(tuple(trace_id, timestamp_ns)) AS ex
 FROM trace_spans
 PREWHERE service = 'checkout'
