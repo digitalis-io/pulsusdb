@@ -1160,6 +1160,188 @@ async fn metrics_explain_and_budget_gates() {
          cast exists for, and a pure-Rust unit test cannot reach it"
     );
     assert_eq!(top, 9_223_372_036.854_776_f64);
+
+    // ---- Issue #477 AC8: what the two NEW statements per range request
+    // cost. Exemplars are on by DEFAULT now, and a grouped range query
+    // runs its own probe over the widened window, so this issue adds up to
+    // two statements to a panel that previously ran one. Each is gated
+    // against the range query it rides beside — a relation, never a
+    // literal: granule denominators move between Compact and Wide parts on
+    // the same fixture, so an absolute count is a flake, not a gate. -----
+    let default_ex = plan_for(&engine, r#"{ resource.service.name = "checkout" } | rate()"#, base, now);
+    assert_eq!(
+        default_ex.exemplar_budget(),
+        100,
+        "no hint and no parameter resolves the default budget"
+    );
+    let exemplar_sql = default_ex
+        .exemplar_sql()
+        .expect("the default budget renders exemplar SQL");
+
+    // (i) The exemplar query selects the SAME projection and prunes to the
+    // same granule count as the range query it accompanies. It carries the
+    // identical PREWHERE/WHERE/window by construction; this is the live
+    // confirmation that the access path is identical too.
+    let range_raw = explain_raw(&client, default_ex.range_sql()).await;
+    let ex_raw = explain_raw(&client, exemplar_sql).await;
+    assert!(
+        ex_raw.contains("service_time"),
+        "the exemplar query must select the same service_time projection:\n{ex_raw}"
+    );
+    // Keyed on `service_time`, not on `trace_spans`: when the projection
+    // is selected the `ReadFromMergeTree` block names the PROJECTION, so
+    // parsing it is itself the assertion that both statements took the
+    // projection path rather than the base table.
+    assert_eq!(
+        table_primary_key_granules(&ex_raw, "service_time"),
+        table_primary_key_granules(&range_raw, "service_time"),
+        "the exemplar query must prune to the same granules as its range query\n         range:\n{range_raw}\nexemplar:\n{ex_raw}"
+    );
+
+    // (ii) …and read the same rows. `read_rows`, not `read_bytes`: the two
+    // statements project different column sets, so the byte figures differ
+    // legitimately while the row figures must not.
+    let _ = engine
+        .metrics_range(&default_ex)
+        .await
+        .expect("the default-exemplar range executes");
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    let range_cost = query_log_exact(&client, default_ex.range_sql())
+        .await
+        .expect("the range statement is in query_log");
+    let ex_cost = query_log_exact(&client, exemplar_sql)
+        .await
+        .expect("the exemplar statement is in query_log");
+    assert_eq!(
+        ex_cost.read_rows, range_cost.read_rows,
+        "the exemplar query reads the same rows as its range query          ({} vs {})",
+        ex_cost.read_rows, range_cost.read_rows
+    );
+
+    // (iii) A range request whose framed result has no non-zero sample
+    // issues EXACTLY ONE statement. This is what bounds turning exemplars
+    // on by default: after densification an empty answer is a full grid of
+    // zeros, which is the commonest shape a sparse panel produces, and
+    // there is no bucket an exemplar could belong to.
+    //
+    // Counted by STATEMENT SHAPE, not by a service literal: `AGG` is the
+    // aggregation every range statement carries and `EX` the exemplar
+    // collection's own aggregate, so both candidate statements are inside
+    // the count and neither can be classified out of it.
+    const AGG: &str = "uniqExact(trace_id, span_id) AS n";
+    const EX: &str = "groupArraySample(";
+    let absent = plan_for(
+        &engine,
+        r#"{ resource.service.name = "no-such-service-477" } | rate()"#,
+        base,
+        now,
+    );
+    assert!(
+        absent.exemplar_sql().is_some(),
+        "the plan still RENDERS exemplar SQL - the skip is a runtime decision on the framed \
+         result, not a planning one, or this gate would be vacuous"
+    );
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    let agg0 = count_statements_like(&client, AGG).await;
+    let ex0 = count_statements_like(&client, EX).await;
+    let framed = engine
+        .metrics_range(&absent)
+        .await
+        .expect("the no-match range executes");
+    assert!(
+        framed.series[0].samples.iter().all(|(_, v)| *v == 0.0),
+        "the fixture must produce an all-zero frame, or the skip is not the thing under test"
+    );
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    let agg1 = count_statements_like(&client, AGG).await;
+    let ex1 = count_statements_like(&client, EX).await;
+    assert_eq!(agg1 - agg0, 1, "the range statement itself");
+    assert_eq!(
+        ex1 - ex0,
+        0,
+        "an all-zero frame must issue NO exemplar statement"
+    );
+
+    // The control that makes the zero above a measurement rather than a
+    // blind spot: the SAME counters over a request that DOES produce a
+    // non-zero sample see the exemplar statement.
+    let matched = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } | rate()"#,
+        base,
+        now,
+    );
+    let framed = engine
+        .metrics_range(&matched)
+        .await
+        .expect("the matching range executes");
+    assert!(
+        framed.series[0].samples.iter().any(|(_, v)| *v != 0.0),
+        "the control must produce a non-zero sample, or it proves nothing"
+    );
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    let agg2 = count_statements_like(&client, AGG).await;
+    let ex2 = count_statements_like(&client, EX).await;
+    assert_eq!(agg2 - agg1, 1, "the range statement itself");
+    assert_eq!(
+        ex2 - ex1,
+        1,
+        "a frame with a non-zero sample DOES issue the exemplar statement - without this the \
+         zero above could mean the counter is blind"
+    );
+
+    // (iv) The range probe selects the same projection as the range query
+    // and prunes at least as many granules as the instant probe — it
+    // covers a strictly wider window, so `>=`, a relation and not a
+    // literal.
+    let grouped = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } | rate() by(resource.service.name)"#,
+        base,
+        now,
+    );
+    let range_probe_raw =
+        explain_raw(&client, grouped.range_probe_sql().expect("a range probe")).await;
+    let instant_probe_raw =
+        explain_raw(&client, grouped.instant_probe_sql().expect("an instant probe")).await;
+    assert!(
+        range_probe_raw.contains("service_time"),
+        "the range probe must select the same projection as the range query:\n{range_probe_raw}"
+    );
+    let (range_probe_granules, _) = table_primary_key_granules(&range_probe_raw, "service_time");
+    let (instant_probe_granules, _) =
+        table_primary_key_granules(&instant_probe_raw, "service_time");
+    assert!(
+        range_probe_granules >= instant_probe_granules,
+        "the range probe covers a strictly wider window, so it can never prune MORE granules          ({range_probe_granules} < {instant_probe_granules})"
+    );
+}
+
+/// How many `QueryFinish` statements in this database carry `fragment` —
+/// the counter AC8(iii) reads.
+///
+/// `query NOT LIKE '%system.query_log%'` excludes this counter's own
+/// statement, which necessarily contains the fragment it searches for and
+/// would otherwise be counted on the next call.
+async fn count_statements_like(client: &ChClient, fragment: &str) -> u64 {
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct CountRow {
+        n: u64,
+    }
+    let sql = format!(
+        "SELECT count() AS n FROM system.query_log WHERE type = 'QueryFinish' \
+         AND current_database = '{DB}' AND query NOT LIKE '%system.query_log%' \
+         AND position(query, '{fragment}') > 0"
+    );
+    let mut stream = client
+        .query_stream::<CountRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query_log count");
+    let mut n = 0;
+    while let Some(row) = stream.next().await {
+        n = row.expect("row").n;
+    }
+    n
 }
 
 /// Isolates the inner replay-dedup subquery of a log2 histogram range
