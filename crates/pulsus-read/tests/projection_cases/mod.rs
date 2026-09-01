@@ -12,6 +12,16 @@
 // the library test `include!`s this file, the differential `mod`s it,
 // and coverage is decided by comparing `ProjectionCase::q` values.
 //
+// THE REQUIRED SET IS NOT IN THIS FILE, on purpose. It is
+// `REQUIRED_SHAPE_PAIRS` in `crates/pulsus-read/src/traces/search_plan.rs`,
+// which nothing here can edit — a registry cannot report its own
+// absences. Code review wave 3 removed the mandated same-field
+// physical-column case (34) and both registry guards stayed green,
+// because the demand was then one witness per LABEL and both of that
+// case's labels were supplied by other cases. Removing or rewriting any
+// case that carries a required pair's witness query now fails that test,
+// naming the pair.
+//
 // Not a top-level `tests/*.rs` file on purpose: Cargo would build it as
 // its own integration-test target, which would select no tests and exit
 // green.

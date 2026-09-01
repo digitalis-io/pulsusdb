@@ -44,8 +44,7 @@
 //! ```
 //!
 //! **The registry's DOMAIN, and how to tell a shape is missing from it.**
-//! The registry covers two axes, each required to be complete on its own
-//! rather than as a cross product:
+//! A shape is a PAIR drawn from two axes:
 //!
 //!  * the **value source** a projected entry is filled from — one label
 //!    per `ProjectionValue` variant (`value:name`, `value:probe-value`,
@@ -54,6 +53,13 @@
 //!    `projection_value` (`leaf:physical`, `leaf:attr`,
 //!    `leaf:nested-set`, `leaf:field-compare`) plus the gate-free
 //!    `select()` half (`leaf:select`).
+//!
+//! The registry is required to be complete over a NAMED SET OF PAIRS, not
+//! over each axis separately. Covering the axes separately was the wave-3
+//! gap: the mandated same-field physical-column case could be removed and
+//! both registry guards stayed green, because `leaf:field-compare` was
+//! still supplied by the same-field ATTRIBUTE case and `value:service` by
+//! the plain service-name case.
 //!
 //! Everything else here is enumerated but NOT mechanically complete: the
 //! seven envelope fields, the scope collision, the empty and non-ASCII
@@ -67,16 +73,20 @@
 //!
 //! A reader tells a shape is missing by RUNNING
 //! `pulsus_read::traces::search_plan::tests::the_live_differential_registry_covers_every_projection_shape`,
-//! which derives the label set from the planner's own enums (both label
-//! matches are exhaustive, so a new variant fails to compile), checks a
-//! witness query really produces each label, and then fails naming any
-//! label no case's `q` is EQUAL to. That test is why cases 31–35 exist:
-//! the 30-case registry contained no same-field `FieldCompare` and
-//! nothing reaching `instrumentation:version`, and reading it could not
-//! show that. It reads `projection_cases::CASES` as typed data, which
-//! this file `mod`s and that test `include!`s; it used to read this file
-//! as TEXT, and a witness query written in a case NAME satisfied it while
-//! the case exercised nothing (code review wave 2).
+//! which holds the required PAIR set — `REQUIRED_SHAPE_PAIRS`, stated in
+//! `crates/pulsus-read/src/traces/search_plan.rs`, where this registry
+//! cannot reach it — checks each pair's witness query really produces
+//! that pair, and then fails naming every pair no case's `q` is EQUAL to.
+//! The two AXES are still closed against the planner's own enums (both
+//! label matches are exhaustive, so a new variant fails to compile, and
+//! every label must appear in some required pair); the cross product is
+//! not, which that constant states as its own limit. That test is why
+//! cases 31–35 exist: the 30-case registry contained no same-field
+//! `FieldCompare` and nothing reaching `instrumentation:version`, and
+//! reading it could not show that. It reads `projection_cases::CASES` as
+//! typed data, which this file `mod`s and that test `include!`s; it used
+//! to read this file as TEXT, and a witness query written in a case NAME
+//! satisfied it while the case exercised nothing (code review wave 2).
 //!
 //! **Instance isolation.** This suite requires a reference instance that
 //! holds NO other suite's corpus, and asserts it below before pushing:

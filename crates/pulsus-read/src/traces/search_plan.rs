@@ -2661,14 +2661,18 @@ mod tests {
     /// `crates/pulsus-read/tests/traces_search_projection_differential.rs`
     /// declares its case registry against.
     ///
-    /// Two axes, each covered SEPARATELY rather than as a cross product:
-    /// the **value source** a projection group is filled from (one label
-    /// per [`ProjectionValue`] variant) and the **leaf class** that
-    /// supplied it (one per projecting arm of [`projection_value`], plus
-    /// the gate-free `select()` half). Every label must be named by at
-    /// least one differential case; a shape missing from the registry is
-    /// therefore a label no case declares, which that suite prints by
-    /// name.
+    /// One label per point on each of two axes: the **value source** a
+    /// projection group is filled from (one per [`ProjectionValue`]
+    /// variant) and the **leaf class** that supplied it (one per
+    /// projecting arm of [`projection_value`], plus the gate-free
+    /// `select()` half).
+    ///
+    /// **This is the VOCABULARY, not the demand.** The demand the registry
+    /// is held to is [`REQUIRED_SHAPE_PAIRS`], which names (value, leaf)
+    /// PAIRS: covering the two axes separately was the wave-3 gap, since a
+    /// case can be removed while both of its labels stay supplied by other
+    /// cases. Every label here must appear in at least one required pair,
+    /// which is what carries the closure below through to the demand.
     ///
     /// The list is closed from BOTH ends. Below,
     /// [`every_projection_shape_label_is_produced_by_some_query`] plans one
@@ -2756,6 +2760,30 @@ mod tests {
         out
     }
 
+    /// The (value source, leaf class) PAIRS one planned query produces.
+    ///
+    /// The pair, not the two labels separately: the registry's own gap was
+    /// a MISSING COMBINATION — a same-field `FieldCompare` over a physical
+    /// column — while both of its labels were supplied by other cases
+    /// (code review wave 3).
+    fn projection_pairs_of(
+        plan: &SearchPlan,
+    ) -> std::collections::BTreeSet<(&'static str, &'static str)> {
+        let mut out = std::collections::BTreeSet::new();
+        for group in &plan.projections {
+            for source in &group.sources {
+                let leaf = match source.gate {
+                    None => "leaf:select",
+                    Some((filter_idx, leaf_idx)) => {
+                        projection_leaf_label(&plan.filters[filter_idx].leaves[leaf_idx])
+                    }
+                };
+                out.insert((projection_value_label(&source.value), leaf));
+            }
+        }
+        out
+    }
+
     /// Every label in [`PROJECTION_SHAPES`] is one a real query produces,
     /// and no query produces a label outside it.
     ///
@@ -2789,46 +2817,113 @@ mod tests {
         );
     }
 
-    /// One WITNESS query per shape label, spelled exactly as the live
-    /// differential's case registry spells it.
+    /// The (value source, leaf class) PAIRS the live differential must
+    /// exercise, each with the WITNESS query that produces it — spelled
+    /// exactly as the registry spells it, corpus values and all.
     ///
-    /// The queries are the registry's own, corpus values and all, so the
-    /// coverage check below is a property of the registry rather than of a
-    /// label somebody wrote beside a case. A witness that does not in fact
-    /// produce its label fails before the registry is consulted.
-    const SHAPE_WITNESSES: [(&str, &str); 17] = [
-        ("value:name", r#"{ name = "GET /pay" }"#),
+    /// **This list is the REQUIRED SET, and it lives here rather than
+    /// beside the cases.** Code review wave 3 removed the mandated
+    /// same-field physical-column case and both registry guards stayed
+    /// green: the previous form of this list demanded one witness per
+    /// LABEL, and `leaf:field-compare` was still supplied by the
+    /// same-field ATTRIBUTE case while `value:service` was still supplied
+    /// by the plain service-name case. A registry cannot report its own
+    /// absences, and neither can a demand the registry can edit — so the
+    /// demand is keyed on the PAIR, and it is stated in this file, which
+    /// `crates/pulsus-read/tests/projection_cases/mod.rs` cannot reach.
+    ///
+    /// Each row is checked from both directions below: the witness is
+    /// PLANNED and must really produce the pair (so an unreachable pair
+    /// cannot be demanded), and exactly one registered case's `q` must be
+    /// that witness (so deleting or rewriting that case fails, naming the
+    /// pair that went missing).
+    ///
+    /// **Where the closure stops, stated so it is not read as more.** The
+    /// two AXES are closed against the planner's enums — both label
+    /// functions match exhaustively, [`PROJECTION_SHAPES`] is pinned to
+    /// the labels real queries produce, and the check below requires every
+    /// label in it to appear in some pair here, so a new `ProjectionValue`
+    /// or `PlannedLeafEval` variant cannot land without a row. The CROSS
+    /// PRODUCT is not closed: a reachable pair whose two labels are each
+    /// already covered by other rows — `{ status = status }`, say — is not
+    /// demanded by anything, and nothing here would notice its absence.
+    /// Deriving that would need a query generator over field spellings,
+    /// whose vocabulary would be another hand-written list one layer down.
+    const REQUIRED_SHAPE_PAIRS: [(&str, &str, &str); 17] = [
+        // -- the physical-column value sources, one row each --------------
+        ("value:name", "leaf:physical", r#"{ name = "GET /pay" }"#),
         (
             "value:service",
+            "leaf:physical",
             r#"{ resource.service.name = "proj-checkout" }"#,
         ),
-        ("value:status", "{ status = error }"),
-        ("value:kind", "{ kind = client }"),
-        ("value:status-message", r#"{ statusMessage = "boom" }"#),
+        ("value:status", "leaf:physical", "{ status = error }"),
+        ("value:kind", "leaf:physical", "{ kind = client }"),
+        (
+            "value:status-message",
+            "leaf:physical",
+            r#"{ statusMessage = "boom" }"#,
+        ),
         (
             "value:parent-id",
+            "leaf:physical",
             r#"{ span:parentID = "a479000000000001" }"#,
         ),
         (
             "value:scope-name",
+            "leaf:physical",
             r#"{ instrumentation:name = "proj-scope" }"#,
         ),
         (
             "value:scope-version",
+            "leaf:physical",
             r#"{ instrumentation:version = "1.2.3" }"#,
         ),
-        ("value:probe-literal", r#"{ span.http.method = "GET" }"#),
-        ("value:probe-value", r#"{ span.http.method =~ "GE.*" }"#),
-        ("value:select-value", "{} | select(span.http.method)"),
-        ("value:nested-set", "{ nestedSetLeft > 0 }"),
-        ("leaf:physical", r#"{ name = "GET /pay" }"#),
-        ("leaf:attr", r#"{ span.http.method = "GET" }"#),
-        ("leaf:nested-set", "{ nestedSetLeft > 0 }"),
+        // -- the attribute probe, literal and fused ------------------------
         (
+            "value:probe-literal",
+            "leaf:attr",
+            r#"{ span.http.method = "GET" }"#,
+        ),
+        (
+            "value:probe-value",
+            "leaf:attr",
+            r#"{ span.http.method =~ "GE.*" }"#,
+        ),
+        // -- the gate-free `select()` half, over both value sources it
+        //    reaches ---------------------------------------------------
+        (
+            "value:select-value",
+            "leaf:select",
+            "{} | select(span.http.method)",
+        ),
+        ("value:name", "leaf:select", "{} | select(name)"),
+        // -- the nested-set intrinsic --------------------------------------
+        (
+            "value:nested-set",
+            "leaf:nested-set",
+            "{ nestedSetLeft > 0 }",
+        ),
+        // -- the same-field comparison, one row per value source it draws
+        //    from. THESE ARE THE FOUR the registry's own comment mandates,
+        //    and the physical-column row is the one whose removal went
+        //    unnoticed in wave 3.
+        (
+            "value:select-value",
             "leaf:field-compare",
             r#"{ span.http.method = span.http.method }"#,
         ),
-        ("leaf:select", "{} | select(span.http.method)"),
+        ("value:name", "leaf:field-compare", "{ name = name }"),
+        (
+            "value:nested-set",
+            "leaf:field-compare",
+            "{ nestedSetLeft = nestedSetLeft }",
+        ),
+        (
+            "value:service",
+            "leaf:field-compare",
+            r#"{ resource.service.name = resource.service.name }"#,
+        ),
     ];
 
     /// The differential's case registry, as typed data.
@@ -2924,58 +3019,82 @@ mod tests {
         );
     }
 
-    /// AC9's registry is COMPLETE over the shape vocabulary — every label
-    /// in [`PROJECTION_SHAPES`] is the query of a case in
+    /// AC9's registry is COMPLETE over the required PAIRS — every row of
+    /// [`REQUIRED_SHAPE_PAIRS`] is the query of exactly one case in
     /// `crates/pulsus-read/tests/projection_cases/mod.rs`.
     ///
     /// This is the check the wave-1 code review found missing. The registry
     /// agreed 30 of 30 while containing no case whose leaf was a same-field
     /// `FieldCompare` and none reaching `instrumentation:version`, and
     /// nothing in the registry said so: a list cannot report what is not on
-    /// it. Here the demand comes from the planner's own enums instead —
-    /// both label functions match exhaustively, so a new variant fails to
-    /// compile, and this test then fails until a live case exercises it.
+    /// it.
     ///
-    /// The witness is matched against each case's `q` by EQUALITY, and
-    /// exactly one case may carry it. Wave 2 of the code review satisfied
-    /// the previous, textual form of this check by putting a witness query
-    /// in a case's NAME and leaving the case a match-all: a substring
-    /// search over the array's source text cannot tell the query field
-    /// from any other.
+    /// Two later rounds each beat the check a new way, and both are why it
+    /// is shaped as it is:
     ///
-    /// *RED when:* a shape label has no witness, a witness does not produce
-    /// the label claimed for it, or no case's query is exactly the witness.
+    /// * **Wave 2** put a witness query in a case's NAME and left the case
+    ///   a match-all. The check then read the array as TEXT, so a substring
+    ///   search could not tell the query field from any other. The witness
+    ///   is now compared against `ProjectionCase::q` by EQUALITY.
+    /// * **Wave 3** replaced the mandated same-field physical-column case's
+    ///   query with `{}` — and, equivalently, removed the case — while both
+    ///   registry guards stayed green, because the demand was keyed on one
+    ///   LABEL at a time and both of that case's labels were supplied
+    ///   elsewhere. The demand is now keyed on the (value source, leaf
+    ///   class) PAIR, and the failure names the pair that went missing.
+    ///
+    /// *RED when:* a required pair has no case carrying its witness query
+    /// verbatim (removal, renaming, or rewriting the query), a witness does
+    /// not in fact produce the pair claimed for it, two cases carry the same
+    /// witness, or a label in [`PROJECTION_SHAPES`] appears in no pair.
     #[test]
     fn the_live_differential_registry_covers_every_projection_shape() {
         use projection_cases::CASES;
-        // 1. the witness list is complete over the vocabulary.
-        let witnessed: std::collections::BTreeSet<&str> =
-            SHAPE_WITNESSES.iter().map(|(label, _)| *label).collect();
+        // 1. the required pairs span the whole shape vocabulary, so the
+        //    enum-exhaustive closure on the two AXES carries through to the
+        //    demand: a new `ProjectionValue` or `PlannedLeafEval` variant
+        //    adds a label to `PROJECTION_SHAPES`, and that label must then
+        //    appear in some required pair.
+        let labelled: std::collections::BTreeSet<&str> = REQUIRED_SHAPE_PAIRS
+            .iter()
+            .flat_map(|(value, leaf, _)| [*value, *leaf])
+            .collect();
         assert_eq!(
-            witnessed,
+            labelled,
             PROJECTION_SHAPES.into_iter().collect(),
-            "every shape label needs a witness query"
+            "every shape label must appear in at least one required pair, and no pair may name \
+             a label outside the vocabulary"
         );
 
-        // 2. each witness really produces its label.
-        for (label, q) in SHAPE_WITNESSES {
-            let produced = projection_shapes_of(&plan(q));
+        // 2. each witness really produces the pair claimed for it — so an
+        //    unreachable pair cannot be demanded of the registry.
+        for (value, leaf, q) in REQUIRED_SHAPE_PAIRS {
+            let produced = projection_pairs_of(&plan(q));
             assert!(
-                produced.contains(label),
-                "the witness {q:?} does not produce {label:?}; it produces {produced:?}"
+                produced.contains(&(value, leaf)),
+                "the witness {q:?} does not produce ({value:?}, {leaf:?}); it produces {produced:?}"
             );
         }
 
-        // 3. exactly one case's QUERY is that witness.
-        let missing: Vec<(&str, &str, usize)> = SHAPE_WITNESSES
+        // 3. exactly one case's QUERY is that witness. With (2) above, the
+        //    case found here is a case that really exercises the pair.
+        let missing: Vec<(&str, &str, &str, usize)> = REQUIRED_SHAPE_PAIRS
             .iter()
-            .map(|(label, q)| (*label, *q, CASES.iter().filter(|case| case.q == *q).count()))
-            .filter(|(_, _, found)| *found != 1)
+            .map(|(value, leaf, q)| {
+                (
+                    *value,
+                    *leaf,
+                    *q,
+                    CASES.iter().filter(|case| case.q == *q).count(),
+                )
+            })
+            .filter(|(_, _, _, found)| *found != 1)
             .collect();
         assert!(
             missing.is_empty(),
-            "the live projection differential must hold exactly one case per shape; \
-             (label, witness, cases carrying it) = {missing:?} — edit \
+            "the live projection differential must hold exactly one case per required pair; \
+             (value source, leaf class, witness, cases carrying it) = {missing:?} — a count of 0 \
+             is a shape that is no longer tested against the reference. Edit \
              crates/pulsus-read/tests/projection_cases/mod.rs"
         );
     }
