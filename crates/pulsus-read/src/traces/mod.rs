@@ -62,5 +62,7 @@ pub use metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 pub use rows::{GraphEdgeRow, SpanNameRow, StoredSpan, StoredSpanRow, TagNameRow, TagValueRow};
-pub use search_eval::{GroupValue, SpanSetGroup, SpanSummary, canonical_double_bits};
-pub use search_plan::{SearchCtx, SearchParams, SearchPlan, plan_search};
+pub use search_eval::{
+    GroupValue, ProjectedAttribute, SpanSetGroup, SpanSummary, canonical_double_bits,
+};
+pub use search_plan::{SearchCtx, SearchParams, SearchPlan, WireKey, plan_search};

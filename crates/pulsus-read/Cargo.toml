@@ -102,5 +102,11 @@ uuid = { version = "1", features = ["v4"] }
 # latter counts CALL EXPRESSIONS, so respelling a call site cannot move
 # a published count the way a substring census let it.
 sha2.workspace = true
-syn = { version = "=2.0.118", default-features = false, features = ["full", "parsing", "visit", "clone-impls", "printing"] }
+syn = { version = "=2.0.118", default-features = false, features = ["full", "parsing", "visit", "visit-mut", "clone-impls", "printing"] }
 proc-macro2 = "1"
+# DEV-ONLY (issue #479): the span-summary declaration seal renders the
+# stripped production items back to tokens to count `pulsus_read` mentions
+# (`quote::ToTokens`), and strips `#[cfg(test)]` modules with a mutable
+# visitor (`syn::visit_mut`). Both are test-only; `cargo tree -p
+# pulsus-read -e normal` is byte-identical with and without them.
+quote = "1"

@@ -59,7 +59,7 @@
 use std::collections::{HashMap, HashSet};
 
 use pulsus_traceql::{
-    AggregateOp, BoolOp, ComparisonOp, FieldExpr, FieldOp, SpansetExpr, StructuralModifier,
+    AggregateOp, BoolOp, ComparisonOp, Field, FieldExpr, FieldOp, SpansetExpr, StructuralModifier,
     StructuralOp, UnaryOp, Value,
 };
 
@@ -67,8 +67,8 @@ use super::exec::ByteBudget;
 use super::filter::{BoolMatch, NestedSetField, SetSide};
 use super::search_plan::{
     AggSource, GroupKeyResolver, PhysicalEval, PhysicalSelect, PlannedArith, PlannedBoolTerm,
-    PlannedFilter, PlannedGroupKey, PlannedLeafEval, PlannedOperand, SearchPlan, SelectField,
-    SpansetStage, TraceCtxEval,
+    PlannedFilter, PlannedGroupKey, PlannedLeafEval, PlannedOperand, ProjectionGroup,
+    ProjectionTarget, ProjectionValue, SearchPlan, SpansetStage, TraceCtxEval, WireKey,
 };
 use crate::logql::error::{ReadError, TooBroadReason};
 
@@ -109,9 +109,38 @@ pub type SpanKey = ([u8; 16], [u8; 8]);
 /// trace-wide co-load results (populated only when the plan's
 /// `needs_trace_ctx()`/`needs_child_counts()` flags demand them; empty
 /// maps otherwise, so other queries pay nothing).
+/// One probe's batch membership result (issue #479).
+///
+/// A probe whose matched value no projection needs stays a bare key set —
+/// the read and the memory are unchanged. A probe a projection reads a
+/// value from carries the value fused into the SAME read, so the map
+/// answers both questions and no second statement is issued.
+#[derive(Debug)]
+pub enum ProbeMembership {
+    Keys(HashSet<SpanKey>),
+    Values(HashMap<SpanKey, String>),
+}
+
+impl ProbeMembership {
+    pub fn contains(&self, key: &SpanKey) -> bool {
+        match self {
+            ProbeMembership::Keys(set) => set.contains(key),
+            ProbeMembership::Values(map) => map.contains_key(key),
+        }
+    }
+
+    /// The matched value, when this probe fused one.
+    pub fn value(&self, key: &SpanKey) -> Option<&str> {
+        match self {
+            ProbeMembership::Keys(_) => None,
+            ProbeMembership::Values(map) => map.get(key).map(String::as_str),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BatchAttrs {
-    pub membership: Vec<HashSet<SpanKey>>,
+    pub membership: Vec<ProbeMembership>,
     pub agg_values: Vec<HashMap<SpanKey, f64>>,
     pub select_values: Vec<HashMap<SpanKey, String>>,
     /// Per-span MULTI-VALUED event/link value sets (issue #351),
@@ -190,36 +219,113 @@ struct EvalEnv<'a> {
     ctx: TraceEvalCtx<'a>,
 }
 
+/// One projected `attributes` entry (issue #479).
+///
+/// **Both fields are PRIVATE and there is exactly one constructor**, so no
+/// string in this workspace can become a wire attribute key without
+/// passing through [`WireKey::new`] — the boundary reaches the renderer,
+/// not only the planner, because this is the type the renderer reads.
+/// What the compiler does NOT establish is that the `Field` handed here is
+/// the query's own field rather than one a caller transformed first: a
+/// sole constructor proves a value was BUILT by that function, never that
+/// it is the right value. `search_plan`'s
+/// `projection_identities_equal_the_parsed_query_fields` is the check for
+/// that half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedAttribute {
+    key: WireKey,
+    value: String,
+}
+
+impl ProjectedAttribute {
+    pub fn new(field: &Field, value: String) -> Self {
+        ProjectedAttribute {
+            key: WireKey::new(field),
+            value,
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        self.key.as_str()
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// `key.len() + value.len()` — the term [`SpanSummary::heap_payload_bytes`]
+    /// adds and [`build_summary`] charges BEFORE the pair is built.
+    pub fn heap_bytes(&self) -> usize {
+        self.key.as_str().len() + self.value.len()
+    }
+}
+
 /// One matched span's response summary (docs/api.md §4.2 `spanSets`
-/// entry): summary fields plus the `select()`-projected attributes.
+/// entry): summary fields plus the projected attributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpanSummary {
     pub span_id: [u8; 8],
-    pub name: String,
+    /// `Some` iff a name value was COLLECTED for this span (issue #479
+    /// rule 1) — the query referenced `name` and the leaf that referenced
+    /// it matched, or a `select(name)` stage named it.
+    ///
+    /// PRIVATE: every read outside this module goes through [`Self::name`],
+    /// so a future reader cannot reach the field through a tuple position,
+    /// an enum payload, a generic container or an inferred binding — and,
+    /// decisively, `Option<String>` in a `json!` value position COMPILES
+    /// and renders `null`, which is exactly the wrong answer the reference
+    /// never gives. Privacy turns that silent null into a type error.
+    /// `None` costs no retained bytes and writes no wire field.
+    name: Option<String>,
     pub start_ns: i64,
     pub duration_ns: i64,
-    /// `select()`-projected `(display, rendered value)` pairs, in the
-    /// query's select order.
-    pub attributes: Vec<(String, String)>,
+    /// The projected attributes, in the plan's projection-group order.
+    pub attributes: Vec<ProjectedAttribute>,
 }
 
 impl SpanSummary {
+    /// The only way to build one outside this module.
+    pub fn new(
+        span_id: [u8; 8],
+        name: Option<String>,
+        start_ns: i64,
+        duration_ns: i64,
+        attributes: Vec<ProjectedAttribute>,
+    ) -> Self {
+        SpanSummary {
+            span_id,
+            name,
+            start_ns,
+            duration_ns,
+            attributes,
+        }
+    }
+
+    /// `None` iff the query collected no name for this span. Callers that
+    /// need a `String` must choose their own absent-value behaviour: the
+    /// renderer writes no key at all, and the TTL-race fallback writes an
+    /// empty root name, as it already does for the other two fallback
+    /// fields it refuses to invent.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
     /// The summary's heap payload beyond its own `size_of` slot in the
     /// parent `TraceMatch::spans` buffer (which the parent accounts):
-    /// overhead envelope + name bytes + the attributes buffer at its
-    /// **actual capacity** (code review round 2: unused preallocated
-    /// capacity is retained memory too) + the attribute string bytes.
-    /// [`evaluate_batch`] charges exactly these amounts BEFORE each
-    /// allocation, so a heap-evict release of
+    /// overhead envelope + name bytes (only when one was collected) + the
+    /// attributes buffer at its **actual capacity** (code review round 2:
+    /// unused preallocated capacity is retained memory too) + the
+    /// attribute string bytes. [`evaluate_batch`] charges exactly these
+    /// amounts BEFORE each allocation, so a heap-evict release of
     /// [`TraceMatch::retained_bytes`] returns precisely what was charged.
     pub(crate) fn heap_payload_bytes(&self) -> usize {
         super::exec::RETAINED_ENTRY_OVERHEAD
-            + self.name.len()
-            + self.attributes.capacity() * std::mem::size_of::<(String, String)>()
+            + self.name.as_ref().map_or(0, String::len)
+            + self.attributes.capacity() * std::mem::size_of::<ProjectedAttribute>()
             + self
                 .attributes
                 .iter()
-                .map(|(k, v)| k.len() + v.len())
+                .map(ProjectedAttribute::heap_bytes)
                 .sum::<usize>()
     }
 }
@@ -1923,72 +2029,149 @@ pub(crate) mod clone_probe {
     }
 }
 
+/// Resolves one projection group's value for one span (issue #479), or
+/// `None` when no source's gate passes.
+///
+/// **The gate is the leaf's own truth value, re-evaluated against the same
+/// `EvalEnv`** — which is what makes the rule per SPAN rather than per
+/// query. `eval_expr` does not short-circuit (both operands of `&&`/`||`
+/// are always evaluated), and `EvalEnv` is unchanged between the matching
+/// pass and this one, so a leaf that decided the match decides the
+/// projection identically. Measured on the reference:
+/// `{name="slow-op" || span.http.method="GET"}` gives the `slow-op` span a
+/// `name` and NO `http.method`, though it stores one.
+fn resolve_projection<'a>(
+    group: &'a ProjectionGroup,
+    plan: &SearchPlan,
+    trace_id: [u8; 16],
+    span: &'a HydratedSpan,
+    env: &EvalEnv<'a>,
+) -> Result<Option<ProjectedValue<'a>>, ReadError> {
+    for source in &group.sources {
+        if let Some((filter_idx, leaf_idx)) = source.gate {
+            let leaf = &plan.filters[filter_idx].leaves[leaf_idx];
+            if !eval_leaf(leaf, span, env)? {
+                continue;
+            }
+        }
+        let key = (trace_id, span.span_id);
+        let resolved = match &source.value {
+            ProjectionValue::Name => Some(ProjectedValue::Borrowed(span.name.as_str())),
+            ProjectionValue::Service => Some(ProjectedValue::Borrowed(span.service.as_str())),
+            ProjectionValue::StatusMessage => {
+                Some(ProjectedValue::Borrowed(span.status_message.as_str()))
+            }
+            ProjectionValue::ScopeName => Some(ProjectedValue::Borrowed(span.scope_name.as_str())),
+            ProjectionValue::ScopeVersion => {
+                Some(ProjectedValue::Borrowed(span.scope_version.as_str()))
+            }
+            ProjectionValue::Status => {
+                Some(ProjectedValue::Borrowed(status_keyword(span.status_code)))
+            }
+            ProjectionValue::Kind => Some(ProjectedValue::Borrowed(kind_keyword(span.kind))),
+            // A scalar render, bounded by construction (16 hex bytes).
+            ProjectionValue::ParentIdHex => Some(ProjectedValue::Owned(hex_lower(&span.parent_id))),
+            ProjectionValue::ProbeLiteral(v) => Some(ProjectedValue::Borrowed(v.as_str())),
+            ProjectionValue::ProbeValue { probe_idx } => env
+                .attrs
+                .membership
+                .get(*probe_idx)
+                .and_then(|m| m.value(&key))
+                .map(ProjectedValue::Borrowed),
+            ProjectionValue::SelectValue { field_idx } => env
+                .attrs
+                .select_values
+                .get(*field_idx)
+                .and_then(|m| m.get(&key))
+                .map(|v| ProjectedValue::Borrowed(v.as_str())),
+            // A scalar render, ≤ 20 bytes by construction.
+            ProjectionValue::NestedSet(field) => env
+                .nested_set
+                .and_then(|idx| idx.get(&span.span_id))
+                .map(|v| ProjectedValue::Owned(v.value(*field).to_string())),
+        };
+        if let Some(value) = resolved {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+/// A resolved projection value, borrowed from the span / batch reads where
+/// it already exists and owned only for the two bounded scalar renders —
+/// so an unbounded string is never cloned before its budget charge.
+enum ProjectedValue<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+}
+
+impl ProjectedValue<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            ProjectedValue::Borrowed(s) => s,
+            ProjectedValue::Owned(s) => s.as_str(),
+        }
+    }
+}
+
 /// Builds one span summary, charging the budget **before every retained
-/// allocation** (code review round 2): the summary's overhead + name
-/// bytes + the attributes buffer at full capacity are charged before
-/// anything is cloned, and each attribute's display/value string bytes
-/// are charged before that pair is cloned into the buffer. The one
-/// stated residual: scalar renders (`duration`/`status`/`kind` — ≤ ~20
-/// bytes by construction) are transiently allocated to learn their
-/// length, then charged before entering the buffer; unbounded strings
-/// (name/service/attr values) are never cloned before their charge.
+/// allocation** (code review round 2): the summary's overhead + the
+/// attributes buffer at full capacity are charged before anything is
+/// cloned, then each projected value's bytes are charged before that
+/// value enters the buffer. Issue #479 makes the NAME charge conditional
+/// too — an uncollected name costs nothing and writes no wire field. The
+/// one stated residual: scalar renders (`status`/`kind`/`span:parentID`/
+/// nested-set numbers — ≤ ~20 bytes by construction) are transiently
+/// allocated or borrowed to learn their length, then charged before
+/// entering the buffer; unbounded strings (name/service/attr values) are
+/// never cloned before their charge.
 fn build_summary(
     plan: &SearchPlan,
     trace_id: [u8; 16],
     span: &HydratedSpan,
-    attrs: &BatchAttrs,
+    env: &EvalEnv<'_>,
     budget: &mut ByteBudget,
 ) -> Result<SpanSummary, ReadError> {
-    let attr_capacity = plan.select_fields.len();
+    let attr_capacity = plan.projected_attr_capacity();
     budget.charge(
         super::exec::RETAINED_ENTRY_OVERHEAD
-            + span.name.len()
-            + attr_capacity * std::mem::size_of::<(String, String)>(),
+            + attr_capacity * std::mem::size_of::<ProjectedAttribute>(),
     )?;
     let mut attributes = Vec::with_capacity(attr_capacity);
-    for field in &plan.select_fields {
-        match field {
-            SelectField::Physical { display, column } => match column {
-                PhysicalSelect::Name => {
-                    budget.charge(display.len() + span.name.len())?;
-                    attributes.push((display.clone(), span.name.clone()));
-                }
-                PhysicalSelect::Service => {
-                    budget.charge(display.len() + span.service.len())?;
-                    attributes.push((display.clone(), span.service.clone()));
-                }
-                PhysicalSelect::DurationNs | PhysicalSelect::Status | PhysicalSelect::Kind => {
-                    let value = match column {
-                        PhysicalSelect::DurationNs => span.duration_ns.to_string(),
-                        PhysicalSelect::Status => status_keyword(span.status_code).to_string(),
-                        _ => kind_keyword(span.kind).to_string(),
-                    };
-                    budget.charge(display.len() + value.len())?;
-                    attributes.push((display.clone(), value));
-                }
-            },
-            SelectField::Attr { display, field_idx } => {
-                if let Some(value) = attrs.select_values[*field_idx].get(&(trace_id, span.span_id))
-                {
-                    budget.charge(display.len() + value.len())?;
-                    // The probe sits between the charge and the clone: a
-                    // refused charge returns above and this line — and
-                    // therefore the clone below — never executes (the
-                    // round-4 observable ordering proof).
-                    #[cfg(test)]
-                    clone_probe::record();
-                    attributes.push((display.clone(), value.clone()));
-                }
+    let mut name: Option<String> = None;
+    for group in &plan.projections {
+        let Some(value) = resolve_projection(group, plan, trace_id, span, env)? else {
+            continue;
+        };
+        match &group.target {
+            ProjectionTarget::SpanName => {
+                budget.charge(value.as_str().len())?;
+                // The probe sits between the charge and the clone: a
+                // refused charge returns above and this line — and
+                // therefore the clone below — never executes (the
+                // round-4 observable ordering proof).
+                #[cfg(test)]
+                clone_probe::record();
+                name = Some(value.as_str().to_string());
+            }
+            ProjectionTarget::Attribute(key) => {
+                budget.charge(key.as_str().len() + value.as_str().len())?;
+                #[cfg(test)]
+                clone_probe::record();
+                attributes.push(ProjectedAttribute::new(
+                    &group.field,
+                    value.as_str().to_string(),
+                ));
             }
         }
     }
-    Ok(SpanSummary {
-        span_id: span.span_id,
-        name: span.name.clone(),
-        start_ns: span.timestamp_ns,
-        duration_ns: span.duration_ns,
+    Ok(SpanSummary::new(
+        span.span_id,
+        name,
+        span.timestamp_ns,
+        span.duration_ns,
         attributes,
-    })
+    ))
 }
 
 /// Per-span transient partition cost for [`build_span_set_groups`] (issue
@@ -2291,7 +2474,7 @@ fn build_span_set_groups(
                 plan,
                 trace_id,
                 matched_spans[idx],
-                env.attrs,
+                env,
                 budget,
             )?);
         }
@@ -2454,7 +2637,7 @@ pub(crate) fn evaluate_batch(
         )?;
         let mut summaries = Vec::with_capacity(take);
         for span in matched_spans.iter().take(take) {
-            summaries.push(build_summary(plan, trace.trace_id, span, attrs, budget)?);
+            summaries.push(build_summary(plan, trace.trace_id, span, &env, budget)?);
         }
         let matched_total = matched_spans.len() as u32;
         // Issue #193: reshape into `by()`/`coalesce()` spanSets from the
@@ -2575,17 +2758,63 @@ mod tests {
         .expect("within the test budget")
     }
 
+    /// A probe membership vector of `n` empty key sets — the shape every
+    /// probe a projection reads no value from keeps (issue #479).
+    fn key_sets(n: usize) -> Vec<ProbeMembership> {
+        (0..n)
+            .map(|_| ProbeMembership::Keys(HashSet::new()))
+            .collect()
+    }
+
+    /// Inserts one span key into a probe's membership, whichever shape it
+    /// carries.
+    fn add_member(m: &mut ProbeMembership, key: SpanKey) {
+        match m {
+            ProbeMembership::Keys(set) => {
+                set.insert(key);
+            }
+            ProbeMembership::Values(map) => {
+                map.entry(key).or_default();
+            }
+        }
+    }
+
     fn membership(plan: &SearchPlan, entries: &[(usize, [u8; 16], [u8; 8])]) -> BatchAttrs {
         let mut attrs = BatchAttrs {
-            membership: vec![HashSet::new(); plan.probes.len()],
+            membership: key_sets(plan.probes.len()),
             agg_values: vec![HashMap::new(); plan.agg_fields.len()],
             select_values: vec![HashMap::new(); plan.select_attrs.len()],
             ..BatchAttrs::default()
         };
         for (probe_idx, trace_id, span_id) in entries {
-            attrs.membership[*probe_idx].insert((*trace_id, *span_id));
+            add_member(&mut attrs.membership[*probe_idx], (*trace_id, *span_id));
         }
         attrs
+    }
+
+    /// The per-trace evaluation environment a direct [`build_summary`]
+    /// call needs, borrowing the batch reads exactly as `evaluate_batch`
+    /// does.
+    fn eval_env<'a>(attrs: &'a BatchAttrs, trace_id: [u8; 16]) -> EvalEnv<'a> {
+        EvalEnv {
+            attrs,
+            event_sets: &attrs.event_sets,
+            nested_set: None,
+            ctx: TraceEvalCtx {
+                trace_id,
+                info: attrs.trace_ctx.get(&trace_id),
+                child_counts: &attrs.child_counts,
+            },
+        }
+    }
+
+    /// The projected `(key, value)` pairs of one summary, for assertions
+    /// that predate [`ProjectedAttribute`].
+    fn attr_pairs(s: &SpanSummary) -> Vec<(String, String)> {
+        s.attributes
+            .iter()
+            .map(|a| (a.key().to_string(), a.value().to_string()))
+            .collect()
     }
 
     #[test]
@@ -2807,11 +3036,13 @@ mod tests {
         let mut attrs = membership(&p, &[]);
         attrs.select_values[0].insert((tid(1), sid(1)), "bar".to_string());
         let matches = eval(&p, &[trace], &attrs);
+        // Issue #479: the wire key is the BARE field name, never our
+        // scope-prefixed spelling.
         assert_eq!(
-            matches[0].spans[0].attributes,
+            attr_pairs(&matches[0].spans[0]),
             vec![
-                ("resource.service.name".to_string(), "checkout".to_string()),
-                ("span.foo".to_string(), "bar".to_string()),
+                ("service.name".to_string(), "checkout".to_string()),
+                ("foo".to_string(), "bar".to_string()),
             ]
         );
     }
@@ -3168,10 +3399,10 @@ mod tests {
         let attrs = membership(&p, &[]);
         let matches = eval(&p, &[family_trace()], &attrs);
         assert_eq!(matches.len(), 1);
-        assert_eq!(
-            matches[0].spans[0].attributes,
-            vec![("name".to_string(), "b".to_string())]
-        );
+        // Issue #479: `select(name)` fills the response's own `name`
+        // field and never an `attributes` entry — the reference's rule.
+        assert_eq!(matches[0].spans[0].name(), Some("b"));
+        assert!(attr_pairs(&matches[0].spans[0]).is_empty());
         let p = plan(r#"{ name = "a" } >> { name = "b" } | count() = 1"#);
         let attrs = membership(&p, &[]);
         assert!(
@@ -3289,7 +3520,7 @@ mod tests {
             (4, "h", "hg"),
         ];
         let mut attrs = BatchAttrs {
-            membership: vec![HashSet::new(); p.probes_len()],
+            membership: key_sets(p.probes_len()),
             agg_values: vec![HashMap::new(); p.agg_fields_len()],
             select_values: vec![HashMap::new(); p.select_attrs_len()],
             ..BatchAttrs::default()
@@ -3298,7 +3529,7 @@ mod tests {
             if let ValuePred::StringEq(val) = &probe.pred {
                 for (sb, k, v) in ROWS {
                     if probe.key == *k && val == v {
-                        attrs.membership[i].insert((tid(1), sid(*sb)));
+                        add_member(&mut attrs.membership[i], (tid(1), sid(*sb)));
                     }
                 }
             }
@@ -4603,14 +4834,20 @@ mod tests {
     /// charge site.
     #[test]
     fn span_summary_charge_is_exactly_overhead_plus_name_len() {
-        let p = plan("{}"); // no select() fields: attribute capacity is 0
+        // Issue #479: the name is retained only when the query COLLECTS
+        // one, so the query that anchors this exact-equality unit is the
+        // one that collects it and nothing else. `select(name)` fills the
+        // response's own `name` field, so the attribute capacity is still
+        // 0 and the arithmetic is unchanged.
+        let p = plan("{} | select(name)");
         let attrs = membership(&p, &[]);
         for name_len in [0usize, 1, 8_000] {
             let name = "n".repeat(name_len);
             let s = span(1, "svc", &name, 10, 1);
             let mut budget = ByteBudget::new(usize::MAX);
+            let env = eval_env(&attrs, tid(1));
             let summary =
-                build_summary(&p, tid(1), &s, &attrs, &mut budget).expect("within the test budget");
+                build_summary(&p, tid(1), &s, &env, &mut budget).expect("within the test budget");
             assert_eq!(
                 budget.used(),
                 super::super::exec::RETAINED_ENTRY_OVERHEAD + name_len,
@@ -4622,6 +4859,197 @@ mod tests {
                 "the release-side cost model must equal the charge at L={name_len}"
             );
         }
+    }
+
+    // ---- issue #479: the matched-span projection -------------------------
+
+    /// AC7 — the retained-byte contract holds EXACTLY at every projection
+    /// value source, on both release paths, and for an absent value.
+    ///
+    /// `charged == retained` is a relation, so it is asserted as an
+    /// equality at each of the four value classes rather than sampled at
+    /// one: a class whose charge site was forgotten shows up as a
+    /// mismatch, not as an approximate total.
+    #[test]
+    fn projected_charges_equal_retained_exactly() {
+        // (a) all four value classes, each in its own plan so the charge
+        // for that class is the whole delta.
+        //
+        // hydrated column: `{ status = error }` reads `status_keyword`.
+        // probe literal:   `{ span.foo = "bar" }` needs no column at all.
+        // fused value:     `{ span.foo =~ "b.*" }` reads the probe's own
+        //                  fused `v`.
+        // nested-set:      `{ nestedSetLeft > 0 }` reads the per-trace
+        //                  query-time numbering.
+        let mut hydrated_span = span(1, "svc", "op", 10, 1);
+        hydrated_span.status_code = 2;
+
+        // hydrated column
+        let p = plan(r#"{ status = error }"#);
+        let attrs = membership(&p, &[]);
+        let mut budget = ByteBudget::new(usize::MAX);
+        let env = eval_env(&attrs, tid(1));
+        let s = build_summary(&p, tid(1), &hydrated_span, &env, &mut budget).expect("fits");
+        assert_eq!(
+            attr_pairs(&s),
+            vec![("status".to_string(), "error".to_string())]
+        );
+        assert_eq!(budget.used(), s.heap_payload_bytes());
+
+        // probe literal — the value is the query's own literal, so no
+        // column is read and the charge is still exact.
+        let p = plan(r#"{ span.foo = "bar" }"#);
+        let attrs = membership(&p, &[(0, tid(1), sid(1))]);
+        let mut budget = ByteBudget::new(usize::MAX);
+        let env = eval_env(&attrs, tid(1));
+        let s = build_summary(&p, tid(1), &hydrated_span, &env, &mut budget).expect("fits");
+        assert_eq!(attr_pairs(&s), vec![("foo".to_string(), "bar".to_string())]);
+        assert_eq!(budget.used(), s.heap_payload_bytes());
+
+        // fused value
+        let p = plan(r#"{ span.foo =~ "b.*" }"#);
+        assert!(p.probe_fuses_value(0));
+        let mut attrs = membership(&p, &[]);
+        attrs.membership[0] = ProbeMembership::Values(HashMap::from([(
+            (tid(1), sid(1)),
+            "bar-from-the-row".to_string(),
+        )]));
+        let mut budget = ByteBudget::new(usize::MAX);
+        let env = eval_env(&attrs, tid(1));
+        let s = build_summary(&p, tid(1), &hydrated_span, &env, &mut budget).expect("fits");
+        assert_eq!(
+            attr_pairs(&s),
+            vec![("foo".to_string(), "bar-from-the-row".to_string())],
+            "the fused value is the SPAN's stored value, never the query's pattern"
+        );
+        assert_eq!(budget.used(), s.heap_payload_bytes());
+
+        // nested-set number — the per-trace numbering is what the leaf
+        // filtered on, so `evaluate_batch` supplies it.
+        let p = plan(r#"{ nestedSetLeft > 0 }"#);
+        let attrs = membership(&p, &[]);
+        let mut budget = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(
+            &p,
+            &[TraceSpans {
+                trace_id: tid(1),
+                spans: vec![span(1, "svc", "op", 10, 1)],
+            }],
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect("fits");
+        assert_eq!(
+            attr_pairs(&matches[0].spans[0]),
+            vec![("nestedSetLeft".to_string(), "1".to_string())]
+        );
+
+        // (b) an absent value emits no entry and charges nothing for one.
+        let p = plan(r#"{ span.foo =~ "b.*" }"#);
+        let attrs = membership(&p, &[]); // the probe matched nothing
+        let mut budget = ByteBudget::new(usize::MAX);
+        let env = eval_env(&attrs, tid(1));
+        let s = build_summary(&p, tid(1), &hydrated_span, &env, &mut budget).expect("fits");
+        assert!(s.attributes.is_empty());
+        assert_eq!(budget.used(), s.heap_payload_bytes());
+        assert_eq!(
+            budget.used(),
+            super::super::exec::RETAINED_ENTRY_OVERHEAD + std::mem::size_of::<ProjectedAttribute>(),
+            "the unused-but-allocated capacity slot is charged; the absent value is not"
+        );
+
+        // (f) a summary with NO collected name charges nothing for one.
+        let p = plan(r#"{ span.foo = "bar" }"#);
+        let attrs = membership(&p, &[(0, tid(1), sid(1))]);
+        let mut long = span(1, "svc", &"n".repeat(8192), 10, 1);
+        long.status_code = 0;
+        let mut budget = ByteBudget::new(usize::MAX);
+        let env = eval_env(&attrs, tid(1));
+        let s = build_summary(&p, tid(1), &long, &env, &mut budget).expect("fits");
+        assert_eq!(s.name(), None);
+        assert_eq!(
+            budget.used(),
+            super::super::exec::RETAINED_ENTRY_OVERHEAD
+                + std::mem::size_of::<ProjectedAttribute>()
+                + "foo".len()
+                + "bar".len(),
+            "an 8192-byte span name that the query did not collect costs ZERO"
+        );
+
+        // (c) charge-before-clone, and (d) the evict-release identity, on
+        // a full `evaluate_batch` pass: the budget's total equals the sum
+        // of what the release side would return.
+        let p = plan(r#"{ span.foo = "bar" } | select(name)"#);
+        let attrs = membership(&p, &[(0, tid(1), sid(1))]);
+        let mut budget = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(
+            &p,
+            &[TraceSpans {
+                trace_id: tid(1),
+                spans: vec![span(1, "svc", "op", 10, 1)],
+            }],
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect("fits");
+        assert_eq!(matches[0].spans[0].name(), Some("op"));
+        assert_eq!(
+            budget.used(),
+            matches
+                .iter()
+                .map(TraceMatch::retained_bytes)
+                .sum::<usize>(),
+            "a heap-evict release returns precisely what was charged"
+        );
+    }
+
+    /// AC13 — an UNSENT name is neither charged nor retained, and the
+    /// summary itself does not grow.
+    ///
+    /// The two summaries differ in exactly one input — whether the plan
+    /// collects `name` — so the delta between their charges is the name
+    /// and nothing else. A build that retains the name unconditionally
+    /// makes that delta zero and fails here.
+    #[test]
+    fn an_uncollected_name_is_neither_charged_nor_retained() {
+        // Niche optimisation: every `take * size_of::<SpanSummary>()`
+        // charge in this module depends on the representation not growing.
+        assert_eq!(
+            std::mem::size_of::<Option<String>>(),
+            std::mem::size_of::<String>(),
+            "Option<String> must be niche-optimised, or every size_of<SpanSummary> charge moves"
+        );
+
+        let name = "n".repeat(8_192);
+        let s = span(1, "svc", &name, 10, 1);
+
+        let collecting = plan("{} | select(name)");
+        let not_collecting = plan("{}");
+        let attrs = membership(&collecting, &[]);
+
+        let mut with_name = ByteBudget::new(usize::MAX);
+        let env = eval_env(&attrs, tid(1));
+        let a = build_summary(&collecting, tid(1), &s, &env, &mut with_name).expect("fits");
+
+        let mut without_name = ByteBudget::new(usize::MAX);
+        let b = build_summary(&not_collecting, tid(1), &s, &env, &mut without_name).expect("fits");
+
+        assert_eq!(a.name(), Some(name.as_str()));
+        assert_eq!(b.name(), None);
+        assert_eq!(
+            with_name.used() - without_name.used(),
+            8_192,
+            "the charges differ by EXACTLY the name bytes"
+        );
+        assert_eq!(
+            b.heap_payload_bytes(),
+            super::super::exec::RETAINED_ENTRY_OVERHEAD,
+            "an uncollected name contributes no term to the retained cost model"
+        );
+        assert_eq!(a.heap_payload_bytes(), with_name.used());
+        assert_eq!(b.heap_payload_bytes(), without_name.used());
     }
 
     /// Round-2 finding: unused preallocated `select()` capacity is
@@ -4649,11 +5077,11 @@ mod tests {
         assert_eq!(
             summary.attributes.capacity(),
             1,
-            "with_capacity(select_fields)"
+            "with_capacity(projected attribute groups)"
         );
         assert!(
             summary.heap_payload_bytes()
-                >= std::mem::size_of::<(String, String)>()
+                >= std::mem::size_of::<ProjectedAttribute>()
                     + super::super::exec::RETAINED_ENTRY_OVERHEAD,
             "the empty-but-allocated attributes buffer is still costed"
         );
@@ -4677,7 +5105,12 @@ mod tests {
     /// it from counter arithmetic.
     #[test]
     fn over_budget_selected_string_errors_before_cloning_into_the_output() {
-        let p = plan(r#"{ name = "x" } | select(span.foo)"#);
+        // Issue #479: the filter references `duration`, one of the SEVEN
+        // envelope fields that never project, so the ONLY projection is
+        // the `select()`ed value — which keeps "exactly one clone on the
+        // allowed path, zero on either breach path" an observable of the
+        // value clone site and not a sum over several.
+        let p = plan(r#"{ duration >= 1ns } | select(span.foo)"#);
         let big = "v".repeat(100_000);
         let trace = TraceSpans {
             trace_id: tid(1),

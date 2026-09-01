@@ -408,7 +408,21 @@ async fn healed_attr_registration_is_found_by_attribute_scoped_traceql_search() 
     assert_eq!(trace.root.name, "op-a");
     assert_eq!(trace.matched, 1, "exactly the one matched span");
     assert_eq!(trace.spans.len(), 1);
-    assert_eq!(trace.spans[0].name, "op-a");
+    // Issue #479: the query is attribute-scoped and references no `name`,
+    // so the reference emits no `name` for the matched span and neither do
+    // we. The ROOT read still supplies it (asserted above), which is the
+    // point: the trace envelope keeps the name the span summary drops.
+    assert_eq!(trace.spans[0].name(), None);
+    // …and the condition's own field IS projected, keyed by the bare
+    // attribute name.
+    assert_eq!(
+        trace.spans[0]
+            .attributes
+            .iter()
+            .map(|a| (a.key(), a.value()))
+            .collect::<Vec<_>>(),
+        vec![("http.status_code", "500")]
+    );
 
     writer.shutdown(Duration::from_secs(5)).await;
     drop_database(&bootstrap, db).await;

@@ -1729,3 +1729,75 @@ when we are asking it to slow down, so we keep `429`; recorded as
   to a query that returns nothing. **The mechanism behind the reference's
   omission was not established**, only the observation; recorded so the
   next reader does not treat its answer as the target.
+
+### `traceql-matched-span-attribute-order` (issue #479)
+
+- **What:** the ORDER of a matched span's projected `attributes` array on
+  `GET /api/traces/v1/search` and its `/api/search` alias. PulsusDB emits
+  the projection groups in a deterministic first-appearance order — filter
+  order, then leaf pre-order, then `select()` order. The reference's order
+  is not stable.
+- **Observed:** the same five-attribute query issued six consecutive times
+  against the pinned reference returned six DISTINCT key orders
+  (`['city','http.method','ratio','user.id','deployment.environment']`,
+  `['deployment.environment','ratio','user.id','city','http.method']`,
+  `['http.method','ratio','user.id','deployment.environment','city']`,
+  `['user.id','deployment.environment','ratio','city','http.method']`,
+  `['ratio','user.id','city','deployment.environment','http.method']`,
+  `['ratio','user.id','http.method','deployment.environment','city']`).
+  Six draws show the order is not fixed; nothing more is claimed from six
+  draws.
+- **Triage:** ratify-documented-difference. An unordered map has no order
+  to reproduce, and inventing one would be copying an artefact rather than
+  a rule. Determinism is strictly better for a consumer and for our own
+  byte-exact response goldens.
+- **Disposition:** parity on this mechanism is compared as a MULTISET, on
+  both routes — `crates/pulsus-read/tests/traces_search_projection_differential.rs`
+  sorts both sides before comparing, so a reordering passes by design and
+  an added or dropped key fails.
+
+### `traceql-matched-span-negated-attribute-value-absent` (issue #479)
+
+- **What:** a NEGATED attribute condition (`!=`, `!~`, or any leaf under
+  `!` / `= nil`) projects no attribute on
+  `GET /api/traces/v1/search` or its `/api/search` alias. The reference
+  emits the matched span's stored value.
+- **Observed:** `{span.http.method != "GET"}` — the reference returns the
+  `POST` and `DELETE` spans each carrying
+  `attributes:[{"key":"http.method","value":{"stringValue":"…"}}]`;
+  PulsusDB returns the same two spans with no `attributes` key.
+- **Triage:** gap, deliberately deferred. A negated leaf knows only that
+  the span is NOT in the probe's result set, so the value is not in hand:
+  supplying it needs a second, key-only value read whose cost was measured
+  at 4.3x–70x the membership read's bytes plus one serial round trip per
+  batch per key. The query-performance mandate is why this is a wave and
+  not an omission.
+- **Disposition:** remaining work on issue #479. Our answer (absent) is
+  pinned live by
+  `crates/pulsus-server/tests/traces_search_live.rs::the_matched_span_projection_follows_the_reference_rule`
+  so a later wave has a diff to move rather than a silent change.
+
+### `traceql-matched-span-multi-field-leaf-not-projected` (issue #479)
+
+- **What:** a condition that does not filter on exactly one field projects
+  no attribute on `GET /api/traces/v1/search` or its `/api/search` alias:
+  field-vs-field (`{.a = .b}`), cross-attribute arithmetic that did not
+  push down (`{.a + .b > 5}`), boolean-vs-boolean (`{.a = .b = .c}`),
+  boolean truthiness under `!` (`{!.a}`), event/link SET comparisons
+  (`{.a = event:name}`), trace-context leaves (`{traceDuration > 1s}`,
+  `{rootName = …}`, `{span:childCount > 0}`), folded constants
+  (`{"x" = "y"}`), and a `by()` key.
+- **Observed:** the trace-context class agrees with the reference today —
+  four of its five operands are among the seven envelope fields the
+  reference never projects either, and `span:childCount` is not collected
+  by the reference in EITHER position (`{span:childCount>0}` returns no
+  spans there, and `| select(span:childCount)` returns a span with no
+  `attributes` key at all). The other classes are not characterised
+  against the reference on this mechanism.
+- **Triage:** gap for the multi-field classes, agreement for the
+  trace-context one. There is no single field to key an entry by when a
+  leaf names two, and picking one would be an invention.
+- **Disposition:** remaining work on issue #479. Pinned hermetically by
+  `pulsus_read::traces::search_plan::tests::wave_two_shapes_project_nothing`,
+  which asserts the planner builds no projection source for each shape and
+  carries a positive control so "nothing" is the shape's doing.

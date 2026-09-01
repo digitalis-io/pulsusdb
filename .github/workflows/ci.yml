@@ -721,6 +721,22 @@ jobs:
           PULSUSDB_GROUPING_OTLP_URL: "http://localhost:4318"
         run: cargo test -p pulsus-read --test traces_search_grouping_differential
 
+      # Issue #479: the matched-span PROJECTION differential, ENFORCED
+      # (non-skipped). Reuses the SAME digest-pinned oracle: pushes ONE
+      # OTLP/JSON body to :4318 and decodes those same bytes through our
+      # own ingest parser, then compares, per matched span, the multiset of
+      # projected attribute keys and the `name`-present flag over a
+      # 30-case registry. FAIL-CLOSED: all three gates go through
+      # pulsus_testkit's require_* guards, so dropping this env block
+      # panics rather than reporting green.
+      - name: TraceQL Tempo differential leg (matched-span projection)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_PROJECTION_DIFF_URL: "http://localhost:13200"
+          PULSUSDB_PROJECTION_OTLP_URL: "http://localhost:4318"
+        run: cargo test -p pulsus-read --test traces_search_projection_differential
+
       # Issue #458: the metrics-FILTER accept surface, oracle half. Replays
       # every probe in crates/pulsus-read/tests/fixtures/metrics_filter_accept.json
       # against the SAME digest-pinned oracle and asserts every committed
