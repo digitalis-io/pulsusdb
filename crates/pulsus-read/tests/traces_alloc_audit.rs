@@ -50,12 +50,16 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "span-name values read (issue #478) - same class again: outside the search budget by design (no SearchPlan/ByteBudget on this path), hard-bounded by the SQL LIMIT to TAG_VALUES_MAX + 1 rows, each at most the 8192-byte string-column cap"),
     ("exec.rs", "search_inner", "HashMap::", 1,
      "the empty-winners roots arm: HashMap::new() with zero entries - nothing to charge"),
-    ("exec.rs", "frame_range", "Vec::new", 4,
-     "metrics range series/samples (issue #59/#182) - outside the search ByteBudget by design (no SearchPlan on this path); hard-bounded by MAX_METRICS_POINTS buckets x the series count (grouped series pre-capped by reader.traceql_max_series via the distinct-by-key probe; the quantile series count is the requested quantile list, and since issue #252 the histogram's is data-dependent but hard-bounded by the bit width of Int64 (63 reachable buckets))"),
-    ("exec.rs", "frame_range", ".collect", 3,
-     "same bound as frame_range Vec::new: quantile per-series init, the issue #252 histogram's per-bucket tally map -> series map, and grouped by-partition framing, all bounded by the fixed/probe-capped/64-bucket series count x MAX_METRICS_POINTS buckets"),
+    ("exec.rs", "frame_range_series", "Vec::new", 4,
+     "metrics range series/samples (issue #59/#182) - outside the search ByteBudget by design (no SearchPlan on this path); hard-bounded by MAX_METRICS_POINTS + 1 emitted buckets x the series count (grouped series pre-capped by reader.traceql_max_series via the distinct-by-key probe; the quantile series count is the requested quantile list, and since issue #252 the histogram's is data-dependent but hard-bounded by the bit width of Int64 (63 reachable buckets)). Issue #477 split this function out of frame_range so the densify post-pass has its own charge row below; the bound is unchanged"),
+    ("exec.rs", "frame_range_series", ".collect", 3,
+     "same bound as frame_range_series Vec::new: quantile per-series init, the issue #252 histogram's per-bucket tally map -> series map, and grouped by-partition framing, all bounded by the fixed/probe-capped/64-bucket series count x MAX_METRICS_POINTS + 1 buckets"),
+    ("exec.rs", "densify", "Vec::with_capacity", 1,
+     "issue #477: the densified sample vector, allocated at exactly RangeAxis::points, which the planner capped at MAX_METRICS_POINTS + 1 before any SQL ran - the fill is computed from the window and the step, so it reads no row and adds no scan; same metrics carve-out as frame_range_series"),
+    ("exec.rs", "densify", ".collect", 1,
+     "same bound as densify Vec::with_capacity: the framed (label -> value) lookup map, bounded by the already-materialized sample count of the series being densified"),
     ("exec.rs", "frame_instant", "Vec::new", 2,
-     "metrics instant series/samples - one sample per series; series count fixed (quantile), <= 63 reachable buckets (issue #252 histogram) or probe-capped (grouped), same design carve-out as frame_range"),
+     "metrics instant series/samples - one sample per series; series count fixed (quantile), <= 63 reachable buckets (issue #252 histogram) or probe-capped (grouped), same design carve-out as frame_range_series"),
     ("exec.rs", "frame_instant", ".collect", 2,
      "same bound as frame_instant Vec::new: per-series instant framing over the fixed/probe-capped/64-bucket series count"),
     ("exec.rs", "apply_series_reduce", ".collect", 2,
@@ -64,6 +68,8 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "exemplar list (issue #182 P5) - bounded by the total exemplar budget (issue #477: MAX_EXEMPLARS for the whole response, thinned to it after collection), and before thinning by MAX_METRICS_POINTS + 1 buckets x the per-bucket sample size the budget spreads over that grid; outside the search ByteBudget by design"),
     ("exec.rs", "attach_range_exemplars", ".collect", 1,
      "value-at-bucket lookup map, bounded by MAX_METRICS_POINTS buckets; same metrics carve-out"),
+    ("exec.rs", "thin_exemplars", ".collect", 1,
+     "issue #477: the even-stride reduction of an already-materialized exemplar list down to the total exemplar budget - the kept vector is bounded by that budget (MAX_EXEMPLARS), strictly smaller than the list it replaces; same metrics carve-out"),
     ("exec.rs", "frame_compare", "Vec::new", 7,
      "compare() meta-series (issue #182 P6b) - outside the search ByteBudget by design; the cross-tab (key,value) cardinality is pre-capped by reader.traceql_max_series via the distinct-(key,value) probe (enforce_series_cap runs it first), and the per-key nil/total buffers are bounded by the bucket count (MAX_METRICS_POINTS). Issue #460 adds the two topN rank-and-keep buffers (rank_base/rank_sel), allocated ONCE outside the per-key loop and cleared per key, each bounded by that key's distinct value count and so by the same probe cap"),
     ("exec.rs", "frame_compare", ".collect", 4,
@@ -281,5 +287,37 @@ fn every_collection_allocation_site_is_on_the_charge_allowlist() {
          A new collection allocation needs a budget charge BEFORE it (docs: \
          the module's allocation-charge audit table) and an allowlist entry \
          documenting that charge.\n{drift}"
+    );
+}
+
+
+/// AC10(i-b), second half (issue #477): no charge rationale still
+/// describes a PER-BUCKET exemplar cap.
+///
+/// This is a prose check and it exists because prose is the residue the
+/// compiler cannot reach. Renaming the constants moves every code
+/// occurrence; the sentence in this table explaining what bounds the
+/// exemplar list is not a code occurrence, and it said the wrong thing
+/// until issue #477 changed the unit under it.
+#[test]
+fn no_charge_rationale_describes_a_per_bucket_exemplar_cap() {
+    for (file, func, token, _n, charge) in ALLOWLIST {
+        let low = charge.to_ascii_lowercase();
+        assert!(
+            !charge.contains("EXEMPLARS_PER_BUCKET"),
+            "{file}/{func}/{token}: names a constant that no longer exists"
+        );
+        assert!(
+            !low.contains("per-bucket exemplar") && !low.contains("per_bucket exemplar"),
+            "{file}/{func}/{token}: describes a per-bucket exemplar bound, and the bound is a total"
+        );
+    }
+    let (_, _, _, _, charge) = ALLOWLIST
+        .iter()
+        .find(|(_, f, t, _, _)| *f == "attach_range_exemplars" && *t == "Vec::new")
+        .expect("the exemplar allocation row exists");
+    assert!(
+        charge.contains("total exemplar budget"),
+        "the exemplar list's rationale must state the bound it actually has: {charge}"
     );
 }
