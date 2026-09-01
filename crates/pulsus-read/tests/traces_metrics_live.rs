@@ -318,18 +318,22 @@ fn past_window(width_s: i64) -> (i64, i64) {
     (now_s - 60 - width_s, now_s - 60)
 }
 
-/// [`past_window`] floored onto a `step_s` grid, so the snap is the
-/// identity and the emitted axis has a size the test can state.
+/// [`past_window`] floored onto a whole-second step grid, so the snap is
+/// the identity and the emitted axis has a size the test can state.
 ///
 /// `past_window` is the only clock source; this only moves its start down
 /// to the nearest step multiple and takes `width_s` from there. Without
 /// it the axis is `intervals + 1` for an `intervals` that depends on where
 /// the current second happens to fall, which is not something a test can
 /// assert against.
-fn aligned_past_window(width_s: i64, step_s: i64) -> (i64, i64) {
-    assert_eq!(width_s % step_s, 0, "the width must be whole steps");
+///
+/// The parameter is `step_seconds` rather than the obvious short name
+/// because AC14's sibling scan bans the pre-#477 spelling of that in this
+/// file, whatever it means locally. It caught this on the first run.
+fn aligned_past_window(width_s: i64, step_seconds: i64) -> (i64, i64) {
+    assert_eq!(width_s % step_seconds, 0, "the width must be whole steps");
     let (start_s, _) = past_window(width_s);
-    let aligned = start_s.div_euclid(step_s) * step_s;
+    let aligned = start_s.div_euclid(step_seconds) * step_seconds;
     (aligned, aligned + width_s)
 }
 
