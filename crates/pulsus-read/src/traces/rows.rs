@@ -272,6 +272,21 @@ pub struct MetricExemplarRow {
     pub ex: Vec<([u8; 16], i64)>,
 }
 
+/// One per-bucket exemplar-collection row for a GROUPED range shape
+/// (`metrics_exemplar_range_sql` with one by-key, issue #477 wave 2): the
+/// bucket start, the group label value `g0`, and the bounded
+/// `groupArraySample` of `(trace_id, timestamp_ns)` tuples. Field order
+/// matches the SELECT list (RowBinary is positional), and `g0` is what
+/// lets the engine attach each sample to the series it came from instead
+/// of to whichever series happens to be first.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricGroupExemplarRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub g0: String,
+    pub ex: Vec<([u8; 16], i64)>,
+}
+
 /// One `compare()` cross-tab row (`metrics_compare_sql`, issue #182 P6b):
 /// the bucket start, an attribute `(key, value)`, and its baseline (all
 /// outer spans) and selection (`countIf(is_sel)`) counts.

@@ -188,6 +188,14 @@ pub struct TraceMetricsPlan {
     /// whenever the resolved TOTAL exemplar budget is non-zero; the engine
     /// runs it and attaches `trace:id` exemplars.
     exemplar_sql: Option<String>,
+    /// The label key the exemplar SQL's `g0` column carries, when the
+    /// plan's shape frames one series per group value (issue #477 wave
+    /// 2). `Some` exactly when [`Self::exemplar_sql`] selects a group
+    /// column, so the engine knows which row shape to decode and which
+    /// series each row belongs to; `None` for every ungrouped shape and
+    /// for `quantile`/`histogram`/`compare`, whose series are not one per
+    /// by-key value.
+    exemplar_group_label: Option<String>,
     /// The resolved TOTAL exemplar budget for the whole response (issue
     /// #477 (c) and ruling 1): `0` means none. The engine thins the
     /// collected per-bucket samples down to this many.
@@ -251,10 +259,18 @@ impl TraceMetricsPlan {
         self.reduce
     }
 
-    /// The per-bucket exemplar collection SQL, if `with(exemplars=…)` was
-    /// requested on a supported (ungrouped rate/count) query.
+    /// The per-bucket exemplar collection SQL, if the resolved budget is
+    /// non-zero.
     pub fn exemplar_sql(&self) -> Option<&str> {
         self.exemplar_sql.as_deref()
+    }
+
+    /// The label key carried by the exemplar SQL's group column, when
+    /// there is one. `Some` exactly when [`Self::exemplar_sql`] renders
+    /// `g0`, so a caller cannot decode the grouped row shape against an
+    /// ungrouped statement or the other way round.
+    pub fn exemplar_group_label(&self) -> Option<&str> {
+        self.exemplar_group_label.as_deref()
     }
 
     /// The trailing metrics-result comparison post-filter, if present.
@@ -656,6 +672,18 @@ pub fn plan_trace_metrics(
         (None, Some(p)) => p.min(MAX_EXEMPLARS),
         (None, None) => DEFAULT_EXEMPLARS,
     };
+    // The exemplar sample carries the group identity for exactly the
+    // shapes `frame_range_series` frames as one series per by-key value
+    // (issue #477 wave 2). `quantile_over_time` labels its series by `p`,
+    // `histogram_over_time` by `__bucket` and `compare()` by its own
+    // meta-labels, so a `g0` column would name nothing they emit; those
+    // keep the ungrouped statement and the first-series attachment.
+    let exemplar_keys: &[metrics_sql::GroupKeySql] =
+        if matches!(analysis.kind, PlanKind::Count { .. } | PlanKind::Agg(_)) {
+            &keys
+        } else {
+            &[]
+        };
     let exemplar_sql = (exemplar_budget > 0).then(|| {
         let per_bucket_k = (exemplar_budget / range_axis.points as u32).max(1);
         metrics_sql::metrics_exemplar_range_sql(
@@ -664,8 +692,13 @@ pub fn plan_trace_metrics(
             range_window,
             params.step_ms,
             per_bucket_k,
+            exemplar_keys,
         )
     });
+    let exemplar_group_label = exemplar_sql
+        .is_some()
+        .then(|| exemplar_keys.first().map(|k| k.label_key.clone()))
+        .flatten();
 
     Ok(TraceMetricsPlan {
         kind: analysis.kind,
@@ -676,6 +709,7 @@ pub fn plan_trace_metrics(
         quantiles: analysis.quantiles,
         reduce: analysis.reduce,
         exemplar_sql,
+        exemplar_group_label,
         exemplar_budget,
         result_filter: analysis.result_filter,
         compare_range,

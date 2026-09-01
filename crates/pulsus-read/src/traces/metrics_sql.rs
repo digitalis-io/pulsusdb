@@ -921,24 +921,36 @@ pub fn metrics_log2_bucket_instant_sql(
 
 /// The per-bucket exemplar collection query (issue #182 P5): a bounded
 /// `groupArraySample(K, seed)` of `(trace_id, timestamp_ns)` per time
-/// bucket, pushed down alongside the count aggregation. Rendered only for
-/// an ungrouped rate/count query under `with(exemplars=…)`. The fixed
+/// bucket, pushed down alongside the count aggregation. The fixed
 /// seed keeps the sample deterministic (test-stable); exact
 /// exemplar-count/selection parity vs Tempo is Tier-2 (issue #25).
+///
+/// `keys` carries the GROUP IDENTITY back with each sample (issue #477
+/// wave 2). A grouped range answer is one series per group value, so an
+/// exemplar row that names only its time bucket cannot say which series
+/// it belongs to; the engine used to attach every row to the first
+/// series, which puts one group's traces on another group's line and
+/// reads that other series' value at the bucket. Grouping the sample by
+/// the same `g0..gN` columns the count/aggregation query groups by makes
+/// the row self-identifying, and costs no extra scan: it is the same
+/// `PREWHERE`/`WHERE` over the same rows, with the group column already
+/// in the projection the range query selects.
 pub fn metrics_exemplar_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
     step_ms: i64,
     k: u32,
+    keys: &[GroupKeySql],
 ) -> String {
+    let (gsel, ggroup, gorder) = group_fragments(keys);
     let mut sql = format!(
-        "SELECT {} AS t,\n       \
+        "SELECT {} AS t{gsel},\n       \
          groupArraySample({k}, 1)(tuple(trace_id, timestamp_ns)) AS ex\nFROM {spans_table}\n",
         range_bucket_expr(step_ms)
     );
     push_prewhere_where(&mut sql, filter, window);
-    sql.push_str("\nGROUP BY t\nORDER BY t ASC");
+    sql.push_str(&format!("\nGROUP BY t{ggroup}\nORDER BY t ASC{gorder}"));
     sql
 }
 
@@ -1508,7 +1520,7 @@ mod tests {
             metrics_agg_range_sql("trace_spans", &f, W, 500, AggFn::Sum, &[]),
             metrics_quantile_range_sql("trace_spans", &f, W, 500, &[0.9]),
             metrics_log2_bucket_range_sql("trace_spans", &f, W, 500),
-            metrics_exemplar_range_sql("trace_spans", &f, W, 500, 1),
+            metrics_exemplar_range_sql("trace_spans", &f, W, 500, 1, &[]),
         ] {
             assert!(sql.contains(&range_bucket_expr(500)), "{sql}");
             assert!(

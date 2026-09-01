@@ -94,9 +94,9 @@ use super::rows::{
     CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, HydrationRow,
     MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
     MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
-    MetricGroupCountRow, MetricLog2BucketInstantRow, MetricLog2BucketRow, MetricQuantileInstantRow,
-    MetricQuantileRow, NumValueRow, RootRow, SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow,
-    TagNameRow, TagValueRow, TraceCtxRow,
+    MetricGroupCountRow, MetricGroupExemplarRow, MetricLog2BucketInstantRow, MetricLog2BucketRow,
+    MetricQuantileInstantRow, MetricQuantileRow, NumValueRow, RootRow, SpanNameRow, StoredSpan,
+    StoredSpanRow, StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
     self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
@@ -1309,19 +1309,37 @@ impl TraceEngine {
     }
 
     /// Runs the exemplar-collection query (issue #182 P5) and attaches a
-    /// bounded `trace:id` exemplar per sampled span to the first series.
-    /// Each exemplar carries the bucket's metric value and the span's own
-    /// timestamp (only the trace reference is emitted; the sampled
-    /// `span_id` is not a wire field).
+    /// bounded `trace:id` exemplar per sampled span to the series it
+    /// belongs to. Each exemplar carries that series' value at its own
+    /// bucket and the span's own timestamp (only the trace reference is
+    /// emitted; the sampled `span_id` is not a wire field).
     ///
     /// The bucket lookup keys on the row's `t`, which after issue #477 (b)
     /// is the RIGHT-CLOSED label — the same label the series' samples are
     /// stamped with. A left-edge lookup returned the previous bucket's
     /// value, which is the wrong number whenever the two buckets differ.
     ///
+    /// **Which series** is decided by the row, not by position (issue
+    /// #477 wave 2). A grouped range answer is one series per group
+    /// value; attaching every row to `series.first_mut()` put the second
+    /// group's traces on the first group's line, and read the value out
+    /// of that first series — which for a densified shape is the `0.0`
+    /// of a bucket where that group had nothing, and for a sparse
+    /// aggregation is a bucket the series does not carry at all. Both
+    /// render as a measured zero. The SQL now returns `g0` for the
+    /// grouped shapes ([`TraceMetricsPlan::exemplar_group_label`]) and
+    /// the row is matched to the series carrying that label value.
+    ///
+    /// A row whose group has no series, or whose bucket the matched
+    /// series does not carry, is DROPPED rather than attached at `0.0`:
+    /// neither can arise from a consistent pair of statements over the
+    /// same rows and the same window, and a fabricated zero is worse than
+    /// a missing exemplar because it reads as a measurement.
+    ///
     /// The SQL's `groupArraySample(k, …)` is a PER-BUCKET bound; the
     /// resolved budget is a TOTAL (ruling 1 on issue #477), so the
-    /// collected list is thinned to it here.
+    /// collected list is thinned to it here — across every series, since
+    /// the budget is for the whole response.
     async fn attach_range_exemplars(
         &self,
         plan: &TraceMetricsPlan,
@@ -1330,33 +1348,65 @@ impl TraceEngine {
         let Some(exemplar_sql) = plan.exemplar_sql() else {
             return Ok(());
         };
-        let Some(series) = result.series.first_mut() else {
+        if result.series.is_empty() {
             return Ok(());
-        };
-        // Bucket start (ms) → the series value at that bucket.
-        let value_at: BTreeMap<i64, f64> = series.samples.iter().copied().collect();
+        }
+        // Bucket label (ms) → the value of series `i` at that bucket.
+        let value_at: Vec<BTreeMap<i64, f64>> = result
+            .series
+            .iter()
+            .map(|s| s.samples.iter().copied().collect())
+            .collect();
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(exemplar_sql);
         crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
-        let mut exemplars: Vec<MetricExemplar> = Vec::new();
-        let mut stream = self
-            .client
-            .query_stream::<MetricExemplarRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-            let value = value_at.get(&row.t_ms).copied().unwrap_or(0.0);
-            for (trace_id, ts_ns) in row.ex {
-                exemplars.push(MetricExemplar {
-                    labels: vec![MetricLabel::str("trace:id", hex16(&trace_id))],
-                    value,
-                    timestamp_ms: ts_ns / 1_000_000,
-                });
+        // `(series index, exemplar)`, in bucket order, so the thinning
+        // stride below is taken over the whole response exactly as it was
+        // when every exemplar lived on one series.
+        let mut collected: Vec<(usize, MetricExemplar)> = Vec::new();
+        match plan.exemplar_group_label() {
+            None => {
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    push_bucket_exemplars(&mut collected, 0, &value_at[0], row.t_ms, row.ex);
+                }
+            }
+            Some(label) => {
+                // Group value → the index of the series carrying it. Built
+                // from the framed answer, so a group the answer does not
+                // contain has nowhere to land and its rows are dropped.
+                let index: HashMap<&str, usize> = result
+                    .series
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| series_label_value(s, label).map(|v| (v, i)))
+                    .collect();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricGroupExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    let Some(&i) = index.get(row.g0.as_str()) else {
+                        continue;
+                    };
+                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                }
             }
         }
-        thin_exemplars(&mut exemplars, plan.exemplar_budget());
-        series.exemplars = exemplars;
+        thin_collected_exemplars(&mut collected, plan.exemplar_budget());
+        for series in result.series.iter_mut() {
+            series.exemplars.clear();
+        }
+        for (i, ex) in collected {
+            result.series[i].exemplars.push(ex);
+        }
         Ok(())
     }
 
@@ -2760,6 +2810,54 @@ fn has_a_non_zero_sample(result: &TraceMetricsResult) -> bool {
         .any(|s| s.samples.iter().any(|(_, v)| *v != 0.0))
 }
 
+/// The string value of `series`' label `key`, if it carries one.
+///
+/// Grouped range series are labelled `MetricLabel::str(<by-key>, <group
+/// value>)` by `frame_range_series`, so this is the inverse of that
+/// construction and the join column between an exemplar row's `g0` and
+/// the series it belongs to (issue #477 wave 2).
+fn series_label_value<'a>(series: &'a TraceMetricSeries, key: &str) -> Option<&'a str> {
+    series.labels.iter().find(|l| l.key == key).and_then(|l| {
+        match &l.value {
+            MetricLabelValue::Str(v) => Some(v.as_str()),
+            // A by-key group value is always rendered as a string; the
+            // numeric label forms belong to `p=` and `__bucket=`, which
+            // are never grouped shapes.
+            _ => None,
+        }
+    })
+}
+
+/// Appends one exemplar per sampled span of a bucket row to `collected`,
+/// stamped with series `i`'s own value at that bucket.
+///
+/// A bucket the series does not carry is skipped outright (issue #477
+/// wave 2): the exemplar statement and the range statement read the same
+/// rows over the same window, so a hit here would mean the two disagreed,
+/// and the old `unwrap_or(0.0)` turned that disagreement into a
+/// measured-looking zero.
+fn push_bucket_exemplars(
+    collected: &mut Vec<(usize, MetricExemplar)>,
+    i: usize,
+    value_at: &BTreeMap<i64, f64>,
+    t_ms: i64,
+    sampled: Vec<([u8; 16], i64)>,
+) {
+    let Some(&value) = value_at.get(&t_ms) else {
+        return;
+    };
+    for (trace_id, ts_ns) in sampled {
+        collected.push((
+            i,
+            MetricExemplar {
+                labels: vec![MetricLabel::str("trace:id", hex16(&trace_id))],
+                value,
+                timestamp_ms: ts_ns / 1_000_000,
+            },
+        ));
+    }
+}
+
 /// Reduces a bucket-ordered exemplar list to at most `budget` entries by
 /// even stride, keeping index `i * len / budget` for `i in 0..budget`.
 ///
@@ -2770,20 +2868,25 @@ fn has_a_non_zero_sample(result: &TraceMetricsResult) -> bool {
 /// spread across the window, which is what a panel draws them on; the
 /// stride is exact integer arithmetic, so it is deterministic and the
 /// same list always thins the same way.
-fn thin_exemplars(exemplars: &mut Vec<MetricExemplar>, budget: u32) {
+///
+/// The list is carried as `(series index, exemplar)` pairs (issue #477
+/// wave 2) so one stride covers the WHOLE response: the budget is a total
+/// (ruling 1 on issue #477), and thinning each grouped series separately
+/// would multiply it by the number of groups.
+fn thin_collected_exemplars(collected: &mut Vec<(usize, MetricExemplar)>, budget: u32) {
     let budget = budget as usize;
     if budget == 0 {
-        exemplars.clear();
+        collected.clear();
         return;
     }
-    let len = exemplars.len();
+    let len = collected.len();
     if len <= budget {
         return;
     }
-    let kept: Vec<MetricExemplar> = (0..budget)
-        .map(|i| exemplars[i * len / budget].clone())
+    let kept: Vec<(usize, MetricExemplar)> = (0..budget)
+        .map(|i| collected[i * len / budget].clone())
         .collect();
-    *exemplars = kept;
+    *collected = kept;
 }
 
 /// The count-path (`rate`/`count_over_time`) encode-boundary value:

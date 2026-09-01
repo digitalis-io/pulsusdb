@@ -39,10 +39,10 @@ SELECT count() AS n FROM (
 )
 
 == exemplars ==
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, service AS g0,
        groupArraySample(1, 1)(tuple(trace_id, timestamp_ns)) AS ex
 FROM trace_spans
 WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
   AND duration_ns > 1000000000
-GROUP BY t
-ORDER BY t ASC
+GROUP BY t, g0
+ORDER BY t ASC, g0

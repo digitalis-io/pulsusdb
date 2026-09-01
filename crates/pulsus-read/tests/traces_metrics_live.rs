@@ -1775,6 +1775,13 @@ static DB_NOMATCH: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_nomatch_it");
 static DB_EX: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_exemplar_it");
+/// Issue #477 wave 2: the two grouped-exemplar criteria get a database
+/// each, for the same reason `DB_NOMATCH` does — the tests in this binary
+/// run concurrently and two `run_init`s against one name race.
+static DB_GEX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_group_exemplar_it");
+static DB_GSPARSE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_group_sparse_exemplar_it");
 static DB_CAP: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_metrics_cap_it");
 
 /// Creates `db` fresh and returns an admin client plus an engine bound to
@@ -2228,6 +2235,209 @@ async fn exemplars_attach_by_default_and_map_to_the_right_edge_label() {
     );
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_EX}")).await;
+}
+
+/// Issue #477 wave 2, ruling finding 1, criterion (a): **an exemplar is
+/// attached to the series of the group it came from.**
+///
+/// The corpus makes ownership readable off the wire: a span's `trace_id`
+/// is its `idx` in hex, and the two services take disjoint `idx` ranges,
+/// so the service a returned `trace:id` belongs to is recoverable without
+/// asking the database again. The two services also occupy DISJOINT
+/// buckets, which is what makes the criterion discriminate — under the
+/// pre-fix code every group's exemplars were attached to
+/// `result.series.first_mut()`, so `gb`'s two traces appeared on `ga`'s
+/// line, and they took `ga`'s value at those buckets, which after
+/// densification is the `0.0` of a bucket where `ga` had nothing.
+#[tokio::test]
+async fn grouped_exemplars_attach_to_the_series_of_their_own_group() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_GEX).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let probe = plan_for(
+        &engine,
+        "{} | count_over_time() by(resource.service.name)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = probe.range_axis();
+    assert!(axis.points >= 6, "the grid must hold both groups' buckets");
+
+    // `ga` occupies slots 1 and 3, `gb` slots 2 and 4 — disjoint, so a
+    // misattached exemplar lands on a bucket its host series has no data
+    // in. Two spans per occupied bucket, so the values are non-zero and
+    // the two groups' values are equal (2.0 everywhere) — the criterion
+    // is ownership, and it must not be able to pass on the value alone.
+    let mut rows = Vec::new();
+    let mut owner: std::collections::BTreeMap<String, &'static str> =
+        std::collections::BTreeMap::new();
+    for (service, base_idx, slots) in [("ga", 40_000i64, [1usize, 3]), ("gb", 50_000, [2, 4])] {
+        let mut idx = base_idx;
+        for slot in slots {
+            let ts_ns = axis.label_ms(slot) * 1_000_000 - 1_000;
+            for _ in 0..2 {
+                rows.push(span_row(idx, service, ts_ns, 1_000_000, 0));
+                owner.insert(format!("{idx:032x}"), service);
+                idx += 1;
+            }
+        }
+    }
+    insert_spans(&admin, &DB_GEX, &rows).await;
+
+    let result = engine
+        .metrics_range(&probe)
+        .await
+        .expect("the grouped range executes");
+    assert_eq!(result.series.len(), 2, "two services: {result:?}");
+
+    let mut seen_per_series: Vec<usize> = Vec::new();
+    for series in &result.series {
+        let service = service_label(series);
+        let samples: std::collections::BTreeMap<i64, f64> =
+            series.samples.iter().copied().collect();
+        for ex in &series.exemplars {
+            let trace = match &ex
+                .labels
+                .iter()
+                .find(|l| l.key == "trace:id")
+                .unwrap_or_else(|| panic!("every exemplar carries trace:id: {ex:?}"))
+                .value
+            {
+                pulsus_read::MetricLabelValue::Str(hex) => hex.clone(),
+                other => panic!("trace:id must be a string, got {other:?}"),
+            };
+            let from = owner
+                .get(&trace)
+                .unwrap_or_else(|| panic!("unknown trace id {trace} in {service}"));
+            assert_eq!(
+                *from, service,
+                "exemplar {trace} came from {from} and was attached to {service}"
+            );
+            // …and it carries THAT series' value at its own bucket, which
+            // on this corpus is 2.0 and never the 0.0 of a bucket the
+            // other group filled.
+            let label = axis.label_for_ms(ex.timestamp_ms);
+            let want = samples.get(&label).copied().unwrap_or_else(|| {
+                panic!(
+                    "{service}: exemplar at {} has no sample at {label}",
+                    ex.timestamp_ms
+                )
+            });
+            assert_eq!(
+                ex.value.to_bits(),
+                want.to_bits(),
+                "{service}: exemplar value"
+            );
+            assert_eq!(ex.value.to_bits(), 2.0f64.to_bits(), "{service}: {ex:?}");
+        }
+        seen_per_series.push(series.exemplars.len());
+    }
+    assert!(
+        seen_per_series.iter().all(|n| *n > 0),
+        "every group must carry its own exemplars, got {seen_per_series:?}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_GEX}")).await;
+}
+
+/// Issue #477 wave 2, ruling finding 1, criterion (b): **an exemplar's
+/// value is never taken from a series that does not carry its bucket.**
+///
+/// `sum_over_time` is the shape that makes this visible. It is SPARSE —
+/// `densifies()` is false for the value aggregations — so each group's
+/// series carries only the buckets that group has data in. Under the
+/// pre-fix code `gb`'s exemplars were attached to `ga`'s series at
+/// buckets `ga` does not carry at all, and the bucket lookup's
+/// `unwrap_or(0.0)` turned that miss into a `value:0.0` on the wire: a
+/// number no span produced, indistinguishable from a measured zero.
+#[tokio::test]
+async fn a_grouped_sparse_aggregation_never_stamps_an_exemplar_from_a_missing_bucket() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_GSPARSE).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | sum_over_time(duration) by(resource.service.name)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+
+    // Disjoint buckets again, and DISTINCT durations per group so the two
+    // series' values can never coincide: `ga` sums to 4 ms per bucket,
+    // `gb` to 12 ms — 0.004 s and 0.012 s after the ns→s conversion.
+    let mut rows = Vec::new();
+    for (service, base_idx, slots, duration_ns) in [
+        ("ga", 60_000i64, [1usize, 3], 2_000_000i64),
+        ("gb", 70_000, [2, 4], 6_000_000),
+    ] {
+        let mut idx = base_idx;
+        for slot in slots {
+            let ts_ns = axis.label_ms(slot) * 1_000_000 - 1_000;
+            for _ in 0..2 {
+                rows.push(span_row(idx, service, ts_ns, duration_ns, 0));
+                idx += 1;
+            }
+        }
+    }
+    insert_spans(&admin, &DB_GSPARSE, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the grouped aggregation executes");
+    assert_eq!(result.series.len(), 2, "two services: {result:?}");
+
+    let mut total_exemplars = 0usize;
+    for series in &result.series {
+        let service = service_label(series);
+        let samples: std::collections::BTreeMap<i64, f64> =
+            series.samples.iter().copied().collect();
+        assert_eq!(
+            samples.len(),
+            2,
+            "{service}: a value aggregation stays sparse — two occupied buckets, got {samples:?}"
+        );
+        for ex in &series.exemplars {
+            let label = axis.label_for_ms(ex.timestamp_ms);
+            let want = samples.get(&label).copied().unwrap_or_else(|| {
+                panic!(
+                    "{service}: exemplar at {} was stamped from bucket {label}, which this \
+                     series does not carry — its buckets are {:?}",
+                    ex.timestamp_ms,
+                    samples.keys().collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(
+                ex.value.to_bits(),
+                want.to_bits(),
+                "{service}: exemplar value at {label}"
+            );
+            assert_ne!(
+                ex.value, 0.0,
+                "{service}: a fabricated zero is what this criterion exists for: {ex:?}"
+            );
+            total_exemplars += 1;
+        }
+    }
+    assert!(
+        total_exemplars >= 2,
+        "both groups must carry exemplars, got {total_exemplars}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_GSPARSE}")).await;
 }
 
 /// AC8(iv-b): the RANGE probe counts the groups the range answer can
