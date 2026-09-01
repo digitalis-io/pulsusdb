@@ -1168,7 +1168,12 @@ async fn metrics_explain_and_budget_gates() {
     // against the range query it rides beside — a relation, never a
     // literal: granule denominators move between Compact and Wide parts on
     // the same fixture, so an absolute count is a flake, not a gate. -----
-    let default_ex = plan_for(&engine, r#"{ resource.service.name = "checkout" } | rate()"#, base, now);
+    let default_ex = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } | rate()"#,
+        base,
+        now,
+    );
     assert_eq!(
         default_ex.exemplar_budget(),
         100,
@@ -1302,8 +1307,11 @@ async fn metrics_explain_and_budget_gates() {
     );
     let range_probe_raw =
         explain_raw(&client, grouped.range_probe_sql().expect("a range probe")).await;
-    let instant_probe_raw =
-        explain_raw(&client, grouped.instant_probe_sql().expect("an instant probe")).await;
+    let instant_probe_raw = explain_raw(
+        &client,
+        grouped.instant_probe_sql().expect("an instant probe"),
+    )
+    .await;
     assert!(
         range_probe_raw.contains("service_time"),
         "the range probe must select the same projection as the range query:\n{range_probe_raw}"

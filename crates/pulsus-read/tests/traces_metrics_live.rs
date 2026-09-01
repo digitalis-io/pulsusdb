@@ -1472,12 +1472,15 @@ async fn metrics_internal_consistency_identities() {
     // default. Asserting the whole result would be asserting that a
     // sampler is idempotent, which it is not and which no criterion asks
     // for (`traceql-metrics-exemplar-count-not-a-parity-surface`).
-    let samples_of = |r: &TraceMetricsResult| -> Vec<(Vec<pulsus_read::MetricLabel>, Vec<(i64, f64)>)> {
+    /// A result's series stripped of their exemplars — the labels and the
+    /// samples, which is what replay-dedup is a claim about.
+    type LabelledSamples = Vec<(Vec<pulsus_read::MetricLabel>, Vec<(i64, f64)>)>;
+    fn samples_of(r: &TraceMetricsResult) -> LabelledSamples {
         r.series
             .iter()
             .map(|s| (s.labels.clone(), s.samples.clone()))
             .collect()
-    };
+    }
     assert_eq!(
         samples_of(&before_range),
         samples_of(&after_range),
