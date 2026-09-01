@@ -2078,42 +2078,6 @@ when we are asking it to slow down, so we keep `429`; recorded as
   run, bounded by the budget, non-monotonic in it, and not stable across
   runs, and that is where the investigation stopped.
 
-### `traceql-metrics-quantile-exemplar-placement-domain` (issue #477 wave 2) — **an exemplar is placed against the quantiles of its OWN bucket, not of the whole window**
-
-- **Route.** `GET /api/traces/v1/metrics/query_range`, `quantile_over_time`.
-
-- **What the reference does.** A `quantile_over_time` answer is one series
-  per requested `p`, and an exemplar belongs to exactly one of them. The
-  reference pools every interval's bucket counts into ONE distribution,
-  computes each requested quantile of that pooled distribution once for
-  the response, and puts each exemplar on the quantile whose pooled value
-  is nearest the sampled span's duration — ties to the lowest index. The
-  series' own sample at that bucket is a per-interval quantile, so the
-  reference's placement and the value drawn beside it come from two
-  different distributions.
-
-- **Ours.** The same nearest-value rule with the same tie-break, against
-  the per-BUCKET quantile values — the numbers already in the response,
-  which are the numbers the panel draws this exemplar beside. The
-  exemplar's value is the sampled span's own duration in seconds, as the
-  reference's is.
-
-- **Where the two differ.** Only when a span's bucket ranks it differently
-  from the window: with one span per bucket, every per-bucket quantile
-  equals that span's duration, so every candidate ties and the tie-break
-  puts the exemplar on the lowest `p` — while the pooled rule would spread
-  the same spans across `p` values. With several spans per bucket the two
-  agree on the ordering that matters. Placement only: the set of series,
-  their labels, their samples and the exemplar count are unaffected.
-
-- **Disposition.** Deliberate. Pooling would need a second aggregation
-  over the whole range window inside a statement that, since issue #477
-  (c), runs on every range panel by default — a second scan of the same
-  rows on the read path, for a placement nuance. Query performance is a
-  first-class requirement here and this is the side of it we take. Revisit
-  if a client is found that reads exemplar placement across a sparse
-  window; the ordering rule and the tie-break are already the reference's.
-
 ### `traceql-metrics-exemplars-total-budget` (issue #477) — **`with(exemplars=N)` now means N for the whole response**
 
 - **Route.** `GET /api/traces/v1/metrics/query_range`.

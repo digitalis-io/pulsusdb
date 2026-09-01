@@ -1053,6 +1053,12 @@ fn every_exemplar_statement_returns_its_shapes_series_identity() {
                 vec![
                     "tuple(trace_id, ts, val)".to_string(),
                     "GROUP BY t\n".to_string(),
+                    // The wave-3 ruling's domain, pinned where it is
+                    // decided: the `p` values a sample is placed against
+                    // are the whole window's, merged across the range
+                    // partition by a WINDOW function — one statement and
+                    // one scan, not a second aggregation over the spans.
+                    " OVER () AS Array(Float64)) AS qs".to_string(),
                 ],
             ),
             ExemplarSeriesKey::HistogramBucket => (

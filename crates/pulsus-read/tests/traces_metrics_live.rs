@@ -1786,6 +1786,10 @@ static DB_GSPARSE: pulsus_testkit::TestDb =
 /// exemplar-attribution criterion, for the same concurrency reason.
 static DB_QEX: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_exemplar_it");
+/// Issue #477 wave 3: the pooled-domain criterion needs a sparse corpus
+/// of its own, and its own database for the same concurrency reason.
+static DB_QSPARSE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_sparse_exemplar_it");
 static DB_HEX: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_histogram_exemplar_it");
 static DB_CEX: pulsus_testkit::TestDb =
@@ -2509,6 +2513,13 @@ fn str_label(series: &pulsus_read::TraceMetricSeries, key: &str) -> String {
 /// apart, and the criterion is purely which `p` series each landed on.
 /// Before the fix both landed on the first series (`p=0.5`) carrying that
 /// series' value; the reference splits them.
+///
+/// **This one does not cover the placement DOMAIN.** Exactly one bucket
+/// is occupied, so the pooled window and that bucket hold the same two
+/// spans and produce the same `p` values — the per-bucket and the pooled
+/// rules agree here by construction, and the criterion for the domain is
+/// [`quantile_exemplars_are_placed_against_the_whole_windows_pooled_quantiles`].
+/// What this gates is the nearest-value rule and the exemplar's value.
 #[tokio::test]
 async fn quantile_exemplars_land_on_the_quantile_nearest_their_own_duration() {
     if !should_run() {
@@ -2613,6 +2624,122 @@ async fn quantile_exemplars_land_on_the_quantile_nearest_their_own_duration() {
     );
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QEX}")).await;
+}
+
+/// **`quantile_over_time` exemplar placement is against the WHOLE range
+/// window's quantiles, pooled over every bucket** (issue #477 wave 3
+/// ruling).
+///
+/// The case the ruling names, and the only one that can tell the two
+/// domains apart: **one span per bucket across a sparse window**. Every
+/// bucket then holds a single duration, so *that bucket's* `p=0.5` and
+/// `p=1` are the same number — every candidate ties, and a per-bucket
+/// implementation's lowest-index tie-break puts all eight exemplars on
+/// `p=0.5`. Pooled, the eight durations form one distribution and the
+/// exemplars split.
+///
+/// **Why the expected split needs no oracle.** Six of the eight durations
+/// are `<= 6 ms` and two are `>= 200 ms`, so the pooled median is
+/// somewhere in `[1 ms, 6 ms]` for any quantile estimator (six of eight
+/// points are in that range), and the pooled `p=1` is the maximum,
+/// `201 ms`. Nearest-value placement splits at the midpoint of the two,
+/// which is therefore between `101 ms` and `104 ms` — above every low
+/// duration and below every high one. The partition is the same for any
+/// estimator that puts the median inside the low cluster, so this asserts
+/// the DOMAIN and not our TDigest's arithmetic.
+#[tokio::test]
+async fn quantile_exemplars_are_placed_against_the_whole_windows_pooled_quantiles() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_QSPARSE).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | quantile_over_time(duration, 0.5, 1)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    // One span per bucket, buckets 1..=8 of the 9-point grid.
+    const DURATIONS_MS: [i64; 8] = [1, 2, 3, 4, 5, 6, 200, 201];
+    let mut rows = Vec::new();
+    let mut duration_of: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    for (n, ms) in DURATIONS_MS.iter().enumerate() {
+        let idx = 90_000 + n as i64;
+        let ts_ns = axis.label_ms(n + 1) * 1_000_000 - 1_000;
+        rows.push(span_row(idx, "qs", ts_ns, ms * 1_000_000, 0));
+        duration_of.insert(format!("{idx:032x}"), *ms);
+    }
+    insert_spans(&admin, &DB_QSPARSE, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the quantile range executes");
+    assert_eq!(
+        result.series.len(),
+        2,
+        "one series per quantile: {result:?}"
+    );
+    assert_eq!(double_label(&result.series[0], "p"), 0.5);
+    assert_eq!(double_label(&result.series[1], "p"), 1.0);
+
+    // Anti-vacuity, and the whole reason this corpus discriminates: at
+    // EVERY bucket the two quantiles are the same number, so nothing in
+    // the per-bucket values can tell the two series apart. A test that
+    // passed here without this check could be reading a corpus where the
+    // per-bucket domain would have answered identically.
+    let (lo, hi) = (&result.series[0].samples, &result.series[1].samples);
+    assert_eq!(lo.len(), hi.len(), "both series carry the same grid");
+    for (a, b) in lo.iter().zip(hi.iter()) {
+        assert_eq!(a.0, b.0, "the two series share a bucket grid");
+        assert_eq!(
+            a.1.to_bits(),
+            b.1.to_bits(),
+            "p=0.5 and p=1 must COINCIDE at every bucket for this case to \
+             discriminate — got {a:?} vs {b:?} over {lo:?} / {hi:?}"
+        );
+    }
+
+    let mut placed: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (i, series) in result.series.iter().enumerate() {
+        let p = double_label(series, "p");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            let ms = *duration_of
+                .get(&trace)
+                .unwrap_or_else(|| panic!("unknown trace {trace}"));
+            assert_eq!(
+                ex.value.to_bits(),
+                (ms as f64 / 1_000.0).to_bits(),
+                "p={p}: an exemplar's value is the sampled span's own duration: {ex:?}"
+            );
+            assert!(placed.insert(trace, i).is_none(), "a span is placed once");
+        }
+    }
+    let mut by_duration: Vec<(i64, usize)> = placed
+        .iter()
+        .map(|(trace, i)| (duration_of[trace], *i))
+        .collect();
+    by_duration.sort_unstable();
+    let want: Vec<(i64, usize)> = DURATIONS_MS
+        .iter()
+        .map(|ms| (*ms, usize::from(*ms >= 200)))
+        .collect();
+    assert_eq!(
+        by_duration, want,
+        "each span belongs to the pooled quantile nearest its own duration: the six short \
+         spans to p=0.5 and the two long ones to p=1. All eight on p=0.5 is the per-BUCKET \
+         domain, where every candidate ties"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QSPARSE}")).await;
 }
 
 /// **`histogram_over_time` exemplars land on the `__bucket=` series their

@@ -1223,6 +1223,64 @@ async fn metrics_explain_and_budget_gates() {
         ex_cost.read_rows, range_cost.read_rows
     );
 
+    // (ii-b, wave-3 ruling) The POOLED quantile placement domain costs no
+    // second scan. A `quantile_over_time` exemplar is placed against the
+    // quantiles of the WHOLE range window, and the two ways to get them
+    // are a second aggregation over the spans or a window function over
+    // the per-bucket rows the statement already produces. We took the
+    // window function, and this is the measurement that says so rather
+    // than a reading of the query text: the exemplar statement reads the
+    // SAME rows as its range query (a second pass over the spans would
+    // roughly double it), and the whole request still puts exactly TWO
+    // statements over `trace_spans` into the query log.
+    let quant = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } | quantile_over_time(duration, 0.5, 0.9)"#,
+        base,
+        now,
+    );
+    let quant_ex = quant
+        .exemplar_sql()
+        .expect("the default budget renders quantile exemplar SQL");
+    assert!(
+        quant_ex.contains(" OVER () AS Array(Float64)) AS qs"),
+        "the pooled array must come from a window function over the range partition:\n{quant_ex}"
+    );
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    const SPANS: &str = "FROM trace_spans";
+    let spans0 = count_statements_like(&client, SPANS).await;
+    let framed = engine
+        .metrics_range(&quant)
+        .await
+        .expect("the quantile range executes");
+    assert!(
+        framed
+            .series
+            .iter()
+            .any(|s| s.samples.iter().any(|(_, v)| *v != 0.0)),
+        "the fixture must produce a non-zero quantile, or the exemplar statement is skipped \
+         and this gate measures nothing"
+    );
+    exec(&client, "SYSTEM FLUSH LOGS").await;
+    assert_eq!(
+        count_statements_like(&client, SPANS).await - spans0,
+        2,
+        "a quantile range request with exemplars issues the range statement and the exemplar \
+         statement and NOTHING else - a third would be the second aggregation this design \
+         exists to avoid"
+    );
+    let q_range_cost = query_log_exact(&client, quant.range_sql())
+        .await
+        .expect("the quantile range statement is in query_log");
+    let q_ex_cost = query_log_exact(&client, quant_ex)
+        .await
+        .expect("the quantile exemplar statement is in query_log");
+    assert_eq!(
+        q_ex_cost.read_rows, q_range_cost.read_rows,
+        "the pooled quantiles must ride the exemplar statement's own scan          ({} vs {})",
+        q_ex_cost.read_rows, q_range_cost.read_rows
+    );
+
     // (iii) A range request whose framed result has no non-zero sample
     // issues EXACTLY ONE statement. This is what bounds turning exemplars
     // on by default: after densification an empty answer is a full grid of

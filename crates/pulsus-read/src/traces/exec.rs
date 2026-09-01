@@ -1404,8 +1404,11 @@ impl TraceEngine {
             }
             ExemplarSeriesKey::Quantile => {
                 // No index: the join is numeric. Each sampled span goes to
-                // the `p=` series whose value at the span's OWN bucket is
-                // nearest the span's own duration.
+                // the `p=` series whose value over the WHOLE window is
+                // nearest the span's own duration — the pooled array the
+                // statement carries on every row, not that bucket's
+                // samples.
+                let series_count = result.series.len();
                 let mut stream = self
                     .client
                     .query_stream::<MetricQuantileExemplarRow>(&sql, &settings)
@@ -1413,7 +1416,7 @@ impl TraceEngine {
                     .map_err(|e| map_trace_metrics_error(e, &self.config))?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-                    push_quantile_exemplars(&mut collected, &value_at, row.t_ms, row.ex);
+                    push_quantile_exemplars(&mut collected, series_count, &row.qs, row.ex);
                     decimate_if_full(&mut collected);
                 }
             }
@@ -2931,15 +2934,28 @@ fn push_bucket_exemplars(
 
 /// Places each sampled span of a `quantile_over_time` bucket row on the
 /// `p=` series nearest its own duration, and stamps it with that duration
-/// (issue #477 wave 2).
+/// (issue #477 wave 2; pooled domain per the wave-3 ruling).
 ///
-/// Two rules from the reference, both different from every other shape:
+/// Three rules from the reference, all different from every other shape:
 ///
 /// * **Placement** is nearest-value, not nearest-anything-else: the
 ///   exemplar goes to the quantile whose value is closest to the span's
 ///   duration, ties to the lowest index (`assignExemplarToQuantile`,
 ///   `pkg/traceql/engine_metrics.go:2013-2041 @ v3.0.2` — a strict `<`
 ///   keeps the first of equals).
+/// * **The domain is the whole range window, pooled.** The values
+///   compared against are the requested quantiles of every bucket's spans
+///   taken together, computed once for the response — the reference sums
+///   each interval's bucket counts into one distribution and quantiles
+///   THAT (`aggregatedBuckets` → `quantileValues`,
+///   `pkg/traceql/engine_metrics.go:1934-1962 @ v3.0.2`), then assigns
+///   every exemplar against that single array (`:1996-2001`). The
+///   per-interval values it draws on each series are a separate
+///   computation, so placement and the sample beside it deliberately come
+///   from two different distributions. `pooled` is that array, in request
+///   order — it arrives on every row of the exemplar statement, which
+///   computes it as one window function over the range partition rather
+///   than as a second pass over the spans.
 /// * **The value is the span's own duration**, not the series' sample.
 ///   `quantile_over_time(duration)` records a real observed value
 ///   (`exemplarDuration`, `pkg/traceql/ast_metrics.go:235-239 @ v3.0.2`)
@@ -2947,34 +2963,25 @@ fn push_bucket_exemplars(
 ///   rewritten to the series sample at the end
 ///   (`modules/frontend/combiner/metrics_query_range.go:278-305 @ v3.0.2`).
 ///   The ns→seconds conversion is [`agg_value`], the same one the series
-///   values go through, so the comparison is between like units.
+///   values and the pooled array go through, so every comparison is
+///   between like units.
 ///
-/// The comparison is against the `p` values at the exemplar's OWN bucket,
-/// which is where our distribution differs from the reference's: it pools
-/// every interval into one distribution and compares against that (
-/// `engine_metrics.go:1934-1953 @ v3.0.2`). Pooling would need a second
-/// aggregation over the whole window — a second scan on a statement that
-/// now runs by default — and the per-bucket values are the numbers the
-/// panel actually draws this exemplar beside. Ledgered as
-/// `traceql-metrics-quantile-exemplar-placement-domain` in
-/// docs/benchmarks/traces-differential-ledger.md.
-///
-/// A bucket no series carries drops the sample, exactly as
-/// [`push_bucket_exemplars`] does.
+/// The pooled array is one value per requested `p`, and the framed series
+/// are built one per requested `p` in the same order, so the winning
+/// index IS the series index. A row whose array is shorter than the
+/// series list (an impossible pairing of statements) places nothing
+/// rather than guessing.
 fn push_quantile_exemplars(
     collected: &mut Vec<(usize, MetricExemplar)>,
-    value_at: &[BTreeMap<i64, f64>],
-    t_ms: i64,
+    series_count: usize,
+    pooled: &[f64],
     sampled: Vec<([u8; 16], i64, i64)>,
 ) {
     for (trace_id, ts_ns, duration_ns) in sampled {
         let value = agg_value(duration_ns as f64);
         let mut best: Option<(usize, f64)> = None;
-        for (i, series) in value_at.iter().enumerate() {
-            let Some(&q) = series.get(&t_ms) else {
-                continue;
-            };
-            let diff = (value - q).abs();
+        for (i, q) in pooled.iter().enumerate().take(series_count) {
+            let diff = (value - agg_value(finite_or_zero(*q))).abs();
             let better = match best {
                 Some((_, b)) => diff < b,
                 None => true,

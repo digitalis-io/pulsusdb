@@ -240,7 +240,20 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// quantile, the log2 bucket bound for histogram, `is_sel` + `akey` for
 /// comparison. The other 20 metrics goldens and all 50 search goldens are
 /// byte-identical to the wave-1-fix corpus.
-const PINNED_SQL_CORPUS: u64 = 0xc47b_293b_c17e_d944;
+///
+/// **Digest-only a fourth time, on the wave-3 ruling. Still 77 entries;
+/// TWO of the 26 `traces_metrics` goldens moved and no other file did** —
+/// `quantile_over_time_multi.sql` and `docs_quantile_worked_example.sql`,
+/// the two quantile cases, and only their `exemplars` section. The
+/// placement domain became the pooled range window, so that statement now
+/// tallies a `quantilesTDigestState` per bucket beside its sample and
+/// merges those states across the range partition with a window function
+/// (`quantilesTDigestMerge(…) OVER ()`): one statement, one scan, the
+/// pooled `p` values on every row. The predicate, the window, the sampled
+/// tuple and the `groupArraySample` bound are unchanged; the other 24
+/// metrics goldens and all 50 search goldens are byte-identical to the
+/// wave-2-fix corpus.
+const PINNED_SQL_CORPUS: u64 = 0x9fab_0aa0_3987_a375;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
