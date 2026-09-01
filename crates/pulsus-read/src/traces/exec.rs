@@ -792,9 +792,18 @@ impl TraceEngine {
         plan: &TraceMetricsPlan,
     ) -> Result<TraceMetricsResult, ReadError> {
         let mut result = self.frame_range(plan).await?;
-        // P5: attach per-bucket exemplars (ungrouped rate/count) and apply
-        // the topk/bottomk second-stage reduction (issue #182).
-        if plan.exemplar_sql().is_some() {
+        // P5: attach exemplars and apply the topk/bottomk second-stage
+        // reduction (issue #182).
+        //
+        // Issue #477 (c) turns exemplars on by DEFAULT, so this is now a
+        // second ClickHouse statement on every range panel rather than
+        // only under a `with()` hint. The skip below is what bounds that:
+        // a frame whose samples are all zero has no bucket an exemplar
+        // could belong to, and after densification an empty answer is a
+        // full grid of zeros — exactly the shape a sparse panel produces
+        // most often. Checked against the FRAMED result, so it costs no
+        // extra query to decide.
+        if plan.exemplar_sql().is_some() && has_a_non_zero_sample(&result) {
             self.attach_range_exemplars(plan, &mut result).await?;
         }
         // P6b: the metrics-result comparison post-filter (`… > 5`).
@@ -807,9 +816,32 @@ impl TraceEngine {
         Ok(result)
     }
 
-    /// Frames the first-stage range result (before P5 exemplars/reduce).
+    /// Frames the first-stage range result (before P5 exemplars/reduce),
+    /// then DENSIFIES it onto the plan's bucket axis (issue #477 (a)).
+    ///
+    /// The fill happens here, at the framing boundary, and never in SQL:
+    /// the query still groups only over rows that exist, and the missing
+    /// buckets are materialised from the window and the step, which are
+    /// already known. A ClickHouse-side gap fill, a second query, or a
+    /// wider scan would all be the wrong shape — emitting every bucket is
+    /// a rendering property, not a scan property.
     async fn frame_range(&self, plan: &TraceMetricsPlan) -> Result<TraceMetricsResult, ReadError> {
-        self.enforce_series_cap(plan).await?;
+        self.enforce_series_cap(plan.range_probe_sql()).await?;
+        let mut result = self.frame_range_series(plan).await?;
+        if densifies(plan.kind()) {
+            let axis = plan.range_axis();
+            for series in &mut result.series {
+                densify(series, axis);
+            }
+        }
+        Ok(result)
+    }
+
+    /// The per-shape range framing, before densification.
+    async fn frame_range_series(
+        &self,
+        plan: &TraceMetricsPlan,
+    ) -> Result<TraceMetricsResult, ReadError> {
         if plan.kind() == PlanKind::Compare {
             let (cross_tab, totals) = plan
                 .compare_range()
@@ -896,7 +928,7 @@ impl TraceEngine {
                 let mut samples: Vec<(i64, f64)> = Vec::new();
                 match kind {
                     PlanKind::Count { is_rate } => {
-                        let denom = plan.step_s();
+                        let denom = plan.step_seconds();
                         let mut stream = self
                             .client
                             .query_stream::<MetricBucketRow>(&sql, &settings)
@@ -922,7 +954,17 @@ impl TraceEngine {
                         unreachable!("quantile/histogram are framed above")
                     }
                 }
-                if samples.is_empty() {
+                // Issue #477 (a): membership is per function. An ungrouped
+                // `rate`/`count_over_time` ALWAYS emits its one `__name__`
+                // series, even with no matching row anywhere in the window
+                // — densification then fills every bucket with a zero the
+                // encoder omits, and the datasource reads an absent value
+                // back as zero, which is the right answer. The value
+                // aggregations stay sparse and keep returning nothing:
+                // measured, the reference answers `{"series":[]}` for a
+                // no-match `avg_over_time` and a zero-filled series for a
+                // no-match `rate`.
+                if samples.is_empty() && !matches!(kind, PlanKind::Count { .. }) {
                     return Ok(TraceMetricsResult { series: vec![] });
                 }
                 Ok(TraceMetricsResult {
@@ -939,7 +981,7 @@ impl TraceEngine {
                 let mut by_group: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
                 match kind {
                     PlanKind::Count { is_rate } => {
-                        let denom = plan.step_s();
+                        let denom = plan.step_seconds();
                         let mut stream = self
                             .client
                             .query_stream::<MetricGroupCountRow>(&sql, &settings)
@@ -989,8 +1031,15 @@ impl TraceEngine {
     /// a `cap+1` result is a static `422 query_too_broad`
     /// ([`TooBroadReason::TraceMetricsSeriesCap`]). Ungrouped plans have
     /// no probe and return immediately.
-    async fn enforce_series_cap(&self, plan: &TraceMetricsPlan) -> Result<(), ReadError> {
-        let Some(probe) = plan.probe_sql() else {
+    ///
+    /// The probe is PASSED IN rather than read off the plan (issue #477):
+    /// the two routes count over different windows, so the range path
+    /// hands it [`TraceMetricsPlan::range_probe_sql`] and the instant path
+    /// [`TraceMetricsPlan::instant_probe_sql`]. Reading one accessor here
+    /// is what made the range answer's cap countable only over the
+    /// instant window.
+    async fn enforce_series_cap(&self, probe: Option<&str>) -> Result<(), ReadError> {
+        let Some(probe) = probe else {
             return Ok(());
         };
         let cap = self.config.max_series;
@@ -1255,10 +1304,19 @@ impl TraceEngine {
     }
 
     /// Runs the exemplar-collection query (issue #182 P5) and attaches a
-    /// bounded `trace:id` exemplar per sampled span to the (single,
-    /// ungrouped rate/count) series. Each exemplar carries the bucket's
-    /// metric value and the span's own timestamp (Tempo emits only the
-    /// trace reference; the sampled span_id is not a wire field).
+    /// bounded `trace:id` exemplar per sampled span to the first series.
+    /// Each exemplar carries the bucket's metric value and the span's own
+    /// timestamp (only the trace reference is emitted; the sampled
+    /// `span_id` is not a wire field).
+    ///
+    /// The bucket lookup keys on the row's `t`, which after issue #477 (b)
+    /// is the RIGHT-CLOSED label — the same label the series' samples are
+    /// stamped with. A left-edge lookup returned the previous bucket's
+    /// value, which is the wrong number whenever the two buckets differ.
+    ///
+    /// The SQL's `groupArraySample(k, …)` is a PER-BUCKET bound; the
+    /// resolved budget is a TOTAL (ruling 1 on issue #477), so the
+    /// collected list is thinned to it here.
     async fn attach_range_exemplars(
         &self,
         plan: &TraceMetricsPlan,
@@ -1292,6 +1350,7 @@ impl TraceEngine {
                 });
             }
         }
+        thin_exemplars(&mut exemplars, plan.exemplar_budget());
         series.exemplars = exemplars;
         Ok(())
     }
@@ -1321,7 +1380,7 @@ impl TraceEngine {
         &self,
         plan: &TraceMetricsPlan,
     ) -> Result<TraceMetricsResult, ReadError> {
-        self.enforce_series_cap(plan).await?;
+        self.enforce_series_cap(plan.instant_probe_sql()).await?;
         if plan.kind() == PlanKind::Compare {
             let (cross_tab, totals) = plan
                 .compare_instant()
@@ -1391,7 +1450,7 @@ impl TraceEngine {
                 // Ungrouped: exactly one row (aggregate with no GROUP BY).
                 let value = match kind {
                     PlanKind::Count { is_rate } => {
-                        let denom = plan.window_s();
+                        let denom = plan.window_seconds();
                         let mut n: u64 = 0;
                         let mut stream = self
                             .client
@@ -1433,7 +1492,7 @@ impl TraceEngine {
                 let mut by_group: BTreeMap<String, f64> = BTreeMap::new();
                 match kind {
                     PlanKind::Count { is_rate } => {
-                        let denom = plan.window_s();
+                        let denom = plan.window_seconds();
                         let mut stream = self
                             .client
                             .query_stream::<MetricGroupCountInstantRow>(&sql, &settings)
@@ -2648,13 +2707,91 @@ fn graph_settings(config: &TraceReadConfig) -> QuerySettings {
 
 /// The explicit encode-boundary value conversion (issue #59 plan v2
 /// delta 5): the SQL side always ships the deduped `UInt64` count;
+/// Whether a range shape emits EVERY bucket in the window or only the
+/// occupied ones (issue #477 (a)).
+///
+/// Density follows the FUNCTION, not the query — measured against the
+/// reference over one window with interior and edge gaps:
+/// `count_over_time`, `rate`, `quantile_over_time`, `histogram_over_time`,
+/// `count_over_time by(name)` and every series of a `compare()` come back
+/// dense, while `sum`/`min`/`max`/`avg_over_time` come back sparse,
+/// grouped or not. A blanket fill would create four fresh divergences;
+/// the value aggregations are already correct and must be left alone.
+fn densifies(kind: PlanKind) -> bool {
+    match kind {
+        PlanKind::Count { .. } | PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
+            true
+        }
+        PlanKind::Agg(_) => false,
+    }
+}
+
+/// Rewrites `series.samples` as exactly one sample per axis label, in
+/// ascending label order, taking the framed value where the query
+/// produced one and `0.0` where it did not.
+///
+/// Every label the SQL can produce is an axis label by construction: the
+/// range window's instants are `(aS - step, aE]`, whose right-closed
+/// bucket labels run from `aS` to `aE` inclusive — the axis exactly. A
+/// framed sample on some other label would therefore be a defect, and
+/// dropping it here is the honest handling: the axis is what the response
+/// promises.
+fn densify(series: &mut TraceMetricSeries, axis: super::metrics_plan::RangeAxis) {
+    let framed: BTreeMap<i64, f64> = series.samples.iter().copied().collect();
+    let mut dense = Vec::with_capacity(axis.points);
+    for i in 0..axis.points {
+        let label = axis.label_ms(i);
+        dense.push((label, framed.get(&label).copied().unwrap_or(0.0)));
+    }
+    series.samples = dense;
+}
+
+/// Whether any framed sample carries a non-zero value — the precondition
+/// for issuing the exemplar query at all (issue #477 (c)).
+fn has_a_non_zero_sample(result: &TraceMetricsResult) -> bool {
+    result
+        .series
+        .iter()
+        .any(|s| s.samples.iter().any(|(_, v)| *v != 0.0))
+}
+
+/// Reduces a bucket-ordered exemplar list to at most `budget` entries by
+/// even stride, keeping index `i * len / budget` for `i in 0..budget`.
+///
+/// A total budget cannot be enforced in the SQL, because
+/// `groupArraySample`'s `k` is per group and the number of occupied
+/// groups is not known until the rows come back. Taking an even stride
+/// rather than the first `budget` entries keeps the surviving exemplars
+/// spread across the window, which is what a panel draws them on; the
+/// stride is exact integer arithmetic, so it is deterministic and the
+/// same list always thins the same way.
+fn thin_exemplars(exemplars: &mut Vec<MetricExemplar>, budget: u32) {
+    let budget = budget as usize;
+    if budget == 0 {
+        exemplars.clear();
+        return;
+    }
+    let len = exemplars.len();
+    if len <= budget {
+        return;
+    }
+    let kept: Vec<MetricExemplar> = (0..budget)
+        .map(|i| exemplars[i * len / budget].clone())
+        .collect();
+    *exemplars = kept;
+}
+
 /// The count-path (`rate`/`count_over_time`) encode-boundary value:
-/// `rate` divides by its denominator (`step_s` per range bucket, the
-/// snapped window width for an instant) in `f64` here — never in SQL;
-/// `count_over_time` is the deduped count itself.
-fn count_value(is_rate: bool, n: u64, rate_denominator_s: i64) -> f64 {
+/// `rate` divides by its denominator (one bucket's width per range
+/// sample, the snapped window's width for an instant) in `f64` here —
+/// never in SQL; `count_over_time` is the deduped count itself.
+///
+/// The denominator is **fractional seconds** (issue #477 (d)): a
+/// sub-second step, or a snapped window narrower than a second, truncated
+/// to `0` under the old whole-second form and made every rate `inf`.
+fn count_value(is_rate: bool, n: u64, rate_denominator_seconds: f64) -> f64 {
     if is_rate {
-        n as f64 / rate_denominator_s as f64
+        n as f64 / rate_denominator_seconds
     } else {
         n as f64
     }

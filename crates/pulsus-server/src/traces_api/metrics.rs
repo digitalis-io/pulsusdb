@@ -86,7 +86,8 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
     let metrics_params = pulsus_read::MetricsParams {
         start_ns: params.start_ns,
         end_ns: params.end_ns,
-        step_s: params.step_s,
+        step_ms: params.step_ms,
+        exemplars: params.exemplars,
     };
     let plan =
         pulsus_read::plan_trace_metrics(&query, &metrics_params, &ctx).map_err(ApiError::Plan)?;
