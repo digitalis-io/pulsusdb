@@ -1,0 +1,15 @@
+//! A second `base_s` declared in an `extern` block. It has no body, so it
+//! can hold no read, and a rule that recognises declarations by their
+//! source line will not see it at all — this is the false GREEN of the
+//! superseded column rule.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+unsafe extern "C" {
+    fn base_s() -> i64;
+}

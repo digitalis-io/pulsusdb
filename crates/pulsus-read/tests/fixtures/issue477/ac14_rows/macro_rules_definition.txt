@@ -1,0 +1,15 @@
+//! A `macro_rules!` definition. Its expansion is invisible to the parse,
+//! so it is refused rather than read.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+macro_rules! helper {
+    () => {
+        std::time::SystemTime::now()
+    };
+}

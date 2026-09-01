@@ -2816,6 +2816,301 @@ fn scan_clocks(text: &str, label: &str) -> ClockScan {
     scan
 }
 
+/// Issue #477 wave 2, Q29 staged: every declaration form the ownership
+/// rule must recognise, in three variants each.
+///
+/// The plan's Q29 named a 19-form matrix produced by a standalone
+/// recogniser in a scratch directory. The forms are committed here
+/// (`tests/fixtures/issue477/ac14_forms/forms.txt`) and the three
+/// variants are built from each: the form alone must be GREEN, the form
+/// plus a read in a function that may not own one must be RED for the
+/// VIOLATION reason, and the form declared twice must be RED for the
+/// declaration-pin reason.
+///
+/// The answers that must not appear are the two false passes: a GREEN in
+/// the `read outside` or `second declaration` column, which would mean a
+/// break slipped through, and a RED in the `correct` column, which would
+/// mean a form is not recognised as a declaration at all. The superseded
+/// column rule answered 14 of these wrongly; it exists nowhere in this
+/// tree and is not re-created.
+///
+/// Eighteen forms, not the plan's nineteen: the `extern` block
+/// declaration has no body and so cannot hold the read its `correct`
+/// variant needs. It is staged instead as the single input
+/// `extern_block_second_decl` in the Q25 corpus above, which is the
+/// variant that discriminates — a second `base_s` with no body, invisible
+/// to any rule that recognises declarations by their source line.
+#[test]
+fn every_declaration_form_owns_its_own_clock_read() {
+    const READ: &str = "std::time::SystemTime::now()\n        \
+                        .duration_since(std::time::UNIX_EPOCH)\n        \
+                        .expect(\"clock\")\n        .as_secs() as i64";
+    const VIOLATION: &str = "clock read(s) outside the permitted helpers";
+    const PIN: &str = "is declared";
+
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/issue477/ac14_forms/forms.txt"),
+    )
+    .expect("read the form templates");
+
+    // `== name ==` sections; everything before the first header is prose.
+    let mut forms: Vec<(String, String)> = Vec::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in src.lines() {
+        if let Some(name) = line
+            .strip_prefix("== ")
+            .and_then(|rest| rest.strip_suffix(" =="))
+        {
+            if let Some((n, body)) = current.take() {
+                forms.push((n, body.join("\n")));
+            }
+            current = Some((name.to_string(), Vec::new()));
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push(line);
+        }
+    }
+    if let Some((n, body)) = current {
+        forms.push((n, body.join("\n")));
+    }
+    assert_eq!(forms.len(), 18, "the committed form set is eighteen");
+
+    let mut table = String::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (name, template) in &forms {
+        let form = template.replace("@READ@", READ);
+        let outside = format!("{form}\n\nfn unowned_case() -> i64 {{\n    {READ}\n}}\n");
+        let twice = format!("{form}\n\n{form}\n");
+        let mut row = format!("  {name:<20}");
+        for (variant, text, want) in [
+            ("correct", &form, None),
+            ("read outside", &outside, Some(VIOLATION)),
+            ("second declaration", &twice, Some(PIN)),
+        ] {
+            let label = format!("{name}/{variant}");
+            let scan = scan_clocks(text, &label);
+            let reasons = ac14_file_reasons(&scan, &["base_s"], "base_s");
+            let pin = scan.decls.iter().filter(|d| d.as_str() == "base_s").count();
+            row.push_str(&format!(
+                " | {} pin={pin}",
+                if reasons.is_empty() { "GREEN" } else { "RED  " }
+            ));
+            match want {
+                None if !reasons.is_empty() => failures.push(format!(
+                    "{label}: must be GREEN — the form is not recognised as a declaration \
+                     that owns its body:\n{}",
+                    reasons.join("\n")
+                )),
+                Some(key) => {
+                    if reasons.is_empty() {
+                        failures.push(format!("{label}: must be RED, and was GREEN"));
+                    } else if !reasons.iter().any(|r| r.contains(key)) {
+                        failures.push(format!(
+                            "{label}: expected the {key:?} reason, got:\n{}",
+                            reasons.join("\n")
+                        ));
+                    }
+                }
+                None => {}
+            }
+        }
+        table.push_str(&row);
+        table.push('\n');
+    }
+    eprintln!("Q29 — declaration forms (correct | read outside | second declaration):\n{table}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Issue #477 wave 2, Q25 staged: AC14's rule over a committed mutation
+/// corpus, one input per behaviour, each with the verdict AND the reason
+/// it must give.
+///
+/// The plan's Q25 named twenty rows a reviewer had no way to reproduce —
+/// the mutations were built in a scratch directory from a 1 500-line
+/// domain file and thrown away. The inputs are committed here instead,
+/// small enough to read, and the rows assert WHICH assertion fires, not
+/// merely that something did: a corpus where every red row is red for the
+/// same reason would prove one assertion five times.
+///
+/// The `.txt` extension keeps deliberately-wrong Rust out of the domain
+/// of the tree-walking guards over `crates/*/tests/**/*.rs`.
+///
+/// Two of the plan's rows are NOT here and cannot be: `V2n` and the whole
+/// `old (column rule)` column ran the corpus through rules that were
+/// superseded before implementation and exist nowhere in this tree.
+#[test]
+fn the_clock_scan_answers_the_committed_verdict_on_every_staged_input() {
+    /// `(input, permitted owners, the reasons that must fire)`. An empty
+    /// reason list is GREEN.
+    const ROWS: [(&str, &[&str], &[&str]); 16] = [
+        ("base_only", &["base_s"], &[]),
+        ("read_outside", &["base_s"], &[VIOLATION]),
+        ("both_owners", &["base_s", "past_window"], &[]),
+        ("third_read", &["base_s", "past_window"], &[VIOLATION]),
+        ("owner_declared_twice", &["base_s", "past_window"], &[PIN]),
+        ("no_read_at_all", &["base_s", "past_window"], &[VACUITY]),
+        ("nested_launder", &["base_s"], &[VIOLATION, PIN]),
+        ("alias_in_scanner", &["base_s"], &[]),
+        ("alias_in_case", &["base_s"], &[]),
+        ("qualified_self", &["base_s"], &[VIOLATION]),
+        ("inside_macro", &["base_s"], &[VIOLATION]),
+        ("fn_pointer", &["base_s"], &[VIOLATION]),
+        ("nested_permitted_owner", &["base_s"], &[PIN]),
+        ("macro_rules_definition", &["base_s"], &[VIOLATION, OPAQUE]),
+        ("unknown_attribute", &["base_s"], &[ATTRIBUTE]),
+        ("extern_block_second_decl", &["base_s"], &[PIN]),
+    ];
+    const VIOLATION: &str = "clock read(s) outside the permitted helpers";
+    const VACUITY: &str = "owns no clock read";
+    const PIN: &str = "is declared";
+    const OPAQUE: &str = "opaque construct(s)";
+    const ATTRIBUTE: &str = "attribute(s) outside the pinned set";
+    const ALL: [&str; 5] = [VIOLATION, VACUITY, PIN, OPAQUE, ATTRIBUTE];
+
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/issue477/ac14_rows");
+    let mut table = String::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (name, permitted, want) in ROWS {
+        let path = dir.join(format!("{name}.txt"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        let scan = scan_clocks(&text, name);
+        let reasons = ac14_file_reasons(&scan, permitted, "base_s");
+        let fired: Vec<&str> = ALL
+            .iter()
+            .copied()
+            .filter(|key| reasons.iter().any(|r| r.contains(key)))
+            .collect();
+        table.push_str(&format!(
+            "  {name:<26} occurrences={} decls={} {} {fired:?}\n",
+            scan.occs.len(),
+            scan.decls.len(),
+            if reasons.is_empty() { "GREEN" } else { "RED  " }
+        ));
+        let want_sorted: Vec<&str> = ALL.iter().copied().filter(|k| want.contains(k)).collect();
+        if fired != want_sorted {
+            failures.push(format!(
+                "{name}: expected reasons {want_sorted:?}, got {fired:?}\n{}",
+                reasons.join("\n")
+            ));
+        }
+        // Nothing outside the declared reason set may fire, so a new
+        // assertion added to the rule cannot pass unnoticed here.
+        if reasons.len() != fired.len() {
+            failures.push(format!(
+                "{name}: {} reason(s) reported but only {} classified — a reason outside \
+                 the declared set fired:\n{}",
+                reasons.len(),
+                fired.len(),
+                reasons.join("\n")
+            ));
+        }
+    }
+
+    // The seventeenth input: a file that does not parse. Under a line scan
+    // it scanned clean; the parse must refuse it instead.
+    let unparseable = std::fs::read_to_string(dir.join("does_not_parse.txt")).expect("read");
+    let panicked =
+        std::panic::catch_unwind(|| scan_clocks(&unparseable, "does_not_parse")).is_err();
+    table.push_str(&format!("  {:<26} PANIC={panicked}\n", "does_not_parse"));
+    if !panicked {
+        failures.push("does_not_parse: the scan accepted a file that is not Rust".to_string());
+    }
+
+    eprintln!("Q25 — AC14 over the staged corpus:\n{table}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// AC14's per-file half — assertions (1), (2), (3), (5) and (6) — as a
+/// verdict rather than a panic: the empty vector is GREEN and every entry
+/// is a reason the file is RED.
+///
+/// Factored out of [`every_live_metrics_window_comes_from_the_past_window_helper`]
+/// so the staged corpora under `tests/fixtures/issue477/ac14_*` run THIS
+/// rule and not a second copy of it (issue #477 wave 2, Q25 and Q29).
+/// Assertion (4) is liveness against the control fixture — a property of
+/// the control and not of the file under scan — and stays inline there.
+fn ac14_file_reasons(
+    scan: &ClockScan,
+    permitted: &[&str],
+    anti_vacuity_owner: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // (1) every read has a permitted owner.
+    let violations: Vec<&(String, String, String)> = scan
+        .occs
+        .iter()
+        .filter(|(_, owner, _)| !permitted.contains(&owner.as_str()))
+        .collect();
+    if !violations.is_empty() {
+        out.push(format!(
+            "clock read(s) outside the permitted helpers — every live metrics window must come \
+             from `past_window`, and the corpus base from `base_s`:\n{}",
+            violations
+                .iter()
+                .map(|(needle, owner, how)| format!("  {needle}::now owner={owner} {how}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    // (2) anti-vacuity: the named owner owns at least one read, so the
+    // scan is proved able to SEE a real clock site in this file.
+    if !scan
+        .occs
+        .iter()
+        .any(|(_, owner, _)| owner == anti_vacuity_owner)
+    {
+        out.push(format!(
+            "`{anti_vacuity_owner}` owns no clock read — either the scan went blind, or the \
+             corpus base was replaced by a committed epoch that will age past the delete TTL"
+        ));
+    }
+
+    // (3) each permitted name is declared EXACTLY once, counted from the
+    // same declaration list ownership is derived from — so there is no
+    // second spelling to substitute, and a nested `fn base_s() {}` that
+    // launders ownership is caught here.
+    for name in permitted {
+        let n = scan.decls.iter().filter(|d| d.as_str() == *name).count();
+        if n != 1 {
+            out.push(format!(
+                "permitted owner `{name}` is declared {n} times, expected exactly 1"
+            ));
+        }
+    }
+
+    // (5) the fail-closed census: nothing in this file can introduce a
+    // declaration or a read the parse cannot see.
+    if !scan.opaque.is_empty() {
+        out.push(format!(
+            "opaque construct(s) in the domain file: {:?} — a `macro_rules!`, an item-position \
+             macro invocation or a `Verbatim` node is refused because its expansion is invisible \
+             to this gate, not because it is wrong",
+            scan.opaque
+        ));
+    }
+
+    // (6) the attribute pin. An attribute macro rewrites the item it
+    // decorates and that rewrite is invisible to this parse, so the set of
+    // attribute paths is pinned rather than trusted.
+    let unknown: Vec<&String> = scan
+        .attrs
+        .iter()
+        .filter(|a| !ATTR_ALLOW.contains(&a.as_str()))
+        .collect();
+    if !unknown.is_empty() {
+        out.push(format!(
+            "attribute(s) outside the pinned set {ATTR_ALLOW:?}: {unknown:?} — an attribute \
+             macro rewrites the item it decorates and that rewrite is invisible to this parse. \
+             Widening `ATTR_ALLOW` is a deliberate decision, not a tidy-up."
+        ));
+    }
+
+    out
+}
+
 /// AC14. Class PRESERVATION: it is GREEN on `2f78c53` (where the only
 /// clock read is `base_s`'s) and stays green here, and what it forbids is
 /// a clock read arriving anywhere else later.
@@ -2826,42 +3121,9 @@ fn every_live_metrics_window_comes_from_the_past_window_helper() {
 
     let src = scan_clocks(SRC, "traces_metrics_live.rs");
 
-    // (1) every read has a permitted owner.
-    let violations: Vec<&(String, String, String)> = src
-        .occs
-        .iter()
-        .filter(|(_, owner, _)| !PERMITTED.contains(&owner.as_str()))
-        .collect();
-    assert!(
-        violations.is_empty(),
-        "clock read(s) outside the permitted helpers — every live metrics window must come from \
-         `past_window`, and the corpus base from `base_s`:\n{}",
-        violations
-            .iter()
-            .map(|(needle, owner, how)| format!("  {needle}::now owner={owner} {how}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-
-    // (2) anti-vacuity: `base_s` owns at least one read, so the scan is
-    // proved able to SEE a real clock site in this file.
-    assert!(
-        src.occs.iter().any(|(_, owner, _)| owner == "base_s"),
-        "`base_s` owns no clock read — either the scan went blind, or the corpus base was \
-         replaced by a committed epoch that will age past the delete TTL"
-    );
-
-    // (3) each permitted name is declared EXACTLY once, counted from the
-    // same declaration list ownership is derived from — so there is no
-    // second spelling to substitute, and a nested `fn base_s() {}` that
-    // launders ownership is caught here.
-    for name in PERMITTED {
-        let n = src.decls.iter().filter(|d| *d == name).count();
-        assert_eq!(
-            n, 1,
-            "permitted owner `{name}` is declared {n} times, expected exactly 1"
-        );
-    }
+    // Assertions (1), (2), (3), (5) and (6), all over this file.
+    let reasons = ac14_file_reasons(&src, &PERMITTED, "base_s");
+    assert!(reasons.is_empty(), "{}", reasons.join("\n\n"));
 
     // (4) needle liveness against the committed control: one hit per
     // needle, under its own probe, every one a violation. With the domain
@@ -2882,29 +3144,4 @@ fn every_live_metrics_window_comes_from_the_past_window_helper() {
             "the control's owners must NOT be permitted, or it proves nothing"
         );
     }
-
-    // (5) the fail-closed census: nothing in this file can introduce a
-    // declaration or a read the parse cannot see.
-    assert!(
-        src.opaque.is_empty(),
-        "opaque construct(s) in the domain file: {:?} — a `macro_rules!`, an item-position \
-         macro invocation or a `Verbatim` node is refused because its expansion is invisible \
-         to this gate, not because it is wrong",
-        src.opaque
-    );
-
-    // (6) the attribute pin. An attribute macro rewrites the item it
-    // decorates and that rewrite is invisible to this parse, so the set of
-    // attribute paths is pinned rather than trusted.
-    let unknown: Vec<&String> = src
-        .attrs
-        .iter()
-        .filter(|a| !ATTR_ALLOW.contains(&a.as_str()))
-        .collect();
-    assert!(
-        unknown.is_empty(),
-        "attribute(s) outside the pinned set {ATTR_ALLOW:?}: {unknown:?} — an attribute macro \
-         rewrites the item it decorates and that rewrite is invisible to this parse. Widening \
-         `ATTR_ALLOW` is a deliberate decision, not a tidy-up."
-    );
 }

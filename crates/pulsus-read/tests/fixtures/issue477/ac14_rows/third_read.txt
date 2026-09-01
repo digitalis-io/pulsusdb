@@ -1,0 +1,22 @@
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn past_window(width_s: i64) -> (i64, i64) {
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    (now_s - 60 - width_s, now_s - 60)
+}
+
+fn a_case() -> (i64, i64) {
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    (now_s - 5, now_s)
+}

@@ -1,0 +1,12 @@
+//! A read hidden in a macro body, which `syn` does not parse.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn a_case() {
+    assert!(std::time::Instant::now().elapsed().as_secs() < 1);
+}

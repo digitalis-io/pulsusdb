@@ -1,0 +1,23 @@
+//! `past_window` declared twice. Every read is owned by a permitted
+//! name, so assertion (1) is silent and only the declaration pin fires.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn past_window(width_s: i64) -> (i64, i64) {
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    (now_s - 60 - width_s, now_s - 60)
+}
+
+mod other {
+    pub fn past_window(width_s: i64) -> (i64, i64) {
+        (0 - width_s, 0)
+    }
+}

@@ -1135,6 +1135,43 @@ fn metrics_root(rel: &str) -> std::path::PathBuf {
         .join(rel)
 }
 
+/// AC10(i)'s verdict over one scanned tree: the empty vector is GREEN and
+/// every entry is a reason the tree is RED, in a fixed order.
+///
+/// Factored out of [`the_metrics_path_carries_no_stale_step_unit_token`]
+/// so the staged mutation corpus under
+/// `tests/fixtures/issue477/ac10i_trees/` runs THIS rule and not a second
+/// copy of it (issue #477 wave 2, Q23). `file_floor` is the anti-vacuity
+/// floor, which scales with the tree: 30 for the two real roots, a
+/// fixture's own file count for a staged tree.
+fn ac10i_reasons(
+    hits: &[(String, usize, &'static str)],
+    files: usize,
+    step_ms: usize,
+    file_floor: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    // Anti-vacuity: a scan pointed at nothing must fail, not pass.
+    if files < file_floor {
+        out.push(format!(
+            "only {files} .rs files scanned — the scan read almost nothing"
+        ));
+    }
+    if step_ms < 1 {
+        out.push("no `step_ms` anywhere — the scan is not reading the changed code".to_string());
+    }
+    if !hits.is_empty() {
+        out.push(format!(
+            "stale pre-#477 spellings survive in the metrics path:\n{}",
+            hits.iter()
+                .map(|(f, l, t)| format!("  {f}:{l} {t}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    out
+}
+
 /// AC10(i). Class CHANGE: at `2f78c53` this fails with 75 occurrences over
 /// 73 lines in 5 files.
 #[test]
@@ -1151,23 +1188,86 @@ fn the_metrics_path_carries_no_stale_step_unit_token() {
         files += n;
         step_ms += m;
     }
-    // Anti-vacuity: a scan pointed at nothing must fail, not pass.
-    assert!(
-        files >= 30,
-        "only {files} .rs files scanned — the scan read almost nothing"
-    );
-    assert!(
-        step_ms >= 1,
-        "no `step_ms` anywhere — the scan is not reading the changed code"
-    );
-    assert!(
-        hits.is_empty(),
-        "stale pre-#477 spellings survive in the metrics path:\n{}",
-        hits.iter()
-            .map(|(f, l, t)| format!("  {f}:{l} {t}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    let reasons = ac10i_reasons(&hits, files, step_ms, 30);
+    assert!(reasons.is_empty(), "{}", reasons.join("\n"));
+}
+
+/// Issue #477 wave 2, Q23 staged: the same rule over the six committed
+/// mutation trees, each with the verdict and the occurrence count it must
+/// give. The plan's Q23 named eighteen answers a reviewer had no way to
+/// reproduce — the trees were built in a scratch directory and thrown
+/// away — so the trees are committed here and the answers are asserted.
+///
+/// Fixtures are `.txt` and are materialised as `.rs` in a temporary
+/// directory: an `.rs` file under `crates/*/tests/` is inside the domain
+/// of `live_db_naming.rs` and `live_port_uniqueness.rs`, and a corpus of
+/// deliberately-wrong source has no business being in either.
+///
+/// `e3b` is GREEN on purpose. It is the published defeat of this
+/// best-effort scan: a consistent rename of all five spellings to a name
+/// that is also wrong passes, because the rule compares spellings and not
+/// meanings. What enforces the meaning is AC6, AC7(c), AC5 and AC13.
+#[test]
+fn the_stale_unit_scan_answers_the_committed_verdict_on_every_staged_tree() {
+    /// `(tree, expected verdict is GREEN, banned-spelling occurrences)`.
+    const ROWS: [(&str, bool, usize); 6] = [
+        ("base", false, 7),
+        ("e1", false, 1),
+        ("e2", false, 4),
+        ("e3", false, 1),
+        ("e3b", true, 0),
+        ("e4", false, 2),
+    ];
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/issue477/ac10i_trees");
+    let scratch = std::env::temp_dir().join(format!("pulsus-i477-ac10i-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    let mut table = String::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (tree, want_green, want_hits) in ROWS {
+        let out = scratch.join(tree);
+        std::fs::create_dir_all(&out).expect("create the staged tree");
+        let mut staged = 0usize;
+        for entry in std::fs::read_dir(src.join(tree)).expect("read the fixture tree") {
+            let path = entry.expect("fixture entry").path();
+            let stem = path
+                .file_stem()
+                .expect("stem")
+                .to_string_lossy()
+                .into_owned();
+            std::fs::copy(&path, out.join(format!("{stem}.rs"))).expect("stage the fixture");
+            staged += 1;
+        }
+        let (hits, files, step_ms) = stale_spellings(&out);
+        // The floor is this tree's own file count, so the anti-vacuity
+        // half still fires on an emptied directory without rejecting a
+        // fixture for being small.
+        let reasons = ac10i_reasons(&hits, files, step_ms, staged);
+        let green = reasons.is_empty();
+        table.push_str(&format!(
+            "  {tree:<5} files={files} occurrences={} step_ms={step_ms} {}\n",
+            hits.len(),
+            if green { "GREEN" } else { "RED" }
+        ));
+        if green != want_green {
+            failures.push(format!(
+                "{tree}: expected {}, got {} ({reasons:?})",
+                if want_green { "GREEN" } else { "RED" },
+                if green { "GREEN" } else { "RED" }
+            ));
+        }
+        if hits.len() != want_hits {
+            failures.push(format!(
+                "{tree}: expected {want_hits} banned occurrences, got {} ({hits:?})",
+                hits.len()
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    eprintln!("Q23 — AC10(i) over the staged trees:\n{table}");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// AC10(i-b). The complete set of NON-COMPILED residue outside the two

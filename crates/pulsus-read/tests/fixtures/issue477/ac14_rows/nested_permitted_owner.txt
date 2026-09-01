@@ -1,0 +1,21 @@
+//! A nested `fn base_s` that itself reads the clock. Ownership is
+//! legitimately permitted, so assertion (1) is silent; the declaration
+//! pin is the only thing that catches it, which is the row that pin
+//! exists for.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn a_case() -> i64 {
+    fn base_s() -> i64 {
+        std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+    }
+    base_s()
+}

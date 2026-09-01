@@ -1,0 +1,107 @@
+Issue #477 Q29 — every declaration form AC14's ownership rule must
+recognise. One entry per form; `@READ@` is replaced by the clock read.
+
+The runner builds three variants of each: the form alone (GREEN), the
+form plus a read in a function that may not own one (RED, violation),
+and the form declared twice (RED, declaration pin).
+
+== bare ==
+fn base_s() -> i64 {
+    @READ@
+}
+== pub ==
+pub fn base_s() -> i64 {
+    @READ@
+}
+== pub_crate ==
+pub(crate) fn base_s() -> i64 {
+    @READ@
+}
+== pub_super ==
+mod inner {
+    pub(super) fn base_s() -> i64 {
+        @READ@
+    }
+}
+== pub_in_path ==
+mod inner {
+    pub(in crate::inner) fn base_s() -> i64 {
+        @READ@
+    }
+}
+== async ==
+async fn base_s() -> i64 {
+    @READ@
+}
+== const ==
+const fn base_s() -> i64 {
+    @READ@
+}
+== unsafe ==
+unsafe fn base_s() -> i64 {
+    @READ@
+}
+== extern_c ==
+extern "C" fn base_s() -> i64 {
+    @READ@
+}
+== all_modifiers ==
+pub const unsafe extern "C" fn base_s() -> i64 {
+    @READ@
+}
+== generic_where ==
+fn base_s<T>() -> i64
+where
+    T: Copy,
+{
+    @READ@
+}
+== attributed ==
+#[allow(dead_code)]
+fn base_s() -> i64 {
+    @READ@
+}
+== nested_in_fn ==
+fn outer_case() {
+    fn base_s() -> i64 {
+        @READ@
+    }
+    let _ = base_s();
+}
+== in_mod ==
+mod inner {
+    fn base_s() -> i64 {
+        @READ@
+    }
+}
+== mod_in_fn ==
+fn outer_case() {
+    mod inner {
+        pub fn base_s() -> i64 {
+            @READ@
+        }
+    }
+    let _ = inner::base_s();
+}
+== inherent_impl ==
+struct Holder;
+
+impl Holder {
+    fn base_s() -> i64 {
+        @READ@
+    }
+}
+== trait_impl ==
+struct Holder;
+
+impl ExternalTrait for Holder {
+    fn base_s() -> i64 {
+        @READ@
+    }
+}
+== trait_default_body ==
+trait Base {
+    fn base_s() -> i64 {
+        @READ@
+    }
+}
