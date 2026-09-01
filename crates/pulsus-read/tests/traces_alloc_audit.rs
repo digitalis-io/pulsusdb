@@ -61,7 +61,7 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
     ("exec.rs", "apply_series_reduce", ".collect", 2,
      "topk/bottomk client-side reduction (issue #182 P5) over the ALREADY-materialized (probe-capped) series set; the per-timestamp rank/keep buffers are bounded by that series count"),
     ("exec.rs", "attach_range_exemplars", "Vec::new", 1,
-     "exemplar list (issue #182 P5) - bounded by MAX_METRICS_POINTS buckets x the per-bucket exemplar cap MAX_EXEMPLARS_PER_BUCKET; outside the search ByteBudget by design"),
+     "exemplar list (issue #182 P5) - bounded by the total exemplar budget (issue #477: MAX_EXEMPLARS for the whole response, thinned to it after collection), and before thinning by MAX_METRICS_POINTS + 1 buckets x the per-bucket sample size the budget spreads over that grid; outside the search ByteBudget by design"),
     ("exec.rs", "attach_range_exemplars", ".collect", 1,
      "value-at-bucket lookup map, bounded by MAX_METRICS_POINTS buckets; same metrics carve-out"),
     ("exec.rs", "frame_compare", "Vec::new", 7,

@@ -181,7 +181,33 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// so the SQL alone cannot discriminate them — the negation does, and a
 /// negated leaf projects nothing. `git diff --name-only -- /// crates/pulsus-read/tests/golden/traces_search/` shows exactly those
 /// seven, and `CORPORA`'s count stays `50`.
-const PINNED_SQL_CORPUS: u64 = 0x29bb_2bb8_568a_3382;
+///
+/// **Digest-only on issue #477. The corpus stays at 77 entries: all 26
+/// `traces_metrics` goldens were REGENERATED, 0 added, 0 removed**, and
+/// the 50 `traces_search` goldens are byte-identical. Three things moved
+/// in every regenerated file at once, which is why the whole corpus half
+/// moves together:
+///   1. the range bucket label became RIGHT-CLOSED —
+///      `toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), …)
+///      + step_ms` in place of the left-edge form — so a span landing on
+///      a grid point belongs to that point;
+///   2. the range window widened to `(aS - step, aE]`, rendered as
+///      `>= 1699999920000000001 AND < 1700010840000000001`, one whole
+///      step earlier and one nanosecond later than the instant window;
+///   3. two sections were ADDED per file — a `range series probe` (or
+///      `compare range series probe`) beside the frozen instant one, and
+///      an `exemplars` section, since exemplars are now collected by
+///      default rather than only under a `with()` hint.
+/// The `instant (query)`, `series probe` and `compare series probe`
+/// sections are byte-identical to `2f78c53` in all 26 files — the instant
+/// route is #503's and this change moves none of its bytes. **The
+/// committed base copy lives in `tests/golden/traces_metrics_base/`,
+/// which is a SIBLING of the two walked roots and therefore outside this
+/// corpus**: `CORPORA` is a fixed two-name list, so neither the count
+/// (still 50 + 27 = 77) nor this digest can see it. Do not "fix" either
+/// by adding it — that would freeze the base copy and defeat the
+/// section-wise inverse the base copy exists for.
+const PINNED_SQL_CORPUS: u64 = 0x03c0_08a1_8a1a_981a;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
