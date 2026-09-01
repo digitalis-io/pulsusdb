@@ -214,7 +214,17 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// (still 50 + 27 = 77) nor this digest can see it. Do not "fix" either
 /// by adding it — that would freeze the base copy and defeat the
 /// section-wise inverse the base copy exists for.
-const PINNED_SQL_CORPUS: u64 = 0xb359_140a_e92a_1789;
+///
+/// **Digest-only again on issue #477 wave 2. Still 77 entries; two of
+/// the 26 `traces_metrics` goldens moved and no other file did** —
+/// `rate_by_service.sql` and `sum_over_time_by_service.sql`, the two
+/// grouped cases. Their `exemplars` section gained the group column the
+/// grouped range query already groups by (`, service AS g0` in the
+/// SELECT list, `GROUP BY t, g0`, `ORDER BY t ASC, g0`) so an exemplar
+/// row says which series it belongs to. Nothing else in either file
+/// moves, and the other 24 metrics goldens and all 50 search goldens are
+/// byte-identical to the wave-1 corpus.
+const PINNED_SQL_CORPUS: u64 = 0x0352_4103_5bf4_1227;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
