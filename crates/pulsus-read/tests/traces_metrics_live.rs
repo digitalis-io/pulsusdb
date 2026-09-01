@@ -3154,12 +3154,19 @@ fn scan_clocks(text: &str, label: &str) -> ClockScan {
 /// column rule answered 14 of these wrongly; it exists nowhere in this
 /// tree and is not re-created.
 ///
-/// Eighteen forms, not the plan's nineteen: the `extern` block
-/// declaration has no body and so cannot hold the read its `correct`
-/// variant needs. It is staged instead as the single input
-/// `extern_block_second_decl` in the Q25 corpus above, which is the
-/// variant that discriminates — a second `base_s` with no body, invisible
-/// to any rule that recognises declarations by their source line.
+/// Nineteen forms, not the plan's twenty: the `extern` block declaration
+/// has no body and so cannot hold the read its `correct` variant needs.
+/// It is staged instead as the single input `extern_block_second_decl` in
+/// the Q25 corpus above, which is the variant that discriminates — a
+/// second `base_s` with no body, invisible to any rule that recognises
+/// declarations by their source line.
+///
+/// The nineteenth is the RECEIVER-method form, `fn base_s(&self)`, added
+/// on the wave-2 review's finding: it is in the plan, it is expressible
+/// and it runs, so leaving it out was an omission and not an
+/// impossibility. It differs from `inherent_impl` in the thing the rule
+/// has to get right — a method with a receiver, where `inherent_impl` is
+/// an associated function without one.
 #[test]
 fn every_declaration_form_owns_its_own_clock_read() {
     const READ: &str = "std::time::SystemTime::now()\n        \
@@ -3193,7 +3200,7 @@ fn every_declaration_form_owns_its_own_clock_read() {
     if let Some((n, body)) = current {
         forms.push((n, body.join("\n")));
     }
-    assert_eq!(forms.len(), 18, "the committed form set is eighteen");
+    assert_eq!(forms.len(), 19, "the committed form set is nineteen");
 
     let mut table = String::new();
     let mut failures: Vec<String> = Vec::new();

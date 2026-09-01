@@ -105,3 +105,11 @@ trait Base {
         @READ@
     }
 }
+== receiver_method ==
+struct Holder;
+
+impl Holder {
+    fn base_s(&self) -> i64 {
+        @READ@
+    }
+}

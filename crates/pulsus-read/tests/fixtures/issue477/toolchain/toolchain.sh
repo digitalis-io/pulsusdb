@@ -83,6 +83,7 @@ echo "step_ms occurrences in the two roots, before: $BEFORE"
 # to demand, one round at a time.
 perl -0pi -e 's{pub step_ms: i64,}{pub step_units: i64,}g' "$PLAN"
 perl -0pi -e 's{pub fn step_ms\(&self\) -> i64 \{\n        self\.step_ms\n    \}}{pub fn step_units(&self) -> i64 {\n        self.step_units\n    }}' "$PLAN"
+RENAMED=0
 for round in 1 2 3 4 5 6 7 8; do
   cargo check --keep-going --all-targets -p pulsus-read -p pulsus-server \
     --message-format=json > "$WORK/round.json" 2>/dev/null
@@ -90,6 +91,8 @@ for round in 1 2 3 4 5 6 7 8; do
   out=$(python3 "$FIXPOINT" rename "$WORK/round.json" "$ROOT" "$WORK/ledger.tsv" step_ms step_units)
   guard=$?
   echo "  round $round cargo_check_exit=$code guard_exit=$guard $out"
+  this=$(printf '%s' "$out" | sed -n 's/.*occurrences_renamed=\([0-9]*\).*/\1/p')
+  RENAMED=$(( RENAMED + ${this:-0} ))
   [ "$code" = "0" ] && break
   [ "$guard" != "0" ] && break
   # A round that renames nothing will report the same sites for ever:
@@ -98,13 +101,40 @@ for round in 1 2 3 4 5 6 7 8; do
   case "$out" in *"occurrences_renamed=0"*)
     echo "  STALLED — the compiler still demands these sites and the rewrite reached none of them:"
     sed -n 's/.*/  &/p' "$WORK/ledger.tsv" | head -20
+    echo "  what the compiler is asking for at each (its own message, and the"
+    echo "  line as the mutated tree has it):"
+    python3 "$HERE/stalled.py" "$WORK/round.json" "$ROOT"
     break ;;
   esac
 done
 AFTER=$(git grep -c '\bstep_ms\b' -- crates/pulsus-read/src/traces crates/pulsus-server/src/traces_api | awk -F: '{n+=$2} END {print n+0}')
 echo "step_ms occurrences left in the two roots when the loop stopped: ${AFTER:-0}"
-echo "(the compiler demanded none of these; they are doc comments, string"
-echo " literals and local bindings — the residue AC10(i) exists for)"
+echo
+echo "WHY IT STOPPED, and it is a limit of THIS INSTRUMENT:"
+echo "  the rewrite is line-local — it substitutes the old name on the line"
+echo "  the compiler's primary span points at. Every stalled site above is a"
+echo "  no-op because that line no longer holds the old name; the edit the"
+echo "  compiler is asking for is on a DIFFERENT line, and the messages"
+echo "  printed beside each site say which. The sites are ordinary Rust"
+echo "  code, not comments or literals."
+echo
+echo "WHAT THIS RUN ESTABLISHES:"
+echo "  - a wrong unit compiles clean (Q26(a) above);"
+echo "  - the compiler PROPAGATES a seed rename without being asked: renaming"
+echo "    two struct fields and one accessor made it demand sites the seed"
+echo "    never touched, and $RENAMED of the $BEFORE occurrences were rewritten"
+echo "    from its demands alone;"
+echo "  - it never DEMANDED a rename: it went quiet as soon as the types"
+echo "    agreed, which is the Q26 claim."
+echo
+echo "WHAT IT DOES NOT ESTABLISH:"
+echo "  nothing at all about the ${AFTER:-0} occurrences left. They were not"
+echo "  reached, and this run cannot say whether the compiler would demand"
+echo "  them under a rewrite able to express the stalled sites. They are"
+echo "  listed below as a record of what was NOT reached — not as a"
+echo "  classification of it. Reading that list shows the mixture: private"
+echo "  field declarations, function parameters, doc comments and panic"
+echo "  messages alike, i.e. whatever the seed rename's blast radius missed."
 git grep -n '\bstep_ms\b' -- crates/pulsus-read/src/traces crates/pulsus-server/src/traces_api | head -40
 restore
 
