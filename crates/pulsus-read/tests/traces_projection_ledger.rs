@@ -86,11 +86,26 @@ fn the_api_doc_states_every_clause_of_the_projection_rule() {
     // Each clause is a SEPARATE property of the rule, so each is checked
     // separately: a paragraph that states four of five is a paragraph a
     // reader would act on wrongly.
-    let clauses: [(&str, &str); 6] = [
+    let clauses: [(&str, &str); 8] = [
         (
             "the condition half",
             "the fields the query filtered on with a **single-field condition that matched THAT \
              span**",
+        ),
+        // The clause the wave-1 code review found missing: the paragraph
+        // listed "field-vs-field" flatly under the classes that project
+        // nothing, so it said the opposite of what the code now does for
+        // the same-field form.
+        (
+            "what makes a condition single-field",
+            "**A condition is single-field when exactly ONE DISTINCT field appears across BOTH \
+             its operands**",
+        ),
+        (
+            "the same-field comparisons that DO project",
+            "the degenerate same-field comparisons `{.a = .a}`, `{name = name}`, \
+             `{nestedSetLeft = nestedSetLeft}` and `{resource.service.name = \
+             resource.service.name}` all project that one field",
         ),
         ("the select half", "plus every `select()`ed field"),
         (
@@ -111,6 +126,14 @@ fn the_api_doc_states_every_clause_of_the_projection_rule() {
             "**`span:childCount` is never projected** in either position",
         ),
     ];
+    // The multi-field clause must name the DISTINCT-field restriction, not
+    // "field-vs-field" flatly — the wording the review found wrong.
+    assert!(
+        !doc.contains(&squash(
+            "a **multi-field** condition (field-vs-field, cross-attribute arithmetic"
+        )),
+        "docs/api.md §4.2 still lists field-vs-field flatly as a class that projects nothing;          a same-field comparison DOES project"
+    );
     for (what, needle) in clauses {
         assert!(
             doc.contains(&squash(needle)),

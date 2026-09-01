@@ -283,7 +283,12 @@ pub(crate) enum TraceCtxEval {
 /// attribute operand is interned into BOTH `agg_fields` (its `val_num`
 /// read) and `select_attrs` (its `val` read) so Phase 2 has a typed value
 /// with no new hydration SQL builder.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` decides "the two operands are the SAME field" for issue
+/// #479's same-field projection: interning is append-only and dedupes, so
+/// two references to one attribute carry identical indices, and every
+/// other variant is a unit or a `Copy` field id.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlannedOperand {
     Name,
     Service,
@@ -1838,13 +1843,22 @@ fn projection_target(field: &Field) -> Option<ProjectionTarget> {
 /// projection from (issue #479 rule 3), or `None` when the leaf is
 /// deferred to wave 2.
 ///
-/// **Exactly three of the ten [`PlannedLeafEval`] variants project**, and
-/// the match is exhaustive with no wildcard so an eleventh variant fails
-/// to compile rather than silently joining the deferred set:
-/// `Physical`, `Attr { negated: false }` and `NestedSet`. The other
-/// seven — `BoolTruth`, `FieldCompare`, `TraceCtx`, `Arith`, `Const`,
-/// `BoolCompare`, `EventSetCompare` — produce no source and carry a
-/// ledger row (docs/benchmarks/traces-differential-ledger.md).
+/// **Four of the ten [`PlannedLeafEval`] variants project**, and the match
+/// is exhaustive with no wildcard so an eleventh variant fails to compile
+/// rather than silently joining the deferred set: `Physical`,
+/// `Attr { negated: false }`, `NestedSet`, and a `FieldCompare` whose two
+/// operands are the SAME field. The other six — `BoolTruth`, `TraceCtx`,
+/// `Arith`, `Const`, `BoolCompare`, `EventSetCompare` — produce no source
+/// and carry a ledger row (docs/benchmarks/traces-differential-ledger.md),
+/// as does a `FieldCompare` naming two DISTINCT fields.
+///
+/// The `FieldCompare` split is [`single_field_of_comparison`]'s rule
+/// applied to the value as well as to the identity (code review, wave 1):
+/// `{.a = .a}`, `{name = name}` and `{nestedSetLeft = nestedSetLeft}` name
+/// exactly one field, so they are single-field conditions and the
+/// reference projects that field for them. Half a reading — collecting the
+/// identity wide and refusing the value narrow — matched spans and dropped
+/// the projection, which is neither reading.
 ///
 /// `TraceCtx` is deferred on measurement, not on cost: four of its five
 /// operands are among the seven, and the fifth (`span:childCount`) is
@@ -1890,13 +1904,64 @@ fn projection_value(
             }
         },
         PlannedLeafEval::NestedSet { field, .. } => Some(ProjectionValue::NestedSet(*field)),
+        // A comparison between two operands that are the SAME field is a
+        // single-field condition and projects that field's value; two
+        // DISTINCT fields stay the deferred multi-field class. The
+        // equality is checked here rather than assumed from the caller's
+        // `single_field_of_comparison` gate, so this function is correct
+        // read on its own.
+        PlannedLeafEval::FieldCompare { lhs, rhs, .. } => {
+            if lhs == rhs {
+                operand_projection_value(lhs)
+            } else {
+                None
+            }
+        }
         PlannedLeafEval::BoolTruth { .. }
-        | PlannedLeafEval::FieldCompare { .. }
         | PlannedLeafEval::TraceCtx(_)
         | PlannedLeafEval::Arith { .. }
         | PlannedLeafEval::Const(_)
         | PlannedLeafEval::BoolCompare { .. }
         | PlannedLeafEval::EventSetCompare { .. } => None,
+    }
+}
+
+/// The value source a resolved comparison OPERAND can fill a projection
+/// from — the same value the comparison itself already resolves per
+/// candidate span, so a same-field `FieldCompare` costs no extra read
+/// (issue #479, code review wave 1).
+///
+/// An attribute operand reads `select_attrs[str_idx]`, the `val` column
+/// `plan_operand` already interned for it, which is exactly the source the
+/// `select()` half uses. The match is exhaustive over `PlannedOperand`
+/// with no wildcard, so a new operand kind must decide here.
+fn operand_projection_value(operand: &PlannedOperand) -> Option<ProjectionValue> {
+    match operand {
+        PlannedOperand::Name => Some(ProjectionValue::Name),
+        PlannedOperand::Service => Some(ProjectionValue::Service),
+        PlannedOperand::Status => Some(ProjectionValue::Status),
+        PlannedOperand::Kind => Some(ProjectionValue::Kind),
+        PlannedOperand::StatusMessage => Some(ProjectionValue::StatusMessage),
+        PlannedOperand::ParentId => Some(ProjectionValue::ParentIdHex),
+        PlannedOperand::ScopeName => Some(ProjectionValue::ScopeName),
+        PlannedOperand::ScopeVersion => Some(ProjectionValue::ScopeVersion),
+        PlannedOperand::NestedSet(field) => Some(ProjectionValue::NestedSet(*field)),
+        PlannedOperand::Attr { str_idx, .. } => Some(ProjectionValue::SelectValue {
+            field_idx: *str_idx,
+        }),
+        // Six of the seven the response envelope already carries;
+        // `projection_target` has refused them before this is reached,
+        // and they are kept explicit so the match stays exhaustive.
+        PlannedOperand::Duration
+        | PlannedOperand::SpanId
+        | PlannedOperand::TraceId
+        | PlannedOperand::TraceDurationNs
+        | PlannedOperand::RootName
+        | PlannedOperand::RootServiceName => None,
+        // `span:childCount` is never projected in EITHER position — the
+        // reference does not collect it (ledger
+        // `traceql-matched-span-multi-field-leaf-not-projected`).
+        PlannedOperand::ChildCount => None,
     }
 }
 
@@ -2409,6 +2474,13 @@ mod tests {
             r#"{ instrumentation:name = "scope" }"#,
             // Single-field arithmetic: one field through an operand tree.
             r#"{ .duration_ms * 1000 > 5000 }"#,
+            // A comparison whose two operands are the SAME field is also a
+            // single-field condition: the AST names one field twice and
+            // the plan projects it once (code review, wave 1).
+            r#"{ .a = .a }"#,
+            r#"{ name = name }"#,
+            r#"{ nestedSetLeft = nestedSetLeft }"#,
+            r#"{ resource.service.name = resource.service.name }"#,
             // Two distinct fields: the multi-field class, deferred — the
             // AST names both, the plan projects neither, so this row is
             // asserted separately below.
@@ -2468,7 +2540,7 @@ mod tests {
             (r#"{ !(span.a = "x") }"#, "a leaf under `!`"),
             (r#"{ .a = nil }"#, "a negated Exists"),
             (r#"{ !.a }"#, "BoolTruth"),
-            (r#"{ .a = .b }"#, "FieldCompare"),
+            (r#"{ .a = .b }"#, "FieldCompare (two DISTINCT fields)"),
             (r#"{ traceDuration > 1s }"#, "TraceCtx"),
             (r#"{ rootName = "r" }"#, "TraceCtx (rootName)"),
             (r#"{ span:childCount > 0 }"#, "TraceCtx (childCount)"),
@@ -2510,6 +2582,319 @@ mod tests {
         let p = plan(r#"{ span.a = "x" }"#);
         assert_eq!(p.projections.len(), 1);
         assert!(p.projections[0].sources[0].gate.is_some());
+    }
+
+    /// Issue #479, code review wave 1 — a comparison whose two operands
+    /// are the SAME field projects that field; two DISTINCT fields still
+    /// project nothing.
+    ///
+    /// The pair is the discriminator: an implementation that refuses every
+    /// `FieldCompare` passes the second half and fails the first, which is
+    /// exactly the state this test was written for. The expected value
+    /// SOURCE is asserted, not merely the group's existence — a group
+    /// filled from the wrong operand would carry a different label.
+    #[test]
+    fn a_same_field_comparison_projects_and_a_distinct_field_one_does_not() {
+        for (q, want_key, want_value) in [
+            (r#"{ .a = .a }"#, "a", "value:select-value"),
+            (
+                r#"{ span.http.method = span.http.method }"#,
+                "http.method",
+                "value:select-value",
+            ),
+            (r#"{ name = name }"#, "name", "value:name"),
+            (
+                r#"{ resource.service.name = resource.service.name }"#,
+                // `resource.service.name` parses as the RESOURCE-scoped
+                // attribute `service.name`, so the bare wire key drops the
+                // scope exactly as it does for any other attribute.
+                "service.name",
+                "value:service",
+            ),
+            (
+                r#"{ nestedSetLeft = nestedSetLeft }"#,
+                "nestedSetLeft",
+                "value:nested-set",
+            ),
+            (
+                r#"{ statusMessage = statusMessage }"#,
+                "statusMessage",
+                "value:status-message",
+            ),
+        ] {
+            let p = plan(q);
+            assert_eq!(p.projections.len(), 1, "{q}: exactly one group");
+            let group = &p.projections[0];
+            assert_eq!(group.sources.len(), 1, "{q}: one source");
+            let source = &group.sources[0];
+            assert!(
+                source.gate.is_some(),
+                "{q}: the projection is gated on the leaf matching THAT span"
+            );
+            assert_eq!(
+                projection_value_label(&source.value),
+                want_value,
+                "{q}: the value comes from the compared operand"
+            );
+            match &group.target {
+                ProjectionTarget::SpanName => assert_eq!(want_key, "name", "{q}"),
+                ProjectionTarget::Attribute(k) => assert_eq!(k.as_str(), want_key, "{q}"),
+            }
+        }
+        // `span:childCount` is never projected in either position, so the
+        // same-field form of it is not an exception to that.
+        for q in [
+            r#"{ .a = .b }"#,
+            r#"{ span.foo = resource.foo }"#,
+            r#"{ span:childCount = span:childCount }"#,
+        ] {
+            assert!(
+                plan(q).projections.is_empty(),
+                "{q}: two DISTINCT fields — or a never-projected one — supply no value"
+            );
+        }
+    }
+
+    // ---- the DOMAIN of the live differential's case registry ------------
+
+    /// Issue #479, code review wave 1 — the shape vocabulary
+    /// `crates/pulsus-read/tests/traces_search_projection_differential.rs`
+    /// declares its case registry against.
+    ///
+    /// Two axes, each covered SEPARATELY rather than as a cross product:
+    /// the **value source** a projection group is filled from (one label
+    /// per [`ProjectionValue`] variant) and the **leaf class** that
+    /// supplied it (one per projecting arm of [`projection_value`], plus
+    /// the gate-free `select()` half). Every label must be named by at
+    /// least one differential case; a shape missing from the registry is
+    /// therefore a label no case declares, which that suite prints by
+    /// name.
+    ///
+    /// The list is closed from BOTH ends. Below,
+    /// [`every_projection_shape_label_is_produced_by_some_query`] plans one
+    /// query per label and asserts the produced set is exactly this list,
+    /// so a label nothing can produce fails here; and both label functions
+    /// match exhaustively with no wildcard, so a new `ProjectionValue` or
+    /// `PlannedLeafEval` variant fails to COMPILE until it is named. The
+    /// registry read it as TEXT out of this file, so the two cannot drift.
+    ///
+    /// The gaps this was written after: no case whose leaf was a same-field
+    /// `FieldCompare`, and none for `instrumentation:version`. Neither was
+    /// visible from reading the registry.
+    const PROJECTION_SHAPES: [&str; 17] = [
+        "leaf:attr",
+        "leaf:field-compare",
+        "leaf:nested-set",
+        "leaf:physical",
+        "leaf:select",
+        "value:kind",
+        "value:name",
+        "value:nested-set",
+        "value:parent-id",
+        "value:probe-literal",
+        "value:probe-value",
+        "value:scope-name",
+        "value:scope-version",
+        "value:select-value",
+        "value:service",
+        "value:status",
+        "value:status-message",
+    ];
+
+    /// One label per [`ProjectionValue`] variant. Exhaustive, no wildcard.
+    fn projection_value_label(value: &ProjectionValue) -> &'static str {
+        match value {
+            ProjectionValue::Name => "value:name",
+            ProjectionValue::Service => "value:service",
+            ProjectionValue::Status => "value:status",
+            ProjectionValue::Kind => "value:kind",
+            ProjectionValue::StatusMessage => "value:status-message",
+            ProjectionValue::ParentIdHex => "value:parent-id",
+            ProjectionValue::ScopeName => "value:scope-name",
+            ProjectionValue::ScopeVersion => "value:scope-version",
+            ProjectionValue::ProbeLiteral(_) => "value:probe-literal",
+            ProjectionValue::ProbeValue { .. } => "value:probe-value",
+            ProjectionValue::SelectValue { .. } => "value:select-value",
+            ProjectionValue::NestedSet(_) => "value:nested-set",
+        }
+    }
+
+    /// One label per [`PlannedLeafEval`] variant. Exhaustive, no wildcard.
+    /// The six non-projecting variants share a label that is deliberately
+    /// NOT in [`PROJECTION_SHAPES`]: a source built from one of them would
+    /// fail the membership half of the registry check.
+    fn projection_leaf_label(leaf: &PlannedLeafEval) -> &'static str {
+        match leaf {
+            PlannedLeafEval::Physical(_) => "leaf:physical",
+            PlannedLeafEval::Attr { .. } => "leaf:attr",
+            PlannedLeafEval::NestedSet { .. } => "leaf:nested-set",
+            PlannedLeafEval::FieldCompare { .. } => "leaf:field-compare",
+            PlannedLeafEval::BoolTruth { .. }
+            | PlannedLeafEval::TraceCtx(_)
+            | PlannedLeafEval::Arith { .. }
+            | PlannedLeafEval::Const(_)
+            | PlannedLeafEval::BoolCompare { .. }
+            | PlannedLeafEval::EventSetCompare { .. } => "leaf:not-projectable",
+        }
+    }
+
+    /// Every shape label one planned query produces.
+    fn projection_shapes_of(plan: &SearchPlan) -> std::collections::BTreeSet<&'static str> {
+        let mut out = std::collections::BTreeSet::new();
+        for group in &plan.projections {
+            for source in &group.sources {
+                out.insert(projection_value_label(&source.value));
+                out.insert(match source.gate {
+                    None => "leaf:select",
+                    Some((filter_idx, leaf_idx)) => {
+                        projection_leaf_label(&plan.filters[filter_idx].leaves[leaf_idx])
+                    }
+                });
+            }
+        }
+        out
+    }
+
+    /// Every label in [`PROJECTION_SHAPES`] is one a real query produces,
+    /// and no query produces a label outside it.
+    ///
+    /// *RED when:* a label is added that nothing can reach (the list would
+    /// then demand a differential case for a shape that does not exist), or
+    /// a reachable shape is left off it.
+    #[test]
+    fn every_projection_shape_label_is_produced_by_some_query() {
+        let produced: std::collections::BTreeSet<&'static str> = [
+            r#"{ name = "x" }"#,
+            r#"{ resource.service.name = "x" }"#,
+            r#"{ status = error }"#,
+            r#"{ kind = client }"#,
+            r#"{ statusMessage = "x" }"#,
+            r#"{ span:parentID = "0102030405060708" }"#,
+            r#"{ instrumentation:name = "x" }"#,
+            r#"{ instrumentation:version = "1.2.3" }"#,
+            r#"{ span.a = "x" }"#,
+            r#"{ span.a =~ "x.*" }"#,
+            r#"{} | select(span.a)"#,
+            r#"{ nestedSetLeft > 0 }"#,
+            r#"{ .a = .a }"#,
+        ]
+        .into_iter()
+        .flat_map(|q| projection_shapes_of(&plan(q)))
+        .collect();
+        assert_eq!(
+            produced,
+            PROJECTION_SHAPES.into_iter().collect(),
+            "the shape vocabulary and the shapes queries actually produce must be the same set"
+        );
+    }
+
+    /// One WITNESS query per shape label, spelled exactly as the live
+    /// differential's case registry spells it.
+    ///
+    /// The queries are the registry's own, corpus values and all, so the
+    /// coverage check below is a property of the registry rather than of a
+    /// label somebody wrote beside a case. A witness that does not in fact
+    /// produce its label fails before the registry is consulted.
+    const SHAPE_WITNESSES: [(&str, &str); 17] = [
+        ("value:name", r#"{ name = "GET /pay" }"#),
+        (
+            "value:service",
+            r#"{ resource.service.name = "proj-checkout" }"#,
+        ),
+        ("value:status", "{ status = error }"),
+        ("value:kind", "{ kind = client }"),
+        ("value:status-message", r#"{ statusMessage = "boom" }"#),
+        (
+            "value:parent-id",
+            r#"{ span:parentID = "a479000000000001" }"#,
+        ),
+        (
+            "value:scope-name",
+            r#"{ instrumentation:name = "proj-scope" }"#,
+        ),
+        (
+            "value:scope-version",
+            r#"{ instrumentation:version = "1.2.3" }"#,
+        ),
+        ("value:probe-literal", r#"{ span.http.method = "GET" }"#),
+        ("value:probe-value", r#"{ span.http.method =~ "GE.*" }"#),
+        ("value:select-value", "{} | select(span.http.method)"),
+        ("value:nested-set", "{ nestedSetLeft > 0 }"),
+        ("leaf:physical", r#"{ name = "GET /pay" }"#),
+        ("leaf:attr", r#"{ span.http.method = "GET" }"#),
+        ("leaf:nested-set", "{ nestedSetLeft > 0 }"),
+        (
+            "leaf:field-compare",
+            r#"{ span.http.method = span.http.method }"#,
+        ),
+        ("leaf:select", "{} | select(span.http.method)"),
+    ];
+
+    /// AC9's registry is COMPLETE over the shape vocabulary — every label
+    /// in [`PROJECTION_SHAPES`] is exercised by a case in
+    /// `crates/pulsus-read/tests/traces_search_projection_differential.rs`.
+    ///
+    /// This is the check the wave-1 code review found missing. The registry
+    /// agreed 30 of 30 while containing no case whose leaf was a same-field
+    /// `FieldCompare` and none reaching `instrumentation:version`, and
+    /// nothing in the registry said so: a list cannot report what is not on
+    /// it. Here the demand comes from the planner's own enums instead —
+    /// both label functions match exhaustively, so a new variant fails to
+    /// compile, and this test then fails until a live case exercises it.
+    ///
+    /// *RED when:* a shape label has no witness, a witness does not produce
+    /// the label claimed for it, or the registry does not contain the
+    /// witness query.
+    #[test]
+    fn the_live_differential_registry_covers_every_projection_shape() {
+        // 1. the witness list is complete over the vocabulary.
+        let witnessed: std::collections::BTreeSet<&str> =
+            SHAPE_WITNESSES.iter().map(|(label, _)| *label).collect();
+        assert_eq!(
+            witnessed,
+            PROJECTION_SHAPES.into_iter().collect(),
+            "every shape label needs a witness query"
+        );
+
+        // 2. each witness really produces its label.
+        for (label, q) in SHAPE_WITNESSES {
+            let produced = projection_shapes_of(&plan(q));
+            assert!(
+                produced.contains(label),
+                "the witness {q:?} does not produce {label:?}; it produces {produced:?}"
+            );
+        }
+
+        // 3. the registry contains each witness query. Only the `CASES`
+        //    array is searched, and its `//` comment lines are stripped, so
+        //    a query mentioned in prose cannot satisfy a shape.
+        let registry = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("traces_search_projection_differential.rs"),
+        )
+        .expect("read the differential's case registry");
+        let start = registry
+            .find("const CASES: [ProjectionCase;")
+            .expect("the registry declares CASES");
+        let end = registry[start..]
+            .find("\n];")
+            .expect("the CASES array is terminated");
+        let cases: String = registry[start..start + end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let missing: Vec<&str> = SHAPE_WITNESSES
+            .iter()
+            .filter(|(_, q)| !cases.contains(q))
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the live projection differential has no case for {missing:?} — add one to \
+             crates/pulsus-read/tests/traces_search_projection_differential.rs::CASES"
+        );
     }
 
     /// Issue #479 — the fused-value flag is set for exactly the probe

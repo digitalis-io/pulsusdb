@@ -39,6 +39,46 @@
 //!   cargo test -p pulsus-read --test traces_search_projection_differential -- --nocapture
 //! ```
 //!
+//! **The registry's DOMAIN, and how to tell a shape is missing from it.**
+//! The registry covers two axes, each required to be complete on its own
+//! rather than as a cross product:
+//!
+//!  * the **value source** a projected entry is filled from — one label
+//!    per `ProjectionValue` variant (`value:name`, `value:probe-value`,
+//!    `value:select-value`, …);
+//!  * the **leaf class** that supplied it — one per projecting arm of
+//!    `projection_value` (`leaf:physical`, `leaf:attr`,
+//!    `leaf:nested-set`, `leaf:field-compare`) plus the gate-free
+//!    `select()` half (`leaf:select`).
+//!
+//! Everything else here is enumerated but NOT mechanically complete: the
+//! seven envelope fields, the scope collision, the empty and non-ASCII
+//! values, the numeric wire types and the deliberately-empty case. The
+//! classes we knowingly answer differently from the reference (a negated
+//! attribute leaf, the genuine multi-field conditions) are deliberately
+//! ABSENT — they are pinned by
+//! `pulsus_read::traces::search_plan::tests::wave_two_shapes_project_nothing`
+//! and carry ledger rows, and putting them here would assert an agreement
+//! that does not exist.
+//!
+//! A reader tells a shape is missing by RUNNING
+//! `pulsus_read::traces::search_plan::tests::the_live_differential_registry_covers_every_projection_shape`,
+//! which derives the label set from the planner's own enums (both label
+//! matches are exhaustive, so a new variant fails to compile), checks a
+//! witness query really produces each label, and then fails naming any
+//! label whose witness query is absent from `CASES` below. That test is
+//! why cases 31–35 exist: the 30-case registry contained no same-field
+//! `FieldCompare` and nothing reaching `instrumentation:version`, and
+//! reading it could not show that.
+//!
+//! **Instance isolation.** This suite requires a reference instance that
+//! holds NO other suite's corpus, and asserts it below before pushing:
+//! its spans move another differential's aggregates (a `compare()` top-N
+//! picked up this corpus's `statusMessage`, service and root names), and
+//! that failure surfaces in the OTHER suite as an ordinary-looking value
+//! mismatch. `the_projection_leg_does_not_share_an_instance_with_another_suite`
+//! fails if the workflow ever points two legs at one endpoint.
+//!
 //! Clean-room: no reference source, grammar or test corpus is read — the
 //! fixture is our own authorship and the reference's answers are read
 //! back as black-box runtime output.
@@ -83,7 +123,7 @@ const fn keys_only(name: &'static str, q: &'static str) -> ProjectionCase {
 /// The registry — one entry per numbered row of the issue's query table.
 /// The length is asserted at compile time so the count cannot drift from
 /// the table it describes.
-const CASES: [ProjectionCase; 30] = [
+const CASES: [ProjectionCase; 35] = [
     c("01_name_eq", r#"{ name = "GET /pay" }"#),
     c("02_duration_gt", "{ duration > 1s }"),
     c("03_match_all", "{}"),
@@ -135,9 +175,33 @@ const CASES: [ProjectionCase; 30] = [
     c("28_key_existence", "{ span.http.method != nil }"),
     c("29_root_name", r#"{ rootName = "GET /pay" }"#),
     c("30_name_neq_empty", r#"{ name != "" }"#),
+    // 31-34: the SAME-FIELD comparison, one per value source it can draw
+    // from — an attribute, an intrinsic that fills `name`, a nested-set
+    // intrinsic and a physical column. Exactly one distinct field appears
+    // across both operands, so each is a single-field condition and the
+    // reference projects that field; a comparison naming two DIFFERENT
+    // fields is the deferred multi-field class and is not a case here.
+    c(
+        "31_same_field_attribute",
+        r#"{ span.http.method = span.http.method }"#,
+    ),
+    c("32_same_field_intrinsic_name", "{ name = name }"),
+    keys_only(
+        "33_same_field_nested_set",
+        "{ nestedSetLeft = nestedSetLeft }",
+    ),
+    c(
+        "34_same_field_physical_column",
+        r#"{ resource.service.name = resource.service.name }"#,
+    ),
+    // The remaining uncovered value source: the scope VERSION column.
+    c(
+        "35_instrumentation_version",
+        r#"{ instrumentation:version = "1.2.3" }"#,
+    ),
 ];
 
-const _: () = assert!(CASES.len() == 30);
+const _: () = assert!(CASES.len() == 35);
 
 // ---------------------------------------------------------------------------
 // the corpus — built ONCE, as OTLP/JSON bytes
@@ -511,6 +575,120 @@ fn now_ns() -> i64 {
     .expect("fits i64")
 }
 
+/// Every trace id the reference's SEARCH route returns for `{}`, whatever
+/// trace it belongs to — the unfiltered form of [`reference`], used to
+/// prove the instance is empty before this suite's corpus goes in.
+fn reference_all_trace_ids(api_base: &str) -> Vec<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let url = format!("{}/api/search", api_base.trim_end_matches('/'));
+    let out = Command::new("curl")
+        .args(["-s", "-G", "--max-time", "20"])
+        .args(["--data-urlencode", "q={}"])
+        // Wide enough to cover any corpus another leg pushed in this job.
+        .args(["--data-urlencode", &format!("start={}", now - 86_400)])
+        .args(["--data-urlencode", &format!("end={}", now + 3_600)])
+        .args(["--data-urlencode", "limit=100"])
+        .arg(&url)
+        .output()
+        .expect("curl on PATH");
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return Vec::new();
+    };
+    body.get("traces")
+        .and_then(|v| v.as_array())
+        .map(|traces| {
+            traces
+                .iter()
+                .filter_map(|t| t.get("traceID").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every `PULSUSDB_*_URL` endpoint the CI workflow assigns, as
+/// `(variable, value)` in file order. Comment lines are skipped, so a
+/// commented-out endpoint is not an assignment.
+fn workflow_endpoint_assignments(workflow: &str) -> Vec<(String, String)> {
+    workflow
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (key, value) = line.split_once(':')?;
+            if !key.starts_with("PULSUSDB_") || !key.ends_with("_URL") {
+                return None;
+            }
+            Some((key.to_string(), value.trim().trim_matches('"').to_string()))
+        })
+        .collect()
+}
+
+/// Hermetic — issue #479, code review wave 1. **The projection leg may not
+/// share a reference instance with any other differential leg.**
+///
+/// Running this suite before `compare_value_differential` on ONE instance
+/// makes the latter fail: this corpus's `statusMessage`, service and root
+/// names enter that query's `compare()` top-N. The failure appears in the
+/// OTHER suite, names a value mismatch against the reference, and reads
+/// exactly like a parity defect in the code under review — so the fix is
+/// isolation, not a documented running order.
+///
+/// This is the CONFIGURATION half: no other leg may be pointed at either
+/// of this leg's two endpoints. The RUNTIME half is the emptiness
+/// precondition in the differential below, which catches an instance
+/// shared by some route this file cannot see (a differently spelled URL, a
+/// developer's shell, a reused container).
+///
+/// *RED when:* a second step reuses this leg's endpoint, or this leg's
+/// endpoint variables stop being assigned exactly once.
+#[test]
+fn the_projection_leg_does_not_share_an_instance_with_another_suite() {
+    const OURS: [&str; 2] = [
+        "PULSUSDB_PROJECTION_DIFF_URL",
+        "PULSUSDB_PROJECTION_OTLP_URL",
+    ];
+    let workflow = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join(".github/workflows/ci.yml"),
+    )
+    .expect("read .github/workflows/ci.yml");
+    let assignments = workflow_endpoint_assignments(&workflow);
+
+    let (ours, others): (Vec<_>, Vec<_>) = assignments
+        .iter()
+        .partition(|(key, _)| OURS.contains(&key.as_str()));
+    for var in OURS {
+        assert_eq!(
+            ours.iter().filter(|(key, _)| key == var).count(),
+            1,
+            "{var} must be assigned exactly once in the workflow; found {ours:?}"
+        );
+    }
+    // The check would pass vacuously on a workflow that ran no other
+    // differential leg, which is the state it exists to rule out.
+    assert!(
+        others.len() >= 2,
+        "no other PULSUSDB_*_URL leg is configured — this check would pass having compared \
+         nothing"
+    );
+    for (our_var, our_url) in &ours {
+        for (their_var, their_url) in &others {
+            assert_ne!(
+                our_url, their_url,
+                "{our_var} and {their_var} name the SAME reference endpoint {our_url}: this \
+                 suite's corpus would move that leg's aggregates, and the failure would surface \
+                 there as a value mismatch against the reference"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the differential
 // ---------------------------------------------------------------------------
@@ -540,6 +718,22 @@ async fn traces_search_projection_differential() {
     let base = now_ns() - 60_000_000_000;
     let window = (base - 60_000_000_000, base + 600_000_000_000);
     let body = corpus(base);
+
+    // ---- the isolation precondition, BEFORE anything is pushed --------
+    // This suite's corpus moves another differential's aggregates (a
+    // `compare()` top-N picked up its statusMessage / service / root
+    // names), and that shows up in the OTHER suite as a value mismatch
+    // against the reference. So the instance must hold nothing else. The
+    // configuration half is
+    // `the_projection_leg_does_not_share_an_instance_with_another_suite`;
+    // this is the runtime half, and it also catches a container reused
+    // across two local runs.
+    let resident = reference_all_trace_ids(&api_base);
+    assert!(
+        resident.is_empty(),
+        "the reference at {api_base} already holds {} trace(s) ({resident:?}) — this suite          needs an instance of its OWN. Its corpus enters other legs' aggregates (compare()'s          top-N), and the resulting failure surfaces in THAT suite as an ordinary-looking value          mismatch. Start a fresh instance for this leg.",
+        resident.len()
+    );
 
     // The reference first, so it has the whole poll window to index.
     otlp_push(&otlp_base, &body);
