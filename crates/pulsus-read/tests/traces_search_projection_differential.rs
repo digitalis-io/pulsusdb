@@ -572,6 +572,30 @@ fn required_array<'a>(
 ///   environment, compared by canonical host and port rather than by URL
 ///   string, so `localhost` and `127.0.0.1` do not pass as two instances.
 ///
+/// **The response classes this guard treats as free, measured — two of
+/// them (issue #479, code review wave 3).** Rows 1-4 and 7-8 are answered
+/// by a loopback responder; rows 1-4 and 7 serve the reference's own
+/// build-info envelope on the identity route, so the row isolates the
+/// search and tag routes, and row 8 does not.
+///
+/// | # | what answers `/api/search` and `/api/search/tags` | verdict | rejected at |
+/// |---|---|---|---|
+/// | 1 | `200` carrying traces | REJECTED | search route |
+/// | 2 | `200`, empty `traces` AND empty `tagNames` | **FREE** | — |
+/// | 3 | `404` | REJECTED | search route |
+/// | 4 | `503` | REJECTED | search route |
+/// | 5 | no answer within `--max-time` | REJECTED | identity route |
+/// | 6 | connection refused | REJECTED | identity route |
+/// | 7 | `200` with a malformed body | REJECTED | search route |
+/// | 8 | a DIFFERENT service on the port | REJECTED | identity route |
+///
+/// Row 2 is free only when BOTH arrays are empty: an empty search with a
+/// non-empty tag catalog is the catalog-residue case and is rejected. Row
+/// 8 is the wave-3 finding: before
+/// [`pulsus_testkit::assert_traces_reference_identity`] ran first, an
+/// unrelated service answering the two empty envelopes satisfied this
+/// guard outright.
+///
 /// **What it does NOT prevent.**
 ///
 /// * A suite that runs AFTER this one against this instance: this corpus
@@ -585,7 +609,17 @@ fn required_array<'a>(
 ///   no tag name.
 /// * A proxy or port forward reaching this instance under an address
 ///   neither the workflow nor this process's environment names.
+/// * A SECOND container of the same pinned image on this endpoint: the
+///   identity check below authenticates the service and its build, not
+///   which instance of it answers. What that costs is bounded by the two
+///   checks that do compare instances — the runtime emptiness probes here
+///   and the configuration check in
+///   [`the_projection_leg_does_not_share_an_instance_with_another_suite`].
 fn assert_reference_instance_is_exclusive(api_base: &str) {
+    // WHO is answering, before any emptiness is read as isolation: an
+    // empty envelope from something that is not the reference says
+    // nothing at all (code review wave 3).
+    pulsus_testkit::assert_traces_reference_identity(api_base);
     let base = api_base.trim_end_matches('/');
     let now = i64::try_from(
         std::time::SystemTime::now()
