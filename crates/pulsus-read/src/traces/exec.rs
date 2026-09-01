@@ -1375,6 +1375,7 @@ impl TraceEngine {
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     push_bucket_exemplars(&mut collected, 0, &value_at[0], row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
                 }
             }
             ExemplarSeriesKey::Group { label } => {
@@ -1398,6 +1399,7 @@ impl TraceEngine {
                         continue;
                     };
                     push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
                 }
             }
             ExemplarSeriesKey::Quantile => {
@@ -1412,6 +1414,7 @@ impl TraceEngine {
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     push_quantile_exemplars(&mut collected, &value_at, row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
                 }
             }
             ExemplarSeriesKey::HistogramBucket => {
@@ -1437,6 +1440,7 @@ impl TraceEngine {
                         continue;
                     };
                     push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
                 }
             }
             ExemplarSeriesKey::CompareSide => {
@@ -1463,6 +1467,7 @@ impl TraceEngine {
                         continue;
                     };
                     push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
                 }
             }
         }
@@ -3018,6 +3023,43 @@ fn compare_total_series_key(series: &TraceMetricSeries) -> Option<(&str, &str)> 
     Some((kind, key.key.as_str()))
 }
 
+/// The ceiling on the IN-FLIGHT exemplar list, before the final thinning
+/// (issue #477 wave 2).
+///
+/// The exemplar statement returns one row per (bucket × series identity),
+/// and since this wave the identity is per shape: a `__bucket` per log2
+/// duration bucket that occurred, an `(is_sel, akey)` per side and
+/// attribute key. The row count is therefore no longer bounded by the
+/// bucket grid alone — at the interval cap a comparison over a wide
+/// attribute universe can return orders of magnitude more rows than a
+/// count does, and every sample on them would be materialized before the
+/// stride ran. The response keeps at most `MAX_EXEMPLARS`, so holding
+/// millions to pick 100 is pure waste as well as a memory risk.
+const EXEMPLAR_COLLECTION_CEILING: usize = 8_192;
+
+/// Halves `collected` in place when it reaches
+/// [`EXEMPLAR_COLLECTION_CEILING`], keeping every other entry.
+///
+/// Halving rather than truncating, and rather than thinning straight to
+/// the budget: keeping every other entry of what has been seen so far
+/// leaves the survivors spread evenly over it, so repeated halving over a
+/// long stream is still an even sample of the whole stream. Truncating
+/// would keep only the earliest buckets and thinning to the budget each
+/// time would let the tail crowd out the head — both are the bias the
+/// final stride exists to avoid. Deterministic: the same row order always
+/// yields the same list.
+fn decimate_if_full(collected: &mut Vec<(usize, MetricExemplar)>) {
+    if collected.len() < EXEMPLAR_COLLECTION_CEILING {
+        return;
+    }
+    let mut i = 0usize;
+    collected.retain(|_| {
+        let keep = i.is_multiple_of(2);
+        i += 1;
+        keep
+    });
+}
+
 /// Reduces a bucket-ordered exemplar list to at most `budget` entries by
 /// even stride, keeping index `i * len / budget` for `i in 0..budget`.
 ///
@@ -3553,6 +3595,49 @@ mod tests {
     /// surface-wide ceiling and the generator's tighter one can never be
     /// confused for one another in an assertion.
     const TEST_READ_MEM: u64 = 7_654_321;
+
+    /// Issue #477 wave 2: the in-flight exemplar list stays under its
+    /// ceiling however many rows the statement returns, and what survives
+    /// is still spread over the whole stream.
+    ///
+    /// The stream is deliberately much longer than the ceiling — the
+    /// shape a comparison over a wide attribute universe produces — so
+    /// the halving runs several times rather than once.
+    #[test]
+    fn the_exemplar_collection_stays_under_its_ceiling_and_stays_even() {
+        let mut collected: Vec<(usize, MetricExemplar)> = Vec::new();
+        let n = EXEMPLAR_COLLECTION_CEILING * 9;
+        for i in 0..n {
+            collected.push((
+                0,
+                MetricExemplar {
+                    labels: vec![MetricLabel::str("trace:id", format!("{i:032x}"))],
+                    value: 1.0,
+                    timestamp_ms: i as i64,
+                },
+            ));
+            decimate_if_full(&mut collected);
+            assert!(
+                collected.len() <= EXEMPLAR_COLLECTION_CEILING,
+                "the list breached its ceiling at row {i}: {}",
+                collected.len()
+            );
+        }
+        // Spread, not a prefix and not a suffix: the survivors must reach
+        // both ends of the stream. A truncating bound keeps only the head
+        // and a thin-to-budget bound keeps only the tail; either would
+        // fail here.
+        let first = collected.first().expect("survivors").1.timestamp_ms;
+        let last = collected.last().expect("survivors").1.timestamp_ms;
+        assert_eq!(first, 0, "the head of the stream must survive");
+        assert!(
+            last as usize > n - EXEMPLAR_COLLECTION_CEILING,
+            "the tail of the stream must survive, last was {last} of {n}"
+        );
+        // …and the final stride still lands on the budget.
+        thin_collected_exemplars(&mut collected, 100);
+        assert_eq!(collected.len(), 100);
+    }
 
     /// Issue #460 AC 9 — under a TIE, only the CARDINALITY is a
     /// specification.
