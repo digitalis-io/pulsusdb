@@ -290,7 +290,6 @@ fn every_collection_allocation_site_is_on_the_charge_allowlist() {
     );
 }
 
-
 /// AC10(i-b), second half (issue #477): no charge rationale still
 /// describes a PER-BUCKET exemplar cap.
 ///

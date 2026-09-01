@@ -481,7 +481,13 @@ async fn assert_aggregation_identities(engine: &TraceEngine) {
     let one_ms_s = 0.001_f64;
 
     // sum_over_time(duration): Σ buckets == CORPUS_SPANS · 0.001.
-    let sum_plan = plan_for(engine, "{} | sum_over_time(duration)", base_s(), end_s, 60_000);
+    let sum_plan = plan_for(
+        engine,
+        "{} | sum_over_time(duration)",
+        base_s(),
+        end_s,
+        60_000,
+    );
     let sum_points = matrix_points(&engine.metrics_range(&sum_plan).await.expect("sum range"));
     let sum_total: f64 = sum_points.iter().map(|(_, v)| v).sum();
     assert!(
@@ -1510,7 +1516,13 @@ async fn metrics_internal_consistency_identities() {
     // ---- Empty window: range → empty matrix; instant → one "0" sample
     // (the documented empty-DB oracles). ---------------------------------
     let empty_start = base_s() - 86_400;
-    let plan = plan_for(&engine, "{} | rate()", empty_start, empty_start + 600, 60_000);
+    let plan = plan_for(
+        &engine,
+        "{} | rate()",
+        empty_start,
+        empty_start + 600,
+        60_000,
+    );
     let empty_points = matrix_points(&engine.metrics_range(&plan).await.expect("empty range"));
     // Issue #477 (a): an ungrouped rate over a window with NO matching
     // data is one series carrying every bucket at zero — the sample-count
@@ -1700,4 +1712,941 @@ async fn duration_seconds_conversion_matches_the_reference() {
     }
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_ULP}")).await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #477: the bucket geometry, density, exemplar and cap-probe gates.
+//
+// Each test below seeds its OWN throwaway database and takes its window
+// from `past_window`, so none of them perturbs the shared `DB` corpus and
+// none of them depends on another's ordering.
+// ---------------------------------------------------------------------------
+
+static DB_GEOM: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_geom_it");
+static DB_DENSE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_dense_it");
+static DB_EX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_exemplar_it");
+static DB_CAP: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_metrics_cap_it");
+
+/// Creates `db` fresh and returns an admin client plus an engine bound to
+/// it. The admin client is the caller's to drop the database with.
+async fn fresh_db(db: &str) -> (ChClient, TraceEngine) {
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    run_init(&admin, &test_ctx(db)).await.expect("run_init");
+    let engine = TraceEngine::new(
+        {
+            let mut cfg = test_config();
+            cfg.database = db.to_string();
+            ChClient::new(cfg).await.expect("connect engine")
+        },
+        engine_config(),
+    );
+    (admin, engine)
+}
+
+/// One span row literal. `idx` seeds the trace/span ids, so distinct
+/// indices are distinct logical spans and repeated ones are replays.
+fn span_row(idx: i64, service: &str, ts_ns: i64, duration_ns: i64, status_code: i64) -> String {
+    format!(
+        "(toFixedString(unhex('{idx:032x}'), 16), toFixedString(unhex('{idx:016x}'), 8), \
+         toFixedString(unhex('0000000000000000'), 8), 'op', '{service}', '', {ts_ns}, \
+         {duration_ns}, {status_code}, 1, 1, 'p')"
+    )
+}
+
+async fn insert_spans(admin: &ChClient, db: &str, rows: &[String]) {
+    exec(
+        admin,
+        &format!(
+            "INSERT INTO {db}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, status_message, timestamp_ns, \
+              duration_ns, status_code, kind, payload_type, payload) VALUES {}",
+            rows.join(", ")
+        ),
+    )
+    .await;
+}
+
+/// AC2 (live) and AC6(ii): a span landing exactly on a grid point belongs
+/// to THAT point, and a sub-second `step` is served with the sample count
+/// the window and the step imply.
+///
+/// The pair is what discriminates. Two spans sit at exactly `L` and three
+/// at `L + 1 ms`; under the right-closed reading they land on `L` and on
+/// `L + step`, and under the pre-#477 left-edge reading **all five** land
+/// on `L`. So `2` and `3` on adjacent labels is an answer the old
+/// geometry cannot produce, where a bare sample count could not tell the
+/// two apart.
+#[tokio::test]
+async fn spans_on_a_bucket_boundary_land_on_the_right_edge_label() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_GEOM).await;
+    let (start_s, end_s) = past_window(20);
+    let step_ms = 500;
+
+    let plan = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
+    let axis = plan.range_axis();
+    // 20 s at 500 ms is 40 intervals, so 41 labels (AC6(ii)'s identity).
+    assert_eq!(axis.points, 41, "20s / 500ms + 1");
+    assert_eq!(axis.step_ms, 500);
+
+    // A grid instant strictly inside the window, well away from both ends.
+    let label_ms = axis.label_ms(20);
+    let l_ns = label_ms * 1_000_000;
+    let mut rows = Vec::new();
+    for i in 0..2 {
+        rows.push(span_row(1_000 + i, "bnd", l_ns, 1_000_000, 0));
+    }
+    for i in 0..3 {
+        rows.push(span_row(2_000 + i, "bnd", l_ns + 1_000_000, 1_000_000, 0));
+    }
+    insert_spans(&admin, &DB_GEOM, &rows).await;
+
+    let points = matrix_points(&engine.metrics_range(&plan).await.expect("range"));
+    assert_eq!(points.len(), axis.points, "every bucket is emitted");
+    let at = |ms: i64| {
+        points
+            .iter()
+            .find(|(t, _)| *t == ms)
+            .unwrap_or_else(|| panic!("no sample at {ms}: {points:?}"))
+            .1
+    };
+    assert_eq!(
+        at(label_ms),
+        2.0,
+        "the two spans AT the grid point stay on it"
+    );
+    assert_eq!(
+        at(label_ms + 500),
+        3.0,
+        "the three spans one millisecond later belong to the NEXT label"
+    );
+    // And nothing leaked anywhere else.
+    let total: f64 = points.iter().map(|(_, v)| v).sum();
+    assert_eq!(total, 5.0, "{points:?}");
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_GEOM}")).await;
+}
+
+/// AC3: a no-match range query returns a zero-filled series, with and
+/// without an in-window control span.
+///
+/// The control span is load-bearing on the reference side and is stated
+/// here so a test author knows which case they are constructing: the
+/// reference zero-fills only when a block covers the window, and answers
+/// an empty series list when nothing at all is stored. We answer the same
+/// grid either way — a divergence this change introduces deliberately,
+/// recorded as `traceql-metrics-zero-fill-without-a-block`.
+#[tokio::test]
+async fn a_no_match_range_query_returns_a_zero_filled_series() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_DENSE).await;
+    let (start_s, end_s) = past_window(20);
+
+    // A control span INSIDE the window that the queried predicate does
+    // not match.
+    let plan = plan_for(&engine, "{} | rate()", start_s, end_s, 5_000);
+    let axis = plan.range_axis();
+    insert_spans(
+        &admin,
+        &DB_DENSE,
+        &[span_row(
+            7_001,
+            "ac3-control",
+            axis.label_ms(2) * 1_000_000,
+            1_000_000,
+            0,
+        )],
+    )
+    .await;
+
+    let absent = plan_for(
+        &engine,
+        r#"{ resource.service.name = "ac3-absent" } | rate()"#,
+        start_s,
+        end_s,
+        5_000,
+    );
+    let res = engine.metrics_range(&absent).await.expect("no-match range");
+    assert_eq!(res.series.len(), 1, "one zero-filled series: {res:?}");
+    assert_eq!(
+        res.series[0].labels,
+        vec![pulsus_read::MetricLabel::str("__name__", "rate")]
+    );
+    assert_eq!(res.series[0].samples.len(), axis.points);
+    assert!(res.series[0].samples.iter().all(|(_, v)| *v == 0.0));
+    assert!(
+        res.series[0].exemplars.is_empty(),
+        "an all-zero frame issues no exemplar query at all"
+    );
+
+    // Second clause: a window with NOTHING stored in it anywhere answers
+    // the same grid. This is the divergence, not a regression guard.
+    let (empty_start, empty_end) = (start_s - 86_400, end_s - 86_400);
+    let empty = plan_for(&engine, "{} | rate()", empty_start, empty_end, 5_000);
+    let res = engine.metrics_range(&empty).await.expect("empty range");
+    assert_eq!(
+        res.series.len(),
+        1,
+        "still one series with no block: {res:?}"
+    );
+    assert_eq!(res.series[0].samples.len(), empty.range_axis().points);
+    assert!(res.series[0].samples.iter().all(|(_, v)| *v == 0.0));
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_DENSE}")).await;
+}
+
+/// AC4: density follows the FUNCTION, not the query.
+///
+/// One corpus, one window, interior AND edge gaps. The dense half asserts
+/// the whole `(label, value)` vector rather than only its length, so
+/// rotating the values by one position fails it — a length check alone
+/// would pass a frame whose samples sit on the wrong labels.
+#[tokio::test]
+async fn density_follows_the_function_not_the_query() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_DENSE).await;
+    let (start_s, end_s) = past_window(30);
+    let step_ms = 5_000;
+
+    let probe = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
+    let axis = probe.range_axis();
+    assert_eq!(axis.points, 7, "30s / 5s + 1");
+
+    // Two occupied buckets: label[2] and label[4]. Leading, trailing and
+    // one interior bucket stay empty.
+    let occupied = [axis.label_ms(2), axis.label_ms(4)];
+    let rows = vec![
+        span_row(
+            9_001,
+            "dense",
+            occupied[0] * 1_000_000 - 1_000,
+            1_000_000,
+            0,
+        ),
+        span_row(
+            9_002,
+            "dense",
+            occupied[1] * 1_000_000 - 1_000,
+            1_000_000,
+            2,
+        ),
+    ];
+    insert_spans(&admin, &DB_DENSE, &rows).await;
+
+    let expected_dense: Vec<(i64, f64)> = (0..axis.points)
+        .map(|i| {
+            let l = axis.label_ms(i);
+            (l, if occupied.contains(&l) { 1.0 } else { 0.0 })
+        })
+        .collect();
+
+    // ---- the dense half ------------------------------------------------
+    let counts = matrix_points(
+        &engine
+            .metrics_range(&plan_for(
+                &engine,
+                "{} | count_over_time()",
+                start_s,
+                end_s,
+                step_ms,
+            ))
+            .await
+            .expect("count range"),
+    );
+    assert_eq!(
+        counts, expected_dense,
+        "count_over_time emits every bucket, values on their own labels"
+    );
+
+    for q in [
+        "{} | rate()",
+        "{} | quantile_over_time(duration, 0.9)",
+        "{} | histogram_over_time(duration)",
+        "{} | count_over_time() by(resource.service.name)",
+        r#"{} | compare({ status = error })"#,
+    ] {
+        let res = engine
+            .metrics_range(&plan_for(&engine, q, start_s, end_s, step_ms))
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert!(!res.series.is_empty(), "{q}: expected series, got none");
+        for s in &res.series {
+            assert_eq!(
+                s.samples.len(),
+                axis.points,
+                "{q}: every returned series must carry every bucket ({s:?})"
+            );
+            let labels: Vec<i64> = s.samples.iter().map(|(t, _)| *t).collect();
+            let want: Vec<i64> = (0..axis.points).map(|i| axis.label_ms(i)).collect();
+            assert_eq!(labels, want, "{q}: samples must sit on the axis labels");
+        }
+    }
+
+    // ---- the sparse half: the value aggregations, grouped or not ------
+    for q in [
+        "{} | sum_over_time(duration)",
+        "{} | min_over_time(duration)",
+        "{} | avg_over_time(duration)",
+        "{} | sum_over_time(duration) by(resource.service.name)",
+    ] {
+        let res = engine
+            .metrics_range(&plan_for(&engine, q, start_s, end_s, step_ms))
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert!(!res.series.is_empty(), "{q}: expected series, got none");
+        for s in &res.series {
+            assert_eq!(
+                s.samples.len(),
+                occupied.len(),
+                "{q}: value aggregations stay SPARSE ({s:?})"
+            );
+            assert!(
+                s.samples.len() < axis.points,
+                "{q}: and strictly fewer than the axis"
+            );
+            let labels: Vec<i64> = s.samples.iter().map(|(t, _)| *t).collect();
+            assert_eq!(labels, occupied.to_vec(), "{q}");
+        }
+    }
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_DENSE}")).await;
+}
+
+/// AC5(iii)/(iv): exemplars attach with no parameter and no hint; the
+/// budget is a TOTAL; the hint wins over the parameter; and every
+/// exemplar's value is the sample at its own right-closed label.
+#[tokio::test]
+async fn exemplars_attach_by_default_and_map_to_the_right_edge_label() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_EX).await;
+    let (start_s, end_s) = past_window(35);
+    let step_ms = 5_000;
+
+    let probe = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
+    let axis = probe.range_axis();
+    assert!(
+        axis.points >= 8,
+        "the grid must be wider than the budget set"
+    );
+
+    // Four occupied buckets with DISTINCT values 2, 3, 5, 1. Spans inside
+    // one bucket share one nanosecond timestamp, so the bucket's value is
+    // the span count and the exemplars all carry that instant.
+    let mut rows = Vec::new();
+    let mut idx = 20_000i64;
+    for (slot, n) in [(1usize, 2), (2, 3), (3, 5), (4, 1)] {
+        let ts_ns = axis.label_ms(slot) * 1_000_000 - 1_000;
+        for _ in 0..n {
+            rows.push(span_row(idx, "ex", ts_ns, 1_000_000, 0));
+            idx += 1;
+        }
+    }
+    insert_spans(&admin, &DB_EX, &rows).await;
+
+    /// How many exemplars one `(parameter, hint)` combination returns.
+    async fn count_exemplars(
+        engine: &TraceEngine,
+        start_s: i64,
+        end_s: i64,
+        step_ms: i64,
+        exemplars: Option<u32>,
+        hint: &str,
+    ) -> usize {
+        let q = format!("{{}} | count_over_time(){hint}");
+        let plan = plan_with(engine, &q, start_s, end_s, step_ms, exemplars);
+        let res = engine.metrics_range(&plan).await.expect("range");
+        res.series.iter().map(|s| s.exemplars.len()).sum()
+    }
+    let count_exemplars = |exemplars: Option<u32>, hint: &'static str| {
+        count_exemplars(&engine, start_s, end_s, step_ms, exemplars, hint)
+    };
+
+    // (iii) a plain query with NO parameter and NO hint carries exemplars.
+    let plain = engine
+        .metrics_range(&plan_for(
+            &engine,
+            "{} | count_over_time()",
+            start_s,
+            end_s,
+            step_ms,
+        ))
+        .await
+        .expect("plain range");
+    let exemplars: Vec<&pulsus_read::MetricExemplar> =
+        plain.series.iter().flat_map(|s| &s.exemplars).collect();
+    assert!(
+        !exemplars.is_empty(),
+        "exemplars must attach with no parameter and no hint"
+    );
+    for ex in &exemplars {
+        let trace = ex
+            .labels
+            .iter()
+            .find(|l| l.key == "trace:id")
+            .unwrap_or_else(|| panic!("every exemplar carries trace:id: {ex:?}"));
+        match &trace.value {
+            pulsus_read::MetricLabelValue::Str(hex) => {
+                assert_eq!(hex.len(), 32, "16-byte hex trace id: {hex:?}");
+                assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+            }
+            other => panic!("trace:id must be a string, got {other:?}"),
+        }
+    }
+
+    // (iv)-4 the mapping, on that same plain answer. The value is looked
+    // up here from the exemplar's OWN timestamp through the axis, which
+    // is a different route from the one the engine used (the SQL bucket
+    // column), so agreeing is a real check.
+    let samples: std::collections::BTreeMap<i64, f64> =
+        plain.series[0].samples.iter().copied().collect();
+    let mut seen: std::collections::BTreeSet<(i64, u64)> = std::collections::BTreeSet::new();
+    for ex in &exemplars {
+        let label = axis.label_for_ms(ex.timestamp_ms);
+        let want = samples
+            .get(&label)
+            .copied()
+            .unwrap_or_else(|| panic!("exemplar at {} has no sample at {label}", ex.timestamp_ms));
+        assert_eq!(
+            ex.value.to_bits(),
+            want.to_bits(),
+            "exemplar {} must carry its own bucket's value",
+            ex.timestamp_ms
+        );
+        seen.insert((label, want.to_bits()));
+    }
+    let distinct_values: std::collections::BTreeSet<u64> = seen.iter().map(|(_, v)| *v).collect();
+    assert!(
+        seen.len() >= 2 && distinct_values.len() >= 2,
+        "at least two exemplars in DIFFERENT buckets carrying DIFFERENT values: {seen:?}"
+    );
+
+    // (iv)-1 the bound, and (iv)-2 the unit.
+    for budget in [1u32, 2, 4, 8, 100] {
+        let n = count_exemplars(Some(budget), "").await;
+        assert!(
+            n <= budget as usize,
+            "budget {budget} returned {n} exemplars"
+        );
+    }
+    assert_eq!(
+        count_exemplars(Some(1), "").await,
+        1,
+        "a TOTAL budget of 1 over four occupied buckets is one exemplar; per-bucket semantics \
+         would return four"
+    );
+
+    // (iv)-3 precedence, as an equality that discriminates.
+    for (h, p, hint) in [
+        (1u32, 8u32, " with(exemplars=1)"),
+        (8, 1, " with(exemplars=8)"),
+        (2, 100, " with(exemplars=2)"),
+        (100, 2, " with(exemplars=100)"),
+    ] {
+        let both = count_exemplars(Some(p), hint).await;
+        let hint_alone = count_exemplars(None, hint).await;
+        let param_alone = count_exemplars(Some(p), "").await;
+        assert_eq!(
+            both, hint_alone,
+            "hint {h} must win over parameter {p} (got {both} vs {hint_alone})"
+        );
+        assert_ne!(
+            param_alone, hint_alone,
+            "hint {h} and parameter {p} must give DIFFERENT answers alone, or the equality \
+             above proves nothing"
+        );
+    }
+    // `false` turns them off outright, whatever the parameter says.
+    assert_eq!(
+        count_exemplars(Some(9), " with(exemplars=false)").await,
+        0,
+        "with(exemplars=false) wins over the parameter"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_EX}")).await;
+}
+
+/// AC8(iv-b): the RANGE probe counts the groups the range answer can
+/// contain, and the instant probe does not — so a group visible only to
+/// the range window trips the cap while the instant route still serves.
+///
+/// Both pieces of the error set are covered: a group present only at
+/// exactly `aE`, which the half-open instant window excludes, and one
+/// present only in the leading step `(aS - step, aS)`, which it also
+/// excludes. The instant control is what makes this an assertion about
+/// TWO probes rather than about a cap — a single shared probe cannot
+/// satisfy both halves.
+#[tokio::test]
+async fn the_range_probe_rejects_groups_outside_the_instant_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, _) = fresh_db(&DB_CAP).await;
+    let mut cfg = engine_config();
+    cfg.max_series = 1;
+    let capped = TraceEngine::new(
+        {
+            let mut c = test_config();
+            c.database = DB_CAP.to_string();
+            ChClient::new(c).await.expect("connect")
+        },
+        cfg,
+    );
+
+    // Two time-disjoint aligned windows, so the two corpora cannot see
+    // each other.
+    let (base_start, _) = past_window(600);
+    let aligned = base_start.div_euclid(60) * 60;
+    let step_ms = 60_000;
+
+    // E: `a` inside [aS, aE); `b` ONLY at exactly aE.
+    let e_start = aligned;
+    let e_end = aligned + 120;
+    // L: `c` inside; `d` ONLY in (aS - step, aS).
+    let l_start = aligned + 300;
+    let l_end = aligned + 420;
+
+    insert_spans(
+        &admin,
+        &DB_CAP,
+        &[
+            span_row(30_001, "cap-a", (e_start + 30) * NS, 1_000_000, 0),
+            span_row(30_002, "cap-b", e_end * NS, 1_000_000, 0),
+            span_row(30_003, "cap-c", (l_start + 30) * NS, 1_000_000, 0),
+            span_row(30_004, "cap-d", (l_start - 30) * NS, 1_000_000, 0),
+        ],
+    )
+    .await;
+
+    for (name, start_s, end_s, inside) in [
+        ("E (a group at exactly aE)", e_start, e_end, "cap-a"),
+        ("L (a group in the leading step)", l_start, l_end, "cap-c"),
+    ] {
+        let plan = plan_for(
+            &capped,
+            "{} | count_over_time() by(resource.service.name)",
+            start_s,
+            end_s,
+            step_ms,
+        );
+        // The range window really does see the extra group and the
+        // instant window really does not — stated as the two windows,
+        // which is the only difference between the two probes.
+        assert_eq!(
+            plan.snapped_window_ns(),
+            (start_s * NS, end_s * NS),
+            "{name}"
+        );
+        assert_eq!(
+            plan.range_window_ns(),
+            ((start_s - 60) * NS + 1, end_s * NS + 1),
+            "{name}"
+        );
+
+        match capped.metrics_range(&plan).await {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSeriesCap { count, cap })) => {
+                assert!(count > cap, "{name}: count {count} must exceed cap {cap}");
+                assert_eq!(cap, 1, "{name}");
+            }
+            other => panic!("{name}: expected a series-cap rejection, got {other:?}"),
+        }
+
+        // Control, same plan: the instant route serves it, because the
+        // instant probe sees one group.
+        let instant = capped
+            .metrics_instant(&plan)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the instant route must NOT reject: {e}"));
+        assert_eq!(instant.series.len(), 1, "{name}: {instant:?}");
+        assert_eq!(service_label(&instant.series[0]), inside, "{name}");
+    }
+
+    // AC13's live half: a millisecond step over thirty days resolves far
+    // more intervals than the cap, and is refused before any SQL exists.
+    let month = 30 * 86_400;
+    let err = plan_trace_metrics(
+        &pulsus_traceql::parse("{} | rate()").expect("parse"),
+        &MetricsParams {
+            start_ns: aligned * NS,
+            end_ns: (aligned + month) * NS,
+            step_ms: 1,
+            exemplars: None,
+        },
+        &capped.metrics_ctx(),
+    )
+    .expect_err("a 1 ms step over 30 days is over the point cap");
+    match err {
+        pulsus_read::traces::filter::PlanError::MetricsPointCap { buckets, cap } => {
+            assert_eq!(buckets, month * 1_000);
+            assert_eq!(cap, 11_000);
+        }
+        other => panic!("expected MetricsPointCap, got {other:?}"),
+    }
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_CAP}")).await;
+}
+
+// ---------------------------------------------------------------------------
+// AC14 (issue #477): every wall-clock read in THIS file is confined to two
+// named owners.
+//
+// Why a `syn` parse and not a line scan. The first version of this gate
+// matched `^(?:pub )?(?:async )?fn NAME` at column 0. Changing the real
+// declaration to `pub(crate) fn base_s` made that pattern miss it, so a
+// nested `fn base_s() {}` became the only declaration it could see, the
+// count read 1, and the scanner returned GREEN with two breaks sitting in
+// the file. A pattern that only knows the shapes someone thought of is the
+// same defect one iteration later — the precedent is
+// `crates/pulsus-read/tests/traces_regex_seal.rs:18-40`, whose own
+// hand-rolled line scanner was replaced for exactly this reason. `syn` and
+// `proc-macro2` are already dev-dependencies of this crate
+// (`crates/pulsus-read/Cargo.toml`), with the `visit` feature on; no
+// manifest change.
+// ---------------------------------------------------------------------------
+
+use proc_macro2::{TokenStream, TokenTree};
+use syn::visit::Visit;
+
+/// `(clock type, constructor)`. A read is a path in expression position
+/// whose last segment is the constructor and whose owning type — the
+/// preceding segment, or the qualified-self type for `<T>::now()` — is the
+/// clock type; or the same two-token sequence inside a macro's tokens.
+const CLOCKS: [(&str, &str); 3] = [("SystemTime", "now"), ("Instant", "now"), ("Utc", "now")];
+
+/// The only two functions in this file that may read a clock.
+///
+/// `base_s` MUST read one: a committed corpus base ages past the schema's
+/// delete TTL and turns the whole live suite into a silent pass.
+/// `past_window` is the funnel this gate exists to enforce. The scanner
+/// itself is NOT here — its `CLOCKS` entries are string literals, not
+/// paths and not inside a macro, so it owns zero occurrences by
+/// construction and needs no exemption. An exemption hides the cases it
+/// admits; deleting it makes them visible.
+const PERMITTED: [&str; 2] = ["base_s", "past_window"];
+
+/// The owners the control fixture's three reads sit under, in needle
+/// order.
+const CONTROL_OWNERS: [&str; 3] = ["probe_a", "probe_b", "probe_c"];
+
+/// The complete attribute set this file may carry.
+///
+/// `tokio::test` is the only attribute macro it spells; `test` is what the
+/// plain `#[test]` below adds; `doc` is how the parser represents every
+/// `///` and `//!` line, which is why it looks redundant and is not —
+/// removing it reddens the gate on this file's own doc comments; `allow`
+/// is a built-in inert lint attribute, included so that satisfying
+/// `-D warnings` never forces a deviation. Anything else — a `derive`, a
+/// `cfg_attr`, any other path — reddens the gate, because an attribute
+/// macro REWRITES the item it decorates and that rewrite is invisible to
+/// this parse. Widening this list is a deliberate decision, not a tidy-up.
+const ATTR_ALLOW: [&str; 4] = ["test", "tokio::test", "allow", "doc"];
+
+/// No `#[derive(...)]` here, deliberately: `derive` is outside
+/// `ATTR_ALLOW` (a derive macro is an expansion this parse cannot see),
+/// so assertion (6) reddens on it — including on this scanner's own
+/// struct. The empty state is written out below instead.
+struct ClockScan {
+    /// The innermost-enclosing-function stack; `<module>` when empty.
+    owners: Vec<String>,
+    /// Every function declaration, in source order, over the four item
+    /// types `syn` gives a `Signature` — so visibility,
+    /// `const`/`async`/`unsafe`/`extern`, generics, attributes and nesting
+    /// cannot hide one.
+    decls: Vec<String>,
+    /// `(needle, owner, how it was spelled)`; the third field is
+    /// diagnostics only and never a decision.
+    occs: Vec<(String, String, String)>,
+    /// Fail-closed census: `macro_rules!` definitions, item-position macro
+    /// invocations and `Verbatim` nodes — anything that can introduce a
+    /// declaration or a read this parse cannot see.
+    opaque: Vec<String>,
+    /// Every attribute path in the file, joined with `::`.
+    attrs: Vec<String>,
+}
+
+impl ClockScan {
+    fn empty() -> Self {
+        ClockScan {
+            owners: Vec::new(),
+            decls: Vec::new(),
+            occs: Vec::new(),
+            opaque: Vec::new(),
+            attrs: Vec::new(),
+        }
+    }
+
+    fn owner(&self) -> String {
+        self.owners
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<module>".to_string())
+    }
+
+    fn record(&mut self, needle: &str, spelling: String) {
+        let owner = self.owner();
+        self.occs.push((needle.to_string(), owner, spelling));
+    }
+}
+
+/// Matches `Ident(clock) :: Ident(ctor)` anywhere in a token stream, then
+/// recurses into every group. A clock spelling inside a string literal is
+/// a `Literal` token and does not match; whitespace and formatting are
+/// invisible to a token match.
+fn scan_tokens(scan: &mut ClockScan, ts: &TokenStream, what: &str) {
+    let flat: Vec<TokenTree> = ts.clone().into_iter().collect();
+    for w in flat.windows(4) {
+        let (TokenTree::Ident(a), TokenTree::Punct(c1), TokenTree::Punct(c2), TokenTree::Ident(b)) =
+            (&w[0], &w[1], &w[2], &w[3])
+        else {
+            continue;
+        };
+        if c1.as_char() != ':' || c2.as_char() != ':' {
+            continue;
+        }
+        let (ty, ctor) = (a.to_string(), b.to_string());
+        if let Some((clock, _)) = CLOCKS.iter().find(|(t, c)| *t == ty && *c == ctor) {
+            scan.record(clock, format!("[macro `{what}` tokens `{ty}::{ctor}`]"));
+        }
+    }
+    for tt in flat {
+        if let TokenTree::Group(g) = tt {
+            scan_tokens(scan, &g.stream(), what);
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for ClockScan {
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        let name = f.sig.ident.to_string();
+        self.decls.push(name.clone());
+        self.owners.push(name);
+        syn::visit::visit_item_fn(self, f);
+        self.owners.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        let name = f.sig.ident.to_string();
+        self.decls.push(name.clone());
+        self.owners.push(name);
+        syn::visit::visit_impl_item_fn(self, f);
+        self.owners.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
+        let name = f.sig.ident.to_string();
+        self.decls.push(name.clone());
+        self.owners.push(name);
+        syn::visit::visit_trait_item_fn(self, f);
+        self.owners.pop();
+    }
+
+    fn visit_foreign_item_fn(&mut self, f: &'ast syn::ForeignItemFn) {
+        // No body to descend into; it is still a declaration.
+        self.decls.push(f.sig.ident.to_string());
+        syn::visit::visit_foreign_item_fn(self, f);
+    }
+
+    fn visit_expr_path(&mut self, e: &'ast syn::ExprPath) {
+        let segs: Vec<String> = e
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        if let Some(ctor) = segs.last() {
+            // `<T>::now()` carries the owning type in the qualified self,
+            // where the path's own segments do not name it.
+            let owning = match (&e.qself, segs.len()) {
+                (Some(q), _) => match &*q.ty {
+                    syn::Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
+                    _ => None,
+                },
+                (None, n) if n >= 2 => Some(segs[n - 2].clone()),
+                _ => None,
+            };
+            if let Some((clock, _)) = owning
+                .as_deref()
+                .and_then(|o| CLOCKS.iter().find(|(t, c)| *t == o && *c == *ctor))
+            {
+                let spelling = format!("[path `{}`]", segs.join("::"));
+                self.record(clock, spelling);
+            }
+        }
+        syn::visit::visit_expr_path(self, e);
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        let what = m
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        scan_tokens(self, &m.tokens, &what);
+        syn::visit::visit_macro(self, m);
+    }
+
+    fn visit_attribute(&mut self, a: &'ast syn::Attribute) {
+        let path = a
+            .path()
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        self.attrs.push(path);
+        syn::visit::visit_attribute(self, a);
+    }
+
+    fn visit_item(&mut self, i: &'ast syn::Item) {
+        match i {
+            syn::Item::Macro(_) => self.opaque.push("Item::Macro".to_string()),
+            syn::Item::Verbatim(_) => self.opaque.push("Item::Verbatim".to_string()),
+            _ => {}
+        }
+        syn::visit::visit_item(self, i);
+    }
+
+    fn visit_impl_item(&mut self, i: &'ast syn::ImplItem) {
+        match i {
+            syn::ImplItem::Macro(_) => self.opaque.push("ImplItem::Macro".to_string()),
+            syn::ImplItem::Verbatim(_) => self.opaque.push("ImplItem::Verbatim".to_string()),
+            _ => {}
+        }
+        syn::visit::visit_impl_item(self, i);
+    }
+
+    fn visit_trait_item(&mut self, i: &'ast syn::TraitItem) {
+        match i {
+            syn::TraitItem::Macro(_) => self.opaque.push("TraitItem::Macro".to_string()),
+            syn::TraitItem::Verbatim(_) => self.opaque.push("TraitItem::Verbatim".to_string()),
+            _ => {}
+        }
+        syn::visit::visit_trait_item(self, i);
+    }
+
+    fn visit_expr(&mut self, e: &'ast syn::Expr) {
+        if matches!(e, syn::Expr::Verbatim(_)) {
+            self.opaque.push("Expr::Verbatim".to_string());
+        }
+        syn::visit::visit_expr(self, e);
+    }
+}
+
+/// Parses `text` and runs the scan. A file that does not parse FAILS —
+/// under a line scan an unparseable file scanned clean.
+fn scan_clocks(text: &str, label: &str) -> ClockScan {
+    let file = syn::parse_file(text).unwrap_or_else(|e| panic!("{label} must parse: {e}"));
+    let mut scan = ClockScan::empty();
+    scan.visit_file(&file);
+    scan
+}
+
+/// AC14. Class PRESERVATION: it is GREEN on `2f78c53` (where the only
+/// clock read is `base_s`'s) and stays green here, and what it forbids is
+/// a clock read arriving anywhere else later.
+#[test]
+fn every_live_metrics_window_comes_from_the_past_window_helper() {
+    const CONTROL: &str = include_str!("fixtures/ac14_clock_control.txt");
+    const SRC: &str = include_str!("traces_metrics_live.rs");
+
+    let src = scan_clocks(SRC, "traces_metrics_live.rs");
+
+    // (1) every read has a permitted owner.
+    let violations: Vec<&(String, String, String)> = src
+        .occs
+        .iter()
+        .filter(|(_, owner, _)| !PERMITTED.contains(&owner.as_str()))
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "clock read(s) outside the permitted helpers — every live metrics window must come from \
+         `past_window`, and the corpus base from `base_s`:\n{}",
+        violations
+            .iter()
+            .map(|(needle, owner, how)| format!("  {needle}::now owner={owner} {how}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // (2) anti-vacuity: `base_s` owns at least one read, so the scan is
+    // proved able to SEE a real clock site in this file.
+    assert!(
+        src.occs.iter().any(|(_, owner, _)| owner == "base_s"),
+        "`base_s` owns no clock read — either the scan went blind, or the corpus base was \
+         replaced by a committed epoch that will age past the delete TTL"
+    );
+
+    // (3) each permitted name is declared EXACTLY once, counted from the
+    // same declaration list ownership is derived from — so there is no
+    // second spelling to substitute, and a nested `fn base_s() {}` that
+    // launders ownership is caught here.
+    for name in PERMITTED {
+        let n = src.decls.iter().filter(|d| *d == name).count();
+        assert_eq!(
+            n, 1,
+            "permitted owner `{name}` is declared {n} times, expected exactly 1"
+        );
+    }
+
+    // (4) needle liveness against the committed control: one hit per
+    // needle, under its own probe, every one a violation. With the domain
+    // file green by construction, this independent text is what says the
+    // scan can still see anything at all.
+    let control = scan_clocks(CONTROL, "fixtures/ac14_clock_control.txt");
+    for (i, (clock, _)) in CLOCKS.iter().enumerate() {
+        let hits: Vec<&(String, String, String)> =
+            control.occs.iter().filter(|(n, _, _)| n == clock).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the control must carry exactly one {clock}::now, got {hits:?}"
+        );
+        assert_eq!(hits[0].1, CONTROL_OWNERS[i], "{clock}::now owner");
+        assert!(
+            !PERMITTED.contains(&hits[0].1.as_str()),
+            "the control's owners must NOT be permitted, or it proves nothing"
+        );
+    }
+
+    // (5) the fail-closed census: nothing in this file can introduce a
+    // declaration or a read the parse cannot see.
+    assert!(
+        src.opaque.is_empty(),
+        "opaque construct(s) in the domain file: {:?} — a `macro_rules!`, an item-position \
+         macro invocation or a `Verbatim` node is refused because its expansion is invisible \
+         to this gate, not because it is wrong",
+        src.opaque
+    );
+
+    // (6) the attribute pin. An attribute macro rewrites the item it
+    // decorates and that rewrite is invisible to this parse, so the set of
+    // attribute paths is pinned rather than trusted.
+    let unknown: Vec<&String> = src
+        .attrs
+        .iter()
+        .filter(|a| !ATTR_ALLOW.contains(&a.as_str()))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "attribute(s) outside the pinned set {ATTR_ALLOW:?}: {unknown:?} — an attribute macro \
+         rewrites the item it decorates and that rewrite is invisible to this parse. Widening \
+         `ATTR_ALLOW` is a deliberate decision, not a tidy-up."
+    );
 }

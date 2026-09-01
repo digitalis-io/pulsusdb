@@ -1,0 +1,21 @@
+// AC14's needle-liveness control (issue #477). Not compiled, not a test
+// target: it is parsed by the AC14 scanner and by nothing else.
+//
+// One raw clock read per needle, each under its own column-0 `fn` whose
+// name is NOT in the scanner's permitted set — so a correct scan reports
+// exactly three occurrences, one per needle, all classified as
+// violations. If the scanner is blind to a needle (a mistyped spelling,
+// a lost visitor arm) this file is what says so, because the domain file
+// itself has no violation to see.
+
+fn probe_a() {
+    let _ = std::time::SystemTime::now();
+}
+
+fn probe_b() {
+    let _ = std::time::Instant::now();
+}
+
+fn probe_c() {
+    let _ = chrono::Utc::now();
+}

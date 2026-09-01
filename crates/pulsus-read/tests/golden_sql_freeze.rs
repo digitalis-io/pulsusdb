@@ -186,18 +186,22 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// `traces_metrics` goldens were REGENERATED, 0 added, 0 removed**, and
 /// the 50 `traces_search` goldens are byte-identical. Three things moved
 /// in every regenerated file at once, which is why the whole corpus half
-/// moves together:
-///   1. the range bucket label became RIGHT-CLOSED —
-///      `toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), …)
-///      + step_ms` in place of the left-edge form — so a span landing on
-///      a grid point belongs to that point;
-///   2. the range window widened to `(aS - step, aE]`, rendered as
-///      `>= 1699999920000000001 AND < 1700010840000000001`, one whole
-///      step earlier and one nanosecond later than the instant window;
-///   3. two sections were ADDED per file — a `range series probe` (or
-///      `compare range series probe`) beside the frozen instant one, and
-///      an `exemplars` section, since exemplars are now collected by
-///      default rather than only under a `with()` hint.
+/// moves together.
+///
+/// (1) The range bucket label became RIGHT-CLOSED — `toStartOfInterval(
+/// fromUnixTimestamp64Nano(timestamp_ns - 1), …) + step_ms` in place of
+/// the left-edge form — so a span landing on a grid point belongs to that
+/// point.
+///
+/// (2) The range window widened to `(aS - step, aE]`, rendered as
+/// `>= 1699999920000000001 AND < 1700010840000000001`, one whole step
+/// earlier and one nanosecond later than the instant window.
+///
+/// (3) Two sections were ADDED per file: a `range series probe` (or
+/// `compare range series probe`) beside the frozen instant one, and an
+/// `exemplars` section, since exemplars are now collected by default
+/// rather than only under a `with()` hint.
+///
 /// The `instant (query)`, `series probe` and `compare series probe`
 /// sections are byte-identical to `2f78c53` in all 26 files — the instant
 /// route is #503's and this change moves none of its bytes. **The

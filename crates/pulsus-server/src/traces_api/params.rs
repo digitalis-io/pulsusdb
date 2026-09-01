@@ -1621,11 +1621,8 @@ mod tests {
     #[test]
     fn the_exemplars_parameter_normalises_by_value() {
         let parse = |suffix: &str| {
-            parse_metrics_params(
-                &format!("q=%7B%7D&start=1&end=7201&step=60{suffix}"),
-                NOW_S,
-            )
-            .unwrap_or_else(|e| panic!("exemplars{suffix:?} must not be an error, got {e}"))
+            parse_metrics_params(&format!("q=%7B%7D&start=1&end=7201&step=60{suffix}"), NOW_S)
+                .unwrap_or_else(|e| panic!("exemplars{suffix:?} must not be an error, got {e}"))
         };
         assert_eq!(parse("").exemplars, None, "absent");
         assert_eq!(parse("&exemplars=").exemplars, None, "empty");

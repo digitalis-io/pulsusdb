@@ -730,12 +730,7 @@ fn sql_stems(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
         .unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"))
         .map(|e| e.expect("dir entry").path())
         .filter(|p| p.extension().is_some_and(|x| x == "sql"))
-        .map(|p| {
-            p.file_stem()
-                .expect("stem")
-                .to_string_lossy()
-                .into_owned()
-        })
+        .map(|p| p.file_stem().expect("stem").to_string_lossy().into_owned())
         .collect()
 }
 
@@ -844,8 +839,8 @@ fn the_declared_inverse_restores_every_moved_section_to_its_base_bytes() {
             let Some(b) = section_body(&base, name) else {
                 continue;
             };
-            let n = section_body(&new, name)
-                .unwrap_or_else(|| panic!("{stem}: {name} disappeared"));
+            let n =
+                section_body(&new, name).unwrap_or_else(|| panic!("{stem}: {name} disappeared"));
             assert_ne!(n, b, "{stem}: {name} did not move at all");
             assert_eq!(undo_axis(&n), b, "{stem}: {name} does not invert");
             checked += 1;
@@ -869,7 +864,10 @@ fn the_declared_inverse_restores_every_moved_section_to_its_base_bytes() {
                 .expect("a numeric hint");
             let n = section_body(&new, "exemplars").expect("exemplars survive");
             assert_eq!(
-                undo_axis(&n).replace("groupArraySample(1, 1)", &format!("groupArraySample({k}, 1)")),
+                undo_axis(&n).replace(
+                    "groupArraySample(1, 1)",
+                    &format!("groupArraySample({k}, 1)")
+                ),
                 b,
                 "{stem}: the pre-existing exemplar section does not invert"
             );
@@ -877,7 +875,10 @@ fn the_declared_inverse_restores_every_moved_section_to_its_base_bytes() {
         }
     }
     // 24 range + 2 compare cross-tab + 2 compare totals + 1 exemplars.
-    assert_eq!(checked, 29, "the inverse must be applied to every moved section");
+    assert_eq!(
+        checked, 29,
+        "the inverse must be applied to every moved section"
+    );
 }
 
 /// AC7(d): every instant-side section is byte-identical to `2f78c53`.
@@ -895,14 +896,17 @@ fn every_instant_side_section_is_byte_identical_to_base() {
             let Some(b) = section_body(&base, name) else {
                 continue;
             };
-            let n = section_body(&new, name)
-                .unwrap_or_else(|| panic!("{stem}: {name} disappeared"));
+            let n =
+                section_body(&new, name).unwrap_or_else(|| panic!("{stem}: {name} disappeared"));
             assert_eq!(n, b, "{stem}: {name} moved and must not have");
             checked += 1;
         }
     }
     // 24 instant + 2 grouped probes + 2 compare probes.
-    assert_eq!(checked, 28, "the frozen half must cover every instant section");
+    assert_eq!(
+        checked, 28,
+        "the frozen half must cover every instant section"
+    );
 }
 
 /// AC7(c), added-section half: an added section has no base counterpart,
@@ -1146,8 +1150,14 @@ fn the_metrics_path_carries_no_stale_step_unit_token() {
         step_ms += m;
     }
     // Anti-vacuity: a scan pointed at nothing must fail, not pass.
-    assert!(files >= 30, "only {files} .rs files scanned — the scan read almost nothing");
-    assert!(step_ms >= 1, "no `step_ms` anywhere — the scan is not reading the changed code");
+    assert!(
+        files >= 30,
+        "only {files} .rs files scanned — the scan read almost nothing"
+    );
+    assert!(
+        step_ms >= 1,
+        "no `step_ms` anywhere — the scan is not reading the changed code"
+    );
     assert!(
         hits.is_empty(),
         "stale pre-#477 spellings survive in the metrics path:\n{}",

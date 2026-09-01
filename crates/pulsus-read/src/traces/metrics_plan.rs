@@ -64,7 +64,11 @@ impl RangeAxis {
     /// The `i`-th label. Panics in debug on an out-of-range index; the
     /// only caller iterates `0..points`.
     pub fn label_ms(&self, i: usize) -> i64 {
-        debug_assert!(i < self.points, "axis index {i} out of {} points", self.points);
+        debug_assert!(
+            i < self.points,
+            "axis index {i} out of {} points",
+            self.points
+        );
         self.first_ms + (i as i64) * self.step_ms
     }
 
@@ -591,8 +595,7 @@ pub fn plan_trace_metrics(
             fixed_series,
             sel_window: analysis.compare_window,
         });
-        let instant_probe_bucket =
-            metrics_sql::compare_instant_probe_bucket_expr(params.step_ms);
+        let instant_probe_bucket = metrics_sql::compare_instant_probe_bucket_expr(params.step_ms);
         let ip = metrics_sql::metrics_compare_sql(&metrics_sql::CompareSqlInput {
             spans_table: spans,
             attrs_table: ctx.filter.attrs_table,
@@ -615,7 +618,7 @@ pub fn plan_trace_metrics(
 
     let (range_probe_sql, instant_probe_sql) = match compare_probes {
         Some((range_probe, instant_probe)) => (Some(range_probe), Some(instant_probe)),
-        None if keys.first().is_some() => (
+        None if !keys.is_empty() => (
             Some(metrics_sql::metrics_series_probe_sql(
                 spans,
                 &range_filter_sql,
@@ -1093,13 +1096,62 @@ mod tests {
     #[test]
     fn the_range_axis_matches_the_reference_grid() {
         for (start_s, end_s, step_ms, points, first_ms, last_ms) in [
-            (1_788_182_400i64, 1_788_182_640i64, 30_000i64, 9usize, 1_788_182_400_000i64, 1_788_182_640_000i64),
-            (1_788_182_401, 1_788_182_641, 30_000, 10, 1_788_182_400_000, 1_788_182_670_000),
-            (1_788_182_429, 1_788_182_669, 30_000, 10, 1_788_182_400_000, 1_788_182_670_000),
-            (1_788_182_521, 1_788_182_579, 30_000, 3, 1_788_182_520_000, 1_788_182_580_000),
-            (1_788_182_537, 1_788_182_540, 500, 7, 1_788_182_537_000, 1_788_182_540_000),
-            (1_788_182_535, 1_788_182_541, 1_500, 5, 1_788_182_535_000, 1_788_182_541_000),
-            (1_788_183_390, 1_788_183_410, 20_000, 3, 1_788_183_380_000, 1_788_183_420_000),
+            (
+                1_788_182_400i64,
+                1_788_182_640i64,
+                30_000i64,
+                9usize,
+                1_788_182_400_000i64,
+                1_788_182_640_000i64,
+            ),
+            (
+                1_788_182_401,
+                1_788_182_641,
+                30_000,
+                10,
+                1_788_182_400_000,
+                1_788_182_670_000,
+            ),
+            (
+                1_788_182_429,
+                1_788_182_669,
+                30_000,
+                10,
+                1_788_182_400_000,
+                1_788_182_670_000,
+            ),
+            (
+                1_788_182_521,
+                1_788_182_579,
+                30_000,
+                3,
+                1_788_182_520_000,
+                1_788_182_580_000,
+            ),
+            (
+                1_788_182_537,
+                1_788_182_540,
+                500,
+                7,
+                1_788_182_537_000,
+                1_788_182_540_000,
+            ),
+            (
+                1_788_182_535,
+                1_788_182_541,
+                1_500,
+                5,
+                1_788_182_535_000,
+                1_788_182_541_000,
+            ),
+            (
+                1_788_183_390,
+                1_788_183_410,
+                20_000,
+                3,
+                1_788_183_380_000,
+                1_788_183_420_000,
+            ),
         ] {
             let params = MetricsParams {
                 start_ns: start_s * NS_PER_S,
@@ -1132,7 +1184,11 @@ mod tests {
             step_ms: 500,
             points: 5,
         };
-        assert_eq!(axis.label_for_ms(1_000_000), 1_000_000, "exactly on a grid point goes LEFT");
+        assert_eq!(
+            axis.label_for_ms(1_000_000),
+            1_000_000,
+            "exactly on a grid point goes LEFT"
+        );
         assert_eq!(axis.label_for_ms(1_000_001), 1_000_500);
         assert_eq!(axis.label_for_ms(1_000_499), 1_000_500);
         assert_eq!(axis.label_for_ms(1_000_500), 1_000_500);
@@ -1164,7 +1220,10 @@ mod tests {
         // No hint, no parameter: exemplars are ON by default.
         let d = plan_ex("{} | rate()", None);
         assert_eq!(d.exemplar_budget(), 100);
-        assert!(d.exemplar_sql().is_some(), "a plain rate() renders exemplar SQL");
+        assert!(
+            d.exemplar_sql().is_some(),
+            "a plain rate() renders exemplar SQL"
+        );
         // The parameter alone.
         assert_eq!(plan_ex("{} | rate()", Some(5)).exemplar_budget(), 5);
         // The hint WINS over the parameter, in both directions — this is
@@ -1181,7 +1240,10 @@ mod tests {
         // through to the default.
         let off = plan_ex("{} | rate() with(exemplars=false)", None);
         assert_eq!(off.exemplar_budget(), 0);
-        assert!(off.exemplar_sql().is_none(), "a zero budget renders no exemplar SQL");
+        assert!(
+            off.exemplar_sql().is_none(),
+            "a zero budget renders no exemplar SQL"
+        );
         // …including when the parameter asks for some.
         assert_eq!(
             plan_ex("{} | rate() with(exemplars=false)", Some(9)).exemplar_budget(),
@@ -1193,7 +1255,10 @@ mod tests {
             100
         );
         // Both inputs are clamped to the ceiling.
-        assert_eq!(plan_ex("{} | rate()", Some(100_000)).exemplar_budget(), MAX_EXEMPLARS);
+        assert_eq!(
+            plan_ex("{} | rate()", Some(100_000)).exemplar_budget(),
+            MAX_EXEMPLARS
+        );
         assert_eq!(
             plan_ex("{} | rate() with(exemplars=100000)", None).exemplar_budget(),
             MAX_EXEMPLARS
@@ -1229,7 +1294,11 @@ mod tests {
             let got = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx());
             match (want, got) {
                 (Ok(points), Ok(p)) => {
-                    assert_eq!(p.range_axis().points, points, "step {step_ms}ms / {width_ms}ms")
+                    assert_eq!(
+                        p.range_axis().points,
+                        points,
+                        "step {step_ms}ms / {width_ms}ms"
+                    )
                 }
                 (Err(buckets), Err(e)) => assert_eq!(
                     e,
@@ -1239,7 +1308,9 @@ mod tests {
                     },
                     "step {step_ms}ms / {width_ms}ms"
                 ),
-                (want, got) => panic!("step {step_ms}ms / {width_ms}ms: wanted {want:?}, got {got:?}"),
+                (want, got) => {
+                    panic!("step {step_ms}ms / {width_ms}ms: wanted {want:?}, got {got:?}")
+                }
             }
         }
     }
@@ -1257,11 +1328,15 @@ mod tests {
             let instant = p.instant_probe_sql().expect("an instant probe");
             assert_ne!(range, instant, "{q}: the two probes must not be one probe");
             assert!(
-                range.contains("timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001"),
+                range.contains(
+                    "timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001"
+                ),
                 "{q}: the range probe is over the range window: {range}"
             );
             assert!(
-                instant.contains("timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"),
+                instant.contains(
+                    "timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
+                ),
                 "{q}: the instant probe is over the instant window: {instant}"
             );
             assert!(

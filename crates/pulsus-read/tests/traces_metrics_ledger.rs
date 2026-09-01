@@ -268,7 +268,10 @@ fn the_five_metrics_geometry_ledger_entries_each_name_their_endpoint() {
     // The hint's unit change is ledgered separately (ruling 1 on issue
     // #477): it is a behaviour change for existing users, not a
     // divergence from the reference.
-    let unit = squash(entry_body(&ledger, "traceql-metrics-exemplars-total-budget"));
+    let unit = squash(entry_body(
+        &ledger,
+        "traceql-metrics-exemplars-total-budget",
+    ));
     assert!(unit.contains("/api/traces/v1/metrics/query_range"));
     assert!(
         unit.contains("used to mean N exemplars **per bucket**"),
