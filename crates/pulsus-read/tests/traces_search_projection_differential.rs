@@ -11,11 +11,15 @@
 //!
 //! **What is compared, per case, per span:** the MULTISET of projected
 //! attribute keys, and the `name`-present flag. Values are compared for
-//! the cases whose reference value is a `stringValue`; the three cases
-//! whose reference value is typed (`http.status_code`, `nestedSetLeft`,
-//! `duration_ms` — all `intValue`) are KEY-compared only, because value
-//! typing is a separate issue and a wrong number rendering would pass
-//! this leg. That limit is stated rather than implied.
+//! the cases whose reference value is a `stringValue`; the FOUR cases
+//! whose reference value is typed (`http.status_code`, `nestedSetLeft`
+//! twice — the range form and the same-field form — and `duration_ms`,
+//! all `intValue`) are KEY-compared only, because value typing is a
+//! separate issue and a wrong number rendering would pass this leg. That
+//! limit is stated rather than implied:
+//! `pulsus_read::traces::search_plan::tests::the_live_differential_registry_is_well_formed`
+//! holds the same four names as data and fails if the registry's
+//! keys-only set stops being them.
 //!
 //! **The validity gate is direction-neutral and runs BEFORE the
 //! comparison.** Two empty multisets are equal, so a case that runs
@@ -66,18 +70,29 @@
 //! which derives the label set from the planner's own enums (both label
 //! matches are exhaustive, so a new variant fails to compile), checks a
 //! witness query really produces each label, and then fails naming any
-//! label whose witness query is absent from `CASES` below. That test is
-//! why cases 31–35 exist: the 30-case registry contained no same-field
-//! `FieldCompare` and nothing reaching `instrumentation:version`, and
-//! reading it could not show that.
+//! label no case's `q` is EQUAL to. That test is why cases 31–35 exist:
+//! the 30-case registry contained no same-field `FieldCompare` and
+//! nothing reaching `instrumentation:version`, and reading it could not
+//! show that. It reads `projection_cases::CASES` as typed data, which
+//! this file `mod`s and that test `include!`s; it used to read this file
+//! as TEXT, and a witness query written in a case NAME satisfied it while
+//! the case exercised nothing (code review wave 2).
 //!
 //! **Instance isolation.** This suite requires a reference instance that
 //! holds NO other suite's corpus, and asserts it below before pushing:
 //! its spans move another differential's aggregates (a `compare()` top-N
 //! picked up this corpus's `statusMessage`, service and root names), and
 //! that failure surfaces in the OTHER suite as an ordinary-looking value
-//! mismatch. `the_projection_leg_does_not_share_an_instance_with_another_suite`
-//! fails if the workflow ever points two legs at one endpoint.
+//! mismatch. Two guards, each with its contract written on it:
+//! `assert_reference_instance_is_exclusive` (runtime — no trace over the
+//! widest window the reference accepts, no tag key at all, and every
+//! request fail-closed) and
+//! `the_projection_leg_does_not_share_an_instance_with_another_suite`
+//! (configuration — instance identity and container lifecycle, not URL
+//! strings). The reverse-order half, another suite running against the
+//! instance this one has already filled, is caught in that other suite:
+//! `compare_value_differential` refuses to run while this corpus's trace
+//! is resident.
 //!
 //! Clean-room: no reference source, grammar or test corpus is read — the
 //! fixture is our own authorship and the reference's answers are read
@@ -96,118 +111,18 @@ use pulsus_schema::{RenderCtx, run_init};
 use pulsus_write::TraceSink;
 use pulsus_write::writer::{ChBlockInserter, TraceWriter, TraceWriterTables};
 
-/// One differential case: the query, and whether its reference value is a
-/// `stringValue` (so the VALUES are compared too, not only the keys).
-struct ProjectionCase {
-    name: &'static str,
-    q: &'static str,
-    compare_values: bool,
-}
+mod projection_cases;
 
-const fn c(name: &'static str, q: &'static str) -> ProjectionCase {
-    ProjectionCase {
-        name,
-        q,
-        compare_values: true,
-    }
-}
-
-const fn keys_only(name: &'static str, q: &'static str) -> ProjectionCase {
-    ProjectionCase {
-        name,
-        q,
-        compare_values: false,
-    }
-}
-
-/// The registry — one entry per numbered row of the issue's query table.
-/// The length is asserted at compile time so the count cannot drift from
-/// the table it describes.
-const CASES: [ProjectionCase; 35] = [
-    c("01_name_eq", r#"{ name = "GET /pay" }"#),
-    c("02_duration_gt", "{ duration > 1s }"),
-    c("03_match_all", "{}"),
-    c(
-        "04_service_name",
-        r#"{ resource.service.name = "proj-checkout" }"#,
-    ),
-    c("05_status_error", "{ status = error }"),
-    c("06_span_http_method", r#"{ span.http.method = "GET" }"#),
-    c(
-        "07_disjunction_per_span",
-        r#"{ name = "slow-op" || span.http.method = "GET" }"#,
-    ),
-    c(
-        "08_scope_collision",
-        r#"{ span.foo = "S-span" && resource.foo = "R-resource" }"#,
-    ),
-    c("09_unscoped_foo", r#"{ .foo = "S-span" }"#),
-    keys_only("10_status_code_num", "{ span.http.status_code >= 500 }"),
-    c("11_method_regex", r#"{ span.http.method =~ "GE.*" }"#),
-    c("12_empty_value", r#"{ span.note = "" }"#),
-    c("13_non_ascii_value", r#"{ span.city = "München" }"#),
-    c("14_select_attr", "{} | select(span.http.method)"),
-    c("15_select_name", "{} | select(name)"),
-    c("16_select_duration", "{} | select(duration)"),
-    c(
-        "17_condition_and_select_same_field",
-        r#"{ span.http.method = "GET" } | select(span.http.method)"#,
-    ),
-    c("18_status_message", r#"{ statusMessage = "boom" }"#),
-    c("19_kind_client", "{ kind = client }"),
-    c("20_parent_id", r#"{ span:parentID = "a479000000000001" }"#),
-    c(
-        "21_instrumentation_name",
-        r#"{ instrumentation:name = "proj-scope" }"#,
-    ),
-    c(
-        "22_event_scoped_attr",
-        r#"{ event.exception.type = "IOError" }"#,
-    ),
-    c("23_event_name", r#"{ event:name = "exception" }"#),
-    c("24_link_span_id", r#"{ link:spanID = "0a1b2c3d4e5f6071" }"#),
-    keys_only("25_nested_set_left", "{ nestedSetLeft > 0 }"),
-    c("26_trace_duration", "{ traceDuration > 1s }"),
-    keys_only(
-        "27_single_field_arithmetic",
-        "{ span.duration_ms * 1000 > 5000 }",
-    ),
-    c("28_key_existence", "{ span.http.method != nil }"),
-    c("29_root_name", r#"{ rootName = "GET /pay" }"#),
-    c("30_name_neq_empty", r#"{ name != "" }"#),
-    // 31-34: the SAME-FIELD comparison, one per value source it can draw
-    // from — an attribute, an intrinsic that fills `name`, a nested-set
-    // intrinsic and a physical column. Exactly one distinct field appears
-    // across both operands, so each is a single-field condition and the
-    // reference projects that field; a comparison naming two DIFFERENT
-    // fields is the deferred multi-field class and is not a case here.
-    c(
-        "31_same_field_attribute",
-        r#"{ span.http.method = span.http.method }"#,
-    ),
-    c("32_same_field_intrinsic_name", "{ name = name }"),
-    keys_only(
-        "33_same_field_nested_set",
-        "{ nestedSetLeft = nestedSetLeft }",
-    ),
-    c(
-        "34_same_field_physical_column",
-        r#"{ resource.service.name = resource.service.name }"#,
-    ),
-    // The remaining uncovered value source: the scope VERSION column.
-    c(
-        "35_instrumentation_version",
-        r#"{ instrumentation:version = "1.2.3" }"#,
-    ),
-];
-
-const _: () = assert!(CASES.len() == 35);
+use projection_cases::CASES;
 
 // ---------------------------------------------------------------------------
 // the corpus — built ONCE, as OTLP/JSON bytes
 // ---------------------------------------------------------------------------
 
-const TRACE_HEX: &str = "a4790000000000000000000000000001";
+/// This suite's corpus trace id. Declared in `pulsus_testkit` because
+/// `compare_value_differential` guards against exactly this residue —
+/// see [`pulsus_testkit::PROJECTION_DIFFERENTIAL_TRACE_HEX`].
+const TRACE_HEX: &str = pulsus_testkit::PROJECTION_DIFFERENTIAL_TRACE_HEX;
 const S_PAY: &str = "a479000000000001";
 const S_CHARGE: &str = "a479000000000002";
 const S_CONFIRM: &str = "a479000000000011";
@@ -575,38 +490,204 @@ fn now_ns() -> i64 {
     .expect("fits i64")
 }
 
-/// Every trace id the reference's SEARCH route returns for `{}`, whatever
-/// trace it belongs to — the unfiltered form of [`reference`], used to
-/// prove the instance is empty before this suite's corpus goes in.
-fn reference_all_trace_ids(api_base: &str) -> Vec<String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs();
-    let url = format!("{}/api/search", api_base.trim_end_matches('/'));
-    let out = Command::new("curl")
-        .args(["-s", "-G", "--max-time", "20"])
-        .args(["--data-urlencode", "q={}"])
-        // Wide enough to cover any corpus another leg pushed in this job.
-        .args(["--data-urlencode", &format!("start={}", now - 86_400)])
-        .args(["--data-urlencode", &format!("end={}", now + 3_600)])
-        .args(["--data-urlencode", "limit=100"])
-        .arg(&url)
+/// A GET against the reference, FAIL-CLOSED.
+///
+/// Every transport failure, every non-200 status and every unparseable
+/// body is an `Err` carrying what happened. The exclusivity guard below
+/// reads "the instance holds nothing" out of these answers, and the
+/// previous version of that read returned an empty vector on any error —
+/// a guard that reports success exactly when it cannot see (code review
+/// wave 2).
+fn reference_get(url: &str, params: &[(&str, String)]) -> Result<serde_json::Value, String> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s", "-G", "--max-time", "20", "-w", "\n%{http_code}"]);
+    for (key, value) in params {
+        cmd.args(["--data-urlencode", &format!("{key}={value}")]);
+    }
+    let out = cmd
+        .arg(url)
         .output()
-        .expect("curl on PATH");
-    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return Vec::new();
-    };
-    body.get("traces")
+        .map_err(|e| format!("curl {url} could not be run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "curl {url} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let (payload, status) = body
+        .rsplit_once('\n')
+        .ok_or_else(|| format!("curl {url} wrote no status line: {body:?}"))?;
+    if status.trim() != "200" {
+        return Err(format!(
+            "{url} answered HTTP {} — body {payload:?}",
+            status.trim()
+        ));
+    }
+    serde_json::from_str(payload).map_err(|e| format!("{url} returned {payload:?}: {e}"))
+}
+
+/// A JSON array field that MUST be present. An absent field is a failure,
+/// not an empty answer — the same rule as [`reference_get`], one level
+/// down.
+fn required_array<'a>(
+    body: &'a serde_json::Value,
+    field: &str,
+    what: &str,
+) -> Result<&'a Vec<serde_json::Value>, String> {
+    body.get(field)
         .and_then(|v| v.as_array())
-        .map(|traces| {
-            traces
-                .iter()
-                .filter_map(|t| t.get("traceID").and_then(|v| v.as_str()))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+        .ok_or_else(|| format!("{what} carried no `{field}` array: {body}"))
+}
+
+/// The reference instance this leg is pointed at holds NO trace and NO
+/// ingested attribute key, and no other leg in this environment names it.
+///
+/// **What this prevents.**
+///
+/// * Another leg's corpus being resident when this suite pushes its own.
+///   The search probe uses the WIDEST window the pinned reference accepts
+///   — it refuses a range over 168h with
+///   `400 range specified by start and end exceeds 168h0m0s` — so a
+///   corpus timestamped anywhere within the past week is seen, not only
+///   one inside the 25h window the first version of this guard used.
+/// * Catalog residue a search cannot reach: the unbounded tag-name route
+///   still lists an attribute key after the spans that carried it have
+///   left every legal search window, so an instance that looks empty to
+///   `{}` but has ingested before is rejected.
+/// * A failed request read as an empty instance: every error above is a
+///   panic here.
+/// * Another differential leg pointed at this same instance from the same
+///   environment, compared by canonical host and port rather than by URL
+///   string, so `localhost` and `127.0.0.1` do not pass as two instances.
+///
+/// **What it does NOT prevent.**
+///
+/// * A suite that runs AFTER this one against this instance: this corpus
+///   is resident by then, and the guard that catches it belongs to that
+///   suite —
+///   `compare_value_differential` refuses to run while
+///   [`pulsus_testkit::PROJECTION_DIFFERENTIAL_TRACE_HEX`] is resident,
+///   which is the reverse-order half of the hazard.
+/// * A trace older than a week carrying no attribute and no resource
+///   attribute at all: outside every legal search window and contributing
+///   no tag name.
+/// * A proxy or port forward reaching this instance under an address
+///   neither the workflow nor this process's environment names.
+fn assert_reference_instance_is_exclusive(api_base: &str) {
+    let base = api_base.trim_end_matches('/');
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    )
+    .expect("fits i64");
+
+    let search = format!("{base}/api/search");
+    let body = reference_get(
+        &search,
+        &[
+            ("q", "{}".to_string()),
+            // 167h30m: under the reference's 168h refusal, and the widest
+            // window this probe can legally ask for.
+            ("start", (now - 167 * 3600).to_string()),
+            ("end", (now + 1800).to_string()),
+            ("limit", "100".to_string()),
+        ],
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "the exclusivity precondition could not read {search}: {e}\nThis suite needs a \
+             reference instance of its OWN and cannot confirm it has one, so it refuses to run."
+        )
+    });
+    let resident = required_array(&body, "traces", &search).unwrap_or_else(|e| panic!("{e}"));
+    let ids: Vec<&str> = resident
+        .iter()
+        .filter_map(|t| t.get("traceID").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        resident.is_empty(),
+        "the reference at {api_base} already holds {} trace(s) ({ids:?}) over the widest window \
+         it accepts — this suite needs an instance of its OWN. Its corpus enters other legs' \
+         aggregates (compare()'s top-N), and the resulting failure surfaces in THAT suite as an \
+         ordinary-looking value mismatch. Start a fresh instance for this leg.",
+        resident.len()
+    );
+
+    let tags = format!("{base}/api/search/tags");
+    let body = reference_get(&tags, &[]).unwrap_or_else(|e| {
+        panic!(
+            "the exclusivity precondition could not read {tags}: {e}\nThis suite needs a \
+             reference instance of its OWN and cannot confirm it has one, so it refuses to run."
+        )
+    });
+    let names = required_array(&body, "tagNames", &tags).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        names.is_empty(),
+        "the reference at {api_base} has ingested attribute key(s) {names:?} — its tag catalog \
+         is not this suite's own corpus. Spans that have aged out of every searchable window \
+         still leave their keys here, so this instance has served another leg. Start a fresh \
+         instance."
+    );
+
+    // The same instance reached through a second variable in this very
+    // environment: the reverse-order hazard's configuration half, checked
+    // at RUNTIME because a shell or a script sets what the workflow does
+    // not.
+    let ours: Vec<(String, String)> = OUR_ENDPOINT_VARS
+        .iter()
+        .filter_map(|var| std::env::var(var).ok().map(|v| ((*var).to_string(), v)))
+        .collect();
+    for (their_var, their_url) in std::env::vars()
+        .filter(|(k, _)| k.starts_with("PULSUSDB_") && k.ends_with("_URL"))
+        .filter(|(k, _)| !OUR_ENDPOINT_VARS.contains(&k.as_str()))
+    {
+        for (our_var, our_url) in &ours {
+            assert_ne!(
+                endpoint_identity(&their_url),
+                endpoint_identity(our_url),
+                "{their_var}={their_url} and {our_var}={our_url} name the SAME instance \
+                 ({:?}) — this suite's corpus would enter that leg's aggregates. The two \
+                 spellings differ; the host and port do not.",
+                endpoint_identity(our_url)
+            );
+        }
+    }
+}
+
+/// This leg's two endpoint variables.
+const OUR_ENDPOINT_VARS: [&str; 2] = [
+    "PULSUSDB_PROJECTION_DIFF_URL",
+    "PULSUSDB_PROJECTION_OTLP_URL",
+];
+
+/// A canonical INSTANCE identity for an endpoint URL: `(host, port)` with
+/// every loopback spelling folded to one token.
+///
+/// `http://localhost:13200` and `http://127.0.0.1:13200` are one instance
+/// and are equal here. As literal strings they are not, which is how a
+/// shared instance passed the configuration check unnoticed (code review
+/// wave 2).
+fn endpoint_identity(url: &str) -> (String, String) {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (h, p),
+        // No explicit port: the scheme's default. Recorded as the literal
+        // empty port rather than guessed, so two portless URLs on one host
+        // still compare equal and a portless one never accidentally
+        // matches an explicit port.
+        _ => (authority, ""),
+    };
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    let canonical = match host {
+        "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "" => "loopback",
+        other => other,
+    };
+    (canonical.to_string(), port.to_string())
 }
 
 /// Every `PULSUSDB_*_URL` endpoint the CI workflow assigns, as
@@ -626,8 +707,55 @@ fn workflow_endpoint_assignments(workflow: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Hermetic — issue #479, code review wave 1. **The projection leg may not
-/// share a reference instance with any other differential leg.**
+/// The workflow's steps, as `(title, body)` — the body being every line
+/// from the `- name:` line to the next one. Scoping the container checks
+/// to a STEP is what makes "the step that starts our instance" a
+/// well-defined thing to assert about.
+fn workflow_steps(workflow: &str) -> Vec<(String, String)> {
+    let mut steps: Vec<(String, String)> = Vec::new();
+    for line in workflow.lines() {
+        if let Some(title) = line.trim().strip_prefix("- name:") {
+            steps.push((title.trim().to_string(), String::new()));
+        } else if let Some((_, body)) = steps.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    steps
+}
+
+/// The HOST ports a step's `docker run` publishes — the left half of each
+/// `-p <host>:<container>`.
+fn published_host_ports(step_body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut tokens = step_body.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "-p"
+            && let Some(mapping) = tokens.next()
+            && let Some((host, _)) = mapping.split_once(':')
+        {
+            out.push(host.to_string());
+        }
+    }
+    out
+}
+
+/// The container names a step declares with `--name`.
+fn declared_container_names(step_body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut tokens = step_body.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--name"
+            && let Some(name) = tokens.next()
+        {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Hermetic — issue #479, code review waves 1 and 2. **The projection leg
+/// may not share a reference instance with any other differential leg.**
 ///
 /// Running this suite before `compare_value_differential` on ONE instance
 /// makes the latter fail: this corpus's `statusMessage`, service and root
@@ -636,20 +764,36 @@ fn workflow_endpoint_assignments(workflow: &str) -> Vec<(String, String)> {
 /// exactly like a parity defect in the code under review — so the fix is
 /// isolation, not a documented running order.
 ///
-/// This is the CONFIGURATION half: no other leg may be pointed at either
-/// of this leg's two endpoints. The RUNTIME half is the emptiness
-/// precondition in the differential below, which catches an instance
-/// shared by some route this file cannot see (a differently spelled URL, a
-/// developer's shell, a reused container).
+/// This is the CONFIGURATION half. It no longer compares endpoint STRINGS:
+/// wave 2 pointed this leg at `127.0.0.1:13200/4318` while the others used
+/// `localhost:13200/4318` and the check passed on one instance. What is
+/// asserted now is instance IDENTITY and LIFECYCLE —
 ///
-/// *RED when:* a second step reuses this leg's endpoint, or this leg's
-/// endpoint variables stop being assigned exactly once.
+///  * each of our two variables is assigned exactly once, and at least two
+///    other legs exist, so nothing is compared vacuously;
+///  * no other leg's endpoint shares our canonical `(host, port)`, and none
+///    shares either of our PORTS under any host spelling;
+///  * exactly one step starts a container publishing our ports, it
+///    publishes BOTH of them, it declares exactly one container name, and
+///    that container publishes no other leg's port — the container, not the
+///    URL text, is the instance;
+///  * that container name is started once and torn down by an
+///    `if: always()` step, so a leftover container cannot be silently
+///    inherited by the next run.
+///
+/// What it still cannot see: a proxy, a port forward or a value built at
+/// runtime that reaches the same instance under an address the workflow
+/// does not contain. The RUNTIME half —
+/// [`assert_reference_instance_is_exclusive`] — covers that from the other
+/// direction by refusing an instance that holds any trace or any tag key.
+///
+/// *RED when:* a second leg reuses this leg's endpoint or either of its
+/// ports under any spelling, our variables stop being assigned exactly
+/// once, the start step stops being unique or stops publishing both ports,
+/// its container is shared with another leg, or the teardown step goes
+/// away.
 #[test]
 fn the_projection_leg_does_not_share_an_instance_with_another_suite() {
-    const OURS: [&str; 2] = [
-        "PULSUSDB_PROJECTION_DIFF_URL",
-        "PULSUSDB_PROJECTION_OTLP_URL",
-    ];
     let workflow = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -662,8 +806,8 @@ fn the_projection_leg_does_not_share_an_instance_with_another_suite() {
 
     let (ours, others): (Vec<_>, Vec<_>) = assignments
         .iter()
-        .partition(|(key, _)| OURS.contains(&key.as_str()));
-    for var in OURS {
+        .partition(|(key, _)| OUR_ENDPOINT_VARS.contains(&key.as_str()));
+    for var in OUR_ENDPOINT_VARS {
         assert_eq!(
             ours.iter().filter(|(key, _)| key == var).count(),
             1,
@@ -677,16 +821,95 @@ fn the_projection_leg_does_not_share_an_instance_with_another_suite() {
         "no other PULSUSDB_*_URL leg is configured — this check would pass having compared \
          nothing"
     );
+
+    let our_ports: Vec<String> = ours
+        .iter()
+        .map(|(_, url)| endpoint_identity(url).1)
+        .collect();
     for (our_var, our_url) in &ours {
+        let (our_host, our_port) = endpoint_identity(our_url);
+        assert!(
+            !our_port.is_empty(),
+            "{our_var}={our_url} names no port, so this leg's instance cannot be identified"
+        );
         for (their_var, their_url) in &others {
+            let (their_host, their_port) = endpoint_identity(their_url);
+            assert!(
+                (our_host.clone(), our_port.clone()) != (their_host, their_port.clone()),
+                "{our_var}={our_url} and {their_var}={their_url} name the SAME reference \
+                 instance: this suite's corpus would move that leg's aggregates, and the \
+                 failure would surface there as a value mismatch against the reference"
+            );
             assert_ne!(
-                our_url, their_url,
-                "{our_var} and {their_var} name the SAME reference endpoint {our_url}: this \
-                 suite's corpus would move that leg's aggregates, and the failure would surface \
-                 there as a value mismatch against the reference"
+                our_port, their_port,
+                "{our_var}={our_url} and {their_var}={their_url} share the port {our_port}: on \
+                 this runner every oracle is published on the loopback interface, so one port \
+                 is one instance whatever the host is spelled as"
             );
         }
     }
+
+    // The LIFECYCLE half: our ports belong to exactly one container, and
+    // that container is ours alone.
+    let steps = workflow_steps(&workflow);
+    let starters: Vec<&(String, String)> = steps
+        .iter()
+        .filter(|(_, body)| {
+            body.contains("docker run")
+                && published_host_ports(body)
+                    .iter()
+                    .any(|p| our_ports.contains(p))
+        })
+        .collect();
+    assert_eq!(
+        starters.len(),
+        1,
+        "exactly one step must start the container publishing {our_ports:?}; found {:?}",
+        starters.iter().map(|(t, _)| t).collect::<Vec<_>>()
+    );
+    let (start_title, start_body) = starters[0];
+    let published = published_host_ports(start_body);
+    for port in &our_ports {
+        assert!(
+            published.contains(port),
+            "the step {start_title:?} publishes {published:?} but not {port} — this leg's two \
+             endpoints must be two ports of ONE container"
+        );
+    }
+    for (their_var, their_url) in &others {
+        // Destructured rather than indexed so the workspace's fixed-port
+        // uniqueness guard can see this is not a port literal.
+        let (_their_host, their_port) = endpoint_identity(their_url);
+        assert!(
+            !published.contains(&their_port),
+            "the step {start_title:?} publishes {their_port}, which {their_var}={their_url} \
+             also names: that container serves two legs and is one shared instance"
+        );
+    }
+    let names = declared_container_names(start_body);
+    assert_eq!(
+        names.len(),
+        1,
+        "the step {start_title:?} must declare exactly one --name; found {names:?}"
+    );
+    let name = &names[0];
+    let started = steps
+        .iter()
+        .filter(|(_, body)| body.contains("docker run") && body.contains(&format!("--name {name}")))
+        .count();
+    assert_eq!(
+        started, 1,
+        "the container {name} is started by {started} steps; a second start would attach this \
+         leg to whatever the first one left behind"
+    );
+    let torn_down = steps.iter().any(|(_, body)| {
+        body.contains(&format!("docker rm -f {name}")) && body.contains("if: always()")
+    });
+    assert!(
+        torn_down,
+        "no `if: always()` step removes the container {name} — a leftover instance is inherited \
+         by the next run of this job, corpus and tag catalog included"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -723,17 +946,12 @@ async fn traces_search_projection_differential() {
     // This suite's corpus moves another differential's aggregates (a
     // `compare()` top-N picked up its statusMessage / service / root
     // names), and that shows up in the OTHER suite as a value mismatch
-    // against the reference. So the instance must hold nothing else. The
-    // configuration half is
-    // `the_projection_leg_does_not_share_an_instance_with_another_suite`;
-    // this is the runtime half, and it also catches a container reused
-    // across two local runs.
-    let resident = reference_all_trace_ids(&api_base);
-    assert!(
-        resident.is_empty(),
-        "the reference at {api_base} already holds {} trace(s) ({resident:?}) — this suite          needs an instance of its OWN. Its corpus enters other legs' aggregates (compare()'s          top-N), and the resulting failure surfaces in THAT suite as an ordinary-looking value          mismatch. Start a fresh instance for this leg.",
-        resident.len()
-    );
+    // against the reference. So the instance must hold nothing else, and
+    // must be provably readable while it says so. The contract — what
+    // this prevents and what it does not — is on
+    // `assert_reference_instance_is_exclusive`; the configuration half is
+    // `the_projection_leg_does_not_share_an_instance_with_another_suite`.
+    assert_reference_instance_is_exclusive(&api_base);
 
     // The reference first, so it has the whole poll window to index.
     otlp_push(&otlp_base, &body);

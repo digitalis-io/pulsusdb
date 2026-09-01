@@ -121,6 +121,18 @@ pub const CLICKHOUSE_GATE: &str = "PULSUS_TEST_CLICKHOUSE";
 /// The gate on the suites that additionally need a TLS-enabled ClickHouse.
 pub const CLICKHOUSE_TLS_GATE: &str = "PULSUS_TEST_CLICKHOUSE_TLS";
 
+/// The trace id the matched-span PROJECTION differential
+/// (`crates/pulsus-read/tests/traces_search_projection_differential.rs`,
+/// issue #479) pushes into its own reference instance.
+///
+/// It lives here, and not in that suite, because a SECOND suite has to be
+/// able to recognise the residue: that corpus enters a `compare()` top-N
+/// and the resulting failure surfaces in the other suite as an ordinary
+/// value mismatch against the reference. `compare_value_differential`
+/// refuses to run against an instance holding this trace, and naming the
+/// constant once is what stops the two suites drifting to different ids.
+pub const PROJECTION_DIFFERENTIAL_TRACE_HEX: &str = "a4790000000000000000000000000001";
+
 /// GitHub Actions job ids that may execute a gated test binary with no
 /// gate set. Only the hermetic lane qualifies: it runs
 /// `cargo test --workspace` with no container, so the gated suites are
@@ -628,6 +640,54 @@ pub fn settle_by<T: Clone + PartialEq + std::fmt::Debug>(
         "{what}: never returned a STABLE non-empty view before the deadline \
          (last observation {:?})",
         wait.last()
+    );
+}
+
+/// Refuse to run against a reference instance that already holds
+/// `trace_hex` (issue #479, code review wave 2).
+///
+/// The matched-span projection differential fills its instance with a
+/// corpus that enters a `compare()` top-N. If a suite that reads such an
+/// aggregate is then pointed at the same instance, it fails with a value
+/// mismatch against the reference — a failure that reads exactly like a
+/// parity defect in the code under review, and cost one review round. The
+/// projection suite refuses an instance that is not empty; this is the
+/// other direction, the one it cannot check for itself, because its
+/// corpus is only resident AFTER it has run.
+///
+/// Fail-closed: only an explicit `404` counts as absent. A transport
+/// error, any other status, or a `200` are all refusals — a guard that
+/// reads "not present" from a request that failed passes precisely when
+/// it cannot see.
+pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, owner: &str) {
+    let url = format!("{}/api/traces/{trace_hex}", api_base.trim_end_matches('/'));
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "20",
+        ])
+        .arg(&url)
+        .output()
+        .unwrap_or_else(|e| panic!("curl {url} could not be run: {e}"));
+    assert!(
+        out.status.success(),
+        "curl {url} exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(
+        code, "404",
+        "the reference at {api_base} answered HTTP {code} for trace {trace_hex}, the corpus \
+         {owner} pushes. Anything but 404 means this instance is not exclusively this suite's: \
+         {owner}'s spans enter compare()'s top-N and this suite would then report a value \
+         mismatch against the reference that looks like a parity defect. Give each leg its own \
+         instance."
     );
 }
 

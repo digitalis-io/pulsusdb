@@ -1838,6 +1838,23 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (`cafe000000000009[a={"stringValue": "R"}]`,
   `cafe000000000001[a={"intValue": "3"}]`). So the non-reproduction is not
   "the key never arrived".
+- **Replaying the original sequence does not reproduce it either, and
+  cannot settle it.** The wave-2 code review rebuilt the wave-1 probe
+  harness from that round's transcript — the reconstruction's git blob
+  hash matches the original byte for byte — and ran the ORIGINAL suite
+  order rather than a controlled isolation: the comparison leg, then the
+  projection leg on one instance, then the harness. The case still read
+  `NO-SPANS` on the reference. **The replay is not a same-window
+  comparison**, and that is the point worth recording: the harness's read
+  modes carry wave-1's HARD-CODED timestamps, while the run that pushes
+  the corpus anchors it at `now - 90s`. Those fixed windows no longer
+  cover the spans the same invocation just pushed, so the read half
+  quietly returns nothing whatever the catalog holds — the mixed-TTL
+  failure this project has hit before, where the pinned half stays green
+  and the data half sees an empty range. Re-read directly over the
+  CURRENT window with the key `a` resident, the case still returned no
+  spans. So: replaying those windows is not evidence either way, and
+  nobody should spend a seventh attempt on it.
 - **Status:** UNEXPLAINED, and deliberately left so. The observation is
   kept because it was made; the mechanism is not established, and six
   attempts built to produce it did not. What would settle it is the exact
@@ -1845,12 +1862,15 @@ when we are asking it to slow down, so we keep `429`; recorded as
   matters more than the diagnosis.
 - **Why no pin this issue adds can move under it.**
   `crates/pulsus-read/tests/traces_search_projection_differential.rs` now
-  refuses to run against a reference instance holding any other trace, so
-  its oracle's key catalog is exactly its own corpus. Independently, the
-  registry contains exactly ONE `nil` case,
-  `{ span.http.method != nil }` — PRESENCE, on a key the corpus itself
-  defines — enumerated over the whole `CASES` array with its comment lines
-  stripped, and none in the live pin
+  refuses to run against a reference instance holding any trace over the
+  widest window that instance will accept OR any tag key at all, so its
+  oracle's key catalog is exactly its own corpus — and every probe behind
+  that refusal is fail-closed, so an unreadable instance is a failure and
+  not an empty one. Independently, the registry contains exactly ONE `nil`
+  case, `{ span.http.method != nil }` — PRESENCE, on a key the corpus
+  itself defines — which
+  `pulsus_read::traces::search_plan::tests::the_live_differential_registry_is_well_formed`
+  asserts by counting the typed case queries, and none in the live pin
   `crates/pulsus-server/tests/traces_search_live.rs::the_matched_span_projection_follows_the_reference_rule`.
   The one pinned expectation that asserts EMPTINESS,
   `{ name = "GET /pay" && span.zzz = "nope" }`, was measured against an

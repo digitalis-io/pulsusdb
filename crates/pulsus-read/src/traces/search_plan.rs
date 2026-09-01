@@ -2676,7 +2676,8 @@ mod tests {
     /// so a label nothing can produce fails here; and both label functions
     /// match exhaustively with no wildcard, so a new `ProjectionValue` or
     /// `PlannedLeafEval` variant fails to COMPILE until it is named. The
-    /// registry read it as TEXT out of this file, so the two cannot drift.
+    /// registry and this file bind ONE `const CASES`, so the two cannot
+    /// drift.
     ///
     /// The gaps this was written after: no case whose leaf was a same-field
     /// `FieldCompare`, and none for `instrumentation:version`. Neither was
@@ -2830,9 +2831,102 @@ mod tests {
         ("leaf:select", "{} | select(span.http.method)"),
     ];
 
+    /// The differential's case registry, as typed data.
+    ///
+    /// The same file the integration test `mod`s, so the two bind ONE
+    /// `const CASES`. It used to be read as TEXT here, which made the
+    /// coverage check below a substring search: a witness query written
+    /// into a case NAME satisfied it while the case exercised nothing
+    /// (code review wave 2, demonstrated with a match-all case). A path
+    /// under `tests/` that is not a top-level `tests/*.rs` is not built
+    /// as its own test target.
+    mod projection_cases {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/projection_cases/mod.rs"
+        ));
+    }
+
+    /// AC9's registry is WELL FORMED: every case is uniquely named, its
+    /// name carries its own 1-based position, and the cases compared by
+    /// KEY only are exactly the four the differential's module doc names.
+    ///
+    /// Position and uniqueness rather than presence: a duplicate case, a
+    /// renumbering, or a value comparison quietly dropped from a case all
+    /// move something here.
+    ///
+    /// *RED when:* two cases share a name, a case's ordinal prefix stops
+    /// matching its index, or the keys-only set changes without the
+    /// documented list changing with it.
+    #[test]
+    fn the_live_differential_registry_is_well_formed() {
+        use projection_cases::CASES;
+        // The KEY-only cases, as the differential's module doc lists them.
+        // Declared here so a value comparison silently dropped from a case
+        // — or added — has to move this list too.
+        const KEYS_ONLY_CASES: [&str; 4] = [
+            "10_status_code_num",
+            "25_nested_set_left",
+            "27_single_field_arithmetic",
+            "33_same_field_nested_set",
+        ];
+        let names: std::collections::BTreeSet<&str> = CASES.iter().map(|c| c.name).collect();
+        assert_eq!(
+            names.len(),
+            CASES.len(),
+            "two differential cases share a name; the registry's names are its identities"
+        );
+        for (i, case) in CASES.iter().enumerate() {
+            let want = format!("{:02}_", i + 1);
+            assert!(
+                case.name.starts_with(&want),
+                "case {} is named {:?} but sits at position {}; the ordinal is part of the name \
+                 so a case cannot be added in the middle without renumbering",
+                case.name,
+                case.name,
+                i + 1
+            );
+            assert!(
+                !case.q.is_empty(),
+                "case {} carries no query at all",
+                case.name
+            );
+        }
+        let keys_only: Vec<&str> = CASES
+            .iter()
+            .filter(|c| !c.compare_values)
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            keys_only,
+            KEYS_ONLY_CASES.to_vec(),
+            "the cases compared by KEY only are not the ones declared — the differential's \
+             module doc states this limit in prose, and it must be the same list"
+        );
+        // The catalog-dependence ledger row
+        // (`traceql-matched-span-nil-condition-instance-state`) rests on
+        // this registry holding exactly ONE `nil` case, and that one being
+        // a PRESENCE test on a key the corpus itself defines: an ABSENCE
+        // case would be answered from the reference's instance-wide key
+        // catalog rather than from the corpus under test. Counted over the
+        // typed queries, so a case added in a comment or a name cannot
+        // change the answer either way.
+        let nil_cases: Vec<&str> = CASES
+            .iter()
+            .filter(|c| c.q.contains("nil"))
+            .map(|c| c.q)
+            .collect();
+        assert_eq!(
+            nil_cases,
+            vec![r#"{ span.http.method != nil }"#],
+            "the differential's `nil` cases changed; an ABSENCE case is answered from the \
+             reference's key catalog, not from this corpus, so it has no stable pin"
+        );
+    }
+
     /// AC9's registry is COMPLETE over the shape vocabulary — every label
-    /// in [`PROJECTION_SHAPES`] is exercised by a case in
-    /// `crates/pulsus-read/tests/traces_search_projection_differential.rs`.
+    /// in [`PROJECTION_SHAPES`] is the query of a case in
+    /// `crates/pulsus-read/tests/projection_cases/mod.rs`.
     ///
     /// This is the check the wave-1 code review found missing. The registry
     /// agreed 30 of 30 while containing no case whose leaf was a same-field
@@ -2842,11 +2936,18 @@ mod tests {
     /// both label functions match exhaustively, so a new variant fails to
     /// compile, and this test then fails until a live case exercises it.
     ///
+    /// The witness is matched against each case's `q` by EQUALITY, and
+    /// exactly one case may carry it. Wave 2 of the code review satisfied
+    /// the previous, textual form of this check by putting a witness query
+    /// in a case's NAME and leaving the case a match-all: a substring
+    /// search over the array's source text cannot tell the query field
+    /// from any other.
+    ///
     /// *RED when:* a shape label has no witness, a witness does not produce
-    /// the label claimed for it, or the registry does not contain the
-    /// witness query.
+    /// the label claimed for it, or no case's query is exactly the witness.
     #[test]
     fn the_live_differential_registry_covers_every_projection_shape() {
+        use projection_cases::CASES;
         // 1. the witness list is complete over the vocabulary.
         let witnessed: std::collections::BTreeSet<&str> =
             SHAPE_WITNESSES.iter().map(|(label, _)| *label).collect();
@@ -2865,35 +2966,17 @@ mod tests {
             );
         }
 
-        // 3. the registry contains each witness query. Only the `CASES`
-        //    array is searched, and its `//` comment lines are stripped, so
-        //    a query mentioned in prose cannot satisfy a shape.
-        let registry = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests")
-                .join("traces_search_projection_differential.rs"),
-        )
-        .expect("read the differential's case registry");
-        let start = registry
-            .find("const CASES: [ProjectionCase;")
-            .expect("the registry declares CASES");
-        let end = registry[start..]
-            .find("\n];")
-            .expect("the CASES array is terminated");
-        let cases: String = registry[start..start + end]
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let missing: Vec<&str> = SHAPE_WITNESSES
+        // 3. exactly one case's QUERY is that witness.
+        let missing: Vec<(&str, &str, usize)> = SHAPE_WITNESSES
             .iter()
-            .filter(|(_, q)| !cases.contains(q))
-            .map(|(label, _)| *label)
+            .map(|(label, q)| (*label, *q, CASES.iter().filter(|case| case.q == *q).count()))
+            .filter(|(_, _, found)| *found != 1)
             .collect();
         assert!(
             missing.is_empty(),
-            "the live projection differential has no case for {missing:?} — add one to \
-             crates/pulsus-read/tests/traces_search_projection_differential.rs::CASES"
+            "the live projection differential must hold exactly one case per shape; \
+             (label, witness, cases carrying it) = {missing:?} — edit \
+             crates/pulsus-read/tests/projection_cases/mod.rs"
         );
     }
 
