@@ -214,6 +214,57 @@ fn the_residual_entry_states_that_it_records_gaps_rather_than_divergences_of_jud
     );
 }
 
+/// Issue #477 wave 2: the density row asserted parity on two queries we
+/// answer `400` to, and that claim has moved to a row of its own.
+///
+/// Both halves are asserted, because correcting one without the other
+/// leaves the same defect: the MATCHED row must no longer offer a
+/// `by(name)` shape as something that was measured on both sides, and
+/// the divergence row must carry the refusal body a client actually
+/// receives. A row that says "we differ" without the wire text is the
+/// same unfalsifiable prose the wrong row was.
+#[test]
+fn the_by_key_restriction_is_a_divergence_row_and_not_a_matched_claim() {
+    let ledger = ledger();
+
+    let density = squash(entry_body(&ledger, "traceql-metrics-density-by-function"));
+    for refused in ["count_over_time by(name)", "sum_over_time by(name)"] {
+        assert!(
+            !density.contains(&format!("`{refused}`")),
+            "the MATCHED density row still offers {refused:?} as a measured shape, and our \
+             planner answers 400 to it"
+        );
+    }
+    assert!(
+        density.contains(&squash(
+            "`{} | count_over_time() by(resource.service.name)`"
+        )),
+        "the density row must state which grouped shape it was measured on"
+    );
+
+    let by_key = squash(entry_body(
+        &ledger,
+        "traceql-metrics-by-key-restricted-to-service-name",
+    ));
+    assert!(
+        by_key.contains("/api/traces/v1/metrics/query_range"),
+        "a ledger row must name the endpoint it is about"
+    );
+    // The verbatim refusal, which is what a client sees and what makes
+    // the row checkable against the running server.
+    assert!(
+        by_key.contains(&squash(
+            "type mismatch: by() currently supports grouping by resource.service.name only \
+             (issue #182); attribute grouping keys route to a follow-up"
+        )),
+        "the row must carry the 400 body verbatim"
+    );
+    assert!(
+        by_key.contains("`{} | count_over_time() by(name)`"),
+        "the row must name the query it is about"
+    );
+}
+
 /// AC11 (issue #477): the five bucket-geometry/exemplar ledger entries
 /// exist, each names the endpoint it is about, and each carries the fact
 /// its own disposition rests on.

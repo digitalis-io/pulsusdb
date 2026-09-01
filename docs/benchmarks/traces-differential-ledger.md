@@ -1962,11 +1962,12 @@ when we are asking it to slow down, so we keep `429`; recorded as
   four values, `sum_over_time` four samples / four values, identically on
   both.
 
-  This row previously listed `count_over_time by(name)` and
-  `sum_over_time by(name)` among what was measured. Those two are a
-  reference-only measurement — **our side answers `400`** — so they were
-  a parity claim over a query we refuse, and they have moved out of this
-  row into `traceql-metrics-by-key-restricted-to-service-name` below.
+  This row previously listed two `by(name)` shapes among what was
+  measured. Those are a reference-only measurement — **our side answers
+  `400`** — so they were a parity claim over a query we refuse, and they
+  have moved out of this row into
+  `traceql-metrics-by-key-restricted-to-service-name` below, which
+  carries both sides and the refusal body.
 
 - **Ours.** The same split, by construction: densification runs at the
   framing boundary over the count, quantile, histogram and compare shapes
@@ -2001,6 +2002,12 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (`crates/pulsus-read/src/traces/metrics_plan.rs`, the
   `PlanError::TypeMismatch` arm), and `TypeMismatch` maps to `400` at
   `crates/pulsus-server/src/traces_api/error.rs`.
+
+- **Where this came from.** The `traceql-metrics-density-by-function`
+  row above was headed MATCHED and listed `count_over_time by(name)` and
+  `sum_over_time by(name)` among what had been measured, on both sides.
+  Only the reference half of that could have been measured. The queries
+  are recorded here instead, with our half measured too.
 
 - **Disposition.** Deliberate, and **temporary**: widening the metrics
   `by()` key set is issue #182's, not issue #477's, and it is a `400`
