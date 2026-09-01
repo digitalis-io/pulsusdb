@@ -1465,3 +1465,117 @@ fn step_start_ns(ts_ns: i64) -> i64 {
     const STEP_NS: i64 = 3_600 * NS_PER_S;
     ts_ns.div_euclid(STEP_NS) * STEP_NS
 }
+
+/// The per-statement read cost of a range request, printed rather than
+/// asserted — the reproducible source of the cost figures in
+/// [`metrics_sql::metrics_compare_exemplar_range_sql`]'s and
+/// [`metrics_sql::metrics_quantile_exemplar_range_sql`]'s doc comments
+/// (issue #477 wave 3).
+///
+/// `#[ignore]`d and gated on the same `PULSUS_TEST_CLICKHOUSE` as the
+/// rest of this file. It is a MEASUREMENT, not a gate: it asserts only
+/// that it saw statements at all, because absolute row counts are a
+/// property of the corpus and wall times are a property of the machine.
+/// Its purpose is that a reader can re-derive the numbers instead of
+/// taking them from a comment.
+///
+/// ```text
+/// PULSUS_TEST_CLICKHOUSE=1 PULSUS_TEST_CH_HTTP_PORT=18123 \
+///   PULSUS_TEST_CH_DATABASE_PREFIX=<yours> \
+///   cargo nextest run -p pulsus-read --test traces_metrics_explain \
+///   -E 'test(=the_per_statement_read_cost_of_a_range_request)' \
+///   --run-ignored all --no-capture
+/// ```
+#[tokio::test]
+#[ignore = "a measurement probe, not a gate; see the doc comment"]
+async fn the_per_statement_read_cost_of_a_range_request() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct StmtRow {
+        read_rows: u64,
+        read_bytes: u64,
+        memory_usage: u64,
+        query_duration_ms: u64,
+        head: String,
+    }
+    #[derive(Row, serde::Serialize, serde::Deserialize)]
+    struct MarkRow {
+        mark: String,
+    }
+
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB}")).await;
+    run_init(&admin, &test_ctx(&DB)).await.expect("run_init");
+    let now = now_ns();
+    let base = now - WINDOW_NS;
+    let client = data_client().await;
+    seed_corpus(&client, &DB, base).await;
+    let engine = TraceEngine::new(data_client().await, engine_config());
+
+    // The high-water mark of this database's query log, so each request's
+    // statements are the ones logged after its own marker rather than
+    // everything in a trailing time window.
+    async fn watermark(client: &ChClient, db: &str) -> String {
+        let sql = format!(
+            "SELECT toString(max(event_time_microseconds)) AS mark FROM system.query_log \
+             WHERE current_database = '{db}'"
+        );
+        let mut stream = client
+            .query_stream::<MarkRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("watermark");
+        let mut mark = String::from("1970-01-01 00:00:00.000000");
+        while let Some(r) = stream.next().await {
+            let r = r.expect("row");
+            if !r.mark.is_empty() {
+                mark = r.mark;
+            }
+        }
+        mark
+    }
+
+    for q in [
+        r#"{ } | rate()"#,
+        r#"{ } | quantile_over_time(duration, 0.5, 0.9)"#,
+        r#"{ } | compare({ resource.service.name = "checkout" })"#,
+    ] {
+        let plan = plan_for(&engine, q, base, now);
+        exec(&client, "SYSTEM FLUSH LOGS").await;
+        let mark = watermark(&client, &DB).await;
+        let framed = engine.metrics_range(&plan).await.expect("executes");
+        exec(&client, "SYSTEM FLUSH LOGS").await;
+        let sql = format!(
+            "SELECT read_rows, read_bytes, memory_usage, toUInt64(query_duration_ms) AS \
+             query_duration_ms, replaceAll(substring(query, 1, 58), '\\n', ' ') AS head \
+             FROM system.query_log WHERE type = 'QueryFinish' AND current_database = '{DB}' \
+             AND query NOT LIKE '%system.query_log%' AND query NOT LIKE '%SYSTEM FLUSH%' \
+             AND event_time_microseconds > toDateTime64('{mark}', 6) \
+             ORDER BY event_time_microseconds ASC"
+        );
+        let mut stream = client
+            .query_stream::<StmtRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("query_log");
+        let mut n = 0usize;
+        let mut rows = 0u64;
+        println!("\n=== {q}   ({} series)", framed.series.len());
+        while let Some(r) = stream.next().await {
+            let r = r.expect("row");
+            n += 1;
+            rows += r.read_rows;
+            println!(
+                "  stmt {n}: read_rows={:>9} read_bytes={:>11} mem={:>11} dur_ms={:>5}  {}",
+                r.read_rows, r.read_bytes, r.memory_usage, r.query_duration_ms, r.head
+            );
+        }
+        println!("  statements: {n}, read_rows total: {rows}");
+        assert!(
+            n >= 2,
+            "every one of these requests issues at least the range statement and its exemplar statement"
+        );
+    }
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB}")).await;
+}

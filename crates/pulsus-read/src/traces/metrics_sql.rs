@@ -1015,8 +1015,10 @@ fn exemplar_duration_inner(
 /// window's width enters its memory. `read_rows` is gated equal to the
 /// range query's in `tests/traces_metrics_explain.rs`.
 ///
-/// Costs no extra scan over the ungrouped form: same rows, same window,
-/// one more column out of the same subquery.
+/// **Cost, measured.** On the same corpus the range statement and this
+/// one each read **120 000 rows / 4 800 240 bytes** — identical, so the
+/// pooled quantiles cost nothing beyond the exemplar statement that was
+/// already there, and the request stays at two statements. Same probe.
 pub fn metrics_quantile_exemplar_range_sql(
     spans_table: &str,
     filter: &FilterSql,
@@ -1347,11 +1349,20 @@ pub struct CompareExemplarSqlInput<'a> {
 /// regardless of what the root resolves to, so the exemplar side does not
 /// need the trace-wide join the cross-tab needs for its values.
 ///
-/// **Cost**: one statement of the cross-tab's shape (the same
-/// `PREWHERE`/`WHERE` over `spans_table`, the same `DISTINCT` semi-join
-/// against `attrs_table`), minus the roots CTE and minus the value
-/// projection. It runs only on a range comparison that framed a non-zero
-/// sample and only while the exemplar budget is non-zero.
+/// **Cost, measured** (issue #477 wave 3 — the wave-2 note called this
+/// "one more statement of the cross-tab's shape", which was read off the
+/// committed golden and overstates it). On the 120 000-span / 47 h corpus
+/// `tests/traces_metrics_explain.rs` seeds, a range `compare()` with the
+/// default exemplar budget issues four statements, and this one reads
+/// **480 000 rows / 16 566 225 bytes** against the cross-tab's
+/// **720 000 / 26 526 839** — 0.67x its rows and 0.62x its bytes, because
+/// it drops the roots CTE and the value projection. It takes the
+/// request's total from 1 560 000 to 2 040 000 read rows, +31%. Two runs,
+/// identical row and byte figures. Re-derive with the ignored
+/// `the_per_statement_read_cost_of_a_range_request` probe in that file;
+/// the durations there are one run on a shared box and are not a claim.
+/// It runs only on a range comparison that framed a non-zero sample and
+/// only while the exemplar budget is non-zero.
 pub fn metrics_compare_exemplar_range_sql(input: &CompareExemplarSqlInput<'_>) -> String {
     let CompareExemplarSqlInput {
         spans_table,
