@@ -2116,6 +2116,44 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
         vec![("http.method".to_string(), "GET".to_string())],
         "one group per field identity, body {json}"
     );
+    // A comparison whose two operands are the SAME field is a single-field
+    // condition and projects that field ON THE WIRE (code review wave 1).
+    // Asserted here as well as in the engine-level differential because
+    // `name` lands in a different response field from an attribute, and
+    // only this suite reads the rendered body.
+    // `spss=10` because this matches all FOUR spans and the route's
+    // default spans-per-spanset is 3.
+    let q = r#"{ span.http.method = span.http.method }"#;
+    let json = search(port, q, w0, w1, "&spss=10", q).json(q);
+    for (id, want) in [
+        (sid(1), "GET"),
+        (sid(2), "POST"),
+        (sid(11), "GET"),
+        (sid(21), "DELETE"),
+    ] {
+        assert_eq!(
+            attrs_of(&span_by_id(&json, &hex(&id))),
+            vec![("http.method".to_string(), want.to_string())],
+            "a same-field comparison projects the compared field, body {json}"
+        );
+    }
+    let q = "{ name = name }";
+    let json = search(port, q, w0, w1, "&spss=10", q).json(q);
+    assert_eq!(
+        spans_of(&json).len(),
+        4,
+        "{q}: every span matches, body {json}"
+    );
+    for s in spans_of(&json) {
+        assert!(
+            s.get("name").is_some(),
+            "{q}: `name` fills the response's own field, span {s}"
+        );
+        assert!(
+            s.get("attributes").is_none(),
+            "{q}: …and never an attributes entry, span {s}"
+        );
+    }
     // The wave-2 gap, pinned as OUR behaviour so a later wave has a diff
     // to move: a negated attribute leaf projects nothing (the reference
     // emits the span's stored value; ledger row

@@ -19,13 +19,14 @@
 
 use std::path::PathBuf;
 
-/// The three ids this issue adds. The count is in the type: a row added
+/// The four ids this issue adds. The count is in the type: a row added
 /// to the ledger without a clause here, or removed while a clause
 /// survives, moves this array.
-const LEDGER_IDS: [&str; 3] = [
+const LEDGER_IDS: [&str; 4] = [
     "traceql-matched-span-attribute-order",
     "traceql-matched-span-negated-attribute-value-absent",
     "traceql-matched-span-multi-field-leaf-not-projected",
+    "traceql-matched-span-nil-condition-instance-state",
 ];
 
 /// Both mounted routes. The search handler is one function behind two

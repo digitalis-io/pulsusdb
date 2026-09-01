@@ -1801,3 +1801,62 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `pulsus_read::traces::search_plan::tests::wave_two_shapes_project_nothing`,
   which asserts the planner builds no projection source for each shape and
   carries a positive control so "nothing" is the shape's doing.
+
+### `traceql-matched-span-nil-condition-instance-state` (issue #479)
+
+- **What:** whether the reference's answer to an ABSENCE condition
+  (`{ .a = nil }`) on `GET /api/traces/v1/search` and its `/api/search`
+  alias depends on which attribute KEYS the instance has ever ingested,
+  rather than only on the spans in the queried window. Recorded because a
+  differential whose oracle answers from instance-wide state, not from the
+  corpus under test, has no stable pin — and because it was seen once.
+- **Reported once, during the wave-1 code review of this issue.** On ONE
+  reference instance carrying two corpora pushed by two different legs,
+  `{ .a = nil }` answered no spans on an isolated run and, after a second
+  corpus introduced the key `a`, answered with the `a`-absent spans
+  carrying `a` at a nil value. The corpus and instance that produced it no
+  longer exist.
+- **Not reproduced, in six controlled configurations.** Each ran against a
+  FRESH pinned reference instance started for that run alone, with one
+  variable changed and everything else — the queried spans, the window,
+  the request — held identical
+  (a throwaway probe: one OTLP/JSON push over the HTTP receiver, then the
+  query read from `/api/search` after the corpus became visible to `{}`):
+
+  | # | how the key `a` entered the instance | `{}` | `{ .a = nil }` |
+  |---|---|---|---|
+  | 1 | never | 1 span | `NO-SPANS` |
+  | 2 | a SECOND trace, a later push | 2 spans | `NO-SPANS` |
+  | 3 | a second trace in the SAME push (A/B control: run without it) | 1 / 2 spans | `NO-SPANS` both |
+  | 4 | a sibling span of the SAME trace, `intValue` | 2 spans | `NO-SPANS` |
+  | 5 | a sibling span of the SAME trace, `stringValue` | 2 spans | `NO-SPANS` |
+  | 6 | a RESOURCE attribute of a later push / a re-push of an EXISTING span id | 4 / 3 spans | `NO-SPANS` |
+
+  In rows 2 and 4–6 the key was demonstrably resident: the same instance
+  answered `{ .a != nil }` with the carrying span and its value
+  (`cafe000000000009[a={"stringValue": "R"}]`,
+  `cafe000000000001[a={"intValue": "3"}]`). So the non-reproduction is not
+  "the key never arrived".
+- **Status:** UNEXPLAINED, and deliberately left so. The observation is
+  kept because it was made; the mechanism is not established, and six
+  attempts built to produce it did not. What would settle it is the exact
+  two-corpus instance it was seen on, which is why the isolation below
+  matters more than the diagnosis.
+- **Why no pin this issue adds can move under it.**
+  `crates/pulsus-read/tests/traces_search_projection_differential.rs` now
+  refuses to run against a reference instance holding any other trace, so
+  its oracle's key catalog is exactly its own corpus. Independently, the
+  registry contains exactly ONE `nil` case,
+  `{ span.http.method != nil }` — PRESENCE, on a key the corpus itself
+  defines — enumerated over the whole `CASES` array with its comment lines
+  stripped, and none in the live pin
+  `crates/pulsus-server/tests/traces_search_live.rs::the_matched_span_projection_follows_the_reference_rule`.
+  The one pinned expectation that asserts EMPTINESS,
+  `{ name = "GET /pay" && span.zzz = "nope" }`, was measured against an
+  instance whose catalog DOES hold `zzz` at another value and still
+  answered `NO-SPANS`, while `{ span.zzz = "something-else" }` returned
+  the carrying span — so that pin is value-driven, not catalog-driven.
+- **Disposition:** no action on this issue. The wider question — whether
+  other differential suites hold pins that depend on instance state — is
+  separate work and is scheduled elsewhere; this row deliberately does not
+  sweep them.
