@@ -102,7 +102,9 @@ for round in 1 2 3 4 5 6 7 8; do
   esac
 done
 AFTER=$(git grep -c '\bstep_ms\b' -- crates/pulsus-read/src/traces crates/pulsus-server/src/traces_api | awk -F: '{n+=$2} END {print n+0}')
-echo "step_ms occurrences the compiler never demanded, after: ${AFTER:-0}"
+echo "step_ms occurrences left in the two roots when the loop stopped: ${AFTER:-0}"
+echo "(the compiler demanded none of these; they are doc comments, string"
+echo " literals and local bindings — the residue AC10(i) exists for)"
 git grep -n '\bstep_ms\b' -- crates/pulsus-read/src/traces crates/pulsus-server/src/traces_api | head -40
 restore
 
