@@ -50,6 +50,16 @@
 //!   cargo test -p pulsus-read --test compare_arity_differential -- --nocapture
 //! ```
 //!
+//! **Do not point this binary and [`compare_value_differential`] at the
+//! same reference container at the same time** (issue #477 wave 4
+//! review). This suite scopes every query by `resource.service.name`, so
+//! it is not itself contaminated; the sibling's matcher is bare `{}` over
+//! a wall-clock window, so it counts THIS suite's pushed spans as
+//! baseline and fails as if the product were wrong. The reasoning and the
+//! measurement are recorded on the sibling's module header. Recorded, not
+//! fixed: the rule is one reference container per agent, and CI already
+//! starts one per job.
+//!
 //! Clean-room: no Tempo/Grafana source, grammar or test corpus is read —
 //! the fixtures are our own authorship and the reference values are read
 //! back as black-box runtime output.
@@ -320,7 +330,8 @@ async fn pulsus_counts(
         &MetricsParams {
             start_ns: window.0,
             end_ns: window.1,
-            step_s: window_s,
+            step_ms: window_s * 1_000,
+            exemplars: None,
         },
         &engine.metrics_ctx(),
     )

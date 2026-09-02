@@ -1,0 +1,3 @@
+{"reason": "build-script-executed", "package_id": "probe"}
+{"reason": "compiler-artifact", "target": {"name": "probe"}, "fresh": false}
+{"reason": "build-finished", "success": true}

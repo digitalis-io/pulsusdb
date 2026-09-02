@@ -1,0 +1,18 @@
+//! The SAME evasion in a second place, so the limit is visibly a property
+//! of the needle set and not of one location.
+
+type Clock = std::time::SystemTime;
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn another_case() -> i64 {
+    let t = Clock::now();
+    t.duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}

@@ -217,7 +217,10 @@ pub(crate) enum MetricsParamError {
     InvalidRange { start: i64, end: i64 },
     #[error("invalid 'since' {0:?}: expected a whole-second duration (e.g. 1h, 30m, 90s)")]
     InvalidSince(String),
-    #[error("invalid 'step' {0:?}: expected positive whole seconds (e.g. 60, 60s, 5m, 1h)")]
+    #[error(
+        "invalid 'step' {0:?}: expected a positive whole number of milliseconds \
+         (e.g. 60, 60s, 500ms, 1m30s, 1.5s)"
+    )]
     InvalidStep(String),
     /// The `q`/`query` expression exceeded the reference's cap (issue
     /// #284).
@@ -225,9 +228,10 @@ pub(crate) enum MetricsParamError {
     QueryText(#[from] QueryTextError),
 }
 
-/// The parsed metrics request: the TraceQL expression plus the validated
-/// window and step. `step_s` is already defaulted via the committed
-/// derivation formula (docs/api.md §4.4) when the request omitted `step`.
+/// The parsed metrics request: the TraceQL expression, the validated
+/// window and step, and the normalised exemplar budget. `step_ms` is
+/// already defaulted via the committed derivation formula (docs/api.md
+/// §4.4) when the request omitted `step`.
 ///
 /// `q` is a [`TraceQlText`] for the same reason the search params' is
 /// (issue #284): the cap runs or the struct cannot be built.
@@ -236,19 +240,31 @@ pub(crate) struct RawMetricsParams {
     pub q: TraceQlText,
     pub start_ns: i64,
     pub end_ns: i64,
-    pub step_s: i64,
+    /// Whole milliseconds (issue #477 (d)).
+    pub step_ms: i64,
+    /// The `exemplars` request parameter, normalised: `None` when absent,
+    /// empty, unparseable, zero or negative. Never a `400` — the
+    /// reference accepts every one of those and behaves as if the
+    /// parameter were absent, and the datasource is what sends it.
+    pub exemplars: Option<u32>,
 }
 
 /// Parses the metrics query string (docs/api.md §4.4). `now_s` feeds the
 /// `since` relative window (injected for testability). `q`/`query` are
 /// strict aliases (both present → 400); `since` conflicts with
 /// `start`/`end` (never silent precedence — the search surface's
-/// ratified rule); `step` accepts positive whole seconds (`60`) or
-/// whole-second duration forms (`60s`, `5m`, `1h`, `60000ms`) —
-/// non-positive or fractional-second steps are explicit 400s. When
-/// `step` is omitted: `step_s = max(1, ⌊(end_s − start_s) /
-/// DEFAULT_METRICS_POINTS⌋)` (the committed contract; the point cap is
-/// enforced downstream by `plan_trace_metrics`).
+/// ratified rule); `step` accepts any positive whole number of
+/// MILLISECONDS through [`parse_step_ms`] — `500ms`, `1.5s`, `1m30s` and
+/// a bare seconds count all work (issue #477 (d)) — and anything that is
+/// not a whole millisecond is an explicit 400. When `step` is omitted the
+/// derivation is unchanged and still whole seconds:
+/// `step_ms = 1000 · max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)`
+/// (the committed contract; the point cap is enforced downstream by
+/// `plan_trace_metrics`).
+///
+/// `exemplars` is read here (issue #477 (c)) and normalised to
+/// `Option<u32>`; every unusable spelling behaves as absent rather than
+/// as a 400.
 pub(crate) fn parse_metrics_params(
     raw: &str,
     now_s: i64,
@@ -291,27 +307,50 @@ pub(crate) fn parse_metrics_params(
         });
     }
 
-    let step_s = match get(&pairs, "step").filter(|s| !s.is_empty()) {
-        Some(raw_step) => parse_whole_seconds(raw_step)
+    let step_ms = match get(&pairs, "step").filter(|s| !s.is_empty()) {
+        Some(raw_step) => parse_step_ms(raw_step)
             .ok_or_else(|| MetricsParamError::InvalidStep(raw_step.to_string()))?,
-        // The committed derivation formula (docs/api.md §4.4).
+        // The committed derivation formula (docs/api.md §4.4) — still in
+        // whole seconds, scaled to the new unit. Only the explicit `step`
+        // grammar gained sub-second forms; the derived floor stays one
+        // second, so an omitted `step` produces exactly the grid it did
+        // before.
         None => {
             // i128: with ns-precision endpoints the i64 width can wrap
             // (code review round 1) — the derived step must stay exact so
             // the planner's static point cap sees the true bucket count.
             let span_s =
                 (i128::from(end_ns) - i128::from(start_ns)) / i128::from(1_000_000_000_i64);
-            let step = (span_s / i128::from(pulsus_read::DEFAULT_METRICS_POINTS)).max(1);
-            i64::try_from(step).unwrap_or(i64::MAX)
+            let step_seconds = (span_s / i128::from(pulsus_read::DEFAULT_METRICS_POINTS)).max(1);
+            i64::try_from(step_seconds * 1_000).unwrap_or(i64::MAX)
         }
     };
+
+    let exemplars = parse_exemplars(&pairs);
 
     Ok(RawMetricsParams {
         q,
         start_ns,
         end_ns,
-        step_s,
+        step_ms,
+        exemplars,
     })
+}
+
+/// The `exemplars` request parameter (issue #477 (c)), normalised rather
+/// than validated: absent, empty, non-numeric, zero or negative all yield
+/// `None`, which the planner reads as "fall through to the next input".
+///
+/// **Never a 400.** Measured on the reference: `exemplars=0`,
+/// `exemplars=-1` and `exemplars=abc` each answer `200` with the same
+/// exemplars an omitted parameter produces. A 400 here would break a
+/// panel for a value the reference serves.
+fn parse_exemplars(pairs: &[(String, String)]) -> Option<u32> {
+    get(pairs, "exemplars")
+        .filter(|s| !s.is_empty())
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 fn parse_opt_unix_seconds_ns(
@@ -326,6 +365,123 @@ fn parse_opt_unix_seconds_ns(
     parse_timestamp_ns(raw)
         .map(Some)
         .ok_or_else(|| MetricsParamError::InvalidTimestamp(raw.to_string()))
+}
+
+/// Nanoseconds in one millisecond — the resolution boundary the metrics
+/// step is required to land on.
+const NS_PER_MS: i128 = 1_000_000;
+
+/// The metrics `step` grammar (issue #477 (d)): any positive duration
+/// that is a whole number of MILLISECONDS, returned in milliseconds.
+///
+/// Accepted, all measured against the reference: a bare number
+/// (seconds — the Prometheus `step` convention), an optional leading `+`,
+/// a decimal fraction, and one or more `<number><unit>` components with
+/// `ms`/`s`/`m`/`h`. So `30`, `30s`, `500ms`, `100ms`, `3ms`, `1.5s`,
+/// `1500ms`, `0.5s`, `.5s`, `+30s`, `2.5s`, `1m30s`, `1s500ms`, `1h30m`,
+/// `1m` and `1h` all parse.
+///
+/// Rejected: anything that is not a whole number of milliseconds **at any
+/// magnitude** — `1.5ms`, `3.5ms` and `100.25ms` are all 400 here and all
+/// `200` on the reference above its own `range/10000` floor. The bound is
+/// deliberately "not a whole number of milliseconds" and not
+/// "sub-millisecond", and `100.25ms` is the counterexample that says so.
+/// We reject rather than emulate because the reference's own wire form is
+/// lossy for such steps: a 3.5 ms grid renders with label spacing
+/// `[3,4,3,4]` ms, because `timestampMs` truncates a nanosecond grid.
+/// Ledgered as `traceql-metrics-fractional-ms-step-rejected`.
+/// Also rejected, as there: `abc`, `30S` (case-sensitive), `5e2ms`, `0`,
+/// `0s`, `-60`, and units outside the four (`500us`, `2d`).
+///
+/// Arithmetic is exact: each component is `numerator · ns_per_unit /
+/// 10^fraction_digits` in `i128`, and a component that does not divide
+/// evenly is a sub-nanosecond value and rejects.
+fn parse_step_ms(raw: &str) -> Option<i64> {
+    const UNITS: [(&str, i128); 4] = [
+        ("ms", NS_PER_MS),
+        ("s", 1_000 * NS_PER_MS),
+        ("m", 60_000 * NS_PER_MS),
+        ("h", 3_600_000 * NS_PER_MS),
+    ];
+
+    let body = raw.strip_prefix('+').unwrap_or(raw);
+    if body.is_empty() {
+        return None;
+    }
+    // A bare number carries no unit and means seconds.
+    if body.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        let ns = decimal_component_ns(body, 1_000 * NS_PER_MS)?;
+        return whole_ms(ns);
+    }
+
+    let bytes = body.as_bytes();
+    let mut idx = 0usize;
+    let mut total_ns: i128 = 0;
+    while idx < bytes.len() {
+        let number_start = idx;
+        while bytes
+            .get(idx)
+            .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
+        {
+            idx += 1;
+        }
+        if idx == number_start {
+            return None;
+        }
+        let number = &body[number_start..idx];
+        // Longest match, so `ms` is never read as `m` followed by `s`.
+        let unit_start = idx;
+        let (unit, per_unit_ns) = UNITS
+            .iter()
+            .filter(|(name, _)| body[unit_start..].starts_with(name))
+            .max_by_key(|(name, _)| name.len())
+            .copied()?;
+        idx = unit_start + unit.len();
+        total_ns = total_ns.checked_add(decimal_component_ns(number, per_unit_ns)?)?;
+    }
+    whole_ms(total_ns)
+}
+
+/// One `<number>` of a step component, in nanoseconds. The number may
+/// carry a decimal point and may start with one (`.5`); it may not be
+/// empty, carry two points, or resolve to a fraction of a nanosecond.
+fn decimal_component_ns(number: &str, per_unit_ns: i128) -> Option<i128> {
+    let (int_part, frac_part) = match number.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (number, ""),
+    };
+    if int_part.contains('.') || frac_part.contains('.') {
+        return None;
+    }
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // Guard the exponent before building it: 10^n overflows `i128` past
+    // n = 38, and a step written with 39 fraction digits is nonsense
+    // rather than a value to compute.
+    if frac_part.len() > 18 {
+        return None;
+    }
+    let digits: i128 = format!("{int_part}{frac_part}").parse().ok()?;
+    let denominator = 10_i128.checked_pow(frac_part.len() as u32)?;
+    let scaled = digits.checked_mul(per_unit_ns)?;
+    if scaled % denominator != 0 {
+        return None;
+    }
+    Some(scaled / denominator)
+}
+
+/// A positive nanosecond duration as whole milliseconds, or `None`.
+fn whole_ms(total_ns: i128) -> Option<i64> {
+    if total_ns <= 0 || total_ns % NS_PER_MS != 0 {
+        return None;
+    }
+    i64::try_from(total_ns / NS_PER_MS).ok()
 }
 
 /// Parses a positive whole-second count: bare digits (seconds) or a
@@ -1011,14 +1167,17 @@ mod tests {
         assert_eq!(p.q.as_str(), "{} | rate()");
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
-        // Derivation: max(1, 3600 / DEFAULT_METRICS_POINTS(100)) = 36.
-        assert_eq!(p.step_s, 36);
+        // Derivation: max(1, 3600 / DEFAULT_METRICS_POINTS(100)) = 36 s,
+        // carried in milliseconds since issue #477 (d).
+        assert_eq!(p.step_ms, 36_000);
     }
 
     #[test]
     fn a_short_window_derives_the_one_second_step_floor() {
+        // The FLOOR is still one whole second — only an explicit `step`
+        // gained sub-second forms (issue #477 (d)).
         let p = parse_metrics_params("q=%7B%7D&start=100&end=110", NOW_S).unwrap();
-        assert_eq!(p.step_s, 1);
+        assert_eq!(p.step_ms, 1_000);
     }
 
     #[test]
@@ -1393,24 +1552,51 @@ mod tests {
         }
     }
 
+    /// AC6(i), accept half: the complete step spelling set measured
+    /// `200` on the reference, each pinned to its exact millisecond
+    /// value. `500ms` is the spelling the issue was filed on; the
+    /// compound and fractional forms are what the Step box lets a user
+    /// type.
     #[test]
-    fn explicit_step_forms_parse_to_whole_seconds() {
-        for (raw, expected) in [
-            ("60", 60),
-            ("60s", 60),
-            ("5m", 300),
-            ("1h", 3_600),
-            ("60000ms", 60),
+    fn the_step_grammar_accepts_sub_second_and_compound_forms() {
+        for (raw, expected_ms) in [
+            ("30s", 30_000),
+            ("500ms", 500),
+            ("100ms", 100),
+            ("3ms", 3),
+            ("1.5s", 1_500),
+            ("1500ms", 1_500),
+            ("0.5s", 500),
+            (".5s", 500),
+            ("%2B30s", 30_000),
+            ("2.5s", 2_500),
+            ("1m30s", 90_000),
+            ("1s500ms", 1_500),
+            ("1h30m", 5_400_000),
+            ("30", 30_000),
+            ("1m", 60_000),
+            ("1h", 3_600_000),
+            ("60000ms", 60_000),
+            ("5m", 300_000),
         ] {
             let p = parse_metrics_params(&format!("q=%7B%7D&start=1&end=7201&step={raw}"), NOW_S)
-                .unwrap();
-            assert_eq!(p.step_s, expected, "step={raw}");
+                .unwrap_or_else(|e| panic!("step={raw} must be accepted, got {e}"));
+            assert_eq!(p.step_ms, expected_ms, "step={raw}");
         }
     }
 
+    /// AC6(i), reject half. `1.5ms`/`3.5ms`/`100.25ms` are the
+    /// whole-millisecond bound — the reference answers `200` for each
+    /// above its own floor and we deliberately do not
+    /// (`traceql-metrics-fractional-ms-step-rejected`). `100.25ms` is far
+    /// above one millisecond and still rejected, which is why the bound
+    /// is "not a whole number of milliseconds" and not "sub-millisecond".
     #[test]
-    fn non_positive_or_fractional_second_steps_are_rejected() {
-        for raw in ["0", "0s", "abc", "-60", "1.5", "500ms", "1500ms", "2d", ""] {
+    fn non_whole_millisecond_and_malformed_steps_are_rejected() {
+        for raw in [
+            "0", "0s", "abc", "-60", "1.5ms", "3.5ms", "100.25ms", "30S", "5e2ms", "500us", "2d",
+            "",
+        ] {
             let query = format!("q=%7B%7D&start=1&end=7201&step={raw}");
             let result = parse_metrics_params(&query, NOW_S);
             if raw.is_empty() {
@@ -1423,6 +1609,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// AC5(ii): the `exemplars` request parameter is READ, and its
+    /// normalised VALUE is what this asserts.
+    ///
+    /// The value is the point. Before issue #477 the parameter was not
+    /// looked for anywhere, so every one of these requests parsed to a
+    /// `200`-shaped params struct and a status-only assertion would have
+    /// passed at base for the wrong reason.
+    #[test]
+    fn the_exemplars_parameter_normalises_by_value() {
+        let parse = |suffix: &str| {
+            parse_metrics_params(&format!("q=%7B%7D&start=1&end=7201&step=60{suffix}"), NOW_S)
+                .unwrap_or_else(|e| panic!("exemplars{suffix:?} must not be an error, got {e}"))
+        };
+        assert_eq!(parse("").exemplars, None, "absent");
+        assert_eq!(parse("&exemplars=").exemplars, None, "empty");
+        assert_eq!(parse("&exemplars=0").exemplars, None, "zero");
+        assert_eq!(parse("&exemplars=-1").exemplars, None, "negative");
+        assert_eq!(parse("&exemplars=abc").exemplars, None, "non-numeric");
+        assert_eq!(parse("&exemplars=5").exemplars, Some(5));
+        assert_eq!(parse("&exemplars=100").exemplars, Some(100));
+        // Clamping to the ceiling is the planner's job, not the parser's:
+        // the parameter is carried whole so the precedence rule sees what
+        // the client actually sent.
+        assert_eq!(parse("&exemplars=100000").exemplars, Some(100_000));
     }
 
     #[test]
@@ -1473,8 +1685,8 @@ mod tests {
         .unwrap();
         assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
         assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
-        // Derived step over the ns-precision window: 3600 / 100 = 36.
-        assert_eq!(p.step_s, 36);
+        // Derived step over the ns-precision window: 3600 / 100 = 36 s.
+        assert_eq!(p.step_ms, 36_000);
     }
 
     #[test]
@@ -1487,8 +1699,8 @@ mod tests {
             NOW_S,
         )
         .unwrap();
-        assert!(p.step_s > 0);
-        assert_eq!(p.step_s, ((u64::MAX / 1_000_000_000) / 100) as i64);
+        assert!(p.step_ms > 0);
+        assert_eq!(p.step_ms, ((u64::MAX / 1_000_000_000) / 100) as i64 * 1_000);
     }
 
     #[test]

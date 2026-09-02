@@ -1,0 +1,12 @@
+//! A `derive` — an attribute macro that rewrites the item it decorates,
+//! and a rewrite this parse cannot see.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+#[derive(Debug)]
+struct Marker;

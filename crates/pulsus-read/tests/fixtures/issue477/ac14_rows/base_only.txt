@@ -1,0 +1,12 @@
+//! The only clock read in the file is `base_s`'s.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn a_case() -> i64 {
+    base_s() + 1
+}

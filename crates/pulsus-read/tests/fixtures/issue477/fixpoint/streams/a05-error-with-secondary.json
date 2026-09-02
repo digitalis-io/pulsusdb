@@ -1,0 +1,2 @@
+{"reason": "compiler-message", "message": {"level": "error", "message": "x", "spans": [{"file_name": "src/lib.rs", "line_start": 2, "line_end": 2, "is_primary": false, "column_start": 1, "column_end": 2}, {"file_name": "src/lib.rs", "line_start": 3, "line_end": 3, "is_primary": true, "column_start": 1, "column_end": 2}]}}
+{"reason": "build-finished", "success": false}

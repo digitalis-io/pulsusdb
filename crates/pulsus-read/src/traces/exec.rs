@@ -86,17 +86,18 @@ use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
 use super::graph_sql::{self, GraphWindow};
 use super::log2_histogram;
-use super::metrics_plan::{MetricsCtx, PlanKind, TraceMetricsPlan};
+use super::metrics_plan::{ExemplarSeriesKey, MetricsCtx, PlanKind, TraceMetricsPlan};
 use super::metrics_result::{
     MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 use super::rows::{
     CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, HydrationRow,
     MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
-    MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
-    MetricGroupCountRow, MetricLog2BucketInstantRow, MetricLog2BucketRow, MetricQuantileInstantRow,
-    MetricQuantileRow, NumValueRow, RootRow, SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow,
-    TagNameRow, TagValueRow, TraceCtxRow,
+    MetricBucketRow, MetricCompareExemplarRow, MetricCountRow, MetricExemplarRow,
+    MetricGroupCountInstantRow, MetricGroupCountRow, MetricGroupExemplarRow,
+    MetricLog2BucketInstantRow, MetricLog2BucketRow, MetricLog2ExemplarRow,
+    MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow, NumValueRow, RootRow,
+    SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
     self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
@@ -779,22 +780,36 @@ impl TraceEngine {
 
     /// Executes a metrics range plan (issue #59): one fully-pushed-down
     /// time-bucketed query — bucketing, replay-deduped counting, and time
-    /// pruning all happen in ClickHouse; the engine only frames at most
-    /// `MAX_METRICS_POINTS` `(t_ms, value)` points (the plan enforced the
-    /// cap statically) and applies the explicit encode-boundary
-    /// conversions (`n as f64`, rate ÷ `step_s`; the row's `t_ms` is
-    /// already the millisecond point unit `prom_api::encode` consumes —
-    /// issue #59 re-audit, `Int64` epoch-milliseconds). Empty result
-    /// → `Matrix(vec![])` (the documented empty-DB oracle); otherwise one
-    /// label-less series (single-series M4 output — `by()` is M7).
+    /// pruning all happen in ClickHouse; the engine frames exactly
+    /// `range_axis().points` `(t_ms, value)` samples per densified series
+    /// (at most `MAX_METRICS_POINTS + 1`; the plan enforced the cap
+    /// statically) and applies the explicit encode-boundary conversions
+    /// (`n as f64`, rate ÷ the step in fractional seconds; the row's
+    /// `t_ms` is already the millisecond point unit the encoder consumes —
+    /// issue #59 re-audit, `Int64` epoch-milliseconds).
+    ///
+    /// Membership follows the function (issue #477 (a)): an ungrouped
+    /// `rate`/`count_over_time` always returns its one series, zero-filled
+    /// where nothing matched; the value aggregations, the grouped shapes,
+    /// `quantile_over_time`, `histogram_over_time` and `compare()` return
+    /// an empty series list when nothing matched.
     pub async fn metrics_range(
         &self,
         plan: &TraceMetricsPlan,
     ) -> Result<TraceMetricsResult, ReadError> {
         let mut result = self.frame_range(plan).await?;
-        // P5: attach per-bucket exemplars (ungrouped rate/count) and apply
-        // the topk/bottomk second-stage reduction (issue #182).
-        if plan.exemplar_sql().is_some() {
+        // P5: attach exemplars and apply the topk/bottomk second-stage
+        // reduction (issue #182).
+        //
+        // Issue #477 (c) turns exemplars on by DEFAULT, so this is now a
+        // second ClickHouse statement on every range panel rather than
+        // only under a `with()` hint. The skip below is what bounds that:
+        // a frame whose samples are all zero has no bucket an exemplar
+        // could belong to, and after densification an empty answer is a
+        // full grid of zeros — exactly the shape a sparse panel produces
+        // most often. Checked against the FRAMED result, so it costs no
+        // extra query to decide.
+        if plan.exemplar_sql().is_some() && has_a_non_zero_sample(&result) {
             self.attach_range_exemplars(plan, &mut result).await?;
         }
         // P6b: the metrics-result comparison post-filter (`… > 5`).
@@ -807,9 +822,32 @@ impl TraceEngine {
         Ok(result)
     }
 
-    /// Frames the first-stage range result (before P5 exemplars/reduce).
+    /// Frames the first-stage range result (before P5 exemplars/reduce),
+    /// then DENSIFIES it onto the plan's bucket axis (issue #477 (a)).
+    ///
+    /// The fill happens here, at the framing boundary, and never in SQL:
+    /// the query still groups only over rows that exist, and the missing
+    /// buckets are materialised from the window and the step, which are
+    /// already known. A ClickHouse-side gap fill, a second query, or a
+    /// wider scan would all be the wrong shape — emitting every bucket is
+    /// a rendering property, not a scan property.
     async fn frame_range(&self, plan: &TraceMetricsPlan) -> Result<TraceMetricsResult, ReadError> {
-        self.enforce_series_cap(plan).await?;
+        self.enforce_series_cap(plan.range_probe_sql()).await?;
+        let mut result = self.frame_range_series(plan).await?;
+        if densifies(plan.kind()) {
+            let axis = plan.range_axis();
+            for series in &mut result.series {
+                densify(series, axis);
+            }
+        }
+        Ok(result)
+    }
+
+    /// The per-shape range framing, before densification.
+    async fn frame_range_series(
+        &self,
+        plan: &TraceMetricsPlan,
+    ) -> Result<TraceMetricsResult, ReadError> {
         if plan.kind() == PlanKind::Compare {
             let (cross_tab, totals) = plan
                 .compare_range()
@@ -896,7 +934,7 @@ impl TraceEngine {
                 let mut samples: Vec<(i64, f64)> = Vec::new();
                 match kind {
                     PlanKind::Count { is_rate } => {
-                        let denom = plan.step_s();
+                        let denom = plan.step_seconds();
                         let mut stream = self
                             .client
                             .query_stream::<MetricBucketRow>(&sql, &settings)
@@ -922,7 +960,17 @@ impl TraceEngine {
                         unreachable!("quantile/histogram are framed above")
                     }
                 }
-                if samples.is_empty() {
+                // Issue #477 (a): membership is per function. An ungrouped
+                // `rate`/`count_over_time` ALWAYS emits its one `__name__`
+                // series, even with no matching row anywhere in the window
+                // — densification then fills every bucket with a zero the
+                // encoder omits, and the datasource reads an absent value
+                // back as zero, which is the right answer. The value
+                // aggregations stay sparse and keep returning nothing:
+                // measured, the reference answers `{"series":[]}` for a
+                // no-match `avg_over_time` and a zero-filled series for a
+                // no-match `rate`.
+                if samples.is_empty() && !matches!(kind, PlanKind::Count { .. }) {
                     return Ok(TraceMetricsResult { series: vec![] });
                 }
                 Ok(TraceMetricsResult {
@@ -939,7 +987,7 @@ impl TraceEngine {
                 let mut by_group: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
                 match kind {
                     PlanKind::Count { is_rate } => {
-                        let denom = plan.step_s();
+                        let denom = plan.step_seconds();
                         let mut stream = self
                             .client
                             .query_stream::<MetricGroupCountRow>(&sql, &settings)
@@ -989,8 +1037,15 @@ impl TraceEngine {
     /// a `cap+1` result is a static `422 query_too_broad`
     /// ([`TooBroadReason::TraceMetricsSeriesCap`]). Ungrouped plans have
     /// no probe and return immediately.
-    async fn enforce_series_cap(&self, plan: &TraceMetricsPlan) -> Result<(), ReadError> {
-        let Some(probe) = plan.probe_sql() else {
+    ///
+    /// The probe is PASSED IN rather than read off the plan (issue #477):
+    /// the two routes count over different windows, so the range path
+    /// hands it [`TraceMetricsPlan::range_probe_sql`] and the instant path
+    /// [`TraceMetricsPlan::instant_probe_sql`]. Reading one accessor here
+    /// is what made the range answer's cap countable only over the
+    /// instant window.
+    async fn enforce_series_cap(&self, probe: Option<&str>) -> Result<(), ReadError> {
+        let Some(probe) = probe else {
             return Ok(());
         };
         let cap = self.config.max_series;
@@ -1255,10 +1310,37 @@ impl TraceEngine {
     }
 
     /// Runs the exemplar-collection query (issue #182 P5) and attaches a
-    /// bounded `trace:id` exemplar per sampled span to the (single,
-    /// ungrouped rate/count) series. Each exemplar carries the bucket's
-    /// metric value and the span's own timestamp (Tempo emits only the
-    /// trace reference; the sampled span_id is not a wire field).
+    /// bounded `trace:id` exemplar per sampled span to the series it
+    /// belongs to. Each exemplar carries that series' value at its own
+    /// bucket and the span's own timestamp (only the trace reference is
+    /// emitted; the sampled `span_id` is not a wire field).
+    ///
+    /// The bucket lookup keys on the row's `t`, which after issue #477 (b)
+    /// is the RIGHT-CLOSED label — the same label the series' samples are
+    /// stamped with. A left-edge lookup returned the previous bucket's
+    /// value, which is the wrong number whenever the two buckets differ.
+    ///
+    /// **Which series** is decided by the row, not by position (issue
+    /// #477 wave 2). A grouped range answer is one series per group
+    /// value; attaching every row to `series.first_mut()` put the second
+    /// group's traces on the first group's line, and read the value out
+    /// of that first series — which for a densified shape is the `0.0`
+    /// of a bucket where that group had nothing, and for a sparse
+    /// aggregation is a bucket the series does not carry at all. Both
+    /// render as a measured zero. The SQL now returns `g0` for the
+    /// grouped shapes ([`TraceMetricsPlan::exemplar_group_label`]) and
+    /// the row is matched to the series carrying that label value.
+    ///
+    /// A row whose group has no series, or whose bucket the matched
+    /// series does not carry, is DROPPED rather than attached at `0.0`:
+    /// neither can arise from a consistent pair of statements over the
+    /// same rows and the same window, and a fabricated zero is worse than
+    /// a missing exemplar because it reads as a measurement.
+    ///
+    /// The SQL's `groupArraySample(k, …)` is a PER-BUCKET bound; the
+    /// resolved budget is a TOTAL (ruling 1 on issue #477), so the
+    /// collected list is thinned to it here — across every series, since
+    /// the budget is for the whole response.
     async fn attach_range_exemplars(
         &self,
         plan: &TraceMetricsPlan,
@@ -1267,32 +1349,135 @@ impl TraceEngine {
         let Some(exemplar_sql) = plan.exemplar_sql() else {
             return Ok(());
         };
-        let Some(series) = result.series.first_mut() else {
+        if result.series.is_empty() {
             return Ok(());
-        };
-        // Bucket start (ms) → the series value at that bucket.
-        let value_at: BTreeMap<i64, f64> = series.samples.iter().copied().collect();
+        }
+        // Bucket label (ms) → the value of series `i` at that bucket.
+        let value_at: Vec<BTreeMap<i64, f64>> = result
+            .series
+            .iter()
+            .map(|s| s.samples.iter().copied().collect())
+            .collect();
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(exemplar_sql);
         crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
-        let mut exemplars: Vec<MetricExemplar> = Vec::new();
-        let mut stream = self
-            .client
-            .query_stream::<MetricExemplarRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-            let value = value_at.get(&row.t_ms).copied().unwrap_or(0.0);
-            for (trace_id, ts_ns) in row.ex {
-                exemplars.push(MetricExemplar {
-                    labels: vec![MetricLabel::str("trace:id", hex16(&trace_id))],
-                    value,
-                    timestamp_ms: ts_ns / 1_000_000,
-                });
+        // `(series index, exemplar)`, in bucket order, so the thinning
+        // stride below is taken over the whole response exactly as it was
+        // when every exemplar lived on one series.
+        let mut collected: Vec<(usize, MetricExemplar)> = Vec::new();
+        match plan.exemplar_key() {
+            ExemplarSeriesKey::Single => {
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    push_bucket_exemplars(&mut collected, 0, &value_at[0], row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
+                }
+            }
+            ExemplarSeriesKey::Group { label } => {
+                // Group value → the index of the series carrying it. Built
+                // from the framed answer, so a group the answer does not
+                // contain has nowhere to land and its rows are dropped.
+                let index: HashMap<&str, usize> = result
+                    .series
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| series_label_value(s, label).map(|v| (v, i)))
+                    .collect();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricGroupExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    let Some(&i) = index.get(row.g0.as_str()) else {
+                        continue;
+                    };
+                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
+                }
+            }
+            ExemplarSeriesKey::Quantile => {
+                // No index: the join is numeric. Each sampled span goes to
+                // the `p=` series whose value at the span's OWN bucket is
+                // nearest the span's own duration.
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricQuantileExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    push_quantile_exemplars(&mut collected, &value_at, row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
+                }
+            }
+            ExemplarSeriesKey::HistogramBucket => {
+                // Bucket bound → the index of the `__bucket` series
+                // carrying it. Keyed on the RENDERED label (the seconds
+                // double the framing put on the wire) so the join is the
+                // exact inverse of the construction, not a re-derivation.
+                let index: HashMap<u64, usize> = result
+                    .series
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (bucket_label(s).to_bits(), i))
+                    .collect();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricLog2ExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    let key = log2_histogram::bucket_seconds(row.bucket_ns).to_bits();
+                    let Some(&i) = index.get(&key) else {
+                        continue;
+                    };
+                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
+                }
+            }
+            ExemplarSeriesKey::CompareSide => {
+                // `(__meta_type, attribute key)` → series index, over the
+                // two TOTAL meta-types only: those are the series the
+                // reference attaches a comparison exemplar to. A key whose
+                // totals series the answer dropped (all-zero) has nowhere
+                // to land and its rows are dropped.
+                let index: HashMap<(&str, &str), usize> = result
+                    .series
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| compare_total_series_key(s).map(|k| (k, i)))
+                    .collect();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricCompareExemplarRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    let kind = compare_total_meta_type(row.is_sel);
+                    let Some(&i) = index.get(&(kind, row.akey.as_str())) else {
+                        continue;
+                    };
+                    push_bucket_exemplars(&mut collected, i, &value_at[i], row.t_ms, row.ex);
+                    decimate_if_full(&mut collected);
+                }
             }
         }
-        series.exemplars = exemplars;
+        thin_collected_exemplars(&mut collected, plan.exemplar_budget());
+        for series in result.series.iter_mut() {
+            series.exemplars.clear();
+        }
+        for (i, ex) in collected {
+            result.series[i].exemplars.push(ex);
+        }
         Ok(())
     }
 
@@ -1321,7 +1506,7 @@ impl TraceEngine {
         &self,
         plan: &TraceMetricsPlan,
     ) -> Result<TraceMetricsResult, ReadError> {
-        self.enforce_series_cap(plan).await?;
+        self.enforce_series_cap(plan.instant_probe_sql()).await?;
         if plan.kind() == PlanKind::Compare {
             let (cross_tab, totals) = plan
                 .compare_instant()
@@ -1391,7 +1576,7 @@ impl TraceEngine {
                 // Ungrouped: exactly one row (aggregate with no GROUP BY).
                 let value = match kind {
                     PlanKind::Count { is_rate } => {
-                        let denom = plan.window_s();
+                        let denom = plan.window_seconds();
                         let mut n: u64 = 0;
                         let mut stream = self
                             .client
@@ -1433,7 +1618,7 @@ impl TraceEngine {
                 let mut by_group: BTreeMap<String, f64> = BTreeMap::new();
                 match kind {
                     PlanKind::Count { is_rate } => {
-                        let denom = plan.window_s();
+                        let denom = plan.window_seconds();
                         let mut stream = self
                             .client
                             .query_stream::<MetricGroupCountInstantRow>(&sql, &settings)
@@ -2648,13 +2833,308 @@ fn graph_settings(config: &TraceReadConfig) -> QuerySettings {
 
 /// The explicit encode-boundary value conversion (issue #59 plan v2
 /// delta 5): the SQL side always ships the deduped `UInt64` count;
+/// Whether a range shape emits EVERY bucket in the window or only the
+/// occupied ones (issue #477 (a)).
+///
+/// Density follows the FUNCTION, not the query — measured against the
+/// reference over one window with interior and edge gaps:
+/// `count_over_time`, `rate`, `quantile_over_time`, `histogram_over_time`,
+/// `count_over_time by(name)` and every series of a `compare()` come back
+/// dense, while `sum`/`min`/`max`/`avg_over_time` come back sparse,
+/// grouped or not. A blanket fill would create four fresh divergences;
+/// the value aggregations are already correct and must be left alone.
+fn densifies(kind: PlanKind) -> bool {
+    match kind {
+        PlanKind::Count { .. } | PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
+            true
+        }
+        PlanKind::Agg(_) => false,
+    }
+}
+
+/// Rewrites `series.samples` as exactly one sample per axis label, in
+/// ascending label order, taking the framed value where the query
+/// produced one and `0.0` where it did not.
+///
+/// Every label the SQL can produce is an axis label by construction: the
+/// range window's instants are `(aS - step, aE]`, whose right-closed
+/// bucket labels run from `aS` to `aE` inclusive — the axis exactly. A
+/// framed sample on some other label would therefore be a defect, and
+/// dropping it here is the honest handling: the axis is what the response
+/// promises.
+fn densify(series: &mut TraceMetricSeries, axis: super::metrics_plan::RangeAxis) {
+    let framed: BTreeMap<i64, f64> = series.samples.iter().copied().collect();
+    let mut dense = Vec::with_capacity(axis.points);
+    for i in 0..axis.points {
+        let label = axis.label_ms(i);
+        dense.push((label, framed.get(&label).copied().unwrap_or(0.0)));
+    }
+    series.samples = dense;
+}
+
+/// Whether any framed sample carries a non-zero value — the precondition
+/// for issuing the exemplar query at all (issue #477 (c)).
+fn has_a_non_zero_sample(result: &TraceMetricsResult) -> bool {
+    result
+        .series
+        .iter()
+        .any(|s| s.samples.iter().any(|(_, v)| *v != 0.0))
+}
+
+/// The string value of `series`' label `key`, if it carries one.
+///
+/// Grouped range series are labelled `MetricLabel::str(<by-key>, <group
+/// value>)` by `frame_range_series`, so this is the inverse of that
+/// construction and the join column between an exemplar row's `g0` and
+/// the series it belongs to (issue #477 wave 2).
+fn series_label_value<'a>(series: &'a TraceMetricSeries, key: &str) -> Option<&'a str> {
+    series.labels.iter().find(|l| l.key == key).and_then(|l| {
+        match &l.value {
+            MetricLabelValue::Str(v) => Some(v.as_str()),
+            // A by-key group value is always rendered as a string; the
+            // numeric label forms belong to `p=` and `__bucket=`, which
+            // are never grouped shapes.
+            _ => None,
+        }
+    })
+}
+
+/// Appends one exemplar per sampled span of a bucket row to `collected`,
+/// stamped with series `i`'s own value at that bucket.
+///
+/// A bucket the series does not carry is skipped outright (issue #477
+/// wave 2): the exemplar statement and the range statement read the same
+/// rows over the same window, so a hit here would mean the two disagreed,
+/// and the old `unwrap_or(0.0)` turned that disagreement into a
+/// measured-looking zero.
+fn push_bucket_exemplars(
+    collected: &mut Vec<(usize, MetricExemplar)>,
+    i: usize,
+    value_at: &BTreeMap<i64, f64>,
+    t_ms: i64,
+    sampled: Vec<([u8; 16], i64)>,
+) {
+    let Some(&value) = value_at.get(&t_ms) else {
+        return;
+    };
+    for (trace_id, ts_ns) in sampled {
+        collected.push((
+            i,
+            MetricExemplar {
+                labels: vec![MetricLabel::str("trace:id", hex16(&trace_id))],
+                value,
+                timestamp_ms: ts_ns / 1_000_000,
+            },
+        ));
+    }
+}
+
+/// Places each sampled span of a `quantile_over_time` bucket row on the
+/// `p=` series nearest its own duration, and stamps it with that duration
+/// (issue #477 wave 2).
+///
+/// Two rules from the reference, both different from every other shape:
+///
+/// * **Placement** is nearest-value, not nearest-anything-else: the
+///   exemplar goes to the quantile whose value is closest to the span's
+///   duration, ties to the lowest index (`assignExemplarToQuantile`,
+///   `pkg/traceql/engine_metrics.go:2013-2031 @ v3.0.2` — a strict `<`
+///   keeps the first of equals).
+/// * **The value is the span's own duration**, not the series' sample.
+///   `quantile_over_time(duration)` records a real observed value
+///   (`exemplarDuration`, `pkg/traceql/ast_metrics.go:235-239 @ v3.0.2`)
+///   and only the NaN placeholders the counting shapes record are
+///   rewritten to the series sample at the end
+///   (`modules/frontend/combiner/metrics_query_range.go:278-305 @ v3.0.2`).
+///   The ns→seconds conversion is [`agg_value`], the same one the series
+///   values go through, so the comparison is between like units.
+///
+/// **The comparison is against the `p` values at the exemplar's OWN
+/// bucket — the numbers the panel draws beside it — and that is a
+/// deliberate divergence.** The reference compares against a distribution
+/// it never draws: it pools every interval's bucket counts into one map
+/// and takes the requested quantiles of THAT once per response
+/// (`aggregatedBuckets` / `quantileValues`,
+/// `pkg/traceql/engine_metrics.go:1933-1962 @ v3.0.2`), while the value
+/// each `p=` series carries is computed per interval from that interval's
+/// own buckets (`:1993`); placement then compares the exemplar against
+/// the pooled array (`:1996-2001`). So the series an exemplar is put on
+/// is chosen from numbers that series never carries, and where load
+/// varies across the window the two disagree. Its placement function is
+/// also unfinished rather than designed: the doc comment promises a `-1`
+/// "doesn't fit any quantile reasonably well" return and "reasonable
+/// bucket validation" (`:2010-2012`), and the body implements neither —
+/// `buckets` is dead past an emptiness check and the nearest index is
+/// always returned (`:2013-2031`). Ledgered as
+/// `traceql-metrics-quantile-exemplar-placement-domain` in
+/// docs/benchmarks/traces-differential-ledger.md, which cross-references
+/// `2026-08-05-traceql-quantile-over-time-tdigest` (issue #252): our `p=`
+/// values are already computed differently, so placing against our own
+/// values is what keeps an exemplar coherent with the series it sits on.
+///
+/// With one span in a bucket every quantile of that bucket is that span's
+/// duration, so every candidate ties and the lowest `p` wins. That is a
+/// property of degenerate input — one observation has no spread — not a
+/// defect in the rule.
+///
+/// A bucket no series carries drops the sample, exactly as
+/// [`push_bucket_exemplars`] does.
+fn push_quantile_exemplars(
+    collected: &mut Vec<(usize, MetricExemplar)>,
+    value_at: &[BTreeMap<i64, f64>],
+    t_ms: i64,
+    sampled: Vec<([u8; 16], i64, i64)>,
+) {
+    for (trace_id, ts_ns, duration_ns) in sampled {
+        let value = agg_value(duration_ns as f64);
+        let mut best: Option<(usize, f64)> = None;
+        for (i, series) in value_at.iter().enumerate() {
+            let Some(&q) = series.get(&t_ms) else {
+                continue;
+            };
+            let diff = (value - q).abs();
+            let better = match best {
+                Some((_, b)) => diff < b,
+                None => true,
+            };
+            if better {
+                best = Some((i, diff));
+            }
+        }
+        let Some((i, _)) = best else {
+            continue;
+        };
+        collected.push((
+            i,
+            MetricExemplar {
+                labels: vec![MetricLabel::str("trace:id", hex16(&trace_id))],
+                value,
+                timestamp_ms: ts_ns / 1_000_000,
+            },
+        ));
+    }
+}
+
+/// The `__meta_type` a `compare()` exemplar row's side names (issue #477
+/// wave 2): the reference attaches baseline samples to `baseline_total`
+/// and selection samples to `selection_total`, never to the per-value
+/// `baseline`/`selection` series
+/// (`pkg/traceql/engine_metrics_compare.go:296-301 @ v3.0.2`).
+fn compare_total_meta_type(is_sel: u8) -> &'static str {
+    if is_sel == 0 {
+        "baseline_total"
+    } else {
+        "selection_total"
+    }
+}
+
+/// The `(__meta_type, attribute key)` pair identifying a `compare()`
+/// TOTALS series, or `None` for any other series — the inverse of
+/// `frame_compare`'s `meta("baseline_total", key, "nil")` construction
+/// and the join column for a comparison exemplar row.
+fn compare_total_series_key(series: &TraceMetricSeries) -> Option<(&str, &str)> {
+    let kind = series_label_value(series, "__meta_type")?;
+    if kind != "baseline_total" && kind != "selection_total" {
+        return None;
+    }
+    let key = series.labels.iter().find(|l| l.key != "__meta_type")?;
+    Some((kind, key.key.as_str()))
+}
+
+/// The ceiling on the IN-FLIGHT exemplar list, before the final thinning
+/// (issue #477 wave 2).
+///
+/// The exemplar statement returns one row per (bucket × series identity),
+/// and since this wave the identity is per shape: a `__bucket` per log2
+/// duration bucket that occurred, an `(is_sel, akey)` per side and
+/// attribute key. The row count is therefore no longer bounded by the
+/// bucket grid alone — at the interval cap a comparison over a wide
+/// attribute universe can return orders of magnitude more rows than a
+/// count does, and every sample on them would be materialized before the
+/// stride ran. The response keeps at most `MAX_EXEMPLARS`, so holding
+/// millions to pick 100 is pure waste as well as a memory risk.
+const EXEMPLAR_COLLECTION_CEILING: usize = 8_192;
+
+/// Halves `collected` in place when it reaches
+/// [`EXEMPLAR_COLLECTION_CEILING`], keeping every other entry.
+///
+/// Halving rather than truncating, and rather than thinning straight to
+/// the budget: keeping every other entry of what has been seen so far
+/// leaves the survivors spread evenly over it, so repeated halving over a
+/// long stream is still an even sample of the whole stream. Truncating
+/// would keep only the earliest buckets and thinning to the budget each
+/// time would let the tail crowd out the head — both are the bias the
+/// final stride exists to avoid. Deterministic: the same row order always
+/// yields the same list.
+///
+/// **Halving can discard an exemplar the final stride would have kept**
+/// (recorded on the wave-3 review). The two passes index different
+/// lists: a halved list has renumbered every survivor, so
+/// [`thin_collected_exemplars`]'s `i * len / budget` lands on a different
+/// original row than it would have on the unhalved stream. Worked at the
+/// committed constants — ceiling 8 192, at most 50 samples on one
+/// returned row, so at most 8 241 entries exist before a halving — the
+/// stride's `i = 3` position is original index 247 without halving and
+/// 246 with it. **What halving does not change is the COUNT**: the final
+/// pass returns exactly the budget whenever at least that many exemplars
+/// survive, and every available one when fewer do. The bias the ceiling
+/// trades away is which representative of a neighbourhood is shown, not
+/// how many or from where in the window — both passes keep an even
+/// spread over the stream.
+fn decimate_if_full(collected: &mut Vec<(usize, MetricExemplar)>) {
+    if collected.len() < EXEMPLAR_COLLECTION_CEILING {
+        return;
+    }
+    let mut i = 0usize;
+    collected.retain(|_| {
+        let keep = i.is_multiple_of(2);
+        i += 1;
+        keep
+    });
+}
+
+/// Reduces a bucket-ordered exemplar list to at most `budget` entries by
+/// even stride, keeping index `i * len / budget` for `i in 0..budget`.
+///
+/// A total budget cannot be enforced in the SQL, because
+/// `groupArraySample`'s `k` is per group and the number of occupied
+/// groups is not known until the rows come back. Taking an even stride
+/// rather than the first `budget` entries keeps the surviving exemplars
+/// spread across the window, which is what a panel draws them on; the
+/// stride is exact integer arithmetic, so it is deterministic and the
+/// same list always thins the same way.
+///
+/// The list is carried as `(series index, exemplar)` pairs (issue #477
+/// wave 2) so one stride covers the WHOLE response: the budget is a total
+/// (ruling 1 on issue #477), and thinning each grouped series separately
+/// would multiply it by the number of groups.
+fn thin_collected_exemplars(collected: &mut Vec<(usize, MetricExemplar)>, budget: u32) {
+    let budget = budget as usize;
+    if budget == 0 {
+        collected.clear();
+        return;
+    }
+    let len = collected.len();
+    if len <= budget {
+        return;
+    }
+    let kept: Vec<(usize, MetricExemplar)> = (0..budget)
+        .map(|i| collected[i * len / budget].clone())
+        .collect();
+    *collected = kept;
+}
+
 /// The count-path (`rate`/`count_over_time`) encode-boundary value:
-/// `rate` divides by its denominator (`step_s` per range bucket, the
-/// snapped window width for an instant) in `f64` here — never in SQL;
-/// `count_over_time` is the deduped count itself.
-fn count_value(is_rate: bool, n: u64, rate_denominator_s: i64) -> f64 {
+/// `rate` divides by its denominator (one bucket's width per range
+/// sample, the snapped window's width for an instant) in `f64` here —
+/// never in SQL; `count_over_time` is the deduped count itself.
+///
+/// The denominator is **fractional seconds** (issue #477 (d)): a
+/// sub-second step, or a snapped window narrower than a second, truncated
+/// to `0` under the old whole-second form and made every rate `inf`.
+fn count_value(is_rate: bool, n: u64, rate_denominator_seconds: f64) -> f64 {
     if is_rate {
-        n as f64 / rate_denominator_s as f64
+        n as f64 / rate_denominator_seconds
     } else {
         n as f64
     }
@@ -3149,6 +3629,49 @@ mod tests {
     /// confused for one another in an assertion.
     const TEST_READ_MEM: u64 = 7_654_321;
 
+    /// Issue #477 wave 2: the in-flight exemplar list stays under its
+    /// ceiling however many rows the statement returns, and what survives
+    /// is still spread over the whole stream.
+    ///
+    /// The stream is deliberately much longer than the ceiling — the
+    /// shape a comparison over a wide attribute universe produces — so
+    /// the halving runs several times rather than once.
+    #[test]
+    fn the_exemplar_collection_stays_under_its_ceiling_and_stays_even() {
+        let mut collected: Vec<(usize, MetricExemplar)> = Vec::new();
+        let n = EXEMPLAR_COLLECTION_CEILING * 9;
+        for i in 0..n {
+            collected.push((
+                0,
+                MetricExemplar {
+                    labels: vec![MetricLabel::str("trace:id", format!("{i:032x}"))],
+                    value: 1.0,
+                    timestamp_ms: i as i64,
+                },
+            ));
+            decimate_if_full(&mut collected);
+            assert!(
+                collected.len() <= EXEMPLAR_COLLECTION_CEILING,
+                "the list breached its ceiling at row {i}: {}",
+                collected.len()
+            );
+        }
+        // Spread, not a prefix and not a suffix: the survivors must reach
+        // both ends of the stream. A truncating bound keeps only the head
+        // and a thin-to-budget bound keeps only the tail; either would
+        // fail here.
+        let first = collected.first().expect("survivors").1.timestamp_ms;
+        let last = collected.last().expect("survivors").1.timestamp_ms;
+        assert_eq!(first, 0, "the head of the stream must survive");
+        assert!(
+            last as usize > n - EXEMPLAR_COLLECTION_CEILING,
+            "the tail of the stream must survive, last was {last} of {n}"
+        );
+        // …and the final stride still lands on the budget.
+        thin_collected_exemplars(&mut collected, 100);
+        assert_eq!(collected.len(), 100);
+    }
+
     /// Issue #460 AC 9 — under a TIE, only the CARDINALITY is a
     /// specification.
     ///
@@ -3563,9 +4086,9 @@ mod tests {
 
     #[test]
     fn metric_values_convert_at_the_encode_boundary() {
-        assert_eq!(count_value(true, 120, 60), 2.0);
-        assert_eq!(count_value(false, 120, 60), 120.0);
-        assert_eq!(count_value(true, 0, 3_600), 0.0);
+        assert_eq!(count_value(true, 120, 60.0), 2.0);
+        assert_eq!(count_value(false, 120, 60.0), 120.0);
+        assert_eq!(count_value(true, 0, 3_600.0), 0.0);
         // Value aggregations scale duration ns → seconds.
         assert_eq!(agg_value(2_000_000_000.0), 2.0);
         assert_eq!(agg_value(0.0), 0.0);

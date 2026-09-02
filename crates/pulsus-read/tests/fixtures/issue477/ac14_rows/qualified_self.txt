@@ -1,0 +1,13 @@
+//! `<T>::now()` — the owning type is in the qualified self and the source
+//! text carries no `SystemTime::now` substring at all.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn a_case() -> std::time::SystemTime {
+    <std::time::SystemTime>::now()
+}

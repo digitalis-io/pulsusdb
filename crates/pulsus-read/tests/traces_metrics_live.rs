@@ -2,10 +2,17 @@
 //! identities for the TraceQL metrics endpoints against ClickHouse 26.3,
 //! on a seeded deterministic corpus:
 //!
-//! - **(a)** `Σ_buckets rate·step_s == Σ_buckets count_over_time ==`
+//! - **(a)** `Σ_buckets rate·step == Σ_buckets count_over_time ==`
 //!   an independent deduped `COUNT` of the matching spans — for every
 //!   gated filter shape (service PREWHERE, attr semi-join, negation,
-//!   match-all).
+//!   match-all). The step is carried in MILLISECONDS since issue #477
+//!   (d), so the rate factor is the step's width in fractional seconds.
+//! - **Bucket geometry** (issue #477): the range form labels a bucket by
+//!   its RIGHT edge and reads the right-closed instants
+//!   `(aS - step, aE]`, so a window of `n` steps emits `n + 1` samples —
+//!   one extra LEADING bucket — and a span landing exactly on a grid
+//!   point belongs to THAT point. Every densified shape emits every
+//!   bucket, zero-valued where nothing matched.
 //! - **(b)** instant `/query` == the single bucket of a range with
 //!   `step = window` — on aligned windows, where snap = identity (the
 //!   plan's "AC4 by construction").
@@ -263,7 +270,20 @@ fn plan_for(
     q: &str,
     start_s: i64,
     end_s: i64,
-    step_s: i64,
+    step_ms: i64,
+) -> TraceMetricsPlan {
+    plan_with(engine, q, start_s, end_s, step_ms, None)
+}
+
+/// [`plan_for`] with an explicit HTTP `exemplars` parameter (issue #477
+/// (c)) — the input the datasource sends and the `with()` hint overrides.
+fn plan_with(
+    engine: &TraceEngine,
+    q: &str,
+    start_s: i64,
+    end_s: i64,
+    step_ms: i64,
+    exemplars: Option<u32>,
 ) -> TraceMetricsPlan {
     let query = pulsus_traceql::parse(q).expect("query parses");
     plan_trace_metrics(
@@ -271,11 +291,50 @@ fn plan_for(
         &MetricsParams {
             start_ns: start_s * NS,
             end_ns: end_s * NS,
-            step_s,
+            step_ms,
+            exemplars,
         },
         &engine.metrics_ctx(),
     )
     .expect("query plans")
+}
+
+/// The one window source for every live metrics case this issue adds:
+/// `(now - 60 - width, now - 60)`.
+///
+/// The 60-second margin is fixed and is chosen against the reference's
+/// own 30-second end cutoff, not against any measured transition — a
+/// window ending too close to `now` is clamped there and can invert.
+/// Nothing here depends on where that transition falls; the margin sits
+/// clear of the cutoff itself.
+fn past_window(width_s: i64) -> (i64, i64) {
+    let now_s = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    )
+    .expect("fits i64");
+    (now_s - 60 - width_s, now_s - 60)
+}
+
+/// [`past_window`] floored onto a whole-second step grid, so the snap is
+/// the identity and the emitted axis has a size the test can state.
+///
+/// `past_window` is the only clock source; this only moves its start down
+/// to the nearest step multiple and takes `width_s` from there. Without
+/// it the axis is `intervals + 1` for an `intervals` that depends on where
+/// the current second happens to fall, which is not something a test can
+/// assert against.
+///
+/// The parameter is `step_seconds` rather than the obvious short name
+/// because AC14's sibling scan bans the pre-#477 spelling of that in this
+/// file, whatever it means locally. It caught this on the first run.
+fn aligned_past_window(width_s: i64, step_seconds: i64) -> (i64, i64) {
+    assert_eq!(width_s % step_seconds, 0, "the width must be whole steps");
+    let (start_s, _) = past_window(width_s);
+    let aligned = start_s.div_euclid(step_seconds) * step_seconds;
+    (aligned, aligned + width_s)
 }
 
 /// The samples of an ungrouped result (0 or 1 series).
@@ -304,11 +363,19 @@ fn vector_value(result: &TraceMetricsResult) -> f64 {
 }
 
 /// Asserts the full AC4 identity set for one filter over the aligned
-/// primary window `[base_s(), base_s() + CORPUS_SPANS)`, step 60, against an
-/// independently-computed expected span count.
+/// primary window `[base_s(), base_s() + CORPUS_SPANS)`, step 60 s,
+/// against an independently-computed expected span count.
+///
+/// The identity survives issue #477 unchanged in substance but not in
+/// arithmetic. The range form now reads `(aS - step, aE]` and emits
+/// `intervals + 1` labels, so the corpus's span at exactly `base_s()`
+/// lands in the LEADING bucket rather than in the first interior one,
+/// and every bucket is emitted whether or not it has data. Both sums are
+/// still over the whole emitted axis, and the axis still covers every
+/// corpus span, so both still equal `expected`.
 async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
     let end_s = base_s() + CORPUS_SPANS;
-    let step_s = 60;
+    let step_ms = 60_000;
     let window_s = CORPUS_SPANS;
 
     let rate_plan = plan_for(
@@ -316,17 +383,31 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
         &format!("{filter} | rate()"),
         base_s(),
         end_s,
-        step_s,
+        step_ms,
     );
     let count_plan = plan_for(
         engine,
         &format!("{filter} | count_over_time()"),
         base_s(),
         end_s,
-        step_s,
+        step_ms,
     );
-    // Snap is the identity on this aligned window.
+    // Snap is the identity on this aligned window; the INSTANT window is
+    // what `snapped_window_ns` reports and issue #477 leaves it alone.
     assert_eq!(rate_plan.snapped_window_ns(), (base_s() * NS, end_s * NS));
+    // The range window is one whole step wider on the left and includes
+    // its own right edge.
+    assert_eq!(
+        rate_plan.range_window_ns(),
+        ((base_s() - 60) * NS + 1, end_s * NS + 1)
+    );
+
+    let axis = rate_plan.range_axis();
+    assert_eq!(
+        axis.points,
+        (CORPUS_SPANS / 60 + 1) as usize,
+        "{filter}: intervals + 1 labels"
+    );
 
     let rate_points = matrix_points(&engine.metrics_range(&rate_plan).await.expect("rate range"));
     let count_points = matrix_points(
@@ -336,8 +417,18 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
             .expect("count range"),
     );
 
+    // Issue #477 (a): an ungrouped count/rate emits EVERY bucket, always,
+    // even when nothing matched anywhere in the window.
+    assert_eq!(
+        rate_points.len(),
+        axis.points,
+        "{filter}: the sample count is the interval count from the window and the step"
+    );
+    assert_eq!(count_points.len(), axis.points, "{filter}");
+
     // (a) Σ rate·step == Σ count_over_time == the independent count.
-    let rate_total: f64 = rate_points.iter().map(|(_, v)| v * step_s as f64).sum();
+    let step_seconds = step_ms as f64 / 1_000.0;
+    let rate_total: f64 = rate_points.iter().map(|(_, v)| v * step_seconds).sum();
     let count_total: f64 = count_points.iter().map(|(_, v)| v).sum();
     assert_eq!(
         rate_total.round() as i64,
@@ -348,17 +439,16 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
         count_total as i64, expected,
         "{filter}: Σ count_over_time must equal the independent count ({count_points:?})"
     );
-    // Bucket timestamps are epoch-aligned milliseconds within the window.
-    for (t_ms, _) in &rate_points {
-        assert_eq!(
-            t_ms % (step_s * 1_000),
-            0,
-            "{filter}: unaligned bucket {t_ms}"
-        );
-        assert!(*t_ms >= base_s() * 1_000 && *t_ms < end_s * 1_000);
+    // Bucket timestamps are the axis labels: epoch-aligned milliseconds
+    // from `aS` to `aE` INCLUSIVE (the right edge is a label now).
+    for (i, (t_ms, _)) in rate_points.iter().enumerate() {
+        assert_eq!(*t_ms, axis.label_ms(i), "{filter}: label {i}");
+        assert_eq!(t_ms % step_ms, 0, "{filter}: unaligned bucket {t_ms}");
+        assert!(*t_ms >= base_s() * 1_000 && *t_ms <= end_s * 1_000);
     }
+    assert_eq!(axis.last_ms(), end_s * 1_000, "{filter}: last label is aE");
 
-    // (b) instant == the single bucket of range-with-step = window.
+    // (b) instant == the whole-window range, summed over its axis.
     let instant_rate = vector_value(
         &engine
             .metrics_instant(&rate_plan)
@@ -381,20 +471,23 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
         &format!("{filter} | rate()"),
         base_s(),
         end_s,
-        window_s,
+        window_s * 1_000,
     );
     let whole_points = matrix_points(&engine.metrics_range(&whole_rate_plan).await.expect("whole"));
-    if expected == 0 {
-        assert!(whole_points.is_empty());
-    } else {
-        assert_eq!(whole_points.len(), 1, "step = window is one bucket");
-        assert_eq!(whole_points[0].0, base_s() * 1_000);
-        assert!(
-            (whole_points[0].1 - instant_rate).abs() < 1e-12,
-            "{filter}: instant ({instant_rate}) == the single whole-window bucket ({})",
-            whole_points[0].1
-        );
-    }
+    // Two labels — the leading bucket `(aS - window, aS]` and the window
+    // bucket `(aS, aE]` — not one. The identity is the SUM.
+    assert_eq!(
+        whole_points.len(),
+        2,
+        "{filter}: step = window is the leading bucket plus one interval"
+    );
+    assert_eq!(whole_points[0].0, base_s() * 1_000);
+    assert_eq!(whole_points[1].0, end_s * 1_000);
+    let whole_total: f64 = whole_points.iter().map(|(_, v)| v * window_s as f64).sum();
+    assert!(
+        (whole_total - instant_rate * window_s as f64).abs() < 1e-9,
+        "{filter}: instant ({instant_rate}) accounts for the whole-window axis ({whole_points:?})"
+    );
 }
 
 /// P3 (issue #182): the `*_over_time(duration)` value-aggregation
@@ -407,7 +500,13 @@ async fn assert_aggregation_identities(engine: &TraceEngine) {
     let one_ms_s = 0.001_f64;
 
     // sum_over_time(duration): Σ buckets == CORPUS_SPANS · 0.001.
-    let sum_plan = plan_for(engine, "{} | sum_over_time(duration)", base_s(), end_s, 60);
+    let sum_plan = plan_for(
+        engine,
+        "{} | sum_over_time(duration)",
+        base_s(),
+        end_s,
+        60_000,
+    );
     let sum_points = matrix_points(&engine.metrics_range(&sum_plan).await.expect("sum range"));
     let sum_total: f64 = sum_points.iter().map(|(_, v)| v).sum();
     assert!(
@@ -428,7 +527,7 @@ async fn assert_aggregation_identities(engine: &TraceEngine) {
             &format!("{{}} | {func}(duration)"),
             base_s(),
             end_s,
-            60,
+            60_000,
         );
         let v = vector_value(&engine.metrics_instant(&plan).await.expect("agg instant"));
         assert!(
@@ -457,7 +556,7 @@ async fn assert_by_service_grouping(engine: &TraceEngine) {
         "{} | count_over_time() by(resource.service.name)",
         base_s(),
         end_s,
-        CORPUS_SPANS, // one whole-window bucket
+        CORPUS_SPANS * 1_000, // one whole-window interval, plus the leading bucket
     );
     let result = engine
         .metrics_range(&plan)
@@ -501,7 +600,7 @@ async fn assert_series_cap_rejects() {
         "{} | count_over_time() by(resource.service.name)",
         base_s(),
         end_s,
-        60,
+        60_000,
     );
     let err = capped
         .metrics_range(&plan)
@@ -544,7 +643,7 @@ async fn assert_quantile_and_histogram(engine: &TraceEngine) {
         "{} | quantile_over_time(duration, 0.5, 0.9)",
         base_s(),
         end_s,
-        CORPUS_SPANS,
+        CORPUS_SPANS * 1_000,
     );
     let q_res = engine
         .metrics_instant(&q_plan)
@@ -574,7 +673,7 @@ async fn assert_quantile_and_histogram(engine: &TraceEngine) {
         "{} | histogram_over_time(duration)",
         base_s(),
         end_s,
-        CORPUS_SPANS,
+        CORPUS_SPANS * 1_000,
     );
     let h_res = engine
         .metrics_instant(&h_plan)
@@ -694,7 +793,7 @@ async fn log2_histogram_membership_and_the_sub_two_ns_guard() {
     let instant = |q: String| {
         let engine = &engine;
         async move {
-            let plan = plan_for(engine, &q, base_s(), end_s, CORPUS_SPANS);
+            let plan = plan_for(engine, &q, base_s(), end_s, CORPUS_SPANS * 1_000);
             engine.metrics_instant(&plan).await.expect("instant")
         }
     };
@@ -826,7 +925,7 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
         r#"{} | compare({ span.http.status_code = "500" }) with(exemplars=2)"#,
     ] {
         let res = engine
-            .metrics_range(&plan_for(engine, q, base_s(), end_s, 60))
+            .metrics_range(&plan_for(engine, q, base_s(), end_s, 60_000))
             .await
             .unwrap_or_else(|e| panic!("{q}: {e}"));
         let exs: Vec<&pulsus_read::MetricExemplar> =
@@ -855,7 +954,7 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
             "{} | rate() with(exemplars=2)",
             base_s(),
             end_s,
-            60,
+            60_000,
         ))
         .await
         .expect("instant exemplars");
@@ -871,7 +970,7 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
 
     // with(sample): accepted, exact superset — identical to no sample.
     let plain = engine
-        .metrics_range(&plan_for(engine, "{} | rate()", base_s(), end_s, 60))
+        .metrics_range(&plan_for(engine, "{} | rate()", base_s(), end_s, 60_000))
         .await
         .expect("plain");
     let sampled = engine
@@ -880,30 +979,56 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
             "{} | rate() with(sample=0.1)",
             base_s(),
             end_s,
-            60,
+            60_000,
         ))
         .await
         .expect("sampled");
-    // Samples equal; sampled has no exemplars, plain has none either.
+    // Samples equal. Both now carry exemplars — issue #477 (c) turns them
+    // on by default — and that is not what this gate is about.
     assert_eq!(
         plain.series[0].samples, sampled.series[0].samples,
         "with(sample) returns the exact (superset) result"
     );
 
-    // topk(1) over the two-service grouping keeps only the larger series
-    // per step (svc-x = 480 > checkout = 120); bottomk(1) keeps checkout.
+    // topk(1)/bottomk(1) over the two-service grouping, PER TIMESTAMP.
+    //
+    // Densification (issue #477 (a)) is what makes this a real per-step
+    // test rather than a per-series one. The axis is two labels: the
+    // leading bucket `(aS - 600, aS]`, which holds only the corpus span
+    // at exactly `aS` — a `checkout` span, since `0 % 5 == 0` — and the
+    // window bucket, which holds the other 599. So `checkout` is the
+    // LARGER series at the first label (1 against `svc-x`'s densified 0)
+    // and the smaller at the second (119 against 480), and the reduction
+    // keeps a different series at each. Before densification `svc-x` had
+    // no sample at all in the leading bucket and the answer was one
+    // series; asserting one series now would be asserting the defect.
     let topk = engine
         .metrics_range(&plan_for(
             engine,
             "{} | count_over_time() by(resource.service.name) | topk(1)",
             base_s(),
             end_s,
-            CORPUS_SPANS,
+            CORPUS_SPANS * 1_000,
         ))
         .await
         .expect("topk");
-    assert_eq!(topk.series.len(), 1, "topk(1) keeps one series");
-    assert_eq!(service_label(&topk.series[0]), "svc-x");
+    assert_eq!(
+        topk.series.len(),
+        2,
+        "topk(1) keeps one series PER TIMESTAMP, and they differ: {topk:?}"
+    );
+    assert_eq!(service_label(&topk.series[0]), "checkout");
+    assert_eq!(
+        topk.series[0].samples,
+        vec![(base_s() * 1_000, 1.0)],
+        "checkout wins the leading bucket"
+    );
+    assert_eq!(service_label(&topk.series[1]), "svc-x");
+    assert_eq!(
+        topk.series[1].samples,
+        vec![((base_s() + CORPUS_SPANS) * 1_000, 480.0)],
+        "svc-x wins the window bucket"
+    );
 
     let bottomk = engine
         .metrics_range(&plan_for(
@@ -911,12 +1036,27 @@ async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
             "{} | count_over_time() by(resource.service.name) | bottomk(1)",
             base_s(),
             end_s,
-            CORPUS_SPANS,
+            CORPUS_SPANS * 1_000,
         ))
         .await
         .expect("bottomk");
-    assert_eq!(bottomk.series.len(), 1, "bottomk(1) keeps one series");
+    assert_eq!(
+        bottomk.series.len(),
+        2,
+        "bottomk(1) is the mirror image: {bottomk:?}"
+    );
     assert_eq!(service_label(&bottomk.series[0]), "checkout");
+    assert_eq!(
+        bottomk.series[0].samples,
+        vec![((base_s() + CORPUS_SPANS) * 1_000, 119.0)],
+        "checkout loses the window bucket"
+    );
+    assert_eq!(service_label(&bottomk.series[1]), "svc-x");
+    assert_eq!(
+        bottomk.series[1].samples,
+        vec![(base_s() * 1_000, 0.0)],
+        "svc-x loses the leading bucket, where densification gives it a zero"
+    );
 }
 
 /// P6b (issue #182): `compare({selection})` cross-tab meta-series and the
@@ -930,7 +1070,7 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
         r#"{} | compare({ span.http.status_code = "500" })"#,
         base_s(),
         end_s,
-        CORPUS_SPANS, // one whole-window bucket for exact counts
+        CORPUS_SPANS * 1_000, // one whole-window interval for exact counts
     );
     let res = engine.metrics_range(&plan).await.expect("compare executes");
 
@@ -1099,7 +1239,7 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
             "{} | count_over_time() > 50",
             base_s(),
             end_s,
-            60,
+            60_000,
         ))
         .await
         .expect("result-comparison kept");
@@ -1112,7 +1252,7 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
             "{} | count_over_time() > 100",
             base_s(),
             end_s,
-            60,
+            60_000,
         ))
         .await
         .expect("result-comparison dropped");
@@ -1189,7 +1329,7 @@ async fn compare_roots_resolve_trace_wide() {
         r#"{} | compare({ name = "no-match" })"#,
         window_start,
         window_end,
-        CORPUS_SPANS,
+        CORPUS_SPANS * 1_000,
     );
     let res = engine.metrics_range(&plan).await.expect("compare executes");
 
@@ -1316,7 +1456,7 @@ async fn metrics_internal_consistency_identities() {
         r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 } | rate()"#,
         base_s(),
         end_s,
-        60,
+        60_000,
     );
     let before_range = engine.metrics_range(&rate_plan).await.expect("range");
     let before_instant = engine.metrics_instant(&rate_plan).await.expect("instant");
@@ -1326,11 +1466,31 @@ async fn metrics_internal_consistency_identities() {
         .metrics_instant(&rate_plan)
         .await
         .expect("instant dup");
+    // The SAMPLES are what replay-dedup is about: `uniqExact(trace_id,
+    // span_id)` collapses a replayed row, so every bucket's value is
+    // invariant. The EXEMPLARS are not, and cannot be — `groupArraySample`
+    // draws from raw rows and a replayed row is a real row, so a
+    // duplicated corpus offers the sampler twice as many draws. That was
+    // already true before issue #477; it is newly visible here only
+    // because exemplars used to require a `with()` hint and now attach by
+    // default. Asserting the whole result would be asserting that a
+    // sampler is idempotent, which it is not and which no criterion asks
+    // for (`traceql-metrics-exemplar-count-not-a-parity-surface`).
+    /// A result's series stripped of their exemplars — the labels and the
+    /// samples, which is what replay-dedup is a claim about.
+    type LabelledSamples = Vec<(Vec<pulsus_read::MetricLabel>, Vec<(i64, f64)>)>;
+    fn samples_of(r: &TraceMetricsResult) -> LabelledSamples {
+        r.series
+            .iter()
+            .map(|s| (s.labels.clone(), s.samples.clone()))
+            .collect()
+    }
     assert_eq!(
-        before_range, after_range,
+        samples_of(&before_range),
+        samples_of(&after_range),
         "at-least-once replays must never inflate a bucket (uniqExact dedup)"
     );
-    assert_eq!(before_instant, after_instant);
+    assert_eq!(samples_of(&before_instant), samples_of(&after_instant));
 
     // ---- Unaligned window: outward snap, full-width edge buckets ------
     // [BASE+30, BASE+90) at step 60 snaps to [BASE, BASE+120): two
@@ -1340,7 +1500,7 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         base_s() + 30,
         base_s() + 90,
-        60,
+        60_000,
     );
     assert_eq!(
         plan.snapped_window_ns(),
@@ -1350,8 +1510,13 @@ async fn metrics_internal_consistency_identities() {
     let points = matrix_points(&engine.metrics_range(&plan).await.expect("unaligned"));
     assert_eq!(
         points,
-        vec![(base_s() * 1_000, 60.0), ((base_s() + 60) * 1_000, 60.0)],
-        "snapped edge buckets are full-width — no partial denominators"
+        vec![
+            (base_s() * 1_000, 1.0),
+            ((base_s() + 60) * 1_000, 60.0),
+            ((base_s() + 120) * 1_000, 60.0)
+        ],
+        "three labels: the leading bucket `(aS-60, aS]` carrying the span at exactly `aS`, \
+         then the two full-width intervals"
     );
 
     // ---- Exact right boundary: a span at an aligned `end` is excluded
@@ -1361,13 +1526,14 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         base_s(),
         base_s() + 60,
-        60,
+        60_000,
     );
     let points = matrix_points(&engine.metrics_range(&plan).await.expect("boundary"));
     assert_eq!(
         points,
-        vec![(base_s() * 1_000, 60.0)],
-        "spans at seconds 0..=59 count; the span exactly at end (second 60) is excluded"
+        vec![(base_s() * 1_000, 1.0), ((base_s() + 60) * 1_000, 60.0)],
+        "right-closed (issue #477 (b)): the span at exactly `aS` is the leading bucket's, and \
+         the span at exactly `aE` belongs to the LAST label — spans at seconds 1..=60"
     );
     // …and with an UNALIGNED end inside the corpus, the raw-end span IS
     // included in the final snapped bucket.
@@ -1376,28 +1542,34 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         base_s(),
         base_s() + 30,
-        60,
+        60_000,
     );
     let points = matrix_points(&engine.metrics_range(&plan).await.expect("snap end"));
     assert_eq!(
         points,
-        vec![(base_s() * 1_000, 60.0)],
-        "E snaps outward to BASE+60 — the documented over-inclusion, one full bucket"
+        vec![(base_s() * 1_000, 1.0), ((base_s() + 60) * 1_000, 60.0)],
+        "E snaps outward to BASE+60 — the documented over-inclusion, one full bucket plus \
+         the leading one"
     );
 
     // ---- Empty window: range → empty matrix; instant → one "0" sample
     // (the documented empty-DB oracles). ---------------------------------
     let empty_start = base_s() - 86_400;
-    let plan = plan_for(&engine, "{} | rate()", empty_start, empty_start + 600, 60);
-    assert!(
-        engine
-            .metrics_range(&plan)
-            .await
-            .expect("empty range")
-            .series
-            .is_empty(),
-        "an empty range is no series"
+    let plan = plan_for(
+        &engine,
+        "{} | rate()",
+        empty_start,
+        empty_start + 600,
+        60_000,
     );
+    let empty_points = matrix_points(&engine.metrics_range(&plan).await.expect("empty range"));
+    // Issue #477 (a): an ungrouped rate over a window with NO matching
+    // data is one series carrying every bucket at zero — the sample-count
+    // identity holds on the all-empty window, which is what says the fill
+    // comes from the window and the step rather than from the rows.
+    assert_eq!(empty_points.len(), plan.range_axis().points);
+    assert_eq!(empty_points.len(), 11, "600 s / 60 s intervals, plus one");
+    assert!(empty_points.iter().all(|(_, v)| *v == 0.0));
     let instant = engine.metrics_instant(&plan).await.expect("empty instant");
     assert_eq!(vector_value(&instant), 0.0);
 
@@ -1426,7 +1598,7 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         EXTREME_PAST_S,
         EXTREME_PAST_S + 60,
-        60,
+        60_000,
     );
     let past_points = matrix_points(
         &extreme_engine
@@ -1436,8 +1608,11 @@ async fn metrics_internal_consistency_identities() {
     );
     assert_eq!(
         past_points,
-        vec![(EXTREME_PAST_S * 1_000, 1.0)],
-        "pre-1970 bucket label must be the exact negative millisecond value, not wrapped"
+        vec![
+            (EXTREME_PAST_S * 1_000, 1.0),
+            ((EXTREME_PAST_S + 60) * 1_000, 0.0)
+        ],
+        "pre-1970 bucket labels must be the exact negative millisecond values, not wrapped"
     );
 
     let future_plan = plan_for(
@@ -1445,7 +1620,7 @@ async fn metrics_internal_consistency_identities() {
         "{} | count_over_time()",
         EXTREME_FUTURE_S,
         EXTREME_FUTURE_S + 60,
-        60,
+        60_000,
     );
     let future_points = matrix_points(
         &extreme_engine
@@ -1455,8 +1630,11 @@ async fn metrics_internal_consistency_identities() {
     );
     assert_eq!(
         future_points,
-        vec![(EXTREME_FUTURE_S * 1_000, 1.0)],
-        "post-2106 bucket label must be the exact >UInt32-max millisecond value, not wrapped \
+        vec![
+            (EXTREME_FUTURE_S * 1_000, 1.0),
+            ((EXTREME_FUTURE_S + 60) * 1_000, 0.0)
+        ],
+        "post-2106 bucket labels must be the exact >UInt32-max millisecond values, not wrapped \
          mod 2^32"
     );
 }
@@ -1561,7 +1739,7 @@ async fn duration_seconds_conversion_matches_the_reference() {
             &format!(r#"{{ resource.service.name = "u{i}" }} | max_over_time(duration)"#),
             base_s(),
             end_s,
-            CORPUS_SPANS,
+            CORPUS_SPANS * 1_000,
         );
         let got = vector_value(&engine.metrics_instant(&plan).await.expect("instant"));
         assert_eq!(
@@ -1573,4 +1751,2010 @@ async fn duration_seconds_conversion_matches_the_reference() {
     }
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_ULP}")).await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #477: the bucket geometry, density, exemplar and cap-probe gates.
+//
+// Each test below seeds its OWN throwaway database and takes its window
+// from `past_window`, so none of them perturbs the shared `DB` corpus and
+// none of them depends on another's ordering.
+// ---------------------------------------------------------------------------
+
+static DB_GEOM: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_geom_it");
+static DB_DENSE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_dense_it");
+/// The no-match gate's OWN database. Sharing `DB_DENSE` with
+/// `density_follows_the_function_not_the_query` made the two tests race:
+/// they run concurrently in one binary, and the second `run_init` hit
+/// `TABLE_ALREADY_EXISTS` against the first's half-built schema. Nothing
+/// in the tree checks `TestDb` base names for uniqueness — it is a
+/// convention here, not a gate.
+static DB_NOMATCH: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_nomatch_it");
+static DB_EX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_exemplar_it");
+/// Issue #477 wave 2: the two grouped-exemplar criteria get a database
+/// each, for the same reason `DB_NOMATCH` does — the tests in this binary
+/// run concurrently and two `run_init`s against one name race.
+static DB_GEX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_group_exemplar_it");
+static DB_GSPARSE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_group_sparse_exemplar_it");
+/// Issue #477 wave 2, ruling finding 1: one database per shape-specific
+/// exemplar-attribution criterion, for the same concurrency reason.
+static DB_QEX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_exemplar_it");
+/// Issue #477 wave 4: the two criteria that can SEE the quantile
+/// placement domain need corpora of their own — one span per bucket, and
+/// a bimodal window — and their own databases for the same concurrency
+/// reason.
+static DB_QSPARSE: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_sparse_exemplar_it");
+static DB_QSHIFT: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_shifting_exemplar_it");
+static DB_HEX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_histogram_exemplar_it");
+static DB_CEX: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_compare_exemplar_it");
+static DB_CAP: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_metrics_cap_it");
+
+/// Creates `db` fresh and returns an admin client plus an engine bound to
+/// it. The admin client is the caller's to drop the database with.
+async fn fresh_db(db: &str) -> (ChClient, TraceEngine) {
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    run_init(&admin, &test_ctx(db)).await.expect("run_init");
+    let engine = TraceEngine::new(
+        {
+            let mut cfg = test_config();
+            cfg.database = db.to_string();
+            ChClient::new(cfg).await.expect("connect engine")
+        },
+        engine_config(),
+    );
+    (admin, engine)
+}
+
+/// One span row literal. `idx` seeds the trace/span ids, so distinct
+/// indices are distinct logical spans and repeated ones are replays.
+fn span_row(idx: i64, service: &str, ts_ns: i64, duration_ns: i64, status_code: i64) -> String {
+    format!(
+        "(toFixedString(unhex('{idx:032x}'), 16), toFixedString(unhex('{idx:016x}'), 8), \
+         toFixedString(unhex('0000000000000000'), 8), 'op', '{service}', '', {ts_ns}, \
+         {duration_ns}, {status_code}, 1, 1, 'p')"
+    )
+}
+
+async fn insert_spans(admin: &ChClient, db: &str, rows: &[String]) {
+    exec(
+        admin,
+        &format!(
+            "INSERT INTO {db}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, status_message, timestamp_ns, \
+              duration_ns, status_code, kind, payload_type, payload) VALUES {}",
+            rows.join(", ")
+        ),
+    )
+    .await;
+}
+
+/// AC2 (live) and AC6(ii): a span landing exactly on a grid point belongs
+/// to THAT point, and a sub-second `step` is served with the sample count
+/// the window and the step imply.
+///
+/// The pair is what discriminates. Two spans sit at exactly `L` and three
+/// at `L + 1 ms`; under the right-closed reading they land on `L` and on
+/// `L + step`, and under the pre-#477 left-edge reading **all five** land
+/// on `L`. So `2` and `3` on adjacent labels is an answer the old
+/// geometry cannot produce, where a bare sample count could not tell the
+/// two apart.
+#[tokio::test]
+async fn spans_on_a_bucket_boundary_land_on_the_right_edge_label() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_GEOM).await;
+    // 500 ms divides every whole second, so a one-second-aligned window is
+    // step-aligned here.
+    let (start_s, end_s) = aligned_past_window(20, 1);
+    let step_ms = 500;
+
+    let plan = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
+    let axis = plan.range_axis();
+    // 20 s at 500 ms is 40 intervals, so 41 labels (AC6(ii)'s identity).
+    assert_eq!(axis.points, 41, "20s / 500ms + 1");
+    assert_eq!(axis.step_ms, 500);
+
+    // A grid instant strictly inside the window, well away from both ends.
+    let label_ms = axis.label_ms(20);
+    let l_ns = label_ms * 1_000_000;
+    let mut rows = Vec::new();
+    for i in 0..2 {
+        rows.push(span_row(1_000 + i, "bnd", l_ns, 1_000_000, 0));
+    }
+    for i in 0..3 {
+        rows.push(span_row(2_000 + i, "bnd", l_ns + 1_000_000, 1_000_000, 0));
+    }
+    insert_spans(&admin, &DB_GEOM, &rows).await;
+
+    let points = matrix_points(&engine.metrics_range(&plan).await.expect("range"));
+    assert_eq!(points.len(), axis.points, "every bucket is emitted");
+    let at = |ms: i64| {
+        points
+            .iter()
+            .find(|(t, _)| *t == ms)
+            .unwrap_or_else(|| panic!("no sample at {ms}: {points:?}"))
+            .1
+    };
+    assert_eq!(
+        at(label_ms),
+        2.0,
+        "the two spans AT the grid point stay on it"
+    );
+    assert_eq!(
+        at(label_ms + 500),
+        3.0,
+        "the three spans one millisecond later belong to the NEXT label"
+    );
+    // And nothing leaked anywhere else.
+    let total: f64 = points.iter().map(|(_, v)| v).sum();
+    assert_eq!(total, 5.0, "{points:?}");
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_GEOM}")).await;
+}
+
+/// AC3: a no-match range query returns a zero-filled series, with and
+/// without an in-window control span.
+///
+/// The control span is load-bearing on the reference side and is stated
+/// here so a test author knows which case they are constructing: the
+/// reference zero-fills only when a block covers the window, and answers
+/// an empty series list when nothing at all is stored. We answer the same
+/// grid either way — a divergence this change introduces deliberately,
+/// recorded as `traceql-metrics-zero-fill-without-a-block`.
+#[tokio::test]
+async fn a_no_match_range_query_returns_a_zero_filled_series() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_NOMATCH).await;
+    let (start_s, end_s) = aligned_past_window(20, 5);
+
+    // A control span INSIDE the window that the queried predicate does
+    // not match.
+    let plan = plan_for(&engine, "{} | rate()", start_s, end_s, 5_000);
+    let axis = plan.range_axis();
+    insert_spans(
+        &admin,
+        &DB_NOMATCH,
+        &[span_row(
+            7_001,
+            "ac3-control",
+            axis.label_ms(2) * 1_000_000,
+            1_000_000,
+            0,
+        )],
+    )
+    .await;
+
+    let absent = plan_for(
+        &engine,
+        r#"{ resource.service.name = "ac3-absent" } | rate()"#,
+        start_s,
+        end_s,
+        5_000,
+    );
+    let res = engine.metrics_range(&absent).await.expect("no-match range");
+    assert_eq!(res.series.len(), 1, "one zero-filled series: {res:?}");
+    assert_eq!(
+        res.series[0].labels,
+        vec![pulsus_read::MetricLabel::str("__name__", "rate")]
+    );
+    assert_eq!(res.series[0].samples.len(), axis.points);
+    assert!(res.series[0].samples.iter().all(|(_, v)| *v == 0.0));
+    assert!(
+        res.series[0].exemplars.is_empty(),
+        "an all-zero frame issues no exemplar query at all"
+    );
+
+    // Second clause: a window with NOTHING stored in it anywhere answers
+    // the same grid. This is the divergence, not a regression guard.
+    let (empty_start, empty_end) = (start_s - 86_400, end_s - 86_400);
+    let empty = plan_for(&engine, "{} | rate()", empty_start, empty_end, 5_000);
+    let res = engine.metrics_range(&empty).await.expect("empty range");
+    assert_eq!(
+        res.series.len(),
+        1,
+        "still one series with no block: {res:?}"
+    );
+    assert_eq!(res.series[0].samples.len(), empty.range_axis().points);
+    assert!(res.series[0].samples.iter().all(|(_, v)| *v == 0.0));
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_NOMATCH}")).await;
+}
+
+/// AC4: density follows the FUNCTION, not the query.
+///
+/// One corpus, one window, interior AND edge gaps. The dense half asserts
+/// the whole `(label, value)` vector rather than only its length, so
+/// rotating the values by one position fails it — a length check alone
+/// would pass a frame whose samples sit on the wrong labels.
+#[tokio::test]
+async fn density_follows_the_function_not_the_query() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_DENSE).await;
+    let (start_s, end_s) = aligned_past_window(30, 5);
+    let step_ms = 5_000;
+
+    let probe = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
+    let axis = probe.range_axis();
+    assert_eq!(axis.points, 7, "30s / 5s + 1");
+
+    // Two occupied buckets: label[2] and label[4]. Leading, trailing and
+    // one interior bucket stay empty.
+    let occupied = [axis.label_ms(2), axis.label_ms(4)];
+    let rows = vec![
+        span_row(
+            9_001,
+            "dense",
+            occupied[0] * 1_000_000 - 1_000,
+            1_000_000,
+            0,
+        ),
+        span_row(
+            9_002,
+            "dense",
+            occupied[1] * 1_000_000 - 1_000,
+            1_000_000,
+            2,
+        ),
+    ];
+    insert_spans(&admin, &DB_DENSE, &rows).await;
+
+    let expected_dense: Vec<(i64, f64)> = (0..axis.points)
+        .map(|i| {
+            let l = axis.label_ms(i);
+            (l, if occupied.contains(&l) { 1.0 } else { 0.0 })
+        })
+        .collect();
+
+    // ---- the dense half ------------------------------------------------
+    let counts = matrix_points(
+        &engine
+            .metrics_range(&plan_for(
+                &engine,
+                "{} | count_over_time()",
+                start_s,
+                end_s,
+                step_ms,
+            ))
+            .await
+            .expect("count range"),
+    );
+    assert_eq!(
+        counts, expected_dense,
+        "count_over_time emits every bucket, values on their own labels"
+    );
+
+    for q in [
+        "{} | rate()",
+        "{} | quantile_over_time(duration, 0.9)",
+        "{} | histogram_over_time(duration)",
+        "{} | count_over_time() by(resource.service.name)",
+        r#"{} | compare({ status = error })"#,
+    ] {
+        let res = engine
+            .metrics_range(&plan_for(&engine, q, start_s, end_s, step_ms))
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert!(!res.series.is_empty(), "{q}: expected series, got none");
+        for s in &res.series {
+            assert_eq!(
+                s.samples.len(),
+                axis.points,
+                "{q}: every returned series must carry every bucket ({s:?})"
+            );
+            let labels: Vec<i64> = s.samples.iter().map(|(t, _)| *t).collect();
+            let want: Vec<i64> = (0..axis.points).map(|i| axis.label_ms(i)).collect();
+            assert_eq!(labels, want, "{q}: samples must sit on the axis labels");
+        }
+    }
+
+    // ---- the sparse half: the value aggregations, grouped or not ------
+    for q in [
+        "{} | sum_over_time(duration)",
+        "{} | min_over_time(duration)",
+        "{} | avg_over_time(duration)",
+        "{} | sum_over_time(duration) by(resource.service.name)",
+    ] {
+        let res = engine
+            .metrics_range(&plan_for(&engine, q, start_s, end_s, step_ms))
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert!(!res.series.is_empty(), "{q}: expected series, got none");
+        for s in &res.series {
+            assert_eq!(
+                s.samples.len(),
+                occupied.len(),
+                "{q}: value aggregations stay SPARSE ({s:?})"
+            );
+            assert!(
+                s.samples.len() < axis.points,
+                "{q}: and strictly fewer than the axis"
+            );
+            let labels: Vec<i64> = s.samples.iter().map(|(t, _)| *t).collect();
+            assert_eq!(labels, occupied.to_vec(), "{q}");
+        }
+    }
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_DENSE}")).await;
+}
+
+/// AC5(iii)/(iv): exemplars attach with no parameter and no hint; the
+/// budget is a TOTAL; the hint wins over the parameter; and every
+/// exemplar's value is the sample at its own right-closed label.
+#[tokio::test]
+async fn exemplars_attach_by_default_and_map_to_the_right_edge_label() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_EX).await;
+    let (start_s, end_s) = aligned_past_window(35, 5);
+    let step_ms = 5_000;
+
+    let probe = plan_for(&engine, "{} | count_over_time()", start_s, end_s, step_ms);
+    let axis = probe.range_axis();
+    assert!(
+        axis.points >= 8,
+        "the grid must be wider than the budget set"
+    );
+
+    // Four occupied buckets with DISTINCT values 2, 3, 5, 1. Spans inside
+    // one bucket share one nanosecond timestamp, so the bucket's value is
+    // the span count and the exemplars all carry that instant.
+    let mut rows = Vec::new();
+    let mut idx = 20_000i64;
+    for (slot, n) in [(1usize, 2), (2, 3), (3, 5), (4, 1)] {
+        let ts_ns = axis.label_ms(slot) * 1_000_000 - 1_000;
+        for _ in 0..n {
+            rows.push(span_row(idx, "ex", ts_ns, 1_000_000, 0));
+            idx += 1;
+        }
+    }
+    insert_spans(&admin, &DB_EX, &rows).await;
+
+    /// How many exemplars one `(parameter, hint)` combination returns.
+    async fn count_exemplars(
+        engine: &TraceEngine,
+        start_s: i64,
+        end_s: i64,
+        step_ms: i64,
+        exemplars: Option<u32>,
+        hint: &str,
+    ) -> usize {
+        let q = format!("{{}} | count_over_time(){hint}");
+        let plan = plan_with(engine, &q, start_s, end_s, step_ms, exemplars);
+        let res = engine.metrics_range(&plan).await.expect("range");
+        res.series.iter().map(|s| s.exemplars.len()).sum()
+    }
+    let count_exemplars = |exemplars: Option<u32>, hint: &'static str| {
+        count_exemplars(&engine, start_s, end_s, step_ms, exemplars, hint)
+    };
+
+    // (iii) a plain query with NO parameter and NO hint carries exemplars.
+    let plain = engine
+        .metrics_range(&plan_for(
+            &engine,
+            "{} | count_over_time()",
+            start_s,
+            end_s,
+            step_ms,
+        ))
+        .await
+        .expect("plain range");
+    let exemplars: Vec<&pulsus_read::MetricExemplar> =
+        plain.series.iter().flat_map(|s| &s.exemplars).collect();
+    assert!(
+        !exemplars.is_empty(),
+        "exemplars must attach with no parameter and no hint"
+    );
+    for ex in &exemplars {
+        let trace = ex
+            .labels
+            .iter()
+            .find(|l| l.key == "trace:id")
+            .unwrap_or_else(|| panic!("every exemplar carries trace:id: {ex:?}"));
+        match &trace.value {
+            pulsus_read::MetricLabelValue::Str(hex) => {
+                assert_eq!(hex.len(), 32, "16-byte hex trace id: {hex:?}");
+                assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+            }
+            other => panic!("trace:id must be a string, got {other:?}"),
+        }
+    }
+
+    // (iv)-4 the mapping, on that same plain answer. The value is looked
+    // up here from the exemplar's OWN timestamp through the axis, which
+    // is a different route from the one the engine used (the SQL bucket
+    // column), so agreeing is a real check.
+    let samples: std::collections::BTreeMap<i64, f64> =
+        plain.series[0].samples.iter().copied().collect();
+    let mut seen: std::collections::BTreeSet<(i64, u64)> = std::collections::BTreeSet::new();
+    for ex in &exemplars {
+        let label = axis.label_for_ms(ex.timestamp_ms);
+        let want = samples
+            .get(&label)
+            .copied()
+            .unwrap_or_else(|| panic!("exemplar at {} has no sample at {label}", ex.timestamp_ms));
+        assert_eq!(
+            ex.value.to_bits(),
+            want.to_bits(),
+            "exemplar {} must carry its own bucket's value",
+            ex.timestamp_ms
+        );
+        seen.insert((label, want.to_bits()));
+    }
+    let distinct_values: std::collections::BTreeSet<u64> = seen.iter().map(|(_, v)| *v).collect();
+    assert!(
+        seen.len() >= 2 && distinct_values.len() >= 2,
+        "at least two exemplars in DIFFERENT buckets carrying DIFFERENT values: {seen:?}"
+    );
+
+    // (iv)-1 the bound, and (iv)-2 the unit.
+    for budget in [1u32, 2, 4, 8, 100] {
+        let n = count_exemplars(Some(budget), "").await;
+        assert!(
+            n <= budget as usize,
+            "budget {budget} returned {n} exemplars"
+        );
+    }
+    assert_eq!(
+        count_exemplars(Some(1), "").await,
+        1,
+        "a TOTAL budget of 1 over four occupied buckets is one exemplar; per-bucket semantics \
+         would return four"
+    );
+
+    // (iv)-3 precedence, as an equality that discriminates.
+    for (h, p, hint) in [
+        (1u32, 8u32, " with(exemplars=1)"),
+        (8, 1, " with(exemplars=8)"),
+        (2, 100, " with(exemplars=2)"),
+        (100, 2, " with(exemplars=100)"),
+    ] {
+        let both = count_exemplars(Some(p), hint).await;
+        let hint_alone = count_exemplars(None, hint).await;
+        let param_alone = count_exemplars(Some(p), "").await;
+        assert_eq!(
+            both, hint_alone,
+            "hint {h} must win over parameter {p} (got {both} vs {hint_alone})"
+        );
+        assert_ne!(
+            param_alone, hint_alone,
+            "hint {h} and parameter {p} must give DIFFERENT answers alone, or the equality \
+             above proves nothing"
+        );
+    }
+    // `false` turns them off outright, whatever the parameter says.
+    assert_eq!(
+        count_exemplars(Some(9), " with(exemplars=false)").await,
+        0,
+        "with(exemplars=false) wins over the parameter"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_EX}")).await;
+}
+
+/// Issue #477 wave 2, ruling finding 1, criterion (a): **an exemplar is
+/// attached to the series of the group it came from.**
+///
+/// The corpus makes ownership readable off the wire: a span's `trace_id`
+/// is its `idx` in hex, and the two services take disjoint `idx` ranges,
+/// so the service a returned `trace:id` belongs to is recoverable without
+/// asking the database again. The two services also occupy DISJOINT
+/// buckets, which is what makes the criterion discriminate — under the
+/// pre-fix code every group's exemplars were attached to
+/// `result.series.first_mut()`, so `gb`'s two traces appeared on `ga`'s
+/// line, and they took `ga`'s value at those buckets, which after
+/// densification is the `0.0` of a bucket where `ga` had nothing.
+#[tokio::test]
+async fn grouped_exemplars_attach_to_the_series_of_their_own_group() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_GEX).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let probe = plan_for(
+        &engine,
+        "{} | count_over_time() by(resource.service.name)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = probe.range_axis();
+    assert!(axis.points >= 6, "the grid must hold both groups' buckets");
+
+    // `ga` occupies slots 1 and 3, `gb` slots 2 and 4 — disjoint, so a
+    // misattached exemplar lands on a bucket its host series has no data
+    // in. Two spans per occupied bucket, so the values are non-zero and
+    // the two groups' values are equal (2.0 everywhere) — the criterion
+    // is ownership, and it must not be able to pass on the value alone.
+    let mut rows = Vec::new();
+    let mut owner: std::collections::BTreeMap<String, &'static str> =
+        std::collections::BTreeMap::new();
+    for (service, base_idx, slots) in [("ga", 40_000i64, [1usize, 3]), ("gb", 50_000, [2, 4])] {
+        let mut idx = base_idx;
+        for slot in slots {
+            let ts_ns = axis.label_ms(slot) * 1_000_000 - 1_000;
+            for _ in 0..2 {
+                rows.push(span_row(idx, service, ts_ns, 1_000_000, 0));
+                owner.insert(format!("{idx:032x}"), service);
+                idx += 1;
+            }
+        }
+    }
+    insert_spans(&admin, &DB_GEX, &rows).await;
+
+    let result = engine
+        .metrics_range(&probe)
+        .await
+        .expect("the grouped range executes");
+    assert_eq!(result.series.len(), 2, "two services: {result:?}");
+
+    let mut seen_per_series: Vec<usize> = Vec::new();
+    for series in &result.series {
+        let service = service_label(series);
+        let samples: std::collections::BTreeMap<i64, f64> =
+            series.samples.iter().copied().collect();
+        for ex in &series.exemplars {
+            let trace = match &ex
+                .labels
+                .iter()
+                .find(|l| l.key == "trace:id")
+                .unwrap_or_else(|| panic!("every exemplar carries trace:id: {ex:?}"))
+                .value
+            {
+                pulsus_read::MetricLabelValue::Str(hex) => hex.clone(),
+                other => panic!("trace:id must be a string, got {other:?}"),
+            };
+            let from = owner
+                .get(&trace)
+                .unwrap_or_else(|| panic!("unknown trace id {trace} in {service}"));
+            assert_eq!(
+                *from, service,
+                "exemplar {trace} came from {from} and was attached to {service}"
+            );
+            // …and it carries THAT series' value at its own bucket, which
+            // on this corpus is 2.0 and never the 0.0 of a bucket the
+            // other group filled.
+            let label = axis.label_for_ms(ex.timestamp_ms);
+            let want = samples.get(&label).copied().unwrap_or_else(|| {
+                panic!(
+                    "{service}: exemplar at {} has no sample at {label}",
+                    ex.timestamp_ms
+                )
+            });
+            assert_eq!(
+                ex.value.to_bits(),
+                want.to_bits(),
+                "{service}: exemplar value"
+            );
+            assert_eq!(ex.value.to_bits(), 2.0f64.to_bits(), "{service}: {ex:?}");
+        }
+        seen_per_series.push(series.exemplars.len());
+    }
+    assert!(
+        seen_per_series.iter().all(|n| *n > 0),
+        "every group must carry its own exemplars, got {seen_per_series:?}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_GEX}")).await;
+}
+
+/// Issue #477 wave 2, ruling finding 1, criterion (b): **an exemplar's
+/// value is never taken from a series that does not carry its bucket.**
+///
+/// `sum_over_time` is the shape that makes this visible. It is SPARSE —
+/// `densifies()` is false for the value aggregations — so each group's
+/// series carries only the buckets that group has data in. Under the
+/// pre-fix code `gb`'s exemplars were attached to `ga`'s series at
+/// buckets `ga` does not carry at all, and the bucket lookup's
+/// `unwrap_or(0.0)` turned that miss into a `value:0.0` on the wire: a
+/// number no span produced, indistinguishable from a measured zero.
+#[tokio::test]
+async fn a_grouped_sparse_aggregation_never_stamps_an_exemplar_from_a_missing_bucket() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_GSPARSE).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | sum_over_time(duration) by(resource.service.name)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+
+    // Disjoint buckets again, and DISTINCT durations per group so the two
+    // series' values can never coincide: `ga` sums to 4 ms per bucket,
+    // `gb` to 12 ms — 0.004 s and 0.012 s after the ns→s conversion.
+    let mut rows = Vec::new();
+    for (service, base_idx, slots, duration_ns) in [
+        ("ga", 60_000i64, [1usize, 3], 2_000_000i64),
+        ("gb", 70_000, [2, 4], 6_000_000),
+    ] {
+        let mut idx = base_idx;
+        for slot in slots {
+            let ts_ns = axis.label_ms(slot) * 1_000_000 - 1_000;
+            for _ in 0..2 {
+                rows.push(span_row(idx, service, ts_ns, duration_ns, 0));
+                idx += 1;
+            }
+        }
+    }
+    insert_spans(&admin, &DB_GSPARSE, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the grouped aggregation executes");
+    assert_eq!(result.series.len(), 2, "two services: {result:?}");
+
+    let mut total_exemplars = 0usize;
+    for series in &result.series {
+        let service = service_label(series);
+        let samples: std::collections::BTreeMap<i64, f64> =
+            series.samples.iter().copied().collect();
+        assert_eq!(
+            samples.len(),
+            2,
+            "{service}: a value aggregation stays sparse — two occupied buckets, got {samples:?}"
+        );
+        for ex in &series.exemplars {
+            let label = axis.label_for_ms(ex.timestamp_ms);
+            let want = samples.get(&label).copied().unwrap_or_else(|| {
+                panic!(
+                    "{service}: exemplar at {} was stamped from bucket {label}, which this \
+                     series does not carry — its buckets are {:?}",
+                    ex.timestamp_ms,
+                    samples.keys().collect::<Vec<_>>()
+                )
+            });
+            assert_eq!(
+                ex.value.to_bits(),
+                want.to_bits(),
+                "{service}: exemplar value at {label}"
+            );
+            assert_ne!(
+                ex.value, 0.0,
+                "{service}: a fabricated zero is what this criterion exists for: {ex:?}"
+            );
+            total_exemplars += 1;
+        }
+    }
+    assert!(
+        total_exemplars >= 2,
+        "both groups must carry exemplars, got {total_exemplars}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_GSPARSE}")).await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #477 wave 2, ruling finding 1: the shape-specific exemplar
+// attribution criteria.
+//
+// One per multi-series shape that is NOT keyed by a `by()` label. Each is
+// built on the narrowest difference available: every span sits in the SAME
+// time bucket and carries the same sample value on its own series, so the
+// only thing that can distinguish a correct attachment from the pre-fix
+// "attach everything to series 0" is the series identity itself.
+// ---------------------------------------------------------------------------
+
+/// The `trace:id` an exemplar names, as the 32-char hex the framing
+/// renders.
+fn exemplar_trace(ex: &pulsus_read::MetricExemplar) -> String {
+    match &ex
+        .labels
+        .iter()
+        .find(|l| l.key == "trace:id")
+        .unwrap_or_else(|| panic!("every exemplar carries trace:id: {ex:?}"))
+        .value
+    {
+        pulsus_read::MetricLabelValue::Str(hex) => hex.clone(),
+        other => panic!("trace:id must be a string, got {other:?}"),
+    }
+}
+
+/// The value of a numeric series label (`p`, `__bucket`).
+fn double_label(series: &pulsus_read::TraceMetricSeries, key: &str) -> f64 {
+    match series
+        .labels
+        .iter()
+        .find(|l| l.key == key)
+        .unwrap_or_else(|| panic!("series has no {key} label: {series:?}"))
+        .value
+    {
+        pulsus_read::MetricLabelValue::Double(d) => d,
+        ref other => panic!("{key} must be a double, got {other:?}"),
+    }
+}
+
+/// The value of a string series label.
+fn str_label(series: &pulsus_read::TraceMetricSeries, key: &str) -> String {
+    match &series
+        .labels
+        .iter()
+        .find(|l| l.key == key)
+        .unwrap_or_else(|| panic!("series has no {key} label: {series:?}"))
+        .value
+    {
+        pulsus_read::MetricLabelValue::Str(v) => v.clone(),
+        other => panic!("{key} must be a string, got {other:?}"),
+    }
+}
+
+/// **`quantile_over_time` exemplars land on the `p=` series nearest their
+/// own duration, and carry that duration as their value.**
+///
+/// Both traces sit in ONE time bucket, so the bucket cannot tell them
+/// apart, and the criterion is purely which `p` series each landed on.
+/// Before the fix both landed on the first series (`p=0.5`) carrying that
+/// series' value; the reference splits them.
+///
+/// **This one is vacuous for the placement DOMAIN, and deliberately kept
+/// for its narrower assertions** (issue #477 wave 4 review). Exactly one
+/// bucket is occupied, so the whole window and that bucket hold the same
+/// two spans and produce the same `p` values: the per-bucket rule and the
+/// reference's pooled rule agree here by construction, and swapping one
+/// for the other leaves this test green. What it does gate is the
+/// nearest-value rule, the lowest-index tie-break and the exemplar's own
+/// value. The domain is gated by
+/// [`quantile_exemplars_are_placed_against_their_own_buckets_quantiles`]
+/// and [`every_quantile_exemplar_sits_on_the_series_nearest_it_at_its_own_bucket`].
+#[tokio::test]
+async fn quantile_exemplars_land_on_the_quantile_nearest_their_own_duration() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_QEX).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | quantile_over_time(duration, 0.5, 0.9)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    // Two spans, one short and one long, in the SAME bucket.
+    let ts_ns = axis.label_ms(3) * 1_000_000 - 1_000;
+    let short_ns = 1_000_000i64;
+    let long_ns = 16_000_000i64;
+    let rows = vec![
+        span_row(80_000, "qa", ts_ns, short_ns, 0),
+        span_row(80_001, "qa", ts_ns, long_ns, 0),
+    ];
+    let short_trace = format!("{:032x}", 80_000i64);
+    let long_trace = format!("{:032x}", 80_001i64);
+    insert_spans(&admin, &DB_QEX, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the quantile range executes");
+    assert_eq!(
+        result.series.len(),
+        2,
+        "one series per quantile: {result:?}"
+    );
+
+    let label = axis.label_for_ms(ts_ns / 1_000_000);
+    let value_at: Vec<f64> = result
+        .series
+        .iter()
+        .map(|s| {
+            s.samples
+                .iter()
+                .find(|(t, _)| *t == label)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("no sample at {label}: {s:?}"))
+        })
+        .collect();
+    // Anti-vacuity: if the two quantiles coincided at this bucket the
+    // nearest-value rule could not discriminate and this test would pass
+    // on an implementation that ignores the duration entirely.
+    assert_ne!(
+        value_at[0].to_bits(),
+        value_at[1].to_bits(),
+        "the corpus must make p=0.5 and p=0.9 differ at the shared bucket, got {value_at:?}"
+    );
+
+    let mut placed: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for (i, series) in result.series.iter().enumerate() {
+        let p = double_label(series, "p");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            // The value is the span's OWN duration, in seconds.
+            let want_ns = if trace == short_trace {
+                short_ns
+            } else if trace == long_trace {
+                long_ns
+            } else {
+                panic!("unknown trace {trace}");
+            };
+            assert_eq!(
+                ex.value.to_bits(),
+                (want_ns as f64 / 1_000_000_000.0).to_bits(),
+                "p={p}: an exemplar's value must be the sampled span's own duration: {ex:?}"
+            );
+            // …and it sits on the nearest quantile, ties to the lowest.
+            let mut best = 0usize;
+            for (j, v) in value_at.iter().enumerate() {
+                if (ex.value - *v).abs() < (ex.value - value_at[best]).abs() {
+                    best = j;
+                }
+            }
+            assert_eq!(
+                i, best,
+                "trace {trace} (value {}) was attached to p={p} but the nearest quantile at \
+                 this bucket is index {best} of {value_at:?}",
+                ex.value
+            );
+            placed.insert(trace, p);
+        }
+    }
+    assert_eq!(placed.len(), 2, "both traces must be placed: {placed:?}");
+    let ps: std::collections::BTreeSet<u64> = placed.values().map(|p| p.to_bits()).collect();
+    assert_eq!(
+        ps.len(),
+        2,
+        "the short and the long span belong to DIFFERENT quantile series, got {placed:?}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QEX}")).await;
+}
+
+/// **`quantile_over_time` exemplar placement is against the quantiles of
+/// the exemplar's OWN bucket** — the numbers the `p=` series draws at
+/// that timestamp — and not against the whole window pooled (issue #477
+/// wave 4 ruling; ledger row
+/// `traceql-metrics-quantile-exemplar-placement-domain`).
+///
+/// The corpus is the one case where the two domains cannot both be right:
+/// **one span per bucket across a sparse window**. Every occupied bucket
+/// then holds a single duration, so *that bucket's* `p=0.5` and `p=1` are
+/// the same number — every candidate ties, and the lowest-index tie-break
+/// puts all eight exemplars on `p=0.5`. Pooled, the eight durations form
+/// one distribution whose `p=1` is the maximum, `201 ms`, and whose
+/// median is inside the `1-6 ms` cluster (six of eight points), so the
+/// nearest-value split falls between `104 ms` and `101 ms`: the two long
+/// spans would land on `p=1` and the six short ones on `p=0.5`. **The two
+/// domains therefore predict different answers on this corpus for any
+/// quantile estimator**, which is what makes it a criterion rather than a
+/// coincidence.
+///
+/// The tie is a property of degenerate input, not a rule of its own: one
+/// observation has no spread, so there is no nearest series to find. The
+/// ledger row says so in those terms.
+#[tokio::test]
+async fn quantile_exemplars_are_placed_against_their_own_buckets_quantiles() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_QSPARSE).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | quantile_over_time(duration, 0.5, 1)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    // One span per bucket, buckets 1..=8 of the 9-point grid.
+    const DURATIONS_MS: [i64; 8] = [1, 2, 3, 4, 5, 6, 200, 201];
+    let mut rows = Vec::new();
+    let mut duration_of: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    for (n, ms) in DURATIONS_MS.iter().enumerate() {
+        let idx = 90_000 + n as i64;
+        let ts_ns = axis.label_ms(n + 1) * 1_000_000 - 1_000;
+        rows.push(span_row(idx, "qs", ts_ns, ms * 1_000_000, 0));
+        duration_of.insert(format!("{idx:032x}"), *ms);
+    }
+    insert_spans(&admin, &DB_QSPARSE, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the quantile range executes");
+    assert_eq!(
+        result.series.len(),
+        2,
+        "one series per quantile: {result:?}"
+    );
+    assert_eq!(double_label(&result.series[0], "p"), 0.5);
+    assert_eq!(double_label(&result.series[1], "p"), 1.0);
+
+    // Anti-vacuity, and the whole reason this corpus discriminates: at
+    // EVERY bucket the two quantiles are the same number, so the values
+    // the two series draw cannot tell them apart. A run where they
+    // differed somewhere would be reading a corpus on which the pooled
+    // domain could have produced the same placement.
+    let (lo, hi) = (&result.series[0].samples, &result.series[1].samples);
+    assert_eq!(lo.len(), hi.len(), "both series carry the same grid");
+    for (a, b) in lo.iter().zip(hi.iter()) {
+        assert_eq!(a.0, b.0, "the two series share a bucket grid");
+        assert_eq!(
+            a.1.to_bits(),
+            b.1.to_bits(),
+            "p=0.5 and p=1 must COINCIDE at every bucket for this case to \
+             discriminate — got {a:?} vs {b:?} over {lo:?} / {hi:?}"
+        );
+    }
+
+    let mut placed: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (i, series) in result.series.iter().enumerate() {
+        let p = double_label(series, "p");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            let ms = *duration_of
+                .get(&trace)
+                .unwrap_or_else(|| panic!("unknown trace {trace}"));
+            assert_eq!(
+                ex.value.to_bits(),
+                (ms as f64 / 1_000.0).to_bits(),
+                "p={p}: an exemplar's value is the sampled span's own duration: {ex:?}"
+            );
+            assert!(placed.insert(trace, i).is_none(), "a span is placed once");
+        }
+    }
+    let mut by_duration: Vec<(i64, usize)> = placed
+        .iter()
+        .map(|(trace, i)| (duration_of[trace], *i))
+        .collect();
+    by_duration.sort_unstable();
+    let want: Vec<(i64, usize)> = DURATIONS_MS.iter().map(|ms| (*ms, 0usize)).collect();
+    assert_eq!(
+        by_duration, want,
+        "every span belongs to its OWN bucket's nearest quantile, and with one span in a \
+         bucket every candidate ties, so all eight sit on the lowest p. The two long spans \
+         on p=1 is the POOLED domain, which compares against values no series draws"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QSPARSE}")).await;
+}
+
+/// **Every quantile exemplar sits on the series nearest it AT ITS OWN
+/// BUCKET, ties to the lowest `p`** — the rule stated as a property over
+/// the whole response, on a corpus where the `p=` lines move (issue #477
+/// wave 4 ruling).
+///
+/// The gate is against OUR rule, not against the reference's targets: the
+/// reference computes its placement targets by pooling every interval,
+/// and its `p=` values per interval, so its targets are not a
+/// reproducible oracle for a per-bucket rule and comparing against them
+/// would gate the divergence the ledger row records rather than the
+/// behaviour. Everything asserted here is derived from the response
+/// itself — for each exemplar, the argmin over the series of
+/// `|exemplar value - that series' sample at the exemplar's bucket|`.
+///
+/// **The corpus makes the domain observable.** Two occupied buckets: 40
+/// spans of `1..=10 ms` in one and 10 spans of `100..=190 ms` in the
+/// other, queried for `p=0.5` and `p=0.99`. The `p=0.5` LINE therefore
+/// moves — about `5 ms` at the short bucket and about `145 ms` at the
+/// long one — which is exactly the condition under which the per-bucket
+/// and pooled domains disagree. A `100 ms` span in the long bucket is
+/// nearest that bucket's `p=0.5` (`|100-145| = 45` against
+/// `|100-190| = 90`) and so lands there; pooled, the 40 short spans own
+/// the median, so the pooled `p=0.5` sits inside `1..=10 ms` and the same
+/// span is nearest the pooled `p=0.99` (`|100-190| = 90` against
+/// `|100-5| = 95`). The final assertion pins that span's placement, so a
+/// pooled implementation fails here and not only on the sparse corpus.
+#[tokio::test]
+async fn every_quantile_exemplar_sits_on_the_series_nearest_it_at_its_own_bucket() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_QSHIFT).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | quantile_over_time(duration, 0.5, 0.99)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    const SHORT_BUCKET: usize = 2;
+    const LONG_BUCKET: usize = 6;
+    let short_ts = axis.label_ms(SHORT_BUCKET) * 1_000_000 - 1_000;
+    let long_ts = axis.label_ms(LONG_BUCKET) * 1_000_000 - 1_000;
+    let mut rows = Vec::new();
+    let mut duration_of: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    // 40 short spans: durations 1..=10 ms, four spans each.
+    for n in 0..40i64 {
+        let idx = 91_000 + n;
+        let ms = n % 10 + 1;
+        rows.push(span_row(idx, "qm", short_ts, ms * 1_000_000, 0));
+        duration_of.insert(format!("{idx:032x}"), ms);
+    }
+    // 10 long spans: durations 100, 110, …, 190 ms.
+    for n in 0..10i64 {
+        let idx = 92_000 + n;
+        let ms = 100 + n * 10;
+        rows.push(span_row(idx, "qm", long_ts, ms * 1_000_000, 0));
+        duration_of.insert(format!("{idx:032x}"), ms);
+    }
+    insert_spans(&admin, &DB_QSHIFT, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the quantile range executes");
+    assert_eq!(
+        result.series.len(),
+        2,
+        "one series per quantile: {result:?}"
+    );
+    assert_eq!(double_label(&result.series[0], "p"), 0.5);
+    assert_eq!(double_label(&result.series[1], "p"), 0.99);
+
+    let value_at = |series: &pulsus_read::TraceMetricSeries, label: i64| -> f64 {
+        series
+            .samples
+            .iter()
+            .find(|(t, _)| *t == label)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("no sample at {label}: {series:?}"))
+    };
+    let short_label = axis.label_ms(SHORT_BUCKET);
+    let long_label = axis.label_ms(LONG_BUCKET);
+
+    // Anti-vacuity: the `p=0.5` LINE has to move between the two buckets,
+    // or the pooled and the per-bucket domains would have the same
+    // comparison basis and nothing below could tell them apart.
+    let median_short = value_at(&result.series[0], short_label);
+    let median_long = value_at(&result.series[0], long_label);
+    assert!(
+        median_short <= 0.02 && median_long >= 0.09,
+        "the p=0.5 line must move across the window for this corpus to discriminate: \
+         {median_short} at the short bucket, {median_long} at the long one"
+    );
+
+    // The property, over every exemplar the response carries.
+    let mut long_bucket_on_median = 0usize;
+    let mut total = 0usize;
+    for (i, series) in result.series.iter().enumerate() {
+        let p = double_label(series, "p");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            let ms = *duration_of
+                .get(&trace)
+                .unwrap_or_else(|| panic!("unknown trace {trace}"));
+            assert_eq!(
+                ex.value.to_bits(),
+                (ms as f64 / 1_000.0).to_bits(),
+                "p={p}: an exemplar's value is the sampled span's own duration: {ex:?}"
+            );
+            // The exemplar carries the SPAN's timestamp, not the
+            // bucket label, so the bucket it was placed in has to be
+            // recovered the same way the engine framed it.
+            let label = axis.label_for_ms(ex.timestamp_ms);
+            let at: Vec<f64> = result.series.iter().map(|s| value_at(s, label)).collect();
+            let mut best = 0usize;
+            for (j, v) in at.iter().enumerate() {
+                if (ex.value - *v).abs() < (ex.value - at[best]).abs() {
+                    best = j;
+                }
+            }
+            assert_eq!(
+                i, best,
+                "trace {trace} (value {}) sits on p={p} but the nearest series AT ITS OWN \
+                 bucket {label} is index {best} of {at:?}",
+                ex.value
+            );
+            total += 1;
+            if label == long_label && i == 0 {
+                long_bucket_on_median += 1;
+            }
+        }
+    }
+    assert!(total >= 10, "the response must carry exemplars: {total}");
+    // The discriminating case, pinned: a long-bucket span on the MEDIAN
+    // series. Pooled, the 40 short spans own the median and every one of
+    // these spans is nearer the pooled p=0.99, so a pooled implementation
+    // cannot produce this.
+    assert!(
+        long_bucket_on_median > 0,
+        "at least one long-bucket exemplar must sit on p=0.5 — that is the placement the \
+         pooled domain cannot produce; got {total} exemplars, none of them"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QSHIFT}")).await;
+}
+
+/// **`histogram_over_time` exemplars land on the `__bucket=` series their
+/// own duration falls in.**
+///
+/// Both traces sit in one time bucket and each `__bucket` series carries
+/// the same tally (`1.0`) there, so neither the timestamp nor the value
+/// can distinguish a correct attachment. Before the fix both landed on
+/// the first (smallest) bucket's series.
+#[tokio::test]
+async fn histogram_exemplars_land_on_the_bucket_their_own_duration_falls_in() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_HEX).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | histogram_over_time(duration)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    let ts_ns = axis.label_ms(3) * 1_000_000 - 1_000;
+    // 1 ms bucketizes to 2^20 ns, 16 ms to 2^24 ns.
+    let cases: [(i64, i64, f64); 2] = [
+        (81_000, 1_000_000, 1_048_576.0 / 1e9),
+        (81_001, 16_000_000, 16_777_216.0 / 1e9),
+    ];
+    let rows: Vec<String> = cases
+        .iter()
+        .map(|(idx, dur, _)| span_row(*idx, "ha", ts_ns, *dur, 0))
+        .collect();
+    insert_spans(&admin, &DB_HEX, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the histogram range executes");
+    assert_eq!(
+        result.series.len(),
+        2,
+        "one series per occupied log2 bucket: {result:?}"
+    );
+
+    let mut seen = 0usize;
+    for series in &result.series {
+        let bucket = double_label(series, "__bucket");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            let (_, _, want_bucket) = cases
+                .iter()
+                .find(|(idx, _, _)| format!("{idx:032x}") == trace)
+                .unwrap_or_else(|| panic!("unknown trace {trace}"));
+            assert_eq!(
+                bucket.to_bits(),
+                want_bucket.to_bits(),
+                "trace {trace} was attached to __bucket={bucket}, and its duration falls in \
+                 {want_bucket}"
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 2, "both traces must carry an exemplar: {result:?}");
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_HEX}")).await;
+}
+
+/// **`compare()` exemplars land on their own side's `*_total` series.**
+///
+/// One selection span and one baseline span in the same bucket. Before
+/// the fix every sample landed on the first framed series — a per-value
+/// `baseline` series — so a selection trace appeared under `baseline`.
+#[tokio::test]
+async fn compare_exemplars_land_on_their_own_sides_total_series() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_CEX).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        r#"{} | compare({resource.service.name = "csel"})"#,
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    let ts_ns = axis.label_ms(3) * 1_000_000 - 1_000;
+    let rows = vec![
+        span_row(82_000, "csel", ts_ns, 1_000_000, 0),
+        span_row(82_001, "cbase", ts_ns, 1_000_000, 0),
+    ];
+    let sel_trace = format!("{:032x}", 82_000i64);
+    let base_trace = format!("{:032x}", 82_001i64);
+    insert_spans(&admin, &DB_CEX, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the comparison range executes");
+
+    let mut sides: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let mut attached = 0usize;
+    for series in &result.series {
+        let kind = str_label(series, "__meta_type");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            // Only the two TOTAL meta-types carry exemplars at all.
+            assert!(
+                kind == "baseline_total" || kind == "selection_total",
+                "trace {trace} was attached to a __meta_type={kind} series, and only the \
+                 *_total series carry comparison exemplars: {series:?}"
+            );
+            let want = if trace == sel_trace {
+                "selection_total"
+            } else if trace == base_trace {
+                "baseline_total"
+            } else {
+                panic!("unknown trace {trace}");
+            };
+            assert_eq!(
+                kind, want,
+                "trace {trace} came from the {want} population and was attached to {kind}"
+            );
+            sides.entry(kind.clone()).or_default().insert(trace.clone());
+            attached += 1;
+        }
+    }
+    assert!(attached > 0, "the comparison must carry exemplars");
+    assert_eq!(
+        sides.keys().cloned().collect::<Vec<_>>(),
+        vec!["baseline_total".to_string(), "selection_total".to_string()],
+        "both sides must be represented, got {sides:?}"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_CEX}")).await;
+}
+
+/// AC8(iv-b): the RANGE probe counts the groups the range answer can
+/// contain, and the instant probe does not — so a group visible only to
+/// the range window trips the cap while the instant route still serves.
+///
+/// Both pieces of the error set are covered: a group present only at
+/// exactly `aE`, which the half-open instant window excludes, and one
+/// present only in the leading step `(aS - step, aS)`, which it also
+/// excludes. The instant control is what makes this an assertion about
+/// TWO probes rather than about a cap — a single shared probe cannot
+/// satisfy both halves.
+#[tokio::test]
+async fn the_range_probe_rejects_groups_outside_the_instant_window() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, _) = fresh_db(&DB_CAP).await;
+    let mut cfg = engine_config();
+    cfg.max_series = 1;
+    let capped = TraceEngine::new(
+        {
+            let mut c = test_config();
+            c.database = DB_CAP.to_string();
+            ChClient::new(c).await.expect("connect")
+        },
+        cfg,
+    );
+
+    // Two time-disjoint aligned windows, so the two corpora cannot see
+    // each other.
+    let (aligned, _) = aligned_past_window(600, 60);
+    let step_ms = 60_000;
+
+    // E: `a` inside [aS, aE); `b` ONLY at exactly aE.
+    let e_start = aligned;
+    let e_end = aligned + 120;
+    // L: `c` inside; `d` ONLY in (aS - step, aS).
+    let l_start = aligned + 300;
+    let l_end = aligned + 420;
+
+    insert_spans(
+        &admin,
+        &DB_CAP,
+        &[
+            span_row(30_001, "cap-a", (e_start + 30) * NS, 1_000_000, 0),
+            span_row(30_002, "cap-b", e_end * NS, 1_000_000, 0),
+            span_row(30_003, "cap-c", (l_start + 30) * NS, 1_000_000, 0),
+            span_row(30_004, "cap-d", (l_start - 30) * NS, 1_000_000, 0),
+        ],
+    )
+    .await;
+
+    for (name, start_s, end_s, inside) in [
+        ("E (a group at exactly aE)", e_start, e_end, "cap-a"),
+        ("L (a group in the leading step)", l_start, l_end, "cap-c"),
+    ] {
+        let plan = plan_for(
+            &capped,
+            "{} | count_over_time() by(resource.service.name)",
+            start_s,
+            end_s,
+            step_ms,
+        );
+        // The range window really does see the extra group and the
+        // instant window really does not — stated as the two windows,
+        // which is the only difference between the two probes.
+        assert_eq!(
+            plan.snapped_window_ns(),
+            (start_s * NS, end_s * NS),
+            "{name}"
+        );
+        assert_eq!(
+            plan.range_window_ns(),
+            ((start_s - 60) * NS + 1, end_s * NS + 1),
+            "{name}"
+        );
+
+        match capped.metrics_range(&plan).await {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSeriesCap { count, cap })) => {
+                assert!(count > cap, "{name}: count {count} must exceed cap {cap}");
+                assert_eq!(cap, 1, "{name}");
+            }
+            other => panic!("{name}: expected a series-cap rejection, got {other:?}"),
+        }
+
+        // Control, same plan: the instant route serves it, because the
+        // instant probe sees one group.
+        let instant = capped
+            .metrics_instant(&plan)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: the instant route must NOT reject: {e}"));
+        assert_eq!(instant.series.len(), 1, "{name}: {instant:?}");
+        assert_eq!(service_label(&instant.series[0]), inside, "{name}");
+    }
+
+    // AC13's live half: a millisecond step over thirty days resolves far
+    // more intervals than the cap, and is refused before any SQL exists.
+    let month = 30 * 86_400;
+    let err = plan_trace_metrics(
+        &pulsus_traceql::parse("{} | rate()").expect("parse"),
+        &MetricsParams {
+            start_ns: aligned * NS,
+            end_ns: (aligned + month) * NS,
+            step_ms: 1,
+            exemplars: None,
+        },
+        &capped.metrics_ctx(),
+    )
+    .expect_err("a 1 ms step over 30 days is over the point cap");
+    match err {
+        pulsus_read::traces::filter::PlanError::MetricsPointCap { buckets, cap } => {
+            assert_eq!(buckets, month * 1_000);
+            assert_eq!(cap, 11_000);
+        }
+        other => panic!("expected MetricsPointCap, got {other:?}"),
+    }
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_CAP}")).await;
+}
+
+// ---------------------------------------------------------------------------
+// AC14 (issue #477): every wall-clock read in THIS file is confined to two
+// named owners.
+//
+// Why a `syn` parse and not a line scan. The first version of this gate
+// matched `^(?:pub )?(?:async )?fn NAME` at column 0. Changing the real
+// declaration to `pub(crate) fn base_s` made that pattern miss it, so a
+// nested `fn base_s() {}` became the only declaration it could see, the
+// count read 1, and the scanner returned GREEN with two breaks sitting in
+// the file. A pattern that only knows the shapes someone thought of is the
+// same defect one iteration later — the precedent is
+// `crates/pulsus-read/tests/traces_regex_seal.rs:18-40`, whose own
+// hand-rolled line scanner was replaced for exactly this reason. `syn` and
+// `proc-macro2` are already dev-dependencies of this crate
+// (`crates/pulsus-read/Cargo.toml`), with the `visit` feature on; no
+// manifest change.
+// ---------------------------------------------------------------------------
+
+use proc_macro2::{TokenStream, TokenTree};
+use syn::visit::Visit;
+
+/// `(clock type, constructor)`. A read is a path in expression position
+/// whose last segment is the constructor and whose owning type — the
+/// preceding segment, or the qualified-self type for `<T>::now()` — is the
+/// clock type; or the same two-token sequence inside a macro's tokens.
+const CLOCKS: [(&str, &str); 3] = [("SystemTime", "now"), ("Instant", "now"), ("Utc", "now")];
+
+/// The only two functions in this file that may read a clock.
+///
+/// `base_s` MUST read one: a committed corpus base ages past the schema's
+/// delete TTL and turns the whole live suite into a silent pass.
+/// `past_window` is the funnel this gate exists to enforce. The scanner
+/// itself is NOT here — its `CLOCKS` entries are string literals, not
+/// paths and not inside a macro, so it owns zero occurrences by
+/// construction and needs no exemption. An exemption hides the cases it
+/// admits; deleting it makes them visible.
+const PERMITTED: [&str; 2] = ["base_s", "past_window"];
+
+/// The owners the control fixture's three reads sit under, in needle
+/// order.
+const CONTROL_OWNERS: [&str; 3] = ["probe_a", "probe_b", "probe_c"];
+
+/// The complete attribute set this file may carry.
+///
+/// `tokio::test` is the only attribute macro it spells; `test` is what the
+/// plain `#[test]` below adds; `doc` is how the parser represents every
+/// `///` and `//!` line, which is why it looks redundant and is not —
+/// removing it reddens the gate on this file's own doc comments; `allow`
+/// is a built-in inert lint attribute, included so that satisfying
+/// `-D warnings` never forces a deviation. Anything else — a `derive`, a
+/// `cfg_attr`, any other path — reddens the gate, because an attribute
+/// macro REWRITES the item it decorates and that rewrite is invisible to
+/// this parse. Widening this list is a deliberate decision, not a tidy-up.
+const ATTR_ALLOW: [&str; 4] = ["test", "tokio::test", "allow", "doc"];
+
+/// No `#[derive(...)]` here, deliberately: `derive` is outside
+/// `ATTR_ALLOW` (a derive macro is an expansion this parse cannot see),
+/// so assertion (6) reddens on it — including on this scanner's own
+/// struct. The empty state is written out below instead.
+struct ClockScan {
+    /// The innermost-enclosing-function stack; `<module>` when empty.
+    owners: Vec<String>,
+    /// Every function declaration, in source order, over the four item
+    /// types `syn` gives a `Signature` — so visibility,
+    /// `const`/`async`/`unsafe`/`extern`, generics, attributes and nesting
+    /// cannot hide one.
+    decls: Vec<String>,
+    /// `(needle, owner, how it was spelled)`; the third field is
+    /// diagnostics only and never a decision.
+    occs: Vec<(String, String, String)>,
+    /// Fail-closed census: `macro_rules!` definitions, item-position macro
+    /// invocations and `Verbatim` nodes — anything that can introduce a
+    /// declaration or a read this parse cannot see.
+    opaque: Vec<String>,
+    /// Every attribute path in the file, joined with `::`.
+    attrs: Vec<String>,
+}
+
+impl ClockScan {
+    fn empty() -> Self {
+        ClockScan {
+            owners: Vec::new(),
+            decls: Vec::new(),
+            occs: Vec::new(),
+            opaque: Vec::new(),
+            attrs: Vec::new(),
+        }
+    }
+
+    fn owner(&self) -> String {
+        self.owners
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<module>".to_string())
+    }
+
+    fn record(&mut self, needle: &str, spelling: String) {
+        let owner = self.owner();
+        self.occs.push((needle.to_string(), owner, spelling));
+    }
+}
+
+/// Matches `Ident(clock) :: Ident(ctor)` anywhere in a token stream, then
+/// recurses into every group. A clock spelling inside a string literal is
+/// a `Literal` token and does not match; whitespace and formatting are
+/// invisible to a token match.
+fn scan_tokens(scan: &mut ClockScan, ts: &TokenStream, what: &str) {
+    let flat: Vec<TokenTree> = ts.clone().into_iter().collect();
+    for w in flat.windows(4) {
+        let (TokenTree::Ident(a), TokenTree::Punct(c1), TokenTree::Punct(c2), TokenTree::Ident(b)) =
+            (&w[0], &w[1], &w[2], &w[3])
+        else {
+            continue;
+        };
+        if c1.as_char() != ':' || c2.as_char() != ':' {
+            continue;
+        }
+        let (ty, ctor) = (a.to_string(), b.to_string());
+        if let Some((clock, _)) = CLOCKS.iter().find(|(t, c)| *t == ty && *c == ctor) {
+            scan.record(clock, format!("[macro `{what}` tokens `{ty}::{ctor}`]"));
+        }
+    }
+    for tt in flat {
+        if let TokenTree::Group(g) = tt {
+            scan_tokens(scan, &g.stream(), what);
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for ClockScan {
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        let name = f.sig.ident.to_string();
+        self.decls.push(name.clone());
+        self.owners.push(name);
+        syn::visit::visit_item_fn(self, f);
+        self.owners.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        let name = f.sig.ident.to_string();
+        self.decls.push(name.clone());
+        self.owners.push(name);
+        syn::visit::visit_impl_item_fn(self, f);
+        self.owners.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, f: &'ast syn::TraitItemFn) {
+        let name = f.sig.ident.to_string();
+        self.decls.push(name.clone());
+        self.owners.push(name);
+        syn::visit::visit_trait_item_fn(self, f);
+        self.owners.pop();
+    }
+
+    fn visit_foreign_item_fn(&mut self, f: &'ast syn::ForeignItemFn) {
+        // No body to descend into; it is still a declaration.
+        self.decls.push(f.sig.ident.to_string());
+        syn::visit::visit_foreign_item_fn(self, f);
+    }
+
+    fn visit_expr_path(&mut self, e: &'ast syn::ExprPath) {
+        let segs: Vec<String> = e
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        if let Some(ctor) = segs.last() {
+            // `<T>::now()` carries the owning type in the qualified self,
+            // where the path's own segments do not name it.
+            let owning = match (&e.qself, segs.len()) {
+                (Some(q), _) => match &*q.ty {
+                    syn::Type::Path(tp) => tp.path.segments.last().map(|s| s.ident.to_string()),
+                    _ => None,
+                },
+                (None, n) if n >= 2 => Some(segs[n - 2].clone()),
+                _ => None,
+            };
+            if let Some((clock, _)) = owning
+                .as_deref()
+                .and_then(|o| CLOCKS.iter().find(|(t, c)| *t == o && *c == *ctor))
+            {
+                let spelling = format!("[path `{}`]", segs.join("::"));
+                self.record(clock, spelling);
+            }
+        }
+        syn::visit::visit_expr_path(self, e);
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        let what = m
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        scan_tokens(self, &m.tokens, &what);
+        syn::visit::visit_macro(self, m);
+    }
+
+    fn visit_attribute(&mut self, a: &'ast syn::Attribute) {
+        let path = a
+            .path()
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        self.attrs.push(path);
+        syn::visit::visit_attribute(self, a);
+    }
+
+    fn visit_item(&mut self, i: &'ast syn::Item) {
+        match i {
+            syn::Item::Macro(_) => self.opaque.push("Item::Macro".to_string()),
+            syn::Item::Verbatim(_) => self.opaque.push("Item::Verbatim".to_string()),
+            _ => {}
+        }
+        syn::visit::visit_item(self, i);
+    }
+
+    fn visit_impl_item(&mut self, i: &'ast syn::ImplItem) {
+        match i {
+            syn::ImplItem::Macro(_) => self.opaque.push("ImplItem::Macro".to_string()),
+            syn::ImplItem::Verbatim(_) => self.opaque.push("ImplItem::Verbatim".to_string()),
+            _ => {}
+        }
+        syn::visit::visit_impl_item(self, i);
+    }
+
+    fn visit_trait_item(&mut self, i: &'ast syn::TraitItem) {
+        match i {
+            syn::TraitItem::Macro(_) => self.opaque.push("TraitItem::Macro".to_string()),
+            syn::TraitItem::Verbatim(_) => self.opaque.push("TraitItem::Verbatim".to_string()),
+            _ => {}
+        }
+        syn::visit::visit_trait_item(self, i);
+    }
+
+    fn visit_expr(&mut self, e: &'ast syn::Expr) {
+        if matches!(e, syn::Expr::Verbatim(_)) {
+            self.opaque.push("Expr::Verbatim".to_string());
+        }
+        syn::visit::visit_expr(self, e);
+    }
+}
+
+/// Parses `text` and runs the scan. A file that does not parse FAILS —
+/// under a line scan an unparseable file scanned clean.
+fn scan_clocks(text: &str, label: &str) -> ClockScan {
+    let file = syn::parse_file(text).unwrap_or_else(|e| panic!("{label} must parse: {e}"));
+    let mut scan = ClockScan::empty();
+    scan.visit_file(&file);
+    scan
+}
+
+/// Issue #477 wave 2, Q29 staged: every declaration form the ownership
+/// rule must recognise, in three variants each.
+///
+/// The plan's Q29 named a 19-form matrix produced by a standalone
+/// recogniser in a scratch directory. The forms are committed here
+/// (`tests/fixtures/issue477/ac14_forms/forms.txt`) and the three
+/// variants are built from each: the form alone must be GREEN, the form
+/// plus a read in a function that may not own one must be RED for the
+/// VIOLATION reason, and the form declared twice must be RED for the
+/// declaration-pin reason.
+///
+/// The answers that must not appear are the two false passes: a GREEN in
+/// the `read outside` or `second declaration` column, which would mean a
+/// break slipped through, and a RED in the `correct` column, which would
+/// mean a form is not recognised as a declaration at all. The superseded
+/// column rule answered 14 of these wrongly; it exists nowhere in this
+/// tree and is not re-created.
+///
+/// Nineteen forms, not the plan's twenty: the `extern` block declaration
+/// has no body and so cannot hold the read its `correct` variant needs.
+/// It is staged instead as the single input `extern_block_second_decl` in
+/// the Q25 corpus above, which is the variant that discriminates — a
+/// second `base_s` with no body, invisible to any rule that recognises
+/// declarations by their source line.
+///
+/// The nineteenth is the RECEIVER-method form, `fn base_s(&self)`, added
+/// on the wave-2 review's finding: it is in the plan, it is expressible
+/// and it runs, so leaving it out was an omission and not an
+/// impossibility. It differs from `inherent_impl` in the thing the rule
+/// has to get right — a method with a receiver, where `inherent_impl` is
+/// an associated function without one.
+#[test]
+fn every_declaration_form_owns_its_own_clock_read() {
+    const READ: &str = "std::time::SystemTime::now()\n        \
+                        .duration_since(std::time::UNIX_EPOCH)\n        \
+                        .expect(\"clock\")\n        .as_secs() as i64";
+    const VIOLATION: &str = "clock read(s) outside the permitted helpers";
+    const PIN: &str = "is declared";
+
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/issue477/ac14_forms/forms.txt"),
+    )
+    .expect("read the form templates");
+
+    // `== name ==` sections; everything before the first header is prose.
+    let mut forms: Vec<(String, String)> = Vec::new();
+    let mut current: Option<(String, Vec<&str>)> = None;
+    for line in src.lines() {
+        if let Some(name) = line
+            .strip_prefix("== ")
+            .and_then(|rest| rest.strip_suffix(" =="))
+        {
+            if let Some((n, body)) = current.take() {
+                forms.push((n, body.join("\n")));
+            }
+            current = Some((name.to_string(), Vec::new()));
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push(line);
+        }
+    }
+    if let Some((n, body)) = current {
+        forms.push((n, body.join("\n")));
+    }
+    assert_eq!(forms.len(), 19, "the committed form set is nineteen");
+
+    let mut table = String::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (name, template) in &forms {
+        let form = template.replace("@READ@", READ);
+        let outside = format!("{form}\n\nfn unowned_case() -> i64 {{\n    {READ}\n}}\n");
+        let twice = format!("{form}\n\n{form}\n");
+        let mut row = format!("  {name:<20}");
+        for (variant, text, want) in [
+            ("correct", &form, None),
+            ("read outside", &outside, Some(VIOLATION)),
+            ("second declaration", &twice, Some(PIN)),
+        ] {
+            let label = format!("{name}/{variant}");
+            let scan = scan_clocks(text, &label);
+            let reasons = ac14_file_reasons(&scan, &["base_s"], "base_s");
+            let pin = scan.decls.iter().filter(|d| d.as_str() == "base_s").count();
+            row.push_str(&format!(
+                " | {} pin={pin}",
+                if reasons.is_empty() { "GREEN" } else { "RED  " }
+            ));
+            match want {
+                None if !reasons.is_empty() => failures.push(format!(
+                    "{label}: must be GREEN — the form is not recognised as a declaration \
+                     that owns its body:\n{}",
+                    reasons.join("\n")
+                )),
+                Some(key) => {
+                    if reasons.is_empty() {
+                        failures.push(format!("{label}: must be RED, and was GREEN"));
+                    } else if !reasons.iter().any(|r| r.contains(key)) {
+                        failures.push(format!(
+                            "{label}: expected the {key:?} reason, got:\n{}",
+                            reasons.join("\n")
+                        ));
+                    }
+                }
+                None => {}
+            }
+        }
+        table.push_str(&row);
+        table.push('\n');
+    }
+    eprintln!("Q29 — declaration forms (correct | read outside | second declaration):\n{table}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Issue #477 wave 2, Q25 staged: AC14's rule over a committed mutation
+/// corpus, one input per behaviour, each with the verdict AND the reason
+/// it must give.
+///
+/// The plan's Q25 named twenty rows a reviewer had no way to reproduce —
+/// the mutations were built in a scratch directory from a 1 500-line
+/// domain file and thrown away. The inputs are committed here instead,
+/// small enough to read, and the rows assert WHICH assertion fires, not
+/// merely that something did: a corpus where every red row is red for the
+/// same reason would prove one assertion five times.
+///
+/// The `.txt` extension keeps deliberately-wrong Rust out of the domain
+/// of the tree-walking guards over `crates/*/tests/**/*.rs`.
+///
+/// Two of the plan's rows are NOT here and cannot be: `V2n` and the whole
+/// `old (column rule)` column ran the corpus through rules that were
+/// superseded before implementation and exist nowhere in this tree.
+#[test]
+fn the_clock_scan_answers_the_committed_verdict_on_every_staged_input() {
+    /// `(input, permitted owners, the reasons that must fire)`. An empty
+    /// reason list is GREEN.
+    const ROWS: [(&str, &[&str], &[&str]); 16] = [
+        ("base_only", &["base_s"], &[]),
+        ("read_outside", &["base_s"], &[VIOLATION]),
+        ("both_owners", &["base_s", "past_window"], &[]),
+        ("third_read", &["base_s", "past_window"], &[VIOLATION]),
+        ("owner_declared_twice", &["base_s", "past_window"], &[PIN]),
+        ("no_read_at_all", &["base_s", "past_window"], &[VACUITY]),
+        ("nested_launder", &["base_s"], &[VIOLATION, PIN]),
+        ("alias_in_scanner", &["base_s"], &[]),
+        ("alias_in_case", &["base_s"], &[]),
+        ("qualified_self", &["base_s"], &[VIOLATION]),
+        ("inside_macro", &["base_s"], &[VIOLATION]),
+        ("fn_pointer", &["base_s"], &[VIOLATION]),
+        ("nested_permitted_owner", &["base_s"], &[PIN]),
+        ("macro_rules_definition", &["base_s"], &[VIOLATION, OPAQUE]),
+        ("unknown_attribute", &["base_s"], &[ATTRIBUTE]),
+        ("extern_block_second_decl", &["base_s"], &[PIN]),
+    ];
+    const VIOLATION: &str = "clock read(s) outside the permitted helpers";
+    const VACUITY: &str = "owns no clock read";
+    const PIN: &str = "is declared";
+    const OPAQUE: &str = "opaque construct(s)";
+    const ATTRIBUTE: &str = "attribute(s) outside the pinned set";
+    const ALL: [&str; 5] = [VIOLATION, VACUITY, PIN, OPAQUE, ATTRIBUTE];
+
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/issue477/ac14_rows");
+    let mut table = String::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (name, permitted, want) in ROWS {
+        let path = dir.join(format!("{name}.txt"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        let scan = scan_clocks(&text, name);
+        let reasons = ac14_file_reasons(&scan, permitted, "base_s");
+        let fired: Vec<&str> = ALL
+            .iter()
+            .copied()
+            .filter(|key| reasons.iter().any(|r| r.contains(key)))
+            .collect();
+        table.push_str(&format!(
+            "  {name:<26} occurrences={} decls={} {} {fired:?}\n",
+            scan.occs.len(),
+            scan.decls.len(),
+            if reasons.is_empty() { "GREEN" } else { "RED  " }
+        ));
+        let want_sorted: Vec<&str> = ALL.iter().copied().filter(|k| want.contains(k)).collect();
+        if fired != want_sorted {
+            failures.push(format!(
+                "{name}: expected reasons {want_sorted:?}, got {fired:?}\n{}",
+                reasons.join("\n")
+            ));
+        }
+        // Nothing outside the declared reason set may fire, so a new
+        // assertion added to the rule cannot pass unnoticed here.
+        if reasons.len() != fired.len() {
+            failures.push(format!(
+                "{name}: {} reason(s) reported but only {} classified — a reason outside \
+                 the declared set fired:\n{}",
+                reasons.len(),
+                fired.len(),
+                reasons.join("\n")
+            ));
+        }
+    }
+
+    // The seventeenth input: a file that does not parse. Under a line scan
+    // it scanned clean; the parse must refuse it instead.
+    let unparseable = std::fs::read_to_string(dir.join("does_not_parse.txt")).expect("read");
+    let panicked =
+        std::panic::catch_unwind(|| scan_clocks(&unparseable, "does_not_parse")).is_err();
+    table.push_str(&format!("  {:<26} PANIC={panicked}\n", "does_not_parse"));
+    if !panicked {
+        failures.push("does_not_parse: the scan accepted a file that is not Rust".to_string());
+    }
+
+    eprintln!("Q25 — AC14 over the staged corpus:\n{table}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// AC14's per-file half — assertions (1), (2), (3), (5) and (6) — as a
+/// verdict rather than a panic: the empty vector is GREEN and every entry
+/// is a reason the file is RED.
+///
+/// Factored out of [`every_live_metrics_window_comes_from_the_past_window_helper`]
+/// so the staged corpora under `tests/fixtures/issue477/ac14_*` run THIS
+/// rule and not a second copy of it (issue #477 wave 2, Q25 and Q29).
+/// Assertion (4) is liveness against the control fixture — a property of
+/// the control and not of the file under scan — and stays inline there.
+fn ac14_file_reasons(
+    scan: &ClockScan,
+    permitted: &[&str],
+    anti_vacuity_owner: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // (1) every read has a permitted owner.
+    let violations: Vec<&(String, String, String)> = scan
+        .occs
+        .iter()
+        .filter(|(_, owner, _)| !permitted.contains(&owner.as_str()))
+        .collect();
+    if !violations.is_empty() {
+        out.push(format!(
+            "clock read(s) outside the permitted helpers — every live metrics window must come \
+             from `past_window`, and the corpus base from `base_s`:\n{}",
+            violations
+                .iter()
+                .map(|(needle, owner, how)| format!("  {needle}::now owner={owner} {how}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    // (2) anti-vacuity: the named owner owns at least one read, so the
+    // scan is proved able to SEE a real clock site in this file.
+    if !scan
+        .occs
+        .iter()
+        .any(|(_, owner, _)| owner == anti_vacuity_owner)
+    {
+        out.push(format!(
+            "`{anti_vacuity_owner}` owns no clock read — either the scan went blind, or the \
+             corpus base was replaced by a committed epoch that will age past the delete TTL"
+        ));
+    }
+
+    // (3) each permitted name is declared EXACTLY once, counted from the
+    // same declaration list ownership is derived from — so there is no
+    // second spelling to substitute, and a nested `fn base_s() {}` that
+    // launders ownership is caught here.
+    for name in permitted {
+        let n = scan.decls.iter().filter(|d| d.as_str() == *name).count();
+        if n != 1 {
+            out.push(format!(
+                "permitted owner `{name}` is declared {n} times, expected exactly 1"
+            ));
+        }
+    }
+
+    // (5) the fail-closed census: nothing in this file can introduce a
+    // declaration or a read the parse cannot see.
+    if !scan.opaque.is_empty() {
+        out.push(format!(
+            "opaque construct(s) in the domain file: {:?} — a `macro_rules!`, an item-position \
+             macro invocation or a `Verbatim` node is refused because its expansion is invisible \
+             to this gate, not because it is wrong",
+            scan.opaque
+        ));
+    }
+
+    // (6) the attribute pin. An attribute macro rewrites the item it
+    // decorates and that rewrite is invisible to this parse, so the set of
+    // attribute paths is pinned rather than trusted.
+    let unknown: Vec<&String> = scan
+        .attrs
+        .iter()
+        .filter(|a| !ATTR_ALLOW.contains(&a.as_str()))
+        .collect();
+    if !unknown.is_empty() {
+        out.push(format!(
+            "attribute(s) outside the pinned set {ATTR_ALLOW:?}: {unknown:?} — an attribute \
+             macro rewrites the item it decorates and that rewrite is invisible to this parse. \
+             Widening `ATTR_ALLOW` is a deliberate decision, not a tidy-up."
+        ));
+    }
+
+    out
+}
+
+/// AC14. Class PRESERVATION: it is GREEN on `2f78c53` (where the only
+/// clock read is `base_s`'s) and stays green here, and what it forbids is
+/// a clock read arriving anywhere else later.
+#[test]
+fn every_live_metrics_window_comes_from_the_past_window_helper() {
+    const CONTROL: &str = include_str!("fixtures/ac14_clock_control.txt");
+    const SRC: &str = include_str!("traces_metrics_live.rs");
+
+    let src = scan_clocks(SRC, "traces_metrics_live.rs");
+
+    // Assertions (1), (2), (3), (5) and (6), all over this file.
+    let reasons = ac14_file_reasons(&src, &PERMITTED, "base_s");
+    assert!(reasons.is_empty(), "{}", reasons.join("\n\n"));
+
+    // (4) needle liveness against the committed control: one hit per
+    // needle, under its own probe, every one a violation. With the domain
+    // file green by construction, this independent text is what says the
+    // scan can still see anything at all.
+    let control = scan_clocks(CONTROL, "fixtures/ac14_clock_control.txt");
+    for (i, (clock, _)) in CLOCKS.iter().enumerate() {
+        let hits: Vec<&(String, String, String)> =
+            control.occs.iter().filter(|(n, _, _)| n == clock).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the control must carry exactly one {clock}::now, got {hits:?}"
+        );
+        assert_eq!(hits[0].1, CONTROL_OWNERS[i], "{clock}::now owner");
+        assert!(
+            !PERMITTED.contains(&hits[0].1.as_str()),
+            "the control's owners must NOT be permitted, or it proves nothing"
+        );
+    }
 }

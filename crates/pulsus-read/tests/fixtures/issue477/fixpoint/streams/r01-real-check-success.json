@@ -1,0 +1,2 @@
+{"reason": "compiler-artifact", "package_id": "file:///probe", "manifest_path": "/probe/Cargo.toml", "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "i477probe", "src_path": "/probe/src/lib.rs", "edition": "2021", "doc": true, "doctest": true, "test": true}, "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "test": false}, "features": [], "filenames": ["/probe/target/debug/deps/libi477probe-b7efd9c3ad03076f.rmeta"], "executable": null, "fresh": false}
+{"reason": "build-finished", "success": true}

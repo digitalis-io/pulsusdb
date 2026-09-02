@@ -85,6 +85,17 @@ const WIRE_DOMAIN_PORT: u16 = 31_214;
 /// plan's first choice) was taken by `logs_api_live.rs` before this
 /// branched; `live_port_uniqueness.rs` is what settles it.
 const NULLABLE_WIRE_PORT: u16 = 31_215;
+/// The issue #477 range-vs-instant cap-probe suite's own spawn. It runs
+/// the binary with a cap 1000x below default, so it needs its own port
+/// and its own throwaway database or it changes what every other suite in
+/// this file sees.
+///
+/// `31_220` was this suite's first choice and collided with issue #479's
+/// `the_matched_span_projection_follows_the_reference_rule`, which took
+/// the same value on a branch that merged first: two textually clean
+/// branches, one port. `live_port_uniqueness.rs` is what caught it and is
+/// what settles it.
+const CAP_PROBE_PORT: u16 = 31_221;
 
 /// Retention for the issue #474 spawn only. The fixture's timestamps are
 /// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
@@ -529,6 +540,48 @@ fn ingest(port: u16, spans: Vec<Span>, ctx: &str) {
         resource_spans: vec![ResourceSpans {
             resource: Some(Resource {
                 attributes: vec![kv("service.name", "checkout")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "live-scope".to_string(),
+                    version: String::new(),
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                }),
+                spans,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    let res = request(
+        port,
+        "POST",
+        "/v1/traces",
+        &[],
+        Some(("application/x-protobuf", &req.encode_to_vec())),
+    )
+    .unwrap_or_else(|| panic!("{ctx}: ingest must be reachable"));
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: sync ingest must succeed, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+}
+
+/// [`ingest`] with the resource's `service.name` supplied by the caller —
+/// the issue #477 cap-probe suite needs four distinct services in one
+/// database, and `ingest` hard-codes `checkout`. Everything else matches
+/// it, so the only difference between a trace seeded here and one seeded
+/// there is the field under test.
+fn ingest_as(port: u16, service: &str, spans: Vec<Span>, ctx: &str) {
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv("service.name", service)],
                 dropped_attributes_count: 0,
                 entity_refs: vec![],
             }),
@@ -2221,4 +2274,137 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
     );
 
     drop_db(&db).await;
+}
+
+/// AC8(iv-c) (issue #477): the range route rejects with `422` a group the
+/// instant route serves with `200`.
+///
+/// **Both routes agree at `2f78c53`.** Measured there over four window
+/// configurations: `enforce_series_cap` read ONE accessor off the plan, so
+/// the two routes executed the same probe string and no request pair,
+/// identical but for the route, could return different statuses for a cap
+/// reason. What could be told apart at base was the two WINDOWS — the same
+/// query at the same cap, one step wider, returned `422` where the narrow
+/// one returned `200` — and after this change the window is the only thing
+/// separating `range_probe_sql` from `instant_probe_sql`. So the pair
+/// below is exactly that difference, moved from the request into the code.
+///
+/// Two time-disjoint fixed windows, one spawn, one database. Fixed FUTURE
+/// timestamps rather than clock-derived ones — the idiom already in this
+/// file — so the corpus is deterministic and sits past the delete TTL by
+/// construction rather than by luck. `past_window`'s clock margin is
+/// `crates/pulsus-read/tests/traces_metrics_live.rs`'s rule and exists
+/// against the reference's end clamp; this test never contacts the
+/// reference and takes no bound from the clock.
+///
+/// **Run procedure, because it is not obvious and it costs an hour when it
+/// bites.** Point the spawn at a ClickHouse at or above the minimum
+/// supported version. A serving process pointed at an older one does not
+/// exit: the reconnect loop does not branch on error kind, so it retries
+/// the permanently unsatisfiable version refusal on the transient path
+/// forever (0.5, 1, 2, 4, 8, 16, then 30 s indefinitely) and `/ready`
+/// answers `503` for the life of the process. `--mode init` is the surface
+/// that exits nonzero with the refusal text. And a readiness poll started
+/// with the process is connection-refused (`curl` prints `000`, exit 7)
+/// until the listener binds; that is the process still starting, not a
+/// failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_range_route_rejects_a_group_the_instant_route_serves() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_traces_api_it_cap");
+    // A re-run against a server still holding the previous run's rows must
+    // not be able to make the cap assertions pass or fail for the wrong
+    // reason.
+    drop_db(&db).await;
+    let _child = spawn_ready_with_env(CAP_PROBE_PORT, &db, &[("PULSUS_TRACEQL_MAX_SERIES", "1")]);
+
+    // E: `cap-b` sits at exactly `aE`, which the half-open instant window
+    // excludes and the right-closed range window includes.
+    const E_START: u64 = 3_099_999_000;
+    const E_END: u64 = 3_099_999_300;
+    // L: `cap-d` sits in the leading step `(aS - 60, aS)`, which the range
+    // window reads and the instant window does not.
+    const L_START: u64 = 3_100_002_000;
+    const L_END: u64 = 3_100_002_300;
+    const NS: u64 = 1_000_000_000;
+
+    for (service, id, at_s) in [
+        ("cap-a", 0xa1u8, E_START + 30),
+        ("cap-b", 0xb2, E_END),
+        ("cap-c", 0xc3, L_START + 30),
+        ("cap-d", 0xd4, L_START - 30),
+    ] {
+        let mut trace_id = [0u8; 16];
+        trace_id[15] = id;
+        let mut span_id = [0u8; 8];
+        span_id[7] = id;
+        ingest_as(
+            CAP_PROBE_PORT,
+            service,
+            vec![span(trace_id, span_id, "op", at_s * NS)],
+            service,
+        );
+    }
+
+    const CAP_BODY: &str = "query too broad: trace metrics by() resolved at least 2 series, exceeding the \
+         1-series cap";
+    let q = "q=%7B%7D%20%7C%20count_over_time%28%29%20by%28resource.service.name%29";
+
+    for (name, start_s, end_s, served) in [
+        ("E: a group at exactly aE", E_START, E_END, "cap-a"),
+        ("L: a group in the leading step", L_START, L_END, "cap-c"),
+    ] {
+        let query = format!("?{q}&start={start_s}&end={end_s}&step=60");
+
+        let ctx = format!("{name} — range route");
+        let res = get(
+            CAP_PROBE_PORT,
+            &format!("/api/traces/v1/metrics/query_range{query}"),
+            &[],
+            &ctx,
+        );
+        let body = assert_error_body(&res, 422, &ctx);
+        assert_eq!(body, CAP_BODY, "{ctx}");
+
+        // Control, SAME query string, same cap, same window: the instant
+        // route serves it, because the instant probe sees one group. A
+        // single shared probe cannot satisfy both halves — which is why
+        // this pair, and not the `422` on its own, is the assertion.
+        let ctx = format!("{name} — instant route control");
+        let res = get(
+            CAP_PROBE_PORT,
+            &format!("/api/traces/v1/metrics/query{query}"),
+            &[],
+            &ctx,
+        );
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: a rejection here means the two probes are one probe, body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        let json = res.json(&ctx);
+        assert_eq!(
+            json["series"].as_array().map(Vec::len),
+            Some(1),
+            "{ctx}: exactly the in-window group, body {json}"
+        );
+        assert_eq!(
+            json["series"][0]["labels"][0]["key"].as_str(),
+            Some("resource.service.name"),
+            "{ctx}: body {json}"
+        );
+        assert_eq!(
+            json["series"][0]["labels"][0]["value"]["stringValue"].as_str(),
+            Some(served),
+            "{ctx}: body {json}"
+        );
+        assert!(
+            json["series"][0].get("samples").is_none(),
+            "{ctx}: the instant body shape is untouched by this issue, body {json}"
+        );
+    }
 }
