@@ -998,10 +998,20 @@ fn exemplar_duration_inner(
 /// **Cost, measured.** On the 120 000-span / 47 h corpus
 /// `tests/traces_metrics_explain.rs` seeds, a `quantile_over_time` range
 /// request with the default exemplar budget issues two statements and
-/// each reads **120 000 rows / 4 800 240 bytes** — the exemplar
-/// statement's scan is the range query's, because it is the same rows
-/// over the same window with one more column out of the same subquery.
-/// Re-derive with the ignored
+/// each reads **120 000 rows** — the exemplar statement's scan is the
+/// range query's, because it is the same rows over the same window with
+/// one more column out of the same subquery. **The row count is exact
+/// and reproduces; the byte count is a magnitude only** — about 4.8 MB
+/// per statement. Three consecutive runs of the probe below (2026-09-02)
+/// each reported 4 800 224 bytes for both statements; the figure this
+/// note carried until now, 4 800 240, was measured in an earlier wave of
+/// this issue and did not recur. Consecutive runs agreeing is not
+/// exactness: the probe seeds a fresh database each run, so the part
+/// layout the read walks is not identical even though the rows are, and
+/// the cross-tab figure quoted on
+/// [`metrics_compare_exemplar_range_sql`] moved on the third of the same
+/// three runs. Quote the rows; do not quote a byte figure from here as
+/// exact. Re-derive with the ignored
 /// `the_per_statement_read_cost_of_a_range_request` probe in that file;
 /// the durations it also prints are one run on a shared box and are not
 /// a claim.
@@ -1327,17 +1337,21 @@ pub struct CompareExemplarSqlInput<'a> {
 /// committed golden and overstates it). On the 120 000-span / 47 h corpus
 /// `tests/traces_metrics_explain.rs` seeds, a range `compare()` with the
 /// default exemplar budget issues four statements, and this one reads
-/// **480 000 rows / 16 566 225 bytes** against the cross-tab's
-/// **720 000 / ~26.5 MB** — 0.67x its rows and about 0.62x its bytes,
-/// because it drops the roots CTE and the value projection. It takes the
-/// request's total from 1 560 000 to 2 040 000 read rows, +31%. **The row
-/// counts are exact and reproduce run to run; the cross-tab's read_bytes
-/// does not** — three recorded runs of this probe (wave 3, its review,
-/// and wave 4) gave 26 526 839, 26 528 787 and 26 543 947 bytes, a spread
-/// of ~17 kB on 26.5 MB. The probe seeds a fresh database each run, so
-/// the part layout the read walks is not identical even though the rows
-/// are; quote the rows, treat the bytes as a magnitude. Re-derive
-/// with the ignored
+/// **480 000 rows** against the cross-tab's **720 000** — 0.67x its rows,
+/// and about 0.62x its bytes (~16.6 MB against ~26.5 MB), because it
+/// drops the roots CTE and the value projection. It takes the request's
+/// total from 1 560 000 to 2 040 000 read rows, +31%. **The row counts
+/// are exact and reproduce run to run; no byte figure does.** Three
+/// consecutive runs (2026-09-02) gave this statement 16 565 810 bytes
+/// each and the cross-tab 26 532 692, 26 532 692 and 26 557 333 — so the
+/// cross-tab moved on the third run alone, and the figures this note
+/// carried until now (16 566 225 here; 26 526 839, 26 528 787 and
+/// 26 543 947 for the cross-tab, each measured in an earlier wave) match
+/// none of the readings above. A figure that repeats over a few runs is
+/// still not exact: the probe seeds a fresh database each run, so the
+/// part layout the read walks is not identical even though the rows are.
+/// Quote the rows; do not quote a byte figure from here as exact.
+/// Re-derive with the ignored
 /// `the_per_statement_read_cost_of_a_range_request` probe in that file;
 /// the durations there are one run on a shared box and are not a claim.
 /// It runs only on a range comparison that framed a non-zero sample and
