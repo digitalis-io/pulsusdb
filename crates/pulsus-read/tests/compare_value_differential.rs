@@ -65,9 +65,17 @@
 //! `resource.service.name`; the spans still land in the same instance.
 //! Run the two binaries against one reference container inside the same
 //! two-and-a-half minutes and this suite counts the sibling's spans as
-//! baseline, which reads exactly like a value-parity fault. Measured that
-//! way during the wave-3 review: run together, this leg started three
-//! tests and exited 100; run against its own container it is clean.
+//! baseline, which reads exactly like a value-parity fault.
+//!
+//! Measured (issue #477 wave 4, one reference container of our own, one
+//! shared ClickHouse): `compare_arity_differential` alone passed, and
+//! `compare_value_differential` run against the same container
+//! immediately afterwards failed with exit 100 — its diff listing the
+//! sibling's nonce-suffixed service values and `mNN` status messages as
+//! `pulsus None != reference Some(N)`, since our side reads a throwaway
+//! ClickHouse database while the reference side is shared. The same
+//! binary against a freshly started container, nothing else pushed to it,
+//! passed: `2 tests run: 2 passed, exit 0`.
 //!
 //! The fix is per-agent reference containers, which is already the
 //! project rule for reference containers and is what CI does — the
