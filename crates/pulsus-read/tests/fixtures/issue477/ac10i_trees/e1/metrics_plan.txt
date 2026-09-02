@@ -1,0 +1,12 @@
+//! The step is carried in milliseconds. The field used to be step_s.
+
+pub struct MetricsParams {
+    pub step_ms: i64,
+}
+
+pub const MAX_EXEMPLARS: u32 = 100;
+pub const DEFAULT_EXEMPLARS: u32 = 100;
+
+pub fn axis_points(width: i64, step_ms: i64) -> i64 {
+    width / step_ms
+}

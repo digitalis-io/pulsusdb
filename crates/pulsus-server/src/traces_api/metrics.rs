@@ -86,7 +86,8 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
     let metrics_params = pulsus_read::MetricsParams {
         start_ns: params.start_ns,
         end_ns: params.end_ns,
-        step_s: params.step_s,
+        step_ms: params.step_ms,
+        exemplars: params.exemplars,
     };
     let plan =
         pulsus_read::plan_trace_metrics(&query, &metrics_params, &ctx).map_err(ApiError::Plan)?;
@@ -178,13 +179,22 @@ mod tests {
         assert!(!body.contains("byte "), "body {body}");
     }
 
+    /// Issue #477 (d): `500ms` moved from this list to the accepted
+    /// grammar. `1.5ms` is the whole-millisecond bound that replaces it,
+    /// and `30S` is the case-sensitivity one.
     #[tokio::test]
     async fn a_bad_step_is_400_on_both_forms() {
-        let query = format!("{RATE_Q}&start=1700000000&end=1700003600&step=500ms");
-        let (status, body) = run_range(&query).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
-        let (status, body) = run_instant(&query).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body {body}");
+        for step in ["1.5ms", "30S", "5e2ms", "0s", "500us"] {
+            let query = format!("{RATE_Q}&start=1700000000&end=1700003600&step={step}");
+            let (status, body) = run_range(&query).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "range {step}: body {body}");
+            let (status, body) = run_instant(&query).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "instant {step}: body {body}"
+            );
+        }
     }
 
     #[tokio::test]

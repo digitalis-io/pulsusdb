@@ -202,7 +202,13 @@ pub enum Surface {
     /// metrics}` body (issue #182 replaced the Prometheus query envelope;
     /// these endpoints are Tempo-datasource-only). Against this suite's
     /// empty databases a well-formed request is the mounting oracle:
-    /// `query_range` → 200 with an empty `series` list; `query` → 200 with
+    /// `query_range` → 200 with ONE `__name__`-labelled series carrying
+    /// every bucket on the axis and no `value` on any of them: the base
+    /// query is `{} | rate()`, an ungrouped counting shape, and those are
+    /// dense by construction (issue #477). Answering that grid rather than
+    /// `{"series":[]}` when nothing at all is stored is a deliberate
+    /// divergence — `traceql-metrics-zero-fill-without-a-block` in
+    /// docs/benchmarks/traces-differential-ledger.md. `query` → 200 with
     /// exactly one `__name__`-labelled series carrying a SCALAR `value` and
     /// no `samples` array (issue #464 wave 2: the instant route returns
     /// `tempopb.QueryInstantResponse`, `pkg/tempopb/tempo.proto:346-355` @
@@ -1408,8 +1414,16 @@ fn traces_metrics_missing_range(req: &mut Req) {
 }
 
 fn traces_metrics_bad_step(req: &mut Req) {
-    // Fractional-second steps violate the whole-second contract.
-    req.query = "q=%7B%7D%20%7C%20rate()&start=1700000000&end=1700003600&step=500ms".to_string();
+    // Issue #477 (d) replaced the whole-SECOND step contract with a whole
+    // MILLISECOND one, so `500ms` — this case's literal until then — is now
+    // a 200. The class this case exists for is unchanged: a step that is
+    // not a whole number of milliseconds at any magnitude is a 400
+    // (`parse_step_ms`, crates/pulsus-server/src/traces_api/params.rs).
+    // `1.5ms` is the smallest spelling of that, and it is a deliberate
+    // divergence — the reference answers 200 to it above its own
+    // `range/10000` floor, ledgered as
+    // `traceql-metrics-fractional-ms-step-rejected`.
+    req.query = "q=%7B%7D%20%7C%20rate()&start=1700000000&end=1700003600&step=1.5ms".to_string();
 }
 
 fn traces_metrics_missing_stage(req: &mut Req) {
@@ -2414,10 +2428,11 @@ static MANIFEST: &[RouteSpec] = &[
     },
     // -- Traces metrics (ReaderMode, issue #59) ---------------------------
     // `success_status` is 200: against this suite's empty databases a
-    // well-formed match-all metrics query returns the documented empty
-    // Prometheus envelope (range: `result:[]`; instant: one `"0"`
-    // sample) — the mounting oracle (`Surface::TracesMetrics`'s doc
-    // comment).
+    // well-formed match-all metrics query returns the documented
+    // Tempo-native envelope — the mounting oracle
+    // (`Surface::TracesMetrics`'s doc comment, which carries the two
+    // shapes: a DENSE one-series grid on `query_range` (issue #477) and a
+    // single scalar-valued series on `query`).
     RouteSpec {
         path: "/api/traces/v1/metrics/query_range",
         methods: &[Method::Get],

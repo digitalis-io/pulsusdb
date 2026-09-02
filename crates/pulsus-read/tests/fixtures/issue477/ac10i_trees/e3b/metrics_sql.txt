@@ -1,0 +1,7 @@
+//! The sibling module the rename did not have to touch; it already
+//! carried the millisecond spelling, which is what keeps this tree past
+//! the scan's anti-vacuity floor exactly as the real tree does.
+
+pub fn range_bucket_expr(step_ms: i64) -> String {
+    format!("INTERVAL {step_ms} MILLISECOND")
+}

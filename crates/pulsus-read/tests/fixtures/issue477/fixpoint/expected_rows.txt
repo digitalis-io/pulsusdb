@@ -1,0 +1,29 @@
+a01-clean-success.json                 exit=0 success=True error_msgs=0 error_sites=0 occurrences_renamed=0
+a02-warnings-only.json                 exit=0 success=True error_msgs=0 error_sites=0 occurrences_renamed=0
+a03-one-error-site.json                exit=0 success=False error_msgs=1 error_sites=1 occurrences_renamed=1
+a04-two-error-sites.json               exit=0 success=False error_msgs=2 error_sites=2 occurrences_renamed=2
+a05-error-with-secondary.json          exit=0 success=False error_msgs=1 error_sites=1 occurrences_renamed=1
+a06-build-script.json                  exit=0 success=True error_msgs=0 error_sites=0 occurrences_renamed=0
+m01-empty.json                         exit=2 rule=W1 reason=EMPTY-STREAM tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m02-two-build-finished.json            exit=2 rule=W3 reason=BUILD-FINISHED-RECORD-COUNT tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m03-failed-no-error.json               exit=2 rule=W5 reason=BUILD-FAILED-WITH-NO-ERROR-MESSAGE tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m04-success-with-error.json            exit=2 rule=W5 reason=BUILD-SUCCEEDED-BUT-ERRORS-WERE-REPORTED tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m05-success-with-error-and-artifact.json exit=2 rule=W5 reason=BUILD-SUCCEEDED-BUT-ERRORS-WERE-REPORTED tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m06-not-json.json                      exit=2 rule=W1 reason=LINE-IS-NOT-JSON tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m07-no-reason.json                     exit=2 rule=W1 reason=RECORD-CARRIES-NO-REASON tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m08-unknown-reason.json                exit=2 rule=W2 reason=UNKNOWN-REASON tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m09-no-build-finished.json             exit=2 rule=W3 reason=BUILD-FINISHED-RECORD-COUNT tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m10-build-finished-not-last.json       exit=2 rule=W3 reason=BUILD-FINISHED-IS-NOT-THE-LAST-RECORD tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m11-message-shape.json                 exit=2 rule=W4 reason=COMPILER-MESSAGE-SHAPE tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m12-span-shape.json                    exit=2 rule=W4 reason=PRIMARY-SPAN-SHAPE tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m13-failed-no-primary-span.json        exit=2 rule=W5 reason=BUILD-FAILED-WITH-NO-PRIMARY-ERROR-SPAN tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m14-parent-component.json              exit=2 rule=W6 reason=PRIMARY-SPAN-PATH-HAS-PARENT-COMPONENT tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m15-escapes-root.json                  exit=2 rule=W6 reason=PRIMARY-SPAN-PATH-ESCAPES-ROOT tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m16-not-rust.json                      exit=2 rule=W6 reason=PRIMARY-SPAN-PATH-IS-NOT-A-RUST-SOURCE tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m17-line-zero.json                     exit=2 rule=W6 reason=PRIMARY-SPAN-LINE-OUT-OF-RANGE tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m18-line-past-end.json                 exit=2 rule=W6 reason=PRIMARY-SPAN-LINE-OUT-OF-RANGE tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+m19-parent-inside.json                 exit=2 rule=W6 reason=PRIMARY-SPAN-PATH-HAS-PARENT-COMPONENT tree_unchanged=True ledger_bytes=0 outside_unchanged=True
+r01-real-check-success.json            exit=0 success=True error_msgs=0 error_sites=0 occurrences_renamed=0
+r02-real-check-warning.json            exit=0 success=True error_msgs=0 error_sites=0 occurrences_renamed=0
+r03-real-check-error.json              exit=0 success=False error_msgs=1 error_sites=1 occurrences_renamed=1
+r04-real-cargo-test.txt                exit=2 rule=W1 reason=LINE-IS-NOT-JSON tree_unchanged=True ledger_bytes=0 outside_unchanged=True

@@ -55,6 +55,35 @@
 //! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
 //! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
 //!
+//! **Two differential binaries against ONE reference endpoint contaminate
+//! each other. Recorded, not fixed** (issue #477 wave 4 review). This
+//! suite's TraceQL matcher is bare `{}` — every span the reference holds
+//! in the query window is in its baseline population — and its window is
+//! wall-clock derived (`now-150s .. now-30s`, see `base` below). Its
+//! sibling [`compare_arity_differential`] pushes its own corpus to the
+//! same reference over OTLP and scopes only its QUERY, by
+//! `resource.service.name`; the spans still land in the same instance.
+//! Run the two binaries against one reference container inside the same
+//! two-and-a-half minutes and this suite counts the sibling's spans as
+//! baseline, which reads exactly like a value-parity fault.
+//!
+//! Measured (issue #477 wave 4, one reference container of our own, one
+//! shared ClickHouse): `compare_arity_differential` alone passed, and
+//! `compare_value_differential` run against the same container
+//! immediately afterwards failed with exit 100 — its diff listing the
+//! sibling's nonce-suffixed service values and `mNN` status messages as
+//! `pulsus None != reference Some(N)`, since our side reads a throwaway
+//! ClickHouse database while the reference side is shared. The same
+//! binary against a freshly started container, nothing else pushed to it,
+//! passed: `2 tests run: 2 passed, exit 0`.
+//!
+//! The fix is per-agent reference containers, which is already the
+//! project rule for reference containers and is what CI does — the
+//! `schema-it` job starts one reference per job. Nothing here scopes the
+//! matcher, deliberately: `{}` is the shape the parity claim is about, and
+//! narrowing it to dodge a test-isolation problem would narrow the claim
+//! with it.
+//!
 //! Clean-room: no Tempo/Grafana source, grammar, or test corpus is read —
 //! the fixtures are our own authorship and the Tempo values are read back
 //! as black-box runtime output.
@@ -262,7 +291,9 @@ async fn pulsus_counts(engine: &TraceEngine, window: (i64, i64)) -> Counts {
         &MetricsParams {
             start_ns: window.0,
             end_ns: window.1,
-            step_s: window_s, // one whole-window bucket for exact counts
+            // one whole-window bucket for exact counts
+            step_ms: window_s * 1_000,
+            exemplars: None,
         },
         &engine.metrics_ctx(),
     )

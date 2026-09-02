@@ -1,0 +1,5 @@
+#[test]
+fn explicit_step_forms_parse_to_whole_milliseconds() {}
+
+#[test]
+fn non_whole_millisecond_and_malformed_steps_are_rejected() {}

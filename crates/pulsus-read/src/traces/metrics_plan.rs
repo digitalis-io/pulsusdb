@@ -14,10 +14,11 @@ use super::filter::{PlanError, SpanFilterCtx};
 use super::metrics_sql::{self, AggFn, GroupKeySql, SnappedWindow};
 
 /// The auto-derivation target when `step` is omitted (docs/api.md §4.4,
-/// task-manager adjudication 3): `step_s = max(1, ⌊(end_s − start_s) /
-/// DEFAULT_METRICS_POINTS⌋)`. The derivation itself runs server-side in
-/// `parse_metrics_params`; the constant lives here as the committed
-/// contract's single source.
+/// task-manager adjudication 3): the derived step is
+/// `max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)` whole SECONDS,
+/// scaled to the plan's millisecond unit. The derivation itself runs
+/// server-side in `parse_metrics_params`; the constant lives here as the
+/// committed contract's single source.
 pub const DEFAULT_METRICS_POINTS: i64 = 100;
 
 /// The hard bucket-count cap (docs/api.md §4.4): a snapped range
@@ -27,15 +28,65 @@ pub const DEFAULT_METRICS_POINTS: i64 = 100;
 pub const MAX_METRICS_POINTS: i64 = 11_000;
 
 const NS_PER_S: i64 = 1_000_000_000;
+const NS_PER_MS: i64 = 1_000_000;
 
-/// The caller-validated request window and step. `step_s` is whole
-/// seconds, already defaulted by the server's derivation formula when
-/// the request omitted `step`.
+/// The caller-validated request window, step and exemplar budget.
+/// `step_ms` is whole milliseconds (issue #477 (d)), already defaulted by
+/// the server's derivation formula when the request omitted `step`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsParams {
     pub start_ns: i64,
     pub end_ns: i64,
-    pub step_s: i64,
+    /// Bucket width in whole milliseconds; `>= 1`.
+    pub step_ms: i64,
+    /// The HTTP `exemplars` parameter, normalised by the server:
+    /// `None` when absent, empty, unparseable, zero or negative.
+    pub exemplars: Option<u32>,
+}
+
+/// The emitted bucket grid (issue #477 (a)/(b)): `points` labels at
+/// `first_ms + i * step_ms`, label `L` covering the RIGHT-CLOSED instant
+/// range `(L - step, L]`.
+///
+/// `first_ms` is the snapped window's own left edge `aS`, which is the
+/// right edge of the extra LEADING bucket `(aS - step, aS]` — the range
+/// window reads one whole step before `aS` precisely so that bucket has
+/// data (measured against the reference). `points` is `intervals + 1`,
+/// so a window of `n` steps emits `n + 1` labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeAxis {
+    pub first_ms: i64,
+    pub step_ms: i64,
+    pub points: usize,
+}
+
+impl RangeAxis {
+    /// The `i`-th label. Panics in debug on an out-of-range index; the
+    /// only caller iterates `0..points`.
+    pub fn label_ms(&self, i: usize) -> i64 {
+        debug_assert!(
+            i < self.points,
+            "axis index {i} out of {} points",
+            self.points
+        );
+        self.first_ms + (i as i64) * self.step_ms
+    }
+
+    /// The last label — `aE`, the snapped right edge.
+    pub fn last_ms(&self) -> i64 {
+        self.first_ms + (self.points as i64 - 1) * self.step_ms
+    }
+
+    /// The label whose right-closed bucket contains `ts_ms`:
+    /// `ceil(ts_ms / step_ms) * step_ms`. An instant landing exactly on a
+    /// grid point belongs to THAT point, which is what "right-closed"
+    /// means and what the SQL's [`super::metrics_sql::range_bucket_expr`]
+    /// renders.
+    pub fn label_for_ms(&self, ts_ms: i64) -> i64 {
+        let step = self.step_ms;
+        let floor = ts_ms.div_euclid(step) * step;
+        if floor == ts_ms { ts_ms } else { floor + step }
+    }
 }
 
 /// Engine-derived planning context — mirrors [`super::search_plan::SearchCtx`].
@@ -60,8 +111,9 @@ pub struct MetricsCtx<'a> {
 
 /// The committed M4 metrics functions ([`pulsus_traceql::MetricFn`]'s
 /// read-side twin — the planner owns the value-semantics mapping: `rate`
-/// divides the deduped count by `step_s` client-side at the encode
-/// boundary, `count_over_time` is the count itself).
+/// divides the deduped count by the step, in fractional seconds,
+/// client-side at the encode boundary; `count_over_time` is the count
+/// itself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricFunc {
     Rate,
@@ -118,9 +170,14 @@ pub struct TraceMetricsPlan {
     /// supports one key: `resource.service.name` → the physical `service`
     /// column). `None` is ungrouped.
     group_label: Option<String>,
-    /// The distinct-by-key series-cardinality probe SQL, rendered only for
-    /// a grouped query; the engine runs it before the main query.
-    probe_sql: Option<String>,
+    /// The distinct-by-key series-cardinality probe SQL over the RANGE
+    /// window, rendered only for a grouped or `compare()` query; the range
+    /// path runs it before the main query.
+    range_probe_sql: Option<String>,
+    /// The same probe over the INSTANT window — byte-identical to the
+    /// single probe this plan carried before issue #477, for both the
+    /// grouped and the `compare()` shape. The instant path runs this one.
+    instant_probe_sql: Option<String>,
     /// The requested quantiles (`PlanKind::Quantile` only), in request
     /// order — one output series per entry (`p=<q>` label).
     quantiles: Vec<f64>,
@@ -128,9 +185,18 @@ pub struct TraceMetricsPlan {
     /// client-side per timestamp after the series are framed.
     reduce: Option<SeriesReduce>,
     /// The per-bucket exemplar collection SQL (issue #182 P5), rendered
-    /// when `with(exemplars=…)` is present on an ungrouped rate/count
-    /// query; the engine runs it and attaches `trace:id` exemplars.
+    /// whenever the resolved TOTAL exemplar budget is non-zero; the engine
+    /// runs it and attaches `trace:id` exemplars.
     exemplar_sql: Option<String>,
+    /// What the exemplar statement returns to identify the series each
+    /// sample belongs to (issue #477 wave 2). It says both which row
+    /// shape to decode and how to join a row to a series, so the two can
+    /// never be chosen independently.
+    exemplar_key: ExemplarSeriesKey,
+    /// The resolved TOTAL exemplar budget for the whole response (issue
+    /// #477 (c) and ruling 1): `0` means none. The engine thins the
+    /// collected per-bucket samples down to this many.
+    exemplar_budget: u32,
     /// A trailing `metrics-result comparison` post-filter (`… > 5`, issue
     /// #182 P6b): keeps only samples satisfying `<op> <value>`. Applied
     /// client-side after the series are framed.
@@ -144,8 +210,14 @@ pub struct TraceMetricsPlan {
     /// value is validated `> 0`; a value above `usize::MAX` saturates,
     /// which trims nothing and is exactly what an enormous `topN` means.
     compare_top_n: usize,
-    step_s: i64,
+    step_ms: i64,
+    /// The INSTANT evaluation window `[aS, aE)` — unchanged by issue #477.
     window: SnappedWindow,
+    /// The emitted bucket grid for the range form.
+    range_axis: RangeAxis,
+    /// The RANGE evaluation window `[aS - step + 1, aE + 1)`, i.e. the
+    /// instants `(aS - step, aE]`.
+    range_window: SnappedWindow,
     distributed: bool,
     range_sql: String,
     instant_sql: String,
@@ -184,10 +256,17 @@ impl TraceMetricsPlan {
         self.reduce
     }
 
-    /// The per-bucket exemplar collection SQL, if `with(exemplars=…)` was
-    /// requested on a supported (ungrouped rate/count) query.
+    /// The per-bucket exemplar collection SQL, if the resolved budget is
+    /// non-zero.
     pub fn exemplar_sql(&self) -> Option<&str> {
         self.exemplar_sql.as_deref()
+    }
+
+    /// What the exemplar statement returns to identify a series — the
+    /// row shape to decode AND the join to the framed series, together,
+    /// so a caller cannot pair one shape's decode with another's join.
+    pub fn exemplar_key(&self) -> &ExemplarSeriesKey {
+        &self.exemplar_key
     }
 
     /// The trailing metrics-result comparison post-filter, if present.
@@ -218,15 +297,39 @@ impl TraceMetricsPlan {
         self.compare_top_n
     }
 
-    /// The distinct-by-key series-cardinality probe SQL (grouped queries
-    /// only); the engine runs it before the main query and 422s on a
-    /// `cap+1` result.
-    pub fn probe_sql(&self) -> Option<&str> {
-        self.probe_sql.as_deref()
+    /// The series-cap probe over the RANGE window — consumed by the range
+    /// path only. `None` for an ungrouped, non-`compare()` plan.
+    ///
+    /// It is a SEPARATE probe from [`Self::instant_probe_sql`] because the
+    /// two windows differ: the range answer can contain groups that occur
+    /// only in the leading step `(aS - step, aS)` or only at exactly `aE`,
+    /// and the instant window `[aS, aE)` excludes both. Counting the range
+    /// answer's groups with the instant window would let an unbounded
+    /// number of extra series past a static guard (issue #477).
+    pub fn range_probe_sql(&self) -> Option<&str> {
+        self.range_probe_sql.as_deref()
     }
 
-    pub fn step_s(&self) -> i64 {
-        self.step_s
+    /// The series-cap probe over the INSTANT window — byte-identical to
+    /// the single probe this plan carried before issue #477, for BOTH the
+    /// grouped and the `compare()` shape. Instant path only.
+    pub fn instant_probe_sql(&self) -> Option<&str> {
+        self.instant_probe_sql.as_deref()
+    }
+
+    /// The resolved TOTAL exemplar budget for the whole response; `0` is
+    /// none, and then [`Self::exemplar_sql`] is `None`.
+    pub fn exemplar_budget(&self) -> u32 {
+        self.exemplar_budget
+    }
+
+    /// The emitted bucket grid for the range form.
+    pub fn range_axis(&self) -> RangeAxis {
+        self.range_axis
+    }
+
+    pub fn step_ms(&self) -> i64 {
+        self.step_ms
     }
 
     /// Whether the plan was built against `_dist` tables (mirrors
@@ -235,9 +338,18 @@ impl TraceMetricsPlan {
         self.distributed
     }
 
-    /// The snapped, left-closed window `[S, E)` in nanoseconds.
+    /// The snapped, left-closed INSTANT window `[S, E)` in nanoseconds.
+    /// Unchanged by issue #477 — the range form reads
+    /// [`Self::range_window_ns`].
     pub fn snapped_window_ns(&self) -> (i64, i64) {
         (self.window.start_ns, self.window.end_ns)
+    }
+
+    /// The RANGE window `[aS - step + 1, aE + 1)` in nanoseconds — the
+    /// integer-nanosecond spelling of the right-closed instant range
+    /// `(aS - step, aE]`.
+    pub fn range_window_ns(&self) -> (i64, i64) {
+        (self.range_window.start_ns, self.range_window.end_ns)
     }
 
     /// The instant evaluation timestamp (`E`, the snapped right edge) in
@@ -247,14 +359,23 @@ impl TraceMetricsPlan {
         self.window.end_ns / 1_000_000
     }
 
-    /// The snapped window width in whole seconds — the instant `rate`
-    /// denominator. Widened through `i128`: both snapped bounds fit
-    /// `i64`, but their *difference* need not (extreme accepted windows
-    /// under a large step — code review round 1).
-    pub(crate) fn window_s(&self) -> i64 {
-        let width_s = (i128::from(self.window.end_ns) - i128::from(self.window.start_ns))
-            / i128::from(NS_PER_S);
-        i64::try_from(width_s).unwrap_or(i64::MAX)
+    /// The snapped INSTANT window width in **fractional seconds** — the
+    /// instant `rate` denominator.
+    ///
+    /// `f64`, not whole seconds: once the step can be sub-second (issue
+    /// #477 (d)) a snapped window can be narrower than one second, and the
+    /// old truncating `i64` form made the denominator `0`, so `n / 0.0`
+    /// encoded as `inf`. Widened through `i128` first: both snapped bounds
+    /// fit `i64`, but their difference need not.
+    pub(crate) fn window_seconds(&self) -> f64 {
+        let width_ns = i128::from(self.window.end_ns) - i128::from(self.window.start_ns);
+        width_ns as f64 / NS_PER_S as f64
+    }
+
+    /// The range `rate` denominator: one bucket's width in fractional
+    /// seconds.
+    pub(crate) fn step_seconds(&self) -> f64 {
+        self.step_ms as f64 / 1_000.0
     }
 }
 
@@ -265,9 +386,9 @@ pub fn plan_trace_metrics(
     params: &MetricsParams,
     ctx: &MetricsCtx<'_>,
 ) -> Result<TraceMetricsPlan, PlanError> {
-    if params.step_s < 1 {
+    if params.step_ms < 1 {
         return Err(PlanError::TypeMismatch(
-            "step must be a positive whole number of seconds".to_string(),
+            "step must be a positive whole number of milliseconds".to_string(),
         ));
     }
     if params.end_ns <= params.start_ns {
@@ -297,7 +418,7 @@ pub fn plan_trace_metrics(
     // width does not fit `i64` — must resolve to the same 400/422 classes
     // as ordinary validation, never a panic and never a wrap that sneaks
     // a >cap bucket count past the static check.
-    let step_ns = i128::from(params.step_s) * i128::from(NS_PER_S);
+    let step_ns = i128::from(params.step_ms) * i128::from(NS_PER_MS);
     let start = i128::from(params.start_ns);
     let end = i128::from(params.end_ns);
     let snapped_start = start.div_euclid(step_ns) * step_ns;
@@ -335,25 +456,56 @@ pub fn plan_trace_metrics(
         start_ns: i64::try_from(snapped_start).map_err(|_| out_of_range())?,
         end_ns: i64::try_from(snapped_end).map_err(|_| out_of_range())?,
     };
+    // Issue #477 (a)/(b): the RANGE form reads the right-closed instants
+    // `(aS - step, aE]`, which over integer nanoseconds is exactly the
+    // left-closed/right-open `[aS - step + 1, aE + 1)` the existing
+    // `time_clause`/`date_clause` render — so neither of those moves. One
+    // whole step wider on the left, because the leading bucket's value is
+    // measured to come from that data; and one nanosecond wider on the
+    // right, because `aE` itself belongs to the last bucket.
+    let range_window = SnappedWindow {
+        start_ns: i64::try_from(snapped_start - step_ns + 1).map_err(|_| out_of_range())?,
+        end_ns: i64::try_from(snapped_end + 1).map_err(|_| out_of_range())?,
+    };
+    // `buckets` is `<= MAX_METRICS_POINTS` (checked above), so `+ 1` and
+    // the `usize` narrowing are both exact.
+    let range_axis = RangeAxis {
+        first_ms: window.start_ns / NS_PER_MS,
+        step_ms: params.step_ms,
+        points: (buckets as usize) + 1,
+    };
 
     let filter_sql = metrics_sql::compile_filter_predicate(
         spanset_filter.body.as_ref(),
         ctx.filter.attrs_table,
         window,
     )?;
+    // The attribute semi-joins embed the window's own date/time pruning,
+    // so the range form needs its own compilation over the range window.
+    let range_filter_sql = metrics_sql::compile_filter_predicate(
+        spanset_filter.body.as_ref(),
+        ctx.filter.attrs_table,
+        range_window,
+    )?;
     let spans = ctx.filter.spans_table;
     let keys = analysis.keys;
     let (range_sql, instant_sql) = match analysis.kind {
         PlanKind::Count { .. } => (
-            metrics_sql::metrics_count_range_sql(spans, &filter_sql, window, params.step_s, &keys),
+            metrics_sql::metrics_count_range_sql(
+                spans,
+                &range_filter_sql,
+                range_window,
+                params.step_ms,
+                &keys,
+            ),
             metrics_sql::metrics_count_instant_sql(spans, &filter_sql, window, &keys),
         ),
         PlanKind::Agg(agg) => (
             metrics_sql::metrics_agg_range_sql(
                 spans,
-                &filter_sql,
-                window,
-                params.step_s,
+                &range_filter_sql,
+                range_window,
+                params.step_ms,
                 agg,
                 &keys,
             ),
@@ -362,9 +514,9 @@ pub fn plan_trace_metrics(
         PlanKind::Quantile => (
             metrics_sql::metrics_quantile_range_sql(
                 spans,
-                &filter_sql,
-                window,
-                params.step_s,
+                &range_filter_sql,
+                range_window,
+                params.step_ms,
                 &analysis.quantiles,
             ),
             metrics_sql::metrics_quantile_instant_sql(
@@ -375,17 +527,42 @@ pub fn plan_trace_metrics(
             ),
         ),
         PlanKind::Histogram => (
-            metrics_sql::metrics_log2_bucket_range_sql(spans, &filter_sql, window, params.step_s),
+            metrics_sql::metrics_log2_bucket_range_sql(
+                spans,
+                &range_filter_sql,
+                range_window,
+                params.step_ms,
+            ),
             metrics_sql::metrics_log2_bucket_instant_sql(spans, &filter_sql, window),
         ),
         // compare() serves from its own cross-tab/totals SQL below.
         PlanKind::Compare => (String::new(), String::new()),
     };
 
+    // Issue #477 (c), ONE resolution and not two branches: the `with()`
+    // hint wins if present, otherwise the HTTP `exemplars` parameter,
+    // otherwise `DEFAULT_EXEMPLARS`. The budget is a TOTAL for the whole
+    // response (ruling 1), so the per-bucket sample size is the budget
+    // spread across the grid — at least 1, since `groupArraySample(0, …)`
+    // would collect nothing anywhere — and the engine thins the collected
+    // list down to the budget afterwards.
+    //
+    // Resolved BEFORE the compare() build because the comparison shape's
+    // exemplar statement is built from that block's own range selection
+    // predicate and bucket expression (issue #477 wave 2).
+    let exemplar_budget = match (analysis.exemplar_k, params.exemplars) {
+        (Some(k), _) => k.min(MAX_EXEMPLARS),
+        (None, Some(p)) => p.min(MAX_EXEMPLARS),
+        (None, None) => DEFAULT_EXEMPLARS,
+    };
+    let per_bucket_k = (exemplar_budget / range_axis.points as u32).max(1);
+
     // compare(): build the cross-tab/totals for the range and instant
     // forms, plus the distinct-(key,value) cap probe (reused by
     // `enforce_series_cap`).
-    let (compare_range, compare_instant, compare_probe) = if analysis.kind == PlanKind::Compare {
+    let (compare_range, compare_instant, compare_probes, compare_exemplar_sql) = if analysis.kind
+        == PlanKind::Compare
+    {
         let inner_bool = metrics_sql::compile_filter_bool(
             analysis
                 .compare_selection
@@ -393,6 +570,17 @@ pub fn plan_trace_metrics(
                 .and_then(|f| f.body.as_ref()),
             ctx.filter.attrs_table,
             window,
+        )?;
+        // The selection predicate embeds the window's own date/time
+        // pruning too (visible as the `trace_attrs_idx … timestamp_ns >= …`
+        // clause inside `is_sel`), so the range form needs its own.
+        let range_inner_bool = metrics_sql::compile_filter_bool(
+            analysis
+                .compare_selection
+                .as_ref()
+                .and_then(|f| f.body.as_ref()),
+            ctx.filter.attrs_table,
+            range_window,
         )?;
         // The fixed well-known-absent-attribute set contributes 4 series
         // per key on top of the data-driven cross-tab; fold it into the
@@ -404,19 +592,30 @@ pub fn plan_trace_metrics(
         // reserved here). Safe: over-counting can only reject earlier, never
         // under-cap — do not "tighten" it away.
         let fixed_series = 4 * WELL_KNOWN_COMPARE_KEYS.len() as u64;
-        let range_bucket = metrics_sql::compare_range_bucket_expr(params.step_s);
+        // THREE builds, not two (issue #477). The range pair and its probe
+        // come from the range window under the right-closed bucket label;
+        // the instant pair keeps today's inputs; and the instant PROBE is
+        // rebuilt from today's exact inputs — same window, same filter,
+        // same selection predicate, and the frozen left-edge bucket
+        // expression — because that is the only construction that
+        // guarantees its bytes do not move. `metrics_compare_sql` is a
+        // pure function of its input, so reproducing the call reproduces
+        // the string. Do NOT extract a probe-only builder to avoid the
+        // discarded cross-tab/totals: a second code path that renders the
+        // probe is a second place for those bytes to drift.
+        let range_bucket = metrics_sql::compare_range_bucket_expr(params.step_ms);
         let r = metrics_sql::metrics_compare_sql(&metrics_sql::CompareSqlInput {
             spans_table: spans,
             attrs_table: ctx.filter.attrs_table,
-            outer: &filter_sql,
-            inner_bool: &inner_bool,
-            window,
+            outer: &range_filter_sql,
+            inner_bool: &range_inner_bool,
+            window: range_window,
             bucket_expr: &range_bucket,
             cap: ctx.max_series,
             fixed_series,
             sel_window: analysis.compare_window,
         });
-        let instant_bucket = (window.end_ns / 1_000_000).to_string();
+        let instant_bucket = (window.end_ns / NS_PER_MS).to_string();
         let i = metrics_sql::metrics_compare_sql(&metrics_sql::CompareSqlInput {
             spans_table: spans,
             attrs_table: ctx.filter.attrs_table,
@@ -428,49 +627,185 @@ pub fn plan_trace_metrics(
             fixed_series,
             sel_window: analysis.compare_window,
         });
+        let instant_probe_bucket = metrics_sql::compare_instant_probe_bucket_expr(params.step_ms);
+        let ip = metrics_sql::metrics_compare_sql(&metrics_sql::CompareSqlInput {
+            spans_table: spans,
+            attrs_table: ctx.filter.attrs_table,
+            outer: &filter_sql,
+            inner_bool: &inner_bool,
+            window,
+            bucket_expr: &instant_probe_bucket,
+            cap: ctx.max_series,
+            fixed_series,
+            sel_window: analysis.compare_window,
+        });
+        // The comparison exemplar statement (issue #477 wave 2): the
+        // RANGE inputs, so its side, its bucket labels and its rows
+        // are the ones the cross-tab counted.
+        let ex = (exemplar_budget > 0).then(|| {
+            metrics_sql::metrics_compare_exemplar_range_sql(&metrics_sql::CompareExemplarSqlInput {
+                spans_table: spans,
+                attrs_table: ctx.filter.attrs_table,
+                outer: &range_filter_sql,
+                inner_bool: &range_inner_bool,
+                window: range_window,
+                bucket_expr: &range_bucket,
+                sel_window: analysis.compare_window,
+                k: per_bucket_k,
+            })
+        });
         (
             Some((r.cross_tab, r.totals)),
             Some((i.cross_tab, i.totals)),
-            Some(r.probe),
+            Some((r.probe, ip.probe)),
+            ex,
         )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
-    let probe_sql = compare_probe.or_else(|| {
-        keys.first().map(|_| {
-            metrics_sql::metrics_series_probe_sql(spans, &filter_sql, window, &keys, ctx.max_series)
-        })
-    });
+    let (range_probe_sql, instant_probe_sql) = match compare_probes {
+        Some((range_probe, instant_probe)) => (Some(range_probe), Some(instant_probe)),
+        None if !keys.is_empty() => (
+            Some(metrics_sql::metrics_series_probe_sql(
+                spans,
+                &range_filter_sql,
+                range_window,
+                &keys,
+                ctx.max_series,
+            )),
+            Some(metrics_sql::metrics_series_probe_sql(
+                spans,
+                &filter_sql,
+                window,
+                &keys,
+                ctx.max_series,
+            )),
+        ),
+        None => (None, None),
+    };
 
     // Exemplars are collected for EVERY range shape (issue #182 review
-    // Fix 1 — Tempo emits exemplars for range rate/count/agg/quantile/
-    // histogram/compare, and none for instant): the per-bucket sample is
-    // taken over the outer filter and attached to the first series (Tempo
-    // concentrates a range's exemplars on one series). The instant path
-    // never attaches (matching Tempo — verified black-box).
-    let exemplar_sql = analysis.exemplar_k.map(|k| {
-        metrics_sql::metrics_exemplar_range_sql(spans, &filter_sql, window, params.step_s, k)
-    });
+    // Fix 1 — the reference emits exemplars for range rate/count/agg/
+    // quantile/histogram/compare, and none for instant). The instant path
+    // never attaches.
+    //
+    // **Which series a sample belongs to is a property of the SHAPE**
+    // (issue #477 wave 2, ruling on the wave-2 review). Every range shape
+    // here is multi-series; they differ only in what keys the series
+    // apart, and the statement carries that column back so the engine
+    // never has to guess. See [`ExemplarSeriesKey`] for the enumeration.
+    let (exemplar_sql, exemplar_key) = match exemplar_budget {
+        0 => (None, ExemplarSeriesKey::Single),
+        _ => match analysis.kind {
+            PlanKind::Count { .. } | PlanKind::Agg(_) => (
+                Some(metrics_sql::metrics_exemplar_range_sql(
+                    spans,
+                    &range_filter_sql,
+                    range_window,
+                    params.step_ms,
+                    per_bucket_k,
+                    &keys,
+                )),
+                match keys.first() {
+                    Some(k) => ExemplarSeriesKey::Group {
+                        label: k.label_key.clone(),
+                    },
+                    None => ExemplarSeriesKey::Single,
+                },
+            ),
+            PlanKind::Quantile => (
+                Some(metrics_sql::metrics_quantile_exemplar_range_sql(
+                    spans,
+                    &range_filter_sql,
+                    range_window,
+                    params.step_ms,
+                    per_bucket_k,
+                )),
+                ExemplarSeriesKey::Quantile,
+            ),
+            PlanKind::Histogram => (
+                Some(metrics_sql::metrics_log2_bucket_exemplar_range_sql(
+                    spans,
+                    &range_filter_sql,
+                    range_window,
+                    params.step_ms,
+                    per_bucket_k,
+                )),
+                ExemplarSeriesKey::HistogramBucket,
+            ),
+            PlanKind::Compare => (compare_exemplar_sql, ExemplarSeriesKey::CompareSide),
+        },
+    };
 
     Ok(TraceMetricsPlan {
         kind: analysis.kind,
         metric_name: analysis.metric_name,
         group_label: keys.first().map(|k| k.label_key.clone()),
-        probe_sql,
+        range_probe_sql,
+        instant_probe_sql,
         quantiles: analysis.quantiles,
         reduce: analysis.reduce,
         exemplar_sql,
+        exemplar_key,
+        exemplar_budget,
         result_filter: analysis.result_filter,
         compare_range,
         compare_instant,
         compare_top_n: analysis.compare_top_n,
-        step_s: params.step_s,
+        step_ms: params.step_ms,
         window,
+        range_axis,
+        range_window,
         distributed: ctx.distributed,
         range_sql,
         instant_sql,
     })
+}
+
+/// What the exemplar-collection statement returns so the engine can say
+/// which SERIES each sampled span belongs to (issue #477 wave 2).
+///
+/// **The complete enumeration of what calls the exemplar SQL builders,
+/// and what identifies a series in each caller's output.** Every range
+/// shape but the ungrouped count/aggregation is multi-series; they differ
+/// only in what keys the series apart, so a single "attach to series 0"
+/// rule is wrong for all of them:
+///
+/// | caller (`PlanKind`) | series in the framed answer | identifying column(s) | statement |
+/// |---|---|---|---|
+/// | `Count`/`Agg`, no `by()` | one, `__name__=<fn>` | none needed | [`metrics_sql::metrics_exemplar_range_sql`] with no keys |
+/// | `Count`/`Agg`, `by(k)` | one per group value, `k=<value>` | `g0` | the same builder with the query's own keys |
+/// | `Quantile` | one per requested `p`, `p=<q>` | the sampled span's `duration_ns` | [`metrics_sql::metrics_quantile_exemplar_range_sql`] |
+/// | `Histogram` | one per occupied log2 bucket, `__bucket=<seconds>` | the bucket bound | [`metrics_sql::metrics_log2_bucket_exemplar_range_sql`] |
+/// | `Compare` | one per `(__meta_type, attribute key)` | `is_sel` + `akey` | [`metrics_sql::metrics_compare_exemplar_range_sql`] |
+///
+/// The instant route never attaches exemplars, so it has no row here.
+///
+/// This type carries the row shape and the join TOGETHER on purpose: they
+/// were previously two independent decisions (which builder to call, and
+/// whether to read a group label), and the shapes that answered "no group
+/// label" then fell through to the first series regardless of how many
+/// series they had framed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExemplarSeriesKey {
+    /// The answer has exactly ONE series and the row needs no identity —
+    /// an ungrouped `rate`/`count_over_time`/`*_over_time`.
+    Single,
+    /// One series per `by()` group value, labelled `label`; the row
+    /// carries the group column `g0`.
+    Group { label: String },
+    /// One series per requested quantile (`p=<q>`); the row carries the
+    /// sampled span's own duration, and the engine places it on the
+    /// quantile nearest that duration.
+    Quantile,
+    /// One series per occupied log2 duration bucket (`__bucket=<seconds>`);
+    /// the row carries the bucket bound in nanoseconds.
+    HistogramBucket,
+    /// `compare()`: one series per `(__meta_type, attribute key)`; the row
+    /// carries the selection side and the attribute key, and the sample
+    /// lands on that side's `*_total` series for that key.
+    CompareSide,
 }
 
 /// A second-stage series reduction (issue #182 P5): `topk(n)`/`bottomk(n)`
@@ -527,13 +862,25 @@ pub const WELL_KNOWN_COMPARE_KEYS: &[&str] = &[
 /// is never a meaningless zero.
 const COMPARE_DEFAULT_TOP_N_USIZE: usize = pulsus_traceql::COMPARE_DEFAULT_TOP_N as usize;
 
-/// The default per-bucket exemplar sample size when `with(exemplars=true)`
-/// carries no explicit count. Bounded (see [`MAX_EXEMPLARS_PER_BUCKET`]).
-pub const DEFAULT_EXEMPLARS_PER_BUCKET: u32 = 1;
+/// The TOTAL exemplar budget for a range response when neither the
+/// `with(exemplars=…)` hint nor the HTTP `exemplars` parameter is present
+/// (issue #477 (c)): exemplars attach to a plain `{} | rate()` by default,
+/// as the reference does.
+///
+/// **Total, not per bucket** (ruling 1 on issue #477). The unit had to
+/// change with the default: per-bucket at the 11 001-point grid cap with a
+/// default of 100 is 1.1 million exemplars in one response, and there is
+/// no reading of a default of 100 under which that is the intended
+/// meaning. `with(exemplars=N)` therefore also means N for the whole
+/// response now, where it used to mean N per bucket — a recorded
+/// behaviour change (docs/api.md §4.4,
+/// `traceql-metrics-exemplars-total-budget` in the divergence ledger).
+pub const DEFAULT_EXEMPLARS: u32 = 100;
 
-/// The hard per-bucket exemplar cap — a `with(exemplars=N)` is clamped to
-/// it so exemplar collection can never blow the scan/response budget.
-pub const MAX_EXEMPLARS_PER_BUCKET: u32 = 100;
+/// The hard TOTAL exemplar ceiling — both the hint and the parameter are
+/// clamped to it, so exemplar collection can never blow the scan/response
+/// budget however large a value a client sends.
+pub const MAX_EXEMPLARS: u32 = 100;
 
 /// The resolved metrics pipeline: its kind, the `__name__` label for
 /// ungrouped output, the resolved `by(...)` grouping keys, the optional
@@ -689,23 +1036,28 @@ fn resolve_second_stage(second: &pulsus_traceql::SecondStage) -> SeriesReduce {
 
 /// Resolves `with(...)` hints (issue #182 P5). `sample` is accepted and
 /// returns the exact (superset) result — value-exact sampling parity
-/// routes to #25. `exemplars=<true|N>` requests per-bucket exemplar
-/// collection, clamped to [`MAX_EXEMPLARS_PER_BUCKET`]. Other hints
-/// (e.g. `most_recent`) are accepted and ignored (a valid superset), never
-/// a `400`.
+/// routes to #25. Other hints (e.g. `most_recent`) are accepted and
+/// ignored (a valid superset), never a `400`.
+///
+/// `exemplars=<true|false|N>` is the FIRST of the three exemplar inputs
+/// (issue #477 (c)): `Some(k)` here always wins over the HTTP parameter
+/// and over the default, including `Some(0)`. `false` is therefore
+/// `Some(0)` and not `None` — "no exemplars" has to be expressible, and
+/// `None` would fall through to the default and turn them back on.
+/// The value is a TOTAL budget clamped to [`MAX_EXEMPLARS`].
 fn resolve_hints(hints: &[pulsus_traceql::MetricHint]) -> Result<Option<u32>, PlanError> {
     use pulsus_traceql::HintValue;
     let mut exemplar_k: Option<u32> = None;
     for hint in hints {
         if hint.key == "exemplars" {
             let k = match &hint.value {
-                HintValue::Bool(true) => DEFAULT_EXEMPLARS_PER_BUCKET,
-                HintValue::Bool(false) => continue,
+                HintValue::Bool(true) => DEFAULT_EXEMPLARS,
+                HintValue::Bool(false) => 0,
                 HintValue::Number(raw) => raw
                     .parse::<f64>()
                     .ok()
                     .filter(|n| *n >= 0.0)
-                    .map(|n| (n as u32).clamp(1, MAX_EXEMPLARS_PER_BUCKET))
+                    .map(|n| (n as u32).min(MAX_EXEMPLARS))
                     .ok_or_else(|| {
                         PlanError::TypeMismatch(format!("invalid exemplars count {raw:?}"))
                     })?,
@@ -715,7 +1067,7 @@ fn resolve_hints(hints: &[pulsus_traceql::MetricHint]) -> Result<Option<u32>, Pl
                     ));
                 }
             };
-            exemplar_k = Some(k.min(MAX_EXEMPLARS_PER_BUCKET));
+            exemplar_k = Some(k.min(MAX_EXEMPLARS));
         }
         // `sample` and any other hint: accepted, exact superset returned.
     }
@@ -843,11 +1195,276 @@ mod tests {
     const PARAMS: MetricsParams = MetricsParams {
         start_ns: 1_700_000_000_000_000_000,
         end_ns: 1_700_010_800_000_000_000,
-        step_s: 60,
+        step_ms: 60_000,
+        exemplars: None,
     };
 
     fn plan(q: &str) -> TraceMetricsPlan {
         plan_trace_metrics(&parse(q).expect("parse"), &PARAMS, &ctx()).expect("plan")
+    }
+
+    /// AC1 (issue #477 (a)/(b)): the emitted bucket grid, one case per
+    /// geometry row measured against the reference. Class CHANGE — no
+    /// axis exists at `2f78c53`.
+    ///
+    /// Every row is `(start_s, end_s, step_ms) -> (points, first_ms,
+    /// last_ms)`. `first_ms` is `aS`, the right edge of the extra leading
+    /// bucket; `last_ms` is `aE`; `points` is `intervals + 1`.
+    #[test]
+    fn the_range_axis_matches_the_reference_grid() {
+        for (start_s, end_s, step_ms, points, first_ms, last_ms) in [
+            (
+                1_788_182_400i64,
+                1_788_182_640i64,
+                30_000i64,
+                9usize,
+                1_788_182_400_000i64,
+                1_788_182_640_000i64,
+            ),
+            (
+                1_788_182_401,
+                1_788_182_641,
+                30_000,
+                10,
+                1_788_182_400_000,
+                1_788_182_670_000,
+            ),
+            (
+                1_788_182_429,
+                1_788_182_669,
+                30_000,
+                10,
+                1_788_182_400_000,
+                1_788_182_670_000,
+            ),
+            (
+                1_788_182_521,
+                1_788_182_579,
+                30_000,
+                3,
+                1_788_182_520_000,
+                1_788_182_580_000,
+            ),
+            (
+                1_788_182_537,
+                1_788_182_540,
+                500,
+                7,
+                1_788_182_537_000,
+                1_788_182_540_000,
+            ),
+            (
+                1_788_182_535,
+                1_788_182_541,
+                1_500,
+                5,
+                1_788_182_535_000,
+                1_788_182_541_000,
+            ),
+            (
+                1_788_183_390,
+                1_788_183_410,
+                20_000,
+                3,
+                1_788_183_380_000,
+                1_788_183_420_000,
+            ),
+        ] {
+            let params = MetricsParams {
+                start_ns: start_s * NS_PER_S,
+                end_ns: end_s * NS_PER_S,
+                step_ms,
+                exemplars: None,
+            };
+            let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
+                .unwrap_or_else(|e| panic!("{start_s}..{end_s} step {step_ms}ms: {e}"));
+            let axis = p.range_axis();
+            assert_eq!(
+                (axis.points, axis.first_ms, axis.last_ms()),
+                (points, first_ms, last_ms),
+                "{start_s}..{end_s} step {step_ms}ms"
+            );
+            assert_eq!(axis.step_ms, step_ms);
+            // The labels really are `first + i*step`, and the last one is
+            // the snapped right edge.
+            assert_eq!(axis.label_ms(0), first_ms);
+            assert_eq!(axis.label_ms(axis.points - 1), last_ms);
+        }
+    }
+
+    /// AC1, the right-closed lookup: `label_for_ms` is the ceiling, so an
+    /// instant landing exactly on a grid point stays on THAT point.
+    #[test]
+    fn the_axis_label_for_an_instant_is_the_right_closed_ceiling() {
+        let axis = RangeAxis {
+            first_ms: 1_000_000,
+            step_ms: 500,
+            points: 5,
+        };
+        assert_eq!(
+            axis.label_for_ms(1_000_000),
+            1_000_000,
+            "exactly on a grid point goes LEFT"
+        );
+        assert_eq!(axis.label_for_ms(1_000_001), 1_000_500);
+        assert_eq!(axis.label_for_ms(1_000_499), 1_000_500);
+        assert_eq!(axis.label_for_ms(1_000_500), 1_000_500);
+        // Negative epochs (pre-1970) use the same ceiling, not a truncation.
+        let neg = RangeAxis {
+            first_ms: -3_600_000,
+            step_ms: 60_000,
+            points: 2,
+        };
+        assert_eq!(neg.label_for_ms(-3_600_000), -3_600_000);
+        assert_eq!(neg.label_for_ms(-3_599_999), -3_540_000);
+        // `-3_660_001` sits inside `(-3_720_000, -3_660_000]`, so its
+        // label is that bucket's right edge, not the axis's first one.
+        assert_eq!(neg.label_for_ms(-3_660_001), -3_660_000);
+    }
+
+    /// AC5(i): the exemplar budget resolves as ONE rule — hint, then the
+    /// HTTP parameter, then the default — and the budget is what decides
+    /// whether any exemplar SQL is rendered at all.
+    #[test]
+    fn the_exemplar_budget_resolves_hint_then_parameter_then_default() {
+        let plan_ex = |q: &str, exemplars: Option<u32>| {
+            let params = MetricsParams {
+                exemplars,
+                ..PARAMS
+            };
+            plan_trace_metrics(&parse(q).expect("parse"), &params, &ctx()).expect("plan")
+        };
+        // No hint, no parameter: exemplars are ON by default.
+        let d = plan_ex("{} | rate()", None);
+        assert_eq!(d.exemplar_budget(), 100);
+        assert!(
+            d.exemplar_sql().is_some(),
+            "a plain rate() renders exemplar SQL"
+        );
+        // The parameter alone.
+        assert_eq!(plan_ex("{} | rate()", Some(5)).exemplar_budget(), 5);
+        // The hint WINS over the parameter, in both directions — this is
+        // the pair that discriminates a precedence swap.
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=1)", Some(5)).exemplar_budget(),
+            1
+        );
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=5)", Some(1)).exemplar_budget(),
+            5
+        );
+        // `false` is expressible and turns them off — it must not fall
+        // through to the default.
+        let off = plan_ex("{} | rate() with(exemplars=false)", None);
+        assert_eq!(off.exemplar_budget(), 0);
+        assert!(
+            off.exemplar_sql().is_none(),
+            "a zero budget renders no exemplar SQL"
+        );
+        // …including when the parameter asks for some.
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=false)", Some(9)).exemplar_budget(),
+            0
+        );
+        // `true` means the default, not 1.
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=true)", None).exemplar_budget(),
+            100
+        );
+        // Both inputs are clamped to the ceiling.
+        assert_eq!(
+            plan_ex("{} | rate()", Some(100_000)).exemplar_budget(),
+            MAX_EXEMPLARS
+        );
+        assert_eq!(
+            plan_ex("{} | rate() with(exemplars=100000)", None).exemplar_budget(),
+            MAX_EXEMPLARS
+        );
+        // The budget is a TOTAL: the per-bucket sample size the SQL asks
+        // for is the budget spread over the grid, floored at 1.
+        assert!(
+            d.exemplar_sql()
+                .expect("rendered")
+                .contains("groupArraySample(1, 1)"),
+            "182 points and a budget of 100 is one sample per bucket: {:?}",
+            d.exemplar_sql()
+        );
+    }
+
+    /// AC13: the interval cap at the new unit, pinned on both sides.
+    #[test]
+    fn the_interval_cap_boundary_holds_in_milliseconds() {
+        // (step_ms, width_ms, expected)
+        for (step_ms, width_ms, want) in [
+            (1_000i64, 11_000_000i64, Ok(11_001usize)),
+            (1_000, 11_001_000, Err(11_001i64)),
+            (1, 11_000, Ok(11_001)),
+            (1, 11_001, Err(11_001)),
+            (500, 5_500_000, Ok(11_001)),
+        ] {
+            let params = MetricsParams {
+                start_ns: 0,
+                end_ns: width_ms * NS_PER_MS,
+                step_ms,
+                exemplars: None,
+            };
+            let got = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx());
+            match (want, got) {
+                (Ok(points), Ok(p)) => {
+                    assert_eq!(
+                        p.range_axis().points,
+                        points,
+                        "step {step_ms}ms / {width_ms}ms"
+                    )
+                }
+                (Err(buckets), Err(e)) => assert_eq!(
+                    e,
+                    PlanError::MetricsPointCap {
+                        buckets,
+                        cap: MAX_METRICS_POINTS,
+                    },
+                    "step {step_ms}ms / {width_ms}ms"
+                ),
+                (want, got) => {
+                    panic!("step {step_ms}ms / {width_ms}ms: wanted {want:?}, got {got:?}")
+                }
+            }
+        }
+    }
+
+    /// Issue #477: the two probes are built over DIFFERENT windows, and
+    /// the instant one is the byte-identical pre-change probe.
+    #[test]
+    fn the_two_series_cap_probes_are_over_different_windows() {
+        for q in [
+            "{} | rate() by(resource.service.name)",
+            r#"{} | compare({ span.http.status_code = "500" })"#,
+        ] {
+            let p = plan(q);
+            let range = p.range_probe_sql().expect("a range probe");
+            let instant = p.instant_probe_sql().expect("an instant probe");
+            assert_ne!(range, instant, "{q}: the two probes must not be one probe");
+            assert!(
+                range.contains(
+                    "timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001"
+                ),
+                "{q}: the range probe is over the range window: {range}"
+            );
+            assert!(
+                instant.contains(
+                    "timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
+                ),
+                "{q}: the instant probe is over the instant window: {instant}"
+            );
+            assert!(
+                !instant.contains("timestamp_ns >= 1699999920000000001"),
+                "{q}: no range bound may leak into the instant probe: {instant}"
+            );
+        }
+        // An ungrouped, non-compare plan renders neither.
+        let p = plan("{} | rate()");
+        assert!(p.range_probe_sql().is_none());
+        assert!(p.instant_probe_sql().is_none());
     }
 
     #[test]
@@ -859,7 +1476,7 @@ mod tests {
             p.snapped_window_ns(),
             (1_699_999_980_000_000_000, 1_700_010_840_000_000_000)
         );
-        assert_eq!(p.window_s(), 10_860);
+        assert_eq!(p.window_seconds(), 10_860.0);
         assert_eq!(p.snapped_end_ms(), 1_700_010_840_000);
     }
 
@@ -868,7 +1485,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: 1_699_999_980_000_000_000,
             end_ns: 1_700_010_840_000_000_000,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         };
         let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx()).unwrap();
         assert_eq!(
@@ -906,7 +1524,9 @@ mod tests {
     fn by_resource_service_name_sets_the_group_label_and_probe() {
         let p = plan("{} | rate() by(resource.service.name)");
         assert_eq!(p.group_label(), Some("resource.service.name"));
-        let probe = p.probe_sql().expect("grouped query renders a probe");
+        let probe = p
+            .instant_probe_sql()
+            .expect("grouped query renders an instant probe");
         assert!(probe.contains("GROUP BY g0"), "{probe}");
         assert!(probe.contains("LIMIT 1001"), "cap+1 sentinel: {probe}");
         assert!(p.range_sql().contains("service AS g0"), "{}", p.range_sql());
@@ -977,7 +1597,11 @@ mod tests {
         let plain = plan("{} | rate()");
         let sampled = plan("{} | rate() with(sample=0.1)");
         assert_eq!(plain.range_sql(), sampled.range_sql());
-        assert!(sampled.exemplar_sql().is_none());
+        // `sample` says nothing about exemplars, so the two plans resolve
+        // the same budget — which since issue #477 (c) is the default,
+        // not none.
+        assert_eq!(sampled.exemplar_budget(), plain.exemplar_budget());
+        assert_eq!(sampled.exemplar_sql(), plain.exemplar_sql());
     }
 
     #[test]
@@ -986,9 +1610,33 @@ mod tests {
         let ex = p
             .exemplar_sql()
             .expect("exemplars requested → collection SQL");
+        // The hint is a TOTAL of 5 over a 182-point grid (issue #477 (c)),
+        // so the per-bucket sample size floors at 1 and the engine thins
+        // the collected list down to 5.
+        assert_eq!(p.exemplar_budget(), 5);
         assert!(
-            ex.contains("groupArraySample(5, 1)(tuple(trace_id, timestamp_ns))"),
+            ex.contains("groupArraySample(1, 1)(tuple(trace_id, timestamp_ns))"),
             "{ex}"
+        );
+        // A budget larger than the grid asks for more per bucket.
+        let wide = plan_trace_metrics(
+            &parse("{} | rate() with(exemplars=100)").unwrap(),
+            &MetricsParams {
+                start_ns: 0,
+                end_ns: 10 * NS_PER_S,
+                step_ms: 1_000,
+                exemplars: None,
+            },
+            &ctx(),
+        )
+        .expect("plan");
+        assert_eq!(wide.range_axis().points, 11);
+        assert!(
+            wide.exemplar_sql()
+                .expect("rendered")
+                .contains("groupArraySample(9, 1)"),
+            "100 spread over 11 points is 9 per bucket: {:?}",
+            wide.exemplar_sql()
         );
     }
 
@@ -1072,7 +1720,9 @@ mod tests {
         assert!(cross.contains("key = 'http.status_code'"), "{cross}");
         assert!(totals.contains("countIf(is_sel) AS sel_total"), "{totals}");
         // The distinct-(key,value) cap probe is reused by the engine.
-        let probe = p.probe_sql().expect("compare renders a cap probe");
+        let probe = p
+            .instant_probe_sql()
+            .expect("compare renders an instant cap probe");
         assert!(probe.contains("GROUP BY akey, aval"), "{probe}");
         assert!(probe.contains("LIMIT 1001"), "cap+1: {probe}");
     }
@@ -1130,15 +1780,35 @@ mod tests {
         }
     }
 
+    /// Issue #477: the two forms carry DIFFERENT window bounds. The
+    /// instant form keeps `[aS, aE)` byte for byte; the range form reads
+    /// `(aS - step, aE]`, spelled over integer nanoseconds as
+    /// `[aS - step + 1, aE + 1)`.
     #[test]
-    fn the_generated_sql_carries_the_snapped_left_closed_bounds() {
+    fn the_generated_sql_carries_each_forms_own_window_bounds() {
         let p = plan("{} | rate()");
-        assert!(p.range_sql().contains(
-            "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
-        ));
-        assert!(p.instant_sql().contains(
-            "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
-        ));
+        assert!(
+            p.range_sql().contains(
+                "WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001"
+            ),
+            "{}",
+            p.range_sql()
+        );
+        assert!(
+            p.instant_sql().contains(
+                "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
+            ),
+            "{}",
+            p.instant_sql()
+        );
+        assert_eq!(
+            p.range_window_ns(),
+            (1_699_999_920_000_000_001, 1_700_010_840_000_000_001)
+        );
+        assert_eq!(
+            p.snapped_window_ns(),
+            (1_699_999_980_000_000_000, 1_700_010_840_000_000_000)
+        );
     }
 
     #[test]
@@ -1194,8 +1864,8 @@ mod tests {
 
     #[test]
     fn a_non_positive_step_is_a_plan_error() {
-        for step_s in [0, -60] {
-            let params = MetricsParams { step_s, ..PARAMS };
+        for step_ms in [0, -60] {
+            let params = MetricsParams { step_ms, ..PARAMS };
             let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
                 .expect_err("non-positive step");
             assert!(matches!(err, PlanError::TypeMismatch(_)), "{err}");
@@ -1207,7 +1877,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: PARAMS.end_ns,
             end_ns: PARAMS.start_ns,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("inverted window");
@@ -1220,7 +1891,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: 0,
             end_ns: 12_000 * 1_000_000_000,
-            step_s: 1,
+            step_ms: 1_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("over the cap");
@@ -1244,7 +1916,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: i64::MAX - 1_000_000_000,
             end_ns: i64::MAX,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1257,7 +1930,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: i64::MIN,
             end_ns: i64::MIN + 1_000_000_000,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1273,7 +1947,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: -9_000_000_000_000_000_000,
             end_ns: 9_000_000_000_000_000_000,
-            step_s: 1,
+            step_ms: 1_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1291,7 +1966,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: i64::MIN,
             end_ns: i64::MAX,
-            step_s: 1,
+            step_ms: 1_000,
+            exemplars: None,
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect_err("must reject, not panic");
@@ -1300,10 +1976,10 @@ mod tests {
 
     #[test]
     fn a_step_whose_nanos_exceed_i64_is_a_clean_400_not_a_panic() {
-        // step_s = i64::MAX: step_ns only exists in i128; the snapped end
+        // step_ms = i64::MAX: step_ns only exists in i128; the snapped end
         // (one whole step) cannot fit the storable i64 range → 400.
         let params = MetricsParams {
-            step_s: i64::MAX,
+            step_ms: i64::MAX,
             ..PARAMS
         };
         let err = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
@@ -1319,11 +1995,12 @@ mod tests {
         let params = MetricsParams {
             start_ns: -8_000_000_000_000_000_000,
             end_ns: 8_000_000_000_000_000_000,
-            step_s: 2_000_000,
+            step_ms: 2_000_000_000,
+            exemplars: None,
         };
         let p = plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx())
             .expect("8000 buckets is under the cap");
-        assert_eq!(p.window_s(), 16_000_000_000);
+        assert_eq!(p.window_seconds(), 16_000_000_000.0);
     }
 
     #[test]
@@ -1331,7 +2008,8 @@ mod tests {
         let params = MetricsParams {
             start_ns: 0,
             end_ns: MAX_METRICS_POINTS * 1_000_000_000,
-            step_s: 1,
+            step_ms: 1_000,
+            exemplars: None,
         };
         assert!(plan_trace_metrics(&parse("{} | rate()").unwrap(), &params, &ctx()).is_ok());
     }

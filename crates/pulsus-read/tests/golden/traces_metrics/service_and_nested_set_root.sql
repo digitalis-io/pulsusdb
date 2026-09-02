@@ -2,11 +2,11 @@
 -- q: { resource.service.name = "checkout" && nestedSetParent < 0 } | rate()
 
 == range (query_range) ==
-SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t,
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
        uniqExact(trace_id, span_id) AS n
 FROM trace_spans
 PREWHERE service = 'checkout'
-WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
+WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
   AND parent_id = toFixedString(unhex('0000000000000000'), 8)
 GROUP BY t
 ORDER BY t ASC
@@ -17,3 +17,13 @@ FROM trace_spans
 PREWHERE service = 'checkout'
 WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000
   AND parent_id = toFixedString(unhex('0000000000000000'), 8)
+
+== exemplars ==
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,
+       groupArraySample(1, 1)(tuple(trace_id, timestamp_ns)) AS ex
+FROM trace_spans
+PREWHERE service = 'checkout'
+WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+  AND parent_id = toFixedString(unhex('0000000000000000'), 8)
+GROUP BY t
+ORDER BY t ASC

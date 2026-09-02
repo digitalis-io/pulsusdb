@@ -917,11 +917,11 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             // body (docs/api.md §4.4), replacing the Prometheus query
             // envelope (these endpoints are Tempo-datasource-only). Against
             // this suite's empty databases the well-formed match-all
-            // request is the mounting oracle: `query_range` → an empty
-            // `series` list; `query` → exactly one `__name__`-labelled
-            // series carrying a SCALAR `value` and no `samples` array
-            // (issue #464 wave 2: the instant route returns
-            // `tempopb.QueryInstantResponse`,
+            // request is the mounting oracle: `query_range` → the DENSE
+            // one-series grid asserted below (issue #477); `query` →
+            // exactly one `__name__`-labelled series carrying a SCALAR
+            // `value` and no `samples` array (issue #464 wave 2: the
+            // instant route returns `tempopb.QueryInstantResponse`,
             // `pkg/tempopb/tempo.proto:346-355` @ v3.0.2), whose zero
             // `value` is omitted entirely (protojson default-omission) —
             // a `uniqExact` with no `GROUP BY` always returns one row.
@@ -936,10 +936,53 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 "{ctx}: Tempo-native body carries a metrics object, body {json}"
             );
             if path.ends_with("/query_range") {
+                // Issue #477: `TRACES_METRICS_BASE_QUERY` is `{} | rate()`,
+                // an UNGROUPED counting shape, and those are DENSE by
+                // construction — one `__name__` series carrying every
+                // bucket on the axis, each zero value omitted (protojson
+                // default-omission), so a bucket arrives as a bare
+                // `timestampMs`. The reference builds that series without
+                // observing a single span
+                // (`UngroupedAggregator.Series()`,
+                // `pkg/traceql/engine_metrics.go:925-935` @ v3.0.2, returns
+                // the one series unconditionally from `innerAgg.Samples()`,
+                // which is already the full interval vector).
+                //
+                // Against an EMPTY database the reference instead answers
+                // `{"series":[]}`, because with no tenant instance no
+                // evaluator ever runs to build it
+                // (`withInstance`, `modules/livestore/live_store.go:934-937`
+                // @ v3.0.2, returns the zero-value response), and the
+                // frontend combiner only ever creates a series from an
+                // input series (`SimpleAggregator.Combine`,
+                // `engine_metrics.go:1626-1660`). That is a storage-topology
+                // condition, invisible from the query, so PulsusDB answers
+                // the same grid either way — a deliberate divergence
+                // recorded as `traceql-metrics-zero-fill-without-a-block`
+                // in docs/benchmarks/traces-differential-ledger.md and
+                // gated at the engine level by
+                // `crates/pulsus-read/tests/traces_metrics_live.rs`'s
+                // `a_no_match_range_query_returns_a_zero_filled_series`.
+                // This is that contract at the HTTP boundary.
+                //
+                // The expected grid is arithmetic on the literals in
+                // `TRACES_METRICS_BASE_QUERY` (`start=1700000100`,
+                // `end=1700003700`, `step=60`), not a value the server
+                // produced: 61 right-closed bucket labels from
+                // `1700000100000` to `1700003700000` inclusive.
+                let expected_samples: Vec<serde_json::Value> = (0..=60)
+                    .map(|i| {
+                        let ts = (1_700_000_100_000_i64 + i * 60_000).to_string();
+                        serde_json::json!({ "timestampMs": ts })
+                    })
+                    .collect();
                 assert_eq!(
                     json["series"],
-                    serde_json::json!([]),
-                    "{ctx}: empty DB must return an empty series list, body {json}"
+                    serde_json::json!([{
+                        "labels": [{"key": "__name__", "value": {"stringValue": "rate"}}],
+                        "samples": expected_samples,
+                    }]),
+                    "{ctx}: empty DB must return the dense ungrouped rate grid, body {json}"
                 );
             } else {
                 let series = json["series"]

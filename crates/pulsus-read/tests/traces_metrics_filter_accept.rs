@@ -108,7 +108,8 @@ fn derive_ours(q: &str) -> Side {
         &MetricsParams {
             start_ns: 1_700_000_000_000_000_000,
             end_ns: 1_700_010_800_000_000_000,
-            step_s: 60,
+            step_ms: 60_000,
+            exemplars: None,
         },
         &MetricsCtx {
             filter: SpanFilterCtx {

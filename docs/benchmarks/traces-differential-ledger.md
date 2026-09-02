@@ -1887,3 +1887,292 @@ when we are asking it to slow down, so we keep `429`; recorded as
   other differential suites hold pins that depend on instance state — is
   separate work and is scheduled elsewhere; this row deliberately does not
   sweep them.
+### `traceql-metrics-fractional-ms-step-rejected` (issue #477) — **a step that is not a whole number of milliseconds is a `400` here**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range` (and its datasource
+  aliases). Not the instant route: `step` is read there too, but the
+  instant form evaluates one bucket over the whole window, so the value
+  never reaches a grid.
+
+- **What was measured.** On a 35-second window the reference derives a
+  minimum step of `range/10000` = 3.5 ms and answers `200` for every step
+  at or above it, fractional milliseconds included: `3.5ms`, `4ms`,
+  `10.5ms`, `100.25ms`. Below the floor it answers `400` naming the
+  minimum (`1ms`, `1.5ms`, `3.4ms`, and `1500us`/`1500000ns`/`0.0015s`,
+  which all normalise to 1.5 ms). A 3.5 ms grid renders there with label
+  spacing `[3,4,3,4]` ms.
+
+- **Ours.** Every whole-millisecond step is accepted — `500ms`, `100ms`,
+  `3ms`, `1.5s`, `1500ms`, `0.5s`, `.5s`, `+30s`, `2.5s`, `1m30s`,
+  `1s500ms`, `1h30m` — and anything that is not a whole millisecond, at
+  any magnitude, is a `400`. `100.25ms` is far above one millisecond and
+  is still rejected, which is why the bound is stated as "not a whole
+  number of milliseconds" and not as "sub-millisecond". We also carry no
+  `range/10000` floor: what bounds a small step here is the interval cap
+  (`MAX_METRICS_POINTS` = 11000, a `422`), which is a different bound with
+  a different status and is recorded separately in docs/api.md §4.4.
+
+- **Disposition.** Deliberate divergence. The reference's own wire form is
+  lossy for a fractional-millisecond grid — `timestampMs` is an integer
+  millisecond field, so a nanosecond grid truncates onto it and the label
+  spacing stops being uniform. Emulating that would mean shipping a grid
+  whose labels do not describe its own buckets. Rejecting is the honest
+  answer, and the value a Step box produces is a whole millisecond in
+  every case a datasource generates.
+
+### `traceql-metrics-end-cutoff-unadopted` (issue #477) — **the reference clamps a window ending near `now`; we do not**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range`.
+
+- **What was measured.** A window whose whole extent is newer than the
+  reference's own cutoff comes back `400 end must be greater than start`:
+  `start=now-10&end=now&step=5s` does, while `start=now-900&end=now` does
+  not. The reference reports a 30-second cutoff, and the exact offset at
+  which the transition happens is **not a fixed point** — four back-to-back
+  sweeps put it at 25→26, 26→27, 27→28 and 29→30 seconds, because the
+  client's `now` and the server's differ by a sub-second amount that
+  varies per run and the aligned end is a step multiple.
+
+- **Ours.** No cutoff and no clamp: a window ending at `now` is served,
+  and an inverted window is the only `400` in this family.
+
+- **Disposition.** Not adopted. The clamp exists to hide a store's own
+  ingest visibility lag behind an empty answer; ours answers what it has.
+  No criterion anywhere in this repository reads the transition offset —
+  the live fixtures take a fixed 60-second margin chosen against the
+  reported 30-second cutoff, not against any measured transition, so a
+  fifth sweep giving 24 or 30 changes nothing.
+
+### `traceql-metrics-density-by-function` (issue #477) — **MATCHED: which range functions emit every bucket, and which stay sparse**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range`.
+
+- **What was measured.** Over one window with interior *and* edge empty
+  buckets, on one corpus: `count_over_time`, `rate`, `quantile_over_time`,
+  `histogram_over_time` and every series of a `compare({…})` come back
+  with a sample in **every** bucket of the grid; `sum_over_time`,
+  `min_over_time` and `avg_over_time` come back with a sample only where
+  data exists. Density follows the FUNCTION, not the query.
+
+- **Grouping does not change it, measured on the by-key we serve.**
+  Re-measured 2026-09-01 on both sides over the same shape of corpus —
+  two services, each occupying two of nine `10s` buckets, disjoint, all
+  spans pushed at once well inside the reference's ingest-visibility
+  budget. `{} | count_over_time() by(resource.service.name)` and
+  `{} | rate() by(resource.service.name)` return **two series of ten
+  samples with two carrying a value** on both systems;
+  `{} | sum_over_time(duration) by(resource.service.name)` and
+  `{} | avg_over_time(duration) by(resource.service.name)` return **two
+  series of two samples, both carrying a value** on both systems. The
+  ungrouped controls in the same run: `count_over_time` ten samples /
+  four values, `sum_over_time` four samples / four values, identically on
+  both.
+
+  This row previously listed two `by(name)` shapes among what was
+  measured. Those are a reference-only measurement — **our side answers
+  `400`** — so they were a parity claim over a query we refuse, and they
+  have moved out of this row into
+  `traceql-metrics-by-key-restricted-to-service-name` below, which
+  carries both sides and the refusal body.
+
+- **Ours.** The same split, by construction: densification runs at the
+  framing boundary over the count, quantile, histogram and compare shapes
+  and is never applied to the value aggregations.
+
+- **Disposition.** Matched, and recorded **so nobody "fixes" the value
+  aggregations into density.** They are already correct. A blanket fill
+  would have created four fresh divergences at once, and this row exists
+  because the sparse half looks like the bug.
+
+### `traceql-metrics-by-key-restricted-to-service-name` (issues #477, #182) — **the reference groups a metric by any per-span key; we serve one**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range`.
+
+- **What was measured (2026-09-01, both sides, same corpus shape).** Two
+  services with two operation names, four spans, a nine-bucket `10s`
+  window. The reference answers `{} | count_over_time() by(name)` with
+  **two series** labelled `name=opA` / `name=opB`, ten samples each and
+  two carrying a value, and `{} | sum_over_time(duration) by(name)` with
+  two series of two samples each — the same per-function density its
+  `by(resource.service.name)` answers have.
+
+- **Ours.** Both are a clean `400`, body verbatim:
+
+  ```text
+  type mismatch: by() currently supports grouping by resource.service.name only (issue #182); attribute grouping keys route to a follow-up
+  ```
+
+  `by(resource.service.name)` is served and matches the reference sample
+  for sample (the row above). The refusal is the planner's — the by-key
+  resolver accepts exactly that one spelling
+  (`crates/pulsus-read/src/traces/metrics_plan.rs`, the
+  `PlanError::TypeMismatch` arm), and `TypeMismatch` maps to `400` at
+  `crates/pulsus-server/src/traces_api/error.rs`.
+
+- **Where this came from.** The `traceql-metrics-density-by-function`
+  row above was headed MATCHED and listed `count_over_time by(name)` and
+  `sum_over_time by(name)` among what had been measured, on both sides.
+  Only the reference half of that could have been measured. The queries
+  are recorded here instead, with our half measured too.
+
+- **Disposition.** Deliberate, and **temporary**: widening the metrics
+  `by()` key set is issue #182's, not issue #477's, and it is a `400`
+  rather than a silent flat answer precisely so a client cannot mistake
+  an ungrouped result for a grouped one. Recorded here because the
+  density row above asserted parity on these two queries while we were
+  refusing them — a ledger row that claims a match on a query we answer
+  `400` to is the exact failure the ledger exists to prevent. When #182
+  widens the key set, the two shapes move back into the density row with
+  a fresh measurement, and this row is retired rather than deleted.
+
+### `traceql-metrics-zero-fill-without-a-block` (issue #477) — **INTRODUCED HERE: we zero-fill a no-match range answer even with nothing stored**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range`.
+
+- **What was measured.** The reference's zero-filled no-match answer
+  depends on a block covering the window existing. With an in-window
+  control span that the query's predicate does not match, a no-match
+  `{…} | rate()` returns one series carrying every bucket with the value
+  omitted. With **no** block at all it returns `{"series":[]}`. Both cases
+  were measured on our own tree at `2f78c53` too, and it answered
+  `{"series":[]}` to **both** — so before this change the divergence was
+  in the other half only.
+
+- **Ours, after this change.** The zero-filled series in **both** cases:
+  the fill is computed from the window and the step, which are known
+  without reading a row, so there is nothing for a block's presence to
+  change. That is a NEW divergence, introduced deliberately by issue #477
+  and stated here rather than discovered later.
+
+- **Disposition.** Deliberate divergence, and the one worth having: the
+  block-presence case is invisible from the query, so a client cannot tell
+  which of the two answers it should have got. Answering the same grid
+  either way is what makes an absent `value` mean zero on this route
+  unconditionally. Every live fixture that means to test the no-match case
+  inserts an in-window control span the predicate does not match, and says
+  so, because without it the reference constructs the other case and the
+  comparison is against the wrong thing.
+
+### `traceql-metrics-exemplar-count-not-a-parity-surface` (issue #477) — **we match the exemplar bound, unit and precedence, deliberately not the count**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range`.
+
+- **What was measured.** The reference's exemplar count is a sampler's
+  output, not a function of the requested budget. Sweeping the request
+  parameter over a four-bucket corpus gave `1 2 2 4 4 2 2 5 4 4 4 7 7 7 7`
+  for budgets `1 2 3 4 5 6 7 8 10 11 12 20 50 100 1000` — non-monotonic in
+  every run — and the hint sweep did **not** reproduce between two runs of
+  the same corpus (hint 4 returned 3 once and 2 the next time; the pair
+  `(hint 8, param 1)` returned 5 then 4). Three properties did hold in all
+  29 measured cases across both runs: `count <= budget`; the budget is a
+  TOTAL, not per bucket (`exemplars=1` over four occupied buckets returns
+  exactly one exemplar, where per-bucket semantics return four); and
+  `count(hint=H, param=P) == count(hint=H alone)` for every pair tried,
+  even where the individual counts differed between runs.
+
+- **Ours.** The bound, the unit and the precedence, and nothing about the
+  count. Exemplars attach by default at a total budget of 100, the
+  `with()` hint wins over the `exemplars` parameter which wins over the
+  default, and the collected per-bucket samples are thinned to the total
+  by an even stride.
+
+- **Disposition.** Deliberate. Asserting an exact count against this
+  reference would make a **correct** implementation fail, and would fail
+  differently on a re-run of the same corpus. The three properties above
+  are what a client can act on and are what our gates assert. **The
+  sampler's own rule is not characterised** — it is repeatable within a
+  run, bounded by the budget, non-monotonic in it, and not stable across
+  runs, and that is where the investigation stopped.
+
+### `traceql-metrics-quantile-exemplar-placement-domain` (issue #477) — **an exemplar is placed against the quantiles of its OWN bucket, which are the values the series draws there**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range` (and its datasource
+  aliases), `quantile_over_time` only. Not the instant route: it attaches
+  no exemplars.
+
+- **What the reference does — and why it is wrong here.** A
+  `quantile_over_time` answer is one series per requested `p`, and an
+  exemplar belongs to exactly one of them. The reference pools every
+  interval's bucket counts into ONE distribution and takes the requested
+  quantiles of that pooled distribution once per response
+  (`aggregatedBuckets` / `quantileValues`,
+  `pkg/traceql/engine_metrics.go:1933-1962 @ v3.0.2`), while the value
+  each `p=` series carries is computed **per interval** from that
+  interval's own buckets (`:1993`). Placement compares the exemplar
+  against the pooled array (`:1996-2001`). **So it chooses which series an
+  exemplar belongs to using numbers it never draws.** There is no reading
+  of "attach the exemplar to the nearest series" under which the
+  comparison basis should be values that are not that series' values.
+  The placement function is unfinished rather than designed as well: its
+  own doc comment promises a `-1` "doesn't fit any quantile reasonably
+  well" return and "reasonable bucket validation" (`:2010-2012`), and the
+  body implements neither — the `buckets` argument is dead past an
+  emptiness check and the nearest index is always returned
+  (`:2013-2031`).
+
+- **Ours.** The same nearest-value rule and the same lowest-index
+  tie-break, against the **per-bucket** quantile values: the numbers
+  already in the response, which are the numbers the panel draws this
+  exemplar beside. The exemplar's value is the sampled span's own duration
+  in seconds, as the reference's is.
+
+- **Where the two visibly differ.** Wherever load varies across the
+  window, so that a span's rank inside its own bucket differs from its
+  rank in the pooled window. Constructed case, and the one gated below: a
+  window of two occupied buckets, the first holding many spans of `1-10 ms`
+  and the second many spans of `100-200 ms`, queried for `p=0.5` and
+  `p=0.99`. The `p=0.5` series draws about `5 ms` at the first bucket and
+  about `150 ms` at the second — it is a per-interval value, it moves. A
+  `150 ms` span in the second bucket is nearest that bucket's `p=0.5`, the
+  line it is drawn on, so we put it there. Pooled, the first bucket's
+  spans dominate the median, so the pooled `p=0.5` sits inside `1-10 ms`
+  and the pooled `p=0.99` near `200 ms`: `|150 - 200| = 50 ms` beats
+  `|150 - 5| = 145 ms`, and the reference hangs that exemplar on the
+  `p=0.99` line — whose value at that timestamp is `200 ms`, not `150`.
+  The gap is bounded only by how far apart the buckets are. Placement
+  only: the set of series, their labels, their samples and the exemplar
+  count are unaffected.
+
+- **The sparse-window case, so it is not read as a defect.** With one span
+  in a bucket, every quantile of that bucket equals that span's duration —
+  every candidate ties and the tie-break puts the exemplar on the lowest
+  `p`, while the pooled rule would spread the same spans across `p`
+  values. That is a property of degenerate input: one observation has no
+  spread, so there is no nearest series to find. It is gated in that exact
+  shape by
+  `crates/pulsus-read/tests/traces_metrics_live.rs::quantile_exemplars_are_placed_against_their_own_buckets_quantiles`.
+
+- **Disposition.** Deliberate divergence — the reference is wrong here.
+  This follows from `2026-08-05-traceql-quantile-over-time-tdigest` (issue
+  #252) rather than deciding anything new: our `p=` values are already
+  computed by a different estimator from the reference's, so an exemplar
+  placed against the reference's pooled targets would be placed against
+  numbers that are neither its bucket's nor ours. Coherence with the
+  values we actually draw is what that ruling leaves as the only
+  meaningful rule. The property is gated against our own rule — nearest by
+  the drawn value at the exemplar's own bucket, ties to the lowest `p` —
+  on a non-uniform corpus in
+  `crates/pulsus-read/tests/traces_metrics_live.rs::every_quantile_exemplar_sits_on_the_series_nearest_it_at_its_own_bucket`.
+
+### `traceql-metrics-exemplars-total-budget` (issue #477) — **`with(exemplars=N)` now means N for the whole response**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range`.
+
+- **What changed here, and it is a behaviour change for existing users.**
+  `with(exemplars=N)` used to mean N exemplars **per bucket**; it now
+  means N for the whole response, matching what the reference's budget
+  does. At a 182-point grid `with(exemplars=2)` therefore goes from up to
+  364 exemplars to at most 2. A deployment relying on the old reading gets
+  fewer exemplars after this change, and that is discoverable here rather
+  than only from a graph.
+
+- **Why the unit had to move with the default.** Issue #477 turns
+  exemplars on by default, as the reference does, and the default budget
+  is 100. Per-bucket, at the 11 001-point grid cap, that is 1.1 million
+  exemplars in one response. There is no reading of a default of 100 under
+  which that is the intended meaning, so total is the only unit the
+  default is coherent in. That the reference treats its hint and its
+  request parameter as the same budget is confirmation, not the reason.
+
+- **Disposition.** Deliberate, adjudicated on issue #477, and documented
+  in docs/api.md §4.4 where the precedence rule is stated.

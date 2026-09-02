@@ -1,0 +1,11 @@
+//! A committed epoch instead of a clock: the file is clean and the gate
+//! must still be RED, because a frozen base ages past the delete TTL and
+//! the whole live suite turns into a silent pass.
+
+fn base_s() -> i64 {
+    1_700_000_000
+}
+
+fn past_window(width_s: i64) -> (i64, i64) {
+    (base_s() - width_s, base_s())
+}

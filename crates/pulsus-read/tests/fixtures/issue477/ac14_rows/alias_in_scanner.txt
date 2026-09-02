@@ -1,0 +1,18 @@
+//! The published limit: an alias is a path whose owning segment is the
+//! alias name, and the needle set is closed, so this is GREEN.
+
+type Clock = std::time::SystemTime;
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn a_case() -> i64 {
+    Clock::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}

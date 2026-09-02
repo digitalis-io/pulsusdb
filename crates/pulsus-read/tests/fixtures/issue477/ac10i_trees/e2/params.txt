@@ -1,0 +1,12 @@
+//! This root was not touched.
+
+pub fn parse_step(raw: &str) -> Option<i64> {
+    let step_s: i64 = raw.parse().ok()?;
+    Some(step_s)
+}
+
+#[test]
+fn explicit_step_forms_parse_to_whole_seconds() {}
+
+#[test]
+fn non_positive_or_fractional_second_steps_are_rejected() {}

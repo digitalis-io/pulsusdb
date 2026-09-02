@@ -1,0 +1,14 @@
+//! The code is renamed; the sentences are not.
+
+pub struct MetricsParams {
+    /// The resolution. Callers used to pass step_s here.
+    pub step_ms: i64,
+}
+
+/// Replaces MAX_EXEMPLARS_PER_BUCKET, which bounded one bucket.
+pub const MAX_EXEMPLARS: u32 = 100;
+pub const DEFAULT_EXEMPLARS: u32 = 100;
+
+pub fn axis_points(width: i64, step_ms: i64) -> i64 {
+    width / step_ms
+}

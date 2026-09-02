@@ -1,0 +1,21 @@
+//! The laundering attack: a nested `fn base_s` declared inside the case
+//! that reads the clock. Ownership is the INNERMOST enclosing function,
+//! so the read belongs to `a_case`, not to the nested declaration.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn a_case() -> i64 {
+    fn base_s() -> i64 {
+        0
+    }
+    let _ = base_s();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}

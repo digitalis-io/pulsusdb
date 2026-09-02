@@ -65,7 +65,7 @@ const NS_PER_S: i64 = 1_000_000_000;
 /// The reference's metrics step. Small and fixed: the totals are additive
 /// across disjoint buckets, and a single whole-window bucket can align its
 /// right edge into the future and read back empty.
-const STEP_S: i64 = 60;
+const STEP_MS: i64 = 60_000;
 
 fn ch_config(db: &str) -> ChConnConfig {
     ChConnConfig {
@@ -269,7 +269,8 @@ async fn pulsus_total(engine: &TraceEngine, q: &str, window: (i64, i64)) -> f64 
         &MetricsParams {
             start_ns: window.0,
             end_ns: window.1,
-            step_s: STEP_S,
+            step_ms: STEP_MS,
+            exemplars: None,
         },
         &engine.metrics_ctx(),
     )
@@ -298,7 +299,7 @@ fn reference_total_once(api_base: &str, q: &str, window: (i64, i64)) -> Option<f
             &format!("start={}", window.0 / NS_PER_S),
         ])
         .args(["--data-urlencode", &format!("end={}", window.1 / NS_PER_S)])
-        .args(["--data-urlencode", &format!("step={STEP_S}s")])
+        .args(["--data-urlencode", &format!("step={}s", STEP_MS / 1_000)])
         .arg(&url)
         .output()
         .expect("curl on PATH");

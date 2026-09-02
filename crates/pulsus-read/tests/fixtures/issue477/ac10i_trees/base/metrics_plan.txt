@@ -1,0 +1,16 @@
+//! Pre-#477 metrics planner. The step is carried in whole seconds.
+
+/// The caller-validated request window and step.
+pub struct MetricsParams {
+    /// The resolution, in whole seconds.
+    pub step_s: i64,
+}
+
+/// The per-bucket exemplar ceiling.
+pub const MAX_EXEMPLARS_PER_BUCKET: u32 = 100;
+/// The per-bucket exemplar default.
+pub const DEFAULT_EXEMPLARS_PER_BUCKET: u32 = 100;
+
+pub fn axis_points(width: i64, step_s: i64) -> i64 {
+    width / step_s
+}

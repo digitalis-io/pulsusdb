@@ -213,3 +213,165 @@ fn the_residual_entry_states_that_it_records_gaps_rather_than_divergences_of_jud
         "the entry heading must say it is a gap record"
     );
 }
+
+/// Issue #477 wave 2: the density row asserted parity on two queries we
+/// answer `400` to, and that claim has moved to a row of its own.
+///
+/// Both halves are asserted, because correcting one without the other
+/// leaves the same defect: the MATCHED row must no longer offer a
+/// `by(name)` shape as something that was measured on both sides, and
+/// the divergence row must carry the refusal body a client actually
+/// receives. A row that says "we differ" without the wire text is the
+/// same unfalsifiable prose the wrong row was.
+#[test]
+fn the_by_key_restriction_is_a_divergence_row_and_not_a_matched_claim() {
+    let ledger = ledger();
+
+    let density = squash(entry_body(&ledger, "traceql-metrics-density-by-function"));
+    for refused in ["count_over_time by(name)", "sum_over_time by(name)"] {
+        assert!(
+            !density.contains(&format!("`{refused}`")),
+            "the MATCHED density row still offers {refused:?} as a measured shape, and our \
+             planner answers 400 to it"
+        );
+    }
+    assert!(
+        density.contains(&squash(
+            "`{} | count_over_time() by(resource.service.name)`"
+        )),
+        "the density row must state which grouped shape it was measured on"
+    );
+
+    let by_key = squash(entry_body(
+        &ledger,
+        "traceql-metrics-by-key-restricted-to-service-name",
+    ));
+    assert!(
+        by_key.contains("/api/traces/v1/metrics/query_range"),
+        "a ledger row must name the endpoint it is about"
+    );
+    // The verbatim refusal, which is what a client sees and what makes
+    // the row checkable against the running server.
+    assert!(
+        by_key.contains(&squash(
+            "type mismatch: by() currently supports grouping by resource.service.name only \
+             (issue #182); attribute grouping keys route to a follow-up"
+        )),
+        "the row must carry the 400 body verbatim"
+    );
+    assert!(
+        by_key.contains("`{} | count_over_time() by(name)`"),
+        "the row must name the query it is about"
+    );
+}
+
+/// AC11 (issue #477): the five bucket-geometry/exemplar ledger entries
+/// exist, each names the endpoint it is about, and each carries the fact
+/// its own disposition rests on.
+///
+/// The endpoint is asserted because a ledger row without a route goes
+/// stale invisibly: the reference answers the same query differently on
+/// the range and the instant routes, so "the reference does X" is not a
+/// claim until it says where.
+#[test]
+fn the_five_metrics_geometry_ledger_entries_each_name_their_endpoint() {
+    let ledger = ledger();
+    // (id, a needle from the entry's own measured content)
+    const ENTRIES: [(&str, &str); 5] = [
+        (
+            "traceql-metrics-fractional-ms-step-rejected",
+            // The counterexample that says the bound is "not a whole
+            // millisecond" rather than "sub-millisecond".
+            "`100.25ms` is far above one millisecond",
+        ),
+        (
+            "traceql-metrics-end-cutoff-unadopted",
+            // The transition is not a fixed point, and nothing reads it.
+            "not a fixed point",
+        ),
+        (
+            "traceql-metrics-density-by-function",
+            // Recorded as MATCHED so nobody densifies the aggregations.
+            "so nobody \"fixes\" the value aggregations into density",
+        ),
+        (
+            "traceql-metrics-zero-fill-without-a-block",
+            // Worded as introduced BY this change, not as pre-existing.
+            "introduced deliberately by issue #477",
+        ),
+        (
+            "traceql-metrics-exemplar-count-not-a-parity-surface",
+            // The count is a sampler's output and is not gated.
+            "would make a **correct** implementation fail",
+        ),
+    ];
+    for (id, needle) in ENTRIES {
+        let body = squash(entry_body(&ledger, id));
+        assert!(
+            body.contains("/api/traces/v1/metrics/query_range"),
+            "{id}: a ledger row must name the endpoint it is about"
+        );
+        assert!(
+            body.contains(&squash(needle)),
+            "{id}: the entry does not carry {needle:?}"
+        );
+    }
+    // Issue #477: the quantile exemplar's placement domain is a
+    // divergence of its own, and the row has to carry the four things
+    // the ruling requires of it — a row that only says "we use a
+    // different distribution" cannot be checked against anything.
+    //
+    // The wave-2 form of this row justified the divergence on the cost of
+    // a second scan. That was withdrawn: the reason is that the
+    // reference's comparison basis is a distribution it never draws, and
+    // a row naming the wrong reason sends the next reader to re-decide it
+    // on a benchmark. Each needle below is one of the four required
+    // clauses, so a re-narrowed row fails here rather than silently.
+    let placement = squash(entry_body(
+        &ledger,
+        "traceql-metrics-quantile-exemplar-placement-domain",
+    ));
+    assert!(
+        placement.contains("/api/traces/v1/metrics/query_range"),
+        "the placement row must name the endpoint it is about"
+    );
+    assert!(
+        placement.contains(
+            "it chooses which series an exemplar belongs to using numbers it never draws"
+        ),
+        "the row must say what is wrong with the reference's basis, not only that it differs"
+    );
+    assert!(
+        placement.contains("the numbers already in the response, which are the numbers the panel draws this exemplar beside"),
+        "the row must say what OUR basis is"
+    );
+    assert!(
+        placement.contains("Where the two visibly differ")
+            && placement.contains("many spans of `1-10 ms`"),
+        "the row must carry the constructed case where the two rules disagree visibly"
+    );
+    assert!(
+        placement.contains("That is a property of degenerate input"),
+        "the row must say the sparse-window tie behaviour is not a defect"
+    );
+    assert!(
+        placement.contains("2026-08-05-traceql-quantile-over-time-tdigest"),
+        "the row must cross-reference the ruling our placement follows from"
+    );
+    assert!(
+        !placement.contains("second scan of the same rows on the read path"),
+        "the withdrawn performance justification must not come back: the reason is that the reference compares against values it does not draw"
+    );
+    // The hint's unit change is ledgered separately (ruling 1 on issue
+    // #477): it is a behaviour change for existing users, not a
+    // divergence from the reference.
+    let unit = squash(entry_body(
+        &ledger,
+        "traceql-metrics-exemplars-total-budget",
+    ));
+    assert!(unit.contains("/api/traces/v1/metrics/query_range"));
+    assert!(
+        unit.contains("used to mean N exemplars **per bucket**"),
+        "the entry must state what changed, not only what is true now"
+    );
+}

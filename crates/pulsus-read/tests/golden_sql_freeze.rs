@@ -181,7 +181,89 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// so the SQL alone cannot discriminate them — the negation does, and a
 /// negated leaf projects nothing. `git diff --name-only -- /// crates/pulsus-read/tests/golden/traces_search/` shows exactly those
 /// seven, and `CORPORA`'s count stays `50`.
-const PINNED_SQL_CORPUS: u64 = 0x29bb_2bb8_568a_3382;
+///
+/// **Digest-only on issue #477. The corpus stays at 77 entries: all 26
+/// `traces_metrics` goldens were REGENERATED, 0 added, 0 removed**, and
+/// the 50 `traces_search` goldens are byte-identical to the row above
+/// this one (issue #477 moves no search golden; #479 moved seven, and
+/// this row is stacked on that). Three things moved
+/// in every regenerated file at once, which is why the whole corpus half
+/// moves together.
+///
+/// (1) The range bucket label became RIGHT-CLOSED — `toStartOfInterval(
+/// fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL step_ns
+/// NANOSECOND) + step_ms` in place of the left-edge millisecond form — so
+/// a span landing on a grid point belongs to that point. The unit moved to
+/// nanoseconds with the shift, because a millisecond interval rounds a
+/// one-nanosecond shift away before it floors (measured on 26.3.17.110;
+/// `metrics_sql::range_bucket_expr` carries the figures).
+///
+/// (2) The range window widened to `(aS - step, aE]`, rendered as
+/// `>= 1699999920000000001 AND < 1700010840000000001`, one whole step
+/// earlier and one nanosecond later than the instant window.
+///
+/// (3) Two sections were ADDED per file: a `range series probe` (or
+/// `compare range series probe`) beside the frozen instant one, and an
+/// `exemplars` section, since exemplars are now collected by default
+/// rather than only under a `with()` hint.
+///
+/// The `instant (query)`, `series probe` and `compare series probe`
+/// sections are byte-identical to `2f78c53` in all 26 files — the instant
+/// route is #503's and this change moves none of its bytes. **The
+/// committed base copy lives in `tests/golden/traces_metrics_base/`,
+/// which is a SIBLING of the two walked roots and therefore outside this
+/// corpus**: `CORPORA` is a fixed two-name list, so neither the count
+/// (still 50 + 27 = 77) nor this digest can see it. Do not "fix" either
+/// by adding it — that would freeze the base copy and defeat the
+/// section-wise inverse the base copy exists for.
+///
+/// **Digest-only again on issue #477 wave 2. Still 77 entries; two of
+/// the 26 `traces_metrics` goldens moved and no other file did** —
+/// `rate_by_service.sql` and `sum_over_time_by_service.sql`, the two
+/// grouped cases. Their `exemplars` section gained the group column the
+/// grouped range query already groups by (`, service AS g0` in the
+/// SELECT list, `GROUP BY t, g0`, `ORDER BY t ASC, g0`) so an exemplar
+/// row says which series it belongs to. Nothing else in either file
+/// moves, and the other 24 metrics goldens and all 50 search goldens are
+/// byte-identical to the wave-1 corpus.
+///
+/// **Digest-only a third time, on the wave-2 review's ruling. Still 77
+/// entries; six more of the 26 `traces_metrics` goldens moved and no
+/// other file did** — `quantile_over_time_multi.sql`,
+/// `docs_quantile_worked_example.sql`, `histogram_over_time_duration.sql`,
+/// `docs_histogram_worked_example.sql`, `compare_status.sql` and
+/// `compare_status_window.sql` (six files, three shapes). Only their
+/// `exemplars` section moves, and for one reason: those three shapes
+/// frame MANY series per bucket — one per `p`, one per `__bucket`, one
+/// per `(__meta_type, attribute key)` — while their exemplar statement
+/// returned only the time bucket, so the engine had nothing to join on
+/// and attached every sample to the first series. Each statement now
+/// returns its shape's own identity: the sampled span's duration for
+/// quantile, the log2 bucket bound for histogram, `is_sel` + `akey` for
+/// comparison. The other 20 metrics goldens and all 50 search goldens are
+/// byte-identical to the wave-1-fix corpus.
+///
+/// **Digest-only a fourth time, and this one is a REVERT plus a rebase.
+/// Still 77 entries.** Two things moved the number and they are
+/// independent:
+///
+/// (a) Issue #477's own change: the wave-3 pooled placement domain was
+/// withdrawn (the reference compares an exemplar against a distribution
+/// it never draws — ledger row
+/// `traceql-metrics-quantile-exemplar-placement-domain`), so
+/// `quantile_over_time_multi.sql` and `docs_quantile_worked_example.sql`
+/// went BACK to their wave-2-fix bytes: no `quantilesTDigestState` and no
+/// `quantilesTDigestMerge(…) OVER ()`, just the sampled tuple. Those two
+/// files are byte-identical to the wave-2-fix corpus and the other 24
+/// metrics goldens never moved in wave 3 or 4 at all.
+///
+/// (b) The rebase onto issue #479, whose row above this one moved SEVEN
+/// `traces_search` goldens. Issue #477 moves none of them, so the search
+/// half of the corpus is exactly #479's.
+///
+/// Both together are what this constant is over: with (a) alone it would
+/// be the wave-2-fix value, and with (b) alone #479's.
+const PINNED_SQL_CORPUS: u64 = 0x1117_67b2_9dd1_46cc;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

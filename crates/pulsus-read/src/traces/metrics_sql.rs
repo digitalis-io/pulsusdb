@@ -9,13 +9,20 @@
 //! Counting is always `uniqExact(trace_id, span_id)` (plan v2 delta 1:
 //! at-least-once replays must never inflate a bucket — this is exactly
 //! T5's `(trace_id, span_id)` logical-span identity, carried flat here
-//! because `span_id` is trace-local). Buckets are left-closed epoch
-//! intervals `[b, b + step)` over the **snapped** window `[S, E)` (plan
-//! v2 delta 2 — [`super::metrics_plan`] does the snapping; every emitted
-//! bucket is full-width, so the client-side rate division always uses
-//! the full `step_s`). The time filter is left-closed/right-open
-//! (`>= S`, `< E`), deliberately different from search's `> start`,
-//! `<= end`.
+//! because `span_id` is trace-local).
+//!
+//! **Bucket geometry differs between the two forms** (issue #477). The
+//! RANGE builders label a bucket by its RIGHT edge and treat it as
+//! right-closed — label `L` covers the instants `(L - step, L]`, so an
+//! instant landing exactly on a grid point belongs to THAT point — via
+//! [`range_bucket_expr`]. `metrics_plan` hands them the widened range
+//! window `[aS - step + 1, aE + 1)`, i.e. the instants `(aS - step, aE]`,
+//! which is one whole step wider on the left than the instant window and
+//! includes `aE` itself. The INSTANT builders keep the snapped window
+//! `[S, E)` unchanged, and their `WHERE` bound stays left-closed /
+//! right-open (`>= S`, `< E`) — deliberately different from search's
+//! `> start`, `<= end`. Every emitted bucket is full-width, so the
+//! client-side rate division always uses the full step.
 //!
 //! Leaf lowering reuses T5's shared compiler ([`super::filter`]):
 //! physical leaves inline on `trace_spans` columns; attribute leaves
@@ -507,6 +514,56 @@ fn semi_join_sql(
     ))
 }
 
+/// The right-closed RANGE bucket label, in epoch milliseconds: the
+/// smallest multiple of `step_ms` that is `>=` the span's instant.
+///
+/// The `- 1` is load-bearing, not cosmetic. `toStartOfInterval` floors to
+/// the LEFT edge; shifting the instant back by one nanosecond before
+/// flooring and then adding one whole step forward turns that into a
+/// ceiling that keeps a grid-point instant on ITS OWN point:
+/// `timestamp_ns == L·10^6` floors to `L - step` and comes back to `L`,
+/// while `timestamp_ns == L·10^6 + 1` floors to `L` and comes back to
+/// `L + step`. That is the right-closed reading — label `L` covers
+/// `(L - step, L]` — and it is what makes a bucket boundary go LEFT
+/// (issue #477 (b)).
+///
+/// **The interval is rendered in NANOSECONDS here, and that is the whole
+/// reason the shift survives.** Measured on ClickHouse 26.3.17.110 — the
+/// minimum version this server accepts
+/// (`crates/pulsus-schema/src/controller.rs:58`):
+/// `toStartOfInterval(DateTime64(9), INTERVAL n MILLISECOND)` converts its
+/// argument to the interval's own unit **by rounding, not truncation**,
+/// before it floors. So under a millisecond interval the one-nanosecond
+/// shift is rounded straight back off and the expression degenerates to
+/// `left_edge + step` for every instant, which puts a grid-point span one
+/// whole step to the RIGHT — exactly the boundary case this function
+/// exists to get right. Measured, `INTERVAL 60000 MILLISECOND`:
+/// `1788262800000000000` (on a minute) yielded `1788262860000`, and
+/// `1788262859999999999` yielded `1788262920000`. The nanosecond interval
+/// yields `1788262800000` and `1788262860000` for the same two, which is
+/// the right-closed answer. Verified on boundaries, one nanosecond either
+/// side, half-millisecond offsets, a 500 ms step, and pre-1970 and
+/// post-2106 epochs.
+///
+/// The module doc's warning about SECOND-and-larger interval units
+/// downgrading a `DateTime64` to a 32-bit `DateTime` still stands and is
+/// why this is not `INTERVAL n SECOND`; nanoseconds are finer than
+/// milliseconds, so they clear that boundary too.
+///
+/// `timestamp_ns - 1` wraps silently at `i64::MIN`; rows there are
+/// excluded by the window predicate before this `GROUP BY` key is
+/// evaluated, and no accepted plan has a range window starting at
+/// `i64::MIN` (`metrics_plan` requires `aS - step + 1` to fit `i64`).
+/// `step_ns` is computed in `i128` because this function is `pub` and its
+/// callers' step has only been bounded by the planner, not by this type.
+pub fn range_bucket_expr(step_ms: i64) -> String {
+    let step_ns = i128::from(step_ms) * 1_000_000;
+    format!(
+        "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), \
+         INTERVAL {step_ns} NANOSECOND)) + {step_ms}"
+    )
+}
+
 /// The range query — one fully-pushed-down, time-bucketed, replay-deduped
 /// conditional aggregation (docs/schemas.md §4.2). `toUnixTimestamp64Milli(...)`
 /// pins the bucket column to a deterministic `Int64` epoch-milliseconds wire
@@ -521,21 +578,21 @@ fn semi_join_sql(
 /// `toUnixTimestamp64Milli`'s strict `DateTime64` argument outright, for
 /// every window, not only extreme ones); the millisecond-unit form is the
 /// documented ClickHouse boundary at which `toStartOfInterval` keeps its
-/// `DateTime64` precision/range. `step_ms = step_s * 1000` never overflows
-/// `i64`: `metrics_plan::plan_trace_metrics` already requires the snapped
-/// window (which is at least one whole step) to fit in `i64` nanoseconds,
-/// so `step_s <= i64::MAX / NS_PER_S`.
+/// `DateTime64` precision/range. The step arrives already in milliseconds
+/// (issue #477 (d)): `metrics_plan::plan_trace_metrics` requires the
+/// snapped window — at least one whole step wide — to fit in `i64`
+/// nanoseconds, so `step_ms <= i64::MAX / 10^6`.
+///
+/// The bucket label is [`range_bucket_expr`]'s right-closed form.
 pub fn metrics_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
-    step_s: i64,
+    step_ms: i64,
 ) -> String {
-    let step_ms = step_s * 1000;
     let mut sql = format!(
-        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-         INTERVAL {step_ms} MILLISECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n\
-         FROM {spans_table}\n"
+        "SELECT {} AS t,\n       uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n",
+        range_bucket_expr(step_ms)
     );
     if let Some(prewhere) = &filter.prewhere {
         sql.push_str(&format!("PREWHERE {prewhere}\n"));
@@ -552,7 +609,7 @@ pub fn metrics_range_sql(
 /// `[S, E)` with no `GROUP BY`: exactly one row (`uniqExact` over an
 /// empty set is a single `n = 0` row, the documented empty-DB vector
 /// oracle). The rate division by the window width happens client-side at
-/// the encode boundary, like the range path's division by `step_s`.
+/// the encode boundary, like the range path's division by the step.
 pub fn metrics_instant_sql(spans_table: &str, filter: &FilterSql, window: SnappedWindow) -> String {
     let mut sql = format!("SELECT uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n");
     if let Some(prewhere) = &filter.prewhere {
@@ -630,15 +687,13 @@ pub fn metrics_count_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
-    step_s: i64,
+    step_ms: i64,
     keys: &[GroupKeySql],
 ) -> String {
-    let step_ms = step_s * 1000;
     let (gsel, ggroup, gorder) = group_fragments(keys);
     let mut sql = format!(
-        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-         INTERVAL {step_ms} MILLISECOND)) AS t{gsel},\n       uniqExact(trace_id, span_id) AS n\n\
-         FROM {spans_table}\n"
+        "SELECT {} AS t{gsel},\n       uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n",
+        range_bucket_expr(step_ms)
     );
     push_prewhere_where(&mut sql, filter, window);
     sql.push_str(&format!("\nGROUP BY t{ggroup}\nORDER BY t ASC{gorder}"));
@@ -677,16 +732,15 @@ pub fn metrics_agg_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
-    step_s: i64,
+    step_ms: i64,
     agg: AggFn,
     keys: &[GroupKeySql],
 ) -> String {
-    let step_ms = step_s * 1000;
     let (gsel, ggroup, gorder) = group_fragments(keys);
     let mut inner = format!(
-        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-         INTERVAL {step_ms} MILLISECOND)) AS t{gsel}, trace_id, span_id,\n         \
-         any(duration_ns) AS val\n  FROM {spans_table}\n  "
+        "SELECT {} AS t{gsel}, trace_id, span_id,\n         any(duration_ns) AS val\n  \
+         FROM {spans_table}\n  ",
+        range_bucket_expr(step_ms)
     );
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str(&format!("\n  GROUP BY t{ggroup}, trace_id, span_id"));
@@ -751,14 +805,13 @@ pub fn metrics_quantile_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
-    step_s: i64,
+    step_ms: i64,
     quantiles: &[f64],
 ) -> String {
-    let step_ms = step_s * 1000;
     let mut inner = format!(
-        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-         INTERVAL {step_ms} MILLISECOND)) AS t, trace_id, span_id,\n         \
-         any(duration_ns) AS val\n  FROM {spans_table}\n  "
+        "SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val\n  \
+         FROM {spans_table}\n  ",
+        range_bucket_expr(step_ms)
     );
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str("\n  GROUP BY t, trace_id, span_id");
@@ -834,13 +887,12 @@ pub fn metrics_log2_bucket_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
-    step_s: i64,
+    step_ms: i64,
 ) -> String {
-    let step_ms = step_s * 1000;
     let mut inner = format!(
-        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-         INTERVAL {step_ms} MILLISECOND)) AS t, trace_id, span_id,\n         \
-         any(duration_ns) AS val\n  FROM {spans_table}\n  "
+        "SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val\n  \
+         FROM {spans_table}\n  ",
+        range_bucket_expr(step_ms)
     );
     push_prewhere_where_indented(&mut inner, filter, window);
     inner.push_str("\n  GROUP BY t, trace_id, span_id");
@@ -869,26 +921,139 @@ pub fn metrics_log2_bucket_instant_sql(
 
 /// The per-bucket exemplar collection query (issue #182 P5): a bounded
 /// `groupArraySample(K, seed)` of `(trace_id, timestamp_ns)` per time
-/// bucket, pushed down alongside the count aggregation. Rendered only for
-/// an ungrouped rate/count query under `with(exemplars=…)`. The fixed
+/// bucket, pushed down alongside the count aggregation. The fixed
 /// seed keeps the sample deterministic (test-stable); exact
 /// exemplar-count/selection parity vs Tempo is Tier-2 (issue #25).
+///
+/// `keys` carries the GROUP IDENTITY back with each sample (issue #477
+/// wave 2). A grouped range answer is one series per group value, so an
+/// exemplar row that names only its time bucket cannot say which series
+/// it belongs to; the engine used to attach every row to the first
+/// series, which puts one group's traces on another group's line and
+/// reads that other series' value at the bucket. Grouping the sample by
+/// the same `g0..gN` columns the count/aggregation query groups by makes
+/// the row self-identifying, and costs no extra scan: it is the same
+/// `PREWHERE`/`WHERE` over the same rows, with the group column already
+/// in the projection the range query selects.
 pub fn metrics_exemplar_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
-    step_s: i64,
+    step_ms: i64,
     k: u32,
+    keys: &[GroupKeySql],
 ) -> String {
-    let step_ms = step_s * 1000;
+    let (gsel, ggroup, gorder) = group_fragments(keys);
     let mut sql = format!(
-        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-         INTERVAL {step_ms} MILLISECOND)) AS t,\n       \
-         groupArraySample({k}, 1)(tuple(trace_id, timestamp_ns)) AS ex\nFROM {spans_table}\n"
+        "SELECT {} AS t{gsel},\n       \
+         groupArraySample({k}, 1)(tuple(trace_id, timestamp_ns)) AS ex\nFROM {spans_table}\n",
+        range_bucket_expr(step_ms)
     );
     push_prewhere_where(&mut sql, filter, window);
-    sql.push_str("\nGROUP BY t\nORDER BY t ASC");
+    sql.push_str(&format!("\nGROUP BY t{ggroup}\nORDER BY t ASC{gorder}"));
     sql
+}
+
+/// The deduped per-bucket duration/timestamp source the two
+/// duration-shaped exemplar statements sample from (issue #477 wave 2).
+///
+/// Byte-for-byte [`metrics_quantile_range_sql`]'s and
+/// [`metrics_log2_bucket_range_sql`]'s own inner subquery plus
+/// `any(timestamp_ns) AS ts`: the exemplar has to be placed by the SAME
+/// deduped `val` the series values are computed from, or a replayed span
+/// could put a trace on a bucket the tally never counted. The extra
+/// projection reads a column the PREWHERE already selected the granule
+/// for, so it costs no additional granule.
+fn exemplar_duration_inner(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_ms: i64,
+) -> String {
+    let mut inner = format!(
+        "SELECT {} AS t, trace_id, span_id,\n         any(duration_ns) AS val, \
+         any(timestamp_ns) AS ts\n  FROM {spans_table}\n  ",
+        range_bucket_expr(step_ms)
+    );
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str("\n  GROUP BY t, trace_id, span_id");
+    inner
+}
+
+/// The per-bucket exemplar collection query for `quantile_over_time`
+/// (issue #477 wave 2).
+///
+/// A quantile answer is one series per requested `p`, so a row that names
+/// only its time bucket cannot say which series it belongs to. What
+/// identifies the series is the sampled span's OWN duration: the
+/// reference places an exemplar on the quantile whose value is closest to
+/// it (`pkg/traceql/engine_metrics.go:1996-2001, 2013-2041 @ v3.0.2`,
+/// `assignExemplarToQuantile`), and carries the duration through as the
+/// exemplar's value (`exemplarDuration`, `pkg/traceql/ast_metrics.go:235-239
+/// @ v3.0.2` — a non-NaN exemplar value is never overwritten by the
+/// series sample, `modules/frontend/combiner/metrics_query_range.go:278-305
+/// @ v3.0.2`). So the sample carries `(trace_id, timestamp_ns, val)` and
+/// the engine does the placement against the `p` values it already has.
+///
+/// **Cost, measured.** On the 120 000-span / 47 h corpus
+/// `tests/traces_metrics_explain.rs` seeds, a `quantile_over_time` range
+/// request with the default exemplar budget issues two statements and
+/// each reads **120 000 rows** — the exemplar statement's scan is the
+/// range query's, because it is the same rows over the same window with
+/// one more column out of the same subquery. **The row count is exact
+/// and reproduces; the byte count is a magnitude only** — about 4.8 MB
+/// per statement. Three consecutive runs of the probe below (2026-09-02)
+/// each reported 4 800 224 bytes for both statements; the figure this
+/// note carried until now, 4 800 240, was measured in an earlier wave of
+/// this issue and did not recur. Consecutive runs agreeing is not
+/// exactness: the probe seeds a fresh database each run, so the part
+/// layout the read walks is not identical even though the rows are, and
+/// the cross-tab figure quoted on
+/// [`metrics_compare_exemplar_range_sql`] moved on the third of the same
+/// three runs. Quote the rows; do not quote a byte figure from here as
+/// exact. Re-derive with the ignored
+/// `the_per_statement_read_cost_of_a_range_request` probe in that file;
+/// the durations it also prints are one run on a shared box and are not
+/// a claim.
+pub fn metrics_quantile_exemplar_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_ms: i64,
+    k: u32,
+) -> String {
+    let inner = exemplar_duration_inner(spans_table, filter, window, step_ms);
+    format!(
+        "SELECT t, groupArraySample({k}, 1)(tuple(trace_id, ts, val)) AS ex\nFROM (\n  {inner}\n)\n\
+         GROUP BY t\nORDER BY t ASC"
+    )
+}
+
+/// The per-bucket exemplar collection query for `histogram_over_time`
+/// (issue #477 wave 2).
+///
+/// A histogram answer is one series per occupied log2 duration bucket, so
+/// the column that identifies the series is the bucket bound itself —
+/// [`LOG2_BUCKET_EXPR`] over the same deduped `val` the tally is computed
+/// from, with the same `WHERE val >= 2` sub-2ns guard on the same side of
+/// the dedup. The reference records the exemplar on the `__bucket` series
+/// the span's own duration bucketizes to (`bucketizeFnFor` +
+/// `internalLabelBucket`, `pkg/traceql/ast_metrics.go:129-134 @ v3.0.2`);
+/// attaching it anywhere else puts a trace on a duration range it never
+/// had.
+pub fn metrics_log2_bucket_exemplar_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_ms: i64,
+    k: u32,
+) -> String {
+    let inner = exemplar_duration_inner(spans_table, filter, window, step_ms);
+    format!(
+        "SELECT t, {LOG2_BUCKET_EXPR} AS bucket, \
+         groupArraySample({k}, 1)(tuple(trace_id, ts)) AS ex\nFROM (\n  {inner}\n)\n\
+         WHERE val >= 2\nGROUP BY t, bucket\nORDER BY t ASC, bucket ASC"
+    )
 }
 
 /// The distinct-by-key series-cardinality probe (issue #182, review Fix
@@ -1107,6 +1272,144 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     }
 }
 
+/// The attribute keys [`metrics_compare_sql`]'s intrinsics branch emits
+/// for EVERY span it reads, in that branch's own order (issue #477 wave
+/// 2). Only the KEYS: the intrinsics branch pairs each with a value
+/// expression, and the exemplar statement needs no value — it needs to
+/// know which `<side>_total` series a sampled span contributes to.
+///
+/// Frozen against the cross-tab's text by
+/// `traces_metrics_sql::the_compare_exemplar_keys_are_the_cross_tabs_own_intrinsic_keys`,
+/// so the two branches cannot drift into naming different key universes.
+pub const COMPARE_INTRINSIC_KEYS: [&str; 9] = [
+    "name",
+    "kind",
+    "status",
+    "resource.service.name",
+    "statusMessage",
+    "instrumentation:name",
+    "instrumentation:version",
+    "rootName",
+    "rootServiceName",
+];
+
+/// The inputs to [`metrics_compare_exemplar_range_sql`].
+#[derive(Debug, Clone, Copy)]
+pub struct CompareExemplarSqlInput<'a> {
+    pub spans_table: &'a str,
+    pub attrs_table: &'a str,
+    pub outer: &'a FilterSql,
+    /// The pre-compiled selection predicate (`compile_filter_bool`) — the
+    /// same string [`CompareSqlInput::inner_bool`] carries.
+    pub inner_bool: &'a str,
+    pub window: SnappedWindow,
+    /// The range-form bucket expression aliased `t`.
+    pub bucket_expr: &'a str,
+    /// The `compare(f, n, start, end)` selection window; see
+    /// [`CompareSqlInput::sel_window`] for why it repartitions rather than
+    /// filters.
+    pub sel_window: Option<(i64, i64)>,
+    /// The per-group `groupArraySample` size.
+    pub k: u32,
+}
+
+/// The per-bucket exemplar collection query for `compare()` (issue #477
+/// wave 2).
+///
+/// A comparison answer is one series per `(__meta_type, attribute key)`,
+/// and the reference attaches a sampled span's exemplar to the
+/// `<side>_total` series of EVERY attribute name that span carries — the
+/// side decided by the same selection predicate the cross-tab counts with
+/// (`observeExemplar` and the `addExemplar` loop,
+/// `pkg/traceql/engine_metrics_compare.go:185-207, 281-301 @ v3.0.2`).
+/// So the two columns that identify the series are `is_sel` and `akey`,
+/// and this statement returns both.
+///
+/// The key universe is exactly [`metrics_compare_sql`]'s: the nine
+/// intrinsics every span contributes ([`COMPARE_INTRINSIC_KEYS`]) plus
+/// the span's own scoped index attributes. It carries no VALUE column and
+/// no roots CTE — the root intrinsics' keys are present for every span
+/// regardless of what the root resolves to, so the exemplar side does not
+/// need the trace-wide join the cross-tab needs for its values.
+///
+/// **Cost, measured** (issue #477 wave 3 — the wave-2 note called this
+/// "one more statement of the cross-tab's shape", which was read off the
+/// committed golden and overstates it). On the 120 000-span / 47 h corpus
+/// `tests/traces_metrics_explain.rs` seeds, a range `compare()` with the
+/// default exemplar budget issues four statements, and this one reads
+/// **480 000 rows** against the cross-tab's **720 000** — 0.67x its rows,
+/// and about 0.62x its bytes (~16.6 MB against ~26.5 MB), because it
+/// drops the roots CTE and the value projection. It takes the request's
+/// total from 1 560 000 to 2 040 000 read rows, +31%. **The row counts
+/// are exact and reproduce run to run; no byte figure does.** Three
+/// consecutive runs (2026-09-02) gave this statement 16 565 810 bytes
+/// each and the cross-tab 26 532 692, 26 532 692 and 26 557 333 — so the
+/// cross-tab moved on the third run alone, and the figures this note
+/// carried until now (16 566 225 here; 26 526 839, 26 528 787 and
+/// 26 543 947 for the cross-tab, each measured in an earlier wave) match
+/// none of the readings above. A figure that repeats over a few runs is
+/// still not exact: the probe seeds a fresh database each run, so the
+/// part layout the read walks is not identical even though the rows are.
+/// Quote the rows; do not quote a byte figure from here as exact.
+/// Re-derive with the ignored
+/// `the_per_statement_read_cost_of_a_range_request` probe in that file;
+/// the durations there are one run on a shared box and are not a claim.
+/// It runs only on a range comparison that framed a non-zero sample and
+/// only while the exemplar budget is non-zero.
+pub fn metrics_compare_exemplar_range_sql(input: &CompareExemplarSqlInput<'_>) -> String {
+    let CompareExemplarSqlInput {
+        spans_table,
+        attrs_table,
+        outer,
+        inner_bool,
+        window,
+        bucket_expr,
+        sel_window,
+        k,
+    } = *input;
+    // Byte-identical construction to `metrics_compare_sql`'s `is_sel`.
+    let is_sel = match sel_window {
+        Some((start_ns, end_ns)) => {
+            format!("(({inner_bool}) AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns})")
+        }
+        None => format!("({inner_bool})"),
+    };
+    let mut raw = format!(
+        "SELECT {bucket_expr} AS t, trace_id, span_id, timestamp_ns AS ts, \
+         {is_sel} AS is_sel\n      FROM {spans_table}\n      "
+    );
+    push_prewhere_where_indented(&mut raw, outer, window);
+    // The same replay dedup the cross-tab applies: one row per
+    // `(t, trace_id, span_id)`, so a replayed span is sampled once.
+    let base = format!(
+        "SELECT t, trace_id, span_id, any(ts) AS ts, max(is_sel) AS is_sel\n    \
+         FROM (\n  {raw}\n    )\n    GROUP BY t, trace_id, span_id"
+    );
+    let keys = COMPARE_INTRINSIC_KEYS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let intrinsics = format!(
+        "SELECT t, is_sel, trace_id, ts, arrayJoin([{keys}]) AS akey\n  \
+         FROM (\n  {base}\n  )"
+    );
+    let index_attrs = format!(
+        "SELECT b.t AS t, b.is_sel AS is_sel, b.trace_id AS trace_id, b.ts AS ts, \
+         concat(a.scope, '.', a.key) AS akey\n  FROM (\n  {base}\n  ) b\n  \
+         INNER JOIN (\n    SELECT DISTINCT trace_id, span_id, scope, key \
+         FROM {attrs_table} WHERE {} AND {}\n  ) a ON b.trace_id = a.trace_id \
+         AND b.span_id = a.span_id",
+        date_clause(window),
+        time_clause(window)
+    );
+    format!(
+        "SELECT t, is_sel, akey, groupArraySample({k}, 1)(tuple(trace_id, ts)) AS ex\n\
+         FROM (\n  {intrinsics}\n  UNION ALL\n  {index_attrs}\n)\n\
+         GROUP BY t, is_sel, akey\nORDER BY t ASC, is_sel, akey"
+    )
+}
+
 /// The window-free per-trace roots read for `compare()` (issue #189): one
 /// `argMin(byte_cap_expr(col), root_ordering_tuple())` per trace over
 /// `spans_table`, restricted to the in-window `SELECT DISTINCT trace_id
@@ -1129,10 +1432,35 @@ fn compare_roots_cte(spans_table: &str, base: &str) -> String {
     )
 }
 
-/// The range-form bucket-start expression (`toStartOfInterval` → ms) for
-/// compare().
-pub fn compare_range_bucket_expr(step_s: i64) -> String {
-    let step_ms = step_s * 1000;
+/// The range-form bucket label for `compare()` — [`range_bucket_expr`]'s
+/// right-closed form, so the comparison cross-tab shares the bucket axis
+/// with every other range shape (issue #477 (b)).
+pub fn compare_range_bucket_expr(step_ms: i64) -> String {
+    range_bucket_expr(step_ms)
+}
+
+/// The bucket expression the INSTANT `compare()` cap probe is built with:
+/// the pre-change left-edge form, frozen so the instant route's probe
+/// bytes do not move (#503 owns that route; the golden suite's
+/// `== compare series probe ==` byte-identity is the gate).
+///
+/// This is NOT the same expression as [`compare_range_bucket_expr`] and it
+/// is NOT inert. It reaches the probe's value through the replay-dedup
+/// `GROUP BY t, trace_id, span_id` in [`metrics_compare_sql`]: rows
+/// sharing a `(trace_id, span_id)` that fall in different buckets and
+/// disagree on a physical intrinsic contribute extra distinct
+/// `(akey, aval)` pairs under the range form and one merged pair under
+/// this one (measured — six of the seven projected intrinsics move the
+/// probe's `n`, `service` cannot because the probe's own `PREWHERE`
+/// removes the disagreeing row first). The two agree only on consistent
+/// logical-span rows. Byte preservation is the reason this exists;
+/// inertness is not claimed.
+///
+/// Do not "de-duplicate" it against [`compare_range_bucket_expr`]: they
+/// render different text after issue #477, and deleting this one moves
+/// the instant route's frozen bytes. Delete it when #503 redesigns the
+/// instant window.
+pub fn compare_instant_probe_bucket_expr(step_ms: i64) -> String {
     format!(
         "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
          INTERVAL {step_ms} MILLISECOND))"
@@ -1387,17 +1715,87 @@ mod tests {
     #[test]
     fn range_sql_pins_the_bucket_wrapper_dedup_count_and_bounds() {
         let f = compile(r#"{ resource.service.name = "checkout" && duration > 2s }"#);
-        let sql = metrics_range_sql("trace_spans", &f, W, 60);
-        assert!(sql.starts_with(
-            "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-             INTERVAL 60000 MILLISECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n\
-             FROM trace_spans\nPREWHERE service = 'checkout'\n"
-        ));
+        let sql = metrics_range_sql("trace_spans", &f, W, 60_000);
+        assert!(
+            sql.starts_with(
+                "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(\
+                 timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t,\n       \
+                 uniqExact(trace_id, span_id) AS n\nFROM trace_spans\n\
+                 PREWHERE service = 'checkout'\n"
+            ),
+            "{sql}"
+        );
         assert!(sql.contains(
             "WHERE timestamp_ns >= 1699999980000000000 AND timestamp_ns < 1700010840000000000"
         ));
         assert!(sql.ends_with("GROUP BY t\nORDER BY t ASC"));
         assert!(!sql.contains("count()"), "counting is always uniqExact");
+    }
+
+    /// AC2, hermetic half (issue #477 (b)): the exact rendered
+    /// right-closed bucket label.
+    ///
+    /// The `- 1` and the `+ step` are what turn `toStartOfInterval`'s
+    /// floor into a ceiling, which is what puts a grid-point instant on
+    /// ITS OWN point. Deleting either sends every boundary instant one
+    /// step right and moves every sample in every range response.
+    #[test]
+    fn the_range_bucket_expression_is_right_closed() {
+        assert_eq!(
+            range_bucket_expr(500),
+            "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), \
+             INTERVAL 500000000 NANOSECOND)) + 500"
+        );
+        assert_eq!(
+            range_bucket_expr(60_000),
+            "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), \
+             INTERVAL 60000000000 NANOSECOND)) + 60000"
+        );
+        // Every range builder renders that same label, and none of them
+        // renders the left-edge form.
+        let f = compile(r#"{ duration > 2s }"#);
+        for sql in [
+            metrics_range_sql("trace_spans", &f, W, 500),
+            metrics_count_range_sql("trace_spans", &f, W, 500, &[]),
+            metrics_agg_range_sql("trace_spans", &f, W, 500, AggFn::Sum, &[]),
+            metrics_quantile_range_sql("trace_spans", &f, W, 500, &[0.9]),
+            metrics_log2_bucket_range_sql("trace_spans", &f, W, 500),
+            metrics_exemplar_range_sql("trace_spans", &f, W, 500, 1, &[]),
+        ] {
+            assert!(sql.contains(&range_bucket_expr(500)), "{sql}");
+            assert!(
+                !sql.contains(
+                    "toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 500"
+                ),
+                "a left-edge label survived: {sql}"
+            );
+            assert!(
+                !sql.contains("INTERVAL 500 MILLISECOND"),
+                "a MILLISECOND interval rounds the one-nanosecond shift away: {sql}"
+            );
+        }
+    }
+
+    /// AC7(d2): the INSTANT comparison probe's bucket expression is
+    /// frozen at the pre-#477 left-edge form, and it is NOT the range
+    /// form. Class CHANGE — neither function exists at `2f78c53` in this
+    /// shape.
+    #[test]
+    fn the_instant_compare_probe_bucket_expression_is_frozen() {
+        assert_eq!(
+            compare_instant_probe_bucket_expr(60_000),
+            "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+             INTERVAL 60000 MILLISECOND))"
+        );
+        assert_ne!(
+            compare_instant_probe_bucket_expr(60_000),
+            compare_range_bucket_expr(60_000),
+            "pointing the instant compare probe at the range expression moves the instant \
+             route's frozen bytes"
+        );
+        // The comparison range label is the same right-closed label every
+        // other range shape uses — one axis, no carve-out.
+        assert_eq!(compare_range_bucket_expr(60_000), range_bucket_expr(60_000));
     }
 
     #[test]

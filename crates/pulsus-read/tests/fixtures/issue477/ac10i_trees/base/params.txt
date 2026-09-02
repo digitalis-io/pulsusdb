@@ -1,0 +1,7 @@
+//! Pre-#477 step parameter parsing.
+
+#[test]
+fn explicit_step_forms_parse_to_whole_seconds() {}
+
+#[test]
+fn non_positive_or_fractional_second_steps_are_rejected() {}

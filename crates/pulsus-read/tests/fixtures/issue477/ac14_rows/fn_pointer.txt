@@ -1,0 +1,13 @@
+//! The clock as an un-called function pointer: a path in expression
+//! position with no call at all.
+
+fn base_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+fn a_case() -> fn() -> std::time::Instant {
+    std::time::Instant::now
+}
