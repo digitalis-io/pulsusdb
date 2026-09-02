@@ -2,10 +2,19 @@ Issue #477 Q26 and Q27 — the toolchain's contribution to AC10(i).
 
 Run (the script edits the working tree and restores it, so it refuses to
 start on a dirty one). Every restore is VERIFIED: a failed one prints the
-paths still dirty and exits 65 rather than printing "restored" and 0. The
-transcript below predates that fix — the wave-4 review found this script
-reporting a successful restore in an environment whose git index was not
-writable, and the wave-4 re-run is what the fixed script produces.
+paths still dirty and exits 65 rather than printing "restored" and 0.
+That fix came out of the wave-3 review, which ran this script where the
+git directory was not writable and got "== restored ==" and exit 0 over a
+still-dirty file. Reproduced both ways on wave 4, with the git directory
+chmod'd read-only: the pre-fix script printed "== restored ==", listed
+the dirty path under it and exited 0; the fixed script printed
+"RESTORE FAILED", named the path, aborted before the next measurement and
+exited 65.
+
+The transcript below was captured before that fix and on an earlier tree.
+The fix changes only how a failed restore is REPORTED -- no measurement
+moved -- and the counts move with the tree in any case, as the paragraph
+after this one says.
 
   CARGO_TARGET_DIR=<outside any source tree> CARGO_INCREMENTAL=0 \
     bash crates/pulsus-read/tests/fixtures/issue477/toolchain/toolchain.sh
