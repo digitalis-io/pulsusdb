@@ -995,7 +995,16 @@ fn exemplar_duration_inner(
 /// @ v3.0.2`). So the sample carries `(trace_id, timestamp_ns, val)` and
 /// the engine does the placement against the `p` values it already has.
 ///
-/// **Cost, measured.** MEASURE-HERE-QUANTILE-EXEMPLAR-COST
+/// **Cost, measured.** On the 120 000-span / 47 h corpus
+/// `tests/traces_metrics_explain.rs` seeds, a `quantile_over_time` range
+/// request with the default exemplar budget issues two statements and
+/// each reads **120 000 rows / 4 800 240 bytes** — the exemplar
+/// statement's scan is the range query's, because it is the same rows
+/// over the same window with one more column out of the same subquery.
+/// Re-derive with the ignored
+/// `the_per_statement_read_cost_of_a_range_request` probe in that file;
+/// the durations it also prints are one run on a shared box and are not
+/// a claim.
 pub fn metrics_quantile_exemplar_range_sql(
     spans_table: &str,
     filter: &FilterSql,
@@ -1319,10 +1328,16 @@ pub struct CompareExemplarSqlInput<'a> {
 /// `tests/traces_metrics_explain.rs` seeds, a range `compare()` with the
 /// default exemplar budget issues four statements, and this one reads
 /// **480 000 rows / 16 566 225 bytes** against the cross-tab's
-/// **720 000 / 26 526 839** — 0.67x its rows and 0.62x its bytes, because
-/// it drops the roots CTE and the value projection. It takes the
-/// request's total from 1 560 000 to 2 040 000 read rows, +31%. Two runs,
-/// identical row and byte figures. Re-derive with the ignored
+/// **720 000 / ~26.5 MB** — 0.67x its rows and about 0.62x its bytes,
+/// because it drops the roots CTE and the value projection. It takes the
+/// request's total from 1 560 000 to 2 040 000 read rows, +31%. **The row
+/// counts are exact and reproduce run to run; the cross-tab's read_bytes
+/// does not** — three recorded runs of this probe (wave 3, its review,
+/// and wave 4) gave 26 526 839, 26 528 787 and 26 543 947 bytes, a spread
+/// of ~17 kB on 26.5 MB. The probe seeds a fresh database each run, so
+/// the part layout the read walks is not identical even though the rows
+/// are; quote the rows, treat the bytes as a magnitude. Re-derive
+/// with the ignored
 /// `the_per_statement_read_cost_of_a_range_request` probe in that file;
 /// the durations there are one run on a shared box and are not a claim.
 /// It runs only on a range comparison that framed a non-zero sample and

@@ -89,7 +89,13 @@ const NULLABLE_WIRE_PORT: u16 = 31_215;
 /// the binary with a cap 1000x below default, so it needs its own port
 /// and its own throwaway database or it changes what every other suite in
 /// this file sees.
-const CAP_PROBE_PORT: u16 = 31_220;
+///
+/// `31_220` was this suite's first choice and collided with issue #479's
+/// `the_matched_span_projection_follows_the_reference_rule`, which took
+/// the same value on a branch that merged first: two textually clean
+/// branches, one port. `live_port_uniqueness.rs` is what caught it and is
+/// what settles it.
+const CAP_PROBE_PORT: u16 = 31_221;
 
 /// Retention for the issue #474 spawn only. The fixture's timestamps are
 /// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
