@@ -20,6 +20,12 @@ the #33 triage discipline:
 Entries are append-only; re-gating a case removes its `ledger` reference
 but keeps the entry for history.
 
+A few of these entries are not "we chose differently" but "Tempo is wrong
+here" — the swapped `^` operands, the three readers of a span's events,
+the wrapping `durationMs`. Those are indexed and explained, against the
+v3.0.2 source, in docs/reference-defects-we-do-not-copy.md. The evidence
+stays in this file; that one only explains and points back.
+
 ## Entries
 
 ### 2026-07-16-negation-matches-missing-key
