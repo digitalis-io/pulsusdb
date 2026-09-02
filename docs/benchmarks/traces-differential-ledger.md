@@ -2078,6 +2078,76 @@ when we are asking it to slow down, so we keep `429`; recorded as
   run, bounded by the budget, non-monotonic in it, and not stable across
   runs, and that is where the investigation stopped.
 
+### `traceql-metrics-quantile-exemplar-placement-domain` (issue #477) — **an exemplar is placed against the quantiles of its OWN bucket, which are the values the series draws there**
+
+- **Route.** `GET /api/traces/v1/metrics/query_range` (and its datasource
+  aliases), `quantile_over_time` only. Not the instant route: it attaches
+  no exemplars.
+
+- **What the reference does — and why it is wrong here.** A
+  `quantile_over_time` answer is one series per requested `p`, and an
+  exemplar belongs to exactly one of them. The reference pools every
+  interval's bucket counts into ONE distribution and takes the requested
+  quantiles of that pooled distribution once per response
+  (`aggregatedBuckets` / `quantileValues`,
+  `pkg/traceql/engine_metrics.go:1933-1962 @ v3.0.2`), while the value
+  each `p=` series carries is computed **per interval** from that
+  interval's own buckets (`:1993`). Placement compares the exemplar
+  against the pooled array (`:1996-2001`). **So it chooses which series an
+  exemplar belongs to using numbers it never draws.** There is no reading
+  of "attach the exemplar to the nearest series" under which the
+  comparison basis should be values that are not that series' values.
+  The placement function is unfinished rather than designed as well: its
+  own doc comment promises a `-1` "doesn't fit any quantile reasonably
+  well" return and "reasonable bucket validation" (`:2010-2012`), and the
+  body implements neither — the `buckets` argument is dead past an
+  emptiness check and the nearest index is always returned
+  (`:2013-2031`).
+
+- **Ours.** The same nearest-value rule and the same lowest-index
+  tie-break, against the **per-bucket** quantile values: the numbers
+  already in the response, which are the numbers the panel draws this
+  exemplar beside. The exemplar's value is the sampled span's own duration
+  in seconds, as the reference's is.
+
+- **Where the two visibly differ.** Wherever load varies across the
+  window, so that a span's rank inside its own bucket differs from its
+  rank in the pooled window. Constructed case, and the one gated below: a
+  window of two occupied buckets, the first holding many spans of `1-10 ms`
+  and the second many spans of `100-200 ms`, queried for `p=0.5` and
+  `p=0.99`. The `p=0.5` series draws about `5 ms` at the first bucket and
+  about `150 ms` at the second — it is a per-interval value, it moves. A
+  `150 ms` span in the second bucket is nearest that bucket's `p=0.5`, the
+  line it is drawn on, so we put it there. Pooled, the first bucket's
+  spans dominate the median, so the pooled `p=0.5` sits inside `1-10 ms`
+  and the pooled `p=0.99` near `200 ms`: `|150 - 200| = 50 ms` beats
+  `|150 - 5| = 145 ms`, and the reference hangs that exemplar on the
+  `p=0.99` line — whose value at that timestamp is `200 ms`, not `150`.
+  The gap is bounded only by how far apart the buckets are. Placement
+  only: the set of series, their labels, their samples and the exemplar
+  count are unaffected.
+
+- **The sparse-window case, so it is not read as a defect.** With one span
+  in a bucket, every quantile of that bucket equals that span's duration —
+  every candidate ties and the tie-break puts the exemplar on the lowest
+  `p`, while the pooled rule would spread the same spans across `p`
+  values. That is a property of degenerate input: one observation has no
+  spread, so there is no nearest series to find. It is gated in that exact
+  shape by
+  `crates/pulsus-read/tests/traces_metrics_live.rs::quantile_exemplars_are_placed_against_their_own_buckets_quantiles`.
+
+- **Disposition.** Deliberate divergence — the reference is wrong here.
+  This follows from `2026-08-05-traceql-quantile-over-time-tdigest` (issue
+  #252) rather than deciding anything new: our `p=` values are already
+  computed by a different estimator from the reference's, so an exemplar
+  placed against the reference's pooled targets would be placed against
+  numbers that are neither its bucket's nor ours. Coherence with the
+  values we actually draw is what that ruling leaves as the only
+  meaningful rule. The property is gated against our own rule — nearest by
+  the drawn value at the exemplar's own bucket, ties to the lowest `p` —
+  on a non-uniform corpus in
+  `crates/pulsus-read/tests/traces_metrics_live.rs::every_quantile_exemplar_sits_on_the_series_nearest_it_at_its_own_bucket`.
+
 ### `traceql-metrics-exemplars-total-budget` (issue #477) — **`with(exemplars=N)` now means N for the whole response**
 
 - **Route.** `GET /api/traces/v1/metrics/query_range`.

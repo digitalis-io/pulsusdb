@@ -23,17 +23,13 @@ FROM (
 )
 
 == exemplars ==
-SELECT t, ex, CAST(quantilesTDigestMerge(0.5, 0.9, 0.99)(st) OVER () AS Array(Float64)) AS qs
+SELECT t, groupArraySample(1, 1)(tuple(trace_id, ts, val)) AS ex
 FROM (
-  SELECT t, groupArraySample(1, 1)(tuple(trace_id, ts, val)) AS ex,
-         quantilesTDigestState(0.5, 0.9, 0.99)(val) AS st
-  FROM (
-    SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id,
-           any(duration_ns) AS val, any(timestamp_ns) AS ts
-    FROM trace_spans
-    WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
-    GROUP BY t, trace_id, span_id
-  )
-  GROUP BY t
+  SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns - 1), INTERVAL 60000000000 NANOSECOND)) + 60000 AS t, trace_id, span_id,
+         any(duration_ns) AS val, any(timestamp_ns) AS ts
+  FROM trace_spans
+  WHERE timestamp_ns >= 1699999920000000001 AND timestamp_ns < 1700010840000000001
+  GROUP BY t, trace_id, span_id
 )
+GROUP BY t
 ORDER BY t ASC

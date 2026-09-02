@@ -13,8 +13,18 @@
 #        does, and CI does not run it.
 #
 # This script MUTATES THE WORKING TREE and restores it on exit, including
-# on failure and on Ctrl-C. It refuses to start on a dirty tree, so a
-# failed restore is visible as a dirty tree afterwards rather than silent.
+# on failure and on Ctrl-C. It refuses to start on a dirty tree.
+#
+# EVERY restore is verified and a failed one is fatal (issue #477 wave 4
+# review). The earlier version called `git checkout -- .`, ignored its
+# exit code, printed "restored" and exited 0 even when the tree was still
+# dirty -- observed in an environment whose git index was not writable.
+# A restore that lies is worse than one that fails: the next measurement
+# then runs on a mutated tree and its red is read as a finding. So
+# `restore` checks both the checkout's status AND `git status --porcelain`
+# afterwards, a mid-script failure aborts the run before the next
+# measurement, and the exit trap turns a failed final restore into a
+# non-zero exit (65) with the dirty paths printed.
 #
 #   CARGO_TARGET_DIR=<outside any source tree> CARGO_INCREMENTAL=0 \
 #     bash crates/pulsus-read/tests/fixtures/issue477/toolchain/toolchain.sh
@@ -34,8 +44,39 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 64
 fi
 
-restore() { git -C "$ROOT" checkout -- . ; }
-trap restore EXIT INT TERM
+# Restores the tree and PROVES it: a non-zero checkout, or any dirty path
+# left behind, is a failure. Never silent.
+restore() {
+  local out status dirty
+  out="$(git -C "$ROOT" checkout -- . 2>&1)"; status=$?
+  dirty="$(git -C "$ROOT" status --porcelain)"
+  if [ "$status" -ne 0 ] || [ -n "$dirty" ]; then
+    {
+      echo "RESTORE FAILED: git checkout exited $status; git status is not empty."
+      [ -n "$out" ] && echo "  git said: $out"
+      echo "  dirty paths:"
+      printf '%s\n' "$dirty" | sed 's/^/    /'
+    } >&2
+    return 1
+  fi
+  return 0
+}
+
+# A mid-script restore that fails must stop the run: every later
+# measurement would otherwise be taken on a mutated tree.
+restore_or_abort() {
+  restore && return 0
+  echo "aborting before the next measurement — it would run on a mutated tree" >&2
+  exit 65
+}
+
+cleanup() {
+  local code=$?
+  restore || code=65
+  [ -n "${WORK-}" ] && rm -rf "$WORK"
+  exit "$code"
+}
+trap cleanup EXIT INT TERM
 
 say() { printf '\n== %s ==\n' "$1"; }
 
@@ -46,7 +87,6 @@ run_json() { # <outfile> <cargo args...>
 }
 
 WORK="$(mktemp -d)"
-trap 'restore; rm -rf "$WORK"' EXIT INT TERM
 
 say "Q27(a) cargo test --workspace --doc, clean tree"
 cargo test --workspace --doc > "$WORK/doc-clean.txt" 2>&1
@@ -64,7 +104,7 @@ cargo test --workspace --doc > "$WORK/doc-stale.txt" 2>&1
 echo "doctest   exit=$? warnings=$(grep -c '^warning' "$WORK/doc-stale.txt") errors=$(grep -c '^error' "$WORK/doc-stale.txt")"
 code=$(run_json "$WORK/cargodoc-stale.json" doc --no-deps -p pulsus-read -p pulsus-server)
 echo "cargo doc exit=$code $(python3 "$HERE/summarise.py" "$WORK/cargodoc-stale.json" metrics_plan.rs)"
-restore
+restore_or_abort
 
 say "Q26(a) control D — a unit made WRONG in place, nothing renamed"
 # Two sites where the millisecond field is documented and used as if it
@@ -74,7 +114,7 @@ perl -0pi -e 's{`step_ms` is whole milliseconds \(issue \#477 \(d\)\),}{`step_ms
 git diff --stat -- "$PLAN"
 cargo check --all-targets -p pulsus-read -p pulsus-server > "$WORK/controld.txt" 2>&1
 echo "exit=$? — a wrong unit compiles clean, which is why the scan exists"
-restore
+restore_or_abort
 
 say "Q26(b) the compiler propagates a rename to a fixpoint, and stops short"
 BEFORE=$(git grep -c '\bstep_ms\b' -- crates/pulsus-read/src/traces crates/pulsus-server/src/traces_api | awk -F: '{n+=$2} END {print n}')
@@ -136,7 +176,8 @@ echo "  classification of it. Reading that list shows the mixture: private"
 echo "  field declarations, function parameters, doc comments and panic"
 echo "  messages alike, i.e. whatever the seed rename's blast radius missed."
 git grep -n '\bstep_ms\b' -- crates/pulsus-read/src/traces crates/pulsus-server/src/traces_api | head -40
-restore
+restore_or_abort
 
 say "restored"
 git status --porcelain
+echo "(the exit trap restores once more and exits 65 if anything is left dirty)"

@@ -720,7 +720,6 @@ pub fn plan_trace_metrics(
                     &range_filter_sql,
                     range_window,
                     params.step_ms,
-                    &analysis.quantiles,
                     per_bucket_k,
                 )),
                 ExemplarSeriesKey::Quantile,

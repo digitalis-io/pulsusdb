@@ -1786,10 +1786,14 @@ static DB_GSPARSE: pulsus_testkit::TestDb =
 /// exemplar-attribution criterion, for the same concurrency reason.
 static DB_QEX: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_exemplar_it");
-/// Issue #477 wave 3: the pooled-domain criterion needs a sparse corpus
-/// of its own, and its own database for the same concurrency reason.
+/// Issue #477 wave 4: the two criteria that can SEE the quantile
+/// placement domain need corpora of their own — one span per bucket, and
+/// a bimodal window — and their own databases for the same concurrency
+/// reason.
 static DB_QSPARSE: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_sparse_exemplar_it");
+static DB_QSHIFT: pulsus_testkit::TestDb =
+    pulsus_testkit::TestDb::new("pulsus_traces_metrics_quantile_shifting_exemplar_it");
 static DB_HEX: pulsus_testkit::TestDb =
     pulsus_testkit::TestDb::new("pulsus_traces_metrics_histogram_exemplar_it");
 static DB_CEX: pulsus_testkit::TestDb =
@@ -2514,12 +2518,16 @@ fn str_label(series: &pulsus_read::TraceMetricSeries, key: &str) -> String {
 /// Before the fix both landed on the first series (`p=0.5`) carrying that
 /// series' value; the reference splits them.
 ///
-/// **This one does not cover the placement DOMAIN.** Exactly one bucket
-/// is occupied, so the pooled window and that bucket hold the same two
-/// spans and produce the same `p` values — the per-bucket and the pooled
-/// rules agree here by construction, and the criterion for the domain is
-/// [`quantile_exemplars_are_placed_against_the_whole_windows_pooled_quantiles`].
-/// What this gates is the nearest-value rule and the exemplar's value.
+/// **This one is vacuous for the placement DOMAIN, and deliberately kept
+/// for its narrower assertions** (issue #477 wave 4 review). Exactly one
+/// bucket is occupied, so the whole window and that bucket hold the same
+/// two spans and produce the same `p` values: the per-bucket rule and the
+/// reference's pooled rule agree here by construction, and swapping one
+/// for the other leaves this test green. What it does gate is the
+/// nearest-value rule, the lowest-index tie-break and the exemplar's own
+/// value. The domain is gated by
+/// [`quantile_exemplars_are_placed_against_their_own_buckets_quantiles`]
+/// and [`every_quantile_exemplar_sits_on_the_series_nearest_it_at_its_own_bucket`].
 #[tokio::test]
 async fn quantile_exemplars_land_on_the_quantile_nearest_their_own_duration() {
     if !should_run() {
@@ -2626,29 +2634,30 @@ async fn quantile_exemplars_land_on_the_quantile_nearest_their_own_duration() {
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QEX}")).await;
 }
 
-/// **`quantile_over_time` exemplar placement is against the WHOLE range
-/// window's quantiles, pooled over every bucket** (issue #477 wave 3
-/// ruling).
+/// **`quantile_over_time` exemplar placement is against the quantiles of
+/// the exemplar's OWN bucket** — the numbers the `p=` series draws at
+/// that timestamp — and not against the whole window pooled (issue #477
+/// wave 4 ruling; ledger row
+/// `traceql-metrics-quantile-exemplar-placement-domain`).
 ///
-/// The case the ruling names, and the only one that can tell the two
-/// domains apart: **one span per bucket across a sparse window**. Every
-/// bucket then holds a single duration, so *that bucket's* `p=0.5` and
-/// `p=1` are the same number — every candidate ties, and a per-bucket
-/// implementation's lowest-index tie-break puts all eight exemplars on
-/// `p=0.5`. Pooled, the eight durations form one distribution and the
-/// exemplars split.
+/// The corpus is the one case where the two domains cannot both be right:
+/// **one span per bucket across a sparse window**. Every occupied bucket
+/// then holds a single duration, so *that bucket's* `p=0.5` and `p=1` are
+/// the same number — every candidate ties, and the lowest-index tie-break
+/// puts all eight exemplars on `p=0.5`. Pooled, the eight durations form
+/// one distribution whose `p=1` is the maximum, `201 ms`, and whose
+/// median is inside the `1-6 ms` cluster (six of eight points), so the
+/// nearest-value split falls between `104 ms` and `101 ms`: the two long
+/// spans would land on `p=1` and the six short ones on `p=0.5`. **The two
+/// domains therefore predict different answers on this corpus for any
+/// quantile estimator**, which is what makes it a criterion rather than a
+/// coincidence.
 ///
-/// **Why the expected split needs no oracle.** Six of the eight durations
-/// are `<= 6 ms` and two are `>= 200 ms`, so the pooled median is
-/// somewhere in `[1 ms, 6 ms]` for any quantile estimator (six of eight
-/// points are in that range), and the pooled `p=1` is the maximum,
-/// `201 ms`. Nearest-value placement splits at the midpoint of the two,
-/// which is therefore between `101 ms` and `104 ms` — above every low
-/// duration and below every high one. The partition is the same for any
-/// estimator that puts the median inside the low cluster, so this asserts
-/// the DOMAIN and not our TDigest's arithmetic.
+/// The tie is a property of degenerate input, not a rule of its own: one
+/// observation has no spread, so there is no nearest series to find. The
+/// ledger row says so in those terms.
 #[tokio::test]
-async fn quantile_exemplars_are_placed_against_the_whole_windows_pooled_quantiles() {
+async fn quantile_exemplars_are_placed_against_their_own_buckets_quantiles() {
     if !should_run() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
         return;
@@ -2691,10 +2700,10 @@ async fn quantile_exemplars_are_placed_against_the_whole_windows_pooled_quantile
     assert_eq!(double_label(&result.series[1], "p"), 1.0);
 
     // Anti-vacuity, and the whole reason this corpus discriminates: at
-    // EVERY bucket the two quantiles are the same number, so nothing in
-    // the per-bucket values can tell the two series apart. A test that
-    // passed here without this check could be reading a corpus where the
-    // per-bucket domain would have answered identically.
+    // EVERY bucket the two quantiles are the same number, so the values
+    // the two series draw cannot tell them apart. A run where they
+    // differed somewhere would be reading a corpus on which the pooled
+    // domain could have produced the same placement.
     let (lo, hi) = (&result.series[0].samples, &result.series[1].samples);
     assert_eq!(lo.len(), hi.len(), "both series carry the same grid");
     for (a, b) in lo.iter().zip(hi.iter()) {
@@ -2728,18 +2737,168 @@ async fn quantile_exemplars_are_placed_against_the_whole_windows_pooled_quantile
         .map(|(trace, i)| (duration_of[trace], *i))
         .collect();
     by_duration.sort_unstable();
-    let want: Vec<(i64, usize)> = DURATIONS_MS
-        .iter()
-        .map(|ms| (*ms, usize::from(*ms >= 200)))
-        .collect();
+    let want: Vec<(i64, usize)> = DURATIONS_MS.iter().map(|ms| (*ms, 0usize)).collect();
     assert_eq!(
         by_duration, want,
-        "each span belongs to the pooled quantile nearest its own duration: the six short \
-         spans to p=0.5 and the two long ones to p=1. All eight on p=0.5 is the per-BUCKET \
-         domain, where every candidate ties"
+        "every span belongs to its OWN bucket's nearest quantile, and with one span in a \
+         bucket every candidate ties, so all eight sit on the lowest p. The two long spans \
+         on p=1 is the POOLED domain, which compares against values no series draws"
     );
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QSPARSE}")).await;
+}
+
+/// **Every quantile exemplar sits on the series nearest it AT ITS OWN
+/// BUCKET, ties to the lowest `p`** — the rule stated as a property over
+/// the whole response, on a corpus where the `p=` lines move (issue #477
+/// wave 4 ruling).
+///
+/// The gate is against OUR rule, not against the reference's targets: the
+/// reference computes its placement targets by pooling every interval,
+/// and its `p=` values per interval, so its targets are not a
+/// reproducible oracle for a per-bucket rule and comparing against them
+/// would gate the divergence the ledger row records rather than the
+/// behaviour. Everything asserted here is derived from the response
+/// itself — for each exemplar, the argmin over the series of
+/// `|exemplar value - that series' sample at the exemplar's bucket|`.
+///
+/// **The corpus makes the domain observable.** Two occupied buckets: 40
+/// spans of `1..=10 ms` in one and 10 spans of `100..=190 ms` in the
+/// other, queried for `p=0.5` and `p=0.99`. The `p=0.5` LINE therefore
+/// moves — about `5 ms` at the short bucket and about `145 ms` at the
+/// long one — which is exactly the condition under which the per-bucket
+/// and pooled domains disagree. A `100 ms` span in the long bucket is
+/// nearest that bucket's `p=0.5` (`|100-145| = 45` against
+/// `|100-190| = 90`) and so lands there; pooled, the 40 short spans own
+/// the median, so the pooled `p=0.5` sits inside `1..=10 ms` and the same
+/// span is nearest the pooled `p=0.99` (`|100-190| = 90` against
+/// `|100-5| = 95`). The final assertion pins that span's placement, so a
+/// pooled implementation fails here and not only on the sparse corpus.
+#[tokio::test]
+async fn every_quantile_exemplar_sits_on_the_series_nearest_it_at_its_own_bucket() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let (admin, engine) = fresh_db(&DB_QSHIFT).await;
+    let (start_s, end_s) = aligned_past_window(40, 5);
+    let step_ms = 5_000;
+
+    let plan = plan_for(
+        &engine,
+        "{} | quantile_over_time(duration, 0.5, 0.99)",
+        start_s,
+        end_s,
+        step_ms,
+    );
+    let axis = plan.range_axis();
+    const SHORT_BUCKET: usize = 2;
+    const LONG_BUCKET: usize = 6;
+    let short_ts = axis.label_ms(SHORT_BUCKET) * 1_000_000 - 1_000;
+    let long_ts = axis.label_ms(LONG_BUCKET) * 1_000_000 - 1_000;
+    let mut rows = Vec::new();
+    let mut duration_of: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    // 40 short spans: durations 1..=10 ms, four spans each.
+    for n in 0..40i64 {
+        let idx = 91_000 + n;
+        let ms = n % 10 + 1;
+        rows.push(span_row(idx, "qm", short_ts, ms * 1_000_000, 0));
+        duration_of.insert(format!("{idx:032x}"), ms);
+    }
+    // 10 long spans: durations 100, 110, …, 190 ms.
+    for n in 0..10i64 {
+        let idx = 92_000 + n;
+        let ms = 100 + n * 10;
+        rows.push(span_row(idx, "qm", long_ts, ms * 1_000_000, 0));
+        duration_of.insert(format!("{idx:032x}"), ms);
+    }
+    insert_spans(&admin, &DB_QSHIFT, &rows).await;
+
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("the quantile range executes");
+    assert_eq!(
+        result.series.len(),
+        2,
+        "one series per quantile: {result:?}"
+    );
+    assert_eq!(double_label(&result.series[0], "p"), 0.5);
+    assert_eq!(double_label(&result.series[1], "p"), 0.99);
+
+    let value_at = |series: &pulsus_read::TraceMetricSeries, label: i64| -> f64 {
+        series
+            .samples
+            .iter()
+            .find(|(t, _)| *t == label)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("no sample at {label}: {series:?}"))
+    };
+    let short_label = axis.label_ms(SHORT_BUCKET);
+    let long_label = axis.label_ms(LONG_BUCKET);
+
+    // Anti-vacuity: the `p=0.5` LINE has to move between the two buckets,
+    // or the pooled and the per-bucket domains would have the same
+    // comparison basis and nothing below could tell them apart.
+    let median_short = value_at(&result.series[0], short_label);
+    let median_long = value_at(&result.series[0], long_label);
+    assert!(
+        median_short <= 0.02 && median_long >= 0.09,
+        "the p=0.5 line must move across the window for this corpus to discriminate: \
+         {median_short} at the short bucket, {median_long} at the long one"
+    );
+
+    // The property, over every exemplar the response carries.
+    let mut long_bucket_on_median = 0usize;
+    let mut total = 0usize;
+    for (i, series) in result.series.iter().enumerate() {
+        let p = double_label(series, "p");
+        for ex in &series.exemplars {
+            let trace = exemplar_trace(ex);
+            let ms = *duration_of
+                .get(&trace)
+                .unwrap_or_else(|| panic!("unknown trace {trace}"));
+            assert_eq!(
+                ex.value.to_bits(),
+                (ms as f64 / 1_000.0).to_bits(),
+                "p={p}: an exemplar's value is the sampled span's own duration: {ex:?}"
+            );
+            // The exemplar carries the SPAN's timestamp, not the
+            // bucket label, so the bucket it was placed in has to be
+            // recovered the same way the engine framed it.
+            let label = axis.label_for_ms(ex.timestamp_ms);
+            let at: Vec<f64> = result.series.iter().map(|s| value_at(s, label)).collect();
+            let mut best = 0usize;
+            for (j, v) in at.iter().enumerate() {
+                if (ex.value - *v).abs() < (ex.value - at[best]).abs() {
+                    best = j;
+                }
+            }
+            assert_eq!(
+                i, best,
+                "trace {trace} (value {}) sits on p={p} but the nearest series AT ITS OWN \
+                 bucket {label} is index {best} of {at:?}",
+                ex.value
+            );
+            total += 1;
+            if label == long_label && i == 0 {
+                long_bucket_on_median += 1;
+            }
+        }
+    }
+    assert!(total >= 10, "the response must carry exemplars: {total}");
+    // The discriminating case, pinned: a long-bucket span on the MEDIAN
+    // series. Pooled, the 40 short spans own the median and every one of
+    // these spans is nearer the pooled p=0.99, so a pooled implementation
+    // cannot produce this.
+    assert!(
+        long_bucket_on_median > 0,
+        "at least one long-bucket exemplar must sit on p=0.5 — that is the placement the \
+         pooled domain cannot produce; got {total} exemplars, none of them"
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_QSHIFT}")).await;
 }
 
 /// **`histogram_over_time` exemplars land on the `__bucket=` series their

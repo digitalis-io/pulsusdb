@@ -889,6 +889,27 @@ fn the_declared_inverse_restores_every_moved_section_to_its_base_bytes() {
 /// Asserted separately from the inverse so a failure names which half
 /// moved. The instant route belongs to #503 and this change moves none of
 /// its bytes.
+///
+/// **Count the instant predicates by SECTION, not by a line offset**
+/// (issue #477 wave 4 review). A hand check of `compare_status.sql` that
+/// takes every line from the start of `== compare series probe ==`
+/// onwards and counts window predicates now reports 12 range predicates
+/// beside the 7 instant ones, because this change ADDED two sections
+/// after that point — `== compare range series probe ==` (7) and
+/// `== exemplars ==` (5). The 7 instant predicates are intact and are
+/// exactly the `compare series probe` body; it is the line-offset oracle
+/// that went stale. Section-scoped, on the tree this test guards:
+///
+/// ```text
+/// compare cross-tab             7 range
+/// compare totals                2 range
+/// compare series probe          7 INSTANT   <- what this test freezes
+/// compare range series probe    7 range
+/// exemplars                     5 range
+/// ```
+///
+/// This test does the section-scoped thing already, which is why it stays
+/// green while the offset oracle does not.
 #[test]
 fn every_instant_side_section_is_byte_identical_to_base() {
     const FROZEN: [&str; 3] = ["instant (query)", "series probe", "compare series probe"];
@@ -1053,12 +1074,6 @@ fn every_exemplar_statement_returns_its_shapes_series_identity() {
                 vec![
                     "tuple(trace_id, ts, val)".to_string(),
                     "GROUP BY t\n".to_string(),
-                    // The wave-3 ruling's domain, pinned where it is
-                    // decided: the `p` values a sample is placed against
-                    // are the whole window's, merged across the range
-                    // partition by a WINDOW function — one statement and
-                    // one scan, not a second aggregation over the spans.
-                    " OVER () AS Array(Float64)) AS qs".to_string(),
                 ],
             ),
             ExemplarSeriesKey::HistogramBucket => (

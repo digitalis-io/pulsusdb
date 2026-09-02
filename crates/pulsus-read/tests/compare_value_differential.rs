@@ -55,6 +55,27 @@
 //! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
 //! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
 //!
+//! **Two differential binaries against ONE reference endpoint contaminate
+//! each other. Recorded, not fixed** (issue #477 wave 4 review). This
+//! suite's TraceQL matcher is bare `{}` — every span the reference holds
+//! in the query window is in its baseline population — and its window is
+//! wall-clock derived (`now-150s .. now-30s`, see `base` below). Its
+//! sibling [`compare_arity_differential`] pushes its own corpus to the
+//! same reference over OTLP and scopes only its QUERY, by
+//! `resource.service.name`; the spans still land in the same instance.
+//! Run the two binaries against one reference container inside the same
+//! two-and-a-half minutes and this suite counts the sibling's spans as
+//! baseline, which reads exactly like a value-parity fault. Measured that
+//! way during the wave-3 review: run together, this leg started three
+//! tests and exited 100; run against its own container it is clean.
+//!
+//! The fix is per-agent reference containers, which is already the
+//! project rule for reference containers and is what CI does — the
+//! `schema-it` job starts one reference per job. Nothing here scopes the
+//! matcher, deliberately: `{}` is the shape the parity claim is about, and
+//! narrowing it to dodge a test-isolation problem would narrow the claim
+//! with it.
+//!
 //! Clean-room: no Tempo/Grafana source, grammar, or test corpus is read —
 //! the fixtures are our own authorship and the Tempo values are read back
 //! as black-box runtime output.

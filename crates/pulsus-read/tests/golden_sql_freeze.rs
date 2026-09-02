@@ -184,7 +184,9 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 ///
 /// **Digest-only on issue #477. The corpus stays at 77 entries: all 26
 /// `traces_metrics` goldens were REGENERATED, 0 added, 0 removed**, and
-/// the 50 `traces_search` goldens are byte-identical. Three things moved
+/// the 50 `traces_search` goldens are byte-identical to the row above
+/// this one (issue #477 moves no search golden; #479 moved seven, and
+/// this row is stacked on that). Three things moved
 /// in every regenerated file at once, which is why the whole corpus half
 /// moves together.
 ///
@@ -241,19 +243,27 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// comparison. The other 20 metrics goldens and all 50 search goldens are
 /// byte-identical to the wave-1-fix corpus.
 ///
-/// **Digest-only a fourth time, on the wave-3 ruling. Still 77 entries;
-/// TWO of the 26 `traces_metrics` goldens moved and no other file did** —
-/// `quantile_over_time_multi.sql` and `docs_quantile_worked_example.sql`,
-/// the two quantile cases, and only their `exemplars` section. The
-/// placement domain became the pooled range window, so that statement now
-/// tallies a `quantilesTDigestState` per bucket beside its sample and
-/// merges those states across the range partition with a window function
-/// (`quantilesTDigestMerge(…) OVER ()`): one statement, one scan, the
-/// pooled `p` values on every row. The predicate, the window, the sampled
-/// tuple and the `groupArraySample` bound are unchanged; the other 24
-/// metrics goldens and all 50 search goldens are byte-identical to the
-/// wave-2-fix corpus.
-const PINNED_SQL_CORPUS: u64 = 0x9fab_0aa0_3987_a375;
+/// **Digest-only a fourth time, and this one is a REVERT plus a rebase.
+/// Still 77 entries.** Two things moved the number and they are
+/// independent:
+///
+/// (a) Issue #477's own change: the wave-3 pooled placement domain was
+/// withdrawn (the reference compares an exemplar against a distribution
+/// it never draws — ledger row
+/// `traceql-metrics-quantile-exemplar-placement-domain`), so
+/// `quantile_over_time_multi.sql` and `docs_quantile_worked_example.sql`
+/// went BACK to their wave-2-fix bytes: no `quantilesTDigestState` and no
+/// `quantilesTDigestMerge(…) OVER ()`, just the sampled tuple. Those two
+/// files are byte-identical to the wave-2-fix corpus and the other 24
+/// metrics goldens never moved in wave 3 or 4 at all.
+///
+/// (b) The rebase onto issue #479, whose row above this one moved SEVEN
+/// `traces_search` goldens. Issue #477 moves none of them, so the search
+/// half of the corpus is exactly #479's.
+///
+/// Both together are what this constant is over: with (a) alone it would
+/// be the wave-2-fix value, and with (b) alone #479's.
+const PINNED_SQL_CORPUS: u64 = 0x1117_67b2_9dd1_46cc;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

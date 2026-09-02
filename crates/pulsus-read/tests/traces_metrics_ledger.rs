@@ -316,6 +316,52 @@ fn the_five_metrics_geometry_ledger_entries_each_name_their_endpoint() {
             "{id}: the entry does not carry {needle:?}"
         );
     }
+    // Issue #477: the quantile exemplar's placement domain is a
+    // divergence of its own, and the row has to carry the four things
+    // the ruling requires of it — a row that only says "we use a
+    // different distribution" cannot be checked against anything.
+    //
+    // The wave-2 form of this row justified the divergence on the cost of
+    // a second scan. That was withdrawn: the reason is that the
+    // reference's comparison basis is a distribution it never draws, and
+    // a row naming the wrong reason sends the next reader to re-decide it
+    // on a benchmark. Each needle below is one of the four required
+    // clauses, so a re-narrowed row fails here rather than silently.
+    let placement = squash(entry_body(
+        &ledger,
+        "traceql-metrics-quantile-exemplar-placement-domain",
+    ));
+    assert!(
+        placement.contains("/api/traces/v1/metrics/query_range"),
+        "the placement row must name the endpoint it is about"
+    );
+    assert!(
+        placement.contains(
+            "it chooses which series an exemplar belongs to using numbers it never draws"
+        ),
+        "the row must say what is wrong with the reference's basis, not only that it differs"
+    );
+    assert!(
+        placement.contains("the numbers already in the response, which are the numbers the panel draws this exemplar beside"),
+        "the row must say what OUR basis is"
+    );
+    assert!(
+        placement.contains("Where the two visibly differ")
+            && placement.contains("many spans of `1-10 ms`"),
+        "the row must carry the constructed case where the two rules disagree visibly"
+    );
+    assert!(
+        placement.contains("That is a property of degenerate input"),
+        "the row must say the sparse-window tie behaviour is not a defect"
+    );
+    assert!(
+        placement.contains("2026-08-05-traceql-quantile-over-time-tdigest"),
+        "the row must cross-reference the ruling our placement follows from"
+    );
+    assert!(
+        !placement.contains("second scan of the same rows on the read path"),
+        "the withdrawn performance justification must not come back: the reason is that the reference compares against values it does not draw"
+    );
     // The hint's unit change is ledgered separately (ruling 1 on issue
     // #477): it is a behaviour change for existing users, not a
     // divergence from the reference.
@@ -327,68 +373,5 @@ fn the_five_metrics_geometry_ledger_entries_each_name_their_endpoint() {
     assert!(
         unit.contains("used to mean N exemplars **per bucket**"),
         "the entry must state what changed, not only what is true now"
-    );
-}
-
-/// The withdrawn wave-2 divergence leaves no trace behind.
-///
-/// The wave-2 ledger id ending `-placement-domain` recorded that a
-/// `quantile_over_time` exemplar was placed against its OWN bucket's
-/// quantiles. The wave-3 ruling withdrew it: placement is now against the
-/// pooled range window, as the reference does, so there is no divergence
-/// left to describe. A ledger row for a divergence we do not have is
-/// worse than no row — it sends a reader looking for behaviour that is
-/// not there — and a code comment or a doc sentence still citing the id
-/// is the same defect one layer down.
-///
-/// **Scope, stated so the absence claim is checkable**: the differential
-/// ledger, `docs/api.md`, `docs/schemas.md`, and every `.rs` file under
-/// `crates/pulsus-read/src/traces` and `crates/pulsus-read/tests`. That
-/// is where the row, its gate and its three citations lived. The scan is
-/// a plain substring over file bytes, so a comment cannot hide one.
-#[test]
-fn the_withdrawn_quantile_placement_divergence_is_named_nowhere() {
-    // Spelled in two pieces deliberately: written whole, this file
-    // would be its own first hit and the gate could never pass.
-    const WITHDRAWN: &str = concat!("traceql-metrics-quantile-", "exemplar-placement-domain");
-    let root = workspace_root();
-    let mut files: Vec<PathBuf> = vec![
-        root.join("docs/benchmarks/traces-differential-ledger.md"),
-        root.join("docs/api.md"),
-        root.join("docs/schemas.md"),
-    ];
-    for dir in [
-        root.join("crates/pulsus-read/src/traces"),
-        root.join("crates/pulsus-read/tests"),
-    ] {
-        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
-            let path = entry.expect("dir entry").path();
-            if path.extension().is_some_and(|e| e == "rs") {
-                files.push(path);
-            }
-        }
-    }
-    // Anti-vacuity: a scan over an empty or mistyped file list would
-    // report the same clean answer as a correct tree.
-    assert!(
-        files.len() > 20,
-        "the scan must cover the whole named scope, got {} files",
-        files.len()
-    );
-    let mut hits: Vec<String> = Vec::new();
-    for path in &files {
-        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-        for (i, line) in text.lines().enumerate() {
-            if line.contains(WITHDRAWN) {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                hits.push(format!("  {}:{}", rel.display(), i + 1));
-            }
-        }
-    }
-    assert!(
-        hits.is_empty(),
-        "the withdrawn divergence {WITHDRAWN:?} is still named — the placement domain is the \
-         pooled range window now, so nothing may describe it as a divergence:\n{}",
-        hits.join("\n")
     );
 }

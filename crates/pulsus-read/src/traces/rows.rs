@@ -289,25 +289,14 @@ pub struct MetricGroupExemplarRow {
 
 /// One per-bucket exemplar-collection row for `quantile_over_time`
 /// (`metrics_quantile_exemplar_range_sql`, issue #477 wave 2): the bucket
-/// start, a bounded `groupArraySample` of `(trace_id, timestamp_ns,
-/// duration_ns)` triples, and the POOLED quantile values. The duration is
-/// what says which `p=` series the sample belongs to, and it is also the
-/// exemplar's own value.
-///
-/// `qs` carries the requested quantiles of the WHOLE range window in
-/// request order — the same array on every row, because the statement
-/// computes it once over the whole range partition (wave-3 ruling: the
-/// placement domain is the pooled window, not the exemplar's own bucket).
-/// It repeats per row because a window function projects onto its rows;
-/// at the `MAX_METRICS_POINTS` grid cap that is 11 001 × `|q|` doubles,
-/// against up to 11 001 × `k` 32-byte sample triples in the same answer.
-/// Field order matches the SELECT list (RowBinary is positional).
-#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+/// start and a bounded `groupArraySample` of `(trace_id, timestamp_ns,
+/// duration_ns)` triples. The duration is what says which `p=` series the
+/// sample belongs to, and it is also the exemplar's own value.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricQuantileExemplarRow {
     #[serde(rename = "t")]
     pub t_ms: i64,
     pub ex: Vec<([u8; 16], i64, i64)>,
-    pub qs: Vec<f64>,
 }
 
 /// One per-bucket exemplar-collection row for `histogram_over_time`

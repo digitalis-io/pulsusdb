@@ -1,7 +1,11 @@
 Issue #477 Q26 and Q27 — the toolchain's contribution to AC10(i).
 
 Run (the script edits the working tree and restores it, so it refuses to
-start on a dirty one):
+start on a dirty one). Every restore is VERIFIED: a failed one prints the
+paths still dirty and exits 65 rather than printing "restored" and 0. The
+transcript below predates that fix — the wave-4 review found this script
+reporting a successful restore in an environment whose git index was not
+writable, and the wave-4 re-run is what the fixed script produces.
 
   CARGO_TARGET_DIR=<outside any source tree> CARGO_INCREMENTAL=0 \
     bash crates/pulsus-read/tests/fixtures/issue477/toolchain/toolchain.sh

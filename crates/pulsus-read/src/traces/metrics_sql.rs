@@ -981,7 +981,7 @@ fn exemplar_duration_inner(
 }
 
 /// The per-bucket exemplar collection query for `quantile_over_time`
-/// (issue #477 wave 2; pooled domain per the wave-3 ruling).
+/// (issue #477 wave 2).
 ///
 /// A quantile answer is one series per requested `p`, so a row that names
 /// only its time bucket cannot say which series it belongs to. What
@@ -992,58 +992,22 @@ fn exemplar_duration_inner(
 /// exemplar's value (`exemplarDuration`, `pkg/traceql/ast_metrics.go:235-239
 /// @ v3.0.2` — a non-NaN exemplar value is never overwritten by the
 /// series sample, `modules/frontend/combiner/metrics_query_range.go:278-305
-/// @ v3.0.2`). So the sample carries `(trace_id, timestamp_ns, val)`.
+/// @ v3.0.2`). So the sample carries `(trace_id, timestamp_ns, val)` and
+/// the engine does the placement against the `p` values it already has.
 ///
-/// **The `p` values it is compared against are the WHOLE window's, pooled
-/// over every bucket, not the exemplar's own bucket's.** The reference
-/// sums each interval's bucket counts into one distribution and computes
-/// the requested quantiles of THAT once per response
-/// (`aggregatedBuckets` / `quantileValues`,
-/// `pkg/traceql/engine_metrics.go:1934-1962 @ v3.0.2`), then places every
-/// exemplar against that single array — the per-interval values it draws
-/// on each series are a different computation. `qs` is therefore the same
-/// array on every row.
-///
-/// **One statement, one scan.** The pooled array is a window function
-/// over the per-bucket rows, not a second aggregation over the spans: the
-/// inner level tallies a `quantilesTDigestState` per bucket alongside the
-/// sample, and `quantilesTDigestMerge(…) OVER ()` merges those states
-/// across the whole range partition. That is structurally what the
-/// reference does — it merges per-interval distributions, it does not
-/// re-read the spans — and the merge runs over at most
-/// `MAX_METRICS_POINTS` rows, so nothing about the
-/// window's width enters its memory. `read_rows` is gated equal to the
-/// range query's in `tests/traces_metrics_explain.rs`.
-///
-/// **Cost, measured.** On the same corpus the range statement and this
-/// one each read **120 000 rows / 4 800 240 bytes** — identical, so the
-/// pooled quantiles cost nothing beyond the exemplar statement that was
-/// already there, and the request stays at two statements. Same probe.
+/// **Cost, measured.** MEASURE-HERE-QUANTILE-EXEMPLAR-COST
 pub fn metrics_quantile_exemplar_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
     step_ms: i64,
-    quantiles: &[f64],
     k: u32,
 ) -> String {
-    let inner = indent_one_level(&exemplar_duration_inner(
-        spans_table,
-        filter,
-        window,
-        step_ms,
-    ));
-    let args = quantile_args(quantiles);
+    let inner = exemplar_duration_inner(spans_table, filter, window, step_ms);
     format!(
-        "SELECT t, ex, CAST(quantilesTDigestMerge({args})(st) OVER () AS Array(Float64)) AS qs\nFROM (\n  SELECT t, groupArraySample({k}, 1)(tuple(trace_id, ts, val)) AS ex,\n         quantilesTDigestState({args})(val) AS st\n  FROM (\n    {inner}\n  )\n  GROUP BY t\n)\nORDER BY t ASC"
+        "SELECT t, groupArraySample({k}, 1)(tuple(trace_id, ts, val)) AS ex\nFROM (\n  {inner}\n)\n\
+         GROUP BY t\nORDER BY t ASC"
     )
-}
-
-/// Adds two spaces to every line but the first of an already-indented
-/// subquery body, so it can be nested one level deeper and still read as
-/// one block. The caller supplies the first line's indent.
-fn indent_one_level(sql: &str) -> String {
-    sql.replace('\n', "\n  ")
 }
 
 /// The per-bucket exemplar collection query for `histogram_over_time`
