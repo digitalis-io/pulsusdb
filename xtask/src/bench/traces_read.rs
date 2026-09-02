@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
 use pulsus_read::traces::rows::{
-    CandidateRow, HydrationRow, MembershipRow, RootRow, StoredSpanRow,
+    CandidateRow, HydrationRow, MembershipRow, RootRow, StoredSpanRow, StrValueRow,
 };
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
 use pulsus_read::traces::sql::point_read_sql;
@@ -669,7 +669,24 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
                 drain::<CandidateRow>(&client, &spec.sql, &settings).await?
             }
             "phase2_hydration" => drain::<HydrationRow>(&client, &spec.sql, &settings).await?,
-            "phase2_membership" => drain::<MembershipRow>(&client, &spec.sql, &settings).await?,
+            // The membership read has TWO shapes (issue #479): when a
+            // projection needs the probe's matched value, `membership_sql`
+            // fuses `<byte-capped val> AS v` into the SAME statement and
+            // the row is three columns; otherwise it is two. Production
+            // dispatches on exactly this accessor
+            // (`traces/exec.rs::load_batch_attrs`), and this stage measures
+            // the read production issues — so it mirrors that dispatch
+            // rather than forcing the projection off, which would measure a
+            // statement no query ever sends. The evidence query's probe is
+            // `span.http.status_code >= 500`, a range predicate, so this
+            // run takes the fused arm.
+            "phase2_membership" => {
+                if plan.probe_fuses_value(0) {
+                    drain::<StrValueRow>(&client, &spec.sql, &settings).await?
+                } else {
+                    drain::<MembershipRow>(&client, &spec.sql, &settings).await?
+                }
+            }
             "root_hydration" => drain::<RootRow>(&client, &spec.sql, &settings).await?,
             other => anyhow::bail!("unknown stage {other:?}"),
         };
