@@ -1789,6 +1789,7 @@ dependencies = [
  "pulsus-testkit",
  "pulsus-traceql",
  "pulsus-write",
+ "quote",
  "regex",
  "serde",
  "serde_bytes",

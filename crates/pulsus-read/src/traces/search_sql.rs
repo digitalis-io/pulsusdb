@@ -219,14 +219,30 @@ pub fn hydration_sql(
 /// `SELECT DISTINCT` dedups the `ReplacingMergeTree`/at-least-once
 /// duplicates, the `(key[, val][, scope])` prefix + date/time pruning
 /// keep it index-served, and the candidate restriction bounds it.
+/// **`with_value` FUSES the matched value into the same read** (issue
+/// #479): a probe whose matched value a projection needs adds
+/// `<byte-capped val> AS v` to the SAME statement rather than issuing a
+/// second one. The value predicate has already forced the `val` column to
+/// be read inside the selected granules, so the projection is
+/// granule-neutral — pinned as an identity by
+/// `tests/traces_search_explain.rs` (`EXPLAIN indexes = 1`, no pinned
+/// granule count, no wall-time). The cap is [`byte_cap_expr`], the same
+/// one [`hydration_sql`] applies, so a projected value obeys the same
+/// 8192-byte source truncation as every other projected string.
 pub fn membership_sql(
     attrs_table: &str,
     predicate: &str,
     trace_ids: &[[u8; 16]],
     window: TimeWindow,
+    with_value: bool,
 ) -> String {
+    let projection = if with_value {
+        format!("trace_id, span_id, {} AS v", byte_cap_expr("val"))
+    } else {
+        "trace_id, span_id".to_string()
+    };
     format!(
-        "SELECT DISTINCT trace_id, span_id\n\
+        "SELECT DISTINCT {projection}\n\
          FROM {attrs_table}\n\
          WHERE {}\n  AND ({predicate})\n  AND {}\n  AND {}",
         date_clause(window),
@@ -663,7 +679,7 @@ mod tests {
             100,
         );
         assert!(!generator.contains("substringUTF8"), "{generator}");
-        let membership = membership_sql("trace_attrs_idx", "key = 'foo'", &[[7u8; 16]], W);
+        let membership = membership_sql("trace_attrs_idx", "key = 'foo'", &[[7u8; 16]], W, false);
         assert!(!membership.contains("substringUTF8"), "{membership}");
         // The child-count co-load returns no strings — no cap expression.
         let child_counts = child_count_sql("trace_spans", &[[7u8; 16]]);

@@ -983,10 +983,13 @@ async fn search_semantics_against_real_clickhouse() {
     );
     let json = res.json("case i");
     assert_eq!(trace_set(&json), ids(&[13]), "case i set");
+    // Issue #479: the projected key is the BARE attribute name — the
+    // reference carries the scope as a separate field of its own attribute
+    // struct and sends `foo`, never `span.foo`.
     assert_eq!(
         json["traces"][0]["spanSets"][0]["spans"][0]["attributes"][0],
-        serde_json::json!({"key": "span.foo", "value": {"stringValue": "x"}}),
-        "case i: selected field present, body {json}"
+        serde_json::json!({"key": "foo", "value": {"stringValue": "x"}}),
+        "case i: selected field present under the bare key, body {json}"
     );
 
     // -- (k) functional spss: summaries capped, matched reports total. ----
@@ -1823,4 +1826,346 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
         BTreeSet::from([hex(&tid(1))]),
         "{ctx}: the 422 above must be the BUDGET, not a permanently failing query"
     );
+}
+
+/// Issue #479 — the matched-span projection, end to end over the real
+/// ingest and read paths.
+///
+/// Three criteria in one spawn, because they share one corpus:
+///
+/// * **AC2** — `name` is emitted IFF a name value was collected for that
+///   span, asserted as an exact presence VECTOR over five named queries. A
+///   permutation is the break: an unconditional emitter fails positions
+///   4–5, a never-emitter fails 1–3, and a `contains`-style "some span has
+///   a name" check passes BOTH, so the vector is the gate.
+/// * **AC3** — the rule is per SPAN, not per query, under `||`, with a
+///   positive control on the same span and the same key.
+/// * **AC4** — the seven envelope fields are never projected, in either
+///   position (as a condition and inside `select()`).
+#[tokio::test]
+async fn the_matched_span_projection_follows_the_reference_rule() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_220;
+    let db = &pulsus_testkit::test_db("pulsus_traces_projection_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    // One trace, four spans, two resources — the corpus the projection
+    // rule needs: a span that matches one branch of a disjunction while
+    // STORING the other branch's key, a scope collision on one key, and a
+    // numeric attribute.
+    ingest(
+        port,
+        vec![
+            span(
+                tid(1),
+                sid(1),
+                None,
+                "GET /pay",
+                ts(base, 10),
+                2_000 * MS,
+                vec![
+                    kv_str("http.method", "GET"),
+                    kv_int("http.status_code", 500),
+                    kv_str("foo", "S-span"),
+                    kv_str("note", ""),
+                ],
+            ),
+            span(
+                tid(1),
+                sid(2),
+                Some(sid(1)),
+                "charge",
+                ts(base, 11),
+                500 * MS,
+                vec![kv_str("http.method", "POST")],
+            ),
+            span(
+                tid(1),
+                sid(11),
+                Some(sid(1)),
+                "GET /pay/confirm",
+                ts(base, 12),
+                1_500 * MS,
+                vec![kv_str("http.method", "GET")],
+            ),
+        ],
+        vec![
+            kv_str("service.name", "proj-checkout"),
+            kv_str("foo", "R-resource"),
+        ],
+        "seed #479 checkout spans",
+    );
+    ingest(
+        port,
+        vec![span(
+            tid(1),
+            sid(21),
+            Some(sid(1)),
+            "slow-op",
+            ts(base, 13),
+            3_000 * MS,
+            vec![kv_str("http.method", "DELETE")],
+        )],
+        vec![kv_str("service.name", "proj-db")],
+        "seed #479 db span",
+    );
+
+    /// Every span object in the first spanSet, in response order.
+    fn spans_of(json: &serde_json::Value) -> Vec<serde_json::Value> {
+        json["traces"][0]["spanSets"][0]["spans"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// The projected `(key, value)` pairs of one span object.
+    fn attrs_of(span: &serde_json::Value) -> Vec<(String, String)> {
+        span["attributes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|a| {
+                (
+                    a["key"].as_str().unwrap_or_default().to_string(),
+                    a["value"]["stringValue"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+    let span_by_id = |json: &serde_json::Value, id: &str| -> serde_json::Value {
+        spans_of(json)
+            .into_iter()
+            .find(|s| s["spanID"] == id)
+            .unwrap_or_else(|| panic!("span {id} absent from {json}"))
+    };
+
+    // ---- AC2: the presence VECTOR over five named queries --------------
+    let name_cases: [(&str, bool); 5] = [
+        (r#"{ name = "GET /pay" }"#, true),
+        (r#"{ name = "GET /pay" && duration > 1s }"#, true),
+        (r#"{ name != "" }"#, true),
+        (r#"{ duration > 1s }"#, false),
+        (r#"{}"#, false),
+    ];
+    let observed: Vec<bool> = name_cases
+        .iter()
+        .map(|(q, _)| {
+            let json = search(port, q, w0, w1, "", q).json(q);
+            let spans = spans_of(&json);
+            assert!(!spans.is_empty(), "{q}: must match at least one span");
+            let present: Vec<bool> = spans.iter().map(|s| s.get("name").is_some()).collect();
+            assert!(
+                present.iter().all(|p| *p == present[0]),
+                "{q}: every matched span answers the same way; got {present:?}"
+            );
+            // Neither of the two wrong bodies is ever acceptable.
+            let raw = serde_json::to_string(&json).expect("serialise");
+            assert!(!raw.contains("\"name\":null"), "{q}: {raw}");
+            assert!(!raw.contains("\"name\":\"\""), "{q}: {raw}");
+            present[0]
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        name_cases.iter().map(|(_, want)| *want).collect::<Vec<_>>(),
+        "AC2: the name-presence vector over {:?}",
+        name_cases.iter().map(|(q, _)| *q).collect::<Vec<_>>()
+    );
+
+    // ---- AC3: the rule is per SPAN, not per query ----------------------
+    let q = r#"{ name = "slow-op" || span.http.method = "GET" }"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    let slow = span_by_id(&json, &hex(&sid(21)));
+    assert_eq!(
+        slow.get("name").and_then(|v| v.as_str()),
+        Some("slow-op"),
+        "the span that matched the NAME branch carries its name, body {json}"
+    );
+    assert!(
+        attrs_of(&slow).is_empty(),
+        "…and NO http.method, though it stores DELETE — the branch that would have projected it \
+         did not match for this span, body {json}"
+    );
+    let pay = span_by_id(&json, &hex(&sid(1)));
+    assert!(
+        pay.get("name").is_none(),
+        "the span that matched the METHOD branch carries no name, body {json}"
+    );
+    assert_eq!(
+        attrs_of(&pay),
+        vec![("http.method".to_string(), "GET".to_string())],
+        "…and its own stored value, body {json}"
+    );
+    // The positive control: the SAME span, the SAME key, under a condition
+    // that does match it. Absence above is the disjunction's doing, not a
+    // key that never projects.
+    let q = r#"{ span.http.method = "DELETE" }"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    assert_eq!(
+        attrs_of(&span_by_id(&json, &hex(&sid(21)))),
+        vec![("http.method".to_string(), "DELETE".to_string())],
+        "control: the same span DOES carry http.method when the condition matched it, body {json}"
+    );
+
+    // ---- AC4: the seven are never projected, in EITHER position --------
+    let envelope: &[&str] = &[
+        r#"{ duration > 1s }"#,
+        r#"{} | select(duration)"#,
+        r#"{ traceDuration > 1s }"#,
+        r#"{ rootServiceName = "proj-checkout" }"#,
+        r#"{ rootName = "GET /pay" }"#,
+        r#"{ trace:id = "01010101010101010101010101010101" }"#,
+        r#"{ span:id = "0101010101010101" }"#,
+        r#"{} | select(span:id)"#,
+        r#"{} | select(trace:id)"#,
+    ];
+    for q in envelope {
+        let json = search(port, q, w0, w1, "", q).json(q);
+        for s in spans_of(&json) {
+            assert!(
+                s.get("attributes").is_none(),
+                "{q}: an envelope field must never become an attribute, span {s}"
+            );
+        }
+    }
+    // `name` in BOTH positions: it fills the response's own `name` field
+    // and never an `attributes` entry.
+    for q in [r#"{ name = "GET /pay" }"#, r#"{} | select(name)"#] {
+        let json = search(port, q, w0, w1, "", q).json(q);
+        for s in spans_of(&json) {
+            assert!(s.get("name").is_some(), "{q}: {s}");
+            assert!(s.get("attributes").is_none(), "{q}: {s}");
+        }
+    }
+    // `{} | select(span:id)` stays byte-identical to `{}` — the existing
+    // skip is untouched by this issue.
+    let plain = search(port, "{}", w0, w1, "", "plain").body.clone();
+    let with_id = search(
+        port,
+        r#"{} | select(span:id)"#,
+        w0,
+        w1,
+        "",
+        "select span:id",
+    )
+    .body
+    .clone();
+    assert_eq!(plain, with_id, "select(span:id) must add nothing at all");
+
+    // ---- the projection's own value classes, on the wire ---------------
+    // The scope collision: two entries under ONE key, never de-duplicated.
+    let q = r#"{ span.foo = "S-span" && resource.foo = "R-resource" }"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    let mut pairs = attrs_of(&span_by_id(&json, &hex(&sid(1))));
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("foo".to_string(), "R-resource".to_string()),
+            ("foo".to_string(), "S-span".to_string()),
+        ],
+        "the identity is (scope, key), never the wire key, body {json}"
+    );
+    // The fused value: each span carries its OWN stored value, not the
+    // query's pattern. An implementation that reused the probe literal for
+    // a regex probe would emit `GE.*|PO.*` on both spans and pass every
+    // other case here.
+    let q = r#"{ span.http.method =~ "GE.*|PO.*" }"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    for (id, want) in [(sid(1), "GET"), (sid(2), "POST"), (sid(11), "GET")] {
+        assert_eq!(
+            attrs_of(&span_by_id(&json, &hex(&id))),
+            vec![("http.method".to_string(), want.to_string())],
+            "each span carries its own stored value, body {json}"
+        );
+    }
+    // An empty attribute VALUE is emitted; an empty NAME is omitted.
+    let q = r#"{ span.note = "" }"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    let s = span_by_id(&json, &hex(&sid(1)));
+    assert_eq!(
+        attrs_of(&s),
+        vec![("note".to_string(), String::new())],
+        "an empty value is a value, not an absence, body {json}"
+    );
+    assert!(s.get("name").is_none(), "body {json}");
+    // A numeric attribute renders as a string in this wave (typing is a
+    // separate issue); the KEY is the bare one either way.
+    let q = r#"{ span.http.status_code >= 500 }"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    assert_eq!(
+        attrs_of(&span_by_id(&json, &hex(&sid(1)))),
+        vec![("http.status_code".to_string(), "500".to_string())],
+        "body {json}"
+    );
+    // A condition and a `select()` of the SAME field dedupe to ONE entry.
+    let q = r#"{ span.http.method = "GET" } | select(span.http.method)"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    assert_eq!(
+        attrs_of(&span_by_id(&json, &hex(&sid(1)))),
+        vec![("http.method".to_string(), "GET".to_string())],
+        "one group per field identity, body {json}"
+    );
+    // A comparison whose two operands are the SAME field is a single-field
+    // condition and projects that field ON THE WIRE (code review wave 1).
+    // Asserted here as well as in the engine-level differential because
+    // `name` lands in a different response field from an attribute, and
+    // only this suite reads the rendered body.
+    // `spss=10` because this matches all FOUR spans and the route's
+    // default spans-per-spanset is 3.
+    let q = r#"{ span.http.method = span.http.method }"#;
+    let json = search(port, q, w0, w1, "&spss=10", q).json(q);
+    for (id, want) in [
+        (sid(1), "GET"),
+        (sid(2), "POST"),
+        (sid(11), "GET"),
+        (sid(21), "DELETE"),
+    ] {
+        assert_eq!(
+            attrs_of(&span_by_id(&json, &hex(&id))),
+            vec![("http.method".to_string(), want.to_string())],
+            "a same-field comparison projects the compared field, body {json}"
+        );
+    }
+    let q = "{ name = name }";
+    let json = search(port, q, w0, w1, "&spss=10", q).json(q);
+    assert_eq!(
+        spans_of(&json).len(),
+        4,
+        "{q}: every span matches, body {json}"
+    );
+    for s in spans_of(&json) {
+        assert!(
+            s.get("name").is_some(),
+            "{q}: `name` fills the response's own field, span {s}"
+        );
+        assert!(
+            s.get("attributes").is_none(),
+            "{q}: …and never an attributes entry, span {s}"
+        );
+    }
+    // The wave-2 gap, pinned as OUR behaviour so a later wave has a diff
+    // to move: a negated attribute leaf projects nothing (the reference
+    // emits the span's stored value; ledger row
+    // `traceql-matched-span-negated-attribute-value-absent`).
+    let q = r#"{ span.http.method != "GET" }"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    for s in spans_of(&json) {
+        assert!(
+            s.get("attributes").is_none(),
+            "wave-2: a negated attribute leaf projects nothing, span {s}"
+        );
+    }
+
+    drop_db(db).await;
 }

@@ -721,6 +721,47 @@ jobs:
           PULSUSDB_GROUPING_OTLP_URL: "http://localhost:4318"
         run: cargo test -p pulsus-read --test traces_search_grouping_differential
 
+      # Issue #479: the matched-span PROJECTION differential, ENFORCED
+      # (non-skipped). Pushes ONE OTLP/JSON body to its own instance's OTLP
+      # receiver and decodes those same bytes through our own ingest
+      # parser, then compares, per matched span, the multiset of projected
+      # attribute keys and the `name`-present flag over a 35-case registry.
+      #
+      # ITS OWN INSTANCE, not the shared `pulsus-tempo-diff` above (code
+      # review wave 1): this corpus's statusMessage / service / root names
+      # enter the compare() leg's top-N, and the resulting failure surfaces
+      # in THAT suite as an ordinary-looking value mismatch against the
+      # reference. The suite refuses to run against an instance holding any
+      # other trace, and a hermetic test in the same file fails if any
+      # other leg is ever pointed at these two endpoints.
+      #
+      # FAIL-CLOSED: all three gates go through pulsus_testkit's require_*
+      # guards, so dropping this env block panics rather than reporting
+      # green.
+      - name: Start Tempo v3.0.2 (matched-span projection oracle)
+        run: |
+          docker run -d --name pulsus-tempo-479 -p 13480:3200 -p 14480:4318 \
+            -v "$GITHUB_WORKSPACE"/ci/tempo/tempo-compare.yaml:/etc/tempo/tempo.yaml:ro \
+            grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7 \
+            -config.file=/etc/tempo/tempo.yaml
+          for _ in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:13480/ready)" = "200" ] && break
+            sleep 1
+          done
+          curl -sf http://localhost:13480/ready
+
+      - name: TraceQL Tempo differential leg (matched-span projection)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_PROJECTION_DIFF_URL: "http://localhost:13480"
+          PULSUSDB_PROJECTION_OTLP_URL: "http://localhost:14480"
+        run: cargo test -p pulsus-read --test traces_search_projection_differential
+
+      - name: Stop Tempo matched-span projection oracle
+        if: always()
+        run: docker rm -f pulsus-tempo-479 || true
+
       # Issue #458: the metrics-FILTER accept surface, oracle half. Replays
       # every probe in crates/pulsus-read/tests/fixtures/metrics_filter_accept.json
       # against the SAME digest-pinned oracle and asserts every committed

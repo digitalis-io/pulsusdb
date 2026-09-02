@@ -165,7 +165,23 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 50), ("traces_metrics", 2
 /// new lowering is reached only where the old code returned `Err`, so
 /// `git diff --stat crates/pulsus-read/tests/golden/` shows one addition
 /// and no modification. The digest moves because the corpus grew.
-const PINNED_SQL_CORPUS: u64 = 0x5cfb_2b8b_0af8_817a;
+///
+/// 77 -> 77 (issue #479): **7 modified, none added.** The matched-span
+/// projection fuses the matched `val` into the membership read of every
+/// probe whose value a projection needs, so
+/// `SELECT DISTINCT trace_id, span_id` becomes
+/// `SELECT DISTINCT trace_id, span_id, <byte-capped val> AS v` in exactly
+/// the seven `traces_search` goldens whose `phase2 membership` predicate
+/// is not a plain `val = '…'` string equality:
+/// `arith_attr_pushdown.sql`, `arith_fold.sql`,
+/// `clustered_worked_example.sql`, `event_time_since_start_gt.sql`,
+/// `existence_present.sql`, `val_num_range.sql`, `worked_example.sql`.
+/// `existence_absent.sql` (`{ .a = nil }`) is the control and does NOT
+/// move: its membership SQL is byte-identical to `existence_present`'s,
+/// so the SQL alone cannot discriminate them — the negation does, and a
+/// negated leaf projects nothing. `git diff --name-only -- /// crates/pulsus-read/tests/golden/traces_search/` shows exactly those
+/// seven, and `CORPORA`'s count stays `50`.
+const PINNED_SQL_CORPUS: u64 = 0x29bb_2bb8_568a_3382;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -99,8 +99,8 @@ use super::rows::{
     TagNameRow, TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
-    self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, SpanKey, SpanSetGroup,
-    SpanSummary, TraceCtxInfo, TraceMatch, TraceSpans,
+    self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
+    SpanSetGroup, SpanSummary, TraceCtxInfo, TraceMatch, TraceSpans,
 };
 use super::search_plan::{SearchCtx, SearchPlan};
 use super::tag_narrow::{TagNarrowing, narrowing_from_query};
@@ -2130,7 +2130,11 @@ impl TraceEngine {
                 // pathological) falls back to its matched-span metadata
                 // rather than being silently dropped.
                 None => {
-                    let name_len = w.spans.first().map(|s| s.name.len()).unwrap_or(0);
+                    let name_len = w
+                        .spans
+                        .first()
+                        .and_then(SpanSummary::name)
+                        .map_or(0, str::len);
                     budget.charge(name_len)?;
                     fallback_trace_context(&w.spans, w.sort_key)
                 }
@@ -2210,19 +2214,47 @@ impl TraceEngine {
                 &sql,
                 Some(("probe = ", &plan.probes[probe_idx].key)),
             )?;
-            let rows: Vec<MembershipRow> = self
-                .collect_rows_charged(
-                    &sql,
-                    settings,
-                    budget,
-                    batch_charged,
-                    map_trace_read_error,
-                    |_| MEMBERSHIP_ENTRY_BYTES,
-                )
-                .await?;
-            attrs
-                .membership
-                .push(rows.into_iter().map(|r| (r.trace_id, r.span_id)).collect());
+            // Issue #479: a probe whose matched VALUE a projection needs
+            // decodes the SAME read's fused `v` column. RowBinary is
+            // positional, so `StrValueRow` reads the three-column
+            // projection with no new row type and no second statement —
+            // the pattern the `select()` value read already uses.
+            if plan.probe_fuses_value(probe_idx) {
+                let rows: Vec<StrValueRow> = self
+                    .collect_rows_charged(
+                        &sql,
+                        settings,
+                        budget,
+                        batch_charged,
+                        map_trace_read_error,
+                        |row: &StrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
+                    )
+                    .await?;
+                let mut map = HashMap::with_capacity(rows.len());
+                for row in rows {
+                    // `SELECT DISTINCT trace_id, span_id, v` can return
+                    // several rows for one span under a range / regex /
+                    // existence predicate. The FIRST wins; the reference
+                    // also keeps one arbitrary value (its collector is a
+                    // map).
+                    map.entry((row.trace_id, row.span_id)).or_insert(row.v);
+                }
+                attrs.membership.push(ProbeMembership::Values(map));
+            } else {
+                let rows: Vec<MembershipRow> = self
+                    .collect_rows_charged(
+                        &sql,
+                        settings,
+                        budget,
+                        batch_charged,
+                        map_trace_read_error,
+                        |_| MEMBERSHIP_ENTRY_BYTES,
+                    )
+                    .await?;
+                attrs.membership.push(ProbeMembership::Keys(
+                    rows.into_iter().map(|r| (r.trace_id, r.span_id)).collect(),
+                ));
+            }
         }
         for field_idx in 0..plan.agg_fields.len() {
             let sql = plan.agg_values_sql_for(field_idx, batch_ids);
@@ -3039,7 +3071,16 @@ fn fallback_trace_context(spans: &[SpanSummary], sort_key: i64) -> TraceContext 
     TraceContext {
         root: RootSummary {
             service: String::new(),
-            name: spans.first().map(|s| s.name.clone()).unwrap_or_default(),
+            // Issue #479: the matched span carries a name only when the
+            // query collected one, and the first matched span's name is
+            // not the root's name in any case. An uncollected name
+            // becomes the empty string here, which is consistent with
+            // the two fields this path already refuses to invent.
+            name: spans
+                .first()
+                .and_then(SpanSummary::name)
+                .unwrap_or_default()
+                .to_string(),
             start_ns,
             duration_ns: 0,
         },
@@ -4065,13 +4106,19 @@ mod tests {
             trace_id: tid(1),
             sort_key: 1,
             matched: 1,
-            spans: vec![SpanSummary {
-                span_id: [1; 8],
-                name: "n".repeat(10),
-                start_ns: 1,
-                duration_ns: 1,
-                attributes: vec![("k".to_string(), "v".to_string())],
-            }],
+            spans: vec![SpanSummary::new(
+                [1; 8],
+                Some("n".repeat(10)),
+                1,
+                1,
+                vec![search_eval::ProjectedAttribute::new(
+                    &pulsus_traceql::Field::Attribute {
+                        scope: pulsus_traceql::AttrScope::Span,
+                        key: "k".to_string(),
+                    },
+                    "v".to_string(),
+                )],
+            )],
             groups: None,
         };
         assert!(
@@ -4324,13 +4371,13 @@ mod tests {
     /// can be pinned here without an engine.
     #[test]
     fn the_ttl_race_fallback_reports_the_matched_span_start_and_a_zero_width() {
-        let matched = SpanSummary {
-            span_id: [7u8; 8],
-            name: "matched".to_string(),
-            start_ns: 1_700_000_000_000_000_000,
-            duration_ns: 7_777,
-            attributes: vec![],
-        };
+        let matched = SpanSummary::new(
+            [7u8; 8],
+            Some("matched".to_string()),
+            1_700_000_000_000_000_000,
+            7_777,
+            vec![],
+        );
         let ctx = fallback_trace_context(std::slice::from_ref(&matched), 42);
         assert_eq!(ctx.root.service, "");
         assert_eq!(ctx.root.name, "matched");

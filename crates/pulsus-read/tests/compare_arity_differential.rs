@@ -639,6 +639,16 @@ async fn compare_arity_differential() {
         return;
     };
 
+    // The reverse-order half of the projection leg's isolation hazard
+    // (issue #479, code review wave 2) — the same guard the value leg
+    // carries, because this leg reads the same compare() aggregate from
+    // the same shared instance.
+    pulsus_testkit::assert_reference_instance_is_free_of(
+        &api_base,
+        pulsus_testkit::PROJECTION_DIFFERENTIAL_TRACE_HEX,
+        "the matched-span projection differential",
+    );
+
     // Anchor ~90 s in the PAST and query a window that also ENDS in the
     // past, so every reference bucket the query touches is already
     // finalised and no read waits on a future wall-clock boundary. See

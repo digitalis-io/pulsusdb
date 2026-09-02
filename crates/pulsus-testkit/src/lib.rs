@@ -121,6 +121,18 @@ pub const CLICKHOUSE_GATE: &str = "PULSUS_TEST_CLICKHOUSE";
 /// The gate on the suites that additionally need a TLS-enabled ClickHouse.
 pub const CLICKHOUSE_TLS_GATE: &str = "PULSUS_TEST_CLICKHOUSE_TLS";
 
+/// The trace id the matched-span PROJECTION differential
+/// (`crates/pulsus-read/tests/traces_search_projection_differential.rs`,
+/// issue #479) pushes into its own reference instance.
+///
+/// It lives here, and not in that suite, because a SECOND suite has to be
+/// able to recognise the residue: that corpus enters a `compare()` top-N
+/// and the resulting failure surfaces in the other suite as an ordinary
+/// value mismatch against the reference. `compare_value_differential`
+/// refuses to run against an instance holding this trace, and naming the
+/// constant once is what stops the two suites drifting to different ids.
+pub const PROJECTION_DIFFERENTIAL_TRACE_HEX: &str = "a4790000000000000000000000000001";
+
 /// GitHub Actions job ids that may execute a gated test binary with no
 /// gate set. Only the hermetic lane qualifies: it runs
 /// `cargo test --workspace` with no container, so the gated suites are
@@ -631,11 +643,313 @@ pub fn settle_by<T: Clone + PartialEq + std::fmt::Debug>(
     );
 }
 
+/// The trace reference's build, as its own build-info route reports it.
+///
+/// Every trace differential leg in this workspace is pointed at ONE pinned
+/// container image (`.github/workflows/ci.yml` starts three instances of
+/// it), and this is the build that image reports. Asserted, not recorded:
+/// see [`assert_traces_reference_identity`].
+pub const TRACES_REFERENCE_BUILD_VERSION: &str = "v3.0.2";
+
+/// The source revision the same route reports for that build — the commit
+/// this workspace's trace conformance is written against.
+pub const TRACES_REFERENCE_BUILD_REVISION: &str = "0c4b926d0";
+
+/// Every field the reference's build-info envelope carries. All six must
+/// be present and be JSON strings; two of them are also pinned to a value.
+const TRACES_REFERENCE_BUILD_INFO_FIELDS: [&str; 6] = [
+    "version",
+    "revision",
+    "branch",
+    "buildUser",
+    "buildDate",
+    "goVersion",
+];
+
+/// The one string-valued field `name` of a flat JSON object, or `None`.
+///
+/// A deliberate hand parse rather than a JSON crate: this crate is
+/// dependency-free by design (see the note on `[dependencies]` in its
+/// manifest), and every test binary in the workspace links it. It reads
+/// only what it needs — `"name"`, optional space, `:`, optional space, a
+/// quoted string with `\`-escapes — and returns `None` for anything else,
+/// so a body that merely MENTIONS the field name does not satisfy it.
+fn json_string_field(body: &str, name: &str) -> Option<String> {
+    let key = format!("\"{name}\"");
+    let mut from = 0usize;
+    loop {
+        let at = body[from..].find(&key)? + from;
+        let rest = body[at + key.len()..].trim_start();
+        from = at + key.len();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => return Some(out),
+                '\\' => out.push(chars.next()?),
+                other => out.push(other),
+            }
+        }
+        return None;
+    }
+}
+
+/// Establish that `api_base` is answered by the PINNED TRACE REFERENCE and
+/// not by something else listening on that port (issue #479, code review
+/// wave 3).
+///
+/// **Why a guard needs this.** The two isolation guards below and in
+/// `crates/pulsus-read/tests/traces_search_projection_differential.rs`
+/// conclude "this instance holds no other suite's data" from an empty
+/// search envelope, empty tag arrays, or a `404`. Every one of those
+/// answers is trivially produced by a service that is not the reference at
+/// all — a stale container on a reused port, another suite's server, a
+/// proxy — so before wave 3 an unrelated service on the endpoint SATISFIED
+/// both guards. Emptiness only means "free of other data" once the
+/// responder is known to be the instance the suite thinks it is talking to.
+///
+/// **What it establishes.** `GET {api_base}/api/status/buildinfo` answers
+/// `200` with a flat JSON object carrying all six of
+/// [`TRACES_REFERENCE_BUILD_INFO_FIELDS`] as strings, whose `version` and
+/// `revision` are [`TRACES_REFERENCE_BUILD_VERSION`] and
+/// [`TRACES_REFERENCE_BUILD_REVISION`]. Fail-closed throughout: a
+/// transport failure, a non-200, an unparseable body or a missing field is
+/// a panic, never an accepted answer.
+///
+/// **What it does NOT establish, stated so it is not read as more.**
+///
+/// * It authenticates the SERVICE AND BUILD, not the INSTANCE. Two
+///   containers of the same pinned image are indistinguishable here; that
+///   is what the endpoint-identity checks in the projection differential
+///   are for, and they are a separate mechanism.
+/// * A responder that deliberately replays this envelope passes. The
+///   hazard it is built for is an accidental one — some other service
+///   answering on a port this run assumed was the reference's — not an
+///   adversary.
+/// * It says nothing about what the instance HOLDS. That is the caller's
+///   own check, which runs after this one.
+pub fn assert_traces_reference_identity(api_base: &str) {
+    let url = format!("{}/api/status/buildinfo", api_base.trim_end_matches('/'));
+    let out = std::process::Command::new("curl")
+        .args(["-s", "-w", "\n%{http_code}", "--max-time", "20"])
+        .arg(&url)
+        .output()
+        .unwrap_or_else(|e| panic!("curl {url} could not be run: {e}"));
+    assert!(
+        out.status.success(),
+        "the reference identity check could not reach {url}: curl exited {:?}: {}\nA suite that \
+         cannot confirm WHAT is answering on this endpoint cannot conclude anything from what it \
+         answers.",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = String::from_utf8_lossy(&out.stdout);
+    let (payload, status) = body
+        .rsplit_once('\n')
+        .unwrap_or_else(|| panic!("curl {url} wrote no status line: {body:?}"));
+    assert_eq!(
+        status.trim(),
+        "200",
+        "{url} answered HTTP {} — body {payload:?}. The pinned reference answers this route; \
+         whatever is on this endpoint is not it.",
+        status.trim()
+    );
+    let fields: Vec<(&str, String)> = TRACES_REFERENCE_BUILD_INFO_FIELDS
+        .into_iter()
+        .map(|field| {
+            let value = json_string_field(payload, field).unwrap_or_else(|| {
+                panic!(
+                    "{url} returned {payload:?}, which carries no string field {field:?}. The \
+                     pinned reference's build-info envelope carries all of \
+                     {TRACES_REFERENCE_BUILD_INFO_FIELDS:?}; whatever is on this endpoint is \
+                     not it."
+                )
+            });
+            (field, value)
+        })
+        .collect();
+    let pinned = |field: &str| -> &str {
+        fields
+            .iter()
+            .find(|(f, _)| *f == field)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("{field} was just read from {url}"))
+    };
+    assert_eq!(
+        (pinned("version"), pinned("revision")),
+        (
+            TRACES_REFERENCE_BUILD_VERSION,
+            TRACES_REFERENCE_BUILD_REVISION
+        ),
+        "{url} reports build {fields:?}, not the pinned \
+         {TRACES_REFERENCE_BUILD_VERSION}/{TRACES_REFERENCE_BUILD_REVISION}. This suite's \
+         expectations are that build's behaviour."
+    );
+}
+
+/// Refuse to run against a reference instance that already holds
+/// `trace_hex` (issue #479, code review wave 2).
+///
+/// The matched-span projection differential fills its instance with a
+/// corpus that enters a `compare()` top-N. If a suite that reads such an
+/// aggregate is then pointed at the same instance, it fails with a value
+/// mismatch against the reference — a failure that reads exactly like a
+/// parity defect in the code under review, and cost one review round. The
+/// projection suite refuses an instance that is not empty; this is the
+/// other direction, the one it cannot check for itself, because its
+/// corpus is only resident AFTER it has run.
+///
+/// Fail-closed: only an explicit `404` from the AUTHENTICATED reference
+/// counts as absent. A transport error, any other status, or a `200` are
+/// all refusals — a guard that reads "not present" from a request that
+/// failed passes precisely when it cannot see.
+///
+/// **The response classes this guard treats as free, measured — exactly
+/// one of them (issue #479, code review wave 3).** Rows 1-4 and 7-8 are
+/// answered by a loopback responder; rows 1-4 and 7 serve the reference's
+/// own build-info envelope on the identity route, so the row isolates the
+/// TRACE route, and row 8 does not.
+///
+/// | # | what answers `/api/traces/{trace_hex}` | verdict | rejected at |
+/// |---|---|---|---|
+/// | 1 | `200` carrying the trace | REJECTED | trace route |
+/// | 2 | `200` with an empty envelope | REJECTED | trace route |
+/// | 3 | `404` | **FREE — the only one** | — |
+/// | 4 | `503` | REJECTED | trace route |
+/// | 5 | no answer within `--max-time` | REJECTED | identity route |
+/// | 6 | connection refused | REJECTED | identity route |
+/// | 7 | `200` with a malformed body | REJECTED | trace route |
+/// | 8 | a DIFFERENT service on the port | REJECTED | identity route |
+///
+/// Row 8 is the wave-3 finding: before
+/// [`assert_traces_reference_identity`] ran first, an unrelated service
+/// answering `404` — the ordinary answer for an unknown path — satisfied
+/// this guard outright.
+pub fn assert_reference_instance_is_free_of(api_base: &str, trace_hex: &str, owner: &str) {
+    // WHO is answering, before anything is read into what it answers.
+    assert_traces_reference_identity(api_base);
+    let url = format!("{}/api/traces/{trace_hex}", api_base.trim_end_matches('/'));
+    let out = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "20",
+        ])
+        .arg(&url)
+        .output()
+        .unwrap_or_else(|e| panic!("curl {url} could not be run: {e}"));
+    assert!(
+        out.status.success(),
+        "curl {url} exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(
+        code, "404",
+        "the reference at {api_base} answered HTTP {code} for trace {trace_hex}, the corpus \
+         {owner} pushes. Anything but 404 means this instance is not exclusively this suite's: \
+         {owner}'s spans enter compare()'s top-N and this suite would then report a value \
+         mismatch against the reference that looks like a parity defect. Give each leg its own \
+         instance."
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const VAR: &str = CLICKHOUSE_GATE;
+
+    /// The pinned reference's build-info body, captured verbatim from the
+    /// pinned image on 2026-09-02 (`curl -s
+    /// http://localhost:<port>/api/status/buildinfo`).
+    const BUILD_INFO_BODY: &str = concat!(
+        r#"{"version":"v3.0.2","revision":"0c4b926d0","branch":"HEAD","#,
+        r#""buildUser":"","buildDate":"","goVersion":"go1.26.3"}"#
+    );
+
+    #[test]
+    fn every_pinned_build_info_field_is_read_out_of_the_captured_body() {
+        let read: Vec<(&str, Option<String>)> = TRACES_REFERENCE_BUILD_INFO_FIELDS
+            .into_iter()
+            .map(|f| (f, json_string_field(BUILD_INFO_BODY, f)))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("version", Some("v3.0.2".to_string())),
+                ("revision", Some("0c4b926d0".to_string())),
+                ("branch", Some("HEAD".to_string())),
+                ("buildUser", Some(String::new())),
+                ("buildDate", Some(String::new())),
+                ("goVersion", Some("go1.26.3".to_string())),
+            ]
+        );
+        assert_eq!(
+            json_string_field(BUILD_INFO_BODY, "version").as_deref(),
+            Some(TRACES_REFERENCE_BUILD_VERSION)
+        );
+        assert_eq!(
+            json_string_field(BUILD_INFO_BODY, "revision").as_deref(),
+            Some(TRACES_REFERENCE_BUILD_REVISION)
+        );
+    }
+
+    /// A body that MENTIONS the field name does not supply it. This is the
+    /// whole reason the identity check parses rather than searching for a
+    /// substring: a different service's error page quoting the word is not
+    /// a build-info envelope.
+    #[test]
+    fn a_field_name_that_is_not_a_string_valued_key_is_not_read() {
+        for body in [
+            r#"{"note":"version is not reported here"}"#,
+            r#"{"version":3}"#,
+            r#"{"version":null}"#,
+            r#"{"version":["v3.0.2"]}"#,
+            r#"{"version"}"#,
+            r#"{"version":"unterminated"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(json_string_field(body, "version"), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_later_occurrence_is_used_when_an_earlier_one_is_not_a_key() {
+        assert_eq!(
+            json_string_field(r#"{"a":"version","version":"v3.0.2"}"#, "version").as_deref(),
+            Some("v3.0.2")
+        );
+    }
+
+    #[test]
+    fn an_escaped_quote_inside_the_value_is_kept() {
+        assert_eq!(
+            json_string_field(r#"{"branch":"re\"lease","version":"v1"}"#, "branch").as_deref(),
+            Some("re\"lease")
+        );
+    }
+
+    #[test]
+    fn whitespace_around_the_colon_is_accepted() {
+        assert_eq!(
+            json_string_field("{\"version\" :   \"v3.0.2\"}", "version").as_deref(),
+            Some("v3.0.2")
+        );
+    }
 
     #[test]
     fn the_gate_being_set_runs_regardless_of_the_job() {

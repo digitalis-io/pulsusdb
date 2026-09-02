@@ -443,6 +443,18 @@ struct QueryLogRow {
     projections: Vec<String>,
 }
 
+/// One matched span's id as lowercase hex — the identity the fixtures set
+/// deterministically in their INSERTs.
+///
+/// Issue #479: a matched span carries a `name` only when the query
+/// referenced `name`, so an assertion that identifies a span under a query
+/// that does not reference it identifies it by id. These are NOT
+/// name-presence assertions — that question belongs to the live
+/// conditional-`name` gate and the differential.
+fn matched_span_hex(span: &pulsus_read::SpanSummary) -> String {
+    span.span_id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// One `#[tokio::test]` running every gate in sequence — the corpus is
 /// seeded once; ordering between gates never matters but re-seeding per
 /// gate would be pure waste.
@@ -825,7 +837,19 @@ async fn two_phase_search_explain_and_budget_gates() {
         ),
     )
     .await;
-    let plan = plan_for(&engine, "{}", mb_start - 1, mb_start + 1_000_000_000);
+    // Issue #479: the summary carries a `name` only when the query
+    // COLLECTED one, so the source-truncation gate is anchored on the
+    // query that collects it. `select(name)` is a pipeline STAGE, not a
+    // predicate — it leaves the spanset `{}` untouched, adds no probe and
+    // no statement, and reaches the name through the same `hydration_sql`
+    // projection and the same `byte_cap_expr` cap this gate measures, so
+    // it does not point the gate at a predicate over its own subject.
+    let plan = plan_for(
+        &engine,
+        "{} | select(name)",
+        mb_start - 1,
+        mb_start + 1_000_000_000,
+    );
     let output = engine
         .search(&plan)
         .await
@@ -838,12 +862,19 @@ async fn two_phase_search_explain_and_budget_gates() {
     // EXACTLY the byte ceiling (2048 code points x 4 bytes = 8192 bytes)
     // — the exact boundary case verified live in the plan's empirics.
     assert_eq!(
-        trace.spans[0].name.len(),
+        trace.spans[0]
+            .name()
+            .expect("select(name) collects it")
+            .len(),
         search_sql::TRACE_STR_COL_CAP as usize,
         "the 4-byte-code-point name must truncate to exactly the byte ceiling"
     );
     assert_eq!(
-        trace.spans[0].name.chars().count(),
+        trace.spans[0]
+            .name()
+            .expect("select(name) collects it")
+            .chars()
+            .count(),
         2048,
         "the fallback cut is exactly 2048 code points"
     );
@@ -857,10 +888,13 @@ async fn two_phase_search_explain_and_budget_gates() {
     // Span 1: exactly-8192-byte ASCII name passes through byte-identical
     // (the `length(col) <= TRACE_STR_COL_CAP` branch).
     assert_eq!(
-        trace.spans[1].name.len(),
+        trace.spans[1]
+            .name()
+            .expect("select(name) collects it")
+            .len(),
         search_sql::TRACE_STR_COL_CAP as usize
     );
-    assert_eq!(trace.spans[1].name, "a".repeat(8192));
+    assert_eq!(trace.spans[1].name(), Some("a".repeat(8192).as_str()));
 
     // ---- AC6 (a): the scan budget trips for real -----------------------
     let mut tight = engine_config();
@@ -1237,9 +1271,16 @@ async fn two_phase_search_explain_and_budget_gates() {
          scan_budget_rows (spans={spans_total}, attrs={attrs_total})"
     );
 
+    // Issue #479: the summary retains a name only when the query
+    // COLLECTED one, so the retained-accumulation gate is anchored on the
+    // query that collects it. `select(name)` is a pipeline STAGE, not a
+    // predicate: it leaves the spanset `{}` untouched, adds no probe, adds
+    // no statement, and reaches the name through the same `hydration_sql`
+    // projection — the per-summary arithmetic below
+    // (RETAINED_ENTRY_OVERHEAD + 8000) is unchanged by it.
     let plan = plan_for_with(
         &engine,
-        "{}",
+        "{} | select(name)",
         ac_a4_start - 1,
         ac_a4_start + 1_000_000_000,
         AC_A4_LIMIT,
@@ -1458,8 +1499,9 @@ async fn two_phase_search_explain_and_budget_gates() {
     assert_eq!(output.traces[0].matched, 1, "RHS result set only");
     assert_eq!(output.traces[0].spans.len(), 1);
     assert_eq!(
-        output.traces[0].spans[0].name, "child-b",
-        "the spanSet holds the RHS span, never the checkout LHS span"
+        matched_span_hex(&output.traces[0].spans[0]),
+        B,
+        "the spanSet holds the RHS span (child-b), never the checkout LHS span"
     );
 
     // `>` does NOT reach the grandchild…
@@ -1491,7 +1533,7 @@ async fn two_phase_search_explain_and_budget_gates() {
         "T2's error span has no checkout ancestor"
     );
     assert_eq!(output.traces[0].matched, 1);
-    assert_eq!(output.traces[0].spans[0].name, "grand-c");
+    assert_eq!(matched_span_hex(&output.traces[0].spans[0]), C, "grand-c");
 
     // `~`: the sibling pair under the shared parent, RHS side returned.
     let plan = plan_for(
@@ -1503,7 +1545,7 @@ async fn two_phase_search_explain_and_budget_gates() {
     let output = engine.search(&plan).await.expect("sibling search executes");
     assert_eq!(output.returned, 1);
     assert_eq!(output.traces[0].matched, 1);
-    assert_eq!(output.traces[0].spans[0].name, "sib-d");
+    assert_eq!(matched_span_hex(&output.traces[0].spans[0]), D, "sib-d");
 
     // Adjudicated pin 2: zero-parent roots never match `~`.
     let plan = plan_for(
@@ -1649,10 +1691,30 @@ async fn two_phase_search_explain_and_budget_gates() {
             return vec![];
         }
         assert_eq!(output.returned, 1, "{q}: only T1 matches (T2 is a control)");
+        // Issue #479: a matched span carries a `name` only when the query
+        // referenced `name`, and none of the twenty structural queries
+        // below does. The span is therefore identified by its span_id —
+        // set deterministically by this fixture's INSERTs — and mapped
+        // back to the SAME label the matrix rows already spell, so the
+        // twenty rows stay byte-for-byte as they were.
+        fn ac6_label(span_id: &[u8; 8]) -> &'static str {
+            let hex = span_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            match hex.as_str() {
+                AC6_A => "ac6-a",
+                AC6_B => "ac6-b",
+                AC6_C => "ac6-c",
+                AC6_B2 => "ac6-b2",
+                AC6_D => "ac6-d",
+                other => panic!("unexpected span id {other} in the AC6 fixture"),
+            }
+        }
         let mut names: Vec<String> = output.traces[0]
             .spans
             .iter()
-            .map(|s| s.name.clone())
+            .map(|s| ac6_label(&s.span_id).to_string())
             .collect();
         names.sort();
         names
@@ -1777,7 +1839,11 @@ async fn two_phase_search_explain_and_budget_gates() {
          (fc-ab) never match"
     );
     assert_eq!(output.traces[0].matched, 1, "only fc-eq, never fc-xt/fc-ab");
-    assert_eq!(output.traces[0].spans[0].name, "fc-eq");
+    assert_eq!(
+        matched_span_hex(&output.traces[0].spans[0]),
+        "00000000000000f1",
+        "fc-eq"
+    );
     // The demonstrable-bug guard: `!=` must ALSO reject the cross-type
     // coincident-text span (fc-xt), matching only the genuinely-unequal
     // numeric fc-ne (9 != 1).
@@ -1790,7 +1856,11 @@ async fn two_phase_search_explain_and_budget_gates() {
         output.returned, 1,
         "{{ .a != .b }} matches only fc-ne — cross-type (fc-xt) never matches != either"
     );
-    assert_eq!(output.traces[0].spans[0].name, "fc-ne");
+    assert_eq!(
+        matched_span_hex(&output.traces[0].spans[0]),
+        "00000000000000f2",
+        "fc-ne"
+    );
     let plan = plan_for(&engine, r#"{ .a > .b }"#, fc_start, fc_end);
     let output = engine.search(&plan).await.expect("field-compare gt search");
     assert_eq!(output.returned, 1);
@@ -1799,8 +1869,9 @@ async fn two_phase_search_explain_and_budget_gates() {
         "only fc-ne (9 > 1); fc-xt's cross-type operands block ordering"
     );
     assert_eq!(
-        output.traces[0].spans[0].name, "fc-ne",
-        "9 > 1 numeric ordering"
+        matched_span_hex(&output.traces[0].spans[0]),
+        "00000000000000f2",
+        "fc-ne: 9 > 1 numeric ordering"
     );
     // Lexical string ordering (Tempo-verified): apple < banana matches fc-sx.
     let plan = plan_for(&engine, r#"{ .g < .h }"#, fc_start, fc_end);
@@ -1809,7 +1880,11 @@ async fn two_phase_search_explain_and_budget_gates() {
         output.returned, 1,
         "{{ .g < .h }} matches fc-sx (apple < banana lexically)"
     );
-    assert_eq!(output.traces[0].spans[0].name, "fc-sx");
+    assert_eq!(
+        matched_span_hex(&output.traces[0].spans[0]),
+        "00000000000000f5",
+        "fc-sx"
+    );
 
     // ---- Issue #183: the field-vs-field generator granule-prunes on the
     // attribute `(key)` prefix (EXPLAIN indexes=1), never a bare scan.
@@ -2122,7 +2197,11 @@ async fn two_phase_search_explain_and_budget_gates() {
         assert_eq!(output.returned, 1, "{q}");
         assert_eq!(output.traces[0].trace_id[15], 0x01, "{q}");
         assert_eq!(output.traces[0].matched, 1, "{q}");
-        assert_eq!(output.traces[0].spans[0].name, "child-op184", "{q}");
+        assert_eq!(
+            matched_span_hex(&output.traces[0].spans[0]),
+            C184_1,
+            "child-op184: {q}"
+        );
     }
 
     // (e2) Over-cap statusMessage (issue #184 code review): Phase-1
@@ -2161,7 +2240,11 @@ async fn two_phase_search_explain_and_budget_gates() {
         .find(|t| t.trace_id[15] == 0x04)
         .expect("Phase 1 must select the over-cap trace on the CAPPED value");
     assert_eq!(t.matched, 1, "Phase 2 matches the same capped value");
-    assert_eq!(t.spans[0].name, "overmsg-op184");
+    assert_eq!(
+        matched_span_hex(&t.spans[0]),
+        "00000000000184f1",
+        "overmsg-op184"
+    );
     assert!(
         plan.generator_sqls[0].contains("substringUTF8(status_message, 1, 2048)"),
         "the Phase-1 predicate compares the capped column:\n{}",
@@ -2206,7 +2289,11 @@ async fn two_phase_search_explain_and_budget_gates() {
     let output = engine.search(&plan).await.expect("span:id search");
     assert_eq!(output.returned, 1);
     assert_eq!(output.traces[0].matched, 1);
-    assert_eq!(output.traces[0].spans[0].name, "child-op184");
+    assert_eq!(
+        matched_span_hex(&output.traces[0].spans[0]),
+        C184_1,
+        "child-op184"
+    );
     let plan = plan_for(
         &engine,
         r#"{ span:parentID = "00000000000184a1" }"#,
@@ -2323,7 +2410,11 @@ async fn two_phase_search_explain_and_budget_gates() {
         assert_eq!(output.returned, 1, "{q}");
         assert_eq!(output.traces[0].trace_id[15], 0x21, "{q}");
         assert_eq!(output.traces[0].matched, 1, "{q}");
-        assert_eq!(output.traces[0].spans[0].name, "event-span-p", "{q}");
+        assert_eq!(
+            matched_span_hex(&output.traces[0].spans[0]),
+            EP_SPAN,
+            "event-span-p: {q}"
+        );
     }
 
     // timeSinceStart is a real numeric comparison: 3 ms does NOT satisfy > 5 ms.
@@ -2462,7 +2553,11 @@ async fn two_phase_search_explain_and_budget_gates() {
         assert_eq!(output.returned, 1, "{q}");
         assert_eq!(output.traces[0].trace_id[15], 0x31, "{q}");
         assert_eq!(output.traces[0].matched, 1, "{q}");
-        assert_eq!(output.traces[0].spans[0].name, "link-span-p", "{q}");
+        assert_eq!(
+            matched_span_hex(&output.traces[0].spans[0]),
+            LP_SPAN,
+            "link-span-p: {q}"
+        );
     }
 
     // The AC8 hard partition, proven as DISJOINT RESULT SETS: the intrinsic
@@ -2542,6 +2637,192 @@ async fn two_phase_search_explain_and_budget_gates() {
         .await,
         vec![0x31],
         "an uppercase-hex link:traceID literal must resolve the lowercase-hex-stored span P"
+    );
+
+    // ---- issue #479 AC5: the fused membership projection is granule-neutral
+    //
+    // For the SAME probe, the SAME corpus and the SAME window, the fused
+    // render and the unfused render select the SAME number of primary-key
+    // granules. An IDENTITY, not a pinned granule number and not a
+    // wall-time: the value predicate has already forced the `val` column to
+    // be read inside the selected granules, so adding it to the projection
+    // cannot change what prunes.
+    //
+    // The four classes enumerated are the four `ValuePred` classes that
+    // FUSE a value. `StringEq` never fuses — its value is the query's own
+    // literal — so the claim there is not neutrality but SQL identity, and
+    // it is asserted as such.
+    for (label, q, select_q) in [
+        ("regex", r#"{ .env =~ "pro.*" }"#, r#"{} | select(.env)"#),
+        (
+            "num",
+            r#"{ span.http.status_code >= 500 }"#,
+            r#"{} | select(span.http.status_code)"#,
+        ),
+        (
+            "numexpr",
+            r#"{ span.http.status_code * 2 > 500 }"#,
+            r#"{} | select(span.http.status_code)"#,
+        ),
+        ("keyexists", r#"{ .env != nil }"#, r#"{} | select(.env)"#),
+    ] {
+        let p = plan_for(&engine, q, base, now);
+        assert_eq!(p.probes_len(), 1, "{label}: one probe");
+        assert!(
+            p.probe_fuses_value(0),
+            "{label} ({q}) must fuse its matched value"
+        );
+        let batch = [[0u8; 16], [1u8; 16]];
+        let fused = p.membership_sql_for(0, &batch);
+        let plain = p.membership_sql_without_value_for(0, &batch);
+        assert_ne!(fused, plain, "{label}: the two renders must differ");
+        let raw_fused = explain_raw(&client, &fused).await;
+        let raw_plain = explain_raw(&client, &plain).await;
+        assert_eq!(
+            primary_key_granules(&raw_fused),
+            primary_key_granules(&raw_plain),
+            "{label} ({q}): the fused projection must select the SAME granules\n\
+             fused:\n{raw_fused}\nplain:\n{raw_plain}"
+        );
+        // The control that makes the identity discriminating: the value
+        // read this replaces prunes on `key` alone, so it selects a
+        // DIFFERENT (never smaller) granule set. Without it, "equal
+        // granules" would be satisfiable by any two statements that prune
+        // the same way for an unrelated reason.
+        let sep = plan_for(&engine, select_q, base, now);
+        let values_sql = sep.select_values_sql_for(0, &batch);
+        let raw_values = explain_raw(&client, &values_sql).await;
+        assert!(
+            primary_key_granules(&raw_values).0 >= primary_key_granules(&raw_fused).0,
+            "{label}: the separate key-only value read must not prune BETTER than the fused \
+             render — if it did, the fusion would be the pessimisation\nvalues:\n{raw_values}\n\
+             fused:\n{raw_fused}"
+        );
+    }
+    // `StringEq` fuses nothing, so its membership SQL is byte-identical to
+    // the pre-change render. That is what makes "an equality attribute
+    // condition costs no read" checkable rather than asserted.
+    let eq_plan = plan_for(&engine, r#"{ .env = "prod" }"#, base, now);
+    assert!(!eq_plan.probe_fuses_value(0));
+    assert_eq!(
+        eq_plan.membership_sql_for(0, &[[0u8; 16]]),
+        eq_plan.membership_sql_without_value_for(0, &[[0u8; 16]]),
+        "a string-equality probe issues the SAME statement it did before the projection"
+    );
+
+    // ---- issue #479 AC6: the projection adds no statement, and no stage
+    // under ANY name.
+    //
+    // Two runs of each query on the same corpus and window: A the plan as
+    // built, B the same plan with every `probe_values[i]` forced false. A
+    // stage added under a NEW name changes the multiset; one added under an
+    // EXISTING name changes its count. Neither can pass.
+    fn stage_multiset(e: &pulsus_read::PlanExplain) -> std::collections::BTreeMap<String, usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for s in &e.stages {
+            *out.entry(s.name.to_string()).or_insert(0) += 1;
+        }
+        out
+    }
+    fn membership_sql_of(e: &pulsus_read::PlanExplain) -> String {
+        e.stages
+            .iter()
+            .filter(|s| s.name == "phase2_attr_membership")
+            .map(|s| s.sql.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    // (label, query, does it fuse a value?)
+    let ac6: &[(&str, &str, bool)] = &[
+        ("physical-only", r#"{ status = error }"#, false),
+        ("string-equality", r#"{ .env = "prod" }"#, false),
+        ("nested-set", r#"{ nestedSetLeft > 0 }"#, false),
+        ("regex", r#"{ span.http.status_code =~ "5.*" }"#, true),
+        ("existence", r#"{ span.http.status_code != nil }"#, true),
+        ("arithmetic", r#"{ span.http.status_code * 2 > 500 }"#, true),
+        (
+            "mixed",
+            r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 }"#,
+            true,
+        ),
+    ];
+    let mut fusing_seen = 0usize;
+    for (label, q, fuses) in ac6 {
+        let a = plan_for(&engine, q, base, now);
+        let b = a.without_fused_probe_values();
+        let (_, ea) = engine
+            .search_explained(&a)
+            .await
+            .unwrap_or_else(|e| panic!("{label} A: {e}"));
+        let (_, eb) = engine
+            .search_explained(&b)
+            .await
+            .unwrap_or_else(|e| panic!("{label} B: {e}"));
+
+        // (3a) direction-neutral validity gate, BEFORE the comparison:
+        // both traces are non-empty and both reached hydration, so a
+        // no-op implementation cannot satisfy (1) vacuously.
+        let (ma, mb) = (stage_multiset(&ea), stage_multiset(&eb));
+        assert!(!ma.is_empty() && !mb.is_empty(), "{label}: empty explain");
+        assert!(
+            ma.contains_key("phase2_hydration") && mb.contains_key("phase2_hydration"),
+            "{label}: both runs must reach hydration"
+        );
+
+        // (3b) the projection is actually ON in A for exactly the fusing
+        // classes, and byte-identical for the others.
+        let (sa, sb) = (membership_sql_of(&ea), membership_sql_of(&eb));
+        if *fuses {
+            fusing_seen += 1;
+            assert_ne!(sa, sb, "{label}: A must fuse a value where B does not");
+            assert!(sa.contains(" AS v"), "{label}:\n{sa}");
+        } else {
+            assert_eq!(sa, sb, "{label}: nothing to fuse, so the SQL is identical");
+        }
+        // (3c) no identity is vacuous: the string-equality query DOES
+        // issue a membership read, while the physical-only and nested-set
+        // queries issue none — without this, two of the three "identical"
+        // comparisons would be `"" == ""`.
+        match *label {
+            "string-equality" => assert!(!sa.is_empty(), "{label}: one probe, one read"),
+            "physical-only" | "nested-set" => {
+                assert!(
+                    sa.is_empty(),
+                    "{label}: this query issues no membership read"
+                )
+            }
+            _ => {}
+        }
+
+        // (1) the decision gate.
+        assert_eq!(
+            ma, mb,
+            "{label} ({q}): the projection must add no stage under ANY name"
+        );
+        // (2) the plan-derived identities, an independent second
+        // assertion. Phase 2 runs per candidate BATCH, so the identity
+        // carries the batch factor explicitly — `phase2_hydration` is
+        // pushed exactly once per batch, which is what makes the count
+        // observable rather than corpus-dependent. Both sides are
+        // computed from the PLAN and the batch count, so neither drifts
+        // with the corpus.
+        let batches = ma.get("phase2_hydration").copied().unwrap_or(0);
+        assert!(batches > 0, "{label}: at least one batch must hydrate");
+        assert_eq!(
+            ma.get("phase2_attr_membership").copied().unwrap_or(0),
+            a.probes_len() * batches,
+            "{label}: one membership read per probe per batch"
+        );
+        assert_eq!(
+            ma.get("phase2_attr_values").copied().unwrap_or(0),
+            (a.select_attrs_len() + a.agg_fields_len()) * batches,
+            "{label}: the projection adds NO phase2_attr_values statement"
+        );
+    }
+    assert_eq!(
+        fusing_seen, 4,
+        "exactly four of the seven AC6 queries fuse a value; a table that no longer says so \
+         would accept an implementation that fuses nothing"
     );
 
     // ---- AC5 (issue #193): a `by()` query adds NO new scan --------------

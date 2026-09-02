@@ -1729,3 +1729,155 @@ when we are asking it to slow down, so we keep `429`; recorded as
   to a query that returns nothing. **The mechanism behind the reference's
   omission was not established**, only the observation; recorded so the
   next reader does not treat its answer as the target.
+
+### `traceql-matched-span-attribute-order` (issue #479)
+
+- **What:** the ORDER of a matched span's projected `attributes` array on
+  `GET /api/traces/v1/search` and its `/api/search` alias. PulsusDB emits
+  the projection groups in a deterministic first-appearance order — filter
+  order, then leaf pre-order, then `select()` order. The reference's order
+  is not stable.
+- **Observed:** the same five-attribute query issued six consecutive times
+  against the pinned reference returned six DISTINCT key orders
+  (`['city','http.method','ratio','user.id','deployment.environment']`,
+  `['deployment.environment','ratio','user.id','city','http.method']`,
+  `['http.method','ratio','user.id','deployment.environment','city']`,
+  `['user.id','deployment.environment','ratio','city','http.method']`,
+  `['ratio','user.id','city','deployment.environment','http.method']`,
+  `['ratio','user.id','http.method','deployment.environment','city']`).
+  Six draws show the order is not fixed; nothing more is claimed from six
+  draws.
+- **Triage:** ratify-documented-difference. An unordered map has no order
+  to reproduce, and inventing one would be copying an artefact rather than
+  a rule. Determinism is strictly better for a consumer and for our own
+  byte-exact response goldens.
+- **Disposition:** parity on this mechanism is compared as a MULTISET, on
+  both routes — `crates/pulsus-read/tests/traces_search_projection_differential.rs`
+  sorts both sides before comparing, so a reordering passes by design and
+  an added or dropped key fails.
+
+### `traceql-matched-span-negated-attribute-value-absent` (issue #479)
+
+- **What:** a NEGATED attribute condition (`!=`, `!~`, or any leaf under
+  `!` / `= nil`) projects no attribute on
+  `GET /api/traces/v1/search` or its `/api/search` alias. The reference
+  emits the matched span's stored value.
+- **Observed:** `{span.http.method != "GET"}` — the reference returns the
+  `POST` and `DELETE` spans each carrying
+  `attributes:[{"key":"http.method","value":{"stringValue":"…"}}]`;
+  PulsusDB returns the same two spans with no `attributes` key.
+- **Triage:** gap, deliberately deferred. A negated leaf knows only that
+  the span is NOT in the probe's result set, so the value is not in hand:
+  supplying it needs a second, key-only value read whose cost was measured
+  at 4.3x–70x the membership read's bytes plus one serial round trip per
+  batch per key. The query-performance mandate is why this is a wave and
+  not an omission.
+- **Disposition:** remaining work on issue #479. Our answer (absent) is
+  pinned live by
+  `crates/pulsus-server/tests/traces_search_live.rs::the_matched_span_projection_follows_the_reference_rule`
+  so a later wave has a diff to move rather than a silent change.
+
+### `traceql-matched-span-multi-field-leaf-not-projected` (issue #479)
+
+- **What:** a condition that does not filter on exactly one field projects
+  no attribute on `GET /api/traces/v1/search` or its `/api/search` alias:
+  field-vs-field (`{.a = .b}`), cross-attribute arithmetic that did not
+  push down (`{.a + .b > 5}`), boolean-vs-boolean (`{.a = .b = .c}`),
+  boolean truthiness under `!` (`{!.a}`), event/link SET comparisons
+  (`{.a = event:name}`), trace-context leaves (`{traceDuration > 1s}`,
+  `{rootName = …}`, `{span:childCount > 0}`), folded constants
+  (`{"x" = "y"}`), and a `by()` key.
+- **Observed:** the trace-context class agrees with the reference today —
+  four of its five operands are among the seven envelope fields the
+  reference never projects either, and `span:childCount` is not collected
+  by the reference in EITHER position (`{span:childCount>0}` returns no
+  spans there, and `| select(span:childCount)` returns a span with no
+  `attributes` key at all). The other classes are not characterised
+  against the reference on this mechanism.
+- **Triage:** gap for the multi-field classes, agreement for the
+  trace-context one. There is no single field to key an entry by when a
+  leaf names two, and picking one would be an invention.
+- **Disposition:** remaining work on issue #479. Pinned hermetically by
+  `pulsus_read::traces::search_plan::tests::wave_two_shapes_project_nothing`,
+  which asserts the planner builds no projection source for each shape and
+  carries a positive control so "nothing" is the shape's doing.
+
+### `traceql-matched-span-nil-condition-instance-state` (issue #479)
+
+- **What:** whether the reference's answer to an ABSENCE condition
+  (`{ .a = nil }`) on `GET /api/traces/v1/search` and its `/api/search`
+  alias depends on which attribute KEYS the instance has ever ingested,
+  rather than only on the spans in the queried window. Recorded because a
+  differential whose oracle answers from instance-wide state, not from the
+  corpus under test, has no stable pin — and because it was seen once.
+- **Reported once, during the wave-1 code review of this issue.** On ONE
+  reference instance carrying two corpora pushed by two different legs,
+  `{ .a = nil }` answered no spans on an isolated run and, after a second
+  corpus introduced the key `a`, answered with the `a`-absent spans
+  carrying `a` at a nil value. The corpus and instance that produced it no
+  longer exist.
+- **Not reproduced, in six controlled configurations.** Each ran against a
+  FRESH pinned reference instance started for that run alone, with one
+  variable changed and everything else — the queried spans, the window,
+  the request — held identical
+  (a throwaway probe: one OTLP/JSON push over the HTTP receiver, then the
+  query read from the search route after the corpus became visible to
+  `{}`):
+
+  | # | how the key `a` entered the instance | `{}` | `{ .a = nil }` |
+  |---|---|---|---|
+  | 1 | never | 1 span | `NO-SPANS` |
+  | 2 | a SECOND trace, a later push | 2 spans | `NO-SPANS` |
+  | 3 | a second trace in the SAME push (A/B control: run without it) | 1 / 2 spans | `NO-SPANS` both |
+  | 4 | a sibling span of the SAME trace, `intValue` | 2 spans | `NO-SPANS` |
+  | 5 | a sibling span of the SAME trace, `stringValue` | 2 spans | `NO-SPANS` |
+  | 6 | a RESOURCE attribute of a later push / a re-push of an EXISTING span id | 4 / 3 spans | `NO-SPANS` |
+
+  In rows 2 and 4–6 the key was demonstrably resident: the same instance
+  answered `{ .a != nil }` with the carrying span and its value
+  (`cafe000000000009[a={"stringValue": "R"}]`,
+  `cafe000000000001[a={"intValue": "3"}]`). So the non-reproduction is not
+  "the key never arrived".
+- **Replaying the original sequence does not reproduce it either, and
+  cannot settle it.** The wave-2 code review rebuilt the wave-1 probe
+  harness from that round's transcript — the reconstruction's git blob
+  hash matches the original byte for byte — and ran the ORIGINAL suite
+  order rather than a controlled isolation: the comparison leg, then the
+  projection leg on one instance, then the harness. The case still read
+  `NO-SPANS` on the reference. **The replay is not a same-window
+  comparison**, and that is the point worth recording: the harness's read
+  modes carry wave-1's HARD-CODED timestamps, while the run that pushes
+  the corpus anchors it at `now - 90s`. Those fixed windows no longer
+  cover the spans the same invocation just pushed, so the read half
+  quietly returns nothing whatever the catalog holds — the mixed-TTL
+  failure this project has hit before, where the pinned half stays green
+  and the data half sees an empty range. Re-read directly over the
+  CURRENT window with the key `a` resident, the case still returned no
+  spans. So: replaying those windows is not evidence either way, and
+  nobody should spend a seventh attempt on it.
+- **Status:** UNEXPLAINED, and deliberately left so. The observation is
+  kept because it was made; the mechanism is not established, and six
+  attempts built to produce it did not. What would settle it is the exact
+  two-corpus instance it was seen on, which is why the isolation below
+  matters more than the diagnosis.
+- **Why no pin this issue adds can move under it.**
+  `crates/pulsus-read/tests/traces_search_projection_differential.rs` now
+  refuses to run against a reference instance holding any trace over the
+  widest window that instance will accept OR any tag key at all, so its
+  oracle's key catalog is exactly its own corpus — and every probe behind
+  that refusal is fail-closed, so an unreadable instance is a failure and
+  not an empty one. Independently, the registry contains exactly ONE `nil`
+  case, `{ span.http.method != nil }` — PRESENCE, on a key the corpus
+  itself defines — which
+  `pulsus_read::traces::search_plan::tests::the_live_differential_registry_is_well_formed`
+  asserts by counting the typed case queries, and none in the live pin
+  `crates/pulsus-server/tests/traces_search_live.rs::the_matched_span_projection_follows_the_reference_rule`.
+  The one pinned expectation that asserts EMPTINESS,
+  `{ name = "GET /pay" && span.zzz = "nope" }`, was measured against an
+  instance whose catalog DOES hold `zzz` at another value and still
+  answered `NO-SPANS`, while `{ span.zzz = "something-else" }` returned
+  the carrying span — so that pin is value-driven, not catalog-driven.
+- **Disposition:** no action on this issue. The wider question — whether
+  other differential suites hold pins that depend on instance state — is
+  separate work and is scheduled elsewhere; this row deliberately does not
+  sweep them.

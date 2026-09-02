@@ -8,8 +8,8 @@
 //! rejection here is a caller error ([`PlanError`] → `400 bad_data`).
 
 use pulsus_traceql::{
-    AggregateOp, ComparisonOp, Field, FieldExpr, HintValue, Intrinsic, PipelineStage, Query,
-    SpansetExpr, SpansetFilter, Value,
+    AggregateOp, ComparisonOp, Field, FieldExpr, FieldOp, HintValue, Intrinsic, PipelineStage,
+    Query, SpansetExpr, SpansetFilter, UnaryOp, Value,
 };
 use regex::Regex;
 
@@ -18,7 +18,7 @@ use crate::logql::sql::TimeWindow;
 
 use super::filter::{
     self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, LeafEval,
-    NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx, TraceCtxPred,
+    NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx, TraceCtxPred, ValuePred,
 };
 use super::search_sql;
 
@@ -49,6 +49,137 @@ pub struct SearchCtx<'a> {
     /// settings on every query (co-sharding on `cityHash64(trace_id)`
     /// keeps both phases shard-local — docs/schemas.md §7).
     pub distributed: bool,
+}
+
+/// The wire spelling of one projected field, and the ONLY way one can be
+/// built.
+///
+/// Its own module so the tuple constructor is out of scope everywhere
+/// else: this module's ENTIRE body is the type, its constructor and its
+/// accessor. Outside it, [`WireKey::new`] is the only way to obtain one,
+/// so no string in this workspace can become a wire attribute key without
+/// passing through it (issue #479 AC1(a)).
+mod wire_key {
+    use pulsus_traceql::Field;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct WireKey(String);
+
+    impl WireKey {
+        /// The reference keys a matched span's projected attribute with the
+        /// BARE field name and carries the scope as a separate field of its
+        /// own attribute struct, so the wire key never carries our
+        /// `span.`/`resource.` prefix (issue #479; measured against the
+        /// reference: `{} | select(span.http.method)` comes back keyed
+        /// `http.method`).
+        pub fn new(field: &Field) -> Self {
+            WireKey(match field {
+                // `Intrinsic::as_str` is private to pulsus-traceql;
+                // `Display` delegates to it, so this is byte-identical.
+                Field::Intrinsic(i) => i.to_string(),
+                // RAW key: no scope prefix, and NOT `render_attr_key`'s
+                // bracket-quoted form.
+                Field::Attribute { key, .. } => key.clone(),
+            })
+        }
+
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+}
+pub use wire_key::WireKey;
+
+/// Dedupe identity for a projection group: two references to the same
+/// field fill ONE entry.
+///
+/// Scope is part of the identity even though it is dropped on the wire,
+/// so `span.foo` and `resource.foo` stay two entries under one key —
+/// measured on the reference, which emits both without de-duplicating
+/// them (issue #479 row 33).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectionIdentity {
+    Intrinsic(Intrinsic),
+    Attr {
+        scope: pulsus_traceql::AttrScope,
+        key: String,
+    },
+}
+
+impl ProjectionIdentity {
+    fn of(field: &Field) -> Self {
+        match field {
+            Field::Intrinsic(i) => ProjectionIdentity::Intrinsic(*i),
+            Field::Attribute { scope, key } => ProjectionIdentity::Attr {
+                scope: *scope,
+                key: key.clone(),
+            },
+        }
+    }
+}
+
+/// Where a projection group's value lands in the response.
+#[derive(Debug, Clone)]
+pub(crate) enum ProjectionTarget {
+    /// Fills the response's `name` field; never an `attributes` entry.
+    SpanName,
+    /// One `attributes` entry under this wire key.
+    Attribute(WireKey),
+}
+
+/// How one projection group's value is obtained for a matched span.
+#[derive(Debug, Clone)]
+pub(crate) enum ProjectionValue {
+    /// Read off the hydrated span.
+    Name,
+    Service,
+    Status,
+    Kind,
+    StatusMessage,
+    ParentIdHex,
+    ScopeName,
+    ScopeVersion,
+    /// [`super::filter::ValuePred::StringEq`]'s own literal — the value is
+    /// the query's, so no column is read at all.
+    ProbeLiteral(String),
+    /// The value fused into `probes[probe_idx]`'s membership read.
+    ProbeValue {
+        probe_idx: usize,
+    },
+    /// The value fused into `select_attrs[field_idx]`'s per-span value
+    /// read — the existing `select()` attribute path (`attr_values_sql`),
+    /// which issues its own statement and is index-aligned with
+    /// [`SearchPlan::select_attrs`].
+    SelectValue {
+        field_idx: usize,
+    },
+    /// A per-trace query-time nested-set number, already computed for
+    /// filtering.
+    NestedSet(NestedSetField),
+}
+
+/// One way a projection group can be filled.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionSource {
+    /// `None` = unconditional (a `select()` stage named the field);
+    /// `Some((filter_idx, leaf_idx))` = this leaf must evaluate TRUE for
+    /// the span, re-evaluated against the same `EvalEnv` the matching
+    /// pass used.
+    pub(crate) gate: Option<(usize, usize)>,
+    pub(crate) value: ProjectionValue,
+}
+
+/// One projected field: at most ONE response entry per group per span.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionGroup {
+    pub(crate) identity: ProjectionIdentity,
+    pub(crate) target: ProjectionTarget,
+    /// The field as the query spelled it — the input `WireKey::new` and
+    /// `ProjectedAttribute::new` are handed, so the key on the wire is the
+    /// query's own field and not one a caller transformed first.
+    pub(crate) field: Field,
+    /// First source whose gate passes wins.
+    pub(crate) sources: Vec<ProjectionSource>,
 }
 
 /// A string comparison's evaluation shape — regexes are compiled once at
@@ -152,7 +283,12 @@ pub(crate) enum TraceCtxEval {
 /// attribute operand is interned into BOTH `agg_fields` (its `val_num`
 /// read) and `select_attrs` (its `val` read) so Phase 2 has a typed value
 /// with no new hydration SQL builder.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` decides "the two operands are the SAME field" for issue
+/// #479's same-field projection: interning is append-only and dedupes, so
+/// two references to one attribute carry identical indices, and every
+/// other variant is a unit or a `Copy` field id.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlannedOperand {
     Name,
     Service,
@@ -351,17 +487,19 @@ pub(crate) enum AggSource {
     Attr { field_idx: usize },
 }
 
-/// One `select()`-projected response field.
+/// One `select()`-projected response field (issue #479): the field the
+/// query named, and where its value comes from.
+///
+/// The TraceQL `display` spelling this used to carry is gone: the wire
+/// key is now derived from `field` by [`WireKey::new`], which drops the
+/// scope prefix the reference does not send. `select()` fields fold into
+/// the same [`ProjectionGroup`]s the query's own conditions produce, so
+/// `{span.http.method="GET"} | select(span.http.method)` emits ONE entry.
 #[derive(Debug, Clone)]
-pub(crate) enum SelectField {
-    /// Rendered from the hydrated physical columns; `display` is the
-    /// TraceQL spelling (`name`, `resource.service.name`, …).
-    Physical {
-        display: String,
-        column: PhysicalSelect,
-    },
-    /// Rendered from the `select_attrs[idx]` value read.
-    Attr { display: String, field_idx: usize },
+pub(crate) struct SelectField {
+    /// The field as the query spelled it.
+    pub(crate) field: Field,
+    pub(crate) value: ProjectionValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +618,16 @@ pub struct SearchPlan {
     /// [`Self::membership_sql_for`] — a per-batch, mid-execution call —
     /// infallible.
     pub(crate) probe_predicates: Vec<String>,
+    /// Whether each probe's membership read must also FUSE the matched
+    /// `val` into its projection (issue #479), index-aligned with
+    /// [`Self::probes`]. `false` for every probe no projection needs a
+    /// value from — and for `ValuePred::StringEq`, whose value is the
+    /// query's own literal — so the read shape is unchanged for those.
+    pub(crate) probe_values: Vec<bool>,
+    /// The matched-span projection groups (issue #479), in
+    /// first-appearance order: filter order, leaf pre-order, then
+    /// `select()` order. One response entry per group per span, at most.
+    pub(crate) projections: Vec<ProjectionGroup>,
     /// Distinct attribute aggregate `val_num` reads.
     pub(crate) agg_fields: Vec<AttrFieldRef>,
     /// Distinct attribute `select()` `val` reads.
@@ -490,7 +638,6 @@ pub struct SearchPlan {
     /// nothing else pays for the co-load.
     pub(crate) event_sets: Vec<EventSetField>,
     pub(crate) aggregates: Vec<PlannedAggregate>,
-    pub(crate) select_fields: Vec<SelectField>,
     /// Spanset-level `| by(fields)` grouping keys (issue #185); empty when
     /// absent. The executor enforces `reader.traceql_max_series` over the
     /// distinct group cardinality (`422 query_too_broad`).
@@ -598,7 +745,55 @@ impl SearchPlan {
             &self.probe_predicates[probe_idx],
             trace_ids,
             self.window,
+            self.probe_values[probe_idx],
         )
+    }
+
+    /// Whether probe `probe_idx`'s membership read fuses the matched value
+    /// (issue #479) — exposed for the explain/pushdown gates, which render
+    /// the same probe both ways and compare granule counts.
+    pub fn probe_fuses_value(&self, probe_idx: usize) -> bool {
+        self.probe_values[probe_idx]
+    }
+
+    /// The same membership read with the fused-value projection forced
+    /// off (issue #479) — the control side of the granule-neutrality and
+    /// no-added-statement gates.
+    pub fn membership_sql_without_value_for(
+        &self,
+        probe_idx: usize,
+        trace_ids: &[[u8; 16]],
+    ) -> String {
+        search_sql::membership_sql(
+            &self.attrs_table,
+            &self.probe_predicates[probe_idx],
+            trace_ids,
+            self.window,
+            false,
+        )
+    }
+
+    /// The SAME plan with the fused-value projection forced OFF on every
+    /// probe (issue #479) — the control side of the no-added-statement and
+    /// granule-neutrality gates.
+    ///
+    /// It is the same query, the same corpus, the same window and the same
+    /// evaluation: only the projection is removed, so a difference between
+    /// the two runs is attributable to the projection and to nothing else.
+    /// Nothing production calls it.
+    pub fn without_fused_probe_values(&self) -> SearchPlan {
+        let mut clone = self.clone();
+        clone.probe_values = vec![false; clone.probes.len()];
+        clone
+    }
+
+    /// The number of projection groups whose target is an `attributes`
+    /// entry (issue #479) — the exact capacity `build_summary` reserves.
+    pub(crate) fn projected_attr_capacity(&self) -> usize {
+        self.projections
+            .iter()
+            .filter(|g| matches!(g.target, ProjectionTarget::Attribute(_)))
+            .count()
     }
 
     /// The batch hydration SQL (exposed for the golden suite).
@@ -1247,23 +1442,24 @@ fn plan_pipeline(
             }
             PipelineStage::Select { fields } => {
                 for field in fields {
-                    let display = field.to_string();
                     let planned = match field {
-                        Field::Intrinsic(Intrinsic::Name) => SelectField::Physical {
-                            display,
-                            column: PhysicalSelect::Name,
+                        Field::Intrinsic(Intrinsic::Name) => SelectField {
+                            field: field.clone(),
+                            value: ProjectionValue::Name,
                         },
-                        Field::Intrinsic(Intrinsic::Duration) => SelectField::Physical {
-                            display,
-                            column: PhysicalSelect::DurationNs,
+                        // Issue #479: `duration` is one of the SEVEN
+                        // envelope fields the reference never projects,
+                        // so `select(duration)` is accepted and projects
+                        // NOTHING — measured: its span objects carry
+                        // neither a `name` nor an `attributes` key.
+                        Field::Intrinsic(Intrinsic::Duration) => continue,
+                        Field::Intrinsic(Intrinsic::Status) => SelectField {
+                            field: field.clone(),
+                            value: ProjectionValue::Status,
                         },
-                        Field::Intrinsic(Intrinsic::Status) => SelectField::Physical {
-                            display,
-                            column: PhysicalSelect::Status,
-                        },
-                        Field::Intrinsic(Intrinsic::Kind) => SelectField::Physical {
-                            display,
-                            column: PhysicalSelect::Kind,
+                        Field::Intrinsic(Intrinsic::Kind) => SelectField {
+                            field: field.clone(),
+                            value: ProjectionValue::Kind,
                         },
                         // `select(nestedSet*)` is out of scope for #181
                         // (filter-only): a clean 400, tracked as a
@@ -1327,17 +1523,19 @@ fn plan_pipeline(
                             if *scope == pulsus_traceql::AttrScope::Resource
                                 && key == "service.name" =>
                         {
-                            SelectField::Physical {
-                                display,
-                                column: PhysicalSelect::Service,
+                            SelectField {
+                                field: field.clone(),
+                                value: ProjectionValue::Service,
                             }
                         }
                         attr @ Field::Attribute { .. } => {
                             let field_ref = attr_field_ref(attr)
                                 .expect("Field::Attribute always yields a field ref");
-                            SelectField::Attr {
-                                display,
-                                field_idx: intern(select_attrs, &field_ref),
+                            SelectField {
+                                field: field.clone(),
+                                value: ProjectionValue::SelectValue {
+                                    field_idx: intern(select_attrs, &field_ref),
+                                },
                             }
                         }
                     };
@@ -1618,6 +1816,271 @@ fn bool_term_display(term: &BoolTerm) -> String {
     }
 }
 
+/// The SEVEN response-envelope fields the reference never projects into a
+/// matched span's `attributes` (issue #479 rule 1): the span name, the
+/// span duration, the trace duration, the root service name, the root
+/// name, the trace id and the span id. Each is already carried by the
+/// response envelope, so projecting it would duplicate it.
+///
+/// `name` is the one that is not simply dropped: it fills the response's
+/// own `name` field instead, and only when the query referenced it.
+fn projection_target(field: &Field) -> Option<ProjectionTarget> {
+    match field {
+        Field::Intrinsic(Intrinsic::Name) => Some(ProjectionTarget::SpanName),
+        Field::Intrinsic(
+            Intrinsic::Duration
+            | Intrinsic::TraceDuration
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName
+            | Intrinsic::TraceId
+            | Intrinsic::SpanId,
+        ) => None,
+        other => Some(ProjectionTarget::Attribute(WireKey::new(other))),
+    }
+}
+
+/// The value source a planned CONDITION leaf can fill its field's
+/// projection from (issue #479 rule 3), or `None` when the leaf is
+/// deferred to wave 2.
+///
+/// **Four of the ten [`PlannedLeafEval`] variants project**, and the match
+/// is exhaustive with no wildcard so an eleventh variant fails to compile
+/// rather than silently joining the deferred set: `Physical`,
+/// `Attr { negated: false }`, `NestedSet`, and a `FieldCompare` whose two
+/// operands are the SAME field. The other six — `BoolTruth`, `TraceCtx`,
+/// `Arith`, `Const`, `BoolCompare`, `EventSetCompare` — produce no source
+/// and carry a ledger row (docs/benchmarks/traces-differential-ledger.md),
+/// as does a `FieldCompare` naming two DISTINCT fields.
+///
+/// The `FieldCompare` split is [`single_field_of_comparison`]'s rule
+/// applied to the value as well as to the identity (code review, wave 1):
+/// `{.a = .a}`, `{name = name}` and `{nestedSetLeft = nestedSetLeft}` name
+/// exactly one field, so they are single-field conditions and the
+/// reference projects that field for them. Half a reading — collecting the
+/// identity wide and refusing the value narrow — matched spans and dropped
+/// the projection, which is neither reading.
+///
+/// `TraceCtx` is deferred on measurement, not on cost: four of its five
+/// operands are among the seven, and the fifth (`span:childCount`) is
+/// not collected by the reference in either position.
+fn projection_value(
+    leaf: &PlannedLeafEval,
+    probes: &[AttrProbe],
+    probe_values: &mut [bool],
+) -> Option<ProjectionValue> {
+    match leaf {
+        PlannedLeafEval::Physical(p) => match p {
+            PhysicalEval::Name { .. } => Some(ProjectionValue::Name),
+            PhysicalEval::Service { .. } => Some(ProjectionValue::Service),
+            PhysicalEval::Status { .. } => Some(ProjectionValue::Status),
+            PhysicalEval::Kind { .. } => Some(ProjectionValue::Kind),
+            PhysicalEval::StatusMessage { .. } => Some(ProjectionValue::StatusMessage),
+            PhysicalEval::ParentIdHex { .. } => Some(ProjectionValue::ParentIdHex),
+            PhysicalEval::InstrumentationName { .. } => Some(ProjectionValue::ScopeName),
+            PhysicalEval::InstrumentationVersion { .. } => Some(ProjectionValue::ScopeVersion),
+            // Both are among the seven, so `projection_target` has
+            // already refused them; kept explicit so the match stays
+            // exhaustive over `PhysicalEval`.
+            PhysicalEval::Duration { .. } | PhysicalEval::SpanIdHex { .. } => None,
+        },
+        // Wave 2: a negated attribute leaf (`!=`/`!~`) knows only that the
+        // span is NOT in the probe's set, so it has no value to project.
+        PlannedLeafEval::Attr { negated: true, .. } => None,
+        PlannedLeafEval::Attr {
+            probe_idx,
+            negated: false,
+        } => match &probes[*probe_idx].pred {
+            // The literal IS the matched value, so this class needs no
+            // column at all — the read shape is byte-identical.
+            ValuePred::StringEq(v) => Some(ProjectionValue::ProbeLiteral(v.clone())),
+            ValuePred::Regex(_)
+            | ValuePred::Num { .. }
+            | ValuePred::KeyExists
+            | ValuePred::NumExpr(_) => {
+                probe_values[*probe_idx] = true;
+                Some(ProjectionValue::ProbeValue {
+                    probe_idx: *probe_idx,
+                })
+            }
+        },
+        PlannedLeafEval::NestedSet { field, .. } => Some(ProjectionValue::NestedSet(*field)),
+        // A comparison between two operands that are the SAME field is a
+        // single-field condition and projects that field's value; two
+        // DISTINCT fields stay the deferred multi-field class. The
+        // equality is checked here rather than assumed from the caller's
+        // `single_field_of_comparison` gate, so this function is correct
+        // read on its own.
+        PlannedLeafEval::FieldCompare { lhs, rhs, .. } => {
+            if lhs == rhs {
+                operand_projection_value(lhs)
+            } else {
+                None
+            }
+        }
+        PlannedLeafEval::BoolTruth { .. }
+        | PlannedLeafEval::TraceCtx(_)
+        | PlannedLeafEval::Arith { .. }
+        | PlannedLeafEval::Const(_)
+        | PlannedLeafEval::BoolCompare { .. }
+        | PlannedLeafEval::EventSetCompare { .. } => None,
+    }
+}
+
+/// The value source a resolved comparison OPERAND can fill a projection
+/// from — the same value the comparison itself already resolves per
+/// candidate span, so a same-field `FieldCompare` costs no extra read
+/// (issue #479, code review wave 1).
+///
+/// An attribute operand reads `select_attrs[str_idx]`, the `val` column
+/// `plan_operand` already interned for it, which is exactly the source the
+/// `select()` half uses. The match is exhaustive over `PlannedOperand`
+/// with no wildcard, so a new operand kind must decide here.
+fn operand_projection_value(operand: &PlannedOperand) -> Option<ProjectionValue> {
+    match operand {
+        PlannedOperand::Name => Some(ProjectionValue::Name),
+        PlannedOperand::Service => Some(ProjectionValue::Service),
+        PlannedOperand::Status => Some(ProjectionValue::Status),
+        PlannedOperand::Kind => Some(ProjectionValue::Kind),
+        PlannedOperand::StatusMessage => Some(ProjectionValue::StatusMessage),
+        PlannedOperand::ParentId => Some(ProjectionValue::ParentIdHex),
+        PlannedOperand::ScopeName => Some(ProjectionValue::ScopeName),
+        PlannedOperand::ScopeVersion => Some(ProjectionValue::ScopeVersion),
+        PlannedOperand::NestedSet(field) => Some(ProjectionValue::NestedSet(*field)),
+        PlannedOperand::Attr { str_idx, .. } => Some(ProjectionValue::SelectValue {
+            field_idx: *str_idx,
+        }),
+        // Six of the seven the response envelope already carries;
+        // `projection_target` has refused them before this is reached,
+        // and they are kept explicit so the match stays exhaustive.
+        PlannedOperand::Duration
+        | PlannedOperand::SpanId
+        | PlannedOperand::TraceId
+        | PlannedOperand::TraceDurationNs
+        | PlannedOperand::RootName
+        | PlannedOperand::RootServiceName => None,
+        // `span:childCount` is never projected in EITHER position — the
+        // reference does not collect it (ledger
+        // `traceql-matched-span-multi-field-leaf-not-projected`).
+        PlannedOperand::ChildCount => None,
+    }
+}
+
+/// Every `Field` a comparison's operand tree names, in source order.
+fn operand_fields<'a>(expr: &'a FieldExpr, out: &mut Vec<&'a Field>) {
+    match expr {
+        FieldExpr::Field(f) => out.push(f),
+        FieldExpr::Exists { field, .. } => out.push(field),
+        FieldExpr::Literal(_) => {}
+        FieldExpr::Unary { expr, .. } => operand_fields(expr, out),
+        FieldExpr::Binary { lhs, rhs, .. } => {
+            operand_fields(lhs, out);
+            operand_fields(rhs, out);
+        }
+    }
+}
+
+/// The field a comparison filters on, when it filters on exactly ONE.
+///
+/// "Single-field" is the reference's own boundary and it is wider than
+/// `(Field, Literal)`: `{ .duration_ms * 1000 > 5000 }` names one field
+/// through an arithmetic operand tree and the reference projects that
+/// field's RAW STORED value for it (measured: key `duration_ms`, value
+/// `8`, not the computed `8000`). `{ .a = 1 + 2 }` is the same shape with
+/// the arithmetic on the literal side. So the rule is "exactly one
+/// distinct field across both operands", not an operand-shape match.
+///
+/// Two or more distinct fields (`{ .a = .b }`, `{ .a + .b > 5 }`) is the
+/// multi-field class this wave defers, and zero fields (`{ "x" = "y" }`)
+/// filters on nothing. Whether the resulting leaf can actually supply a
+/// value is [`projection_value`]'s question, not this one's.
+fn single_field_of_comparison<'a>(lhs: &'a FieldExpr, rhs: &'a FieldExpr) -> Option<&'a Field> {
+    let mut fields = Vec::new();
+    operand_fields(lhs, &mut fields);
+    operand_fields(rhs, &mut fields);
+    let first = *fields.first()?;
+    fields.iter().all(|f| *f == first).then_some(first)
+}
+
+/// The per-leaf projection input, in the SAME pre-order
+/// [`super::filter::compile_span_filter`] pushes leaves and `eval_expr`
+/// replays them — one entry per pushed leaf, so entry `i` describes
+/// `PlannedFilter::leaves[i]`.
+///
+/// `None` means the leaf filters on no single field. `Some((field,
+/// negated))` carries the field the query spelled and whether the leaf sits
+/// under an ODD number of `!` / `= nil` negations, which is what rule 2
+/// defers to wave 2.
+///
+/// **This walk must stay in lockstep with `filter::collect`.** They pair by
+/// pre-order POSITION, so an arm that pushes a leaf there must push one
+/// here; [`plan_search`] asserts the two lengths agree.
+fn collect_projection_leaves(
+    expr: &FieldExpr,
+    negated: bool,
+    out: &mut Vec<Option<(Field, bool)>>,
+) {
+    match expr {
+        // `{ .a }` is truthiness — planned as the comparison `.a = true`,
+        // so it is leaf-bearing and it filters on `.a`.
+        FieldExpr::Field(field) => out.push(Some((field.clone(), negated))),
+        // A bare literal pushes no leaf.
+        FieldExpr::Literal(_) => {}
+        // `{ .a != nil }` is presence (projects its value); `{ .a = nil }`
+        // is absence, which negates the same positive leaf.
+        FieldExpr::Exists {
+            field,
+            negated: nil_negated,
+        } => out.push(Some((field.clone(), negated != *nil_negated))),
+        // `{ !.a }` plans as the boolean-truthiness leaf, which does not
+        // project; the entry keeps the positions aligned.
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr: inner,
+        } if matches!(inner.as_ref(), FieldExpr::Field(_)) => out.push(None),
+        FieldExpr::Unary {
+            op: UnaryOp::Not,
+            expr: inner,
+        } => collect_projection_leaves(inner, !negated, out),
+        FieldExpr::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => collect_projection_leaves(inner, negated, out),
+        FieldExpr::Binary {
+            op: FieldOp::Cmp(_),
+            lhs,
+            rhs,
+        } => out.push(single_field_of_comparison(lhs, rhs).map(|field| (field.clone(), negated))),
+        FieldExpr::Binary { lhs, rhs, .. } => {
+            collect_projection_leaves(lhs, negated, out);
+            collect_projection_leaves(rhs, negated, out);
+        }
+    }
+}
+
+/// Adds one source to the group for `field`'s identity, creating the group
+/// on first appearance. Two references to the same field fill ONE entry;
+/// the identity is `(scope, key)`, never the wire key, so `span.foo` and
+/// `resource.foo` stay two groups under one key — which is what the
+/// reference emits.
+fn push_projection_source(
+    groups: &mut Vec<ProjectionGroup>,
+    field: &Field,
+    target: ProjectionTarget,
+    source: ProjectionSource,
+) {
+    let identity = ProjectionIdentity::of(field);
+    if let Some(group) = groups.iter_mut().find(|g| g.identity == identity) {
+        group.sources.push(source);
+        return;
+    }
+    groups.push(ProjectionGroup {
+        identity,
+        target,
+        field: field.clone(),
+        sources: vec![source],
+    });
+}
+
 /// Plans one search request. Pure and deterministic — the same inputs
 /// always produce byte-identical SQL (the golden-suite contract).
 pub fn plan_search(
@@ -1650,7 +2113,10 @@ pub fn plan_search(
     // Issue #351: the distinct event/link SET reads, interned by the same
     // append-only rule so indices stay stable.
     let mut event_sets: Vec<EventSetField> = Vec::new();
-    for spanset_filter in spanset_filters {
+    // Issue #479: the per-leaf projection inputs, collected in the SAME
+    // pre-order the leaves are, one `Vec` per spanset filter.
+    let mut projection_leaves: Vec<Vec<Option<(Field, bool)>>> = Vec::new();
+    for spanset_filter in &spanset_filters {
         let compiled = filter::compile_span_filter(spanset_filter)?;
         let mut leaves = Vec::with_capacity(compiled.leaves.len());
         for leaf in &compiled.leaves {
@@ -1666,6 +2132,16 @@ pub fn plan_search(
             };
             leaves.push(plan_leaf_eval(&leaf.eval, &mut sink)?);
         }
+        let mut leaf_fields = Vec::with_capacity(leaves.len());
+        if let Some(body) = &spanset_filter.body {
+            collect_projection_leaves(body, false, &mut leaf_fields);
+        }
+        debug_assert_eq!(
+            leaf_fields.len(),
+            leaves.len(),
+            "the projection walk and filter::collect must push leaves in lockstep"
+        );
+        projection_leaves.push(leaf_fields);
         filters.push(PlannedFilter { leaves });
         // Cross-spanset `{A} op {B}` candidates are the superset union of
         // both operands' generators for BOTH `&&` and `||` (plan v3 —
@@ -1695,6 +2171,57 @@ pub fn plan_search(
         &mut trace_ctx,
         &mut child_count,
     )?;
+    // Issue #479 — the matched-span projection groups. Built AFTER the
+    // filters (whose leaves supply the gates) and AFTER `plan_pipeline`
+    // (whose `select()` fields fold into the same groups), in
+    // first-appearance order: filter order, leaf pre-order, then
+    // `select()` order. Deterministic where the reference's is not
+    // (ledger `traceql-matched-span-attribute-order`).
+    let mut probe_values = vec![false; probes.len()];
+    let mut projections: Vec<ProjectionGroup> = Vec::new();
+    for (filter_idx, leaf_fields) in projection_leaves.iter().enumerate() {
+        for (leaf_idx, entry) in leaf_fields.iter().enumerate() {
+            // No single field, or the leaf sits under an odd number of
+            // negations — wave 2 either way.
+            let Some((field, false)) = entry.as_ref().map(|(f, n)| (f, *n)) else {
+                continue;
+            };
+            let Some(target) = projection_target(field) else {
+                continue;
+            };
+            let Some(value) = projection_value(
+                &filters[filter_idx].leaves[leaf_idx],
+                &probes,
+                &mut probe_values,
+            ) else {
+                continue;
+            };
+            push_projection_source(
+                &mut projections,
+                field,
+                target,
+                ProjectionSource {
+                    gate: Some((filter_idx, leaf_idx)),
+                    value,
+                },
+            );
+        }
+    }
+    for select in &pipeline.select_fields {
+        let Some(target) = projection_target(&select.field) else {
+            continue;
+        };
+        push_projection_source(
+            &mut projections,
+            &select.field,
+            target,
+            ProjectionSource {
+                gate: None,
+                value: select.value.clone(),
+            },
+        );
+    }
+
     // A trailing `with(most_recent=true)` search hint (issue #185): keeps
     // the response's default recency ordering (most-recent first).
     let most_recent = query
@@ -1743,11 +2270,12 @@ pub fn plan_search(
         child_count,
         probes,
         probe_predicates,
+        probe_values,
+        projections,
         agg_fields,
         select_attrs,
         event_sets,
         aggregates: pipeline.aggregates,
-        select_fields: pipeline.select_fields,
         group_by: pipeline.group_by,
         coalesce: pipeline.coalesce,
         post_stages: pipeline.post_stages,
@@ -1809,6 +2337,797 @@ mod tests {
 
     fn plan(q: &str) -> SearchPlan {
         plan_search(&parse(q).expect("parse"), &PARAMS, &ctx()).expect("plan")
+    }
+
+    // ---- issue #479: the matched-span projection ------------------------
+
+    /// AC1 — every projected attribute key is the BARE field spelling, for
+    /// every field SHAPE the grammar admits.
+    ///
+    /// The enumeration is generated, not transcribed: `Intrinsic::ALL` and
+    /// `AttrScope::ALL` come from the same token list as the variants
+    /// themselves, so a new variant joins this test automatically.
+    ///
+    /// What this does NOT establish, said plainly: that the spelling is
+    /// the reference's. A sole constructor proves a value was BUILT by
+    /// `WireKey::new`, never that `WireKey::new` is right. Eight intrinsic
+    /// spellings are measured against the reference by the live
+    /// differential; the rest are argued from the same rule.
+    #[test]
+    fn wire_key_is_bare_for_every_field_shape() {
+        for i in pulsus_traceql::Intrinsic::ALL {
+            let field = Field::Intrinsic(*i);
+            assert_eq!(
+                WireKey::new(&field).as_str(),
+                i.to_string(),
+                "{i} must render as its own canonical spelling"
+            );
+        }
+        // Keys chosen for the shapes that make a rendering differ: a
+        // dotted key, a nested one, one no identifier syntax admits, and
+        // the empty key.
+        for scope in pulsus_traceql::AttrScope::ALL {
+            for key in ["http.method", "a.b.c", "odd key!", ""] {
+                let field = Field::Attribute {
+                    scope: *scope,
+                    key: key.to_string(),
+                };
+                assert_eq!(
+                    WireKey::new(&field).as_str(),
+                    key,
+                    "{scope}{key:?} must render as the RAW key — no scope prefix, and NOT the \
+                     bracket-quoted Display form"
+                );
+            }
+        }
+        // The Display spelling this replaces, so the difference is pinned
+        // rather than implied.
+        let span_http = Field::Attribute {
+            scope: pulsus_traceql::AttrScope::Span,
+            key: "http.method".to_string(),
+        };
+        assert_eq!(span_http.to_string(), "span.http.method");
+        assert_eq!(WireKey::new(&span_http).as_str(), "http.method");
+    }
+
+    /// AC1(b) — the `Field` a projection group carries is the QUERY's own
+    /// field, not one the planner transformed on the way.
+    ///
+    /// The expected set is walked out of `pulsus_traceql::parse` directly,
+    /// INDEPENDENTLY of the planner, so a caller that mangles a field
+    /// before constructing fails this even though it type-checks. It
+    /// compares IDENTITIES, not the wire keys: a bare-key comparison
+    /// cannot see a scope and cannot see multiplicity, and the case it
+    /// would miss is the one the reference actually produces —
+    /// `select(span.foo, resource.foo)` comes back as TWO entries both
+    /// keyed `foo`.
+    #[test]
+    fn projection_identities_equal_the_parsed_query_fields() {
+        /// Every field the parsed AST names, in source order, minus the
+        /// seven the response envelope already carries.
+        fn ast_identities(q: &str) -> Vec<ProjectionIdentity> {
+            fn walk(e: &FieldExpr, out: &mut Vec<Field>) {
+                match e {
+                    FieldExpr::Field(f) => out.push(f.clone()),
+                    FieldExpr::Exists { field, .. } => out.push(field.clone()),
+                    FieldExpr::Literal(_) => {}
+                    FieldExpr::Unary { expr, .. } => walk(expr, out),
+                    FieldExpr::Binary { lhs, rhs, .. } => {
+                        walk(lhs, out);
+                        walk(rhs, out);
+                    }
+                }
+            }
+            fn spanset(e: &SpansetExpr, out: &mut Vec<Field>) {
+                match e {
+                    SpansetExpr::Filter(f) => {
+                        if let Some(body) = &f.body {
+                            walk(body, out);
+                        }
+                    }
+                    SpansetExpr::Binary { lhs, rhs, .. } => {
+                        spanset(lhs, out);
+                        spanset(rhs, out);
+                    }
+                    SpansetExpr::Structural { lhs, rhs, .. } => {
+                        spanset(lhs, out);
+                        spanset(rhs, out);
+                    }
+                }
+            }
+            let query = parse(q).expect("parse");
+            let mut fields = Vec::new();
+            spanset(&query.spanset, &mut fields);
+            for stage in &query.pipeline {
+                if let PipelineStage::Select { fields: selected } = stage {
+                    fields.extend(selected.iter().cloned());
+                }
+            }
+            let mut out: Vec<ProjectionIdentity> = Vec::new();
+            for f in &fields {
+                if projection_target(f).is_none() {
+                    continue;
+                }
+                let id = ProjectionIdentity::of(f);
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            out
+        }
+
+        for q in [
+            // The scope-collision family: the identity is (scope, key),
+            // never the wire key, so these stay TWO groups under one key.
+            r#"{} | select(span.foo, resource.foo)"#,
+            r#"{ span.foo = "S" && resource.foo = "R" }"#,
+            // A repeat of the SAME field collapses to one group.
+            r#"{ span.foo = "a" && span.foo = "b" }"#,
+            // Both operands are among the seven, so nothing projects.
+            r#"{ name = "x" && duration > 1s }"#,
+            // A condition and a `select()` of the same field: one group,
+            // two sources.
+            r#"{ span.http.method = "GET" } | select(span.http.method)"#,
+            // Intrinsics that DO project.
+            r#"{ status = error && kind = client }"#,
+            r#"{ span:parentID = "0102030405060708" }"#,
+            r#"{ instrumentation:name = "scope" }"#,
+            // Single-field arithmetic: one field through an operand tree.
+            r#"{ .duration_ms * 1000 > 5000 }"#,
+            // A comparison whose two operands are the SAME field is also a
+            // single-field condition: the AST names one field twice and
+            // the plan projects it once (code review, wave 1).
+            r#"{ .a = .a }"#,
+            r#"{ name = name }"#,
+            r#"{ nestedSetLeft = nestedSetLeft }"#,
+            r#"{ resource.service.name = resource.service.name }"#,
+            // Two distinct fields: the multi-field class, deferred — the
+            // AST names both, the plan projects neither, so this row is
+            // asserted separately below.
+        ] {
+            let p = plan(q);
+            let planned: Vec<ProjectionIdentity> =
+                p.projections.iter().map(|g| g.identity.clone()).collect();
+            let mut seen = Vec::new();
+            for id in &planned {
+                assert!(
+                    !seen.contains(id),
+                    "{q}: {id:?} appears twice — one group per field identity"
+                );
+                seen.push(id.clone());
+            }
+            assert_eq!(planned, ast_identities(q), "{q}");
+            // And the group's `field` is the very field the wire key is
+            // built from, so no caller transformed it in between.
+            for g in &p.projections {
+                if let ProjectionTarget::Attribute(key) = &g.target {
+                    assert_eq!(key.as_str(), WireKey::new(&g.field).as_str(), "{q}");
+                }
+            }
+        }
+
+        // The deferred classes: the AST names fields the plan must NOT
+        // project. Asserted as an empty projection list rather than
+        // through the equality above, because the two sets differ here by
+        // design.
+        for q in [
+            r#"{ .a = .b }"#,
+            r#"{ .a + .b > 5 }"#,
+            r#"{ span.http.method != "GET" }"#,
+            r#"{ .a = nil }"#,
+        ] {
+            assert!(
+                plan(q).projections.is_empty(),
+                "{q}: a deferred shape must project nothing"
+            );
+        }
+    }
+
+    /// AC10 — every wave-2 shape is a DELIBERATE omission, one case each,
+    /// over the complete complement of the three projectable leaf kinds.
+    ///
+    /// This proves our plan builds no source for these shapes. It does
+    /// NOT claim the reference agrees: the negated-attribute case is a
+    /// measured divergence with a ledger row, and a leaf under `!` has no
+    /// reference oracle at all (the reference returns no spans for a
+    /// `!`-wrapped comparison).
+    #[test]
+    fn wave_two_shapes_project_nothing() {
+        // (query, the PlannedLeafEval variant it exercises)
+        let cases: &[(&str, &str)] = &[
+            (r#"{ span.a != "x" }"#, "Attr { negated: true }"),
+            (r#"{ span.a !~ "x.*" }"#, "Attr { negated: true } (regex)"),
+            (r#"{ !(span.a = "x") }"#, "a leaf under `!`"),
+            (r#"{ .a = nil }"#, "a negated Exists"),
+            (r#"{ !.a }"#, "BoolTruth"),
+            (r#"{ .a = .b }"#, "FieldCompare (two DISTINCT fields)"),
+            (r#"{ traceDuration > 1s }"#, "TraceCtx"),
+            (r#"{ rootName = "r" }"#, "TraceCtx (rootName)"),
+            (r#"{ span:childCount > 0 }"#, "TraceCtx (childCount)"),
+            (r#"{ .a + .b > 5 }"#, "Arith"),
+            (r#"{ "x" = "y" }"#, "Const"),
+            (r#"{ .a = .b = .c }"#, "BoolCompare"),
+            (r#"{ .a = event:name }"#, "EventSetCompare"),
+        ];
+        for (q, what) in cases {
+            let p = plan(q);
+            let from_conditions: Vec<_> = p
+                .projections
+                .iter()
+                .filter(|g| g.sources.iter().any(|s| s.gate.is_some()))
+                .map(|g| g.identity.clone())
+                .collect();
+            assert!(
+                from_conditions.is_empty(),
+                "{q} ({what}) must build no projection source, got {from_conditions:?}"
+            );
+        }
+        // A `by()` key contributes no SPAN attribute: the group-level
+        // `attributes` are a different surface (`by(<field>)`-spelled and
+        // typed) and are measured identical on both sides today.
+        let p = plan(r#"{ .k = "v" } | by(.g)"#);
+        let keys: Vec<_> = p.projections.iter().map(|g| g.identity.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![ProjectionIdentity::Attr {
+                scope: pulsus_traceql::AttrScope::Unscoped,
+                key: "k".to_string(),
+            }],
+            "only the filter's own leaf projects; the by() key adds nothing"
+        );
+
+        // The positive control: the same key under the POSITIVE form does
+        // project, so "nothing" above is the shape's doing and not a lost
+        // walk.
+        let p = plan(r#"{ span.a = "x" }"#);
+        assert_eq!(p.projections.len(), 1);
+        assert!(p.projections[0].sources[0].gate.is_some());
+    }
+
+    /// Issue #479, code review wave 1 — a comparison whose two operands
+    /// are the SAME field projects that field; two DISTINCT fields still
+    /// project nothing.
+    ///
+    /// The pair is the discriminator: an implementation that refuses every
+    /// `FieldCompare` passes the second half and fails the first, which is
+    /// exactly the state this test was written for. The expected value
+    /// SOURCE is asserted, not merely the group's existence — a group
+    /// filled from the wrong operand would carry a different label.
+    #[test]
+    fn a_same_field_comparison_projects_and_a_distinct_field_one_does_not() {
+        for (q, want_key, want_value) in [
+            (r#"{ .a = .a }"#, "a", "value:select-value"),
+            (
+                r#"{ span.http.method = span.http.method }"#,
+                "http.method",
+                "value:select-value",
+            ),
+            (r#"{ name = name }"#, "name", "value:name"),
+            (
+                r#"{ resource.service.name = resource.service.name }"#,
+                // `resource.service.name` parses as the RESOURCE-scoped
+                // attribute `service.name`, so the bare wire key drops the
+                // scope exactly as it does for any other attribute.
+                "service.name",
+                "value:service",
+            ),
+            (
+                r#"{ nestedSetLeft = nestedSetLeft }"#,
+                "nestedSetLeft",
+                "value:nested-set",
+            ),
+            (
+                r#"{ statusMessage = statusMessage }"#,
+                "statusMessage",
+                "value:status-message",
+            ),
+        ] {
+            let p = plan(q);
+            assert_eq!(p.projections.len(), 1, "{q}: exactly one group");
+            let group = &p.projections[0];
+            assert_eq!(group.sources.len(), 1, "{q}: one source");
+            let source = &group.sources[0];
+            assert!(
+                source.gate.is_some(),
+                "{q}: the projection is gated on the leaf matching THAT span"
+            );
+            assert_eq!(
+                projection_value_label(&source.value),
+                want_value,
+                "{q}: the value comes from the compared operand"
+            );
+            match &group.target {
+                ProjectionTarget::SpanName => assert_eq!(want_key, "name", "{q}"),
+                ProjectionTarget::Attribute(k) => assert_eq!(k.as_str(), want_key, "{q}"),
+            }
+        }
+        // `span:childCount` is never projected in either position, so the
+        // same-field form of it is not an exception to that.
+        for q in [
+            r#"{ .a = .b }"#,
+            r#"{ span.foo = resource.foo }"#,
+            r#"{ span:childCount = span:childCount }"#,
+        ] {
+            assert!(
+                plan(q).projections.is_empty(),
+                "{q}: two DISTINCT fields — or a never-projected one — supply no value"
+            );
+        }
+    }
+
+    // ---- the DOMAIN of the live differential's case registry ------------
+
+    /// Issue #479, code review wave 1 — the shape vocabulary
+    /// `crates/pulsus-read/tests/traces_search_projection_differential.rs`
+    /// declares its case registry against.
+    ///
+    /// One label per point on each of two axes: the **value source** a
+    /// projection group is filled from (one per [`ProjectionValue`]
+    /// variant) and the **leaf class** that supplied it (one per
+    /// projecting arm of [`projection_value`], plus the gate-free
+    /// `select()` half).
+    ///
+    /// **This is the VOCABULARY, not the demand.** The demand the registry
+    /// is held to is [`REQUIRED_SHAPE_PAIRS`], which names (value, leaf)
+    /// PAIRS: covering the two axes separately was the wave-3 gap, since a
+    /// case can be removed while both of its labels stay supplied by other
+    /// cases. Every label here must appear in at least one required pair,
+    /// which is what carries the closure below through to the demand.
+    ///
+    /// The list is closed from BOTH ends. Below,
+    /// [`every_projection_shape_label_is_produced_by_some_query`] plans one
+    /// query per label and asserts the produced set is exactly this list,
+    /// so a label nothing can produce fails here; and both label functions
+    /// match exhaustively with no wildcard, so a new `ProjectionValue` or
+    /// `PlannedLeafEval` variant fails to COMPILE until it is named. The
+    /// registry and this file bind ONE `const CASES`, so the two cannot
+    /// drift.
+    ///
+    /// The gaps this was written after: no case whose leaf was a same-field
+    /// `FieldCompare`, and none for `instrumentation:version`. Neither was
+    /// visible from reading the registry.
+    const PROJECTION_SHAPES: [&str; 17] = [
+        "leaf:attr",
+        "leaf:field-compare",
+        "leaf:nested-set",
+        "leaf:physical",
+        "leaf:select",
+        "value:kind",
+        "value:name",
+        "value:nested-set",
+        "value:parent-id",
+        "value:probe-literal",
+        "value:probe-value",
+        "value:scope-name",
+        "value:scope-version",
+        "value:select-value",
+        "value:service",
+        "value:status",
+        "value:status-message",
+    ];
+
+    /// One label per [`ProjectionValue`] variant. Exhaustive, no wildcard.
+    fn projection_value_label(value: &ProjectionValue) -> &'static str {
+        match value {
+            ProjectionValue::Name => "value:name",
+            ProjectionValue::Service => "value:service",
+            ProjectionValue::Status => "value:status",
+            ProjectionValue::Kind => "value:kind",
+            ProjectionValue::StatusMessage => "value:status-message",
+            ProjectionValue::ParentIdHex => "value:parent-id",
+            ProjectionValue::ScopeName => "value:scope-name",
+            ProjectionValue::ScopeVersion => "value:scope-version",
+            ProjectionValue::ProbeLiteral(_) => "value:probe-literal",
+            ProjectionValue::ProbeValue { .. } => "value:probe-value",
+            ProjectionValue::SelectValue { .. } => "value:select-value",
+            ProjectionValue::NestedSet(_) => "value:nested-set",
+        }
+    }
+
+    /// One label per [`PlannedLeafEval`] variant. Exhaustive, no wildcard.
+    /// The six non-projecting variants share a label that is deliberately
+    /// NOT in [`PROJECTION_SHAPES`]: a source built from one of them would
+    /// fail the membership half of the registry check.
+    fn projection_leaf_label(leaf: &PlannedLeafEval) -> &'static str {
+        match leaf {
+            PlannedLeafEval::Physical(_) => "leaf:physical",
+            PlannedLeafEval::Attr { .. } => "leaf:attr",
+            PlannedLeafEval::NestedSet { .. } => "leaf:nested-set",
+            PlannedLeafEval::FieldCompare { .. } => "leaf:field-compare",
+            PlannedLeafEval::BoolTruth { .. }
+            | PlannedLeafEval::TraceCtx(_)
+            | PlannedLeafEval::Arith { .. }
+            | PlannedLeafEval::Const(_)
+            | PlannedLeafEval::BoolCompare { .. }
+            | PlannedLeafEval::EventSetCompare { .. } => "leaf:not-projectable",
+        }
+    }
+
+    /// Every shape label one planned query produces.
+    fn projection_shapes_of(plan: &SearchPlan) -> std::collections::BTreeSet<&'static str> {
+        let mut out = std::collections::BTreeSet::new();
+        for group in &plan.projections {
+            for source in &group.sources {
+                out.insert(projection_value_label(&source.value));
+                out.insert(match source.gate {
+                    None => "leaf:select",
+                    Some((filter_idx, leaf_idx)) => {
+                        projection_leaf_label(&plan.filters[filter_idx].leaves[leaf_idx])
+                    }
+                });
+            }
+        }
+        out
+    }
+
+    /// The (value source, leaf class) PAIRS one planned query produces.
+    ///
+    /// The pair, not the two labels separately: the registry's own gap was
+    /// a MISSING COMBINATION — a same-field `FieldCompare` over a physical
+    /// column — while both of its labels were supplied by other cases
+    /// (code review wave 3).
+    fn projection_pairs_of(
+        plan: &SearchPlan,
+    ) -> std::collections::BTreeSet<(&'static str, &'static str)> {
+        let mut out = std::collections::BTreeSet::new();
+        for group in &plan.projections {
+            for source in &group.sources {
+                let leaf = match source.gate {
+                    None => "leaf:select",
+                    Some((filter_idx, leaf_idx)) => {
+                        projection_leaf_label(&plan.filters[filter_idx].leaves[leaf_idx])
+                    }
+                };
+                out.insert((projection_value_label(&source.value), leaf));
+            }
+        }
+        out
+    }
+
+    /// Every label in [`PROJECTION_SHAPES`] is one a real query produces,
+    /// and no query produces a label outside it.
+    ///
+    /// *RED when:* a label is added that nothing can reach (the list would
+    /// then demand a differential case for a shape that does not exist), or
+    /// a reachable shape is left off it.
+    #[test]
+    fn every_projection_shape_label_is_produced_by_some_query() {
+        let produced: std::collections::BTreeSet<&'static str> = [
+            r#"{ name = "x" }"#,
+            r#"{ resource.service.name = "x" }"#,
+            r#"{ status = error }"#,
+            r#"{ kind = client }"#,
+            r#"{ statusMessage = "x" }"#,
+            r#"{ span:parentID = "0102030405060708" }"#,
+            r#"{ instrumentation:name = "x" }"#,
+            r#"{ instrumentation:version = "1.2.3" }"#,
+            r#"{ span.a = "x" }"#,
+            r#"{ span.a =~ "x.*" }"#,
+            r#"{} | select(span.a)"#,
+            r#"{ nestedSetLeft > 0 }"#,
+            r#"{ .a = .a }"#,
+        ]
+        .into_iter()
+        .flat_map(|q| projection_shapes_of(&plan(q)))
+        .collect();
+        assert_eq!(
+            produced,
+            PROJECTION_SHAPES.into_iter().collect(),
+            "the shape vocabulary and the shapes queries actually produce must be the same set"
+        );
+    }
+
+    /// The (value source, leaf class) PAIRS the live differential must
+    /// exercise, each with the WITNESS query that produces it — spelled
+    /// exactly as the registry spells it, corpus values and all.
+    ///
+    /// **This list is the REQUIRED SET, and it lives here rather than
+    /// beside the cases.** Code review wave 3 removed the mandated
+    /// same-field physical-column case and both registry guards stayed
+    /// green: the previous form of this list demanded one witness per
+    /// LABEL, and `leaf:field-compare` was still supplied by the
+    /// same-field ATTRIBUTE case while `value:service` was still supplied
+    /// by the plain service-name case. A registry cannot report its own
+    /// absences, and neither can a demand the registry can edit — so the
+    /// demand is keyed on the PAIR, and it is stated in this file, which
+    /// `crates/pulsus-read/tests/projection_cases/mod.rs` cannot reach.
+    ///
+    /// Each row is checked from both directions below: the witness is
+    /// PLANNED and must really produce the pair (so an unreachable pair
+    /// cannot be demanded), and exactly one registered case's `q` must be
+    /// that witness (so deleting or rewriting that case fails, naming the
+    /// pair that went missing).
+    ///
+    /// **Where the closure stops, stated so it is not read as more.** The
+    /// two AXES are closed against the planner's enums — both label
+    /// functions match exhaustively, [`PROJECTION_SHAPES`] is pinned to
+    /// the labels real queries produce, and the check below requires every
+    /// label in it to appear in some pair here, so a new `ProjectionValue`
+    /// or `PlannedLeafEval` variant cannot land without a row. The CROSS
+    /// PRODUCT is not closed: a reachable pair whose two labels are each
+    /// already covered by other rows — `{ status = status }`, say — is not
+    /// demanded by anything, and nothing here would notice its absence.
+    /// Deriving that would need a query generator over field spellings,
+    /// whose vocabulary would be another hand-written list one layer down.
+    const REQUIRED_SHAPE_PAIRS: [(&str, &str, &str); 17] = [
+        // -- the physical-column value sources, one row each --------------
+        ("value:name", "leaf:physical", r#"{ name = "GET /pay" }"#),
+        (
+            "value:service",
+            "leaf:physical",
+            r#"{ resource.service.name = "proj-checkout" }"#,
+        ),
+        ("value:status", "leaf:physical", "{ status = error }"),
+        ("value:kind", "leaf:physical", "{ kind = client }"),
+        (
+            "value:status-message",
+            "leaf:physical",
+            r#"{ statusMessage = "boom" }"#,
+        ),
+        (
+            "value:parent-id",
+            "leaf:physical",
+            r#"{ span:parentID = "a479000000000001" }"#,
+        ),
+        (
+            "value:scope-name",
+            "leaf:physical",
+            r#"{ instrumentation:name = "proj-scope" }"#,
+        ),
+        (
+            "value:scope-version",
+            "leaf:physical",
+            r#"{ instrumentation:version = "1.2.3" }"#,
+        ),
+        // -- the attribute probe, literal and fused ------------------------
+        (
+            "value:probe-literal",
+            "leaf:attr",
+            r#"{ span.http.method = "GET" }"#,
+        ),
+        (
+            "value:probe-value",
+            "leaf:attr",
+            r#"{ span.http.method =~ "GE.*" }"#,
+        ),
+        // -- the gate-free `select()` half, over both value sources it
+        //    reaches ---------------------------------------------------
+        (
+            "value:select-value",
+            "leaf:select",
+            "{} | select(span.http.method)",
+        ),
+        ("value:name", "leaf:select", "{} | select(name)"),
+        // -- the nested-set intrinsic --------------------------------------
+        (
+            "value:nested-set",
+            "leaf:nested-set",
+            "{ nestedSetLeft > 0 }",
+        ),
+        // -- the same-field comparison, one row per value source it draws
+        //    from. THESE ARE THE FOUR the registry's own comment mandates,
+        //    and the physical-column row is the one whose removal went
+        //    unnoticed in wave 3.
+        (
+            "value:select-value",
+            "leaf:field-compare",
+            r#"{ span.http.method = span.http.method }"#,
+        ),
+        ("value:name", "leaf:field-compare", "{ name = name }"),
+        (
+            "value:nested-set",
+            "leaf:field-compare",
+            "{ nestedSetLeft = nestedSetLeft }",
+        ),
+        (
+            "value:service",
+            "leaf:field-compare",
+            r#"{ resource.service.name = resource.service.name }"#,
+        ),
+    ];
+
+    /// The differential's case registry, as typed data.
+    ///
+    /// The same file the integration test `mod`s, so the two bind ONE
+    /// `const CASES`. It used to be read as TEXT here, which made the
+    /// coverage check below a substring search: a witness query written
+    /// into a case NAME satisfied it while the case exercised nothing
+    /// (code review wave 2, demonstrated with a match-all case). A path
+    /// under `tests/` that is not a top-level `tests/*.rs` is not built
+    /// as its own test target.
+    mod projection_cases {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/projection_cases/mod.rs"
+        ));
+    }
+
+    /// AC9's registry is WELL FORMED: every case is uniquely named, its
+    /// name carries its own 1-based position, and the cases compared by
+    /// KEY only are exactly the four the differential's module doc names.
+    ///
+    /// Position and uniqueness rather than presence: a duplicate case, a
+    /// renumbering, or a value comparison quietly dropped from a case all
+    /// move something here.
+    ///
+    /// *RED when:* two cases share a name, a case's ordinal prefix stops
+    /// matching its index, or the keys-only set changes without the
+    /// documented list changing with it.
+    #[test]
+    fn the_live_differential_registry_is_well_formed() {
+        use projection_cases::CASES;
+        // The KEY-only cases, as the differential's module doc lists them.
+        // Declared here so a value comparison silently dropped from a case
+        // — or added — has to move this list too.
+        const KEYS_ONLY_CASES: [&str; 4] = [
+            "10_status_code_num",
+            "25_nested_set_left",
+            "27_single_field_arithmetic",
+            "33_same_field_nested_set",
+        ];
+        let names: std::collections::BTreeSet<&str> = CASES.iter().map(|c| c.name).collect();
+        assert_eq!(
+            names.len(),
+            CASES.len(),
+            "two differential cases share a name; the registry's names are its identities"
+        );
+        for (i, case) in CASES.iter().enumerate() {
+            let want = format!("{:02}_", i + 1);
+            assert!(
+                case.name.starts_with(&want),
+                "case {} is named {:?} but sits at position {}; the ordinal is part of the name \
+                 so a case cannot be added in the middle without renumbering",
+                case.name,
+                case.name,
+                i + 1
+            );
+            assert!(
+                !case.q.is_empty(),
+                "case {} carries no query at all",
+                case.name
+            );
+        }
+        let keys_only: Vec<&str> = CASES
+            .iter()
+            .filter(|c| !c.compare_values)
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            keys_only,
+            KEYS_ONLY_CASES.to_vec(),
+            "the cases compared by KEY only are not the ones declared — the differential's \
+             module doc states this limit in prose, and it must be the same list"
+        );
+        // The catalog-dependence ledger row
+        // (`traceql-matched-span-nil-condition-instance-state`) rests on
+        // this registry holding exactly ONE `nil` case, and that one being
+        // a PRESENCE test on a key the corpus itself defines: an ABSENCE
+        // case would be answered from the reference's instance-wide key
+        // catalog rather than from the corpus under test. Counted over the
+        // typed queries, so a case added in a comment or a name cannot
+        // change the answer either way.
+        let nil_cases: Vec<&str> = CASES
+            .iter()
+            .filter(|c| c.q.contains("nil"))
+            .map(|c| c.q)
+            .collect();
+        assert_eq!(
+            nil_cases,
+            vec![r#"{ span.http.method != nil }"#],
+            "the differential's `nil` cases changed; an ABSENCE case is answered from the \
+             reference's key catalog, not from this corpus, so it has no stable pin"
+        );
+    }
+
+    /// AC9's registry is COMPLETE over the required PAIRS — every row of
+    /// [`REQUIRED_SHAPE_PAIRS`] is the query of exactly one case in
+    /// `crates/pulsus-read/tests/projection_cases/mod.rs`.
+    ///
+    /// This is the check the wave-1 code review found missing. The registry
+    /// agreed 30 of 30 while containing no case whose leaf was a same-field
+    /// `FieldCompare` and none reaching `instrumentation:version`, and
+    /// nothing in the registry said so: a list cannot report what is not on
+    /// it.
+    ///
+    /// Two later rounds each beat the check a new way, and both are why it
+    /// is shaped as it is:
+    ///
+    /// * **Wave 2** put a witness query in a case's NAME and left the case
+    ///   a match-all. The check then read the array as TEXT, so a substring
+    ///   search could not tell the query field from any other. The witness
+    ///   is now compared against `ProjectionCase::q` by EQUALITY.
+    /// * **Wave 3** replaced the mandated same-field physical-column case's
+    ///   query with `{}` — and, equivalently, removed the case — while both
+    ///   registry guards stayed green, because the demand was keyed on one
+    ///   LABEL at a time and both of that case's labels were supplied
+    ///   elsewhere. The demand is now keyed on the (value source, leaf
+    ///   class) PAIR, and the failure names the pair that went missing.
+    ///
+    /// *RED when:* a required pair has no case carrying its witness query
+    /// verbatim (removal, renaming, or rewriting the query), a witness does
+    /// not in fact produce the pair claimed for it, two cases carry the same
+    /// witness, or a label in [`PROJECTION_SHAPES`] appears in no pair.
+    #[test]
+    fn the_live_differential_registry_covers_every_projection_shape() {
+        use projection_cases::CASES;
+        // 1. the required pairs span the whole shape vocabulary, so the
+        //    enum-exhaustive closure on the two AXES carries through to the
+        //    demand: a new `ProjectionValue` or `PlannedLeafEval` variant
+        //    adds a label to `PROJECTION_SHAPES`, and that label must then
+        //    appear in some required pair.
+        let labelled: std::collections::BTreeSet<&str> = REQUIRED_SHAPE_PAIRS
+            .iter()
+            .flat_map(|(value, leaf, _)| [*value, *leaf])
+            .collect();
+        assert_eq!(
+            labelled,
+            PROJECTION_SHAPES.into_iter().collect(),
+            "every shape label must appear in at least one required pair, and no pair may name \
+             a label outside the vocabulary"
+        );
+
+        // 2. each witness really produces the pair claimed for it — so an
+        //    unreachable pair cannot be demanded of the registry.
+        for (value, leaf, q) in REQUIRED_SHAPE_PAIRS {
+            let produced = projection_pairs_of(&plan(q));
+            assert!(
+                produced.contains(&(value, leaf)),
+                "the witness {q:?} does not produce ({value:?}, {leaf:?}); it produces {produced:?}"
+            );
+        }
+
+        // 3. exactly one case's QUERY is that witness. With (2) above, the
+        //    case found here is a case that really exercises the pair.
+        let missing: Vec<(&str, &str, &str, usize)> = REQUIRED_SHAPE_PAIRS
+            .iter()
+            .map(|(value, leaf, q)| {
+                (
+                    *value,
+                    *leaf,
+                    *q,
+                    CASES.iter().filter(|case| case.q == *q).count(),
+                )
+            })
+            .filter(|(_, _, _, found)| *found != 1)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the live projection differential must hold exactly one case per required pair; \
+             (value source, leaf class, witness, cases carrying it) = {missing:?} — a count of 0 \
+             is a shape that is no longer tested against the reference. Edit \
+             crates/pulsus-read/tests/projection_cases/mod.rs"
+        );
+    }
+
+    /// Issue #479 — the fused-value flag is set for exactly the probe
+    /// classes whose matched value is not already the query's own
+    /// literal, and the SQL follows it.
+    #[test]
+    fn only_a_non_equality_probe_fuses_its_value() {
+        for (q, want) in [
+            (r#"{ span.foo = "x" }"#, false),
+            (r#"{ span.foo =~ "x.*" }"#, true),
+            (r#"{ span.foo > 5 }"#, true),
+            (r#"{ span.foo != nil }"#, true),
+            (r#"{ span.foo * 2 > 5 }"#, true),
+        ] {
+            let p = plan(q);
+            assert_eq!(p.probes.len(), 1, "{q}");
+            assert_eq!(p.probe_fuses_value(0), want, "{q}");
+            let sql = p.membership_sql_for(0, &[[0u8; 16]]);
+            assert_eq!(sql.contains(" AS v"), want, "{q}:\n{sql}");
+            // A probe that fuses nothing renders the SAME statement it
+            // rendered before this issue — the zero-read-cost claim for
+            // the string-equality class is an SQL IDENTITY, not a granule
+            // measurement.
+            if !want {
+                assert_eq!(
+                    sql,
+                    p.membership_sql_without_value_for(0, &[[0u8; 16]]),
+                    "{q}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1941,22 +3260,25 @@ mod tests {
     #[test]
     fn select_projects_physical_and_attr_fields() {
         let p = plan(r#"{ .k = "v" } | select(name, span.foo, resource.service.name)"#);
-        assert_eq!(p.select_fields.len(), 3);
-        assert!(matches!(
-            p.select_fields[0],
-            SelectField::Physical {
-                column: PhysicalSelect::Name,
-                ..
-            }
-        ));
-        assert!(matches!(p.select_fields[1], SelectField::Attr { .. }));
-        assert!(matches!(
-            p.select_fields[2],
-            SelectField::Physical {
-                column: PhysicalSelect::Service,
-                ..
-            }
-        ));
+        // Issue #479: `select()` fields fold into the projection groups —
+        // `name` fills the response's own `name` field, the other two
+        // become `attributes` entries keyed by the BARE field name.
+        let projected: Vec<_> = p
+            .projections
+            .iter()
+            .map(|g| match &g.target {
+                ProjectionTarget::SpanName => "<name>".to_string(),
+                ProjectionTarget::Attribute(k) => k.as_str().to_string(),
+            })
+            .collect();
+        assert_eq!(projected, vec!["k", "<name>", "foo", "service.name"]);
+        assert!(
+            p.projections
+                .iter()
+                .skip(1)
+                .all(|g| g.sources.iter().all(|s| s.gate.is_none())),
+            "a select() source is unconditional"
+        );
         assert_eq!(p.select_attrs.len(), 1);
     }
 
@@ -2201,17 +3523,20 @@ mod tests {
             r#"{ .k = "v" } | select(span:id, trace:id)"#,
         ] {
             let p = plan(q);
-            assert!(
-                p.select_fields.is_empty(),
+            // The filter's own `.k` leaf projects (issue #479), so the
+            // id intrinsics adding nothing means exactly one group.
+            assert_eq!(
+                p.projections.len(),
+                1,
                 "{q} must project no select() field, got {:?}",
-                p.select_fields
+                p.projections
             );
         }
         // The control: a projecting `select()` beside them still projects,
         // so "empty" above is the id intrinsics' doing and not a lost
         // stage.
         let p = plan(r#"{ .k = "v" } | select(span:id, .other, trace:id)"#);
-        assert_eq!(p.select_fields.len(), 1);
+        assert_eq!(p.projections.len(), 2);
     }
 
     #[test]

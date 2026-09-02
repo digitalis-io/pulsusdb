@@ -27,13 +27,14 @@ pub use traces::{
     BATCH_TRACES, CANDIDATE_TUPLE_BYTES, DEFAULT_METRICS_POINTS, GraphEdgeRow, GraphWindow,
     GroupValue, HYDRATION_BYTE_BUDGET, MAX_METRICS_POINTS, MAX_SPANS_PER_TRACE, MetricExemplar,
     MetricFunc, MetricLabel, MetricLabelValue, MetricsCtx, MetricsParams,
-    PlanError as TracePlanError, RETAINED_ENTRY_OVERHEAD, RootSummary, SERVICE_GRAPH_MAX_EDGES,
-    SPAN_NAME_VALUE_TYPE, SearchCtx, SearchOutput, SearchParams, SearchPlan, ServiceGraph,
-    SpanFilterCtx, SpanSetGroup, SpanSummary, StoredSpan, TAG_NAMES_MAX, TAG_VALUES_MAX,
-    TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames,
-    TagValue, TagValues, TagValuesRequest, TraceContext, TraceEngine, TraceMetricSeries,
-    TraceMetricsPlan, TraceMetricsResult, TraceReadConfig, TraceSearchResult,
-    canonical_double_bits, compile_span_filter, plan_search, plan_trace_metrics, service_graph_sql,
+    PlanError as TracePlanError, ProjectedAttribute, RETAINED_ENTRY_OVERHEAD, RootSummary,
+    SERVICE_GRAPH_MAX_EDGES, SPAN_NAME_VALUE_TYPE, SearchCtx, SearchOutput, SearchParams,
+    SearchPlan, ServiceGraph, SpanFilterCtx, SpanSetGroup, SpanSummary, StoredSpan, TAG_NAMES_MAX,
+    TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS,
+    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValue, TagValues, TagValuesRequest, TraceContext,
+    TraceEngine, TraceMetricSeries, TraceMetricsPlan, TraceMetricsResult, TraceReadConfig,
+    TraceSearchResult, WireKey, canonical_double_bits, compile_span_filter, plan_search,
+    plan_trace_metrics, service_graph_sql,
 };
 
 #[cfg(test)]

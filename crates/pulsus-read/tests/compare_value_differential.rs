@@ -567,6 +567,18 @@ async fn compare_value_differential() {
         return;
     };
 
+    // The reverse-order half of the projection leg's isolation hazard
+    // (issue #479, code review wave 2). That suite refuses an instance
+    // holding another leg's corpus, but its own corpus is resident only
+    // AFTER it has run — so the check that catches the two sharing an
+    // instance in THIS order has to live here, where the symptom would
+    // otherwise appear as a value mismatch against the reference.
+    pulsus_testkit::assert_reference_instance_is_free_of(
+        &api_base,
+        pulsus_testkit::PROJECTION_DIFFERENTIAL_TRACE_HEX,
+        "the matched-span projection differential",
+    );
+
     let sec = 1_000_000_000i64;
     // Anchor the corpus ~90s in the PAST (span timestamps `base .. base+3s`).
     // This is the crux of the flake fix. Tempo v3.0.2's live_store only

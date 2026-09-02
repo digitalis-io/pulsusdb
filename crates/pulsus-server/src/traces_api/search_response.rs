@@ -342,9 +342,22 @@ fn span_json(span: &SpanSummary, report: &mut DomainReport) -> Value {
     );
     let mut obj = json!({
         "spanID": span_id,
-        "name": span.name,
         "startTimeUnixNano": start.to_string(),
     });
+    // Issue #479 — the `name` key is present IFF the query collected a
+    // name for THIS span AND that name is non-empty. Both conditions are
+    // the reference's, measured on its own response marshaller run on its
+    // own span message: an empty name emits no key at all, while an empty
+    // ATTRIBUTE VALUE is emitted as `"stringValue":""`. The asymmetry is
+    // deliberate and both halves are asserted.
+    //
+    // The key ORDER on the wire does not move by writing this after the
+    // literal: `serde_json`'s object map is ordered, not insertion-ordered
+    // (`preserve_order` appears in zero workspace manifests), which is
+    // what keeps the byte-exact response goldens in this file valid.
+    if let Some(name) = span.name().filter(|n| !n.is_empty()) {
+        obj["name"] = Value::String(name.to_string());
+    }
     if nanos != 0 {
         obj["durationNanos"] = Value::String(nanos.to_string());
     }
@@ -352,7 +365,7 @@ fn span_json(span: &SpanSummary, report: &mut DomainReport) -> Value {
         obj["attributes"] = Value::Array(
             span.attributes
                 .iter()
-                .map(|(key, value)| json!({"key": key, "value": {"stringValue": value}}))
+                .map(|attr| json!({"key": attr.key(), "value": {"stringValue": attr.value()}}))
                 .collect(),
         );
     }
@@ -524,7 +537,7 @@ pub(crate) fn render(output: &SearchOutput) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use pulsus_read::RootSummary;
+    use pulsus_read::{ProjectedAttribute, RootSummary};
 
     use super::*;
 
@@ -580,19 +593,307 @@ mod tests {
                 trace_start_ns: 1_700_000_000_000_000_000,
                 trace_duration_ns: 2_500_000_000,
                 matched: 5,
-                spans: vec![SpanSummary {
-                    span_id: [0xcd; 8],
-                    name: "charge".to_string(),
-                    start_ns: 1_700_000_000_100_000_000,
-                    duration_ns: 42_000_000,
-                    attributes: vec![("span.foo".to_string(), "bar".to_string())],
-                }],
+                spans: vec![SpanSummary::new(
+                    [0xcd; 8],
+                    Some("charge".to_string()),
+                    1_700_000_000_100_000_000,
+                    42_000_000,
+                    // Issue #479: the wire key is the BARE attribute name.
+                    // A fixture cannot invent one — `ProjectedAttribute`'s
+                    // fields are private and its only constructor takes
+                    // the query's own `Field`.
+                    vec![ProjectedAttribute::new(
+                        &pulsus_traceql::Field::Attribute {
+                            scope: pulsus_traceql::AttrScope::Span,
+                            key: "foo".to_string(),
+                        },
+                        "bar".to_string(),
+                    )],
+                )],
                 groups: None,
             }],
             partial: true,
             returned: 1,
             limit: 20,
         }
+    }
+
+    // ---- issue #479: the matched-span projection -------------------------
+
+    /// One projected attribute built from a span-scoped attribute field —
+    /// a fixture cannot invent a key, only choose the field the key is
+    /// derived from.
+    fn projected(key: &str, value: &str) -> ProjectedAttribute {
+        ProjectedAttribute::new(
+            &pulsus_traceql::Field::Attribute {
+                scope: pulsus_traceql::AttrScope::Span,
+                key: key.to_string(),
+            },
+            value.to_string(),
+        )
+    }
+
+    /// The five keys [`span_json`] can emit. Used both by the name axis
+    /// (one name value equal to each of them) and by the predicted key
+    /// set, so the two cannot drift apart.
+    const SPAN_WIRE_KEYS: [&str; 5] = [
+        "spanID",
+        "startTimeUnixNano",
+        "durationNanos",
+        "attributes",
+        "name",
+    ];
+
+    /// PRE-COMMITTED SELECTION RULE. Per axis: for `name`, the absent
+    /// case, the empty string, one ordinary value, one non-ASCII value,
+    /// and ONE VALUE EQUAL TO EACH KEY THIS RENDERER CAN EMIT; for
+    /// `duration_ns`, both saturating extremes and `-1`, `0`, `1`; for
+    /// `attributes`, empty, one entry with an empty value, two entries
+    /// sharing a key, one entry keyed with a wire key name, one entry
+    /// with an empty key; for `start_ns`, `1` and `i64::MAX`.
+    /// 9 x 5 x 5 x 2 = 450 inputs.
+    ///
+    /// THE START AXIS CARRIES NO ZERO, and that is not a break-driven
+    /// edit: at a zero start the reference's measured behaviour and ours
+    /// differ, that difference is recorded, undiagnosed and out of scope
+    /// for this issue, and no criterion may assert either answer there.
+    /// [`axis_guard`] keeps it out.
+    ///
+    /// THIS IS NOT RENDERER-WIDE: a key inserted on a value outside these
+    /// axes is admitted. The residual is stated rather than hidden.
+    fn derived_span_inputs() -> Vec<SpanSummary> {
+        let mut names: Vec<Option<String>> = vec![
+            None,
+            Some(String::new()),
+            Some("GET /pay".to_string()),
+            Some("München".to_string()),
+        ];
+        names.extend(SPAN_WIRE_KEYS.iter().map(|k| Some((*k).to_string())));
+
+        let durations = [i64::MIN, -1, 0, 1, i64::MAX];
+        let attribute_shapes: [Vec<ProjectedAttribute>; 5] = [
+            vec![],
+            vec![projected("foo", "")],
+            vec![projected("foo", "S-span"), projected("foo", "R-resource")],
+            vec![projected("name", "wire-key-name")],
+            vec![projected("", "empty-key")],
+        ];
+        let starts = [1i64, i64::MAX];
+
+        let mut out = Vec::new();
+        for name in &names {
+            for duration_ns in durations {
+                for attrs in &attribute_shapes {
+                    for start_ns in starts {
+                        out.push(SpanSummary::new(
+                            [1u8; 8],
+                            name.clone(),
+                            start_ns,
+                            duration_ns,
+                            attrs.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every key [`predicted_keys`] requires UNCONDITIONALLY must be
+    /// non-default on every input, so the criterion can never mandate a
+    /// key the reference's measured default-omission rule omits. Asserted
+    /// FIRST, before any input is rendered.
+    fn axis_guard(all: &[SpanSummary]) -> Result<(), String> {
+        for s in all {
+            if s.start_ns == 0 {
+                return Err(format!("axis carries start_ns=0: {:?}", s.name()));
+            }
+            if s.span_id == [0u8; 8] {
+                return Err("axis carries an all-zero span id".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// The key set the RULE predicts — computed here, never from the
+    /// renderer, so the renderer cannot be its own oracle.
+    ///
+    /// `spanID` and `startTimeUnixNano` are unconditional; `durationNanos`
+    /// is present iff the projected width is non-zero (a negative width
+    /// clamps to zero and a zero width is omitted, exactly as the
+    /// reference's default-value omission does); `attributes` iff the list
+    /// is non-empty; `name` iff a name was collected AND it is non-empty.
+    fn predicted_keys(span: &SpanSummary) -> std::collections::BTreeSet<String> {
+        let mut keys = std::collections::BTreeSet::new();
+        keys.insert("spanID".to_string());
+        keys.insert("startTimeUnixNano".to_string());
+        if span.duration_ns > 0 {
+            keys.insert("durationNanos".to_string());
+        }
+        if !span.attributes.is_empty() {
+            keys.insert("attributes".to_string());
+        }
+        if span.name().is_some_and(|n| !n.is_empty()) {
+            keys.insert("name".to_string());
+        }
+        keys
+    }
+
+    /// AC16 — the rendered span object is exact for every input in the
+    /// derived set.
+    ///
+    /// The test name understates what the test does, and that is
+    /// deliberate: it also asserts the `name` VALUE, the attribute array
+    /// and the axis guard. A name that says less than the truth misleads
+    /// nobody.
+    #[test]
+    fn the_rendered_span_key_set_is_exact_over_the_derived_inputs() {
+        let inputs = derived_span_inputs();
+        assert_eq!(
+            inputs.len(),
+            450,
+            "9 x 5 x 5 x 2 — silently shrinking an axis must fail rather than reduce coverage"
+        );
+        axis_guard(&inputs).expect("the axis guard must pass before anything is rendered");
+
+        for span in &inputs {
+            let got = span_json(span, &mut DomainReport::default());
+            let obj = got.as_object().expect("span_json renders an object");
+            let keys: std::collections::BTreeSet<String> = obj.keys().cloned().collect();
+
+            // (1) exact set equality against the RULE's prediction.
+            assert_eq!(
+                keys,
+                predicted_keys(span),
+                "key set at name={:?} duration_ns={} attrs={} start_ns={}",
+                span.name(),
+                span.duration_ns,
+                span.attributes.len(),
+                span.start_ns
+            );
+
+            // (2) the SERIALISED body carries neither forbidden literal
+            // anywhere in it, at ANY depth. Narrowing this to the
+            // top-level object defeats it: a renderer that keeps every
+            // predicted top-level key and renders a NESTED field as a
+            // null- or empty-valued `name` passes (1), (3) and (4).
+            let body = serde_json::to_string(&got).expect("serialises");
+            assert!(
+                !body.contains("\"name\":null"),
+                "a JSON null name is never a wire value: {body}"
+            );
+            assert!(
+                !body.contains("\"name\":\"\""),
+                "an empty name is omitted, not emitted: {body}"
+            );
+
+            // (3) when the `name` key is present its value is EXACTLY the
+            // collected name.
+            if let Some(rendered) = obj.get("name") {
+                assert_eq!(
+                    rendered.as_str(),
+                    span.name(),
+                    "the rendered name must be the collected one, unaltered"
+                );
+            }
+
+            // (4) the attribute array, in order, including an entry whose
+            // value is the empty string.
+            if !span.attributes.is_empty() {
+                let want: Vec<Value> = span
+                    .attributes
+                    .iter()
+                    .map(|a| json!({"key": a.key(), "value": {"stringValue": a.value()}}))
+                    .collect();
+                assert_eq!(obj["attributes"], Value::Array(want));
+            }
+        }
+
+        // Outside the axes and on purpose: the adversarial input assertion
+        // (2) looks most likely to false-positive on. An attribute KEYED
+        // `name` and VALUED with the empty string renders
+        // `{"key":"name","value":{"stringValue":""}}`, which contains
+        // neither forbidden literal.
+        let adversarial = SpanSummary::new(
+            [1u8; 8],
+            Some("name".to_string()),
+            1,
+            1,
+            vec![projected("name", ""), projected("", "")],
+        );
+        let body = serde_json::to_string(&span_json(&adversarial, &mut DomainReport::default()))
+            .expect("serialises");
+        assert!(!body.contains("\"name\":null"), "{body}");
+        assert!(!body.contains("\"name\":\"\""), "{body}");
+    }
+
+    /// AC13's wire half — a summary that collected no name renders NO
+    /// `name` key at all, not `"name":null` and not `"name":""`.
+    ///
+    /// `get("name").is_none()` rather than `is_null()`: the two are
+    /// different bodies and only one of them is the reference's.
+    #[test]
+    fn a_none_name_writes_no_wire_field() {
+        for name in [None, Some(String::new())] {
+            let span = SpanSummary::new([0xab; 8], name.clone(), 1, 1, vec![]);
+            let got = span_json(&span, &mut DomainReport::default());
+            assert!(
+                got.get("name").is_none(),
+                "name={name:?} must write no key at all, got {got}"
+            );
+            let body = serde_json::to_string(&got).expect("serialises");
+            assert!(!body.contains("\"name\""), "{body}");
+        }
+    }
+
+    /// AC12 — the wire-cost identity of a projected attribute list.
+    ///
+    /// `,"attributes":[]` is 16 bytes, `{"key":"","value":{"stringValue":""}}`
+    /// is 37, and one comma joins entries, so the delta between the two
+    /// renderings is an ARITHMETIC identity, not a fitted number. It is
+    /// asserted for a flat span AND for a span inside a `by()` group,
+    /// because the identity is per span and must not depend on the
+    /// response shape.
+    #[test]
+    fn projected_attributes_cost_exactly_the_rendered_bytes() {
+        let attrs = vec![
+            projected("http.method", "GET"),
+            projected("service.name", "checkout"),
+            projected("", ""),
+        ];
+        let expected: usize = 16
+            + attrs
+                .iter()
+                .map(|a| 37 + a.key().len() + a.value().len())
+                .sum::<usize>()
+            + (attrs.len() - 1);
+
+        // Flat.
+        let without = SpanSummary::new([0xcd; 8], Some("charge".to_string()), 1, 1, vec![]);
+        let with = SpanSummary::new([0xcd; 8], Some("charge".to_string()), 1, 1, attrs.clone());
+        let len = |s: &SpanSummary| {
+            serde_json::to_string(&span_json(s, &mut DomainReport::default()))
+                .expect("serialises")
+                .len()
+        };
+        assert_eq!(len(&with) - len(&without), expected);
+
+        // Inside a `by()` group — the same identity, a different envelope.
+        let group_len = |spans: Vec<SpanSummary>| {
+            let group = SpanSetGroup {
+                attributes: vec![("by(name)".to_string(), GroupValue::Str("x".to_string()))],
+                matched: 1,
+                spans,
+            };
+            serde_json::to_string(&group_json(&group, &mut DomainReport::default()))
+                .expect("serialises")
+                .len()
+        };
+        assert_eq!(
+            group_len(vec![with]) - group_len(vec![without]),
+            expected,
+            "the identity is per span and does not depend on the response shape"
+        );
     }
 
     #[test]
@@ -651,9 +952,13 @@ mod tests {
             "the reference's Span message has no durationMs field; it belongs to \
              TraceSearchMetadata one level up"
         );
+        // Issue #479: the projected attribute key is the BARE attribute
+        // name. The reference carries the scope as a separate field of
+        // its own attribute struct and sends `http.method`, never
+        // `span.http.method`; ours is the same shape.
         assert_eq!(
             set["spans"][0]["attributes"][0],
-            serde_json::json!({"key": "span.foo", "value": {"stringValue": "bar"}})
+            serde_json::json!({"key": "foo", "value": {"stringValue": "bar"}})
         );
     }
 
@@ -756,17 +1061,17 @@ mod tests {
                 })
                 .collect();
             let got = span_json(
-                &SpanSummary {
-                    span_id: span_id.try_into().expect("8 bytes"),
-                    name: want["name"].as_str().expect("name").to_string(),
-                    start_ns: want["startTimeUnixNano"]
+                &SpanSummary::new(
+                    span_id.try_into().expect("8 bytes"),
+                    Some(want["name"].as_str().expect("name").to_string()),
+                    want["startTimeUnixNano"]
                         .as_str()
                         .expect("startTimeUnixNano")
                         .parse()
                         .expect("i64 nanos"),
                     duration_ns,
-                    attributes: vec![],
-                },
+                    vec![],
+                ),
                 &mut DomainReport::default(),
             );
             assert_eq!(
@@ -1230,13 +1535,13 @@ mod tests {
     }
 
     fn group_span(id: u8, name: &str) -> SpanSummary {
-        SpanSummary {
-            span_id: [id; 8],
-            name: name.to_string(),
-            start_ns: 1_700_000_000_100_000_000,
-            duration_ns: 1_000_000,
-            attributes: vec![],
-        }
+        SpanSummary::new(
+            [id; 8],
+            Some(name.to_string()),
+            1_700_000_000_100_000_000,
+            1_000_000,
+            vec![],
+        )
     }
 
     /// Issue #193: an active `by()` grouping emits ONE spanSet per group,
@@ -1307,13 +1612,13 @@ mod tests {
                 trace_start_ns,
                 trace_duration_ns,
                 matched: 1,
-                spans: vec![SpanSummary {
-                    span_id: [0xcd; 8],
-                    name: "charge".to_string(),
-                    start_ns: span_start_ns,
-                    duration_ns: span_duration_ns,
-                    attributes: vec![],
-                }],
+                spans: vec![SpanSummary::new(
+                    [0xcd; 8],
+                    Some("charge".to_string()),
+                    span_start_ns,
+                    span_duration_ns,
+                    vec![],
+                )],
                 groups: None,
             }],
             partial: false,
