@@ -24,6 +24,15 @@ informational cases** — only the oracle comparison is ever downgraded.
 Entries are append-only; re-gating a case removes its `ledger` reference
 but keeps the entry for history.
 
+Some of these entries record a reference behaviour that is wrong on its
+own terms — internally inconsistent, contradicting its own comments,
+silently dropping or corrupting an input — rather than merely different
+from ours. Those are indexed and explained, with the Loki source read at
+the version each was measured against, in
+docs/reference-defects-we-do-not-copy.md. **That file explains; this one
+keeps the evidence.** It moves nothing out of here, and an entry below
+stays the record even when it is summarised there.
+
 ## Every entry states the conditions that reproduce it — and nothing enforces that
 
 An entry that records a measurement carries the conditions that produced

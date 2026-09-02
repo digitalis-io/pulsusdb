@@ -14,6 +14,7 @@ Conventions:
 - Errors: the log query API (§2) and the trace query API (§4) return a bare `text/plain` body carrying the message and nothing else — but not the same container: §2 also sets `X-Content-Type-Options: nosniff` and §4 does not, because their references differ (see §2.3 and §4). The metrics API (§3) returns a `{"status":"error","errorType":...,"error":...}` JSON envelope, because upstream Prometheus does. `429` on ingest backpressure; `400` for malformed queries.
 - Compression: requests may be `gzip`, `snappy`, or `zstd` (`Content-Encoding`); responses gzip when accepted.
 - Regular expressions: RE2 in every query language — §9 documents the dialect and the measured differences from Loki/Prometheus/Tempo.
+- Parity: PulsusDB answers as Loki, Prometheus and Tempo answer, **except where they are wrong**. The places where that exception applies — and why each one is a defect rather than a different choice — are listed in docs/reference-defects-we-do-not-copy.md; the full divergence record, defects and non-defects alike, is in the three ledgers under docs/benchmarks/.
 
 ## Request headers (all optional)
 
