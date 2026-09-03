@@ -3058,7 +3058,7 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Result<Vec<CheckedFrag
             // in the client pipeline — never emit SQL for them here (doing so
             // would drop lines the client scan must keep / re-test).
             Stage::LineFilter(lf) if is_pushable_line_filter(lf) => {
-                out.push(super::predicate::line_filter(lf)?)
+                out.push(crate::logql::predicate::line_filter(lf)?)
             }
             Stage::LineFilter(_) => {}
             // `line_format`/`decolorize`/`unpack` rewrite the line — a line
@@ -5913,5 +5913,578 @@ mod tests {
             bare.client.is_none(),
             "the same query without the filter IS the pushdown shape"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #492 §11.2: the gates that reproduce each hand-written walk
+    //
+    // §1's argument is that the boundary is computed several times by
+    // hand. These gates ARE that argument as tests: the shared model must
+    // reproduce EACH walk, not just the one that was measured.
+    //
+    // They are lib unit tests because `compile_line_filters` is
+    // `pub(crate)` and `has_unpushed_dropping_stage` and
+    // `metric_pipeline_construct` are private — an integration test can
+    // call none of them, and no production item is widened for them.
+    //
+    // **What they will NOT establish, because they share a helper.** All
+    // three shipped walks call `is_pushable_line_filter`, and so does the
+    // model's `LineFilter::capability`. The sharing is deliberate and
+    // stays — that function's own doc comment calls itself the single
+    // source of truth "so the two paths never drift" — but the
+    // consequence has to be said rather than left implicit: these three
+    // establish that the model's TRAVERSAL and ACCUMULATED STATE
+    // reproduce each hand-written walk, and NOTHING about pushability
+    // itself. If `is_pushable_line_filter` were wrong, both sides would
+    // be wrong together and all three would stay green. Pushability gets
+    // its own gate below, which reaches its answer without the helper:
+    // every expected value there is a literal.
+    // -----------------------------------------------------------------
+
+    use crate::compile::fold::{Disposition as CDisposition, LowerCx, lower_chain};
+    use crate::logql::compile::{Lql, LqlLink, seed_relation};
+
+    /// The fifteen atoms every chain below is built from, each parsed by
+    /// the real parser rather than hand-built. They cover the two shapes
+    /// the model's own negative controls turn on — an `or` alternative
+    /// carrying an `ip()`, and a line rewrite — plus the parsers, the
+    /// label filter and `label_format`, which are the stages the
+    /// line-filter walk alone never reaches.
+    const ATOMS: [&str; 15] = [
+        r#"|= "CONN_REFUSED""#,
+        r#"!= "noise""#,
+        r#"|~ `err[0-9]+`"#,
+        r#"|= ip("10.0.0.0/8")"#,
+        r#"|= "x" or "y""#,
+        r#"|= "x" or ip("10.0.0.1")"#,
+        "| json",
+        "| logfmt",
+        r#"| regexp "(?P<a>.*)""#,
+        r#"| pattern "<a>""#,
+        r#"| level="error""#,
+        r#"| line_format "{{.msg}}""#,
+        "| label_format dst=src",
+        "| decolorize",
+        "| unpack",
+    ];
+
+    /// Every ordered triple of [`ATOMS`] — 15³ = 3,375 chains.
+    fn every_chain_of_length_three() -> Vec<Vec<Stage>> {
+        let atoms: Vec<Stage> = ATOMS
+            .iter()
+            .map(|a| crate::logql::compile::parsed_stage(a))
+            .collect();
+        let mut out = Vec::with_capacity(atoms.len().pow(3));
+        for a in &atoms {
+            for b in &atoms {
+                for c in &atoms {
+                    out.push(vec![a.clone(), b.clone(), c.clone()]);
+                }
+            }
+        }
+        out
+    }
+
+    fn model_chain(pipeline: &[Stage]) -> Vec<LqlLink> {
+        std::iter::once(LqlLink::Source)
+            .chain(pipeline.iter().cloned().map(LqlLink::Pipe))
+            .collect()
+    }
+
+    fn model_bounds() -> crate::compile::fold::RequestBounds {
+        crate::compile::fold::RequestBounds {
+            start_ns: 0,
+            end_ns: 1,
+            step_ns: None,
+            limit: Some(100),
+        }
+    }
+
+    /// Folds one pipeline through the shared model and returns the
+    /// dispositions, in chain order, alongside the accumulated relation.
+    fn model_fold(pipeline: &[Stage]) -> (Vec<CDisposition>, bool) {
+        let chain = model_chain(pipeline);
+        let bounds = model_bounds();
+        let cx = LowerCx::<Lql>::new(&bounds);
+        let lowering =
+            lower_chain::<Lql>(&chain, seed_relation(), &cx).expect("the model folds every chain");
+        (lowering.how, lowering.rel.exact)
+    }
+
+    /// The ordered list of line-filter predicates the MODEL pushes.
+    fn model_pushed_predicates(pipeline: &[Stage]) -> Vec<String> {
+        let (how, _) = model_fold(pipeline);
+        let mut out = Vec::new();
+        for (i, stage) in pipeline.iter().enumerate() {
+            // `how[0]` is the synthesised `Source` link.
+            if let (Stage::LineFilter(lf), CDisposition::Lowered(_)) = (stage, &how[i + 1]) {
+                out.push(
+                    crate::logql::predicate::line_filter(lf)
+                        .expect("every atom's predicate compiles")
+                        .as_sql()
+                        .to_string(),
+                );
+            }
+        }
+        out
+    }
+
+    /// The same list, from the SHIPPED function — the real one, not a
+    /// transcription.
+    fn shipped_pushed_predicates(pipeline: &[Stage]) -> Vec<String> {
+        compile_line_filters(pipeline)
+            .expect("every atom's predicate compiles")
+            .iter()
+            .map(|f| f.as_sql().to_string())
+            .collect()
+    }
+
+    /// Walk 1: the model's ordered pushed-filter list equals
+    /// `compile_line_filters`' own, over all 3,375 chains.
+    #[test]
+    fn the_model_reproduces_compile_line_filters_ordered_predicate_list() {
+        let chains = every_chain_of_length_three();
+        assert_eq!(chains.len(), 3_375);
+        let mut mismatches = 0usize;
+        let mut pushing = 0usize;
+        let mut first: Option<(Vec<String>, Vec<String>, Vec<String>)> = None;
+        for chain in &chains {
+            let shipped = shipped_pushed_predicates(chain);
+            if !shipped.is_empty() {
+                pushing += 1;
+            }
+            let model = model_pushed_predicates(chain);
+            if model != shipped {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((
+                        chain.iter().map(|s| s.to_string()).collect(),
+                        model,
+                        shipped,
+                    ));
+                }
+            }
+        }
+        assert!(
+            pushing > 0,
+            "the corpus must contain chains the shipped walk pushes from, or the equality is \
+             vacuous"
+        );
+        assert_eq!(
+            mismatches,
+            0,
+            "the model and the shipped walk disagree on {mismatches} of {} chains; first: {first:?}",
+            chains.len()
+        );
+    }
+
+    /// The negative control, and it is what makes the zero above mean
+    /// something: a fold that returns at the FIRST refusal — the shape
+    /// this design's first version had — still disagrees with the shipped
+    /// walk, so the regression cannot silently return.
+    #[test]
+    fn a_first_refusal_fold_still_mismatches_the_shipped_walk() {
+        let chains = every_chain_of_length_three();
+        let mut mismatches = 0usize;
+        for chain in &chains {
+            let (how, _) = model_fold(chain);
+            // Stop at the first link that did not lower, and take only
+            // the line filters before it.
+            let mut prefix = Vec::new();
+            for (i, stage) in chain.iter().enumerate() {
+                if !matches!(how[i + 1], CDisposition::Lowered(_)) {
+                    break;
+                }
+                if let Stage::LineFilter(lf) = stage {
+                    prefix.push(
+                        crate::logql::predicate::line_filter(lf)
+                            .expect("compiles")
+                            .as_sql()
+                            .to_string(),
+                    );
+                }
+            }
+            if prefix != shipped_pushed_predicates(chain) {
+                mismatches += 1;
+            }
+        }
+        assert_ne!(
+            mismatches, 0,
+            "a first-refusal fold must NOT agree with the shipped walk — if it does, this \
+             corpus no longer discriminates and the zero above proves nothing"
+        );
+    }
+
+    /// Walk 2: `!exact` on a `Lines` shape after the fold equals
+    /// `has_unpushed_dropping_stage` on the same pipeline.
+    #[test]
+    fn exact_after_the_fold_agrees_with_has_unpushed_dropping_stage() {
+        let chains = every_chain_of_length_three();
+        let mut mismatches = 0usize;
+        let mut dropping = 0usize;
+        let mut first: Option<(Vec<String>, bool, bool)> = None;
+        for chain in &chains {
+            let (_, exact) = model_fold(chain);
+            // The model's answer to the shipped question: the SQL is a
+            // superset, so something drops lines in our own engine.
+            let model_drops = !exact;
+            let shipped = has_unpushed_dropping_stage(chain);
+            if shipped {
+                dropping += 1;
+            }
+            if model_drops != shipped {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((
+                        chain.iter().map(|s| s.to_string()).collect(),
+                        model_drops,
+                        shipped,
+                    ));
+                }
+            }
+        }
+        assert!(
+            dropping > 0 && dropping < chains.len(),
+            "the corpus must contain chains on BOTH sides of the shipped answer, else the \
+             equality is vacuous: {dropping} of {}",
+            chains.len()
+        );
+        assert_eq!(
+            mismatches,
+            0,
+            "the model's !exact and has_unpushed_dropping_stage disagree on {mismatches} of {} \
+             chains; first: {first:?}",
+            chains.len()
+        );
+    }
+
+    /// `metric_pipeline_construct`'s own vocabulary, as the model would
+    /// name each link. Written here as literals, so the mapping is a
+    /// second producer and not the function's own answer echoed back.
+    fn construct_word(stage: &Stage) -> Option<&'static str> {
+        use pulsus_logql::ParserStage;
+        match stage {
+            Stage::LineFilter(_) => Some("ip line filter"),
+            Stage::Parser(ParserStage::Json { .. }) => Some("json"),
+            Stage::Parser(ParserStage::Logfmt { .. }) => Some("logfmt"),
+            Stage::Parser(ParserStage::Regexp(_)) => Some("regexp"),
+            Stage::Parser(ParserStage::Pattern(_)) => Some("pattern"),
+            Stage::LabelFilter(_) => Some("label filter"),
+            Stage::LineFormat(_) => Some("line_format"),
+            Stage::LabelFormat(_) => Some("label_format"),
+            Stage::Unwrap(_) => Some("unwrap"),
+            Stage::Unpack => Some("unpack"),
+            Stage::Decolorize => Some("decolorize"),
+            Stage::Drop(_) => Some("drop"),
+            Stage::Keep(_) => Some("keep"),
+        }
+    }
+
+    /// Walk 3: the first `Pipe` link the fold marks residual is the stage
+    /// `metric_pipeline_construct` names.
+    #[test]
+    fn the_first_residual_pipe_link_agrees_with_metric_pipeline_construct() {
+        let chains = every_chain_of_length_three();
+        let mut mismatches = 0usize;
+        let mut named = 0usize;
+        let mut first: Option<(Vec<String>, Option<&str>, Option<&str>)> = None;
+        for chain in &chains {
+            let (how, _) = model_fold(chain);
+            let model = chain
+                .iter()
+                .enumerate()
+                .find(|(i, _)| matches!(how[i + 1], CDisposition::Residual(_)))
+                .and_then(|(_, s)| construct_word(s));
+            let shipped = metric_pipeline_construct(chain);
+            if shipped.is_some() {
+                named += 1;
+            }
+            if model != shipped {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((
+                        chain.iter().map(|s| s.to_string()).collect(),
+                        model,
+                        shipped,
+                    ));
+                }
+            }
+        }
+        assert!(
+            named > 0 && named < chains.len(),
+            "the corpus must contain chains on both sides: {named} of {}",
+            chains.len()
+        );
+        assert_eq!(
+            mismatches,
+            0,
+            "the model's first residual link and metric_pipeline_construct disagree on \
+             {mismatches} of {} chains; first: {first:?}",
+            chains.len()
+        );
+    }
+
+    /// The residual rule as behaviour: a refused `line_format` marks the
+    /// line rewritten, and the next line filter is residual BECAUSE of
+    /// it. Nothing is skipped silently.
+    #[test]
+    fn a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual() {
+        let pipeline = vec![
+            crate::logql::compile::parsed_stage(r#"|= "CONN_REFUSED""#),
+            crate::logql::compile::parsed_stage(r#"| line_format "{{.msg}}""#),
+            crate::logql::compile::parsed_stage(r#"|= "pod-044""#),
+        ];
+        let (how, _) = model_fold(&pipeline);
+        assert!(
+            matches!(how[1], CDisposition::Lowered(_)),
+            "the filter BEFORE the rewrite lowers"
+        );
+        assert!(matches!(how[2], CDisposition::Residual(_)));
+        assert!(
+            matches!(how[3], CDisposition::Residual(_)),
+            "the filter AFTER the rewrite is residual because the rewrite said so"
+        );
+        // And it is not merely residual by position: the model pushed the
+        // first needle and not the second, exactly as the shipped walk
+        // does.
+        assert_eq!(
+            model_pushed_predicates(&pipeline),
+            shipped_pushed_predicates(&pipeline)
+        );
+        assert_eq!(model_pushed_predicates(&pipeline).len(), 1);
+    }
+
+    /// Pushability gets its own gate, and it reaches its answer WITHOUT
+    /// the shared helper: every expected value below is a literal written
+    /// here, never a value `is_pushable_line_filter` produced.
+    ///
+    /// The table is adversarial on purpose: two rows spell an IP address
+    /// without being an `ip()` filter, and two put the `ip()` on the `or`
+    /// side rather than the head.
+    #[test]
+    fn the_pushability_rule_matches_a_hand_written_table() {
+        struct Row {
+            query: &'static str,
+            value_is_ip: bool,
+            or_matches: &'static [(&'static str, bool)],
+            pushable: bool,
+        }
+        const TABLE: &[Row] = &[
+            Row {
+                query: r#"{service_name="checkout"} |= "x""#,
+                value_is_ip: false,
+                or_matches: &[],
+                pushable: true,
+            },
+            Row {
+                // A regex that SPELLS an IP address is not an `ip()`
+                // filter. The backtick form is the spelling that parses.
+                query: r#"{service_name="checkout"} |~ `1\.2\.3\.4`"#,
+                value_is_ip: false,
+                or_matches: &[],
+                pushable: true,
+            },
+            Row {
+                // A literal that spells the call is not the call.
+                query: r#"{service_name="checkout"} |= "ip(""#,
+                value_is_ip: false,
+                or_matches: &[],
+                pushable: true,
+            },
+            Row {
+                query: r#"{service_name="checkout"} |= ip("10.0.0.1")"#,
+                value_is_ip: true,
+                or_matches: &[],
+                pushable: false,
+            },
+            Row {
+                query: r#"{service_name="checkout"} != ip("10.0.0.1")"#,
+                value_is_ip: true,
+                or_matches: &[],
+                pushable: false,
+            },
+            Row {
+                query: r#"{service_name="checkout"} |= "x" or "y""#,
+                value_is_ip: false,
+                or_matches: &[("y", false)],
+                pushable: true,
+            },
+            Row {
+                // The `ip()` is not the head.
+                query: r#"{service_name="checkout"} |= "x" or ip("10.0.0.1")"#,
+                value_is_ip: false,
+                or_matches: &[("10.0.0.1", true)],
+                pushable: false,
+            },
+            Row {
+                query: r#"{service_name="checkout"} |= ip("10.0.0.1") or "x""#,
+                value_is_ip: true,
+                or_matches: &[("x", false)],
+                pushable: false,
+            },
+        ];
+        for row in TABLE {
+            let expr = parse(row.query).unwrap_or_else(|e| panic!("{}: {e}", row.query));
+            let pulsus_logql::Expr::Log(log) = expr else {
+                panic!("{} is not a log expression", row.query)
+            };
+            let Some(Stage::LineFilter(lf)) = log.pipeline.first() else {
+                panic!("{} has no line filter", row.query)
+            };
+            assert_eq!(lf.value_is_ip, row.value_is_ip, "{}", row.query);
+            let got: Vec<(&str, bool)> = lf
+                .or_matches
+                .iter()
+                .map(|m| (m.value.as_str(), m.is_ip))
+                .collect();
+            assert_eq!(got, row.or_matches.to_vec(), "{}", row.query);
+            assert_eq!(
+                is_pushable_line_filter(lf),
+                row.pushable,
+                "{}: the expected answer is a literal in this table",
+                row.query
+            );
+        }
+
+        // Two shapes that do NOT reach the rule, because the parser
+        // refuses them first. They are asserted so that a later parser
+        // change cannot quietly add a case the table does not cover.
+        for (query, needle) in [
+            (
+                r#"{service_name="checkout"} |~ "1\.2\.3\.4""#,
+                "invalid char escape",
+            ),
+            (
+                r#"{service_name="checkout"} !~ "x" or ip("::1")"#,
+                "expected a string",
+            ),
+        ] {
+            let err = parse(query).expect_err(query).to_string();
+            assert!(err.contains(needle), "{query}: got {err}");
+        }
+    }
+
+    /// Issue #492 §7.2: the eight plan-shape rows this issue names, as
+    /// literals.
+    ///
+    /// These are the fields the plan object's LogQL fit turns on —
+    /// `fetch_until_limit` is `Cut::InexactLimit`'s recogniser and
+    /// `scan_limit` is what it costs — measured through the real planner
+    /// at the request the issue names. **Nothing here is an aspiration:**
+    /// every value is what this tree produces today, so a wave that
+    /// changes one has to move a literal in the same change.
+    ///
+    /// Row 3 is the must-not-cut rule as a number: the `ip()` query
+    /// compiles **2** line filters, the two literal ones on either side
+    /// of the filter that cannot compile. A prefix model would compile
+    /// one, and that difference is the measured metered-byte regression.
+    #[test]
+    fn the_plan_shape_fields_this_issue_names_are_what_the_planner_produces() {
+        struct Row {
+            query: &'static str,
+            limit: u32,
+            fetch_until_limit: bool,
+            scan_limit: u32,
+            line_filters: usize,
+            probes: usize,
+        }
+        const ROWS: &[Row] = &[
+            Row {
+                query: r#"{service_name="checkout"} |= "CONN_REFUSED""#,
+                limit: 100,
+                fetch_until_limit: false,
+                scan_limit: 100,
+                line_filters: 1,
+                probes: 0,
+            },
+            Row {
+                query: r#"{service_name="does-not-exist"} |= "x""#,
+                limit: 100,
+                fetch_until_limit: false,
+                scan_limit: 100,
+                line_filters: 1,
+                probes: 0,
+            },
+            Row {
+                query: r#"{service_name="ipcase"} |= "CONN_REFUSED" |= ip("10.0.0.0/8") |= "pod-044""#,
+                limit: 100,
+                fetch_until_limit: true,
+                scan_limit: 1000,
+                line_filters: 2,
+                probes: 0,
+            },
+            Row {
+                query: r#"{service_name="checkout"} | json | dur_ms="31.0""#,
+                limit: 100,
+                fetch_until_limit: true,
+                scan_limit: 1000,
+                line_filters: 0,
+                probes: 0,
+            },
+            Row {
+                query: r#"{service_name="checkout"} | json | dur_ms="31""#,
+                limit: 100,
+                fetch_until_limit: true,
+                scan_limit: 1000,
+                line_filters: 0,
+                probes: 0,
+            },
+            Row {
+                query: r#"{service_name="checkout"} | json | line_format "{{.msg}}" |= "pod-044""#,
+                limit: 100,
+                fetch_until_limit: true,
+                scan_limit: 1000,
+                line_filters: 0,
+                probes: 0,
+            },
+            Row {
+                query: r#"{service_name=~".+"} |= "pod-044""#,
+                limit: 2,
+                fetch_until_limit: false,
+                scan_limit: 2,
+                line_filters: 1,
+                probes: 1,
+            },
+            Row {
+                query: r#"{service_name="checkout"} | trace_id="740eda9f12aec8e8""#,
+                limit: 100,
+                fetch_until_limit: true,
+                scan_limit: 1000,
+                line_filters: 0,
+                probes: 0,
+            },
+        ];
+
+        for row in ROWS {
+            let params = QueryParams {
+                spec: QuerySpec::Range {
+                    start_ns: 1_788_256_175_000_000_000,
+                    end_ns: 1_788_256_835_000_000_000,
+                    step_ns: 60_000_000_000,
+                },
+                limit: row.limit,
+                direction: Direction::Backward,
+            };
+            let expr = parse(row.query).unwrap_or_else(|e| panic!("{}: {e}", row.query));
+            let Plan::Streams(sp) = plan(&expr, &params, &test_ctx())
+                .unwrap_or_else(|e| panic!("{}: {e:?}", row.query))
+            else {
+                panic!("{} is not a streams plan", row.query)
+            };
+            assert_eq!(
+                sp.fetch_until_limit, row.fetch_until_limit,
+                "{}: fetch_until_limit",
+                row.query
+            );
+            assert_eq!(sp.scan_limit, row.scan_limit, "{}: scan_limit", row.query);
+            assert_eq!(
+                sp.line_filters.len(),
+                row.line_filters,
+                "{}: compiled line filters",
+                row.query
+            );
+            assert_eq!(sp.probes.len(), row.probes, "{}: probes", row.query);
+            assert_eq!(sp.result_limit, row.limit, "{}: result_limit", row.query);
+        }
     }
 }

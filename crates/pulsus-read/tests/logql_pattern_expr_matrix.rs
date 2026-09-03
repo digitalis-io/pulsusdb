@@ -1419,11 +1419,15 @@ fn render_sites_tsv() -> String {
     for (site, written) in sweep_a() {
         match resolve_site(&written) {
             Some((decoded, pre, post)) => {
+                // `-` is this file's empty-cell spelling everywhere
+                // else; an EMPTY last cell renders as a trailing tab,
+                // which `git diff --check` flags on every regenerated
+                // Site row (issue #492, code review round 20).
                 let note = FLIPS
                     .iter()
                     .find(|f| f.argument == decoded)
                     .map(|f| f.resolution)
-                    .unwrap_or("");
+                    .unwrap_or("-");
                 out.push_str(&format!(
                     "Site\tLiteral\t{site}\t-\t-\t{decoded}\t{}\t{}\t-\t-\t{}\n",
                     pre.tsv(),
