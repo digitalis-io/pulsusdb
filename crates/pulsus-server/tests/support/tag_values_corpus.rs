@@ -359,3 +359,69 @@ pub fn ac_476_request(base_ns: u64) -> ExportTraceServiceRequest {
         ],
     }
 }
+
+// ---------------------------------------------------------------------
+// The issue #509 acceptance corpus: attribute keys containing `?`.
+//
+// A `?` in query TEXT is a bind placeholder to the ClickHouse driver we
+// vendor, and the unnarrowed tag-values read inlines the requested
+// attribute key as a literal. The three shapes that produced are all
+// here: an odd run (`k?q`, `a?b?c`, `a???b`), an even run (`a??b`, which
+// the driver collapses so a DIFFERENT key is asked for) and `?fields`
+// (which the driver replaces with the row's column list). Only the first
+// was an error; the other two answered `200` with an empty list, which
+// is why every case's expected VALUE is asserted and not its status.
+//
+// `plain509` is the control that puts the `?` in the VALUE rather than
+// the key, and `span.nosuchkey` — stored by nobody, and deliberately not
+// in this corpus — is the control that says an empty answer is not by
+// itself evidence of anything.
+// ---------------------------------------------------------------------
+
+/// The two spans of the issue #509 acceptance corpus.
+pub fn cq_request(base_ns: u64) -> ExportTraceServiceRequest {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![kv_str("service.name", "q509"), kv_str("res.q?key", "rv?1")],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: Some(InstrumentationScope {
+                    name: "i509".to_string(),
+                    ..Default::default()
+                }),
+                spans: vec![
+                    ac_span(
+                        "50900000000000000000000000000001",
+                        "5090000000000001",
+                        "q509-a",
+                        base_ns,
+                        vec![
+                            kv_str("k?q", "vq1"),
+                            kv_str("a?", "v-trailing"),
+                            kv_str("?a", "v-leading"),
+                            kv_str("a??b", "v-double"),
+                            kv_str("a?b?c", "v-multi"),
+                            kv_str("a???b", "v-triple"),
+                            kv_str("http.target?raw", "/x?y=1"),
+                            kv_str("plain509", "v?1"),
+                            kv_str("a?fields", "vf1"),
+                            kv_str("?fields", "vf2"),
+                        ],
+                    ),
+                    ac_span(
+                        "50900000000000000000000000000002",
+                        "5090000000000002",
+                        "q509-b",
+                        base_ns,
+                        vec![kv_str("k?q", "vq2"), kv_str("plain509", "v?2")],
+                    ),
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}

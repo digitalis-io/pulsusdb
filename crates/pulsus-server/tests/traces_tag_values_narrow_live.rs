@@ -298,17 +298,27 @@ fn entries(body: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A fixture answer's expected entries.
+///
+/// Two element shapes, because the two ROUTE shapes differ: a `[type,
+/// value]` pair for the typed routes, and a bare string for the v1 flat
+/// route, whose body carries bare strings on both sides. `entries` above
+/// reads a bare string out of a RESPONSE as `string`-typed; this is the
+/// same rule on the expectation side.
 fn expected(answer: &Value) -> Vec<(String, String)> {
     answer["values"]
         .as_array()
         .expect("values")
         .iter()
-        .map(|p| {
-            let a = p.as_array().expect("pair");
-            (
-                a[0].as_str().unwrap_or_default().to_string(),
-                a[1].as_str().unwrap_or_default().to_string(),
-            )
+        .map(|p| match p {
+            Value::String(v) => ("string".to_string(), v.clone()),
+            _ => {
+                let a = p.as_array().expect("pair");
+                (
+                    a[0].as_str().unwrap_or_default().to_string(),
+                    a[1].as_str().unwrap_or_default().to_string(),
+                )
+            }
         })
         .collect()
 }
@@ -329,6 +339,25 @@ fn urlencode(s: &str) -> String {
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 struct CountRow {
     n: u64,
+}
+
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+struct TextRow {
+    s: String,
+}
+
+/// One `String` column, as a `Vec` — used for the issue #509
+/// received-literal scan and for reading the server clock.
+async fn text_column(admin: &ChClient, sql: &str) -> Vec<String> {
+    let mut stream = admin
+        .query_stream::<TextRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode text row").s);
+    }
+    out
 }
 
 /// How many finished Selects in `db` match `prefix` and read exactly
@@ -359,6 +388,27 @@ async fn selects_reading(admin: &ChClient, db: &str, prefix: &str, table: &str) 
     }
     n
 }
+
+/// Issue #509: the key literals ClickHouse must have RECEIVED for the
+/// four discriminating cases — the even run, the odd run, the `?fields`
+/// shape and the key that holds nothing.
+const QM_RECEIVED_LITERALS: [&str; 4] = [
+    "key = 'a??b'",
+    "key = 'a???b'",
+    "key = 'a?fields'",
+    "key = 'nosuchkey'",
+];
+
+/// The three literals the driver produced when the key was not escaped.
+/// The first is the even-run collapse — `a??b` asked for, `a?b`
+/// received. The other two are the `?fields` rewrite: the driver
+/// substitutes the derive-generated column list, so the wrong SQL is
+/// VALID SQL and ClickHouse answers it happily with nothing.
+const QM_FORBIDDEN_LITERALS: [&str; 3] = [
+    "key = 'a?b'",
+    "key = 'a`val`,`val_type`'",
+    "key = '`val`,`val_type`'",
+];
 
 /// The byte-frozen prefix of the span-name read (`tags_sql`'s own golden
 /// pins the whole statement).
@@ -519,6 +569,153 @@ async fn our_answers_match_the_committed_fixture() {
         long.0, "string",
         "typing: the capped name is still a string"
     );
+
+    // ---- issue #509: attribute keys containing `?` ------------------
+    //
+    // Pushed LAST, so no earlier assertion in this test can see the two
+    // `q509-*` span names.
+    //
+    // Every case asserts the VALUE SET, never the status alone, and that
+    // is the whole design. Of the three shapes this defect had, only one
+    // was an error: an even run of `?` collapsed in the driver so a
+    // DIFFERENT key was asked for, and `?fields` had the row's column
+    // list substituted into the literal. Both answered `200` with an
+    // empty list — byte-identical to QM-Z, a key nothing holds — so a
+    // status-only check passed two of the three.
+    push(port, &corpus::cq_request(base), "CQ");
+
+    let qm = fx["question_mark_keys"]
+        .as_object()
+        .expect("question_mark_keys");
+    assert_eq!(
+        qm.len(),
+        28,
+        "every fixture question_mark_keys case must be issued"
+    );
+    for (id, case) in qm {
+        let route = case["route"].as_str().expect("route");
+        let mut path = route.to_string();
+        let mut sep = '?';
+        if case["window"].as_bool().unwrap_or(false) {
+            path.push(sep);
+            path.push_str(&window);
+            sep = '&';
+        }
+        if let Some(q) = case["q"].as_str() {
+            path.push(sep);
+            path.push_str(&format!("q={}", urlencode(q)));
+        }
+        let res = get(port, &path, id);
+
+        if case["expect"].as_str() == Some("error") {
+            // QM-T: an empty attribute key. It was a `400` before this
+            // change and must stay one — never a `500`, and never a
+            // `200` that pretends the key was readable.
+            assert_eq!(
+                res.status,
+                case["pulsus"]["status"].as_u64().expect("status") as u16,
+                "{id}: {path} — body {}",
+                res.text()
+            );
+            assert_eq!(
+                res.headers.get("content-type").map(String::as_str),
+                case["pulsus"]["content_type"].as_str(),
+                "{id}: content type"
+            );
+            assert_eq!(
+                res.text(),
+                case["pulsus_body"].as_str().expect("pulsus_body"),
+                "{id}: exact body"
+            );
+            continue;
+        }
+
+        assert_eq!(res.status, 200, "{id}: {path} — body {}", res.text());
+        let body = res.json(id);
+        assert_eq!(
+            entries(&body),
+            expected(&case["pulsus"]),
+            "{id}: {path} — body {body}"
+        );
+        if let Some(want) = case["pulsus"]["truncated"].as_bool() {
+            assert_eq!(
+                body["truncated"].as_bool(),
+                Some(want),
+                "{id}: the native route carries `truncated`, body {body}"
+            );
+        } else {
+            assert!(
+                body.get("truncated").is_none(),
+                "{id}: an alias body carries no `truncated` key, body {body}"
+            );
+        }
+    }
+
+    // ---- issue #509: the key literal ClickHouse RECEIVED -------------
+    //
+    // The response alone cannot separate the two silent shapes from a
+    // key that is genuinely empty: `span.a?fields` and `span.nosuchkey`
+    // returned byte-identical bodies before this change. So the four
+    // discriminating cases are re-issued here and the text ClickHouse
+    // actually received is read back out of `system.query_log`.
+    //
+    // **The instant bound below is not optional.** `system.query_log` is
+    // NOT dropped with the test database and its rows carry the same
+    // `current_database`, so without it the "must not contain"
+    // assertions read the PREVIOUS run's rows — on a previous build,
+    // which is exactly where the forbidden literals live.
+    let since = text_column(&admin, "SELECT toString(now64(6)) AS s")
+        .await
+        .pop()
+        .expect("server clock");
+    for path in [
+        // QM-D, an even run: the driver collapsed it to `a?b`
+        "/api/v2/search/tag/span.a%3F%3Fb/values",
+        // QM-U2, an odd run: no statement reached ClickHouse at all
+        "/api/v2/search/tag/span.a%3F%3F%3Fb/values",
+        // QM-V, `?fields`: the row's column list was substituted
+        "/api/v2/search/tag/span.a%3Ffields/values",
+        // QM-Z, no `?` at all, and no rows either — the control that
+        // makes an empty answer mean something
+        "/api/v2/search/tag/span.nosuchkey/values",
+    ] {
+        let res = get(port, path, "received-literal probe");
+        assert_eq!(res.status, 200, "{path}: body {}", res.text());
+    }
+    admin
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    // Set membership on the EXTRACTED literals, never a bare-key
+    // substring search: on the row whose extracted literal is
+    // `key = 'a?b?c'`, searching for the bare key `a?b` hits, while
+    // searching for the whole `key = '<k>'` form does not.
+    let literals = text_column(
+        &admin,
+        &format!(
+            "SELECT DISTINCT extract(query, 'key = ''[^'']*''') AS s FROM system.query_log \
+             WHERE type = 'QueryFinish' AND current_database = '{db}' \
+               AND query LIKE '%trace_tag_catalog%' \
+               AND event_time_microseconds >= toDateTime64('{since}', 6)"
+        ),
+    )
+    .await;
+    for want in QM_RECEIVED_LITERALS {
+        assert!(
+            literals.iter().any(|l| l == want),
+            "ClickHouse never received {want}: it received {literals:?}"
+        );
+    }
+    for forbidden in QM_FORBIDDEN_LITERALS {
+        assert!(
+            !literals.iter().any(|l| l == forbidden),
+            "ClickHouse received {forbidden} — the driver rewrote the key: {literals:?}"
+        );
+    }
 
     drop_db(db).await;
 }

@@ -90,6 +90,11 @@ fn ledger() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+fn api_doc() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api.md");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
 /// The ledger, parsed into `heading id -> row body`. A row starts at its
 /// own `### \`<id>\`` heading and ends at the next `### `.
 fn ledger_rows(text: &str) -> BTreeMap<String, String> {
@@ -161,7 +166,13 @@ struct Case {
 /// Every case in every section that carries both answers.
 fn cases(fx: &Value) -> Vec<Case> {
     let mut out = Vec::new();
-    for section in ["q_matrix", "range_faults", "range_accepted", "span_names"] {
+    for section in [
+        "q_matrix",
+        "range_faults",
+        "range_accepted",
+        "span_names",
+        "question_mark_keys",
+    ] {
         let Some(map) = fx[section].as_object() else {
             panic!("fixture section {section} is missing");
         };
@@ -378,6 +389,32 @@ fn wait_for_names(api_base: &str, query: &str, want: usize, ctx: &str) {
     }
 }
 
+/// Polls one tag-values PATH (window and all) until it carries at least
+/// `want` values. The reference cuts a live-store block a few seconds
+/// after a push, so a single empty read after ingest proves nothing.
+fn wait_for_tag_values(api_base: &str, path: &str, want: usize, ctx: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let res = curl(
+            &[],
+            &format!("{}{path}", api_base.trim_end_matches('/')),
+            ctx,
+        );
+        let body_text = String::from_utf8_lossy(&res.body).to_string();
+        if res.status == 200 {
+            let body: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+            if body["tagValues"].as_array().map(Vec::len).unwrap_or(0) >= want {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{ctx}: the corpus never became visible within 120s (last body {body_text})"
+        );
+        std::thread::sleep(Duration::from_millis(1_000));
+    }
+}
+
 /// The `(type, value)` pairs of a tag-values body, in whatever order the
 /// server sent them. The v1 flat shape's bare strings are read as
 /// `string`-typed.
@@ -403,17 +440,24 @@ fn sorted(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
     v
 }
 
+/// A fixture answer's expected entries. Two element shapes, because two
+/// route shapes differ: a `[type, value]` pair for the typed routes, and
+/// a bare string for the v1 flat route, whose body carries bare strings
+/// on both sides. `entries` above applies the same rule to a RESPONSE.
 fn expected_entries(answer: &Value) -> Vec<(String, String)> {
     answer["values"]
         .as_array()
         .expect("values array")
         .iter()
-        .map(|pair| {
-            let a = pair.as_array().expect("pair");
-            (
-                a[0].as_str().unwrap_or_default().to_string(),
-                a[1].as_str().unwrap_or_default().to_string(),
-            )
+        .map(|pair| match pair {
+            Value::String(v) => ("string".to_string(), v.clone()),
+            _ => {
+                let a = pair.as_array().expect("pair");
+                (
+                    a[0].as_str().unwrap_or_default().to_string(),
+                    a[1].as_str().unwrap_or_default().to_string(),
+                )
+            }
         })
         .collect()
 }
@@ -570,6 +614,77 @@ fn replay_478_sections(fx: &Value, api: &str, otlp: &str) {
         want_len,
         "span_names T-CAP: the reference no longer returns the whole name"
     );
+
+    // Phase 4 (issue #509): the `?`-key corpus, pushed LAST.
+    //
+    // Push order is load-bearing. `CQ` adds two span names, and `Q-A` —
+    // the unfiltered name list, the very first case above — asserts an
+    // exact set. Pushed any earlier, this corpus would fail that case
+    // and every later one would be unreachable.
+    push(otlp, &corpus::cq_request(base), "CQ push");
+    wait_for_tag_values(
+        api,
+        "/api/v2/search/tag/span.plain509/values",
+        2,
+        "CQ visibility",
+    );
+    let mut qm_checked = 0usize;
+    for (id, case) in fx["question_mark_keys"]
+        .as_object()
+        .expect("question_mark_keys")
+    {
+        if case["reference"].is_null() {
+            // The native route: this reference answers `404` there, so
+            // there is nothing to differ from.
+            continue;
+        }
+        let route = case["route"].as_str().expect("route");
+        let mut url = format!("{}{route}", api.trim_end_matches('/'));
+        let mut sep = '?';
+        if case["window"].as_bool().unwrap_or(false) {
+            url.push(sep);
+            url.push_str(&window);
+            sep = '&';
+        }
+        if let Some(q) = case["q"].as_str() {
+            url.push(sep);
+            url.push_str(&format!("q={}", urlencode(q)));
+        }
+        let res = curl(&[], &url, id);
+        assert_eq!(
+            res.status,
+            case["reference"]["status"].as_u64().expect("status") as u16,
+            "{id}: {url} — body {}",
+            String::from_utf8_lossy(&res.body)
+        );
+        if case["expect"].as_str() == Some("error") {
+            // QM-T. The two 400 BODIES are deliberately not compared —
+            // the reference's names its own grammar, exactly as the
+            // range_faults section already elides. What is compared is
+            // what the two sides agree on.
+            assert_eq!(
+                res.content_type,
+                case["reference"]["content_type"]
+                    .as_str()
+                    .unwrap_or_default(),
+                "{id}: content type"
+            );
+            qm_checked += 1;
+            continue;
+        }
+        let body: Value = serde_json::from_slice(&res.body)
+            .unwrap_or_else(|e| panic!("{id}: reference body is not JSON: {e}"));
+        assert_eq!(
+            sorted(entries(&body)),
+            sorted(expected_entries(&case["reference"])),
+            "{id}: the reference's answer has drifted from the committed capture"
+        );
+        qm_checked += 1;
+    }
+    assert_eq!(
+        qm_checked, 24,
+        "every comparable question_mark_keys case must be replayed"
+    );
 }
 
 /// The sections issue #476 captured, replayed against their own endpoint
@@ -632,4 +747,44 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Issue #509, criterion 12: the `docs/api.md` §4.3 `{tag}` row points at
+/// the cases that define what a `?` in the key does, and this test is
+/// that the pointer RESOLVES.
+///
+/// **That is the whole of what it claims, and the limit is written here
+/// rather than implied.** It cannot see whether any case's route, key,
+/// `q`, expected status or expected value is correct, and it is not
+/// trying to: the row asserts nothing about them, so there is nothing
+/// here to bind. What checks the cases is
+/// `traces_tag_values_narrow_live.rs` (our answers, over HTTP) and
+/// `the_committed_capture_matches_the_live_reference` above (the
+/// reference's, against the pinned container) — both of which EXECUTE
+/// them. Nor does anything here stop a future editor adding a general
+/// sentence back to that row; three earlier revisions tried to close
+/// that by writing a stronger claim into the row, and each stronger
+/// claim was itself the defect. This one leaves the row with nothing to
+/// drift.
+#[test]
+fn the_api_row_points_at_live_cases() {
+    let doc = api_doc();
+    for needle in [
+        "question_mark_keys",
+        "crates/pulsus-server/tests/traces_tag_values_narrow_live.rs",
+        "crates/pulsus-server/tests/trace_tag_values_differential.rs",
+    ] {
+        assert!(
+            doc.contains(needle),
+            "docs/api.md no longer names `{needle}` — the §4.3 {{tag}} row's pointer is broken"
+        );
+    }
+    let fx = fixture();
+    let section = fx["question_mark_keys"]
+        .as_object()
+        .expect("the fixture section docs/api.md points at must exist and be an object");
+    assert!(
+        !section.is_empty(),
+        "the question_mark_keys section is empty, so the row points at nothing"
+    );
 }

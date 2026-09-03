@@ -1130,3 +1130,145 @@ async fn narrowed_reads_prune_on_key_and_partition_not_on_the_set() {
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
+
+// ============================================================================
+// Issue #509: an attribute key containing `?`.
+//
+// The catalog read inlines the requested KEY as a SQL literal, and the
+// ClickHouse driver we vendor reads a bare `?` in query text as a bind
+// placeholder. The fix doubles every `?` at one choke point
+// (`traces::dispatch`), which the driver collapses back before the
+// statement reaches the server — so the read must still be the same
+// index-served read it was for a `?`-free key, and this gate is what
+// says so.
+// ============================================================================
+
+static QM_DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_tags_qm_it");
+
+/// The `?`-bearing key. Stored under `span` with `v`-prefixed values,
+/// and under a writer-RESERVED intrinsic scope with `a`-prefixed ones —
+/// so a read that lost its scope predicate returns the reserved rows
+/// FIRST and the content check below sees it.
+const QM_KEY: &str = "a?b";
+const QM_KEYS_PER_SCOPE: u64 = 10;
+const QM_VALS_PER_KEY: u64 = 10_000;
+
+async fn seed_qm_catalog(client: &ChClient, db: &str) {
+    for scope in ["resource", "span"] {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                 SELECT '{scope}', \
+                        concat('k', toString(number % {QM_KEYS_PER_SCOPE})), \
+                        concat('v', leftPad(toString(intDiv(number, {QM_KEYS_PER_SCOPE})), 7, '0')) \
+                 FROM numbers({})",
+                QM_KEYS_PER_SCOPE * QM_VALS_PER_KEY
+            ),
+        )
+        .await;
+    }
+    for (scope, prefix) in [("span", 'v'), ("event:intrinsic", 'a')] {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                 SELECT '{scope}', '{QM_KEY}', \
+                        concat('{prefix}', leftPad(toString(number), 7, '0')) \
+                 FROM numbers({QM_VALS_PER_KEY})"
+            ),
+        )
+        .await;
+    }
+}
+
+fn qm_config() -> TraceReadConfig {
+    TraceReadConfig {
+        scan_budget_rows: 10_000_000,
+        ..tight_budget_config()
+    }
+}
+
+/// Issue #509, criterion 9: the unnarrowed values read for a key
+/// containing `?` still prunes strictly on the `(scope, key)`
+/// primary-key prefix, and still answers.
+///
+/// Two halves, and they check different things. The EXPLAIN half is the
+/// index claim: `selected < total` on the `PrimaryKey` block, the same
+/// strict prune the `?`-free case above asserts. The engine half is that
+/// the read RUNS — before the fix it was
+/// `500 … invalid SQL: unbound query argument`, so a granule ratio
+/// alone would have been a claim about SQL nobody could execute.
+#[tokio::test]
+async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-read/tests/traces_tags_explain.rs for setup)"
+        );
+        return;
+    }
+
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {QM_DB}")).await;
+    run_init(&admin, &test_ctx(&QM_DB)).await.expect("run_init");
+
+    let mut cfg = test_config();
+    cfg.database = QM_DB.to_string();
+    let client = ChClient::new(cfg).await.expect("connect data client");
+    seed_qm_catalog(&client, &QM_DB).await;
+
+    let scope = ch_string("span");
+    let key = ch_string(QM_KEY);
+    let sql = tag_values_sql(&key, Some(&scope), TAG_VALUES_MAX + 1);
+    assert!(
+        sql.contains(QM_KEY),
+        "the builder must inline the key as a literal, or this gate tests nothing:\n{sql}"
+    );
+
+    // The EXPLAIN goes over this test's OWN driver hop, which applies
+    // the same placeholder rule the engine's dispatcher exists for — so
+    // the `?` is doubled here too. What ClickHouse parses is therefore
+    // the identical statement either way; the doubling is a wire
+    // encoding, not a change of query.
+    let raw = explain_raw(&client, &sql.replace('?', "??")).await;
+    let (selected, total) = primary_key_granules(&raw);
+    assert!(
+        selected > 0 && selected < total,
+        "a `?`-bearing key must still engage and strictly prune the (scope, key) prefix \
+         ({selected}/{total}):\n{raw}"
+    );
+
+    // And the read answers, through the engine, over the dispatcher.
+    let engine = TraceEngine::new(
+        {
+            let mut cfg = test_config();
+            cfg.database = QM_DB.to_string();
+            ChClient::new(cfg).await.expect("connect engine client")
+        },
+        qm_config(),
+    );
+    let values = engine
+        .list_tag_values(QM_KEY, Some("span"), unnarrowed_values_request())
+        .await
+        .expect("a `?` in the key is data: the read must answer, not fail the driver");
+    assert_eq!(
+        values.values.len(),
+        TAG_VALUES_MAX + 1,
+        "the key holds more than the cap, so the SQL LIMIT ships cap + 1 (the probe)"
+    );
+    assert!(values.truncated);
+    assert!(
+        values.values.iter().all(|v| !v.val.starts_with('a')),
+        "a reserved-scope value reached the scoped lookup: {:?}",
+        values
+            .values
+            .iter()
+            .filter(|v| v.val.starts_with('a'))
+            .take(5)
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {QM_DB}")).await;
+}
