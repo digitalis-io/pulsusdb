@@ -1145,10 +1145,14 @@ async fn narrowed_reads_prune_on_key_and_partition_not_on_the_set() {
 
 static QM_DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_tags_qm_it");
 
-/// The `?`-bearing key. Stored under `span` with `v`-prefixed values,
-/// and under a writer-RESERVED intrinsic scope with `a`-prefixed ones —
-/// so a read that lost its scope predicate returns the reserved rows
-/// FIRST and the content check below sees it.
+/// The `?`-bearing key. It is stored under THREE scopes, each with its
+/// own value prefix, and the three exist for three different checks:
+/// `span` (`v`) is what a `span`-scoped read must return, `resource`
+/// (`r`) is a second ATTRIBUTE scope so a bare-key read has a second
+/// primary-key range to touch and the granule comparison below has
+/// something to compare, and `event:intrinsic` (`a`) is a writer-
+/// RESERVED scope whose values sort first, so a read that lost its scope
+/// predicate returns them at the head of the very list under test.
 const QM_KEY: &str = "a?b";
 const QM_KEYS_PER_SCOPE: u64 = 10;
 const QM_VALS_PER_KEY: u64 = 10_000;
@@ -1168,7 +1172,7 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
         )
         .await;
     }
-    for (scope, prefix) in [("span", 'v'), ("event:intrinsic", 'a')] {
+    for (scope, prefix) in [("span", 'v'), ("resource", 'r'), ("event:intrinsic", 'a')] {
         // The seed statement carries the `?` too, and this test's own
         // client is a plain driver hop with no dispatcher in front of
         // it — so the doubling is applied here by hand. It is a wire
@@ -1245,7 +1249,33 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
         "a `?`-bearing key must still engage and strictly prune the (scope, key) prefix \
          ({selected}/{total}):\n{raw}"
     );
-    eprintln!("recorded `?`-key prune: granules={selected}/{total}");
+
+    // The DISCRIMINATOR, and it is not `selected < total` on its own.
+    // Measured on this fixture: with the `scope` predicate deleted from
+    // the builder the shape still reports 2/26, because ClickHouse
+    // excludes granules OPPORTUNISTICALLY inside ranges where the
+    // leading `scope` happens to be constant — the same 24.8-onwards
+    // physics Gate 4 above records. So the claim is a RELATION between
+    // the two shapes over one denominator: fixing `(scope, key)` must
+    // prune strictly deeper than fixing `key` alone. Delete the scope
+    // predicate and the two shapes become the same statement, so the
+    // strict inequality is what fails.
+    let unscoped = tag_values_sql(&key, None, TAG_VALUES_MAX + 1);
+    let unscoped_raw = explain_raw(&client, &unscoped.replace('?', "??")).await;
+    let (unscoped_selected, unscoped_total) = primary_key_granules(&unscoped_raw);
+    assert_eq!(
+        total, unscoped_total,
+        "the two plans must share a denominator, or the comparison is not a comparison"
+    );
+    assert!(
+        selected < unscoped_selected,
+        "fixing (scope, key) must prune strictly deeper than fixing key alone \
+         (scoped {selected} vs bare-key {unscoped_selected} of {total})"
+    );
+    eprintln!(
+        "recorded `?`-key prune: scoped granules={selected}/{total}, \
+         bare-key granules={unscoped_selected}/{unscoped_total}"
+    );
 
     // And the read answers, through the engine, over the dispatcher.
     let engine = TraceEngine::new(
@@ -1269,13 +1299,15 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
         values.truncated,
         "the cap + 1 probe row must flip `truncated` rather than shipping a silent subset"
     );
+    // Only `span`'s values, so both a reserved-scope leak (`a…`) and
+    // the other attribute scope's rows (`r…`) are caught.
     assert!(
-        values.values.iter().all(|v| !v.val.starts_with('a')),
-        "a reserved-scope value reached the scoped lookup: {:?}",
+        values.values.iter().all(|v| v.val.starts_with('v')),
+        "a value from another scope reached the span-scoped lookup: {:?}",
         values
             .values
             .iter()
-            .filter(|v| v.val.starts_with('a'))
+            .filter(|v| !v.val.starts_with('v'))
             .take(5)
             .map(|v| v.val.as_str())
             .collect::<Vec<_>>()
