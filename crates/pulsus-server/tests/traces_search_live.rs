@@ -148,10 +148,25 @@ fn request(
     path: &str,
     body: Option<(&str, &[u8])>,
 ) -> Option<RawResponse> {
+    request_with_headers(port, method, path, body, &[])
+}
+
+/// The same, with extra request headers (issue #492: the explain header
+/// is the first thing this suite has had to send).
+fn request_with_headers(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<(&str, &[u8])>,
+    extra: &[(&str, &str)],
+) -> Option<RawResponse> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+    for (k, v) in extra {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
     let body_bytes = match body {
         Some((content_type, bytes)) => {
             head.push_str(&format!("Content-Type: {content_type}\r\n"));
@@ -2166,6 +2181,234 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
             "wave-2: a negated attribute leaf projects nothing, span {s}"
         );
     }
+
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #492: the regex-dialect split, end to end, and the search
+// route's explain surface.
+// ---------------------------------------------------------------------
+
+/// Issue #492 acceptance criterion 12, live half: **a regex leaf's SQL
+/// reading is NARROWER than our own evaluator's, so a candidate is lost
+/// in the database before the evaluator ever sees it.**
+///
+/// One pattern gets two readings on this path. The generator renders it
+/// into SQL, where the database reads it as RE2; our own evaluator
+/// re-checks the same pattern with the raw Rust `regex` crate, and no
+/// dialect rewrite is applied anywhere under `traces/`. Over the subject
+/// `٤` (U+0664) the two disagree: RE2's `\d` does not match it and the
+/// Rust crate's does.
+///
+/// **The corpus topology is part of the specification, not an
+/// implementation detail.** It must be TWO SEPARATE ONE-SPAN TRACES. A
+/// control with both spans in ONE trace returns `matched=2`: the ASCII
+/// sibling admits the trace, the evaluator then re-accepts both spans,
+/// and the loss becomes invisible. **A same-trace fixture cannot prove
+/// candidate loss**, which is why assertions 2 and 3 exist and why
+/// asserting only the returned-trace count would prove nothing —
+/// `returned_traces == 1` is true under both topologies.
+///
+/// The named break is to merge the two spans into one trace: assertion 1
+/// stays green and assertions 2 and 3 fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_regex_leaf_loses_a_candidate_in_the_database_before_the_evaluator_sees_it() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_223;
+    let db = &pulsus_testkit::test_db("pulsus_traces_regex_dialect_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+
+    // TWO SEPARATE ONE-SPAN TRACES. Merging them is the named break.
+    ingest(
+        port,
+        vec![span(
+            tid(1),
+            sid(1),
+            None,
+            "\u{664}", // ٤ — ARABIC-INDIC DIGIT FOUR
+            ts(base, 10),
+            100 * MS,
+            vec![],
+        )],
+        vec![kv_str("service.name", "regex-dialect")],
+        "seed #492 the Unicode-digit trace",
+    );
+    ingest(
+        port,
+        vec![span(
+            tid(2),
+            sid(2),
+            None,
+            "4",
+            ts(base, 11),
+            100 * MS,
+            vec![],
+        )],
+        vec![kv_str("service.name", "regex-dialect")],
+        "seed #492 the ASCII-digit trace",
+    );
+
+    let q = r#"{ name =~ "\\d" }"#;
+    let json = search(port, q, w0, w1, "", q).json(q);
+    let traces = json["traces"].as_array().cloned().unwrap_or_default();
+
+    // 1. one trace comes back.
+    assert_eq!(
+        traces.len(),
+        1,
+        "{q}: exactly one trace, got {}",
+        serde_json::to_string(&json).unwrap_or_default()
+    );
+
+    // 2. and it matched exactly ONE span. This is the assertion the
+    //    merge break trips: with both spans in one trace the answer is 2.
+    let matched = json["traces"][0]["spanSets"][0]["matched"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{q}: no matched count in {json}"));
+    assert_eq!(
+        matched, 1,
+        "{q}: the Unicode-digit span must be eliminated in the DATABASE, before the evaluator \
+         can re-accept it; got matched={matched} in {json}"
+    );
+
+    // 3. and it is the ASCII-named span of the ASCII-named trace.
+    assert_eq!(
+        json["traces"][0]["traceID"].as_str(),
+        Some(hex(&tid(2)).as_str()),
+        "{q}: the surviving trace is the ASCII one, in {json}"
+    );
+    let spans = json["traces"][0]["spanSets"][0]["spans"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let names: Vec<&str> = spans
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["4"],
+        "{q}: the surviving span's identity, in {json}"
+    );
+    assert_eq!(
+        spans[0]["spanID"].as_str(),
+        Some(hex(&sid(2)).as_str()),
+        "{q}: the surviving span's id, in {json}"
+    );
+
+    // The control that says the query is not simply matching nothing:
+    // an equality on the same field returns the Unicode-named trace, so
+    // the row IS in the store and IS in the window.
+    let control = r#"{ name = "٤" }"#;
+    let json = search(port, control, w0, w1, "", control).json(control);
+    assert_eq!(
+        json["traces"]
+            .as_array()
+            .map(|t| t.len())
+            .unwrap_or_default(),
+        1,
+        "{control}: the Unicode-named span is present and in the window: {json}"
+    );
+
+    drop_db(db).await;
+}
+
+/// Issue #492 acceptance criterion 8: **the traces search route answers
+/// the explain header.**
+///
+/// Before this change the route had no explain surface a user could
+/// reach: the engine entry point existed, built the trace, and was called
+/// only by a test — so the language whose plan changes most was the one
+/// nobody could see. Without the header the response is byte-identical to
+/// before; with it the body gains one sibling key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_traces_search_route_answers_the_explain_header() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_224;
+    let db = &pulsus_testkit::test_db("pulsus_traces_explain_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[]);
+
+    let base = now_s() - 3_600;
+    let (w0, w1) = (base, base + 600);
+    ingest(
+        port,
+        vec![span(
+            tid(1),
+            sid(1),
+            None,
+            "GET /pay",
+            ts(base, 10),
+            100 * MS,
+            vec![kv_str("http.method", "GET")],
+        )],
+        vec![kv_str("service.name", "explain-checkout")],
+        "seed #492 explain corpus",
+    );
+
+    let q = r#"{ resource.service.name = "explain-checkout" }"#;
+    let path = format!("/api/traces/v1/search?q={}&start={w0}&end={w1}", enc(q));
+
+    // Without the header: no `explain` key at all.
+    let plain_raw = get(port, &path, "explain: no header");
+    assert_eq!(
+        plain_raw.status,
+        200,
+        "body {:?}",
+        String::from_utf8_lossy(&plain_raw.body)
+    );
+    let plain = plain_raw.json("no header");
+    assert_eq!(plain.get("explain"), None, "no header, no key: {plain}");
+
+    // With it: one ADDITIVE sibling key, and the three documented
+    // sub-keys.
+    let raw = request_with_headers(port, "GET", &path, None, &[("X-Pulsus-Explain", "1")])
+        .expect("explain: request must be reachable");
+    assert_eq!(
+        raw.status,
+        200,
+        "body {:?}",
+        String::from_utf8_lossy(&raw.body)
+    );
+    let with: serde_json::Value =
+        serde_json::from_slice(&raw.body).expect("explain response parses");
+    // Everything the plain body carries is unchanged beside it.
+    assert_eq!(with["traces"], plain["traces"], "the answer does not move");
+    assert_eq!(with["metrics"], plain["metrics"], "the metrics do not move");
+    let explain = &with["explain"];
+    assert_eq!(explain["result_type"], "traces", "in {with}");
+    assert!(
+        explain["routing"].is_null(),
+        "a search never routes: {with}"
+    );
+    let stages = explain["stages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no stages in {with}"));
+    assert!(!stages.is_empty(), "the per-stage SQL trace: {with}");
+    assert!(
+        stages
+            .iter()
+            .all(|s| s["sql"].as_str().is_some_and(|q| q.contains("SELECT"))),
+        "every stage carries its statement: {with}"
+    );
+    // The plan key is additive and ABSENT today: no read path calls the
+    // compile core yet, so wave 1 adds a field and no byte of response.
+    assert_eq!(
+        explain.get("plan"),
+        None,
+        "the plan key is absent until a read path compiles a plan: {with}"
+    );
 
     drop_db(db).await;
 }

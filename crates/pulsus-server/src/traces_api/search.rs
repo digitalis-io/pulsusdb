@@ -8,7 +8,7 @@
 
 use axum::Json;
 use axum::extract::{RawQuery, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::app::AppState;
@@ -17,15 +17,38 @@ use super::error::ApiError;
 use super::handlers::engine_for;
 use super::{legacy, params, search_response};
 
+/// `X-Pulsus-Explain: 1` (docs/api.md "Request headers"), issue #492.
+///
+/// The search route had no explain surface at all: `TraceEngine::search_explained`
+/// existed, built a `PlanExplain`, and was reached only by a test, so the
+/// language whose plan changes most was the one a user could not see.
+/// The contract is the same as the logs and metrics routes': without the
+/// header nothing changes, and with it the response gains one sibling
+/// key.
+fn wants_explain(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-pulsus-explain")
+        .and_then(|v| v.to_str().ok())
+        == Some("1")
+}
+
 /// `GET /api/traces/v1/search`.
-pub(crate) async fn search(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
-    match search_impl(state, raw.as_deref().unwrap_or("")).await {
+pub(crate) async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    match search_impl(state, &headers, raw.as_deref().unwrap_or("")).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
 }
 
-async fn search_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
+async fn search_impl(
+    state: AppState,
+    headers: &HeaderMap,
+    raw: &str,
+) -> Result<Response, ApiError> {
     let params = params::parse_search_params(raw)?;
     // `q` XOR legacy (both present is already a 400 in the parser);
     // neither present compiles to the `{}` time-only search.
@@ -71,8 +94,21 @@ async fn search_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
     let plan = pulsus_read::plan_search(&query, &search_params, &ctx).map_err(ApiError::Plan)?;
 
     let engine = engine_for(&state).await?;
-    let output = engine.search(&plan).await?;
-    Ok((StatusCode::OK, Json(search_response::render(&output))).into_response())
+    if !wants_explain(headers) {
+        let output = engine.search(&plan).await?;
+        return Ok((StatusCode::OK, Json(search_response::render(&output))).into_response());
+    }
+    // One execution that also captures the per-stage SQL — the same
+    // single-pass contract the logs route has, never a second run.
+    let (output, explain) = engine.search_explained(&plan).await?;
+    let mut body = search_response::render(&output);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "explain".to_string(),
+            search_response::explain_value(&explain),
+        );
+    }
+    Ok((StatusCode::OK, Json(body)).into_response())
 }
 
 #[cfg(test)]
@@ -113,7 +149,12 @@ mod tests {
     /// way through. That is how this module is not a hole in the
     /// container check (issue #384).
     async fn run(query: &str) -> (StatusCode, String) {
-        let res = search(State(test_state()), RawQuery(Some(query.to_string()))).await;
+        let res = search(
+            State(test_state()),
+            axum::http::HeaderMap::new(),
+            RawQuery(Some(query.to_string())),
+        )
+        .await;
         error_body(res).await
     }
 
@@ -248,7 +289,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_query_string_entirely_is_400_for_the_missing_range() {
-        let res = search(State(test_state()), RawQuery(None)).await;
+        let res = search(
+            State(test_state()),
+            axum::http::HeaderMap::new(),
+            RawQuery(None),
+        )
+        .await;
         let (status, _) = error_body(res).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }

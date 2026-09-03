@@ -253,6 +253,10 @@ struct ExplainWire<'a> {
     result_type: &'a str,
     exactness: &'static str,
     stages: Vec<StageWire<'a>>,
+    /// Issue #492: the compiled plan's shape, an ADDITIVE sibling key.
+    /// Skipped when absent, which it is on every path today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<&'a pulsus_read::compile::plan::PlanShape>,
 }
 
 #[derive(Serialize)]
@@ -275,6 +279,7 @@ fn explain_json(e: &PlanExplain) -> String {
                 note: s.note.as_deref(),
             })
             .collect(),
+        plan: e.plan.as_ref(),
     };
     serde_json::to_string(&wire).unwrap_or_else(|_| "{}".to_string())
 }
