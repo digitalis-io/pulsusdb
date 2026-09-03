@@ -18,8 +18,15 @@
 //! tag-discovery builders — the two catalog-only ones of issue #58 and
 //! the two store-backed ones of issue #478), [`tag_narrow`] (the issue
 //! #478 `q`-to-terms lowering), [`sql`]/[`rows`]
-//! (point-read builder + `ChClient` result-row shapes), and [`exec`]
-//! (`TraceEngine`, the only module here that talks to ClickHouse).
+//! (point-read builder + `ChClient` result-row shapes), `dispatch` (the
+//! private issue #509 choke point that owns the `ChClient` and is the
+//! only place a `?` in query text is doubled), and [`exec`]
+//! (`TraceEngine`, which plans and frames every read but reaches
+//! ClickHouse only through `dispatch`).
+
+// Issue #509: private to `traces`. The whole point is that `exec.rs`
+// cannot obtain the `ChClient` any other way, so this must not be `pub`.
+mod dispatch;
 
 pub mod exec;
 pub mod filter;

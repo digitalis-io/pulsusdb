@@ -1130,3 +1130,188 @@ async fn narrowed_reads_prune_on_key_and_partition_not_on_the_set() {
 
     exec(&admin, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
+
+// ============================================================================
+// Issue #509: an attribute key containing `?`.
+//
+// The catalog read inlines the requested KEY as a SQL literal, and the
+// ClickHouse driver we vendor reads a bare `?` in query text as a bind
+// placeholder. The fix doubles every `?` at one choke point
+// (`traces::dispatch`), which the driver collapses back before the
+// statement reaches the server — so the read must still be the same
+// index-served read it was for a `?`-free key, and this gate is what
+// says so.
+// ============================================================================
+
+static QM_DB: pulsus_testkit::TestDb = pulsus_testkit::TestDb::new("pulsus_traces_tags_qm_it");
+
+/// The `?`-bearing key. It is stored under THREE scopes, each with its
+/// own value prefix, and the three exist for three different checks:
+/// `span` (`v`) is what a `span`-scoped read must return, `resource`
+/// (`r`) is a second ATTRIBUTE scope so a bare-key read has a second
+/// primary-key range to touch and the granule comparison below has
+/// something to compare, and `event:intrinsic` (`a`) is a writer-
+/// RESERVED scope whose values sort first, so a read that lost its scope
+/// predicate returns them at the head of the very list under test.
+const QM_KEY: &str = "a?b";
+const QM_KEYS_PER_SCOPE: u64 = 10;
+const QM_VALS_PER_KEY: u64 = 10_000;
+
+async fn seed_qm_catalog(client: &ChClient, db: &str) {
+    for scope in ["resource", "span"] {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                 SELECT '{scope}', \
+                        concat('k', toString(number % {QM_KEYS_PER_SCOPE})), \
+                        concat('v', leftPad(toString(intDiv(number, {QM_KEYS_PER_SCOPE})), 7, '0')) \
+                 FROM numbers({})",
+                QM_KEYS_PER_SCOPE * QM_VALS_PER_KEY
+            ),
+        )
+        .await;
+    }
+    for (scope, prefix) in [("span", 'v'), ("resource", 'r'), ("event:intrinsic", 'a')] {
+        // The seed statement carries the `?` too, and this test's own
+        // client is a plain driver hop with no dispatcher in front of
+        // it — so the doubling is applied here by hand. It is a wire
+        // encoding: the driver collapses `??` back to one byte, and the
+        // row ClickHouse stores holds the single `?` of `QM_KEY`, which
+        // the value assertions below would catch if it did not.
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {db}.trace_tag_catalog (scope, key, val) \
+                 SELECT '{scope}', '{QM_KEY}', \
+                        concat('{prefix}', leftPad(toString(number), 7, '0')) \
+                 FROM numbers({QM_VALS_PER_KEY})"
+            )
+            .replace('?', "??"),
+        )
+        .await;
+    }
+}
+
+fn qm_config() -> TraceReadConfig {
+    TraceReadConfig {
+        scan_budget_rows: 10_000_000,
+        ..tight_budget_config()
+    }
+}
+
+/// Issue #509, criterion 9: the unnarrowed values read for a key
+/// containing `?` still prunes strictly on the `(scope, key)`
+/// primary-key prefix, and still answers.
+///
+/// Two halves, and they check different things. The EXPLAIN half is the
+/// index claim: `selected < total` on the `PrimaryKey` block, the same
+/// strict prune the `?`-free case above asserts. The engine half is that
+/// the read RUNS — before the fix it was
+/// `500 … invalid SQL: unbound query argument`, so a granule ratio
+/// alone would have been a claim about SQL nobody could execute.
+#[tokio::test]
+async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-read/tests/traces_tags_explain.rs for setup)"
+        );
+        return;
+    }
+
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {QM_DB}")).await;
+    run_init(&admin, &test_ctx(&QM_DB)).await.expect("run_init");
+
+    let mut cfg = test_config();
+    cfg.database = QM_DB.to_string();
+    let client = ChClient::new(cfg).await.expect("connect data client");
+    seed_qm_catalog(&client, &QM_DB).await;
+
+    let scope = ch_string("span");
+    let key = ch_string(QM_KEY);
+    let sql = tag_values_sql(&key, Some(&scope), TAG_VALUES_MAX + 1);
+    assert!(
+        sql.contains(QM_KEY),
+        "the builder must inline the key as a literal, or this gate tests nothing:\n{sql}"
+    );
+
+    // The EXPLAIN goes over this test's OWN driver hop, which applies
+    // the same placeholder rule the engine's dispatcher exists for — so
+    // the `?` is doubled here too. What ClickHouse parses is therefore
+    // the identical statement either way; the doubling is a wire
+    // encoding, not a change of query.
+    let raw = explain_raw(&client, &sql.replace('?', "??")).await;
+    let (selected, total) = primary_key_granules(&raw);
+    assert!(
+        selected > 0 && selected < total,
+        "a `?`-bearing key must still engage and strictly prune the (scope, key) prefix \
+         ({selected}/{total}):\n{raw}"
+    );
+
+    // The DISCRIMINATOR, and it is not `selected < total` on its own.
+    // Measured on this fixture: with the `scope` predicate deleted from
+    // the builder the shape still reports 2/26, because ClickHouse
+    // excludes granules OPPORTUNISTICALLY inside ranges where the
+    // leading `scope` happens to be constant — the same 24.8-onwards
+    // physics Gate 4 above records. So the claim is a RELATION between
+    // the two shapes over one denominator: fixing `(scope, key)` must
+    // prune strictly deeper than fixing `key` alone. Delete the scope
+    // predicate and the two shapes become the same statement, so the
+    // strict inequality is what fails.
+    let unscoped = tag_values_sql(&key, None, TAG_VALUES_MAX + 1);
+    let unscoped_raw = explain_raw(&client, &unscoped.replace('?', "??")).await;
+    let (unscoped_selected, unscoped_total) = primary_key_granules(&unscoped_raw);
+    assert_eq!(
+        total, unscoped_total,
+        "the two plans must share a denominator, or the comparison is not a comparison"
+    );
+    assert!(
+        selected < unscoped_selected,
+        "fixing (scope, key) must prune strictly deeper than fixing key alone \
+         (scoped {selected} vs bare-key {unscoped_selected} of {total})"
+    );
+    eprintln!(
+        "recorded `?`-key prune: scoped granules={selected}/{total}, \
+         bare-key granules={unscoped_selected}/{unscoped_total}"
+    );
+
+    // And the read answers, through the engine, over the dispatcher.
+    let engine = TraceEngine::new(
+        {
+            let mut cfg = test_config();
+            cfg.database = QM_DB.to_string();
+            ChClient::new(cfg).await.expect("connect engine client")
+        },
+        qm_config(),
+    );
+    let values = engine
+        .list_tag_values(QM_KEY, Some("span"), unnarrowed_values_request())
+        .await
+        .expect("a `?` in the key is data: the read must answer, not fail the driver");
+    assert_eq!(
+        values.values.len(),
+        TAG_VALUES_MAX,
+        "the key holds more than the cap: the SQL LIMIT ships cap + 1 and the engine returns cap"
+    );
+    assert!(
+        values.truncated,
+        "the cap + 1 probe row must flip `truncated` rather than shipping a silent subset"
+    );
+    // Only `span`'s values, so both a reserved-scope leak (`a…`) and
+    // the other attribute scope's rows (`r…`) are caught.
+    assert!(
+        values.values.iter().all(|v| v.val.starts_with('v')),
+        "a value from another scope reached the span-scoped lookup: {:?}",
+        values
+            .values
+            .iter()
+            .filter(|v| !v.val.starts_with('v'))
+            .take(5)
+            .map(|v| v.val.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {QM_DB}")).await;
+}

@@ -36,6 +36,21 @@
     ],
     "why_two_endpoints": "The two corpora cannot share one reference instance: measured on this build, its tag-value time filtering is BLOCK-granular, not span-granular — two corpora pushed 120 s apart were both returned by a window covering only the later one. So the #476 sections replay against their own endpoint.",
     "measured_incompleteness": "Case Q-AM: with the same corpus and window, the reference answers {resource.service.name=\"pay\"} on span.http.status_code with [201] alone, while its own name-values answer for the same condition lists the span `a`, whose http.status_code is 200 ({name=\"a\"} returns [200]). The same shape appears for service checkout (500 only, 200 missing) and not for cart. The mechanism was not established; what is recorded is the observation."
+   },
+   {
+    "issue": "#509",
+    "captured_on": "2026-09-03",
+    "how": "One OTLP/HTTP JSON push of the CQ corpus below into a freshly started, unmodified, digest-pinned reference container on ports unique to that run, then the 28 requests of the question_mark_keys section, then the container was removed. Every timestamp is derived from the clock at push time.",
+    "corpus": {
+     "CQ": "two single-span traces under service q509, resource attribute res.q?key=\"rv?1\"; span q509-a (trace 50900000000000000000000000000001 / span 5090000000000001) carries k?q=\"vq1\", a?=\"v-trailing\", ?a=\"v-leading\", a??b=\"v-double\", a?b?c=\"v-multi\", a???b=\"v-triple\", http.target?raw=\"/x?y=1\", plain509=\"v?1\", a?fields=\"vf1\", ?fields=\"vf2\"; span q509-b (trace ...0002 / span 5090000000000002) carries k?q=\"vq2\" and plain509=\"v?2\". All values are strings."
+    },
+    "sections": [
+     "question_mark_keys"
+    ],
+    "case_shape": "Each case carries `window` (whether the request appends the corpus window) and `q`. v2 cases carry `values` as [type, value] pairs; the v1 flat route returns bare strings and its cases carry bare strings on BOTH sides. The four native-route cases carry \"reference\": null — that route answers 404 there.",
+    "ordering": "The reference does not sort its value lists and its order is not stable between identical requests: QM-A came back vq1,vq2 and QM-A2 vq2,vq1 in the same capture. Each case's reference half is stored EXACTLY as captured and compared as a multiset; ours is sorted ascending and asserted as an order.",
+    "error_case": "QM-T's two 400 bodies differ in wording, so the body is carried outside the compared `reference`/`pulsus` objects (as `pulsus_body`). The compared halves hold the status and the content type, on which the two sides agree — which is why this section needs no ledger row.",
+    "metrics_object_removed": "As for every other section here: the reference's trailing \"metrics\" object is stripped. Its values are not a fixed quantity either — they were observed changing between consecutive identical requests — so neither it nor the scopes-array order of /api/v2/search/tags may be read as a divergence in ours."
    }
   ]
  },
@@ -3473,6 +3488,589 @@
     "value_len": 2048
    },
    "ledger": "traceql-tag-values-span-name-byte-cap"
+  }
+ },
+ "question_mark_keys": {
+  "QM-A": {
+   "route": "/api/v2/search/tag/span.k%3Fq/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq1"
+     ],
+     [
+      "string",
+      "vq2"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq1"
+     ],
+     [
+      "string",
+      "vq2"
+     ]
+    ]
+   }
+  },
+  "QM-A2": {
+   "route": "/api/v2/search/tag/span.k%3Fq/values",
+   "window": true,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq2"
+     ],
+     [
+      "string",
+      "vq1"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq1"
+     ],
+     [
+      "string",
+      "vq2"
+     ]
+    ]
+   }
+  },
+  "QM-B": {
+   "route": "/api/v2/search/tag/span.a%3F/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-trailing"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-trailing"
+     ]
+    ]
+   }
+  },
+  "QM-C": {
+   "route": "/api/v2/search/tag/span.%3Fa/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-leading"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-leading"
+     ]
+    ]
+   }
+  },
+  "QM-D": {
+   "route": "/api/v2/search/tag/span.a%3F%3Fb/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-double"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-double"
+     ]
+    ]
+   }
+  },
+  "QM-E": {
+   "route": "/api/v2/search/tag/span.a%3Fb%3Fc/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-multi"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-multi"
+     ]
+    ]
+   }
+  },
+  "QM-F": {
+   "route": "/api/v2/search/tag/span.http.target%3Fraw/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "/x?y=1"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "/x?y=1"
+     ]
+    ]
+   }
+  },
+  "QM-G": {
+   "route": "/api/v2/search/tag/resource.res.q%3Fkey/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "rv?1"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "rv?1"
+     ]
+    ]
+   }
+  },
+  "QM-H": {
+   "route": "/api/v2/search/tag/.k%3Fq/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq1"
+     ],
+     [
+      "string",
+      "vq2"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq1"
+     ],
+     [
+      "string",
+      "vq2"
+     ]
+    ]
+   }
+  },
+  "QM-I": {
+   "route": "/api/v2/search/tag/span.%3F/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": []
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   }
+  },
+  "QM-V": {
+   "route": "/api/v2/search/tag/span.a%3Ffields/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vf1"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vf1"
+     ]
+    ]
+   }
+  },
+  "QM-W": {
+   "route": "/api/v2/search/tag/span.%3Ffields/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vf2"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vf2"
+     ]
+    ]
+   }
+  },
+  "QM-U2": {
+   "route": "/api/v2/search/tag/span.a%3F%3F%3Fb/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-triple"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-triple"
+     ]
+    ]
+   }
+  },
+  "QM-Z": {
+   "route": "/api/v2/search/tag/span.nosuchkey/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": []
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   }
+  },
+  "QM-J": {
+   "route": "/api/v2/search/tag/span.plain509/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v?2"
+     ],
+     [
+      "string",
+      "v?1"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v?1"
+     ],
+     [
+      "string",
+      "v?2"
+     ]
+    ]
+   }
+  },
+  "QM-K": {
+   "route": "/api/search/tag/k%3Fq/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     "vq1",
+     "vq2"
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     "vq1",
+     "vq2"
+    ]
+   }
+  },
+  "QM-L": {
+   "route": "/api/search/tag/a%3F%3Fb/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     "v-double"
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     "v-double"
+    ]
+   }
+  },
+  "QM-M": {
+   "route": "/api/search/tag/http.target%3Fraw/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     "/x?y=1"
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     "/x?y=1"
+    ]
+   }
+  },
+  "QM-N": {
+   "route": "/api/search/tag/res.q%3Fkey/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     "rv?1"
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     "rv?1"
+    ]
+   }
+  },
+  "QM-O": {
+   "route": "/api/search/tag/%3F/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": []
+   },
+   "pulsus": {
+    "status": 200,
+    "values": []
+   }
+  },
+  "QM-X": {
+   "route": "/api/search/tag/a%3Ffields/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     "vf1"
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     "vf1"
+    ]
+   }
+  },
+  "QM-U": {
+   "route": "/api/search/tag/a%3F%3F%3Fb/values",
+   "window": false,
+   "q": null,
+   "reference": {
+    "status": 200,
+    "values": [
+     "v-triple"
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     "v-triple"
+    ]
+   }
+  },
+  "QM-P": {
+   "route": "/api/traces/v1/tag/k%3Fq/values",
+   "window": false,
+   "q": null,
+   "reference": null,
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq1"
+     ],
+     [
+      "string",
+      "vq2"
+     ]
+    ],
+    "truncated": false
+   }
+  },
+  "QM-Q": {
+   "route": "/api/traces/v1/tag/a%3F%3Fb/values",
+   "window": false,
+   "q": null,
+   "reference": null,
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "v-double"
+     ]
+    ],
+    "truncated": false
+   }
+  },
+  "QM-R": {
+   "route": "/api/traces/v1/tag/span.http.target%3Fraw/values",
+   "window": false,
+   "q": null,
+   "reference": null,
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "/x?y=1"
+     ]
+    ],
+    "truncated": false
+   }
+  },
+  "QM-Y": {
+   "route": "/api/traces/v1/tag/a%3Ffields/values",
+   "window": false,
+   "q": null,
+   "reference": null,
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vf1"
+     ]
+    ],
+    "truncated": false
+   }
+  },
+  "QM-S": {
+   "route": "/api/v2/search/tag/span.k%3Fq/values",
+   "window": false,
+   "q": "{span.plain509=\"v?1\"}",
+   "reference": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq1"
+     ]
+    ]
+   },
+   "pulsus": {
+    "status": 200,
+    "values": [
+     [
+      "string",
+      "vq1"
+     ]
+    ]
+   }
+  },
+  "QM-T": {
+   "route": "/api/v2/search/tag/span./values",
+   "window": false,
+   "q": null,
+   "expect": "error",
+   "reference": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8"
+   },
+   "pulsus": {
+    "status": 400,
+    "content_type": "text/plain; charset=utf-8"
+   },
+   "pulsus_body": "invalid tag: the attribute key must be non-empty",
+   "reference_body": "not quoted, exactly as the range_faults section elides its counterparts: the reference's 400 names its own grammar. Both sides agree on the two things this fixture compares — the status and the content type — so this case carries no ledger id."
   }
  }
 }

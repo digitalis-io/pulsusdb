@@ -107,7 +107,6 @@ use super::search_plan::{SearchCtx, SearchPlan};
 use super::tag_narrow::{TagNarrowing, narrowing_from_query};
 use super::tags_sql::DaySpan;
 use crate::logql::error::{ReadError, TooBroadReason};
-use crate::logql::exec::escape_query_placeholders;
 use crate::logql::explain::PlanExplain;
 
 /// Phase-2 batch width: candidates hydrated/evaluated per round trip.
@@ -739,13 +738,16 @@ impl Ord for HeapEntry {
 }
 
 pub struct TraceEngine {
-    client: ChClient,
+    dispatch: super::dispatch::TraceDispatch,
     config: TraceReadConfig,
 }
 
 impl TraceEngine {
     pub fn new(client: ChClient, config: TraceReadConfig) -> Self {
-        Self { client, config }
+        Self {
+            dispatch: super::dispatch::TraceDispatch::new(client),
+            config,
+        }
     }
 
     /// The planning context this engine's configuration implies —
@@ -857,8 +859,7 @@ impl TraceEngine {
                 .await;
         }
         let settings = metrics_settings(&self.config);
-        let sql = escape_query_placeholders(plan.range_sql());
-        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let sql = plan.range_sql();
         match (plan.kind(), plan.group_label()) {
             (PlanKind::Quantile, _) => {
                 // One series per requested quantile (`p=<q>`); the TDigest
@@ -873,10 +874,11 @@ impl TraceEngine {
                     })
                     .collect();
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricQuantileRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricQuantileRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     for (i, s) in series.iter_mut().enumerate() {
@@ -902,10 +904,11 @@ impl TraceEngine {
                 // in timestamp order without a second sort.
                 let mut by_bucket: BTreeMap<u64, Vec<(i64, f64)>> = BTreeMap::new();
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricLog2BucketRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricLog2BucketRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     by_bucket
@@ -936,10 +939,11 @@ impl TraceEngine {
                     PlanKind::Count { is_rate } => {
                         let denom = plan.step_seconds();
                         let mut stream = self
-                            .client
-                            .query_stream::<MetricBucketRow>(&sql, &settings)
-                            .await
-                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            .dispatch
+                            .query_stream::<MetricBucketRow, _>(sql, &settings, |e| {
+                                map_trace_metrics_error(e, &self.config)
+                            })
+                            .await?;
                         while let Some(row) = stream.next().await {
                             let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                             samples.push((row.t_ms, count_value(is_rate, row.n, denom)));
@@ -947,10 +951,11 @@ impl TraceEngine {
                     }
                     PlanKind::Agg(_) => {
                         let mut stream = self
-                            .client
-                            .query_stream::<MetricAggRow>(&sql, &settings)
-                            .await
-                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            .dispatch
+                            .query_stream::<MetricAggRow, _>(sql, &settings, |e| {
+                                map_trace_metrics_error(e, &self.config)
+                            })
+                            .await?;
                         while let Some(row) = stream.next().await {
                             let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                             samples.push((row.t_ms, agg_value(row.v)));
@@ -989,10 +994,11 @@ impl TraceEngine {
                     PlanKind::Count { is_rate } => {
                         let denom = plan.step_seconds();
                         let mut stream = self
-                            .client
-                            .query_stream::<MetricGroupCountRow>(&sql, &settings)
-                            .await
-                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            .dispatch
+                            .query_stream::<MetricGroupCountRow, _>(sql, &settings, |e| {
+                                map_trace_metrics_error(e, &self.config)
+                            })
+                            .await?;
                         while let Some(row) = stream.next().await {
                             let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                             by_group
@@ -1003,10 +1009,11 @@ impl TraceEngine {
                     }
                     PlanKind::Agg(_) => {
                         let mut stream = self
-                            .client
-                            .query_stream::<MetricAggGroupRow>(&sql, &settings)
-                            .await
-                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            .dispatch
+                            .query_stream::<MetricAggGroupRow, _>(sql, &settings, |e| {
+                                map_trace_metrics_error(e, &self.config)
+                            })
+                            .await?;
                         while let Some(row) = stream.next().await {
                             let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                             by_group
@@ -1050,15 +1057,14 @@ impl TraceEngine {
         };
         let cap = self.config.max_series;
         let settings = metrics_settings(&self.config);
-        let sql = escape_query_placeholders(probe);
-        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut count: u64 = 0;
         // Scoped stream: the probe returns exactly one `count()` row.
         let mut stream = self
-            .client
-            .query_stream::<MetricCountRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+            .dispatch
+            .query_stream::<MetricCountRow, _>(probe, &settings, |e| {
+                map_trace_metrics_error(e, &self.config)
+            })
+            .await?;
         while let Some(row) = stream.next().await {
             count = row.map_err(|e| map_trace_metrics_error(e, &self.config))?.n;
         }
@@ -1140,13 +1146,12 @@ impl TraceEngine {
         let mut key_bucket_sum: BTreeMap<(String, i64), (u64, u64)> = BTreeMap::new();
         let mut keys: BTreeSet<String> = BTreeSet::new();
         {
-            let sql = escape_query_placeholders(cross_tab_sql);
-            crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
             let mut stream = self
-                .client
-                .query_stream::<CompareCrossTabRow>(&sql, &settings)
-                .await
-                .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                .dispatch
+                .query_stream::<CompareCrossTabRow, _>(cross_tab_sql, &settings, |e| {
+                    map_trace_metrics_error(e, &self.config)
+                })
+                .await?;
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                 keys.insert(row.akey.clone());
@@ -1162,13 +1167,12 @@ impl TraceEngine {
         // Per-bucket baseline/selection totals (the denominators).
         let mut totals: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
         {
-            let sql = escape_query_placeholders(totals_sql);
-            crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
             let mut stream = self
-                .client
-                .query_stream::<CompareTotalsRow>(&sql, &settings)
-                .await
-                .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                .dispatch
+                .query_stream::<CompareTotalsRow, _>(totals_sql, &settings, |e| {
+                    map_trace_metrics_error(e, &self.config)
+                })
+                .await?;
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                 totals.insert(row.t_ms, (row.base_total, row.sel_total));
@@ -1359,8 +1363,7 @@ impl TraceEngine {
             .map(|s| s.samples.iter().copied().collect())
             .collect();
         let settings = metrics_settings(&self.config);
-        let sql = escape_query_placeholders(exemplar_sql);
-        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let sql = exemplar_sql;
         // `(series index, exemplar)`, in bucket order, so the thinning
         // stride below is taken over the whole response exactly as it was
         // when every exemplar lived on one series.
@@ -1368,10 +1371,11 @@ impl TraceEngine {
         match plan.exemplar_key() {
             ExemplarSeriesKey::Single => {
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricExemplarRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricExemplarRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     push_bucket_exemplars(&mut collected, 0, &value_at[0], row.t_ms, row.ex);
@@ -1389,10 +1393,11 @@ impl TraceEngine {
                     .filter_map(|(i, s)| series_label_value(s, label).map(|v| (v, i)))
                     .collect();
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricGroupExemplarRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricGroupExemplarRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     let Some(&i) = index.get(row.g0.as_str()) else {
@@ -1407,10 +1412,11 @@ impl TraceEngine {
                 // the `p=` series whose value at the span's OWN bucket is
                 // nearest the span's own duration.
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricQuantileExemplarRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricQuantileExemplarRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     push_quantile_exemplars(&mut collected, &value_at, row.t_ms, row.ex);
@@ -1429,10 +1435,11 @@ impl TraceEngine {
                     .map(|(i, s)| (bucket_label(s).to_bits(), i))
                     .collect();
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricLog2ExemplarRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricLog2ExemplarRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     let key = log2_histogram::bucket_seconds(row.bucket_ns).to_bits();
@@ -1456,10 +1463,11 @@ impl TraceEngine {
                     .filter_map(|(i, s)| compare_total_series_key(s).map(|k| (k, i)))
                     .collect();
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricCompareExemplarRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricCompareExemplarRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     let kind = compare_total_meta_type(row.is_sel);
@@ -1516,18 +1524,18 @@ impl TraceEngine {
                 .await;
         }
         let settings = metrics_settings(&self.config);
-        let sql = escape_query_placeholders(plan.instant_sql());
-        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let sql = plan.instant_sql();
         let at_ms = plan.snapped_end_ms();
         match (plan.kind(), plan.group_label()) {
             (PlanKind::Quantile, _) => {
                 let quantiles = plan.quantiles();
                 let mut qs: Vec<f64> = Vec::new();
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricQuantileInstantRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricQuantileInstantRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     qs = row
                         .map_err(|e| map_trace_metrics_error(e, &self.config))?
@@ -1554,10 +1562,11 @@ impl TraceEngine {
                 // window (issue #252).
                 let mut series: Vec<TraceMetricSeries> = Vec::new();
                 let mut stream = self
-                    .client
-                    .query_stream::<MetricLog2BucketInstantRow>(&sql, &settings)
-                    .await
-                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    .dispatch
+                    .query_stream::<MetricLog2BucketInstantRow, _>(sql, &settings, |e| {
+                        map_trace_metrics_error(e, &self.config)
+                    })
+                    .await?;
                 while let Some(row) = stream.next().await {
                     let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                     series.push(TraceMetricSeries {
@@ -1579,10 +1588,11 @@ impl TraceEngine {
                         let denom = plan.window_seconds();
                         let mut n: u64 = 0;
                         let mut stream = self
-                            .client
-                            .query_stream::<MetricCountRow>(&sql, &settings)
-                            .await
-                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            .dispatch
+                            .query_stream::<MetricCountRow, _>(sql, &settings, |e| {
+                                map_trace_metrics_error(e, &self.config)
+                            })
+                            .await?;
                         while let Some(row) = stream.next().await {
                             n = row.map_err(|e| map_trace_metrics_error(e, &self.config))?.n;
                         }
@@ -1593,10 +1603,11 @@ impl TraceEngine {
                         // empty aggregate window is a 0-valued sample.
                         let mut v: Option<f64> = None;
                         let mut stream = self
-                            .client
-                            .query_stream::<MetricAggInstantRow>(&sql, &settings)
-                            .await
-                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            .dispatch
+                            .query_stream::<MetricAggInstantRow, _>(sql, &settings, |e| {
+                                map_trace_metrics_error(e, &self.config)
+                            })
+                            .await?;
                         while let Some(row) = stream.next().await {
                             v = Some(row.map_err(|e| map_trace_metrics_error(e, &self.config))?.v);
                         }
@@ -1620,10 +1631,11 @@ impl TraceEngine {
                     PlanKind::Count { is_rate } => {
                         let denom = plan.window_seconds();
                         let mut stream = self
-                            .client
-                            .query_stream::<MetricGroupCountInstantRow>(&sql, &settings)
-                            .await
-                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            .dispatch
+                            .query_stream::<MetricGroupCountInstantRow, _>(sql, &settings, |e| {
+                                map_trace_metrics_error(e, &self.config)
+                            })
+                            .await?;
                         while let Some(row) = stream.next().await {
                             let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                             by_group.insert(row.g0, count_value(is_rate, row.n, denom));
@@ -1631,10 +1643,11 @@ impl TraceEngine {
                     }
                     PlanKind::Agg(_) => {
                         let mut stream = self
-                            .client
-                            .query_stream::<MetricAggGroupInstantRow>(&sql, &settings)
-                            .await
-                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            .dispatch
+                            .query_stream::<MetricAggGroupInstantRow, _>(sql, &settings, |e| {
+                                map_trace_metrics_error(e, &self.config)
+                            })
+                            .await?;
                         while let Some(row) = stream.next().await {
                             let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
                             by_group.insert(row.g0, agg_value(row.v));
@@ -1674,19 +1687,18 @@ impl TraceEngine {
     /// `OPTIMIZE ... FINAL`.
     pub async fn service_graph(&self, window: GraphWindow) -> Result<ServiceGraph, ReadError> {
         let cap = graph_sql::SERVICE_GRAPH_MAX_EDGES;
-        let raw_sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
-        let sql = escape_query_placeholders(&raw_sql);
-        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
         let settings = graph_settings(&self.config);
         let mut edges: Vec<GraphEdgeRow> = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
         // drops at return, after full consumption (≤ cap + 1 rows by the SQL
         // LIMIT).
         let mut stream = self
-            .client
-            .query_stream::<GraphEdgeRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_read_error(e, &self.config))?;
+            .dispatch
+            .query_stream::<GraphEdgeRow, _>(&sql, &settings, |e| {
+                map_trace_read_error(e, &self.config)
+            })
+            .await?;
         while let Some(row) = stream.next().await {
             edges.push(row.map_err(|e| map_trace_read_error(e, &self.config))?);
         }
@@ -1703,11 +1715,15 @@ impl TraceEngine {
     /// `404`); duplicate `span_id`s from at-least-once ingest are returned
     /// as stored — dedup is the assembler's read-time concern.
     ///
-    /// **Issue #35: exempt from the query-text guard.** `point_read_sql`
-    /// is a fixed template plus 32 caller-validated hex chars — SQL well
-    /// under 1 KiB by construction, with no unbounded-width component
-    /// (pinned by `point_read_sql_stays_under_4kib_by_construction` in
-    /// this module's tests).
+    /// **Issue #509: no longer exempt from the query-text guard — it
+    /// PASSES it.** `point_read_sql` is a fixed template plus 32
+    /// caller-validated hex chars, SQL well under 1 KiB by construction
+    /// with no unbounded-width component (pinned by
+    /// `point_read_sql_stays_under_4kib_by_construction` in this
+    /// module's tests), so the guard `traces::dispatch` now applies to
+    /// every read on this path can never fire here. Issue #35's
+    /// exemption was a statement about where the check ran, not about
+    /// this query being unable to survive it.
     pub async fn fetch_by_id(&self, hex32: &str) -> Result<Vec<StoredSpan>, ReadError> {
         let sql = super::sql::point_read_sql(&self.config.spans_table, hex32);
         let mut spans = Vec::new();
@@ -1725,10 +1741,11 @@ impl TraceEngine {
         // so a memory breach here is a `422`, not a `500`.
         let settings = catalog_settings(&self.config);
         let mut stream = self
-            .client
-            .query_stream::<StoredSpanRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_read_error(e, &self.config))?;
+            .dispatch
+            .query_stream::<StoredSpanRow, _>(&sql, &settings, |e| {
+                map_trace_read_error(e, &self.config)
+            })
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
             spans.push(StoredSpan::from(row));
@@ -1757,16 +1774,16 @@ impl TraceEngine {
         let scope_literal = scope.map(crate::logql::escape::ch_string);
         let sql = super::tags_sql::tag_names_sql(scope_literal.as_deref(), TAG_NAMES_MAX + 1);
         let settings = catalog_settings(&self.config);
-        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut names = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
         // drops at return, after full consumption — the stream is always
         // drained (≤ cap + 1 rows by the SQL LIMIT).
         let mut stream = self
-            .client
-            .query_stream::<TagNameRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_read_error(e, &self.config))?;
+            .dispatch
+            .query_stream::<TagNameRow, _>(&sql, &settings, |e| {
+                map_trace_read_error(e, &self.config)
+            })
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
             names.push((row.scope, row.key));
@@ -1821,21 +1838,25 @@ impl TraceEngine {
                 catalog_settings(&self.config),
             )
         } else {
-            // A narrowing term can carry a user regex, whose `(?:` the
-            // driver would otherwise read as a bind placeholder — the
-            // same `escape_query_placeholders` every other regex-bearing
-            // read on this path applies. The catalog shape cannot contain
-            // one, and its bytes stay exactly as they were.
+            // Issue #509: NEITHER branch escapes here, and the comment
+            // this replaced is why. It claimed only the narrowing term
+            // could carry a `?` — "the catalog shape cannot contain one"
+            // — but the unnarrowed shape inlines the requested attribute
+            // KEY, and an OTLP attribute may be named `http.target?raw`.
+            // Measured at `acf44c49`: that key was a `500` on all three
+            // values routes, `a??b` silently read back key `a?b`, and
+            // `a?fields` had the row's column list substituted into the
+            // literal. The doubling now happens once, in
+            // `traces::dispatch`, for every read on this path.
             (
-                escape_query_placeholders(&super::tags_sql::attr_values_narrowed_sql(
+                super::tags_sql::attr_values_narrowed_sql(
                     self.span_filter_ctx(),
                     &key_literal,
                     scope_literal.as_deref(),
                     req.days(),
                     narrowing.terms(),
                     TAG_VALUES_MAX + 1,
-                ))
-                .into_owned(),
+                ),
                 metrics_settings(&self.config),
             )
         };
@@ -1863,24 +1884,21 @@ impl TraceEngine {
         req: TagValuesRequest<'_>,
     ) -> Result<TagValues, ReadError> {
         let narrowing = req.narrowing();
-        // As in `list_tag_values`: a narrowing term can carry a user
-        // regex whose `(?:` the driver would read as a bind placeholder.
-        let sql = escape_query_placeholders(&super::tags_sql::span_name_values_sql(
+        let sql = super::tags_sql::span_name_values_sql(
             self.span_filter_ctx(),
             req.days(),
             narrowing.terms(),
             TAG_VALUES_MAX + 1,
-        ))
-        .into_owned();
+        );
         let settings = metrics_settings(&self.config);
-        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut values = Vec::new();
         // Scoped stream: same lease/drain contract as list_tag_names.
         let mut stream = self
-            .client
-            .query_stream::<SpanNameRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_read_error(e, &self.config))?;
+            .dispatch
+            .query_stream::<SpanNameRow, _>(&sql, &settings, |e| {
+                map_trace_read_error(e, &self.config)
+            })
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
             values.push(span_name_value(row.val));
@@ -1898,14 +1916,14 @@ impl TraceEngine {
         sql: &str,
         settings: &QuerySettings,
     ) -> Result<TagValues, ReadError> {
-        crate::querytext::ensure_query_text_fits(sql).map_err(ReadError::QueryTooBroad)?;
         let mut values = Vec::new();
         // Scoped stream: same lease/drain contract as list_tag_names.
         let mut stream = self
-            .client
-            .query_stream::<TagValueRow>(sql, settings)
-            .await
-            .map_err(|e| map_trace_read_error(e, &self.config))?;
+            .dispatch
+            .query_stream::<TagValueRow, _>(sql, settings, |e| {
+                map_trace_read_error(e, &self.config)
+            })
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
             values.push(TagValue {
@@ -1957,12 +1975,20 @@ impl TraceEngine {
     /// documented Layer-1 residual). `charged` accumulates what the
     /// caller must release when it discards the rows.
     ///
-    /// **Issue #35: the single choke point for every search-phase read.**
-    /// Every phase-1 generator, phase-2 hydration/membership/attribute-
-    /// value batch, and the root-hydration read all route through this one
-    /// function — [`crate::querytext::ensure_query_text_fits`] runs once
-    /// here (against the FINAL escaped text) rather than at each of the
-    /// half-dozen call sites.
+    /// **Issue #35: the single choke point for every search-phase
+    /// CHARGE.** Every phase-1 generator, phase-2 hydration/membership/
+    /// attribute-value batch, and the root-hydration read route through
+    /// this one function, so the byte budget is priced, charged and
+    /// accepted in one place rather than at each of the half-dozen call
+    /// sites.
+    ///
+    /// **Issue #509: it is no longer the choke point for query TEXT.**
+    /// The `?`-doubling and
+    /// [`crate::querytext::ensure_query_text_fits`] used to run here,
+    /// which covered the search phase and left the tag, point-read and
+    /// metrics reads to remember them site by site — three of the
+    /// twenty-seven did not. Both now run in `traces::dispatch`, once,
+    /// for every read this module issues.
     ///
     /// **Issue #57 re-audit:** `mapper` lets phase-1 generator reads route
     /// through [`map_trace_generator_error`] (which alone maps code 241 →
@@ -2022,15 +2048,10 @@ impl TraceEngine {
         mapper: fn(ChError, &TraceReadConfig) -> ReadError,
         sink: &mut impl ChargedRowSink<R>,
     ) -> Result<(), ReadError> {
-        let sql = escape_query_placeholders(sql);
-        if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
-            return Err(ReadError::QueryTooBroad(reason));
-        }
         let mut stream = self
-            .client
-            .query_stream::<R>(&sql, settings)
-            .await
-            .map_err(|e| mapper(e, &self.config))?;
+            .dispatch
+            .query_stream::<R, _>(sql, settings, |e| mapper(e, &self.config))
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| mapper(e, &self.config))?;
             // Price, charge, THEN hand over — the order is the invariant
@@ -2056,15 +2077,14 @@ impl TraceEngine {
         };
         let cap = self.config.max_series;
         let settings = self.search_settings();
-        let sql = escape_query_placeholders(probe);
-        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut count: u64 = 0;
         // Scoped stream: the probe returns exactly one `count()` row.
         let mut stream = self
-            .client
-            .query_stream::<MetricCountRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_read_error(e, &self.config))?;
+            .dispatch
+            .query_stream::<MetricCountRow, _>(probe, &settings, |e| {
+                map_trace_read_error(e, &self.config)
+            })
+            .await?;
         while let Some(row) = stream.next().await {
             count = row.map_err(|e| map_trace_read_error(e, &self.config))?.n;
         }
@@ -5139,11 +5159,13 @@ mod tests {
 
     // --- Issue #35: full-shape parse bound (traces) ---
 
-    /// Pins `fetch_by_id`'s guard exemption: the point-read template plus
-    /// 32 hex chars stays well under any plausible query-text cap, let
-    /// alone [`crate::querytext::MAX_QUERY_TEXT_BYTES`] — `fetch_by_id`
-    /// never calls [`crate::querytext::ensure_query_text_fits`], and this
-    /// is why that is safe.
+    /// The point-read template plus 32 hex chars stays well under any
+    /// plausible query-text cap, let alone
+    /// [`crate::querytext::MAX_QUERY_TEXT_BYTES`]. Issue #35 used this
+    /// to justify EXEMPTING `fetch_by_id` from
+    /// [`crate::querytext::ensure_query_text_fits`]; since issue #509 the
+    /// point read passes that guard like every other read on this path,
+    /// and this test is what says the guard can never fire on it.
     #[test]
     fn point_read_sql_stays_under_4kib_by_construction() {
         let sql =
