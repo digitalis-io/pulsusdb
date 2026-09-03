@@ -1169,6 +1169,12 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
         .await;
     }
     for (scope, prefix) in [("span", 'v'), ("event:intrinsic", 'a')] {
+        // The seed statement carries the `?` too, and this test's own
+        // client is a plain driver hop with no dispatcher in front of
+        // it — so the doubling is applied here by hand. It is a wire
+        // encoding: the driver collapses `??` back to one byte, and the
+        // row ClickHouse stores holds the single `?` of `QM_KEY`, which
+        // the value assertions below would catch if it did not.
         exec(
             client,
             &format!(
@@ -1176,7 +1182,8 @@ async fn seed_qm_catalog(client: &ChClient, db: &str) {
                  SELECT '{scope}', '{QM_KEY}', \
                         concat('{prefix}', leftPad(toString(number), 7, '0')) \
                  FROM numbers({QM_VALS_PER_KEY})"
-            ),
+            )
+            .replace('?', "??"),
         )
         .await;
     }
@@ -1238,6 +1245,7 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
         "a `?`-bearing key must still engage and strictly prune the (scope, key) prefix \
          ({selected}/{total}):\n{raw}"
     );
+    eprintln!("recorded `?`-key prune: granules={selected}/{total}");
 
     // And the read answers, through the engine, over the dispatcher.
     let engine = TraceEngine::new(
@@ -1254,10 +1262,13 @@ async fn unnarrowed_values_for_a_question_mark_key_prune_and_answer() {
         .expect("a `?` in the key is data: the read must answer, not fail the driver");
     assert_eq!(
         values.values.len(),
-        TAG_VALUES_MAX + 1,
-        "the key holds more than the cap, so the SQL LIMIT ships cap + 1 (the probe)"
+        TAG_VALUES_MAX,
+        "the key holds more than the cap: the SQL LIMIT ships cap + 1 and the engine returns cap"
     );
-    assert!(values.truncated);
+    assert!(
+        values.truncated,
+        "the cap + 1 probe row must flip `truncated` rather than shipping a silent subset"
+    );
     assert!(
         values.values.iter().all(|v| !v.val.starts_with('a')),
         "a reserved-scope value reached the scoped lookup: {:?}",
