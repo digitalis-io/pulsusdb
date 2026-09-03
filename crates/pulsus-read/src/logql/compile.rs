@@ -804,6 +804,24 @@ impl Lower<Lql> for EmitLower {
     }
 }
 
+/// Parses `{service_name="x"} <atom>` and returns the single pipeline
+/// stage, so that every payload a gate uses comes from the real parser
+/// rather than from a hand-built AST. Test-only, and crate-visible
+/// because the walk-agreement gates in [`super::plan`] build their corpus
+/// from the same atoms.
+#[cfg(test)]
+pub(crate) fn parsed_stage(atom: &str) -> Stage {
+    let q = format!(r#"{{service_name="x"}} {atom}"#);
+    let expr = pulsus_logql::parse(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
+    let pulsus_logql::Expr::Log(log) = expr else {
+        panic!("{q} is not a log expression")
+    };
+    log.pipeline
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{q} has no stage"))
+}
+
 /// The seed relation a LogQL chain folds from: the resolved selector over
 /// the stream index, with the stored line in the column set.
 pub fn seed_relation() -> Relation<Lql> {
@@ -836,6 +854,7 @@ pub fn seed_relation() -> Relation<Lql> {
 
 #[cfg(test)]
 mod tests {
+    use super::parsed_stage as stage;
     use super::*;
     use crate::compile::fold::{
         Disposition, Grouping, Lowering, Ordering, RequestBounds, ResidualReason, SortDir,
@@ -843,21 +862,6 @@ mod tests {
     };
     use crate::compile::plan::{Cut, Issue, Part, PlanConfig, PlanCx, plan_of};
     use crate::compile::testkit::{EffectRow, assert_every_residual_state_effect};
-
-    /// Parses `{service_name="x"} <atom>` and returns the single pipeline
-    /// stage — so every payload below comes from the real parser rather
-    /// than from a hand-built AST.
-    pub(crate) fn stage(atom: &str) -> Stage {
-        let q = format!(r#"{{service_name="x"}} {atom}"#);
-        let expr = pulsus_logql::parse(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
-        let pulsus_logql::Expr::Log(log) = expr else {
-            panic!("{q} is not a log expression")
-        };
-        log.pipeline
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("{q} has no stage"))
-    }
 
     fn bounds(limit: Option<u32>) -> RequestBounds {
         RequestBounds {
@@ -1488,40 +1492,6 @@ mod tests {
             ),
             "the same statement, issued once per page: {:?}",
             sp.issue
-        );
-    }
-
-    /// A refused `line_format` marks the line rewritten, and the next
-    /// line filter is residual BECAUSE of it — the residual rule as
-    /// behaviour rather than as prose.
-    #[test]
-    fn a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual() {
-        let b = bounds(None);
-        let chain = vec![
-            LqlLink::Source,
-            LqlLink::Pipe(stage(r#"|= "CONN_REFUSED""#)),
-            LqlLink::Pipe(stage(r#"| line_format "{{.msg}}""#)),
-            LqlLink::Pipe(stage(r#"|= "pod-044""#)),
-        ];
-        let lowering = fold(&chain, &b);
-        assert_eq!(lowering.how[1], Disposition::Lowered(Fidelity::Equivalent));
-        assert_eq!(
-            lowering.how[2],
-            Disposition::Residual(ResidualReason::Blocked(BlockReason::NotYetLowered))
-        );
-        assert_eq!(
-            lowering.how[3],
-            Disposition::Residual(ResidualReason::Blocked(BlockReason::BodyNotStored)),
-            "the filter AFTER the rewrite is residual because the rewrite said so"
-        );
-        assert_eq!(
-            lowering.rel.cols.provenance(&Name::from(BODY)),
-            Some(&Provenance::EvaluatorOnly)
-        );
-        assert!(
-            !lowering.rel.predicate.to_string().contains("pod-044"),
-            "the post-rewrite needle must not reach the predicate: {}",
-            lowering.rel.predicate
         );
     }
 
