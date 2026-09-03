@@ -243,6 +243,8 @@ In-house recursive-descent parser → pipeline planner → SQL generator. A LogQ
 
 Live tail (`/api/logs/v1/tail`) is a WebSocket loop polling the tail of `log_samples` for the resolved fingerprints with monotonic cursor advancement, `limit`/`start` support, and `dropped_entries` reporting under backpressure.
 
+Which pipeline stages are compiled into the SQL and which are evaluated in the engine is decided by one shared mechanism, not per stage — see [Query lowering](query-lowering.md). Today that boundary is computed by three separate hand-written walks in `logql/plan.rs`; the LogQL stage inventory is issue #507.
+
 ### 5.4 TraceQL
 
 In-house parser → planner → SQL generator over `trace_attrs_idx` + `trace_spans`:
@@ -250,6 +252,7 @@ In-house parser → planner → SQL generator over `trace_attrs_idx` + `trace_sp
 - Span-attribute conditions become index reads intersected per span (same `GROUP BY ... HAVING` shape as LogQL matchers); intrinsics (`duration`, `status`, `name`, `kind`) filter directly on indexed columns. `service` is not a TraceQL intrinsic — it is the `resource.service.name` attribute, which the planner maps to the physical `service` column.
 - The planner produces a bounded candidate set of `(trace_id, span_id)` and hydrates from `trace_spans` — by primary key for ID fetches, via the `service_time` projection for service-scoped searches.
 - **TraceQL metrics** (`/api/traces/v1/metrics/query_range`, `/api/traces/v1/metrics/query`) compile the same span filters into `GROUP BY toStartOfInterval(...)` aggregations evaluated fully in ClickHouse.
+- **Pipeline stages** (spanset aggregates, `by()`, `select()`) are evaluated in the engine today; which of them compile into the SQL instead, and where the boundary between compiled and evaluated falls, is [Query lowering](query-lowering.md). The SQL shape several lowered stages compose into is [ADR 0008](decisions/0008-sql-composition-for-lowered-pipelines.md).
 
 ### 5.5 Profiles
 
