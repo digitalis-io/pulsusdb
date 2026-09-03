@@ -26,6 +26,7 @@
 //! or [`Provenance::EvaluatorOnly`] — is decided by whether a SQL
 //! expression for the rewrite has been written; see [`Provenance`].
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -377,6 +378,16 @@ impl Pred {
     /// different tables, while an `AND` over two sources is one
     /// statement's job and needs no partition.
     ///
+    /// **A set, compared as a set.** The qualifying test runs over
+    /// [`source_set`], which is a `BTreeSet` and so cannot carry the
+    /// order its sources were first seen in. The keys this returns keep
+    /// first-seen order because [`branch_sources_union`] renders the
+    /// cut's source list from them, and the two are deliberately
+    /// different values: comparing the ordered keys made
+    /// `{idx, rows}` reached as `[idx, rows]` and as `[rows, idx]` two
+    /// distinct keys, and partitioned two branches that read exactly the
+    /// same sources (issue #492, code review round 20).
+    ///
     /// **Every other conjunct on the spine is distributed into each
     /// branch**, in its written position, because `t ∧ (a ∨ b)` is
     /// `(t ∧ a) ∨ (t ∧ b)`: a branch carrying only `a` would mean less
@@ -392,13 +403,19 @@ impl Pred {
     /// [`Pred::sources`] of the branch's own predicate, which is an
     /// equality a test can assert.
     ///
-    /// **Where this stops, and why it is `None` rather than a partial
-    /// answer.** A disjunction nested under another `OR`, or under a
-    /// `Not`, is not partitioned: an `OR` sibling cannot be carried into a
-    /// branch the way a conjunct can, and `¬(a ∨ b)` is `¬a ∧ ¬b`, a
-    /// conjunction. `None` leaves one statement carrying the whole
-    /// predicate, which is conservative; recursing there would return
-    /// branches that mean less than the query.
+    /// **What is flattened, and where this stops.** A disjunction nested
+    /// under another `OR` **is** partitioned: [`flatten_or`] flattens the
+    /// whole `OR` spine before the decision is made, so `a ∨ (b ∨ c)` is
+    /// one three-branch disjunction and each of the three becomes a
+    /// branch. Nothing is lost by that — an `OR` spine has no sibling to
+    /// carry, the way a conjunct on the `AND` spine has.
+    ///
+    /// A disjunction under a `Not` is **not** partitioned, and that case
+    /// answers `None`. `Not` is opaque to both spines, and rightly so:
+    /// `¬(a ∨ b)` is `¬a ∧ ¬b`, so branches taken from inside it would
+    /// be merged as `¬a ∨ ¬b`, which is weaker than the query. `None`
+    /// leaves one statement carrying the whole predicate, which is
+    /// conservative.
     pub fn disjoint_or_branches(&self) -> Option<Vec<(Vec<SourceRef>, Pred)>> {
         let mut spine: Vec<&Pred> = Vec::new();
         self.collect_conjuncts(&mut spine);
@@ -432,12 +449,8 @@ impl Pred {
                     (whole.sources(), whole)
                 })
                 .collect();
-            let mut distinct: Vec<&Vec<SourceRef>> = Vec::new();
-            for (k, _) in &keyed {
-                if !distinct.contains(&k) {
-                    distinct.push(k);
-                }
-            }
+            let distinct: BTreeSet<BTreeSet<SourceRef>> =
+                keyed.iter().map(|(k, _)| source_set(k)).collect();
             if distinct.len() > 1 {
                 return Some(keyed);
             }
@@ -466,6 +479,21 @@ impl Pred {
             other => out.push(other),
         }
     }
+}
+
+/// The **set** of sources a list names, with the order it was written in
+/// discarded — the one normalisation
+/// [`Pred::disjoint_or_branches`] decides "do these branches read the
+/// same sources?" through.
+///
+/// It returns a `BTreeSet` rather than a sorted `Vec` on purpose: the
+/// type itself is what makes the comparison order-independent, so a
+/// future edit cannot reintroduce an ordered comparison by building the
+/// value differently. Order lives in [`branch_sources_union`], which is
+/// a separate function serving a separate need (rendering the cut's
+/// source list), and the two never meet.
+fn source_set(sources: &[SourceRef]) -> BTreeSet<SourceRef> {
+    sources.iter().copied().collect()
 }
 
 /// Every source named by any branch of a partition, in first-seen order —

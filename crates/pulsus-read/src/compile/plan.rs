@@ -913,6 +913,8 @@ impl<L: Lang + ?Sized> Eq for QueryPlan<L> {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::compile::fold::{
         BlockReason, Capability, Col, ColSet, Fidelity, Lower, LowerCx, NeverReason, Pred,
@@ -1215,17 +1217,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Issue #492, code review round 19: the disjoint-source partition
-    // lost the surrounding Boolean context and lost sources.
+    // Issue #492, code review rounds 19 and 20: three ways the
+    // disjoint-source partition asked the wrong question.
     //
-    // Two defects in one function, so two gates, each of which fails on
-    // its own half and stays green under the other's break:
+    // Three defects in one function, so three gates, each of which fails
+    // on its own break and stays green under the other two:
     //
     // * dropping the distribution (a branch carries only its own side)
     //   fails ONLY `a_conjunct_written_beside_the_disjunction_...`;
     // * keying a branch on `sources().first()` fails ONLY
     //   `a_branch_reading_two_sources_...`, whose keys collapse to one
-    //   and whose partition then disappears.
+    //   and whose partition then disappears;
+    // * comparing the keys as ordered `Vec`s rather than as sets fails
+    //   ONLY `equal_source_sets_reached_in_different_orders_...`.
     // -----------------------------------------------------------------
 
     /// A conjunct that sits outside the disjunction belongs to every
@@ -1364,6 +1368,129 @@ mod tests {
             }],
             "one cut, naming both sources: {:?}",
             plan.parts
+        );
+    }
+
+    /// Two branches that read the SAME set of sources are not a
+    /// partition, however that set was spelled — the qualifying question
+    /// is about a set, so the comparison must be about a set.
+    ///
+    /// The two branches here differ in nothing but the order their
+    /// sources are first seen: `{idx, rows, other}` reached as
+    /// `[idx, rows, other]` and as `[idx, other, rows]`. Comparing the
+    /// keys with `Vec` equality — which is what round 19 shipped — makes
+    /// those two distinct keys and partitions a disjunction that reads
+    /// one set of sources on both sides.
+    ///
+    /// **Why three sources and not the two-source spelling.** The
+    /// smallest form of this is `[idx, rows]` against `[rows, idx]`, but
+    /// that input ALSO reddens under the `sources().first()` break —
+    /// `idx` and `rows` are different first sources, so it cannot tell
+    /// "the comparison carries order" apart from "the key is wrong", and
+    /// the one-break-one-gate separation the previous round established
+    /// would be lost. Holding the first source equal and permuting the
+    /// rest leaves the first-source key blind to this input, so this gate
+    /// answers for the comparison alone.
+    #[test]
+    fn equal_source_sets_reached_in_different_orders_are_not_a_partition() {
+        let left = Pred::leaf("a = 1", IDX)
+            .and(Pred::leaf("b = 2", ROWS))
+            .and(Pred::leaf("c = 3", OTHER));
+        let right = Pred::leaf("d = 4", IDX)
+            .and(Pred::leaf("e = 5", OTHER))
+            .and(Pred::leaf("f = 6", ROWS));
+        // The premise the gate rests on, asserted rather than assumed:
+        // same set, different first-seen order, same first source.
+        assert_eq!(left.sources(), vec![IDX, ROWS, OTHER]);
+        assert_eq!(right.sources(), vec![IDX, OTHER, ROWS]);
+        assert_ne!(left.sources(), right.sources(), "the orders differ");
+        assert_eq!(
+            left.sources().iter().copied().collect::<BTreeSet<_>>(),
+            right.sources().iter().copied().collect::<BTreeSet<_>>(),
+            "the sets do not"
+        );
+        assert_eq!(
+            left.sources().first(),
+            right.sources().first(),
+            "and the first source is the same, so a first-source key \
+             cannot distinguish these two branches"
+        );
+
+        let p = left.or(right);
+        assert_eq!(
+            p.disjoint_or_branches(),
+            None,
+            "both sides read {{idx, rows, other}}; one statement holds them"
+        );
+        assert_eq!(p.disjoint_or_sources(), None);
+
+        // And no `DisjointSources` cut through `plan_of`, which is where
+        // a spurious partition would become a second statement.
+        let config = PlanConfig::default();
+        let b = bounds(None);
+        let mut rel = seed_rel();
+        rel.predicate = p.clone();
+        let plan = plan_of::<Tl>(
+            &[],
+            Lowering {
+                rel,
+                how: Vec::new(),
+            },
+            &PlanCx {
+                bounds: &b,
+                config: &config,
+            },
+        )
+        .expect("plan");
+        let sql = plan
+            .parts
+            .iter()
+            .filter(|p| matches!(p, Part::Sql(_)))
+            .count();
+        assert_eq!(sql, 1, "one statement, not two: {:?}", plan.parts);
+        assert!(
+            !plan.parts.iter().any(|p| matches!(
+                p,
+                Part::Sql(s) if matches!(s.cut, Some(Cut::DisjointSources { .. }))
+            )),
+            "no disjoint-source cut: {:?}",
+            plan.parts
+        );
+    }
+
+    /// What the flattening does and does not reach, pinned so the doc
+    /// comment on [`Pred::disjoint_or_branches`] has a failure mode.
+    ///
+    /// A disjunction nested under another `OR` IS partitioned, into all
+    /// of its branches, because `flatten_or` flattens the whole `OR`
+    /// spine before the qualifying question is asked. A disjunction under
+    /// a `Not` is not: `Not` is opaque to both spines, and branches taken
+    /// from inside it would merge as `¬a ∨ ¬b` where the query asked for
+    /// `¬a ∧ ¬b`.
+    #[test]
+    fn a_nested_or_is_flattened_and_a_disjunction_under_a_not_is_left_whole() {
+        let nested =
+            Pred::leaf("a = 1", IDX).or(Pred::leaf("b = 2", ROWS).or(Pred::leaf("c = 3", IDX)));
+        let bs = nested
+            .disjoint_or_branches()
+            .expect("the flattened spine reads two source sets");
+        assert_eq!(
+            bs,
+            vec![
+                (vec![IDX], Pred::leaf("a = 1", IDX)),
+                (vec![ROWS], Pred::leaf("b = 2", ROWS)),
+                (vec![IDX], Pred::leaf("c = 3", IDX)),
+            ],
+            "the nesting is flattened: three branches, not two"
+        );
+
+        let negated = Pred::Not(Box::new(
+            Pred::leaf("a = 1", IDX).or(Pred::leaf("b = 2", ROWS)),
+        ));
+        assert_eq!(
+            negated.disjoint_or_branches(),
+            None,
+            "a disjunction under a `Not` is one statement's whole predicate"
         );
     }
 
