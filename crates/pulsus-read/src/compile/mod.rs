@@ -47,6 +47,7 @@ pub use fold::{
     SqlExpr, lower_chain,
 };
 pub use plan::{
-    Cut, Driver, HandoffCost, Issue, LinkOutcome, Part, PlanConfig, PlanCx, PlanShape, QueryPlan,
-    Seed, SeedBound, SourceRef, SqlPart, plan_of,
+    BoundShape, Cut, CutShape, Driver, EnginePartShape, Handoff, HandoffCost, Issue, LinkOutcome,
+    LinkShape, Part, PartShape, PlanConfig, PlanCx, PlanShape, QueryPlan, Seed, SeedBound,
+    SeedShape, SourceRef, SqlPart, SqlPartShape, cuts_firing, inexact_limit_fires, plan_of,
 };

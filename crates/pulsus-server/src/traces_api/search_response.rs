@@ -80,7 +80,9 @@
 
 use serde_json::{Value, json};
 
-use pulsus_read::{GroupValue, SearchOutput, SpanSetGroup, SpanSummary, TraceSearchResult};
+use pulsus_read::{
+    GroupValue, PlanExplain, SearchOutput, SpanSetGroup, SpanSummary, TraceSearchResult,
+};
 
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -543,7 +545,7 @@ pub(crate) fn render(output: &SearchOutput) -> Value {
 /// `routing` is always `null` here: a search never routes between
 /// tables. `plan` is always absent today, because no read path calls the
 /// compile core yet.
-pub(crate) fn explain_value(e: &pulsus_read::PlanExplain) -> Value {
+pub(crate) fn explain_value(e: &PlanExplain) -> Value {
     let stages = e
         .stages
         .iter()
