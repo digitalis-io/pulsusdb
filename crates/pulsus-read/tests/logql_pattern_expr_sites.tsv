@@ -46,7 +46,7 @@ Site	Literal	crates/pulsus-logql/tests/case_folding.rs:277	-	-	<a>	accept	accept
 Site	Literal	crates/pulsus-logql/tests/case_folding.rs:278	-	-	<a>	accept	accept	-	-	
 Site	Literal	crates/pulsus-logql/tests/snapshots.rs:946	-	-	<method> <path> <_> <status>	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/charge.rs:548	-	-	, 	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/src/logql/compile.rs:976	-	-	<a>	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/src/logql/compile.rs:1003	-	-	<a>	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:4710	-	-	<x> y	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:5963	-	-	<a>	accept	accept	-	-	
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:198	-	-	<method> <path> <status> <took>	accept	accept	-	-	

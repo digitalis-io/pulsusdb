@@ -1185,6 +1185,12 @@ async fn search_semantics_against_real_clickhouse() {
     assert_eq!(json["traces"], serde_json::json!([]));
     // An empty result is a COMPLETE result (issue #464).
     assert_metrics_block(&json, "complete", "empty window");
+
+    // The database this spawn created, dropped on the way out as well as
+    // on the way in: a suite that passes and leaves its database behind
+    // makes the next run read its own residue (issue #492, code review
+    // round 19 — six prefixed databases survived a green run).
+    drop_db(db).await;
 }
 
 // ---------------------------------------------------------------------
@@ -1351,6 +1357,12 @@ async fn candidate_cap_partial_and_boundary_semantics() {
         vec![hex(&tid(123))],
         "{ctx}: the newest true match is still the returned page"
     );
+
+    // The database this spawn created, dropped on the way out as well as
+    // on the way in: a suite that passes and leaves its database behind
+    // makes the next run read its own residue (issue #492, code review
+    // round 19 — six prefixed databases survived a green run).
+    drop_db(db).await;
 }
 
 // ---------------------------------------------------------------------
@@ -1390,6 +1402,12 @@ async fn scan_budget_breach_is_422_query_too_broad() {
     let res = get(port, &path, ctx);
     let body = assert_error_body(&res, 422, ctx);
     assert!(body.contains("budget"), "{ctx}: {body:?}");
+
+    // The database this spawn created, dropped on the way out as well as
+    // on the way in: a suite that passes and leaves its database behind
+    // makes the next run read its own residue (issue #492, code review
+    // round 19 — six prefixed databases survived a green run).
+    drop_db(db).await;
 }
 
 // ---------------------------------------------------------------------
@@ -1578,6 +1596,12 @@ async fn negation_demands_a_boolean_where_truthiness_tolerates_a_string() {
             "{ctx}: {q} must match the reference's span set"
         );
     }
+
+    // The database this spawn created, dropped on the way out as well as
+    // on the way in: a suite that passes and leaves its database behind
+    // makes the next run read its own residue (issue #492, code review
+    // round 19 — six prefixed databases survived a green run).
+    drop_db(db).await;
 }
 
 /// Issue #351 (owner ruling, 2026-08-05): the MULTI-VALUED event/link
@@ -1735,6 +1759,12 @@ async fn event_and_link_comparisons_match_any_event_over_real_clickhouse() {
         let res = search(port, q, w0, w1, "", ctx);
         assert_eq!(trace_set(&res.json(ctx)), expected, "{ctx}: {q}");
     }
+
+    // The database this spawn created, dropped on the way out as well as
+    // on the way in: a suite that passes and leaves its database behind
+    // makes the next run read its own residue (issue #492, code review
+    // round 19 — six prefixed databases survived a green run).
+    drop_db(db).await;
 }
 
 // ---------------------------------------------------------------------
@@ -1841,6 +1871,12 @@ async fn a_wide_event_set_is_refused_by_the_budget_not_materialized() {
         BTreeSet::from([hex(&tid(1))]),
         "{ctx}: the 422 above must be the BUDGET, not a permanently failing query"
     );
+
+    // The database this spawn created, dropped on the way out as well as
+    // on the way in: a suite that passes and leaves its database behind
+    // makes the next run read its own residue (issue #492, code review
+    // round 19 — six prefixed databases survived a green run).
+    drop_db(db).await;
 }
 
 /// Issue #479 — the matched-span projection, end to end over the real

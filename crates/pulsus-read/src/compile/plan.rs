@@ -25,7 +25,7 @@ use serde::Serialize;
 
 use super::fold::{
     BoundaryOutput, Disposition, Fidelity, Lang, Lowering, Name, Relation, RequestBounds,
-    ResidualReason,
+    ResidualReason, branch_sources_union,
 };
 
 // ---------------------------------------------------------------------
@@ -414,7 +414,9 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
     let branches = rel.predicate.disjoint_or_branches();
     match &branches {
         Some(bs) if bs.len() > 1 => {
-            let sources: Vec<SourceRef> = bs.iter().map(|(s, _)| *s).collect();
+            // The SAME derivation `cuts_firing` uses, so the cut's
+            // source list and the parts built beside it cannot disagree.
+            let sources: Vec<SourceRef> = branch_sources_union(bs);
             for (i, (_, pred)) in bs.iter().enumerate() {
                 let mut branch_rel = rel.clone();
                 branch_rel.predicate = pred.clone();
@@ -1210,6 +1212,159 @@ mod tests {
                 "exactly one rule fires, and it produces {want:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #492, code review round 19: the disjoint-source partition
+    // lost the surrounding Boolean context and lost sources.
+    //
+    // Two defects in one function, so two gates, each of which fails on
+    // its own half and stays green under the other's break:
+    //
+    // * dropping the distribution (a branch carries only its own side)
+    //   fails ONLY `a_conjunct_written_beside_the_disjunction_...`;
+    // * keying a branch on `sources().first()` fails ONLY
+    //   `a_branch_reading_two_sources_...`, whose keys collapse to one
+    //   and whose partition then disappears.
+    // -----------------------------------------------------------------
+
+    /// A conjunct that sits outside the disjunction belongs to every
+    /// branch: `(a ∨ b) ∧ t` is `(a ∧ t) ∨ (b ∧ t)`.
+    ///
+    /// The tenant spelling is the point. A branch relation whose
+    /// predicate is `a` alone reads every tenant's rows, and the partition
+    /// is the object the emitter will render statements from.
+    ///
+    /// This gate asserts the branch PREDICATES only, and the conjunct is
+    /// written AFTER the disjunction, so that it is insensitive to the
+    /// source-key half: under a first-source key the two branches still
+    /// key on `idx` and `rows`, the partition survives and the predicates
+    /// are unchanged. The keys are `a_branch_reading_two_sources_...`'s
+    /// subject, and each half therefore reddens one gate and not the
+    /// other.
+    #[test]
+    fn a_conjunct_written_beside_the_disjunction_reaches_every_branch() {
+        let tenant = Pred::leaf("tenant_id = 7", IDX);
+        let p = Pred::leaf("a = 1", IDX)
+            .or(Pred::leaf("b = 2", ROWS))
+            .and(tenant.clone());
+
+        let bs = p
+            .disjoint_or_branches()
+            .expect("a disjunction over two sources under a conjunction partitions");
+        assert_eq!(bs.len(), 2, "one branch per side: {bs:?}");
+        let preds: Vec<&Pred> = bs.iter().map(|(_, pred)| pred).collect();
+        assert_eq!(
+            preds,
+            vec![
+                &Pred::leaf("a = 1", IDX).and(tenant.clone()),
+                &Pred::leaf("b = 2", ROWS).and(tenant.clone()),
+            ],
+            "every branch carries the tenant conjunct, in its written position"
+        );
+
+        // And the same through `plan_of`, which is where the branch
+        // relations are actually built (the site the finding names).
+        let config = PlanConfig::default();
+        let b = bounds(None);
+        let mut rel = seed_rel();
+        rel.predicate = p.clone();
+        let plan = plan_of::<Tl>(
+            &[],
+            Lowering {
+                rel,
+                how: Vec::new(),
+            },
+            &PlanCx {
+                bounds: &b,
+                config: &config,
+            },
+        )
+        .expect("plan");
+        let sql: Vec<&SqlPart<Tl>> = plan
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::Sql(s) => Some(&**s),
+                Part::Engine { .. } => None,
+            })
+            .collect();
+        assert_eq!(sql.len(), 2, "one statement per branch: {:?}", plan.parts);
+        for (i, part) in sql.iter().enumerate() {
+            assert_eq!(
+                part.rel.predicate, bs[i].1,
+                "branch relation {i} carries the whole predicate that applies to it"
+            );
+        }
+    }
+
+    /// A branch that reads two sources is ONE branch — an `AND` over two
+    /// sources is one statement's job — and its key names both of them.
+    ///
+    /// This gate is insensitive to the distribution half: the spine here
+    /// holds nothing but the disjunction, so there is no conjunct to
+    /// distribute and a build that never distributes leaves it green.
+    #[test]
+    fn a_branch_reading_two_sources_stays_one_branch_keyed_on_both() {
+        let spanning = Pred::leaf("a = 1", IDX).and(Pred::leaf("b = 2", ROWS));
+        let p = spanning.clone().or(Pred::leaf("c = 3", IDX));
+
+        let bs = p.disjoint_or_branches().expect(
+            "the two sides read different source SETS ({idx, rows} and {idx}), so this \
+             partitions — a key taken from the first source alone collapses them to one and \
+             loses the partition entirely",
+        );
+        assert_eq!(bs.len(), 2, "the spanning side is one branch: {bs:?}");
+        assert_eq!(
+            bs[0],
+            (vec![IDX, ROWS], spanning),
+            "the spanning branch keeps both leaves and names both sources"
+        );
+        assert_eq!(bs[1], (vec![IDX], Pred::leaf("c = 3", IDX)));
+        // The invariant that makes the key checkable rather than
+        // stipulated: a branch's key IS its predicate's source list.
+        for (key, pred) in &bs {
+            assert_eq!(key, &pred.sources(), "branch key vs predicate sources");
+        }
+        assert_eq!(
+            p.disjoint_or_sources(),
+            Some(vec![IDX, ROWS]),
+            "the cut names every source the partition spans"
+        );
+
+        // `plan_of` names the same set on the cut it attaches.
+        let config = PlanConfig::default();
+        let b = bounds(None);
+        let mut rel = seed_rel();
+        rel.predicate = p.clone();
+        let plan = plan_of::<Tl>(
+            &[],
+            Lowering {
+                rel,
+                how: Vec::new(),
+            },
+            &PlanCx {
+                bounds: &b,
+                config: &config,
+            },
+        )
+        .expect("plan");
+        let cuts: Vec<&Cut> = plan
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::Sql(s) => s.cut.as_ref(),
+                Part::Engine { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            cuts,
+            vec![&Cut::DisjointSources {
+                sources: vec![IDX, ROWS]
+            }],
+            "one cut, naming both sources: {:?}",
+            plan.parts
+        );
     }
 
     /// Issue #492 acceptance criterion 3: a seed with no plan-time bound

@@ -20,9 +20,11 @@
 //!
 //! The residual link still applies its **state effect** ([`Lower::residual_effect`]).
 //! That is the part that makes blocking work: a `line_format` that does
-//! not lower still marks `body` as [`Provenance::Computed`], so a later
-//! line filter finds no stored column to lower against and becomes
-//! residual too. Nothing is skipped silently.
+//! not lower still rewrites `body`'s provenance, so a later line filter
+//! finds nothing to lower against and becomes residual too. Nothing is
+//! skipped silently. Which provenance it rewrites to — [`Provenance::Computed`]
+//! or [`Provenance::EvaluatorOnly`] — is decided by whether a SQL
+//! expression for the rewrite has been written; see [`Provenance`].
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -86,11 +88,29 @@ impl fmt::Display for SqlExpr {
 /// Where a column's value comes from — the fact that derives blocking
 /// rather than restating it.
 ///
-/// A `line_format` that does not lower sets the line's provenance to
-/// [`Provenance::Computed`] with no resolvable expression, so a later
-/// line filter has no stored column to lower against; `decolorize` and
-/// `unpack` set it to `Computed` **with** an expression, and a later
-/// filter lowers against the rewritten expression instead.
+/// A stage that rewrites a column records one of two things, and which
+/// one is decided by whether a SQL expression for that rewrite exists:
+///
+/// * **It exists** — the stage records [`Provenance::Computed`] carrying
+///   the expression, [`Provenance::resolve`] answers `Some`, and a later
+///   link that reads the column lowers against the rewritten expression
+///   instead of the stored one.
+/// * **It does not exist** — the stage records
+///   [`Provenance::EvaluatorOnly`], `resolve` answers `None`, and a later
+///   link that reads the column has nothing to lower against and becomes
+///   residual.
+///
+/// **In wave 1 every rewriting stage in both languages takes the second
+/// case**, `line_format` and `label_format` as expected and `decolorize`
+/// and `unpack` by an approved deviation from the design record's rows,
+/// which name the first for those two. Nothing renders the SGR strip or
+/// the `_entry` unwrap into SQL yet, and a `Computed` whose expression
+/// does not exist would let a following filter lower against something no
+/// planner emits — which moves the measured zero the walk-agreement gates
+/// assert. `logql::compile::mark_line_rewritten` is the one place that
+/// records it and carries the same note; when the wave that writes those
+/// expressions lands, that call becomes `Computed` and the zero moves
+/// deliberately.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Provenance {
     /// The stored column, readable as it is.
@@ -346,63 +366,121 @@ impl Pred {
         }
     }
 
-    /// The branches of the first `OR` node whose sides do not resolve
-    /// against one source, each paired with the source it reads — the
-    /// recogniser for a disjoint-source cut, and the split the plan
-    /// builder renders one statement per.
+    /// The disjoint-source partition of this predicate: one entry per
+    /// branch of the first qualifying disjunction on the top-level
+    /// conjunctive spine, each carrying **the whole predicate that
+    /// branch's statement applies** and **every source that predicate
+    /// reads**.
     ///
-    /// `AND` is walked too, because a disjunction can sit under one; the
-    /// answer is the *disjunction's* branch list, never the whole
-    /// predicate's, since an `AND` over two sources is one statement's
-    /// job and an `OR` over two is not. A branch reading more than one
-    /// source is one entry, keyed on the first source it reads.
-    pub fn disjoint_or_branches(&self) -> Option<Vec<(SourceRef, Pred)>> {
-        match self {
-            Pred::True | Pred::Leaf { .. } => None,
-            Pred::Or(a, b) => {
-                let mut branches = Vec::new();
-                flatten_or(a, &mut branches);
-                flatten_or(b, &mut branches);
-                let keyed: Vec<(SourceRef, Pred)> = branches
-                    .into_iter()
-                    .filter_map(|p| p.sources().first().map(|s| (*s, p)))
-                    .collect();
-                let distinct = {
-                    let mut seen: Vec<SourceRef> = Vec::new();
-                    for (s, _) in &keyed {
-                        if !seen.contains(s) {
-                            seen.push(*s);
-                        }
-                    }
-                    seen.len()
-                };
-                if distinct > 1 {
-                    Some(keyed)
-                } else {
-                    a.disjoint_or_branches()
-                        .or_else(|| b.disjoint_or_branches())
+    /// A disjunction qualifies when its branches do not all read the same
+    /// set of sources — one `WHERE` cannot hold two sides that live in
+    /// different tables, while an `AND` over two sources is one
+    /// statement's job and needs no partition.
+    ///
+    /// **Every other conjunct on the spine is distributed into each
+    /// branch**, in its written position, because `t ∧ (a ∨ b)` is
+    /// `(t ∧ a) ∨ (t ∧ b)`: a branch carrying only `a` would mean less
+    /// than the query did, and a dropped tenant conjunct is a cross-tenant
+    /// read the moment a statement is rendered from it (issue #492, code
+    /// review round 19).
+    ///
+    /// **A branch that spans sources stays one branch**, keyed on all of
+    /// them: the statement for it reads every source its predicate names,
+    /// which is the same "an `AND` over two sources is one statement"
+    /// rule. Keying on the first source alone silently lost the rest —
+    /// the second half of the same finding. The key is therefore always
+    /// [`Pred::sources`] of the branch's own predicate, which is an
+    /// equality a test can assert.
+    ///
+    /// **Where this stops, and why it is `None` rather than a partial
+    /// answer.** A disjunction nested under another `OR`, or under a
+    /// `Not`, is not partitioned: an `OR` sibling cannot be carried into a
+    /// branch the way a conjunct can, and `¬(a ∨ b)` is `¬a ∧ ¬b`, a
+    /// conjunction. `None` leaves one statement carrying the whole
+    /// predicate, which is conservative; recursing there would return
+    /// branches that mean less than the query.
+    pub fn disjoint_or_branches(&self) -> Option<Vec<(Vec<SourceRef>, Pred)>> {
+        let mut spine: Vec<&Pred> = Vec::new();
+        self.collect_conjuncts(&mut spine);
+        for (i, conjunct) in spine.iter().enumerate() {
+            if !matches!(conjunct, Pred::Or(_, _)) {
+                continue;
+            }
+            let mut branches = Vec::new();
+            flatten_or(conjunct, &mut branches);
+            let keyed: Vec<(Vec<SourceRef>, Pred)> = branches
+                .into_iter()
+                .map(|branch| {
+                    // The spine rebuilt with `branch` in the
+                    // disjunction's place: every other conjunct kept, in
+                    // the order it was written.
+                    let whole = spine
+                        .iter()
+                        .enumerate()
+                        .fold(None::<Pred>, |acc, (j, term)| {
+                            let term = if j == i {
+                                branch.clone()
+                            } else {
+                                (*term).clone()
+                            };
+                            Some(match acc {
+                                None => term,
+                                Some(a) => a.and(term),
+                            })
+                        })
+                        .expect("the spine holds at least the disjunction itself");
+                    (whole.sources(), whole)
+                })
+                .collect();
+            let mut distinct: Vec<&Vec<SourceRef>> = Vec::new();
+            for (k, _) in &keyed {
+                if !distinct.contains(&k) {
+                    distinct.push(k);
                 }
             }
-            Pred::And(a, b) => a
-                .disjoint_or_branches()
-                .or_else(|| b.disjoint_or_branches()),
-            Pred::Not(a) => a.disjoint_or_branches(),
+            if distinct.len() > 1 {
+                return Some(keyed);
+            }
         }
+        None
     }
 
     /// The distinct sources of [`Pred::disjoint_or_branches`], in
     /// first-seen order.
     pub fn disjoint_or_sources(&self) -> Option<Vec<SourceRef>> {
-        self.disjoint_or_branches().map(|bs| {
-            let mut seen: Vec<SourceRef> = Vec::new();
-            for (s, _) in bs {
-                if !seen.contains(&s) {
-                    seen.push(s);
-                }
-            }
-            seen
-        })
+        self.disjoint_or_branches()
+            .as_deref()
+            .map(branch_sources_union)
     }
+
+    /// Flattens this predicate's `AND` spine. [`Pred::True`] is the
+    /// conjunction's identity and contributes nothing; `Not` is opaque,
+    /// so a disjunction under one is a conjunct and never a partition.
+    fn collect_conjuncts<'a>(&'a self, out: &mut Vec<&'a Pred>) {
+        match self {
+            Pred::True => {}
+            Pred::And(a, b) => {
+                a.collect_conjuncts(out);
+                b.collect_conjuncts(out);
+            }
+            other => out.push(other),
+        }
+    }
+}
+
+/// Every source named by any branch of a partition, in first-seen order —
+/// the one derivation of `Cut::DisjointSources`' source list, so the cut
+/// and the parts built beside it can never name different sets.
+pub fn branch_sources_union(branches: &[(Vec<SourceRef>, Pred)]) -> Vec<SourceRef> {
+    let mut seen: Vec<SourceRef> = Vec::new();
+    for (sources, _) in branches {
+        for s in sources {
+            if !seen.contains(s) {
+                seen.push(*s);
+            }
+        }
+    }
+    seen
 }
 
 /// Flattens a right-/left-nested `OR` spine into its branches.

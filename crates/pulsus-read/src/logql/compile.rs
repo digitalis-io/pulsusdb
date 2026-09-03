@@ -48,6 +48,28 @@ pub const FINGERPRINT: &str = "fingerprint";
 /// a line-rewriting stage residual, and it is the whole of that rule.
 pub const BODY: &str = "body";
 
+/// One structured-metadata key, and the expression that reads it.
+///
+/// `log_samples.structured_metadata` is a `String` holding flat JSON
+/// (schema migration id 21, `crates/pulsus-schema/src/catalog.rs`), so a
+/// key inside it is a name that is not a column and resolves to an
+/// extraction over one — the same shape the shipped metrics read path
+/// already renders for `labels`
+/// (`crates/pulsus-read/src/metrics/series_where.rs:333`).
+///
+/// **Why the seed carries one at all.** Without a resolvable
+/// structured-metadata name, [`LabelFilterLower::capability`] refuses
+/// every label filter at its name-resolution guard and never reaches the
+/// rule under it, so a change to that rule is invisible to every gate —
+/// a fixture that cannot fail on the input it is given (issue #492, code
+/// review round 19). With this column present, `| level="error"` resolves
+/// and the answer comes from the rule.
+///
+/// **It moves no SQL.** No label filter lowers in wave 1, so the
+/// expression is never emitted; the walk-agreement gates measure that.
+pub const LEVEL: &str = "level";
+pub const LEVEL_EXPR: &str = "JSONExtractString(structured_metadata, 'level')";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LqlSource(pub SourceRef);
 
@@ -823,7 +845,8 @@ pub(crate) fn parsed_stage(atom: &str) -> Stage {
 }
 
 /// The seed relation a LogQL chain folds from: the resolved selector over
-/// the stream index, with the stored line in the column set.
+/// the stream index, with the stored line, the sort key and one
+/// structured-metadata key ([`LEVEL`]) in the column set.
 pub fn seed_relation() -> Relation<Lql> {
     Relation {
         source: crate::compile::fold::SourceTerm::Base(LqlSource(LOG_STREAMS_IDX)),
@@ -837,6 +860,10 @@ pub fn seed_relation() -> Relation<Lql> {
             Col {
                 name: Name::from(TIMESTAMP_NS),
                 provenance: Provenance::Stored,
+            },
+            Col {
+                name: Name::from(LEVEL),
+                provenance: Provenance::Computed(SqlExpr::new(LEVEL_EXPR)),
             },
         ]),
         grouping: None,
