@@ -2815,6 +2815,11 @@ mod tests {
             ("exec.rs", include_str!("exec.rs")),
             ("error.rs", include_str!("error.rs")),
             ("plan.rs", include_str!("plan.rs")),
+            // Issue #492: the LogQL fit of the shared compile core.
+            // Compiled and unwired — it reads no rows and charges no
+            // counter — but the census is over the DIRECTORY, so leaving
+            // it out would make the search cover less than the module.
+            ("compile.rs", include_str!("compile.rs")),
             // Issue #272: `MetricNode`'s drop oracle. A `plan_`-prefixed
             // sibling rather than `plan/drop_order.rs`, because a `plan/`
             // directory is swallowed by a common global gitignore rule

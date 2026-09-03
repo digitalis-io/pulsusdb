@@ -80,7 +80,9 @@
 
 use serde_json::{Value, json};
 
-use pulsus_read::{GroupValue, SearchOutput, SpanSetGroup, SpanSummary, TraceSearchResult};
+use pulsus_read::{
+    GroupValue, PlanExplain, SearchOutput, SpanSetGroup, SpanSummary, TraceSearchResult,
+};
 
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -533,6 +535,38 @@ pub(crate) fn render(output: &SearchOutput) -> Value {
         "traces": traces,
         "metrics": Value::Object(search_metrics),
     })
+}
+
+/// The `X-Pulsus-Explain: 1` trace for the search route (issue #492),
+/// rendered with the same three documented keys the logs and metrics
+/// routes use — `result_type`, `routing`, `stages` — plus the additive
+/// `plan` key when the compiled plan's shape is present.
+///
+/// `routing` is always `null` here: a search never routes between
+/// tables. `plan` is always absent today, because no read path calls the
+/// compile core yet.
+pub(crate) fn explain_value(e: &PlanExplain) -> Value {
+    let stages = e
+        .stages
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "sql": s.sql,
+                "note": s.note,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut out = serde_json::Map::new();
+    out.insert("result_type".to_string(), Value::from(e.result_type));
+    out.insert("routing".to_string(), Value::Null);
+    out.insert("stages".to_string(), Value::Array(stages));
+    if let Some(plan) = &e.plan
+        && let Ok(v) = serde_json::to_value(plan)
+    {
+        out.insert("plan".to_string(), v);
+    }
+    Value::Object(out)
 }
 
 #[cfg(test)]

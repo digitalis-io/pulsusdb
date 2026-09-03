@@ -41,49 +41,51 @@ Probe	-	-	-	-	<_> x <a>	accept	accept	200	-	unnamed_then_named
 Probe	-	-	-	-	<a> x <_>	accept	accept	200	-	named_then_unnamed
 Probe	-	-	-	-	<__> x <_>	accept	accept	200	-	double_underscore_then_unnamed
 Site	Literal	.github/workflows/ci.yml:1079	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
-Site	Literal	crates/pulsus-logql/src/ast.rs:249	-	-	<p>	accept	accept	-	-	
-Site	Literal	crates/pulsus-logql/tests/case_folding.rs:277	-	-	<a>	accept	accept	-	-	
-Site	Literal	crates/pulsus-logql/tests/case_folding.rs:278	-	-	<a>	accept	accept	-	-	
-Site	Literal	crates/pulsus-logql/tests/snapshots.rs:946	-	-	<method> <path> <_> <status>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/src/logql/charge.rs:548	-	-	, 	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:4710	-	-	<x> y	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:198	-	-	<method> <path> <status> <took>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1013	-	-	<method> <_> <status> took <took>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1032	-	-	level=<level> msg	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:253	-	-	<_> <method> <path> <status>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:264	-	-	<level> <subsys> <event>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:446	-	-	<a><b>	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b21_key_collisions.test:190	-	-	<a>	accept	accept	-	-	
+Site	Literal	crates/pulsus-logql/src/ast.rs:249	-	-	<p>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-logql/tests/case_folding.rs:277	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-logql/tests/case_folding.rs:278	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-logql/tests/snapshots.rs:946	-	-	<method> <path> <_> <status>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/charge.rs:548	-	-	, 	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/compile.rs:1003	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:4710	-	-	<x> y	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:5963	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:198	-	-	<method> <path> <status> <took>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1013	-	-	<method> <_> <status> took <took>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1032	-	-	level=<level> msg	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:253	-	-	<_> <method> <path> <status>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:264	-	-	<level> <subsys> <event>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b1_parsers_filters.test:446	-	-	<a><b>	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b21_key_collisions.test:190	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:1	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:100	-	-	<_><_>	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:103	-	-	<_> <_>	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:106	-	-	no captures	reject	reject	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:100	-	-	<_><_>	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:103	-	-	<_> <_>	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:106	-	-	no captures	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:114	-	-	<1a> x	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail row and the ledger's table -- the identifier-charset half, where `5d91ef1` invented the label `_1a`. Added by this change to pin the move
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:117	-	-	<1> x	accept	reject	-	-	the same charset rule with a digit-only name
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:120	-	-	<a-b> x	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:123	-	-	<a b> x	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:126	-	-	<> x	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:130	-	-	<é> x	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:137	-	-		reject	reject	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:120	-	-	<a-b> x	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:123	-	-	<a b> x	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:126	-	-	<> x	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:130	-	-	<é> x	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:137	-	-		reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:144	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:147	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:162	-	-	<a> <1b>	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:162	-	-	<a> <1b>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:42	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:55	-	-	<a> <b> <c>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:60	-	-	<a> <_> <c>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:63	-	-	<_> <b> <_>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:68	-	-	<A> two <a>	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:55	-	-	<a> <b> <c>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:60	-	-	<a> <_> <c>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:63	-	-	<_> <b> <_>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:68	-	-	<A> two <a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:75	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:78	-	-	<a> x <a>	accept	reject	-	-	the same, with the two captures further apart
 Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:83	-	-	<__> x <__>	accept	reject	-	-	the same: `<__>` is a NAMED capture, since isUnnamed tests length 1
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:88	-	-	<a><b>	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:92	-	-	<a><a>	reject	reject	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b2_formatters.test:198	-	-	<method> <path> <status>	accept	accept	-	-	
-Site	Literal	crates/pulsus-read/tests/logqltest/corpus/differential_parsers_filters.test:65	-	-	<method> <path> <status> <took>	accept	accept	-	-	
-Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:201	-	-	PT <app> <trace_id> end	accept	accept	-	-	
-Site	Literal	crates/pulsus-server/tests/fixtures/categorize_labels/capture.json:145	-	-	PT <app> <trace_id> end	accept	accept	-	-	
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:88	-	-	<a><b>	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b25_pattern_expr_reject.test:92	-	-	<a><a>	reject	reject	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/b2_formatters.test:198	-	-	<method> <path> <status>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/tests/logqltest/corpus/differential_parsers_filters.test:65	-	-	<method> <path> <status> <took>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-server/tests/categorize_labels_differential.rs:201	-	-	PT <app> <trace_id> end	accept	accept	-	-	-
+Site	Literal	crates/pulsus-server/tests/fixtures/categorize_labels/capture.json:145	-	-	PT <app> <trace_id> end	accept	accept	-	-	-
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4172	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4173	-	-	<1a> x	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail row and the ledger's table -- the identifier-charset half, where `5d91ef1` invented the label `_1a`. Added by this change to pin the move
-Site	Literal	docs/benchmarks/logs-differential-ledger.md:4174	-	-		reject	reject	-	-	
+Site	Literal	docs/benchmarks/logs-differential-ledger.md:4174	-	-		reject	reject	-	-	-
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:4190	-	-	<a> <a>	accept	reject	-	-	b25_pattern_expr_reject.test's eval_fail rows and the ledger's window-independence table -- THE ISSUE. Added by this change to pin the move, not moved by it
 Site	Literal	docs/features.md:72	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT

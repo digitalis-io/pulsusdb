@@ -444,6 +444,60 @@ const CASES: &[Case] = &[
         q: r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s }"#,
         distributed: true,
     },
+    // --- Issue #492 §7.1: the six queries this issue names, so that
+    // --- "wave 1 moves no SQL" is a claim about text a reviewer can
+    // --- diff rather than a sentence to take on trust. Two of the six
+    // --- PAIRS are the issue's strongest evidence and are asserted
+    // --- directly below: an aggregate that contributes no SQL, and a
+    // --- pipeline order the SQL cannot see.
+    Case {
+        // The plain attribute filter, and the left-hand side of the
+        // aggregate pair.
+        name: "issue492_attr_eq",
+        q: r#"{ span.http.method = "GET" }"#,
+        distributed: false,
+    },
+    Case {
+        // The SAME query with a spanset aggregate. Its composite is
+        // byte-identical to the row above past the header: the aggregate
+        // contributes NO SQL, which is this issue's premise stated in
+        // statement text.
+        name: "issue492_attr_eq_with_max_duration",
+        q: r#"{ span.http.method = "GET" } | max(duration) > 1s"#,
+        distributed: false,
+    },
+    Case {
+        // The left-hand side of the ordering pair.
+        name: "issue492_by_then_count",
+        q: r#"{ resource.service.name = "grp" } | by(name) | count() > 2"#,
+        distributed: false,
+    },
+    Case {
+        // The same two stages in the other written order. The reference
+        // answers the two differently — one span set against three, and
+        // count() 3 against 5 — and our composite is byte-identical past
+        // the header, because the written order is invisible to the SQL.
+        name: "issue492_count_then_by",
+        q: r#"{ resource.service.name = "grp" } | count() > 2 | by(name)"#,
+        distributed: false,
+    },
+    Case {
+        // `select()` of a span attribute: a Phase-2 value read beside
+        // the generator, hydration and root parts.
+        name: "issue492_select_span_attr",
+        q: r#"{ resource.service.name = "checkout" } | select(span.http.method)"#,
+        distributed: false,
+    },
+    Case {
+        // A disjunction whose sides resolve against DIFFERENT sources —
+        // `resource.service.name` is a physical column of the span table
+        // and `span.http.method` is a row of the attribute index. One
+        // WHERE cannot hold both, so the shipped planner already emits
+        // two phase-1 generators and merges them in our process.
+        name: "issue492_mixed_source_or",
+        q: r#"{ resource.service.name = "checkout" || span.http.method = "GET" }"#,
+        distributed: false,
+    },
     Case {
         // Issue #476 Wave B: a cross-type `=` on `resource.service.name`
         // — the query a client builds from an UNQUOTED tag value. The
@@ -884,6 +938,95 @@ fn the_cross_type_service_golden_carries_no_service_predicate_or_attr_join() {
     assert!(
         golden.contains("== phase1 generator[0] =="),
         "the time-range generator must still be emitted:\n{golden}"
+    );
+}
+
+/// Issue #492 acceptance criterion 9, and the strongest evidence in this
+/// change: **two golden PAIRS are byte-identical below their two header
+/// lines.**
+///
+/// The files themselves differ, because each carries its own `-- case:`
+/// and `-- q:` lines; the SQL below them does not. The two pairs say two
+/// different things:
+///
+/// - `{ span.http.method = "GET" }` and the same query with
+///   `| max(duration) > 1s` send **exactly the same statements**. A
+///   spanset aggregate contributes NO SQL — every matching span is
+///   transported and most of it discarded — which is this issue's
+///   premise, in statement text rather than in prose.
+/// - `| by(name) | count() > 2` and `| count() > 2 | by(name)` also send
+///   exactly the same statements, while the reference answers them
+///   differently: one span set with `count()` 3 against three span sets
+///   with `count()` 5, and the span-set attributes in the opposite
+///   order. The written order is invisible to the SQL.
+///
+/// The assertion is on the RENDERED composite with the header stripped,
+/// not on the files, so it cannot be satisfied by two goldens that were
+/// regenerated together from a broken planner and happen to agree on
+/// disk.
+#[test]
+fn the_aggregate_and_the_ordering_pairs_send_byte_identical_sql() {
+    fn body(name: &str) -> String {
+        let case = CASES
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("case {name}"));
+        composite(case)
+            .splitn(3, '\n')
+            .nth(2)
+            .unwrap_or_else(|| panic!("{name}: body past the 2 header lines"))
+            .to_string()
+    }
+    for (a, b, why) in [
+        (
+            "issue492_attr_eq",
+            "issue492_attr_eq_with_max_duration",
+            "a spanset aggregate contributes no SQL",
+        ),
+        (
+            "issue492_by_then_count",
+            "issue492_count_then_by",
+            "the pipeline's written order is invisible to the SQL",
+        ),
+    ] {
+        assert_eq!(body(a), body(b), "{a} vs {b}: {why}");
+    }
+    // ...and the identity is not vacuous: a THIRD case with a different
+    // filter renders different SQL, so "equal" here is a property of the
+    // pair and not of the renderer.
+    assert_ne!(
+        body("issue492_attr_eq"),
+        body("issue492_select_span_attr"),
+        "two unrelated queries must not render the same SQL"
+    );
+}
+
+/// Issue #492 §7.1: the disjunction whose sides resolve against DIFFERENT
+/// sources emits one phase-1 generator per source, which is the
+/// disjoint-source cut with its recogniser and its literal SQL, in the
+/// tree today rather than in a design.
+#[test]
+fn a_cross_source_disjunction_emits_one_generator_per_source() {
+    let plan = plan_for(
+        CASES
+            .iter()
+            .find(|c| c.name == "issue492_mixed_source_or")
+            .expect("issue492_mixed_source_or case"),
+    );
+    assert_eq!(
+        plan.generator_sqls.len(),
+        2,
+        "one WHERE cannot hold a physical column and an attribute-index row"
+    );
+    assert!(
+        plan.generator_sqls[0].contains("FROM trace_spans\n"),
+        "{}",
+        plan.generator_sqls[0]
+    );
+    assert!(
+        plan.generator_sqls[1].contains("FROM trace_attrs_idx\n"),
+        "{}",
+        plan.generator_sqls[1]
     );
 }
 

@@ -6,6 +6,7 @@
 //! see `plan.rs`'s module docs).
 
 use super::plan::RoutingDecision;
+use crate::compile::plan::PlanShape;
 
 /// One executed (or about-to-execute) stage's SQL, named for the response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,14 @@ pub struct PlanExplain {
     /// ([`super::plan::MetricPlan`]) — a streams (log-selector) plan never
     /// routes between tables, so it leaves this `None`.
     pub routing: Option<RoutingDecision>,
+    /// The compiled plan's shape (issue #492), rendered as one ADDITIVE
+    /// sibling key `data.explain.plan`.
+    ///
+    /// `None` on every path today, and deliberately: no read path calls
+    /// the compile core yet, so every explain response is byte-identical
+    /// to the one it produced before this field existed. The three
+    /// existing fields do not move.
+    pub plan: Option<PlanShape>,
 }
 
 impl PlanExplain {
@@ -34,6 +43,7 @@ impl PlanExplain {
             result_type,
             stages: Vec::new(),
             routing: None,
+            plan: None,
         }
     }
 
@@ -47,6 +57,13 @@ impl PlanExplain {
 
     pub fn set_routing(&mut self, decision: RoutingDecision) {
         self.routing = Some(decision);
+    }
+
+    /// Records the compiled plan's shape. Nothing calls this on a served
+    /// path yet — the compile core is unwired — so the key it would add
+    /// is absent from every response this tree sends.
+    pub fn set_plan(&mut self, shape: PlanShape) {
+        self.plan = Some(shape);
     }
 }
 
@@ -69,6 +86,19 @@ mod tests {
     fn a_new_explain_has_no_routing_decision_yet() {
         let explain = PlanExplain::new("matrix");
         assert!(explain.routing.is_none());
+    }
+
+    /// Issue #492: the plan key is additive and absent by default, which
+    /// is what keeps every explain response byte-identical.
+    #[test]
+    fn a_new_explain_carries_no_plan_shape() {
+        let mut explain = PlanExplain::new("streams");
+        assert!(explain.plan.is_none());
+        explain.set_plan(crate::compile::plan::PlanShape {
+            parts: Vec::new(),
+            links: Vec::new(),
+        });
+        assert!(explain.plan.is_some());
     }
 
     #[test]

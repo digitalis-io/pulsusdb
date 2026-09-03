@@ -84,8 +84,15 @@ const PINNED_ITEM_MACROS: &[&str] = &["clone_probe::thread_local!"];
 /// The `pulsus_read` types criterion 4 probes. Criterion 4 asserts this
 /// equals the set DERIVED from the renderer's own production names, so it
 /// cannot silently go stale.
+/// `PlanExplain` joined the list on issue #492, when the search route
+/// gained an explain surface and the renderer began hand-rendering that
+/// trace. It matters: `PlanExplain` now carries a field whose OWN type
+/// derives the serialisation trait, so "the renderer's subjects do not
+/// serialise" stops being obvious the moment you look at it — which is
+/// exactly the case this seal is for.
 const PROBED_SUBJECTS: &[&str] = &[
     "GroupValue",
+    "PlanExplain",
     "SearchOutput",
     "SpanSetGroup",
     "SpanSummary",
@@ -769,6 +776,7 @@ fn the_renderer_subject_types_do_not_implement_serde_serialize() {
 
     let answers: Vec<(&str, (bool, bool))> = vec![
         ("GroupValue", probe!(pulsus_read::GroupValue)),
+        ("PlanExplain", probe!(pulsus_read::PlanExplain)),
         ("SearchOutput", probe!(pulsus_read::SearchOutput)),
         ("SpanSetGroup", probe!(pulsus_read::SpanSetGroup)),
         ("SpanSummary", probe!(pulsus_read::SpanSummary)),

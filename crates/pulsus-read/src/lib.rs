@@ -1,6 +1,7 @@
 //! Query HTTP APIs, response encoders, and live tail. See
 //! docs/architecture.md §5.
 
+pub mod compile;
 pub mod eval_gate;
 pub mod logql;
 pub mod metrics;
