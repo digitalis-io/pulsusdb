@@ -251,7 +251,10 @@ pub struct SqlPart<L: Lang + ?Sized> {
 
 /// One part of a plan: a statement, or work in our own process.
 pub enum Part<L: Lang + ?Sized> {
-    Sql(SqlPart<L>),
+    /// Boxed because an [`SqlPart`] carries a whole [`Relation`] and an
+    /// engine part carries two `usize`s; without the indirection every
+    /// engine part in the vector would pay the statement's width.
+    Sql(Box<SqlPart<L>>),
     /// Work in our own process: the residual links, applied in chain
     /// order. `links` indexes [`QueryPlan::links`].
     Engine { links: std::ops::Range<usize> },
@@ -338,7 +341,8 @@ pub fn inexact_limit_fires<L: Lang + ?Sized>(rel: &Relation<L>, cx: &PlanCx<'_>)
 fn chunk_for<L: Lang + ?Sized + 'static>(bound: u64, cx: &PlanCx<'_>) -> u64 {
     let fits = |n: u64| {
         let c = L::handoff_cost(n);
-        c.text_bytes <= cx.config.max_query_text_bytes && c.ast_elements <= cx.config.max_ast_elements
+        c.text_bytes <= cx.config.max_query_text_bytes
+            && c.ast_elements <= cx.config.max_ast_elements
     };
     if fits(bound) {
         return bound;
@@ -414,7 +418,7 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
             for (i, (_, pred)) in bs.iter().enumerate() {
                 let mut branch_rel = rel.clone();
                 branch_rel.predicate = pred.clone();
-                parts.push(Part::Sql(SqlPart {
+                parts.push(Part::Sql(Box::new(SqlPart {
                     yields: boundary_output(&branch_rel),
                     rel: branch_rel,
                     seed: None,
@@ -426,17 +430,17 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                             sources: sources.clone(),
                         })
                     },
-                }));
+                })));
             }
         }
         _ => {
-            parts.push(Part::Sql(SqlPart {
+            parts.push(Part::Sql(Box::new(SqlPart {
                 yields: boundary_output(&rel),
                 rel: rel.clone(),
                 seed: None,
                 issue: Issue::Once,
                 cut: None,
-            }));
+            })));
         }
     }
     let mut last_sql_part = parts.len() - 1;
@@ -486,7 +490,7 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                             }
                             _ => Issue::Once,
                         };
-                        parts.push(Part::Sql(SqlPart {
+                        parts.push(Part::Sql(Box::new(SqlPart {
                             yields: boundary_output(&part_rel),
                             rel: part_rel,
                             seed: Some(Seed {
@@ -496,7 +500,7 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                             }),
                             issue,
                             cut,
-                        }));
+                        })));
                         last_sql_part = parts.len() - 1;
                         links.push(LinkOutcome {
                             part: last_sql_part,
@@ -768,6 +772,7 @@ fn never_wire(n: super::fold::NeverReason) -> &'static str {
         N::WholeQueryTypeFailure => "whole_query_type_failure",
         N::NoRowToComputeFrom => "no_row_to_compute_from",
         N::ResponseBuild => "response_build",
+        N::NotASearchLink => "not_a_search_link",
     }
 }
 
@@ -1115,8 +1120,15 @@ mod tests {
             vec![TestStage::UnboundedHandoff, TestStage::Residual],
         ] {
             let p = plan(&chain, &bounds(Some(20)), &config);
-            assert!(!p.parts.is_empty(), "chain {chain:?}: a plan is never empty");
-            assert_eq!(p.links.len(), chain.len(), "chain {chain:?}: one entry per link");
+            assert!(
+                !p.parts.is_empty(),
+                "chain {chain:?}: a plan is never empty"
+            );
+            assert_eq!(
+                p.links.len(),
+                chain.len(),
+                "chain {chain:?}: one entry per link"
+            );
             for (i, l) in p.links.iter().enumerate() {
                 assert!(
                     l.part < p.parts.len(),
@@ -1207,7 +1219,11 @@ mod tests {
         let config = PlanConfig::default();
         let b = bounds(Some(20));
 
-        let refused = plan(&[TestStage::Pushable, TestStage::UnboundedHandoff], &b, &config);
+        let refused = plan(
+            &[TestStage::Pushable, TestStage::UnboundedHandoff],
+            &b,
+            &config,
+        );
         let sql_parts = refused
             .parts
             .iter()
@@ -1228,7 +1244,11 @@ mod tests {
 
         // The control: the SAME chain with a bounded seed DOES cut, so
         // the assertion above is about the bound and not about the shape.
-        let taken = plan(&[TestStage::Pushable, TestStage::BoundedHandoff], &b, &config);
+        let taken = plan(
+            &[TestStage::Pushable, TestStage::BoundedHandoff],
+            &b,
+            &config,
+        );
         assert_eq!(
             taken
                 .parts
@@ -1264,15 +1284,16 @@ mod tests {
     fn a_residual_link_between_two_lowered_ones_does_not_open_a_part() {
         let config = PlanConfig::default();
         let p = plan(
-            &[TestStage::Pushable, TestStage::Residual, TestStage::Pushable],
+            &[
+                TestStage::Pushable,
+                TestStage::Residual,
+                TestStage::Pushable,
+            ],
             &bounds(None),
             &config,
         );
         assert_eq!(
-            p.parts
-                .iter()
-                .filter(|p| matches!(p, Part::Sql(_)))
-                .count(),
+            p.parts.iter().filter(|p| matches!(p, Part::Sql(_))).count(),
             1,
             "one statement: {:?}",
             p.parts

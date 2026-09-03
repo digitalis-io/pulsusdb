@@ -37,6 +37,8 @@
 
 pub mod fold;
 pub mod plan;
+#[cfg(test)]
+pub mod testkit;
 
 pub use fold::{
     BlockReason, BoundaryOutput, Capability, Col, ColSet, Disposition, Fidelity, Grouping, Lang,

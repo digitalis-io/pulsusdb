@@ -80,6 +80,7 @@ pub(crate) mod agg;
 pub(crate) mod charge;
 pub(crate) mod client_agg;
 mod cms;
+pub mod compile;
 pub mod detected;
 pub(crate) mod detected_probe;
 pub mod error;

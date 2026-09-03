@@ -267,19 +267,8 @@ impl PartialEq for ColSet {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ColSet::Closed(a), ColSet::Closed(b)) => a == b,
-            (
-                ColSet::Open {
-                    known: a,
-                    from: fa,
-                },
-                ColSet::Open {
-                    known: b,
-                    from: fb,
-                },
-            ) => {
-                a == b
-                    && fa.len() == fb.len()
-                    && fa.iter().zip(fb).all(|(x, y)| x.id() == y.id())
+            (ColSet::Open { known: a, from: fa }, ColSet::Open { known: b, from: fb }) => {
+                a == b && fa.len() == fb.len() && fa.iter().zip(fb).all(|(x, y)| x.id() == y.id())
             }
             _ => false,
         }
@@ -306,7 +295,10 @@ impl Eq for ColSet {}
 pub enum Pred {
     /// `1` — the seed, and what an unlowerable conjunct becomes.
     True,
-    Leaf { sql: SqlExpr, source: SourceRef },
+    Leaf {
+        sql: SqlExpr,
+        source: SourceRef,
+    },
     And(Box<Pred>, Box<Pred>),
     Or(Box<Pred>, Box<Pred>),
     Not(Box<Pred>),
@@ -387,7 +379,8 @@ impl Pred {
                 if distinct > 1 {
                     Some(keyed)
                 } else {
-                    a.disjoint_or_branches().or_else(|| b.disjoint_or_branches())
+                    a.disjoint_or_branches()
+                        .or_else(|| b.disjoint_or_branches())
                 }
             }
             Pred::And(a, b) => a
@@ -572,6 +565,9 @@ pub enum NeverReason {
     NoRowToComputeFrom,
     /// The response builder.
     ResponseBuild,
+    /// Not a chain link on this route at all — the shipped planner
+    /// refuses the stage before any chain is built.
+    NotASearchLink,
 }
 
 /// A link's answer, given what has accumulated.
@@ -882,7 +878,9 @@ impl<L: Lang + ?Sized> Clone for Grouping<L> {
 
 impl<L: Lang + ?Sized> fmt::Debug for Grouping<L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Grouping").field("keys", &self.keys).finish()
+        f.debug_struct("Grouping")
+            .field("keys", &self.keys)
+            .finish()
     }
 }
 
@@ -904,7 +902,9 @@ impl<L: Lang + ?Sized> Clone for Ordering<L> {
 
 impl<L: Lang + ?Sized> fmt::Debug for Ordering<L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Ordering").field("keys", &self.keys).finish()
+        f.debug_struct("Ordering")
+            .field("keys", &self.keys)
+            .finish()
     }
 }
 

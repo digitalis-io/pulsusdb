@@ -28,6 +28,7 @@
 // cannot obtain the `ChClient` any other way, so this must not be `pub`.
 mod dispatch;
 
+pub mod compile;
 pub mod exec;
 pub mod filter;
 pub mod graph_sql;
