@@ -102,6 +102,7 @@ const CAP_PROBE_PORT: u16 = 31_221;
 /// ceiling is process configuration and cannot be varied per request.
 const CEILING_HIGH_PORT: u16 = 31_225;
 const CEILING_ONE_PORT: u16 = 31_226;
+const CEILING_TWO_PORT: u16 = 31_227;
 
 /// Retention for the issue #474 spawn only. The fixture's timestamps are
 /// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
@@ -2432,16 +2433,23 @@ async fn the_range_route_rejects_a_group_the_instant_route_serves() {
 ///                        — only this one sets the incomplete signal
 /// ```
 ///
-/// So the three requests below differ in ONE input at a time, over one
+/// So the four requests below differ in ONE input at a time, over one
 /// three-trace store:
 ///
 /// ```text
 ///   ceiling=1     limit=10  ->  1 trace,  {"totalJobs":1}
+///   ceiling=2     limit=10  ->  2 traces, {"totalJobs":1}
 ///   ceiling=1000  limit=10  ->  3 traces, {"completedJobs":1,"totalJobs":1}
 ///   ceiling=1000  limit=1   ->  1 trace,  {"completedJobs":1,"totalJobs":1}
 /// ```
 ///
-/// **The third request stays in the set on purpose.** It is the shape that
+/// **The ceiling=2 row is what makes the count TRACK the ceiling.** With
+/// only 1 and 1000 in the set, an engine that returned one trace whenever
+/// the ceiling was "small" and everything otherwise would satisfy every
+/// other row. Three ceilings, three different trace counts — 1, 2, 3 — is
+/// the difference between reacting to a small ceiling and following it.
+///
+/// **The last request stays in the set on purpose.** It is the shape that
 /// made the previous criterion unable to fail: one trace of three comes
 /// back and the answer is still complete. Dropping it once understood
 /// would make the same mistake reachable again.
@@ -2496,12 +2504,20 @@ async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request
         &db,
         &[("PULSUS_TRACEQL_MAX_CANDIDATES", "1")],
     );
+    let two = spawn_ready_with_env(
+        CEILING_TWO_PORT,
+        &db,
+        &[("PULSUS_TRACEQL_MAX_CANDIDATES", "2")],
+    );
 
     let complete = serde_json::json!({"completedJobs": 1, "totalJobs": 1});
     let truncated = serde_json::json!({"totalJobs": 1});
 
     for (name, port, limit, want_traces, want_metrics) in [
         ("ceiling=1 limit=10", CEILING_ONE_PORT, 10, 1, &truncated),
+        // The row that makes the trace count TRACK the ceiling rather
+        // than merely react to it being small.
+        ("ceiling=2 limit=10", CEILING_TWO_PORT, 10, 2, &truncated),
         ("ceiling=1000 limit=10", CEILING_HIGH_PORT, 10, 3, &complete),
         // The blind case of the criterion this one replaces.
         ("ceiling=1000 limit=1", CEILING_HIGH_PORT, 1, 1, &complete),
@@ -2536,6 +2552,7 @@ async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request
         );
     }
 
+    drop(two);
     drop(one);
     drop(high);
     drop_db(&db).await;
