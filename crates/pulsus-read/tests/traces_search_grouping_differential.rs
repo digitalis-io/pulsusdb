@@ -806,15 +806,36 @@ impl SetShape {
     /// not a specification on the reference side: measured, one
     /// `coalesce()`d span set came back `03,01,02` on one read and
     /// `01,02,03` on another over the same corpus. Ours is deterministic
-    /// (ascending `(start_ns, span_id)`); asserting the reference's would
-    /// be asserting an artefact, and it reddened a break test for a
-    /// reason unrelated to the break.
+    /// (ascending `(timestamp_ns, span_id)`, `search_eval.rs`); asserting
+    /// the reference's would be asserting an artefact, and it reddened a
+    /// break test for a reason unrelated to the break.
+    ///
+    /// **The sort is a HARNESS NORMALISATION, not a behaviour of ours,
+    /// and it is applied to both sides.** No production path sorts a span
+    /// set's members into this order — ours are already in
+    /// `(timestamp_ns, span_id)` order when the fold hands them over —
+    /// so there is nothing here for a test to cover and no assertion to
+    /// add. A hermetic check that `SetShape::new` given `02,01` renders
+    /// `01,02` would restate this line, not test anything.
+    ///
+    /// **Deleting it does not make a test fail; it makes one FLAKY.** The
+    /// order it absorbs varies between reads of the same corpus, so a
+    /// single run with the sort removed comes back green most of the
+    /// time, and that green says nothing. What established that the sort
+    /// is load-bearing is repetition: after it was added, three
+    /// consecutive full runs of this suite reported 34 fixtures agreeing
+    /// and 8 pinned divergences, each time. Before it, a run reddened
+    /// `coalesce_then_count` on the member order alone while the code
+    /// under test had not moved.
     fn new(attrs: Option<Vec<String>>, matched: u64, members: Vec<String>) -> Self {
         let attrs = match attrs {
             None => "-".to_string(),
             Some(list) => list.join(","),
         };
         let mut members = members;
+        // The normalisation described above: both sides, every span set.
+        // Removing this produces flakiness, not a failure — see the doc
+        // comment before repeating that break.
         members.sort();
         SetShape(format!("{attrs} | m{matched} | {}", members.join(",")))
     }
