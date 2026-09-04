@@ -948,6 +948,12 @@ mod tests {
     /// the expected names are the decoder's own `COLUMN_NAMES` rather
     /// than a second list.
     ///
+    /// It is also the check that EVERY real projection parses under
+    /// [`projection_names`]'s accepted grammar: that reader refuses what
+    /// it cannot read, so a builder emitting a construct outside the
+    /// grammar reddens here rather than being read as something
+    /// plausible.
+    ///
     /// *RED when:* a shared SQL builder's projection changes and this
     /// consumer is not moved with it. Measured, three ways:
     ///
@@ -992,228 +998,309 @@ mod tests {
         );
     }
 
-    /// The outermost `SELECT` list's output names, in order.
+    /// The outermost `SELECT` list's output names, in order — read by
+    /// ACCEPTING a narrow grammar and refusing everything else.
     ///
-    /// **Why this parses SQL at all.** The five builders render their
-    /// projections as inline `format!` strings — there is no alias list
-    /// inside them to expose, and giving them one means changing five
-    /// production read-path SQL builders and re-freezing the golden
-    /// corpus, which this change is not authorised to do. So the names
-    /// are recovered from the rendered statement, and the recovery is
-    /// written to FAIL LOUDLY on anything it does not model rather than
-    /// to return a plausible answer.
-    ///
-    /// It is literal-aware, because a naive depth counter is fooled by a
-    /// parenthesis inside a string:
+    /// **The grammar is the definition, not a description of what happens
+    /// to pass:**
     ///
     /// ```text
-    /// SELECT '(' AS extra, ')' AS x, y FROM t
+    /// projection := item ("," item)*
+    /// item       := expr ["AS" ident]
+    /// expr       := term (cmp term)*
+    /// term       := call | ident | integer
+    /// call       := ident "(" [expr ("," expr)*] ")"
+    /// ident      := [A-Za-z_][A-Za-z0-9_]*
+    /// integer    := [0-9]+
+    /// cmp        := "<=" | ">=" | "!=" | "<" | ">" | "="
     /// ```
     ///
-    /// is a valid THREE-column projection — the server returns three —
-    /// that a paren-counting split reads as two. Single-quoted literals
-    /// (with `''` escapes) and double-quoted / back-quoted identifiers
-    /// are skipped whole, so their contents can contain parentheses,
-    /// commas and the word `AS` without effect.
+    /// An item that is a bare `ident` is named by that identifier; any
+    /// other item MUST carry an `AS ident`, because guessing the name the
+    /// server would give an unaliased expression is the mis-read this
+    /// check exists to prevent. (Measured: `SELECT max(number), 1 AS z`
+    /// is named `max(number)`, `z` by the server.)
     ///
-    /// It REFUSES, rather than guessing, on: an unterminated literal,
-    /// unbalanced parentheses, a comment (`--` or `/* */`, which no
-    /// builder here emits and which cannot be skipped without modelling
-    /// more syntax), and a missing top-level `FROM`.
+    /// **Why an accept-list and not a longer list of refusals.** Three
+    /// review rounds found three fresh holes in a reader that tried to
+    /// handle every projection and refuse the bad shapes it knew about:
+    /// parentheses inside string literals, then square-bracket array
+    /// literals, backslash-escaped quotes, and quoted aliases. Each was a
+    /// PLAUSIBLE WRONG ANSWER, and a plausible wrong answer is
+    /// indistinguishable from a pass. The set of shapes a reader must
+    /// handle is unbounded; the set these five builders emit is not. So
+    /// the alphabet is closed — identifiers, integers, `(`, `)`, `,` and
+    /// the comparison operators, nothing else — and every other character
+    /// is refused BY NAME. Square brackets, backslashes, quotes and
+    /// backticks need no special handling: they are simply not in the
+    /// alphabet, and neither is the next construct nobody has thought of.
+    ///
+    /// A projection that grows a new construct fails loudly and somebody
+    /// looks. That is the point.
     fn projection_names(sql: &str) -> Vec<String> {
         let head = sql
             .strip_prefix("SELECT DISTINCT ")
             .or_else(|| sql.strip_prefix("SELECT "))
             .unwrap_or_else(|| panic!("a stage's SQL must start with SELECT:\n{sql}"));
-        let bytes: Vec<char> = head.chars().collect();
+        let tokens = tokenize_projection(head, sql);
+        parse_projection(&tokens, sql)
+    }
+
+    /// One token of the closed alphabet.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Tok {
+        Ident(String),
+        Int,
+        Open,
+        Close,
+        Comma,
+        Cmp,
+    }
+
+    /// Lexes the projection up to the first `FROM` at paren depth 0.
+    ///
+    /// Refuses, naming what it saw, on any character outside the closed
+    /// alphabet, on an unbalanced `)`, and on running out of input without
+    /// a top-level `FROM`.
+    fn tokenize_projection(head: &str, sql: &str) -> Vec<Tok> {
+        let chars: Vec<char> = head.chars().collect();
+        let mut out: Vec<Tok> = Vec::new();
         let mut depth = 0i32;
-        let mut items: Vec<String> = Vec::new();
-        let mut current = String::new();
         let mut i = 0usize;
-        while i < bytes.len() {
-            let c = bytes[i];
-            // A quoted run is opaque: copied through whole, never
-            // inspected for depth, commas, `AS` or `FROM`.
-            if c == '\'' || c == '"' || c == '`' {
-                let quote = c;
-                current.push(c);
+        while i < chars.len() {
+            let c = chars[i];
+            if c.is_whitespace() {
                 i += 1;
-                loop {
-                    assert!(
-                        i < bytes.len(),
-                        "unterminated {quote:?} literal in the projection of:\n{sql}"
-                    );
-                    let d = bytes[i];
-                    current.push(d);
-                    i += 1;
-                    if d == quote {
-                        // A doubled quote is an escape, not the end.
-                        if i < bytes.len() && bytes[i] == quote {
-                            current.push(quote);
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                }
                 continue;
             }
-            assert!(
-                !(c == '-' && bytes.get(i + 1) == Some(&'-')),
-                "a `--` comment in the projection is not modelled; write the projection \
-                 without it or extend this check:\n{sql}"
-            );
-            assert!(
-                !(c == '/' && bytes.get(i + 1) == Some(&'*')),
-                "a `/* */` comment in the projection is not modelled; write the projection \
-                 without it or extend this check:\n{sql}"
-            );
+            if c.is_ascii_alphabetic() || c == '_' {
+                let from = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[from..i].iter().collect();
+                if word == "FROM" && depth == 0 {
+                    return out;
+                }
+                out.push(Tok::Ident(word));
+                continue;
+            }
+            if c.is_ascii_digit() {
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push(Tok::Int);
+                continue;
+            }
             match c {
-                '(' => depth += 1,
+                '(' => {
+                    depth += 1;
+                    out.push(Tok::Open);
+                    i += 1;
+                }
                 ')' => {
                     depth -= 1;
                     assert!(depth >= 0, "unbalanced `)` in the projection of:\n{sql}");
-                }
-                ',' if depth == 0 => {
-                    items.push(std::mem::take(&mut current));
+                    out.push(Tok::Close);
                     i += 1;
-                    continue;
                 }
-                _ => {}
+                ',' => {
+                    out.push(Tok::Comma);
+                    i += 1;
+                }
+                '<' | '>' | '!' | '=' => {
+                    if chars.get(i + 1) == Some(&'=') {
+                        i += 2;
+                    } else {
+                        assert!(
+                            c != '!',
+                            "unexpected character {c:?} in the projection of:\n{sql}"
+                        );
+                        i += 1;
+                    }
+                    out.push(Tok::Cmp);
+                }
+                other => panic!(
+                    "unexpected character {other:?} in the projection of:\n{sql}\n\
+                     The accepted alphabet is identifiers, integers, `(`, `)`, `,` and the \
+                     comparison operators. A projection outside that shape is REFUSED rather \
+                     than read, because a plausible wrong answer here is indistinguishable \
+                     from a pass — extend the grammar deliberately if a builder needs it."
+                ),
             }
-            // The top-level `FROM` ends the projection. A subquery's own
-            // `FROM` sits at depth > 0 and does not.
-            if depth == 0 && starts_keyword(&bytes, i, "FROM") {
-                assert!(
-                    !current.trim().is_empty(),
-                    "empty trailing projection item before FROM in:\n{sql}"
-                );
-                items.push(std::mem::take(&mut current));
-                return items.iter().map(|item| output_name(item, sql)).collect();
-            }
-            current.push(c);
-            i += 1;
         }
         panic!("no top-level FROM in the projection of:\n{sql}")
     }
 
-    /// `word` occurs at `i` bounded by whitespace on both sides — so
-    /// `FROM` matches and `FROMAGE` or `x_FROM` do not.
-    fn starts_keyword(chars: &[char], i: usize, word: &str) -> bool {
-        let w: Vec<char> = word.chars().collect();
-        if i == 0 || !chars[i - 1].is_whitespace() {
-            return false;
-        }
-        if i + w.len() > chars.len() || chars[i..i + w.len()] != w[..] {
-            return false;
-        }
-        match chars.get(i + w.len()) {
-            Some(c) => c.is_whitespace(),
-            None => true,
-        }
-    }
-
-    /// One projection item's output name: the text after its LAST
-    /// depth-0, outside-a-literal ` AS `, or the item itself when it is a
-    /// bare column. An ` AS ` inside a literal or a function call does
-    /// not count.
-    fn output_name(item: &str, sql: &str) -> String {
-        let chars: Vec<char> = item.chars().collect();
-        let mut depth = 0i32;
-        let mut last_as: Option<usize> = None;
-        let mut i = 0usize;
-        while i < chars.len() {
-            let c = chars[i];
-            if c == '\'' || c == '"' || c == '`' {
-                let quote = c;
-                i += 1;
-                loop {
-                    assert!(
-                        i < chars.len(),
-                        "unterminated literal in {item:?} of:\n{sql}"
-                    );
-                    let d = chars[i];
-                    i += 1;
-                    if d == quote {
-                        if i < chars.len() && chars[i] == quote {
-                            i += 1;
-                            continue;
-                        }
-                        break;
-                    }
+    /// `projection := item ("," item)*`, consumed to the end.
+    fn parse_projection(tokens: &[Tok], sql: &str) -> Vec<String> {
+        let mut at = 0usize;
+        let mut names = Vec::new();
+        loop {
+            names.push(parse_item(tokens, &mut at, sql));
+            match tokens.get(at) {
+                Some(Tok::Comma) => at += 1,
+                None => break,
+                Some(other) => {
+                    panic!("expected `,` or the end of the projection, found {other:?}, in:\n{sql}")
                 }
-                continue;
             }
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 && starts_keyword(&chars, i, "AS") {
-                last_as = Some(i + 2);
-            }
-            i += 1;
         }
-        match last_as {
-            Some(at) => chars[at..].iter().collect::<String>().trim().to_string(),
-            None => item.trim().to_string(),
+        names
+    }
+
+    /// `item := expr ["AS" ident]`. A bare identifier names itself;
+    /// anything else must be aliased.
+    fn parse_item(tokens: &[Tok], at: &mut usize, sql: &str) -> String {
+        let from = *at;
+        parse_expr(tokens, at, sql);
+        let bare = *at == from + 1 && matches!(tokens[from], Tok::Ident(_));
+        if tokens.get(*at) == Some(&Tok::Ident("AS".to_string())) {
+            *at += 1;
+            let Some(Tok::Ident(alias)) = tokens.get(*at) else {
+                panic!(
+                    "`AS` must be followed by a plain identifier, found {:?}, in:\n{sql}",
+                    tokens.get(*at)
+                );
+            };
+            assert!(alias != "AS", "`AS AS` in the projection of:\n{sql}");
+            *at += 1;
+            return alias.clone();
+        }
+        assert!(
+            bare,
+            "an unaliased projection item that is not a bare column is REFUSED: the server \
+             names it from its own rendering of the expression, which this check will not \
+             guess. Add `AS <name>`, in:\n{sql}"
+        );
+        let Tok::Ident(name) = &tokens[from] else {
+            unreachable!("bare implies Ident")
+        };
+        name.clone()
+    }
+
+    /// `expr := term (cmp term)*`
+    fn parse_expr(tokens: &[Tok], at: &mut usize, sql: &str) {
+        parse_term(tokens, at, sql);
+        while tokens.get(*at) == Some(&Tok::Cmp) {
+            *at += 1;
+            parse_term(tokens, at, sql);
         }
     }
 
-    /// The projection reader refuses the shapes it does not model and
-    /// reads the ones it does — including the case that defeated the
-    /// first cut.
+    /// `term := call | ident | integer`
+    fn parse_term(tokens: &[Tok], at: &mut usize, sql: &str) {
+        match tokens.get(*at) {
+            Some(Tok::Int) => *at += 1,
+            Some(Tok::Ident(word)) => {
+                assert!(
+                    word != "AS",
+                    "`AS` where an expression was expected, in:\n{sql}"
+                );
+                *at += 1;
+                if tokens.get(*at) == Some(&Tok::Open) {
+                    *at += 1;
+                    if tokens.get(*at) != Some(&Tok::Close) {
+                        loop {
+                            parse_expr(tokens, at, sql);
+                            match tokens.get(*at) {
+                                Some(Tok::Comma) => *at += 1,
+                                _ => break,
+                            }
+                        }
+                    }
+                    assert!(
+                        tokens.get(*at) == Some(&Tok::Close),
+                        "unclosed call in the projection of:\n{sql}"
+                    );
+                    *at += 1;
+                }
+            }
+            other => panic!("expected an expression, found {other:?}, in:\n{sql}"),
+        }
+    }
+
+    /// The accepted grammar reads what the five builders emit, and
+    /// REFUSES every construct outside it — including three shapes that
+    /// three separate review rounds found the previous, handle-everything
+    /// reader mis-reading.
     ///
-    /// *RED when:* the reader goes back to counting parentheses without
-    /// looking at quotes; the first case then returns two names for a
-    /// three-column projection, which is the hole
-    /// `the_evidence_stages_project_exactly_what_they_decode` exists to
-    /// close.
+    /// Every "server" column below is ground truth from ClickHouse 26.3
+    /// (`FORMAT TSVWithNames`, header row), not read from source.
+    ///
+    /// *RED when:* the alphabet is widened without the grammar being
+    /// widened with it — measured, accepting `[` as an ordinary character
+    /// makes `SELECT [1, 2] AS arr, 3 AS z` read as `["[1", "arr", "z"]`
+    /// where the server answers `arr, z`.
     #[test]
-    fn the_projection_reader_is_literal_aware_and_refuses_what_it_cannot_read() {
-        let cases: [(&str, &[&str]); 8] = [
-            // The attack: parentheses inside string literals. The server
-            // returns THREE columns for this.
-            (
-                "SELECT '(' AS extra, ')' AS x, y FROM t",
-                &["extra", "x", "y"],
-            ),
-            // A doubled quote is an escape; the comma, the paren and the
-            // word AS inside the literal are all inert.
-            ("SELECT 'it''s, a (test) AS z' AS a, b FROM t", &["a", "b"]),
-            // Nested calls carrying their own commas.
-            ("SELECT f(a, g(b, c)) AS a, b FROM t", &["a", "b"]),
-            // A cast whose second operand is a quoted type name.
-            ("SELECT CAST(a, 'UInt64') AS n, b FROM t", &["n", "b"]),
-            // A subquery in the select list: its own FROM is at depth 1
-            // and must not end the projection.
-            ("SELECT (SELECT max(x) FROM u) AS m, b FROM t", &["m", "b"]),
-            // A back-quoted identifier containing a comma.
-            ("SELECT `a,b` AS c, d FROM t", &["c", "d"]),
-            // Bare columns, no aliases at all.
+    fn the_projection_reader_accepts_one_narrow_grammar_and_refuses_the_rest() {
+        // Accepted: exactly the constructs the five builders emit.
+        let accepted: [(&str, &[&str]); 6] = [
+            // bare columns
             ("SELECT a, b FROM t", &["a", "b"]),
-            // The word FROM inside a literal does not end the projection.
-            ("SELECT 'FROM' AS a, b FROM t", &["a", "b"]),
+            // an aggregate with an alias — the generator stage's shape
+            (
+                "SELECT trace_id, max(timestamp_ns) AS bound_ts FROM t",
+                &["trace_id", "bound_ts"],
+            ),
+            // nested calls carrying their own commas, and a comparison
+            // inside an argument — the byte-cap expression's shape
+            (
+                "SELECT trace_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v, \
+                 val_type AS t FROM x",
+                &["trace_id", "v", "t"],
+            ),
+            // server ground truth: plus(1, multiply(2, 3)) AS a, 4 AS b -> a, b
+            (
+                "SELECT plus(1, multiply(2, 3)) AS a, 4 AS b FROM t",
+                &["a", "b"],
+            ),
+            // a call with no arguments
+            ("SELECT now() AS n, b FROM t", &["n", "b"]),
+            // SELECT DISTINCT
+            ("SELECT DISTINCT a, b FROM t", &["a", "b"]),
         ];
-        for (sql, want) in cases {
+        for (sql, want) in accepted {
             assert_eq!(projection_names(sql), want, "reading {sql:?}");
         }
 
-        // …and the shapes it refuses, each with the reason in the message.
-        for (sql, needle) in [
-            ("SELECT 'a AS x FROM t", "unterminated"),
-            ("SELECT f(a AS x FROM t", "no top-level FROM"),
-            ("SELECT a) AS x FROM t", "unbalanced"),
+        // Refused, each with the reason named. The first three are the
+        // round-4 findings; the next is round 3's; the rest are shapes
+        // this reader will not model.
+        let refused: [(&str, &str, &str); 11] = [
+            // (sql, what the SERVER answers, the refusal's needle)
+            ("SELECT [1, 2] AS arr, 3 AS z FROM t", "arr, z", "'['"),
             (
-                "SELECT a -- , b
- AS x FROM t",
-                "comment",
+                "SELECT 'fake \\' actual' AS actual, 2 AS z FROM t",
+                "actual, z",
+                "'\\''",
             ),
-            ("SELECT a /* , b */ AS x FROM t", "comment"),
-            ("SELECT a, b", "no top-level FROM"),
-        ] {
-            let err = std::panic::catch_unwind(|| projection_names(sql))
-                .expect_err(&format!("{sql:?} must be refused, not read"));
+            (
+                "SELECT 1 AS `left AS right`, 2 AS z FROM t",
+                "left AS right, z",
+                "'`'",
+            ),
+            (
+                "SELECT '(' AS extra, ')' AS x, 1 AS y FROM t",
+                "extra, x, y",
+                "'\\''",
+            ),
+            ("SELECT CAST(a, 'UInt64') AS n, b FROM t", "n, b", "'\\''"),
+            (
+                "SELECT (SELECT max(x) FROM u) AS m, b FROM t",
+                "m, b",
+                "expected an expression",
+            ),
+            ("SELECT max(x), 1 AS z FROM t", "max(x), z", "unaliased"),
+            ("SELECT 'a AS x FROM t", "(a parse error)", "'\\''"),
+            ("SELECT a) AS x FROM t", "(a parse error)", "unbalanced"),
+            ("SELECT a -- , b\n AS x FROM t", "x", "'-'"),
+            ("SELECT a, b", "(a parse error)", "no top-level FROM"),
+        ];
+        for (sql, server, needle) in refused {
+            let err = std::panic::catch_unwind(|| projection_names(sql)).expect_err(&format!(
+                "{sql:?} must be refused, not read (server: {server})"
+            ));
             let msg = err
                 .downcast_ref::<String>()
                 .cloned()
@@ -1221,7 +1308,7 @@ mod tests {
                 .unwrap_or_default();
             assert!(
                 msg.contains(needle),
-                "{sql:?} must be refused for {needle:?}; got {msg:?}"
+                "{sql:?} must be refused naming {needle:?}; got {msg:?}"
             );
         }
     }
