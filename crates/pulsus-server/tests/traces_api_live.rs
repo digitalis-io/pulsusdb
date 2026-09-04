@@ -97,9 +97,15 @@ const NULLABLE_WIRE_PORT: u16 = 31_215;
 /// what settles it.
 const CAP_PROBE_PORT: u16 = 31_221;
 
-/// Issue #502's truncation-signal suite. It needs TWO spawns over ONE
-/// store, differing only in `PULSUS_TRACEQL_MAX_CANDIDATES`, because that
-/// ceiling is process configuration and cannot be varied per request.
+/// Issue #502's truncation-signal suite. It needs THREE spawns over ONE
+/// store and ONE throwaway database, differing in nothing but their
+/// listener port and `PULSUS_TRACEQL_MAX_CANDIDATES`, because that ceiling
+/// is process configuration and cannot be varied per request. Three
+/// ceilings are what make the trace count TRACK the ceiling rather than
+/// merely react to it being small — see the criterion's own doc comment.
+///
+/// The suffix is the CEILING each process runs with, not an ordinal:
+/// `_ONE` is `1`, `_TWO` is `2`, `_HIGH` is `1000`.
 const CEILING_HIGH_PORT: u16 = 31_225;
 const CEILING_ONE_PORT: u16 = 31_226;
 const CEILING_TWO_PORT: u16 = 31_227;
@@ -2434,7 +2440,8 @@ async fn the_range_route_rejects_a_group_the_instant_route_serves() {
 /// ```
 ///
 /// So the four requests below differ in ONE input at a time, over one
-/// three-trace store:
+/// three-trace store served by three spawns — one per ceiling, since the
+/// ceiling is process configuration:
 ///
 /// ```text
 ///   ceiling=1     limit=10  ->  1 trace,  {"totalJobs":1}
