@@ -494,8 +494,7 @@ fn the_committed_capture_matches_the_live_reference() {
 /// The sections issue #478 captured, replayed in capture order.
 fn replay_478_sections(fx: &Value, api: &str, otlp: &str) {
     let base = corpus::base_ns();
-    let start = base / 1_000_000_000 - 3_600;
-    let end = base / 1_000_000_000 + 600;
+    let (start, end) = corpus::window_secs(base);
     let window = format!("start={start}&end={end}");
 
     push(otlp, &corpus::c10_request(base), "C10 push");
@@ -507,12 +506,17 @@ fn replay_478_sections(fx: &Value, api: &str, otlp: &str) {
             continue;
         }
         let route = case["route"].as_str().expect("route");
-        // The zero-width window case carries its own params.
+        // The zero-width window case carries its own params: it is
+        // issued at the CORPUS instant, the same instant our leg uses,
+        // so both legs replay the fixture's `params` literally. See
+        // `corpus::zero_width_probe_secs`. NOT at `now`: measured
+        // against a fresh reference instance, a zero-width window there
+        // answers the WHOLE list rather than `[]`, which would turn this
+        // case's recorded divergence into two sides agreeing on
+        // everything without any assertion changing.
         let mut url = if case.get("params").is_some() {
-            format!(
-                "{}{route}?start={start}&end={start}",
-                api.trim_end_matches('/')
-            )
+            let at = corpus::zero_width_probe_secs(base);
+            format!("{}{route}?start={at}&end={at}", api.trim_end_matches('/'))
         } else {
             format!("{}{route}?{window}", api.trim_end_matches('/'))
         };
@@ -693,8 +697,7 @@ fn replay_478_sections(fx: &Value, api: &str, otlp: &str) {
 fn replay_476_sections(fx: &Value, api: &str, otlp: &str) {
     let base = corpus::base_ns();
     push(otlp, &corpus::ac_476_request(base), "#476 corpus push");
-    let start = base / 1_000_000_000 - 3_600;
-    let end = base / 1_000_000_000 + 600;
+    let (start, end) = corpus::window_secs(base);
     wait_for_names(
         api,
         &format!("start={start}&end={end}"),

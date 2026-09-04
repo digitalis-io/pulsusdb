@@ -241,7 +241,93 @@ pub fn base_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    u64::try_from(now).expect("fits u64") - 60_000_000_000
+    base_ns_from(u64::try_from(now).expect("fits u64"))
+}
+
+/// Nanoseconds in a UTC day. The tag-values reads bound their window to
+/// whole UTC days (ledger `traceql-tag-values-window-is-day-granular`),
+/// so which day a corpus and a probe land on is what decides an answer.
+pub const NS_PER_DAY: u64 = 86_400_000_000_000;
+
+/// How far past `base_ns` the LAST instant of the widest corpus in this
+/// module sits. `span_of` stamps row `i` at `base + i ms` and ends it
+/// 1.5 ms later; the widest push is C10 followed by C4, whose last index
+/// is `C10.len() + c4_rows().len() - 1 = 16`, so the last instant is
+/// `base + 17.5 ms`. One second is that with headroom, and it is the
+/// margin [`base_ns_from`] keeps from a UTC midnight.
+pub const CORPUS_BLOCK_NS: u64 = 1_000_000_000;
+
+/// [`base_ns`]'s arithmetic, with the clock passed in so it can be swept
+/// over a whole day hermetically.
+///
+/// `now - 60 s`, then nudged FORWARD to the next UTC midnight if the
+/// corpus block would otherwise straddle one. A straddling corpus is
+/// half in each day, and every day-granular read then answers a partial
+/// list — the same class of clock-dependent answer as the one below, at
+/// a much lower rate, which is what makes it worth removing rather than
+/// living with. The nudge is at most `CORPUS_BLOCK_NS` (1 s), so the
+/// corpus stays ~60 s in the past and inside the reference's live-store
+/// window.
+pub fn base_ns_from(now_ns: u64) -> u64 {
+    let base = now_ns - 60_000_000_000;
+    let into_day = base % NS_PER_DAY;
+    if into_day + CORPUS_BLOCK_NS >= NS_PER_DAY {
+        base + (NS_PER_DAY - into_day)
+    } else {
+        base
+    }
+}
+
+/// The instant, in whole seconds, that the zero-width-window case
+/// (`start == end`, fixture `q_matrix.Q-AZ`) is issued at: the corpus's
+/// own timestamp.
+///
+/// **This is derived from the corpus and not from the request window,
+/// and that is the whole point.** The window these suites otherwise use
+/// starts an hour before the corpus, and a zero-width probe placed there
+/// falls on the PREVIOUS UTC day whenever the suite runs between
+/// 00:01:00 and 01:01:00 UTC — measured, by emulating the whole run at
+/// 14 virtual wall clocks: 10 values outside that band, 0 inside it,
+/// flipping between 00:00:59 and 00:01:01 and back between 01:00:59 and
+/// 01:01:01. Both answers obey the day-granular rule; only the input
+/// moved. Anchoring the probe on the corpus instant makes the day it
+/// resolves to the corpus's day at every wall clock.
+///
+/// **Do not move it to `now`, which is the obvious other fix and is
+/// worse than the defect.** Measured against a fresh reference instance:
+/// a zero-width window at the corpus instant, and at one second either
+/// side of it, answers `[]` for a span stamped mid-second and for one
+/// stamped exactly on a second — but the SAME zero-width window placed
+/// at `now` answers the whole list. The case exists to record that the
+/// reference answers nothing here where we answer the day's values, so a
+/// probe at `now` makes both sides return everything, both legs pass,
+/// and the divergence they are pinning stops being tested at all —
+/// silently, because a green run looks the same either way.
+pub fn zero_width_probe_secs(base_ns: u64) -> i64 {
+    i64::try_from(base_ns / 1_000_000_000).expect("corpus second fits i64")
+}
+
+/// The request window every other case is issued over: an hour before
+/// the corpus to ten minutes after it, in whole seconds. Its UTC day
+/// span must CONTAIN the corpus's day at every wall clock.
+pub fn window_secs(base_ns: u64) -> (i64, i64) {
+    let base_secs = zero_width_probe_secs(base_ns);
+    (base_secs - 3_600, base_secs + 600)
+}
+
+/// The empty half of the occupied-day / empty-day pair: an hour-wide
+/// window 25 to 26 h before the corpus. Its UTC day span must EXCLUDE
+/// the corpus's day at every wall clock — an empty answer over a window
+/// that happened to touch the corpus's day would assert nothing.
+pub fn empty_day_window_secs(base_ns: u64) -> (i64, i64) {
+    let (start, _) = window_secs(base_ns);
+    (start - 90_000, start - 86_400)
+}
+
+/// The UTC day a second-resolution instant falls in — days since the
+/// epoch, the unit `DaySpan` resolves a request window to.
+pub fn utc_day(secs: i64) -> i64 {
+    secs.div_euclid(86_400)
 }
 
 // ---------------------------------------------------------------------

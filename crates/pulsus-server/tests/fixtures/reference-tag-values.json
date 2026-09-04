@@ -2836,7 +2836,7 @@
   "Q-AZ": {
    "route": "/api/v2/search/tag/name/values",
    "q": null,
-   "params": "start=end (a zero-width range)",
+   "params": "start=end=the corpus span instant (a zero-width range, on the corpus's own UTC day)",
    "reference": {
     "status": 200,
     "values": []

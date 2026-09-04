@@ -1650,7 +1650,14 @@ when we are asking it to slow down, so we keep `429`; recorded as
   touches, and an absent one resolves to `reader.traceql_tag_lookback`
   (24 h). A sub-day window therefore answers over its whole day here. The
   sharpest instance is a zero-width range (`start == end`): the reference
-  answers `[]`, we answer that day's values.
+  answers `[]`, we answer the values of the UTC DAY that instant falls
+  in. The case is issued at the corpus's own span instant, so the day it
+  resolves to is the corpus's day at every wall clock — placing it
+  anywhere else makes the recorded answer depend on the hour the suite
+  runs at, which is measured: a probe an hour before the corpus answers
+  `[]` between 00:01:00 and 01:01:00 UTC and the corpus's ten values the
+  rest of the day, because only then do the two sit either side of a UTC
+  midnight.
 
 - **Why day-granular.** A sub-day `timestamp_ns` predicate prunes nothing
   on `trace_spans` — the sorting key is `(trace_id, timestamp_ns)`, so

@@ -431,8 +431,7 @@ async fn our_answers_match_the_committed_fixture() {
     let _guard = spawn_ready(port, db);
 
     let base = corpus::base_ns();
-    let start = (base / 1_000_000_000) as i64 - 3_600;
-    let end = (base / 1_000_000_000) as i64 + 600;
+    let (start, end) = corpus::window_secs(base);
     let window = format!("start={start}&end={end}");
     push(port, &corpus::c10_request(base), "C10");
 
@@ -443,8 +442,16 @@ async fn our_answers_match_the_committed_fixture() {
     for (id, case) in fx["q_matrix"].as_object().expect("q_matrix") {
         let route = case["route"].as_str().expect("route");
         let mut path = if case.get("params").is_some() {
-            // The zero-width window case.
-            format!("{route}?start={start}&end={start}")
+            // The zero-width window case, issued at the CORPUS instant
+            // rather than at `start` — see
+            // `corpus::zero_width_probe_secs`, and the hermetic sweep
+            // `the_clock_derived_windows_land_on_the_intended_days`
+            // below. NOT at `now`: measured, the reference answers the
+            // whole list for a zero-width window there, so both sides
+            // would return everything and this case would stop testing
+            // the divergence it exists for.
+            let at = corpus::zero_width_probe_secs(base);
+            format!("{route}?start={at}&end={at}")
         } else {
             format!("{route}?{window}")
         };
@@ -521,8 +528,7 @@ async fn our_answers_match_the_committed_fixture() {
     // and the query_log is asked whether the span read actually ran.
     let admin = ChClient::new(ch_config()).await.expect("connect admin");
     let before = selects_reading(&admin, db, SPAN_NAME_SELECT_PREFIX, "trace_spans").await;
-    let empty_start = start - 90_000;
-    let empty_end = start - 86_400;
+    let (empty_start, empty_end) = corpus::empty_day_window_secs(base);
     let res = get(
         port,
         &format!("/api/v2/search/tag/name/values?start={empty_start}&end={empty_end}"),
@@ -844,4 +850,79 @@ async fn the_q_tolerance_stops_at_input_that_is_not_well_formed() {
     }
 
     drop_db(db).await;
+}
+
+/// Every window these suites derive from the clock must land on the UTC
+/// days it is meant to, at EVERY wall clock: the zero-width case
+/// (`q_matrix.Q-AZ`) on the corpus's own day, the request window
+/// covering that day, the empty-day half excluding it, and the corpus
+/// itself not straddling a UTC midnight. Hermetic: pure arithmetic over
+/// the same four functions the live tests above call, swept over a whole
+/// day.
+///
+/// **This test exists because the live suite failed on a clock.** Until
+/// this change the zero-width probe was issued at `start` — an hour
+/// before the corpus — so between 00:01:00 and 01:01:00 UTC it landed on
+/// the previous UTC day and the day-granular read answered `[]` instead
+/// of the corpus's ten values. Measured by emulating the whole run at 14
+/// virtual wall clocks: 0 values inside that band, 10 outside it. The
+/// live suite cannot catch that itself, because it runs at one instant
+/// and 23 of every 24 hours are green.
+///
+/// It is a sweep and not a boundary pair on purpose: the old
+/// construction was wrong on a contiguous HOUR, and any single-instant
+/// check has 23 chances in 24 of sitting outside it.
+#[test]
+fn the_clock_derived_windows_land_on_the_intended_days() {
+    // Day 20,699 since the epoch is an arbitrary anchor; only the
+    // offsets inside the day matter.
+    let day0 = 20_699u64 * corpus::NS_PER_DAY;
+    for sec in 0..86_400u64 {
+        for frac in [0u64, 1, 500_000_000, 999_999_999] {
+            let now_ns = day0 + sec * 1_000_000_000 + frac;
+            let base = corpus::base_ns_from(now_ns);
+
+            // The whole corpus block is on one UTC day: its first
+            // instant is `base` and its last is inside `CORPUS_BLOCK_NS`.
+            let first = corpus::utc_day((base / 1_000_000_000) as i64);
+            let last = corpus::utc_day(((base + corpus::CORPUS_BLOCK_NS) / 1_000_000_000) as i64);
+            assert_eq!(
+                first, last,
+                "now_ns={now_ns}: the corpus block straddles a UTC midnight \
+                 (base={base}), so a day-granular read answers a partial list"
+            );
+
+            // And the zero-width probe resolves to that same day.
+            let probe = corpus::zero_width_probe_secs(base);
+            assert_eq!(
+                corpus::utc_day(probe),
+                first,
+                "now_ns={now_ns}: the zero-width probe at {probe} resolves to UTC day {} \
+                 but the corpus is on day {first}",
+                corpus::utc_day(probe)
+            );
+
+            // The request window every other case uses COVERS that day.
+            let (start, end) = corpus::window_secs(base);
+            assert!(
+                corpus::utc_day(start) <= first && first <= corpus::utc_day(end),
+                "now_ns={now_ns}: the request window spans UTC days {}..={} and misses the \
+                 corpus's day {first}",
+                corpus::utc_day(start),
+                corpus::utc_day(end)
+            );
+
+            // And the empty half of the occupied/empty pair EXCLUDES it,
+            // so its empty answer is a measured absence rather than an
+            // accident of where the window fell.
+            let (e_start, e_end) = corpus::empty_day_window_secs(base);
+            assert!(
+                corpus::utc_day(e_end) < first,
+                "now_ns={now_ns}: the empty-day window spans UTC days {}..={} and touches the \
+                 corpus's day {first}",
+                corpus::utc_day(e_start),
+                corpus::utc_day(e_end)
+            );
+        }
+    }
 }
