@@ -2803,8 +2803,7 @@ pub(crate) fn evaluate_batch(
             charge_transient(
                 budget,
                 &mut merged_transient,
-                super::exec::RETAINED_ENTRY_OVERHEAD
-                    + total * std::mem::size_of::<&HydratedSpan>(),
+                super::exec::RETAINED_ENTRY_OVERHEAD + total * std::mem::size_of::<&HydratedSpan>(),
             )?;
             let mut union: Vec<&HydratedSpan> = Vec::with_capacity(total);
             for set in &sets {
@@ -2869,6 +2868,8 @@ pub(crate) fn evaluate_batch(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use pulsus_traceql::parse;
 
     use super::super::filter::SpanFilterCtx;
@@ -4676,6 +4677,328 @@ mod tests {
             err,
             ReadError::QueryTooBroad(TooBroadReason::TraceSearchSeriesCap { count: 3, cap: 2 })
         ));
+    }
+
+    // -- issue #492 item 2: the WRITTEN order of the stages --------------
+
+    /// Corpus C-ORD1 — one trace, four spans: three named `a` (durations
+    /// 0.5s / 2s / 3s) and one named `b` (0.4s), ascending in time so the
+    /// LAST span is the one a `count() > 2` drops. Fixed literal
+    /// timestamps: no test input here is derived from the wall clock.
+    fn ord1_trace() -> TraceSpans {
+        TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "grp492", "a", 10, 500_000_000),
+                span(2, "grp492", "a", 20, 2_000_000_000),
+                span(3, "grp492", "a", 30, 3_000_000_000),
+                span(4, "grp492", "b", 40, 400_000_000),
+            ],
+        }
+    }
+
+    /// Corpus C-ORD2 — one trace, four spans with CROSS-CUTTING keys:
+    /// `(a, server)`, `(a, client)`, `(b, server)`, `(b, server)`. Neither
+    /// key alone separates the spans the other separates, which is what
+    /// makes a nested `by()` observable.
+    fn ord2_trace() -> TraceSpans {
+        let with_kind = |n: u8, name: &str, kind: i8, ts: i64| {
+            let mut s = span(n, "grp492b", name, ts, 1);
+            s.kind = kind;
+            s
+        };
+        TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                with_kind(1, "a", 2, 10),
+                with_kind(2, "a", 3, 20),
+                with_kind(3, "b", 2, 30),
+                with_kind(4, "b", 2, 40),
+            ],
+        }
+    }
+
+    /// One group's attribute KEY sequence, in the order the response
+    /// carries it.
+    fn group_key_sequence(group: &SpanSetGroup) -> Vec<String> {
+        group
+            .attributes
+            .iter()
+            .map(|(display, _)| display.clone())
+            .collect()
+    }
+
+    /// The group map a spanSet array reduces to: the ordered group-VALUE
+    /// tuple -> the member span-id low bytes. Compared as a map, never as
+    /// a sequence.
+    fn group_map(groups: &[SpanSetGroup]) -> BTreeMap<Vec<String>, Vec<u8>> {
+        groups
+            .iter()
+            .map(|g| {
+                let key: Vec<String> = g
+                    .attributes
+                    .iter()
+                    .map(|(_, value)| format!("{value:?}"))
+                    .collect();
+                let members: Vec<u8> = g.spans.iter().map(|s| s.span_id[7]).collect();
+                (key, members)
+            })
+            .collect()
+    }
+
+    /// The flat span-id low bytes of the one returned match.
+    fn flat_ids(matches: &[TraceMatch]) -> Vec<u8> {
+        matches[0].spans.iter().map(|s| s.span_id[7]).collect()
+    }
+
+    /// AC1 — the known pair. `by(name) | count() > 2` filters the GROUPS
+    /// (one survives, three spans); the SAME aggregate written BEFORE the
+    /// `by(name)` filters the whole matched set and leaves both groups.
+    /// The two queries send byte-identical SQL, so this difference is the
+    /// whole of item 2.
+    #[test]
+    fn by_then_count_and_count_then_by_differ() {
+        let p = plan_wide(r#"{ } | by(name) | count() > 2"#);
+        let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert_eq!(
+            m.len(),
+            1,
+            "the `a` group has three spans, so the trace stays"
+        );
+        let groups = m[0].groups.as_ref().expect("by() active");
+        assert_eq!(
+            groups.len(),
+            1,
+            "count() > 2 AFTER by(name) filters the groups"
+        );
+        assert_eq!(
+            groups[0].attributes,
+            vec![("by(name)".to_string(), GroupValue::Str("a".to_string()))]
+        );
+        assert_eq!(groups[0].matched, 3);
+        assert_eq!(
+            flat_ids(&m),
+            vec![1, 2, 3],
+            "the flat view is the survivors"
+        );
+        assert_eq!(m[0].matched, 3);
+
+        let p = plan_wide(r#"{ } | count() > 2 | by(name)"#);
+        let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        let groups = m[0].groups.as_ref().expect("by() active");
+        assert_eq!(
+            groups.len(),
+            2,
+            "the same aggregate BEFORE by(name) filters the whole matched set"
+        );
+        assert_eq!(groups[0].matched, 3);
+        assert_eq!(groups[1].matched, 1);
+        assert_eq!(flat_ids(&m), vec![1, 2, 3, 4]);
+        assert_eq!(m[0].matched, 4);
+    }
+
+    /// AC2 — the narrowest difference: the two queries differ by ONE
+    /// character from AC1's, and the grouped one removes the trace
+    /// entirely while the flat one keeps it whole. An empty spanset list
+    /// ends the trace; it does not fall back to the matched set.
+    #[test]
+    fn grouped_aggregate_can_empty_the_trace() {
+        let p = plan_wide(r#"{ } | by(name) | count() > 3"#);
+        let out = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert!(
+            out.is_empty(),
+            "no group holds more than three spans, so nothing survives"
+        );
+
+        let p = plan_wide(r#"{ } | count() > 3 | by(name)"#);
+        let out = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert_eq!(out.len(), 1, "four matched spans pass count() > 3");
+        assert_eq!(out[0].groups.as_ref().expect("by() active").len(), 2);
+    }
+
+    /// AC3 — a second `by()` SUB-DIVIDES the current spanSets and appends
+    /// its attribute; it does not rebuild from the flat matched set. The
+    /// attribute sequence is the WRITTEN order, so the two spellings
+    /// carry the same partition under different key orders.
+    #[test]
+    fn nested_by_stages_accumulate_attributes() {
+        let p = plan_wide(r#"{ } | by(name) | by(kind)"#);
+        let m = eval(&p, &[ord2_trace()], &membership(&p, &[]));
+        let groups = m[0].groups.as_ref().expect("by() active");
+        assert_eq!(groups.len(), 3, "(a,server) (a,client) (b,server)");
+        for g in groups {
+            assert_eq!(
+                group_key_sequence(g),
+                vec!["by(name)".to_string(), "by(kind)".to_string()]
+            );
+        }
+        assert_eq!(
+            group_map(groups),
+            BTreeMap::from([
+                (
+                    vec![r#"Str("a")"#.to_string(), r#"Str("server")"#.to_string()],
+                    vec![1]
+                ),
+                (
+                    vec![r#"Str("a")"#.to_string(), r#"Str("client")"#.to_string()],
+                    vec![2]
+                ),
+                (
+                    vec![r#"Str("b")"#.to_string(), r#"Str("server")"#.to_string()],
+                    vec![3, 4]
+                ),
+            ])
+        );
+
+        let p = plan_wide(r#"{ } | by(kind) | by(name)"#);
+        let m = eval(&p, &[ord2_trace()], &membership(&p, &[]));
+        let groups = m[0].groups.as_ref().expect("by() active");
+        assert_eq!(groups.len(), 3);
+        for g in groups {
+            assert_eq!(
+                group_key_sequence(g),
+                vec!["by(kind)".to_string(), "by(name)".to_string()]
+            );
+        }
+        assert_eq!(
+            group_map(groups),
+            BTreeMap::from([
+                (
+                    vec![r#"Str("server")"#.to_string(), r#"Str("a")"#.to_string()],
+                    vec![1]
+                ),
+                (
+                    vec![r#"Str("client")"#.to_string(), r#"Str("a")"#.to_string()],
+                    vec![2]
+                ),
+                (
+                    vec![r#"Str("server")"#.to_string(), r#"Str("b")"#.to_string()],
+                    vec![3, 4]
+                ),
+            ])
+        );
+    }
+
+    /// AC4 — `coalesce()` merges what SURVIVES at its written position,
+    /// not what matched: after a filtering stage it merges three spans,
+    /// before one it merges four.
+    #[test]
+    fn coalesce_after_a_filter_keeps_only_survivors() {
+        let p = plan_wide(r#"{ } | by(name) | count() > 2 | coalesce()"#);
+        let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert!(
+            m[0].groups.is_none(),
+            "coalesce() collapses to the flat set"
+        );
+        assert_eq!(m[0].matched, 3);
+        assert_eq!(flat_ids(&m), vec![1, 2, 3]);
+
+        let p = plan_wide(r#"{ } | by(name) | coalesce() | count() > 2"#);
+        let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert!(m[0].groups.is_none());
+        assert_eq!(m[0].matched, 4, "the coalesced set is what count() sees");
+        assert_eq!(flat_ids(&m), vec![1, 2, 3, 4]);
+    }
+
+    /// AC9 — `count()` now counts a SPANSET's members rather than the
+    /// matched-id set. On the flat spanset those are the same number
+    /// because the engine's own `group_hydrated_rows` dedupes hydration
+    /// rows by `span_id` BEFORE evaluation, so a replayed row cannot
+    /// inflate the count. Built through that real function, not a
+    /// hand-deduped fixture.
+    #[test]
+    fn count_matches_the_deduped_span_set() {
+        let row = |span_id: u8| super::super::rows::HydrationRow {
+            trace_id: tid(1),
+            span_id: sid(span_id),
+            parent_id: [0u8; 8],
+            service: "grp492".to_string(),
+            name: "hot".to_string(),
+            timestamp_ns: span_id as i64 * 10,
+            duration_ns: 1,
+            status_code: 0,
+            status_message: String::new(),
+            kind: 1,
+            scope_name: String::new(),
+            scope_version: String::new(),
+        };
+        let p = plan_wide(r#"{ } | count() > 2"#);
+        let verdict = |rows: Vec<super::super::rows::HydrationRow>| {
+            let mut budget = ByteBudget::new(usize::MAX);
+            let mut charged = 0usize;
+            let (traces, _) =
+                super::super::exec::group_hydrated_rows(rows, &mut budget, &mut charged)
+                    .expect("in budget");
+            assert_eq!(traces[0].spans.len(), 3, "the replay is deduped upstream");
+            !eval(&p, &traces, &membership(&p, &[])).is_empty()
+        };
+        assert!(
+            verdict(vec![row(1), row(2), row(3)]),
+            "three distinct spans pass count() > 2"
+        );
+        assert!(
+            verdict(vec![row(1), row(1), row(2), row(3)]),
+            "the same three spans with one row replayed give the SAME verdict"
+        );
+    }
+
+    /// AC10 — the distinct-group cap charges the ACCUMULATED key tuple.
+    ///
+    /// **Why `max_series = 4` and not another number.** On C-ORD2 the
+    /// stage-local accounting this change replaces observes FOUR tuples —
+    /// `[a]`, `[b]`, `[server]`, `[client]` — and the composite accounting
+    /// observes FIVE — `[a]`, `[b]`, `[a,server]`, `[a,client]`,
+    /// `[b,server]`. Four is the ONLY cap that separates them: at 4 the
+    /// old rule returns `Ok` and the new rule must refuse. Any cap <= 3
+    /// refuses under both rules and any cap >= 5 accepts under both, so a
+    /// later edit that "simplifies" this number silently stops the test
+    /// discriminating. The second assertion pins the discrimination
+    /// itself: at 5 the query must still succeed, so the criterion cannot
+    /// pass by refusing everything.
+    #[test]
+    fn nested_by_charges_the_composite_tuple_not_the_stage_local_one() {
+        let q = r#"{ } | by(name) | by(kind)"#;
+        let p = plan_cap(q, 4);
+        let err = evaluate_batch(
+            &p,
+            &[ord2_trace()],
+            &membership(&p, &[]),
+            &mut GroupCardinalityCounter::new(4),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect_err("five composite tuples over a cap of 4 must 422");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(TooBroadReason::TraceSearchSeriesCap { count: 5, cap: 4 })
+            ),
+            "got {err:?}"
+        );
+
+        let p = plan_cap(q, 5);
+        evaluate_batch(
+            &p,
+            &[ord2_trace()],
+            &membership(&p, &[]),
+            &mut GroupCardinalityCounter::new(5),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect("cap 5 is the non-refusal guard: the same query must succeed");
+    }
+
+    /// The trace-ordering control: a filtering stage must not move the
+    /// public inter-trace `sort_key`. On C-ORD1 the LATEST span is the one
+    /// `count() > 2` drops, so a `sort_key` computed over the survivors
+    /// would move — measured on the reference, its `traces[]` order is
+    /// insensitive to the pipeline.
+    #[test]
+    fn pipeline_filtering_does_not_move_the_sort_key() {
+        let grouped = plan_wide(r#"{ } | by(name)"#);
+        let filtered = plan_wide(r#"{ } | by(name) | count() > 2"#);
+        let a = eval(&grouped, &[ord1_trace()], &membership(&grouped, &[]));
+        let b = eval(&filtered, &[ord1_trace()], &membership(&filtered, &[]));
+        assert_eq!(a[0].sort_key, 40, "max timestamp over the MATCHED spans");
+        assert_eq!(b[0].sort_key, a[0].sort_key);
     }
 
     /// Float `by()` grouping (issue #193 R2-F2): `+0.0` and `-0.0` collapse

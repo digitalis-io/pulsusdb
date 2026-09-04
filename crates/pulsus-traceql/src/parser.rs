@@ -840,20 +840,32 @@ fn parse_dotted_key(cursor: &mut Cursor<'_>) -> Result<(String, usize), TraceQlE
 /// `*_over_time` metrics functions are recognized here and rejected as
 /// `NotYetSupported` (M7, task-manager adjudication 1 on issue #59), as
 /// is metrics grouping `by` after a metric stage.
+///
+/// The three "expected a pipeline stage" messages below — end of input
+/// after the pipe, a non-identifier, and an unknown identifier — name the
+/// SAME legal set, including `by` and `coalesce`, which have been served
+/// pipeline stages since issue #185 (issue #492 item 2). All three, not
+/// one: otherwise the legal set a user is shown depends on which way they
+/// got it wrong. The metrics stage names (`rate`, `count_over_time`,
+/// `topk`, `compare`, ...) are deliberately absent — they parse here and
+/// are refused at plan time on the search route, so naming them would
+/// advertise stages that route does not serve.
 fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
     let tok = cursor.peek().clone();
     let name = match &tok.kind {
         TokenKind::Ident(name) => name.clone(),
         TokenKind::Eof => {
             return Err(TraceQlError::UnexpectedEof {
-                expected: "a pipeline stage (count, sum, avg, min, max, or select)".to_string(),
+                expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+                    .to_string(),
                 span: tok.span,
             });
         }
         _ => {
             return Err(TraceQlError::UnexpectedToken {
                 found: describe(&tok.kind),
-                expected: "a pipeline stage (count, sum, avg, min, max, or select)".to_string(),
+                expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+                    .to_string(),
                 span: tok.span,
             });
         }
@@ -892,7 +904,8 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
     }
     Err(TraceQlError::UnexpectedToken {
         found: describe(&tok.kind),
-        expected: "a pipeline stage (count, sum, avg, min, max, or select)".to_string(),
+        expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+            .to_string(),
         span: tok.span,
     })
 }

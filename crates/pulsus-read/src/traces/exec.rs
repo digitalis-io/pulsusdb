@@ -3364,7 +3364,14 @@ const VEC_INITIAL_RESERVATION_SLOTS: usize = 4;
 ///   bucket group). Replayed rows are checked with `contains` FIRST and
 ///   are accounting no-ops (round-5 medium: duplicates allocate nothing,
 ///   so they charge nothing).
-fn group_hydrated_rows(
+///
+/// `pub(super)` so the sibling evaluator's
+/// `count_matches_the_deduped_span_set` (issue #492 item 2) can prove the
+/// dedupe through THIS function rather than through a hand-deduped
+/// fixture — `count()` now counts a spanset's members, and that equals
+/// the old matched-id-set size only because the rows arriving here are
+/// deduped by `span_id`.
+pub(super) fn group_hydrated_rows(
     rows: Vec<HydrationRow>,
     budget: &mut ByteBudget,
     batch_charged: &mut usize,

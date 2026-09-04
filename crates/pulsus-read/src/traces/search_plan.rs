@@ -3222,6 +3222,42 @@ mod tests {
         assert_eq!(p.aggregates[0].threshold, 100_000_000.0);
     }
 
+    /// AC8 (issue #492 item 2): `aggregates` is exactly the ordered
+    /// `Aggregate` stages of `post_stages`, in pipeline order, and
+    /// `post_stages` is the only producer — the derivation is the whole
+    /// relationship, so the two carriers cannot disagree about how many
+    /// aggregates a query has or where they sit.
+    ///
+    /// The other half of this criterion is a sweep for a second producer
+    /// — a push onto the derived vector anywhere under
+    /// `crates/pulsus-read/src` — which must find none: a second producer
+    /// would keep the equality below true while the ORDER stopped meaning
+    /// anything. (The sweep's own pattern is deliberately not spelled out
+    /// here, so this comment cannot be the hit that answers it.)
+    #[test]
+    fn plan_aggregates_are_exactly_the_ordered_aggregate_stages() {
+        let p = plan(r#"{ .x = 1 } | count() > 2 | by(name) | max(duration) > 1s"#);
+        assert_eq!(p.post_stages.len(), 3, "count(), by(name), max(duration)");
+        assert_eq!(p.aggregates_len(), 2);
+        let from_stages: Vec<String> = p
+            .post_stages
+            .iter()
+            .filter_map(|s| match s {
+                SpansetStage::Aggregate(a) => Some(format!("{a:?}")),
+                SpansetStage::By(_) | SpansetStage::Coalesce => None,
+            })
+            .collect();
+        let derived: Vec<String> = p.aggregates.iter().map(|a| format!("{a:?}")).collect();
+        assert_eq!(derived, from_stages);
+        assert!(
+            matches!(p.post_stages[0], SpansetStage::Aggregate(_))
+                && matches!(p.post_stages[1], SpansetStage::By(_))
+                && matches!(p.post_stages[2], SpansetStage::Aggregate(_)),
+            "the stages keep their WRITTEN positions: {:?}",
+            p.post_stages
+        );
+    }
+
     #[test]
     fn attr_aggregate_registers_a_val_num_field_read() {
         let p = plan(r#"{ .k = "v" } | avg(span.retries) > 1"#);
