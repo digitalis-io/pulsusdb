@@ -1015,11 +1015,13 @@ mod tests {
     /// cmp        := "<=" | ">=" | "!=" | "<" | ">" | "="
     /// ```
     ///
-    /// An item that is a bare `ident` is named by that identifier; any
-    /// other item MUST carry an `AS ident`, because guessing the name the
-    /// server would give an unaliased expression is the mis-read this
-    /// check exists to prevent. (Measured: `SELECT max(number), 1 AS z`
-    /// is named `max(number)`, `z` by the server.)
+    /// An item that is a bare `ident` is named by that identifier ONLY
+    /// when that identifier is in [`BARE_TERMS`], the frozen set of bare
+    /// columns these five builders actually emit. Every other item MUST
+    /// carry an `AS ident`, because guessing the name the server gives an
+    /// unaliased expression is the mis-read this check exists to prevent.
+    /// Measured: `SELECT max(number), 1 AS z` is named `max(number)`, `z`
+    /// by the server, and `SELECT TRUE, 1 AS z` is named `true`, `z`.
     ///
     /// **Why an accept-list and not a longer list of refusals.** Three
     /// review rounds found three fresh holes in a reader that tried to
@@ -1037,6 +1039,20 @@ mod tests {
     ///
     /// A projection that grows a new construct fails loudly and somebody
     /// looks. That is the point.
+    ///
+    /// **Why the bare-term rule is a frozen SET and not a shape test.**
+    /// "A bare identifier names itself" is false for the literals that
+    /// lex as identifiers, and narrowing it to *lowercase* identifiers
+    /// does not save it — measured against ClickHouse 26.3, `SELECT null,
+    /// 1 AS z` is named **`NULL`**, `z`. Nothing about a token's spelling
+    /// separates our columns from the server's literals: `kind` and
+    /// `payload` are single lowercase words and so are `true`, `nan` and
+    /// `inf`. Nor is a keyword list the answer — that is the
+    /// handle-everything approach again, enumerating a set the server
+    /// owns and can extend. So the accepted set is the one WE own and
+    /// have written down. `TRUE`, `null`, `NaN`, `inf` and `CURRENT_DATE`
+    /// all refuse for free, and so does the next literal nobody has
+    /// enumerated.
     ///
     /// **Why the names are read from SQL at all.** None of the five
     /// builders holds its output names as a list: `hydration_sql`,
@@ -1058,6 +1074,31 @@ mod tests {
         let tokens = tokenize_projection(head, sql);
         parse_projection(&tokens, sql)
     }
+
+    /// The bare (unaliased) columns the five evidence projections emit.
+    ///
+    /// Every one is a declared column of the tables those stages read, and
+    /// a declared column named `X` is named `X` by the server — measured
+    /// on ClickHouse 26.3 over a table carrying exactly these nine names,
+    /// `FORMAT TSVWithNames`, header row identical to the projection.
+    ///
+    /// Frozen by hand, not derived from the builders: a builder that
+    /// starts emitting a bare term outside this set makes
+    /// `projection_names` REFUSE, which reddens
+    /// `the_evidence_stages_project_exactly_what_they_decode` and puts a
+    /// person in the loop. That loud failure is the intended behaviour,
+    /// not an inconvenience.
+    const BARE_TERMS: [&str; 9] = [
+        "trace_id",
+        "span_id",
+        "parent_id",
+        "payload_type",
+        "kind",
+        "payload",
+        "timestamp_ns",
+        "duration_ns",
+        "status_code",
+    ];
 
     /// One token of the closed alphabet.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1189,6 +1230,14 @@ mod tests {
         let Tok::Ident(name) = &tokens[from] else {
             unreachable!("bare implies Ident")
         };
+        assert!(
+            BARE_TERMS.contains(&name.as_str()),
+            "the bare term {name:?} is not one of this check's known columns, so its output \
+             name is NOT safe to read as itself: the server normalises the literals that lex \
+             as identifiers ({{`TRUE` -> `true`, `null` -> `NULL`, `NaN` -> `nan`}}), and \
+             nothing about a token's spelling separates those from a column. Alias it, or add \
+             it to BARE_TERMS deliberately. In:\n{sql}"
+        );
         name.clone()
     }
 
@@ -1234,23 +1283,28 @@ mod tests {
     }
 
     /// The accepted grammar reads what the five builders emit, and
-    /// REFUSES every construct outside it — including three shapes that
-    /// three separate review rounds found the previous, handle-everything
-    /// reader mis-reading.
+    /// REFUSES every construct outside it — including the shapes four
+    /// separate review rounds found the earlier, handle-everything reader
+    /// mis-reading.
     ///
     /// Every "server" column below is ground truth from ClickHouse 26.3
-    /// (`FORMAT TSVWithNames`, header row), not read from source.
+    /// (`FORMAT TSVWithNames`, header row), not read from source. The
+    /// bare-column readings were taken over a table declaring exactly
+    /// [`BARE_TERMS`]'s nine names; the literal readings were taken in the
+    /// same query position on the same table.
     ///
-    /// *RED when:* the alphabet is widened without the grammar being
-    /// widened with it — measured, accepting `[` as an ordinary character
-    /// makes `SELECT [1, 2] AS arr, 3 AS z` read as `["[1", "arr", "z"]`
-    /// where the server answers `arr, z`.
+    /// *RED when:* the alphabet or the bare-term set is widened without
+    /// the naming rule being widened with it — measured, accepting `[` as
+    /// an ordinary character, and dropping the `AS` requirement so
+    /// `SELECT max(x), 1 AS z` reads `["max", "z"]` where the server says
+    /// `max(x)`, `z`.
     #[test]
     fn the_projection_reader_accepts_one_narrow_grammar_and_refuses_the_rest() {
-        // Accepted: exactly the constructs the five builders emit.
+        // Accepted: exactly the constructs the five builders emit. Every
+        // bare term here is one of BARE_TERMS.
         let accepted: [(&str, &[&str]); 6] = [
             // bare columns
-            ("SELECT a, b FROM t", &["a", "b"]),
+            ("SELECT trace_id, span_id FROM t", &["trace_id", "span_id"]),
             // an aggregate with an alias — the generator stage's shape
             (
                 "SELECT trace_id, max(timestamp_ns) AS bound_ts FROM t",
@@ -1268,20 +1322,68 @@ mod tests {
                 "SELECT plus(1, multiply(2, 3)) AS a, 4 AS b FROM t",
                 &["a", "b"],
             ),
-            // a call with no arguments
-            ("SELECT now() AS n, b FROM t", &["n", "b"]),
+            // a call with no arguments, beside a bare column
+            ("SELECT now() AS n, kind FROM t", &["n", "kind"]),
             // SELECT DISTINCT
-            ("SELECT DISTINCT a, b FROM t", &["a", "b"]),
+            (
+                "SELECT DISTINCT trace_id, span_id FROM t",
+                &["trace_id", "span_id"],
+            ),
         ];
         for (sql, want) in accepted {
             assert_eq!(projection_names(sql), want, "reading {sql:?}");
         }
 
-        // Refused, each with the reason named. The first three are the
-        // round-4 findings; the next is round 3's; the rest are shapes
-        // this reader will not model.
-        let refused: [(&str, &str, &str); 11] = [
-            // (sql, what the SERVER answers, the refusal's needle)
+        // Refused, each asserted on the REASON in its message, with the
+        // server's own answer recorded beside it.
+        let refused: [(&str, &str, &str); 17] = [
+            // (sql, what the SERVER names the columns, the refusal's needle)
+            // --- round 5: literals that lex as identifiers -------------
+            (
+                "SELECT TRUE, 1 AS z FROM t",
+                "true, z",
+                "\"TRUE\" is not one of this check",
+            ),
+            (
+                "SELECT true, 1 AS z FROM t",
+                "true, z",
+                "\"true\" is not one of this check",
+            ),
+            (
+                "SELECT FALSE, 1 AS z FROM t",
+                "false, z",
+                "\"FALSE\" is not one of this check",
+            ),
+            // The one that kills a lowercase-identifier rule: the server
+            // names lowercase `null` as `NULL`.
+            (
+                "SELECT null, 1 AS z FROM t",
+                "NULL, z",
+                "\"null\" is not one of this check",
+            ),
+            (
+                "SELECT NaN, 1 AS z FROM t",
+                "nan, z",
+                "\"NaN\" is not one of this check",
+            ),
+            (
+                "SELECT inf, 1 AS z FROM t",
+                "inf, z",
+                "\"inf\" is not one of this check",
+            ),
+            (
+                "SELECT CURRENT_DATE, 1 AS z FROM t",
+                "CURRENT_DATE, z",
+                "\"CURRENT_DATE\" is not one of this check",
+            ),
+            // …and an ordinary unknown column: refused too, because
+            // nothing in the text separates it from the literals above.
+            (
+                "SELECT a, b FROM t",
+                "a, b",
+                "\"a\" is not one of this check",
+            ),
+            // --- round 4 -----------------------------------------------
             ("SELECT [1, 2] AS arr, 3 AS z FROM t", "arr, z", "'['"),
             (
                 "SELECT 'fake \\' actual' AS actual, 2 AS z FROM t",
@@ -1293,11 +1395,13 @@ mod tests {
                 "left AS right, z",
                 "'`'",
             ),
+            // --- round 3 -----------------------------------------------
             (
                 "SELECT '(' AS extra, ')' AS x, 1 AS y FROM t",
                 "extra, x, y",
                 "'\\''",
             ),
+            // --- shapes this reader will not model ---------------------
             ("SELECT CAST(a, 'UInt64') AS n, b FROM t", "n, b", "'\\''"),
             (
                 "SELECT (SELECT max(x) FROM u) AS m, b FROM t",
@@ -1305,15 +1409,38 @@ mod tests {
                 "expected an expression",
             ),
             ("SELECT max(x), 1 AS z FROM t", "max(x), z", "unaliased"),
-            ("SELECT 'a AS x FROM t", "(a parse error)", "'\\''"),
             ("SELECT a) AS x FROM t", "(a parse error)", "unbalanced"),
-            ("SELECT a -- , b\n AS x FROM t", "x", "'-'"),
-            ("SELECT a, b", "(a parse error)", "no top-level FROM"),
+            (
+                "SELECT trace_id, span_id",
+                "(a parse error)",
+                "no top-level FROM",
+            ),
         ];
         for (sql, server, needle) in refused {
             let err = std::panic::catch_unwind(|| projection_names(sql)).expect_err(&format!(
                 "{sql:?} must be refused, not read (server: {server})"
             ));
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains(needle),
+                "{sql:?} must be refused naming {needle:?}; got {msg:?}"
+            );
+        }
+
+        // The remaining refusals from earlier rounds, whose inputs cannot
+        // carry a server answer because they do not parse at all.
+        for (sql, needle) in [
+            ("SELECT 'a AS x FROM t", "'\\''"),
+            ("SELECT a -- , b\n AS x FROM t", "'-'"),
+            ("SELECT a /* , b */ AS x FROM t", "'/'"),
+            ("SELECT f(trace_id AS x FROM t", "no top-level FROM"),
+        ] {
+            let err = std::panic::catch_unwind(|| projection_names(sql))
+                .expect_err(&format!("{sql:?} must be refused, not read"));
             let msg = err
                 .downcast_ref::<String>()
                 .cloned()
