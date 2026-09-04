@@ -20,6 +20,7 @@ use super::filter::{
     self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, LeafEval,
     NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx, TraceCtxPred, ValuePred,
 };
+use super::search_eval::StoredType;
 use super::search_sql;
 
 /// The caller-validated request window and response caps.
@@ -139,9 +140,15 @@ pub(crate) enum ProjectionValue {
     ParentIdHex,
     ScopeName,
     ScopeVersion,
-    /// [`super::filter::ValuePred::StringEq`]'s own literal — the value is
-    /// the query's, so no column is read at all.
-    ProbeLiteral(String),
+    /// The condition's OWN literal — [`super::filter::ValuePred::StringEq`]'s
+    /// text or [`super::filter::ValuePred::BoolEq`]'s boolean — so no
+    /// column is read at all. The `StoredType` is the LITERAL's type, not
+    /// a column reading: a boolean condition projects `{"boolValue":true}`
+    /// and a string one `{"stringValue":"…"}` (issue #510).
+    ProbeLiteral {
+        text: String,
+        literal_type: StoredType,
+    },
     /// The value fused into `probes[probe_idx]`'s membership read.
     ProbeValue {
         probe_idx: usize,
@@ -474,6 +481,14 @@ pub(crate) struct PlannedAggregate {
     pub(crate) source: AggSource,
     pub(crate) cmp: ComparisonOp,
     pub(crate) threshold: f64,
+    /// The response spanSet `attributes` key for this stage (issue #510):
+    /// the aggregate rendered from the PARSED stage — `format!("{op}()")`
+    /// for `count()`, `format!("{op}({field})")` otherwise. CANONICAL, not
+    /// the text the user typed, because it is built from the AST `Field`
+    /// whose `Display` normalises the spelling: `max(span:duration)` keys
+    /// `max(duration)`. Measured against the reference, which keys the
+    /// attribute from its own parsed stage the same way.
+    pub(crate) display: String,
 }
 
 #[derive(Debug, Clone)]
@@ -567,14 +582,31 @@ pub(crate) enum GroupKeyResolver {
     },
 }
 
-/// One ordered post-filter spanset stage (issue #193): `by()` regroups the
-/// matched spans into one spanSet per distinct key-tuple, `coalesce()`
-/// merges the current spanSets back into one. Ordered (not flattened
-/// flags) so `by()|coalesce()` and `coalesce()|by()` stay distinguishable.
-#[derive(Debug, Clone)]
-pub(crate) enum SpansetStage {
-    By(Vec<PlannedGroupKey>),
-    Coalesce,
+/// One contributor to a span set's response `attributes`, in pipeline
+/// order (issue #510).
+///
+/// A later `by()` **extends** the active grouping key list rather than
+/// replacing it, so both grouping stages of
+/// `| by(name) | count() > 0 | by(status)` contribute — measured on the
+/// reference, which returns `[by(name), count(), by(status)]` over the
+/// composed `(name, status)` partition. v1 of the plan removed the
+/// earlier marker and would have emitted `by(status)` alone over the
+/// wrong two-group partition.
+///
+/// **This list and [`SearchPlan::active_by_keys`] replace the ordered
+/// `SpansetStage` record issue #193 carried.** That record existed to keep
+/// `by()|coalesce()` and `coalesce()|by()` distinguishable, and these two
+/// keep them distinguishable more directly: the first leaves BOTH empty,
+/// the second leaves one key and one contributor. Nothing read the stage
+/// list once grouping stopped re-partitioning per stage, and two records
+/// of one fact can disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttrContributor {
+    /// [`SearchPlan::active_by_keys`]`[j]` — the j-th `by()` stage since
+    /// the last `coalesce()`.
+    GroupKey(usize),
+    /// [`SearchPlan::aggregates`]`[k]`.
+    Aggregate(usize),
 }
 
 /// The complete, deterministic search plan — everything
@@ -621,8 +653,9 @@ pub struct SearchPlan {
     /// Whether each probe's membership read must also FUSE the matched
     /// `val` into its projection (issue #479), index-aligned with
     /// [`Self::probes`]. `false` for every probe no projection needs a
-    /// value from — and for `ValuePred::StringEq`, whose value is the
-    /// query's own literal — so the read shape is unchanged for those.
+    /// value from — and for `ValuePred::StringEq`/`ValuePred::BoolEq`,
+    /// whose value is the query's own literal — so the read shape is
+    /// unchanged for those.
     pub(crate) probe_values: Vec<bool>,
     /// The matched-span projection groups (issue #479), in
     /// first-appearance order: filter order, leaf pre-order, then
@@ -644,11 +677,29 @@ pub struct SearchPlan {
     pub(crate) group_by: Vec<Field>,
     /// Whether a `| coalesce()` stage is present (issue #185).
     pub(crate) coalesce: bool,
-    /// The ordered spanset post-stages (issue #193): `by()`/`coalesce()`
-    /// in pipeline order, carrying the resolved group keys. Phase 2
-    /// reshapes the response from these; empty for a plain (flat) query,
-    /// keeping the default response byte-identical.
-    pub(crate) post_stages: Vec<SpansetStage>,
+    /// The ordered spanSet `attributes` contributors (issue #510), built
+    /// by ONE walk of `query.pipeline`: an aggregate pushes
+    /// `Aggregate(k)`; a `by()` pushes its key onto [`Self::active_by_keys`]
+    /// and pushes `GroupKey(len - 1)`; a `coalesce()` CLEARS both. Empty
+    /// for a query with neither stage, which is what keeps the default
+    /// response byte-identical.
+    pub(crate) attr_contributors: Vec<AttrContributor>,
+    /// The composed grouping key tuple in effect at the END of the
+    /// pipeline (issue #510). Phase 2 partitions ONCE by this tuple,
+    /// which is the same partition the reference reaches by sub-dividing
+    /// at each `by()`, so the group SET matches. Empty when no `by()`
+    /// survives the last `coalesce()`.
+    pub(crate) active_by_keys: Vec<PlannedGroupKey>,
+    /// The composed key tuples of every `by()` run a `coalesce()` CLOSED
+    /// (issue #510) — the response never carries them, and the
+    /// `reader.traceql_max_series` distinct-group cap still counts them.
+    ///
+    /// docs/api.md §4.2 makes that a committed contract: the cap counts
+    /// "at grouping-production time (before any `coalesce()` collapse …),
+    /// so `by()|coalesce()` … cannot bypass the cap". Partitioning only by
+    /// the FINAL tuple would make `{…} | by(x) | coalesce()` count nothing
+    /// at all, which is exactly the bypass the contract names.
+    pub(crate) coalesced_by_keys: Vec<Vec<PlannedGroupKey>>,
     /// The `with(most_recent=true)` search hint (issue #185): the response
     /// keeps its recency ordering (the default), most-recent first.
     pub(crate) most_recent: bool,
@@ -693,12 +744,6 @@ impl SearchPlan {
     /// #185); the response keeps its default recency ordering.
     pub fn most_recent(&self) -> bool {
         self.most_recent
-    }
-
-    /// The ordered spanset post-stages (issue #193) — `by()`/`coalesce()`
-    /// in pipeline order. Empty when the query is flat.
-    pub(crate) fn post_stages(&self) -> &[SpansetStage] {
-        &self.post_stages
     }
 
     /// The spanset `| by(...)` cardinality pre-flight probe SQL (issue
@@ -1270,9 +1315,14 @@ struct PlannedPipeline {
     group_by: Vec<Field>,
     /// Whether a `| coalesce()` stage is present (issue #185).
     coalesce: bool,
-    /// The ordered `by()`/`coalesce()` post-stages with resolved group
-    /// keys (issue #193).
-    post_stages: Vec<SpansetStage>,
+    /// The ordered response-`attributes` contributors (issue #510).
+    attr_contributors: Vec<AttrContributor>,
+    /// The composed grouping key tuple in effect at the end of the
+    /// pipeline (issue #510).
+    active_by_keys: Vec<PlannedGroupKey>,
+    /// The composed tuples a `coalesce()` closed (issue #510) — counted
+    /// against the distinct-group cap, never returned.
+    coalesced_by_keys: Vec<Vec<PlannedGroupKey>>,
 }
 
 fn plan_pipeline(
@@ -1287,7 +1337,13 @@ fn plan_pipeline(
     let mut select_fields = Vec::new();
     let mut group_by = Vec::new();
     let mut coalesce = false;
-    let mut post_stages: Vec<SpansetStage> = Vec::new();
+    // Issue #510: the response `attributes` contributors and the composed
+    // grouping tuple, accumulated in ONE walk of the pipeline alongside
+    // the stages themselves — a `by()` EXTENDS the key list, an aggregate
+    // appends its own contributor, and `coalesce()` clears both.
+    let mut attr_contributors: Vec<AttrContributor> = Vec::new();
+    let mut active_by_keys: Vec<PlannedGroupKey> = Vec::new();
+    let mut coalesced_by_keys: Vec<Vec<PlannedGroupKey>> = Vec::new();
     for stage in &query.pipeline {
         match stage {
             // Spanset-level grouping / coalesce (issue #185 parse, #193
@@ -1332,11 +1388,26 @@ fn plan_pipeline(
                     trace_ctx,
                     child_count,
                 )?;
-                post_stages.push(SpansetStage::By(vec![planned]));
+                active_by_keys.push(planned);
+                attr_contributors.push(AttrContributor::GroupKey(active_by_keys.len() - 1));
             }
             PipelineStage::Coalesce => {
                 coalesce = true;
-                post_stages.push(SpansetStage::Coalesce);
+                // Issue #510: `coalesce()` builds a FRESH flat span set, so
+                // it clears BOTH the grouping tuple and every attribute
+                // contributor written before it. Measured on the reference:
+                // `| by(name) | count() > 1 | coalesce()` comes back with no
+                // `attributes` key at all, and
+                // `| by(name) | coalesce() | count() > 1` comes back with
+                // `[count()]` alone.
+                attr_contributors.clear();
+                // The closed run still counts against the distinct-group
+                // cap (docs/api.md §4.2), so it is kept rather than
+                // dropped: `by(x) | coalesce()` must still `422` on the
+                // fan-out it would have produced.
+                if !active_by_keys.is_empty() {
+                    coalesced_by_keys.push(std::mem::take(&mut active_by_keys));
+                }
             }
             PipelineStage::Aggregate {
                 op,
@@ -1410,11 +1481,22 @@ fn plan_pipeline(
                         )));
                     }
                 };
+                // Issue #510: the response attribute key, rendered from the
+                // PARSED stage so it is canonical rather than the text the
+                // user typed.
+                let display = match field {
+                    Some(FieldExpr::Field(f)) => format!("{op}({f})"),
+                    // `count()` takes no field; every other fieldless shape
+                    // returned above.
+                    _ => format!("{op}()"),
+                };
+                attr_contributors.push(AttrContributor::Aggregate(aggregates.len()));
                 aggregates.push(PlannedAggregate {
                     op: *op,
                     source,
                     cmp: *cmp,
                     threshold: aggregate_threshold(*op, field, value)?,
+                    display,
                 });
             }
             // Metrics functions are `/api/traces/v1/metrics/*`-only (issue
@@ -1549,7 +1631,9 @@ fn plan_pipeline(
         select_fields,
         group_by,
         coalesce,
-        post_stages,
+        attr_contributors,
+        active_by_keys,
+        coalesced_by_keys,
     })
 }
 
@@ -1892,7 +1976,14 @@ fn projection_value(
         } => match &probes[*probe_idx].pred {
             // The literal IS the matched value, so this class needs no
             // column at all — the read shape is byte-identical.
-            ValuePred::StringEq(v) => Some(ProjectionValue::ProbeLiteral(v.clone())),
+            ValuePred::StringEq(v) => Some(ProjectionValue::ProbeLiteral {
+                text: v.clone(),
+                literal_type: StoredType::String,
+            }),
+            ValuePred::BoolEq(b) => Some(ProjectionValue::ProbeLiteral {
+                text: b.to_string(),
+                literal_type: StoredType::Bool,
+            }),
             ValuePred::Regex(_)
             | ValuePred::Num { .. }
             | ValuePred::KeyExists
@@ -2278,7 +2369,9 @@ pub fn plan_search(
         aggregates: pipeline.aggregates,
         group_by: pipeline.group_by,
         coalesce: pipeline.coalesce,
-        post_stages: pipeline.post_stages,
+        attr_contributors: pipeline.attr_contributors,
+        active_by_keys: pipeline.active_by_keys,
+        coalesced_by_keys: pipeline.coalesced_by_keys,
         most_recent,
         by_probe_sql,
     })
@@ -2717,7 +2810,7 @@ mod tests {
             ProjectionValue::ParentIdHex => "value:parent-id",
             ProjectionValue::ScopeName => "value:scope-name",
             ProjectionValue::ScopeVersion => "value:scope-version",
-            ProjectionValue::ProbeLiteral(_) => "value:probe-literal",
+            ProjectionValue::ProbeLiteral { .. } => "value:probe-literal",
             ProjectionValue::ProbeValue { .. } => "value:probe-value",
             ProjectionValue::SelectValue { .. } => "value:select-value",
             ProjectionValue::NestedSet(_) => "value:nested-set",

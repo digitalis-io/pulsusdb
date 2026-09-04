@@ -2183,3 +2183,190 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 - **Disposition.** Deliberate, adjudicated on issue #477, and documented
   in docs/api.md §4.4 where the precedence rule is stated.
+
+### `traceql-spanset-aggregate-precedes-grouping` (issue #510) — **an aggregate value is the TRACE total where the reference's is the GROUP total**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** When a `by()` stage is written BEFORE an aggregate stage, our
+  aggregate is evaluated over the whole trace's matched spans and then the
+  result is partitioned, so every group's `count()` entry carries the
+  trace total. The reference evaluates the aggregate per group, and drops
+  groups that fail the comparison. The attribute's KEY, ARM and POSITION
+  in the list are the reference's; the VALUE, and in one shape the number
+  of span sets, are not.
+
+- **Observed**, one trace, spans `01`/`02` named `alpha` and `03` named
+  `beta`, both sides on the same OTLP bytes:
+
+  | query | reference | PulsusDB |
+  |---|---|---|
+  | `\| by(name) \| count() > 1` | ONE span set, `[by(name)=stringValue:alpha, count()=intValue:2]`, `matched 2`, spans `01,02` | TWO span sets, `[by(name)=stringValue:alpha, count()=intValue:3]` `matched 2` spans `01,02` and `[by(name)=stringValue:beta, count()=intValue:3]` `matched 1` span `03` |
+  | `\| by(name) \| count() > 1 \| coalesce()` | one flat span set, no `attributes` key, `matched 2`, spans `01,02` | one flat span set, no `attributes` key, `matched 3`, spans `01,02,03` |
+
+  and on the stacked corpus (`01`/`02`/`03` named `a` with status
+  ok/error/error, `04` named `b` status ok), for
+  `| by(name) | count() > 0 | by(status)`: both sides return the SAME
+  three span sets with the same memberships and the same key order —
+  `[by(name), count(), by(status)]` — and the reference's counts are
+  `3`/`3`/`1` where ours are `4`/`4`/`4`.
+
+- **Triage.** Gap, deliberately deferred. Stage evaluation ORDER is
+  issue #492 item 2 by ruling; issue #510 fixes what the response CARRIES
+  and does not move which stage runs first. Emitting the trace total is
+  self-consistent under today's engine — it is the number the filter
+  actually used — where emitting nothing would hide the stage the query
+  wrote.
+
+- **Disposition.** **Retires with #492 item 2.** Pinned live in BOTH
+  directions by `crates/pulsus-read/tests/traces_search_grouping_differential.rs`
+  fixtures `by_then_count`, `by_then_count_then_coalesce` and `by_agg_by`:
+  each carries the reference's own answer and ours as literals, and FAILS
+  IF THE TWO AGREE. So the day #492 item 2 lands, those three fixtures go
+  red and this row must be retired in the same change.
+
+### `traceql-spanset-aggregate-double-lexical-form` (issue #510) — **the same `f64` in the same arm, spelled differently**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** A `doubleValue` that our encoder and the reference's agree on
+  as an `f64` is rendered with different TEXT. Ours writes a trailing
+  `.0` on an integral value where the reference writes none, and the two
+  encoders switch to exponent form at different magnitudes.
+
+- **Observed.** `avg(.n)` over `3`, `5`, `7` comes back
+  `{"doubleValue":5}` on the reference and `{"doubleValue":5.0}` here;
+  `1e+16` against `10000000000000000` and `1e-6` against `0.000001` are
+  the same pair of differences at the band edges. Every one of them
+  parses to the same `f64` and decodes into the same field of the same
+  wire arm.
+
+- **Triage.** Ratify-documented-difference. This is a JSON number
+  encoder's formatting, not a value; a strict decoder puts both in the
+  same field. **Falsified by** a client that compares response bytes, or
+  one that refuses a JSON number in exponent form; none is known.
+
+- **Disposition.** No code change. The live differential compares the
+  parsed value and the ARM rather than the bytes
+  (`pulsus_read::wire_arm` renders `5.0_f64` as `5`), which is what keeps
+  this difference from failing a leg that is about typing.
+
+### `traceql-spanset-aggregate-mixed-type-attribute` (issue #510) — **the reference's `sum`/`avg` depend on which span arrived first; ours do not**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** With two spans carrying ONE attribute key at two different
+  stored types, the reference's running sum keeps the FIRST contributor's
+  type and silently drops every later value of another type, while its
+  mean divides that partial sum by the count of ALL contributors. The
+  same two values therefore give it four different answers depending on
+  arrival order. We sum every numeric contributor.
+
+- **Observed**, two traces holding the identical values `int 2` and
+  `double 3.5`, differing only in which span was pushed first, and
+  measured on a SEPARATE reference instance per order (one order cannot
+  show order dependence):
+
+  | push order | reference `sum(.v)` | reference `avg(.v)` | PulsusDB `sum(.v)` | PulsusDB `avg(.v)` |
+  |---|---|---|---|---|
+  | `int 2`, then `double 3.5` | `{"intValue":"2"}` | `{"doubleValue":1}` | `{"doubleValue":5.5}` | `{"doubleValue":2.75}` |
+  | `double 3.5`, then `int 2` | `{"doubleValue":3.5}` | `{"doubleValue":1.75}` | `{"doubleValue":5.5}` | `{"doubleValue":2.75}` |
+
+- **Triage.** The reference is WRONG here and we do not copy it — indexed
+  and explained as entry 23 of `docs/reference-defects-we-do-not-copy.md`
+  (tests **C** and **D**: a contributor is discarded with no error, and
+  no reading of "sum" supports omitting an operand).
+
+- **Disposition.** No arithmetic change. Exercised in BOTH orders by
+  `crates/pulsus-read/tests/traces_search_grouping_differential.rs`
+  fixtures `mixed_type_int_first_sum`, `mixed_type_float_first_sum`,
+  `mixed_type_int_first_avg` and `mixed_type_float_first_avg`; the
+  hermetic
+  `every_pinned_divergence_names_its_ledger_row_and_the_pair_is_complete`
+  in the same file fails if either order is dropped, because a single
+  order cannot show the defect.
+
+### `traceql-spanset-aggregate-string-attribute-contributes` (issue #510) — **a numeric-looking STRING contributes to a numeric aggregate here and not there**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** An attribute the sender stored as a `string` whose text
+  parses as a number (`"8080"`) is written with a non-null `val_num`, so
+  it contributes to `min`/`max`/`sum`/`avg(.attr)` here. The reference
+  types its comparison and does not aggregate it.
+
+- **Observed.** `{… && .sn = "8080"}` returns the span on both systems and
+  its projected value is `{"stringValue":"8080"}` on both; `by(.sn)`
+  groups it under `{"stringValue":"8080"}` on both. The divergence is in
+  the AGGREGATE arm only, and the same stored row is what causes it: our
+  `val_num` is `8080`, so `sum(.sn)` has a contributor there where the
+  reference has none.
+
+- **Triage.** Out of scope for issue #510, which changes what a response
+  CARRIES and not which spans MATCH. Excluding a numeric-looking string
+  from a numeric aggregate changes which traces come back, which is an
+  accept-surface change and belongs with the cross-type accept work
+  (`traceql-untyped-intrinsic-cross-type-operand` is the same family).
+
+- **Disposition.** Recorded, not fixed. The by-key and projection halves
+  are at parity and are pinned by the
+  `by_attr_numeric_string_and_absent` and `projected_string` fixtures;
+  the aggregate half has no fixture, deliberately, because pinning it
+  would freeze an accept divergence this issue did not decide.
+
+### `traceql-attribute-aggregate-float64-precision` (issue #510) — **an attribute aggregate is one digit out past 2^53, and what that bought**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** `min`/`max`/`sum`/`avg(.attr)` compute on `trace_attrs_idx`'s
+  `val_num`, which is `Nullable(Float64)`, so an integer attribute above
+  2^53 has already lost its last digits before any aggregate runs. The
+  by-key and projection paths do NOT have this defect: both render an
+  `int` from the exact stored `val` text.
+
+- **Observed.** One span carrying `big = 9007199254740993`, stored as
+  `val = '9007199254740993'`, `val_type = 'int'`,
+  `val_num = 9007199254740992`:
+
+  | query | reference | PulsusDB |
+  |---|---|---|
+  | `\| by(.big)` | `{"intValue":"9007199254740993"}` | `{"intValue":"9007199254740993"}` |
+  | `{… && .big = 9007199254740993}` (projected) | `{"intValue":"9007199254740993"}` | `{"intValue":"9007199254740993"}` |
+  | `\| max(.big) > 0` | `{"intValue":"9007199254740993"}` | `{"intValue":"9007199254740992"}` |
+
+- **Triage and THE COST THAT WAS DECLINED.** Ratify-documented-difference,
+  adjudicated on issue #510. Making the aggregate exact needs the exact
+  `val` TEXT in the NUMERIC read — an uncapped-per-row `String` column
+  added to the statement that also serves EVERY numeric attribute filter
+  leaf, on the read path, on the hop this project meters bytes over. The
+  alternative that was rejected is therefore not "a bit more work": it is
+  a permanent per-row byte cost on the hot numeric read, paid by every
+  query with a numeric attribute condition, to correct integer attributes
+  above 9 007 199 254 740 992 — a magnitude close to nonexistent in trace
+  data. A future reader revisiting this needs to weigh that column, not
+  just the digit.
+
+- **Disposition.** Recorded, not fixed. Pinned in both directions by the
+  `max_attr_beyond_2_53` fixture (which fails if the two ever agree) with
+  the exact by-key half beside it in `by_attr_int_beyond_2_53`.
+
+### `traceql-spanset-stacked-by-last-key-wins` — **WITHDRAWN before it was ever committed (issue #510)**
+
+- **What it would have said.** That two stacked `by()` stages group by the
+  LAST key on our side where the reference nests, and that the difference
+  was a divergence we accepted.
+
+- **Why it is not here.** It was measured, and the measurement made it a
+  DEFECT rather than a difference. On one trace — spans `01`/`02`/`03`
+  named `a` with status ok/error/error and `04` named `b` status ok —
+  `{…} | by(name) | count() > 0 | by(status)` returns **three** span sets
+  from the reference, one per distinct `(name, status)` pair, and returned
+  **two** here, one per `status`. So the answer was partitioned wrongly,
+  not merely labelled differently, and issue #510 fixes it: a `by()`
+  EXTENDS the active grouping key list, `coalesce()` clears it, and groups
+  are partitioned once by the composed tuple.
+
+- **Disposition.** No row. Recorded as a withdrawal, with the measurement
+  that retired it, so the reasoning is not re-derived from scratch by the
+  next reader. The corrected behaviour is pinned by the `by_agg_by`
+  fixture, whose group SET and key ORDER are the reference's.

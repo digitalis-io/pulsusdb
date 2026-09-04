@@ -333,7 +333,7 @@ async fn ours(engine: &TraceEngine, q: &str, window: (i64, i64)) -> BTreeMap<Str
             let mut attrs: Vec<(String, String)> = s
                 .attributes
                 .iter()
-                .map(|a| (a.key().to_string(), a.value().to_string()))
+                .map(|a| (a.key().to_string(), our_untyped_value(a.value())))
                 .collect();
             attrs.sort();
             map.insert(
@@ -467,11 +467,33 @@ fn reference(api_base: &str, q: &str) -> Option<BTreeMap<String, Projected>> {
     Some(map)
 }
 
+/// OUR projected value as the same TEXT [`untyped_value`] renders the
+/// reference's wire value to (issue #510 made the projected value typed).
+/// Both sides are flattened to text by construction, so this leg keeps
+/// comparing what it always compared — see [`untyped_value`] for where
+/// the typing is pinned instead.
+fn our_untyped_value(v: &pulsus_read::GroupValue) -> String {
+    match v {
+        pulsus_read::GroupValue::Str(s) => s.clone(),
+        pulsus_read::GroupValue::Int(i) => i.to_string(),
+        pulsus_read::GroupValue::Double(bits) => f64::from_bits(*bits).to_string(),
+        pulsus_read::GroupValue::Bool(b) => b.to_string(),
+        pulsus_read::GroupValue::Nil => String::new(),
+    }
+}
+
 /// The reference's attribute value as TEXT, whatever wire type carries
-/// it. Typing is a separate issue; this leg compares the KEY for every
-/// case and the VALUE only for the cases whose reference value is a
-/// `stringValue`, so this normalisation never hides a typing difference
-/// the value comparison would have caught.
+/// it. This leg compares the KEY for every case and the VALUE only for
+/// the cases whose reference value is a `stringValue`, so this
+/// normalisation never hides a typing difference the value comparison
+/// would have caught.
+///
+/// **The WIRE ARM is pinned elsewhere** (issue #510): the projected
+/// attribute's arm is compared type-tagged against the reference by the
+/// `projected_*` fixtures of
+/// `tests/traces_search_grouping_differential.rs`. This suite stays
+/// untyped on purpose — its own comparison is a multiset over five value
+/// SOURCES, and flattening keeps that comparison independent of the arm.
 fn untyped_value(v: &serde_json::Value) -> String {
     for field in ["stringValue", "intValue"] {
         if let Some(s) = v.get(field).and_then(|x| x.as_str()) {

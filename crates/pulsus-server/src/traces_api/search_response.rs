@@ -81,7 +81,7 @@
 use serde_json::{Value, json};
 
 use pulsus_read::{
-    GroupValue, PlanExplain, SearchOutput, SpanSetGroup, SpanSummary, TraceSearchResult,
+    GroupValue, PlanExplain, SearchOutput, SpanSetGroup, SpanSummary, TraceSearchResult, wire_arm,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -364,27 +364,55 @@ fn span_json(span: &SpanSummary, report: &mut DomainReport) -> Value {
         obj["durationNanos"] = Value::String(nanos.to_string());
     }
     if !span.attributes.is_empty() {
+        // Issue #510: through the SAME renderer the group keys and the
+        // aggregates use. This branch used to hard-code `stringValue`, so
+        // an int attribute came back `{"stringValue":"3"}` where the
+        // reference sends `{"intValue":"3"}`, a double came back
+        // `{"stringValue":"1.5"}`, a bool `{"stringValue":"true"}`, and a
+        // non-finite double `{"stringValue":"inf"}`.
         obj["attributes"] = Value::Array(
             span.attributes
                 .iter()
-                .map(|attr| json!({"key": attr.key(), "value": {"stringValue": attr.value()}}))
+                .map(|attr| json!({"key": attr.key(), "value": group_value_json(attr.value())}))
                 .collect(),
         );
     }
     obj
 }
 
-/// One `by()` group-key value → the reference's typed `value:{…}` object
-/// (issue #193). A `Double` renders from its `canonical_double_bits`
-/// pattern via `f64::from_bits`; `Nil` renders no value object (the span
-/// carried no value for this key).
+/// THE renderer for every typed response value (issues #193, #510) — a
+/// `by()` group-key value, an aggregate stage's own value, and a matched
+/// span's projected attribute all pass through here, so a wire arm can
+/// only be wrong in one place.
+///
+/// Two arms are the reference's own spellings and neither is what a
+/// straightforward encoder produces:
+///
+/// * **`Nil` is `{"stringValue":"nil"}`**, not JSON `null`. A span
+///   carrying no value for a `by()` key groups under the reference's
+///   literal `nil` marker; we emitted `null`, which a strict client
+///   decodes as an absent `AnyValue` rather than as the group it is.
+/// * **A NON-FINITE double is a JSON STRING inside the `doubleValue`
+///   arm** — `"NaN"`, `"Infinity"`, `"-Infinity"`. That is protojson's
+///   rule for a `double` field, and it is what the reference sends;
+///   `serde_json` renders an `f64::NAN` as `null`, which would have made
+///   the key vanish from the value object. Our own stored spellings
+///   (`inf`, `-inf`) normalise here, so they never reach the wire.
 fn group_value_json(value: &GroupValue) -> Value {
+    // The ARM is decided once, in `pulsus-read`, so the live differential
+    // that reads `GroupValue`s straight out of the engine compares the arm
+    // this encoder actually writes.
+    let (arm, text) = wire_arm(value);
     match value {
-        GroupValue::Str(s) => json!({ "stringValue": s }),
-        GroupValue::Int(i) => json!({ "intValue": i.to_string() }),
-        GroupValue::Double(bits) => json!({ "doubleValue": f64::from_bits(*bits) }),
-        GroupValue::Bool(b) => json!({ "boolValue": b }),
-        GroupValue::Nil => Value::Null,
+        // protojson writes a `bool` field as a JSON bool and a FINITE
+        // `double` as a JSON number; everything else in these five arms is
+        // a JSON string, including `intValue` (a `uint64`/`int64` field)
+        // and a non-finite `double`.
+        GroupValue::Bool(b) => json!({ arm: b }),
+        GroupValue::Double(bits) if f64::from_bits(*bits).is_finite() => {
+            json!({ arm: f64::from_bits(*bits) })
+        }
+        _ => json!({ arm: text }),
     }
 }
 
@@ -458,14 +486,32 @@ fn trace_json(trace: &TraceSearchResult, report: &mut DomainReport) -> Value {
             .iter()
             .map(|group| group_json(group, report))
             .collect::<Vec<_>>(),
-        None => vec![json!({
-            "matched": trace.matched,
-            "spans": trace
-                .spans
-                .iter()
-                .map(|span| span_json(span, report))
-                .collect::<Vec<_>>(),
-        })],
+        None => {
+            let mut set = json!({
+                "matched": trace.matched,
+                "spans": trace
+                    .spans
+                    .iter()
+                    .map(|span| span_json(span, report))
+                    .collect::<Vec<_>>(),
+            });
+            // Issue #510: an aggregate stage contributes its own
+            // `attributes` entry to the FLAT span set too. The key is
+            // OMITTED when the list is empty — which is every query with
+            // no aggregate, and every `| … | coalesce()` whose trailing
+            // stage cleared the contributors — so the default response
+            // stays byte-identical.
+            if !trace.attributes.is_empty() {
+                set["attributes"] = Value::Array(
+                    trace
+                        .attributes
+                        .iter()
+                        .map(|(key, value)| json!({"key": key, "value": group_value_json(value)}))
+                        .collect(),
+                );
+            }
+            vec![set]
+        }
     };
     let start = wire_nanos(
         trace.trace_start_ns,
@@ -641,10 +687,11 @@ mod tests {
                             scope: pulsus_traceql::AttrScope::Span,
                             key: "foo".to_string(),
                         },
-                        "bar".to_string(),
+                        GroupValue::Str("bar".to_string()),
                     )],
                 )],
                 groups: None,
+                attributes: Vec::new(),
             }],
             partial: true,
             returned: 1,
@@ -658,12 +705,17 @@ mod tests {
     /// a fixture cannot invent a key, only choose the field the key is
     /// derived from.
     fn projected(key: &str, value: &str) -> ProjectedAttribute {
+        projected_typed(key, GroupValue::Str(value.to_string()))
+    }
+
+    /// The same, with the wire arm chosen by the caller (issue #510).
+    fn projected_typed(key: &str, value: GroupValue) -> ProjectedAttribute {
         ProjectedAttribute::new(
             &pulsus_traceql::Field::Attribute {
                 scope: pulsus_traceql::AttrScope::Span,
                 key: key.to_string(),
             },
-            value.to_string(),
+            value,
         )
     }
 
@@ -837,7 +889,7 @@ mod tests {
                 let want: Vec<Value> = span
                     .attributes
                     .iter()
-                    .map(|a| json!({"key": a.key(), "value": {"stringValue": a.value()}}))
+                    .map(|a| json!({"key": a.key(), "value": group_value_json(a.value())}))
                     .collect();
                 assert_eq!(obj["attributes"], Value::Array(want));
             }
@@ -880,6 +932,17 @@ mod tests {
         }
     }
 
+    /// The fixture's own `stringValue` payload. Every entry in the
+    /// byte-cost fixture below is a string, which is what makes the `37`
+    /// frame exact; a typed arm would render a different frame, so the
+    /// panic keeps a future edit from silently changing the arithmetic.
+    fn string_payload_len(v: &GroupValue) -> usize {
+        match v {
+            GroupValue::Str(s) => s.len(),
+            other => panic!("the byte-cost fixture is stringValue-only, got {other:?}"),
+        }
+    }
+
     /// AC12 — the wire-cost identity of a projected attribute list.
     ///
     /// `,"attributes":[]` is 16 bytes, `{"key":"","value":{"stringValue":""}}`
@@ -888,6 +951,11 @@ mod tests {
     /// asserted for a flat span AND for a span inside a `by()` group,
     /// because the identity is per span and must not depend on the
     /// response shape.
+    ///
+    /// The 37 counts a `stringValue` frame (`{"key":"K","value":V}` is
+    /// `19 + K + V`, and `{"stringValue":""}` is 18). Issue #510 made the
+    /// projected value TYPED, so the other arms carry their own frames;
+    /// [`the_typed_arms_each_render_their_own_frame`] pins those.
     #[test]
     fn projected_attributes_cost_exactly_the_rendered_bytes() {
         let attrs = vec![
@@ -898,7 +966,7 @@ mod tests {
         let expected: usize = 16
             + attrs
                 .iter()
-                .map(|a| 37 + a.key().len() + a.value().len())
+                .map(|a| 37 + a.key().len() + string_payload_len(a.value()))
                 .sum::<usize>()
             + (attrs.len() - 1);
 
@@ -1254,6 +1322,7 @@ mod tests {
                     matched: 1,
                     spans: vec![],
                     groups: None,
+                    attributes: Vec::new(),
                 },
                 &mut DomainReport::default(),
             );
@@ -1419,6 +1488,7 @@ mod tests {
                     matched: 1,
                     spans: vec![],
                     groups: None,
+                    attributes: Vec::new(),
                 },
                 &mut DomainReport::default(),
             );
@@ -1654,6 +1724,7 @@ mod tests {
                     vec![],
                 )],
                 groups: None,
+                attributes: Vec::new(),
             }],
             partial: false,
             returned: 1,
@@ -2163,7 +2234,10 @@ mod tests {
     }
 
     /// Issue #193: numeric / double / bool / nil group-key values render
-    /// their reference-typed `value:{…}` objects.
+    /// their reference-typed `value:{…}` objects. Issue #510 corrected
+    /// the `Nil` arm: a span carrying no value for the key groups under
+    /// the reference's literal `{"stringValue":"nil"}` marker, not under
+    /// JSON `null`.
     #[test]
     fn grouped_output_renders_each_group_value_type() {
         let mut output = sample_output();
@@ -2172,7 +2246,7 @@ mod tests {
                 ("span.count".to_string(), GroupValue::Int(7)),
                 (
                     "span.ratio".to_string(),
-                    GroupValue::Double(pulsus_read::canonical_double_bits(1.5)),
+                    GroupValue::Double(1.5_f64.to_bits()),
                 ),
                 ("span.ok".to_string(), GroupValue::Bool(true)),
                 ("span.missing".to_string(), GroupValue::Nil),
@@ -2185,6 +2259,149 @@ mod tests {
         assert_eq!(attrs[0]["value"], serde_json::json!({"intValue": "7"}));
         assert_eq!(attrs[1]["value"], serde_json::json!({"doubleValue": 1.5}));
         assert_eq!(attrs[2]["value"], serde_json::json!({"boolValue": true}));
-        assert_eq!(attrs[3]["value"], serde_json::Value::Null);
+        assert_eq!(
+            attrs[3]["value"],
+            serde_json::json!({"stringValue": "nil"}),
+            "an absent by-key value is the reference's nil MARKER, not JSON null"
+        );
+    }
+
+    /// Issue #510: a non-finite double renders inside the `doubleValue`
+    /// arm as one of the reference's three literal STRINGS.
+    ///
+    /// `serde_json` renders an `f64::NAN` as `null`, so the key would have
+    /// vanished from the value object entirely — a strict client decodes
+    /// that as an unset `AnyValue`. Our own stored spellings (`inf`,
+    /// `-inf`) never reach the wire because the arm normalises here.
+    #[test]
+    fn a_non_finite_double_renders_the_reference_spelling() {
+        let cases: [(f64, &str); 3] = [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ];
+        let mut output = sample_output();
+        output.traces[0].groups = Some(vec![SpanSetGroup {
+            attributes: cases
+                .iter()
+                .map(|(f, _)| ("by(.f)".to_string(), GroupValue::Double(f.to_bits())))
+                .collect(),
+            matched: 1,
+            spans: vec![group_span(0x09, "z")],
+        }]);
+        let v = render(&output);
+        let attrs = &v["traces"][0]["spanSets"][0]["attributes"];
+        for (i, (_, want)) in cases.iter().enumerate() {
+            assert_eq!(
+                attrs[i]["value"],
+                serde_json::json!({ "doubleValue": want }),
+                "case {i}"
+            );
+        }
+        // …and the same renderer, on the same values, at the SPAN level.
+        let mut output = sample_output();
+        output.traces[0].spans = vec![SpanSummary::new(
+            [0x09; 8],
+            None,
+            1,
+            1,
+            cases
+                .iter()
+                .map(|(f, _)| projected_typed("f", GroupValue::Double(f.to_bits())))
+                .collect(),
+        )];
+        let v = render(&output);
+        let attrs = &v["traces"][0]["spanSets"][0]["spans"][0]["attributes"];
+        for (i, (_, want)) in cases.iter().enumerate() {
+            assert_eq!(
+                attrs[i]["value"],
+                serde_json::json!({ "doubleValue": want }),
+                "projected case {i}"
+            );
+        }
+    }
+
+    /// Issue #510: the FLAT span set carries an aggregate stage's
+    /// `attributes`, and OMITS the key when the list is empty.
+    ///
+    /// `get("attributes").is_none()` rather than a length check: an empty
+    /// array and an absent key are different bodies, and only the absent
+    /// one is the reference's answer to `| by(name) | count() > 1 |
+    /// coalesce()`.
+    #[test]
+    fn flat_span_set_omits_an_empty_attribute_list() {
+        let output = sample_output();
+        assert!(output.traces[0].attributes.is_empty());
+        let v = render(&output);
+        assert!(
+            v["traces"][0]["spanSets"][0].get("attributes").is_none(),
+            "a flat span set with no aggregate stage writes no attributes key: {v}"
+        );
+
+        let mut output = sample_output();
+        output.traces[0].attributes = vec![
+            ("count()".to_string(), GroupValue::Int(3)),
+            (
+                "max(duration)".to_string(),
+                GroupValue::Str("3s".to_string()),
+            ),
+        ];
+        let v = render(&output);
+        let attrs = &v["traces"][0]["spanSets"][0]["attributes"];
+        assert_eq!(
+            attrs[0],
+            serde_json::json!({"key": "count()", "value": {"intValue": "3"}})
+        );
+        assert_eq!(
+            attrs[1],
+            serde_json::json!({"key": "max(duration)", "value": {"stringValue": "3s"}})
+        );
+    }
+
+    /// Issue #510: a PROJECTED span attribute renders through the same
+    /// value renderer the group keys and the aggregates use — one arm
+    /// decision for all three surfaces.
+    ///
+    /// The `string` case is in the list on purpose: it is the one that
+    /// stays green when the renderer hard-codes `stringValue`, so its
+    /// presence beside the four typed cases is what shows the other four
+    /// are discriminating.
+    #[test]
+    fn a_projected_attribute_renders_through_the_shared_value_renderer() {
+        let cases: [(GroupValue, serde_json::Value); 5] = [
+            (GroupValue::Int(3), serde_json::json!({"intValue": "3"})),
+            (
+                GroupValue::Int(9_007_199_254_740_993),
+                serde_json::json!({"intValue": "9007199254740993"}),
+            ),
+            (
+                GroupValue::Double(1.5_f64.to_bits()),
+                serde_json::json!({"doubleValue": 1.5}),
+            ),
+            (
+                GroupValue::Bool(true),
+                serde_json::json!({"boolValue": true}),
+            ),
+            (
+                GroupValue::Str("8080".to_string()),
+                serde_json::json!({"stringValue": "8080"}),
+            ),
+        ];
+        let mut output = sample_output();
+        output.traces[0].spans = vec![SpanSummary::new(
+            [0x09; 8],
+            None,
+            1,
+            1,
+            cases
+                .iter()
+                .map(|(v, _)| projected_typed("v", v.clone()))
+                .collect(),
+        )];
+        let v = render(&output);
+        let attrs = &v["traces"][0]["spanSets"][0]["spans"][0]["attributes"];
+        for (i, (_, want)) in cases.iter().enumerate() {
+            assert_eq!(attrs[i]["value"], *want, "case {i}");
+        }
     }
 }

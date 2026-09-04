@@ -99,6 +99,21 @@ const PROBED_SUBJECTS: &[&str] = &[
     "TraceSearchResult",
 ];
 
+/// The `pulsus_read` names the renderer imports that are NOT subject
+/// types, so there is nothing for the serialisation probe to ask about.
+///
+/// **A carve-out is where a defect hides**, so this list is not taken on
+/// trust: the test coerces each entry to a `fn` pointer of its declared
+/// signature, and a TYPE cannot be coerced to one. Parking a subject type
+/// here to dodge the probe does not compile.
+///
+/// `wire_arm` joined on issue #510. It is the one place a typed response
+/// value's WIRE ARM is decided — group keys, aggregate values and
+/// projected span attributes all render through it — and it lives in
+/// `pulsus-read` so the live differential, which reads `GroupValue`s
+/// straight out of the engine, compares the arm this renderer writes.
+const PINNED_NON_TYPE_IMPORTS: &[&str] = &["wire_arm"];
+
 fn read(rel: &str) -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"))
@@ -750,13 +765,31 @@ fn the_renderer_subject_types_do_not_implement_serde_serialize() {
          — every `{CRATE}` token a production item emits must be one this walk interpreted",
         mention_contexts.len()
     );
+    // The renderer's imported names split into the subject TYPES the
+    // probe interrogates and the non-type items it cannot. Both lists are
+    // pinned and their union must be exactly what the walk derived, so a
+    // new import is a red test rather than an unprobed subject.
+    let mut accounted: Vec<String> = PROBED_SUBJECTS
+        .iter()
+        .chain(PINNED_NON_TYPE_IMPORTS)
+        .map(|s| s.to_string())
+        .collect();
+    accounted.sort();
     assert_eq!(
-        derived,
-        PROBED_SUBJECTS
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>(),
-        "derived={derived:?} probed={PROBED_SUBJECTS:?} subject_set_matches=false"
+        derived, accounted,
+        "derived={derived:?} probed={PROBED_SUBJECTS:?} non_types={PINNED_NON_TYPE_IMPORTS:?}          subject_set_matches=false"
+    );
+    // Each non-type entry IS an item that can be coerced to a function
+    // pointer of its declared signature — which a type cannot be, so the
+    // carve-out cannot hide a subject type.
+    /// The one signature a non-type entry must coerce to. A TYPE has no
+    /// such coercion, which is what makes the carve-out checked.
+    type WireArmFn = fn(&pulsus_read::GroupValue) -> (&'static str, String);
+    let non_type_probes: Vec<(&str, WireArmFn)> = vec![("wire_arm", pulsus_read::wire_arm)];
+    assert_eq!(
+        non_type_probes.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        PINNED_NON_TYPE_IMPORTS.to_vec(),
+        "every non-type import must be coerced here, or the carve-out is unchecked"
     );
 
     // The probe's own controls, so a derivation that answers `false` for

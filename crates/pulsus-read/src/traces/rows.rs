@@ -91,13 +91,44 @@ pub struct NumValueRow {
     pub v: Option<f64>,
 }
 
-/// One string attribute value row (`search_sql::attr_values_sql` with
-/// `numeric = false`).
+/// One string attribute value row (`search_sql::event_set_sql`, and the
+/// pre-#510 shape of the value reads).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct StrValueRow {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub v: String,
+}
+
+/// One numeric attribute value row carrying the STORED OTLP kind
+/// (`search_sql::attr_values_sql` with `numeric = true`, issue #510).
+///
+/// A separate type rather than a field added to [`NumValueRow`]:
+/// RowBinary decoding is positional, and `NumValueRow` also decodes
+/// `search_sql::event_set_sql`, whose three-column projection issue #510
+/// deliberately does not move. `t` is positionally LAST, matching the
+/// builder's SELECT list.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct TypedNumValueRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub v: Option<f64>,
+    pub t: String,
+}
+
+/// One string attribute value row carrying the STORED OTLP kind
+/// (`search_sql::attr_values_sql` with `numeric = false`, and
+/// `search_sql::membership_sql` with `with_value = true` — issue #510).
+///
+/// A separate type for the same reason [`TypedNumValueRow`] is one:
+/// [`StrValueRow`] still decodes the three-column `event_set_sql`
+/// projection.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct TypedStrValueRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub v: String,
+    pub t: String,
 }
 
 /// One winners' root-hydration row (`search_sql::root_sql`).

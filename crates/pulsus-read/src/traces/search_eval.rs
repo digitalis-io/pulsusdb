@@ -66,9 +66,9 @@ use pulsus_traceql::{
 use super::exec::ByteBudget;
 use super::filter::{BoolMatch, NestedSetField, SetSide};
 use super::search_plan::{
-    AggSource, GroupKeyResolver, PhysicalEval, PhysicalSelect, PlannedArith, PlannedBoolTerm,
-    PlannedFilter, PlannedGroupKey, PlannedLeafEval, PlannedOperand, ProjectionGroup,
-    ProjectionTarget, ProjectionValue, SearchPlan, SpansetStage, TraceCtxEval, WireKey,
+    AggSource, AttrContributor, GroupKeyResolver, PhysicalEval, PhysicalSelect, PlannedArith,
+    PlannedBoolTerm, PlannedFilter, PlannedGroupKey, PlannedLeafEval, PlannedOperand,
+    ProjectionGroup, ProjectionTarget, ProjectionValue, SearchPlan, TraceCtxEval, WireKey,
 };
 use crate::logql::error::{ReadError, TooBroadReason};
 
@@ -118,7 +118,10 @@ pub type SpanKey = ([u8; 16], [u8; 8]);
 #[derive(Debug)]
 pub enum ProbeMembership {
     Keys(HashSet<SpanKey>),
-    Values(HashMap<SpanKey, String>),
+    /// The fused value AND the OTLP kind the sender stored it as (issue
+    /// #510) — the projection renders the value in that arm rather than
+    /// as a string.
+    Values(HashMap<SpanKey, (String, StoredType)>),
 }
 
 impl ProbeMembership {
@@ -129,11 +132,138 @@ impl ProbeMembership {
         }
     }
 
-    /// The matched value, when this probe fused one.
-    pub fn value(&self, key: &SpanKey) -> Option<&str> {
+    /// The matched value and its stored type, when this probe fused one.
+    pub fn value(&self, key: &SpanKey) -> Option<(&str, StoredType)> {
         match self {
             ProbeMembership::Keys(_) => None,
-            ProbeMembership::Values(map) => map.get(key).map(String::as_str),
+            ProbeMembership::Values(map) => map.get(key).map(|(v, t)| (v.as_str(), *t)),
+        }
+    }
+}
+
+/// One stored attribute's OTLP kind, as `trace_attrs_idx.val_type`
+/// carries it (issue #510).
+///
+/// `Unknown` is the empty string a row written before that column existed
+/// reads back as: the type cannot be recovered from what is stored (`val`
+/// is the text and `val_num` is a parse of that text), so those rows keep
+/// the pre-change rendering rule. The four named spellings are the
+/// writer's own — `pulsus_write::ingest::traces::AttrValueType::as_str` —
+/// and `tests/traces_stored_type_seal.rs` seals them against it with an
+/// exhaustive match, so a new writer variant is a compile error rather
+/// than an untested path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StoredType {
+    String,
+    Int,
+    Float,
+    Bool,
+    #[default]
+    Unknown,
+}
+
+impl StoredType {
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "string" => StoredType::String,
+            "int" => StoredType::Int,
+            "float" => StoredType::Float,
+            "bool" => StoredType::Bool,
+            _ => StoredType::Unknown,
+        }
+    }
+}
+
+/// THE one place a stored attribute becomes a typed response value
+/// (issue #510) — group keys, aggregate arguments and projected span
+/// attributes all decide their wire arm here, so an arm can only be
+/// wrong in ONE place.
+///
+/// `text` is the exact stored `val`; `num` is the `val_num` reading,
+/// absent for a non-finite value (the numeric read carries
+/// `isNotNull(val_num)` and ClickHouse stores `NaN`/`±inf` as NULL there)
+/// and for a non-numeric one. An `int` renders from `text`, so a value
+/// beyond 2^53 keeps its digits where `val_num` has already rounded them;
+/// a `float` with no `num` parses `text` (`"NaN"`, `"inf"`, `"-inf"`,
+/// `"-0"` all parse), which is what stops a non-finite value falling to
+/// the string arm.
+///
+/// Returns a BORROWED arm rather than an owned [`GroupValue`] so every
+/// caller can charge the exact retained payload before the clone happens
+/// — the module's charge-before-allocate contract. The arm DECISION is
+/// still this one match; [`AttrArm::into_value`] is a 1:1 mapping with no
+/// decision in it.
+pub(crate) fn typed_attr_value<'a>(
+    t: StoredType,
+    num: Option<f64>,
+    text: Option<&'a str>,
+) -> AttrArm<'a> {
+    match (t, text, num) {
+        (_, None, None) => AttrArm::Nil,
+        (StoredType::Int, Some(text), num) => AttrArm::Int(
+            text.parse::<i64>()
+                .unwrap_or_else(|_| num.unwrap_or(0.0) as i64),
+        ),
+        (StoredType::Int, None, Some(num)) => AttrArm::Int(num as i64),
+        (StoredType::Float, _, Some(num)) => AttrArm::Double(num.to_bits()),
+        (StoredType::Float, Some(text), None) => {
+            AttrArm::Double(text.parse::<f64>().unwrap_or(f64::NAN).to_bits())
+        }
+        (StoredType::Bool, Some(text), _) => AttrArm::Bool(text == "true"),
+        (StoredType::Bool, None, Some(num)) => AttrArm::Bool(num != 0.0),
+        (StoredType::String, Some(text), _) => AttrArm::Text(text),
+        (StoredType::String, None, Some(num)) => AttrArm::Double(num.to_bits()),
+        // A row written before `val_type` existed: the type is not
+        // recoverable from what is stored, so these rows keep the
+        // pre-#510 rule — a numeric reading renders `doubleValue`,
+        // otherwise the stored text renders `stringValue`.
+        (StoredType::Unknown, _, Some(num)) => AttrArm::Double(num.to_bits()),
+        (StoredType::Unknown, Some(text), None) => AttrArm::Text(text),
+    }
+}
+
+/// One stored attribute's decided wire arm, still borrowing its text
+/// (issue #510) — see [`typed_attr_value`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum AttrArm<'a> {
+    Text(&'a str),
+    Int(i64),
+    /// The raw `f64` bit pattern — NOT [`group_double_bits`]: an aggregate
+    /// value is not a group key, and a group key's own NaN fold is applied
+    /// by the grouping path, not here.
+    Double(u64),
+    Bool(bool),
+    Nil,
+}
+
+impl AttrArm<'_> {
+    /// The retained payload this arm will own once materialised — the
+    /// amount a caller charges BEFORE calling [`Self::into_value`].
+    pub(crate) fn payload_bytes(&self) -> usize {
+        match self {
+            AttrArm::Text(s) => s.len(),
+            _ => 0,
+        }
+    }
+
+    /// The owned response value. A 1:1 mapping — no arm decision.
+    pub(crate) fn into_value(self) -> GroupValue {
+        match self {
+            AttrArm::Text(s) => GroupValue::Str(s.to_string()),
+            AttrArm::Int(i) => GroupValue::Int(i),
+            AttrArm::Double(bits) => GroupValue::Double(bits),
+            AttrArm::Bool(b) => GroupValue::Bool(b),
+            AttrArm::Nil => GroupValue::Nil,
+        }
+    }
+
+    /// The same value with a DOUBLE canonicalised for group IDENTITY
+    /// (issue #510): only NaN folds — `-0.0` and `+0.0` stay two groups,
+    /// which is what the reference returns.
+    pub(crate) fn into_group_value(self) -> GroupValue {
+        match self {
+            AttrArm::Double(bits) => GroupValue::Double(group_double_bits(f64::from_bits(bits))),
+            other => other.into_value(),
         }
     }
 }
@@ -142,7 +272,16 @@ impl ProbeMembership {
 pub struct BatchAttrs {
     pub membership: Vec<ProbeMembership>,
     pub agg_values: Vec<HashMap<SpanKey, f64>>,
+    /// The stored OTLP kind of each `agg_values` reading (issue #510),
+    /// index-aligned with `agg_values`. A non-finite value has NO entry in
+    /// either map — the numeric read filters on `isNotNull(val_num)` —
+    /// which is why the by-key path reads the type from `select_types`
+    /// first.
+    pub agg_types: Vec<HashMap<SpanKey, StoredType>>,
     pub select_values: Vec<HashMap<SpanKey, String>>,
+    /// The stored OTLP kind of each `select_values` reading (issue #510),
+    /// index-aligned with `select_values`.
+    pub select_types: Vec<HashMap<SpanKey, StoredType>>,
     /// Per-span MULTI-VALUED event/link value sets (issue #351),
     /// index-aligned with the plan's `event_sets`
     /// (`search_sql::event_set_sql`). Empty for every query that does not
@@ -234,11 +373,17 @@ struct EvalEnv<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedAttribute {
     key: WireKey,
-    value: String,
+    /// The TYPED value (issue #510). It used to be a `String`, which made
+    /// the renderer hard-code `stringValue` for every projected attribute
+    /// — an int came back `{"stringValue":"3"}` where the reference sends
+    /// `{"intValue":"3"}`. Carrying a [`GroupValue`] routes this surface
+    /// through the SAME `group_value_json` the group keys and the
+    /// aggregates use, so the arm cannot be decided differently here.
+    value: GroupValue,
 }
 
 impl ProjectedAttribute {
-    pub fn new(field: &Field, value: String) -> Self {
+    pub fn new(field: &Field, value: GroupValue) -> Self {
         ProjectedAttribute {
             key: WireKey::new(field),
             value,
@@ -249,14 +394,16 @@ impl ProjectedAttribute {
         self.key.as_str()
     }
 
-    pub fn value(&self) -> &str {
+    pub fn value(&self) -> &GroupValue {
         &self.value
     }
 
-    /// `key.len() + value.len()` — the term [`SpanSummary::heap_payload_bytes`]
-    /// adds and [`build_summary`] charges BEFORE the pair is built.
+    /// `key.len() + value.payload_bytes()` — the term
+    /// [`SpanSummary::heap_payload_bytes`] adds and [`build_summary`]
+    /// charges BEFORE the pair is built. A numeric or boolean value owns
+    /// no heap payload, so its term is the key alone (issue #510).
     pub fn heap_bytes(&self) -> usize {
-        self.key.as_str().len() + self.value.len()
+        self.key.as_str().len() + self.value.payload_bytes()
     }
 }
 
@@ -331,36 +478,110 @@ impl SpanSummary {
 }
 
 /// The canonical NaN bit pattern all NaN group keys collapse onto (issue
-/// #193 R2-F2): grouping is value-parity-correct, not sensitive to NaN
-/// payloads or the sign of zero.
+/// #193 R2-F2).
 const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
 
-/// Canonicalizes an `f64` to the bit pattern a [`GroupValue::Double`]
-/// stores (issue #193 R2-F2): every NaN collapses to one group, and
-/// `-0.0` folds to `+0.0`, so `Eq`/`Hash` grouping matches the reference's
-/// value semantics. The differential is the authority; this is the
-/// mechanism.
-pub fn canonical_double_bits(f: f64) -> u64 {
+/// The WIRE ARM one typed response value renders into, and that value as
+/// text (issue #510).
+///
+/// **One decision, three surfaces, two crates.** The server's
+/// `group_value_json` builds its JSON object from this arm, and the live
+/// grouping differential — which reads [`GroupValue`]s straight out of
+/// the engine, one crate below the encoder — builds its type-tagged
+/// comparison token from the same call. Two spellings of "which arm" was
+/// the defect issue #510 exists to remove; a differential carrying its
+/// own copy would compare text the wire never sends.
+///
+/// The TEXT is the value's own rendering, not the JSON encoder's: a
+/// finite double comes back as `5` where our encoder writes `5.0`. That
+/// lexical difference is a ledger row
+/// (`traceql-spanset-aggregate-double-lexical-form`), and keeping it out
+/// of the token is what lets the differential compare arms and values
+/// without failing on it.
+///
+/// `Nil` is `("stringValue", "nil")`: the reference groups a span
+/// carrying no value for a `by()` key under that literal marker, not
+/// under a null.
+pub fn wire_arm(value: &GroupValue) -> (&'static str, String) {
+    match value {
+        GroupValue::Str(s) => ("stringValue", s.clone()),
+        GroupValue::Int(i) => ("intValue", i.to_string()),
+        GroupValue::Double(bits) => {
+            let f = f64::from_bits(*bits);
+            (
+                "doubleValue",
+                match non_finite_double_spelling(f) {
+                    Some(spelling) => spelling.to_string(),
+                    None => f.to_string(),
+                },
+            )
+        }
+        GroupValue::Bool(b) => ("boolValue", b.to_string()),
+        GroupValue::Nil => ("stringValue", "nil".to_string()),
+    }
+}
+
+/// The reference's spelling of a NON-FINITE double inside the
+/// `doubleValue` arm (issue #510), or `None` when the value is finite.
+///
+/// protojson renders a `double` field's NaN and infinities as these three
+/// literal JSON STRINGS, and the reference sends exactly them —
+/// `{"doubleValue":"NaN"}`, `{"doubleValue":"Infinity"}`,
+/// `{"doubleValue":"-Infinity"}`. Our own stored spellings are Rust's
+/// (`NaN`, `inf`, `-inf`), so the normalisation happens here and `inf`
+/// never reaches the wire.
+///
+/// **In `pulsus-read` rather than beside the renderer** so the response
+/// encoder and the live differential — which reads [`GroupValue`]s
+/// straight out of the engine, one crate below the encoder — spell a
+/// non-finite value the same way. Two spellings would have made the
+/// differential compare text the wire never carries.
+pub fn non_finite_double_spelling(f: f64) -> Option<&'static str> {
+    if f.is_finite() {
+        None
+    } else if f.is_nan() {
+        Some("NaN")
+    } else if f.is_sign_positive() {
+        Some("Infinity")
+    } else {
+        Some("-Infinity")
+    }
+}
+
+/// The bit pattern a double GROUP KEY is identified by (issue #510).
+///
+/// Group identity is the RAW bit pattern with NaN alone canonicalised.
+/// `-0.0` and `+0.0` are DIFFERENT groups, which is what the reference
+/// returns: measured on three spans carrying `-0.0`, `+0.0`, `-0.0`, it
+/// answers two span sets (`{"doubleValue":0}` over span 02 and
+/// `{"doubleValue":-0}` over spans 01 and 03) where the pre-#510 fold gave
+/// one span set of three. The NaN fold stays, and it is UNOBSERVABLE end
+/// to end — the wire format carries one NaN spelling, so no payload
+/// difference can reach a response — which is why it is not claimed as
+/// reference parity in either direction.
+///
+/// Only GROUPING calls this. An aggregate value is not a group key: it
+/// keeps its raw bits, so a `-0.0` sum renders `-0` and not `0`.
+pub(crate) fn group_double_bits(f: f64) -> u64 {
     if f.is_nan() {
         CANONICAL_NAN_BITS
-    } else if f == 0.0 {
-        // Folds -0.0 → +0.0 (0.0 == -0.0 is true).
-        0.0_f64.to_bits()
     } else {
         f.to_bits()
     }
 }
 
-/// One `by()` group-key value, typed to the reference's
-/// `value:{stringValue|intValue|doubleValue|boolValue}` rendering (issue
-/// #193). The float variant stores [`canonical_double_bits`] so the derived
-/// `Eq`/`Hash` hold and `-0.0`/NaN group as the reference groups them.
+/// One typed response value — a `by()` group-key value, an aggregate's
+/// own value, or a matched span's projected attribute (issues #193,
+/// #510) — rendering to the reference's
+/// `value:{stringValue|intValue|doubleValue|boolValue}` arms.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GroupValue {
     Str(String),
     Int(i64),
-    /// A double group key as its [`canonical_double_bits`] pattern; render
-    /// via `f64::from_bits`.
+    /// A double as its `f64` bit pattern; render via `f64::from_bits`.
+    /// A GROUP KEY's pattern comes from [`group_double_bits`] (NaN
+    /// folded, sign of zero kept); an aggregate's and a projected
+    /// attribute's are raw.
     Double(u64),
     Bool(bool),
     /// The span carried no value for this key (grouped into the nil bucket).
@@ -444,6 +665,14 @@ pub struct TraceMatch {
     /// stage is active and not collapsed by a trailing `coalesce()`; the
     /// default (`None`) keeps the flat response byte-identical.
     pub groups: Option<Vec<SpanSetGroup>>,
+    /// The FLAT span set's response `attributes`, in pipeline order
+    /// (issue #510). Empty unless an aggregate stage survives the last
+    /// `coalesce()` while no `by()` grouping is active — so a query with
+    /// neither stage keeps the flat response byte-identical, and
+    /// `| by(name) | count() > 1 | coalesce()` emits no `attributes` key
+    /// at all while `| by(name) | coalesce() | count() > 1` emits
+    /// `[count()]`. Both are the reference's, measured.
+    pub attributes: Vec<(String, GroupValue)>,
 }
 
 impl TraceMatch {
@@ -466,7 +695,25 @@ impl TraceMatch {
                 .as_deref()
                 .map(groups_retained_bytes)
                 .unwrap_or(0)
+            + flat_attributes_retained_bytes(&self.attributes)
     }
+}
+
+/// The retained heap of a FLAT span set's `attributes` (issue #510),
+/// accounted exactly like [`SpanSetGroup`]'s: the enclosing `Vec` slot at
+/// its capacity plus each pair's display bytes and value payload. Zero
+/// for the empty list every non-aggregate query carries, so the default
+/// response's accounting is unchanged.
+pub(crate) fn flat_attributes_retained_bytes(attributes: &[(String, GroupValue)]) -> usize {
+    if attributes.is_empty() {
+        return 0;
+    }
+    super::exec::RETAINED_ENTRY_OVERHEAD
+        + std::mem::size_of_val(attributes)
+        + attributes
+            .iter()
+            .map(|(display, value)| display.len() + value.payload_bytes())
+            .sum::<usize>()
 }
 
 /// A `by()` group-key value tuple (issue #193) — one [`GroupValue`] per
@@ -1942,41 +2189,138 @@ fn union_sets(
     Ok(union)
 }
 
+/// One aggregate stage's result for one trace (issue #510).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AggregateOutcome {
+    /// The scalar the threshold comparison uses — the SAME value and the
+    /// SAME comparison as before issue #510.
+    pub(crate) scalar: f64,
+    /// The typed value the response attribute carries.
+    pub(crate) wire: GroupValue,
+}
+
+/// One aggregate stage's scalar AND the typed value its response
+/// attribute carries (issue #510).
+///
+/// The wire type follows the aggregate's own type, measured against the
+/// reference: `count()` is an `intValue`; the four duration forms are Go
+/// `time.Duration.String()` `stringValue`s, and `avg(duration)` is a
+/// TRUNCATING integer nanosecond division (6 500 000 000 / 3 renders
+/// `2.166666666s`, not `2.1666666666666665s`); `min`/`max(.attr)` take the
+/// WINNING contributor's own type; `sum(.attr)` is an `intValue` iff every
+/// contributor is stored `int`; `avg(.attr)` is always a `doubleValue`.
+///
+/// **Where we deliberately differ.** With two spans carrying one key at
+/// different stored types the reference's running sum keeps the first
+/// contributor's type and silently DROPS every later value of another
+/// type, while its mean divides that partial sum by the count of ALL
+/// contributors — so the same two values give it four answers depending
+/// on arrival order. We sum every numeric contributor. Ledger row
+/// `traceql-spanset-aggregate-mixed-type-attribute`, and entry 23 of
+/// docs/reference-defects-we-do-not-copy.md.
 fn aggregate_value(
     agg: &super::search_plan::PlannedAggregate,
     trace: &TraceSpans,
     matched: &HashSet<[u8; 8]>,
     attrs: &BatchAttrs,
-) -> Option<f64> {
-    let values: Vec<f64> = match &agg.source {
-        AggSource::Count => return Some(matched.len() as f64),
+) -> Option<AggregateOutcome> {
+    // Each contributor's value and, for an attribute source, the OTLP
+    // kind it was stored as. A duration contributor has no stored type;
+    // it never reaches the type-driven arms below.
+    let values: Vec<(f64, StoredType)> = match &agg.source {
+        AggSource::Count => {
+            let n = matched.len();
+            return Some(AggregateOutcome {
+                scalar: n as f64,
+                wire: GroupValue::Int(n as i64),
+            });
+        }
         AggSource::DurationNs => trace
             .spans
             .iter()
             .filter(|s| matched.contains(&s.span_id))
-            .map(|s| s.duration_ns as f64)
+            .map(|s| (s.duration_ns as f64, StoredType::Unknown))
             .collect(),
         AggSource::Attr { field_idx } => trace
             .spans
             .iter()
             .filter(|s| matched.contains(&s.span_id))
             .filter_map(|s| {
-                attrs.agg_values[*field_idx]
-                    .get(&(trace.trace_id, s.span_id))
+                let key = (trace.trace_id, s.span_id);
+                let v = attrs.agg_values[*field_idx].get(&key).copied()?;
+                let t = attrs.agg_types[*field_idx]
+                    .get(&key)
                     .copied()
+                    .unwrap_or_default();
+                Some((v, t))
             })
             .collect(),
     };
     if values.is_empty() {
         return None;
     }
-    Some(match agg.op {
-        AggregateOp::Count => values.len() as f64,
-        AggregateOp::Sum => values.iter().sum(),
-        AggregateOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
-        AggregateOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
-        AggregateOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-    })
+    // The min/max WINNER — the first contributor at the extreme, so a tie
+    // takes the earlier span's type, matching the fold below.
+    let winner = |better: fn(f64, f64) -> bool| -> (f64, StoredType) {
+        let mut best = values[0];
+        for &(v, t) in &values[1..] {
+            if better(v, best.0) {
+                best = (v, t);
+            }
+        }
+        best
+    };
+    let (scalar, winner_type) = match agg.op {
+        AggregateOp::Count => (values.len() as f64, StoredType::Unknown),
+        AggregateOp::Sum => (values.iter().map(|(v, _)| *v).sum(), StoredType::Unknown),
+        AggregateOp::Avg => (
+            values.iter().map(|(v, _)| *v).sum::<f64>() / values.len() as f64,
+            StoredType::Unknown,
+        ),
+        AggregateOp::Min => {
+            let (v, t) = winner(|a, b| a < b);
+            (v, t)
+        }
+        AggregateOp::Max => {
+            let (v, t) = winner(|a, b| a > b);
+            (v, t)
+        }
+    };
+    // An integer SUM needs EVERY contributor to be stored `int` — one
+    // double contributor makes the sum a double. A row written before
+    // `val_type` existed has an unrecoverable type and counts as not-int.
+    let all_int = values.iter().all(|(_, t)| *t == StoredType::Int);
+    let wire = match &agg.source {
+        // Returned above; this arm is unreachable.
+        AggSource::Count => GroupValue::Int(values.len() as i64),
+        AggSource::DurationNs => {
+            // Integer nanosecond arithmetic, so `avg` TRUNCATES the way the
+            // reference's does: it sums `time.Duration`s and divides by the
+            // contributor count in whole nanoseconds. 6 500 000 000 / 3
+            // renders `2.166666666s`; the `f64` division would render
+            // `2.1666666666666665s`.
+            let nanos: i64 = match agg.op {
+                AggregateOp::Avg => {
+                    let sum: i64 = values.iter().map(|(v, _)| *v as i64).sum();
+                    sum / values.len() as i64
+                }
+                _ => scalar as i64,
+            };
+            GroupValue::Str(go_duration_string(nanos))
+        }
+        AggSource::Attr { .. } => match agg.op {
+            // The WINNING contributor's own type.
+            AggregateOp::Min | AggregateOp::Max if winner_type == StoredType::Int => {
+                GroupValue::Int(scalar as i64)
+            }
+            AggregateOp::Sum if all_int => GroupValue::Int(scalar as i64),
+            // `avg` is always a double, and a mixed-type or float sum is
+            // too. `to_bits()` is RAW — an aggregate value is not a group
+            // key, so a `-0.0` sum keeps its sign.
+            _ => GroupValue::Double(scalar.to_bits()),
+        },
+    };
+    Some(AggregateOutcome { scalar, wire })
 }
 
 /// Renders a stored status code back to its TraceQL keyword (the same
@@ -2071,24 +2415,57 @@ fn resolve_projection<'a>(
             ProjectionValue::Kind => Some(ProjectedValue::Borrowed(kind_keyword(span.kind))),
             // A scalar render, bounded by construction (16 hex bytes).
             ProjectionValue::ParentIdHex => Some(ProjectedValue::Owned(hex_lower(&span.parent_id))),
-            ProjectionValue::ProbeLiteral(v) => Some(ProjectedValue::Borrowed(v.as_str())),
+            // The query's OWN literal — no column is read, so the arm
+            // comes from the LITERAL's type. A boolean condition
+            // (`{… && .b = true}`) projects `{"boolValue":true}`, which
+            // the reference sends and which a `stringValue` rendering got
+            // wrong; a string condition projects `{"stringValue":"…"}`.
+            //
+            // A STRING literal compared against a typed attribute is the
+            // one shape where the literal's type and the stored type can
+            // disagree, and it has no parity target to get wrong:
+            // `{… && .big = "9007199254740993"}` and `{… && .v = "2"}`
+            // both return zero traces on the reference while we return
+            // the trace, so the accept surfaces have already parted
+            // (pre-existing, out of scope here).
+            ProjectionValue::ProbeLiteral { text, literal_type } => Some(ProjectedValue::Typed(
+                typed_attr_value(*literal_type, None, Some(text.as_str())),
+            )),
+            // Issue #510: the fused membership read now carries the stored
+            // type beside the value, so the projection renders the arm the
+            // sender stored rather than always `stringValue`.
             ProjectionValue::ProbeValue { probe_idx } => env
                 .attrs
                 .membership
                 .get(*probe_idx)
                 .and_then(|m| m.value(&key))
-                .map(ProjectedValue::Borrowed),
+                .map(|(v, t)| ProjectedValue::Typed(typed_attr_value(t, None, Some(v)))),
             ProjectionValue::SelectValue { field_idx } => env
                 .attrs
                 .select_values
                 .get(*field_idx)
                 .and_then(|m| m.get(&key))
-                .map(|v| ProjectedValue::Borrowed(v.as_str())),
-            // A scalar render, ≤ 20 bytes by construction.
+                .map(|v| {
+                    let t = env
+                        .attrs
+                        .select_types
+                        .get(*field_idx)
+                        .and_then(|m| m.get(&key))
+                        .copied()
+                        .unwrap_or_default();
+                    ProjectedValue::Typed(typed_attr_value(t, None, Some(v.as_str())))
+                }),
+            // A per-trace query-time NUMBER, so it projects in the
+            // `intValue` arm — the same arm `by(nestedSetLeft)` already
+            // resolved it into, and the arm the reference sends
+            // (measured: `{… && nestedSetLeft > 0}` returns
+            // `{"key":"nestedSetLeft","value":{"intValue":"1"}}` there).
+            // It rendered as a string before issue #510, so one stored
+            // number reached the wire two ways from one engine.
             ProjectionValue::NestedSet(field) => env
                 .nested_set
                 .and_then(|idx| idx.get(&span.span_id))
-                .map(|v| ProjectedValue::Owned(v.value(*field).to_string())),
+                .map(|v| ProjectedValue::Typed(AttrArm::Int(v.value(*field)))),
         };
         if let Some(value) = resolved {
             return Ok(Some(value));
@@ -2103,13 +2480,44 @@ fn resolve_projection<'a>(
 enum ProjectedValue<'a> {
     Borrowed(&'a str),
     Owned(String),
+    /// A stored attribute whose wire arm [`typed_attr_value`] has already
+    /// decided (issue #510).
+    Typed(AttrArm<'a>),
 }
 
 impl ProjectedValue<'_> {
+    /// The value's own name, for the [`ProjectionTarget::SpanName`]
+    /// target. Only the physical sources can fill that target, so a typed
+    /// attribute arm never reaches it.
     fn as_str(&self) -> &str {
         match self {
             ProjectedValue::Borrowed(s) => s,
             ProjectedValue::Owned(s) => s.as_str(),
+            ProjectedValue::Typed(arm) => match arm {
+                AttrArm::Text(s) => s,
+                _ => "",
+            },
+        }
+    }
+
+    /// The retained payload the response value will own — charged BEFORE
+    /// it is built.
+    fn payload_bytes(&self) -> usize {
+        match self {
+            ProjectedValue::Borrowed(s) => s.len(),
+            ProjectedValue::Owned(s) => s.len(),
+            ProjectedValue::Typed(arm) => arm.payload_bytes(),
+        }
+    }
+
+    /// The owned typed response value. The three untyped sources are
+    /// strings on the reference too (`select(status)` comes back
+    /// `{"stringValue":"ok"}` there and here), so they render `Str`.
+    fn into_value(self) -> GroupValue {
+        match self {
+            ProjectedValue::Borrowed(s) => GroupValue::Str(s.to_string()),
+            ProjectedValue::Owned(s) => GroupValue::Str(s),
+            ProjectedValue::Typed(arm) => arm.into_value(),
         }
     }
 }
@@ -2155,13 +2563,10 @@ fn build_summary(
                 name = Some(value.as_str().to_string());
             }
             ProjectionTarget::Attribute(key) => {
-                budget.charge(key.as_str().len() + value.as_str().len())?;
+                budget.charge(key.as_str().len() + value.payload_bytes())?;
                 #[cfg(test)]
                 clone_probe::record();
-                attributes.push(ProjectedAttribute::new(
-                    &group.field,
-                    value.as_str().to_string(),
-                ));
+                attributes.push(ProjectedAttribute::new(&group.field, value.into_value()));
             }
         }
     }
@@ -2368,15 +2773,26 @@ fn resolve_group_value(
                 .copied()
                 .unwrap_or(0) as i64,
         ),
+        // Issue #510: the arm follows the STORED type, not which of the
+        // two reads happened to answer. The string read returns EVERY row
+        // for the key, so it is the authority on both the exact text and
+        // the type; the numeric read carries `isNotNull(val_num)`, so it
+        // is absent for a non-finite value and its type map is only a
+        // fallback.
         GroupKeyResolver::Attr { str_idx, num_idx } => {
             let key = (trace_id, span.span_id);
-            if let Some(v) = env.attrs.agg_values[*num_idx].get(&key) {
-                GroupValue::Double(canonical_double_bits(*v))
-            } else if let Some(s) = env.attrs.select_values[*str_idx].get(&key) {
-                charged_str(s, budget, transient)?
-            } else {
-                GroupValue::Nil
-            }
+            let text = env.attrs.select_values[*str_idx]
+                .get(&key)
+                .map(String::as_str);
+            let num = env.attrs.agg_values[*num_idx].get(&key).copied();
+            let t = env.attrs.select_types[*str_idx]
+                .get(&key)
+                .copied()
+                .or_else(|| env.attrs.agg_types[*num_idx].get(&key).copied())
+                .unwrap_or_default();
+            let arm = typed_attr_value(t, num, text);
+            charge_transient(budget, transient, arm.payload_bytes())?;
+            arm.into_group_value()
         }
     })
 }
@@ -2420,6 +2836,7 @@ fn resolve_group_tuple(
 fn build_span_set_groups(
     plan: &SearchPlan,
     keys: &[PlannedGroupKey],
+    aggregates: &[GroupValue],
     env: &EvalEnv<'_>,
     matched_spans: &[&HydratedSpan],
     counter: &mut GroupCardinalityCounter,
@@ -2458,15 +2875,22 @@ fn build_span_set_groups(
     for (tuple, member_idxs) in order.iter().zip(members.iter()) {
         let take = member_idxs.len().min(plan.spss as usize);
         // Per-group container: overhead + attribute slots + span slots.
+        // Issue #510: the attribute list is the ordered record of EVERY
+        // contributing stage, not the `by()` keys alone.
+        let contributors = plan.attr_contributors.len();
         budget.charge(
             super::exec::RETAINED_ENTRY_OVERHEAD
-                + keys.len() * std::mem::size_of::<(String, GroupValue)>()
+                + contributors * std::mem::size_of::<(String, GroupValue)>()
                 + take * std::mem::size_of::<SpanSummary>(),
         )?;
-        let mut attributes = Vec::with_capacity(keys.len());
-        for (key, value) in keys.iter().zip(tuple.iter()) {
-            budget.charge(key.display.len() + value.payload_bytes())?;
-            attributes.push((key.display.clone(), value.clone()));
+        let mut attributes = Vec::with_capacity(contributors);
+        for contributor in &plan.attr_contributors {
+            let (display, value) = match contributor {
+                AttrContributor::GroupKey(j) => (&keys[*j].display, &tuple[*j]),
+                AttrContributor::Aggregate(k) => (&plan.aggregates[*k].display, &aggregates[*k]),
+            };
+            budget.charge(display.len() + value.payload_bytes())?;
+            attributes.push((display.clone(), value.clone()));
         }
         let mut spans = Vec::with_capacity(take);
         for &idx in member_idxs.iter().take(take) {
@@ -2489,43 +2913,78 @@ fn build_span_set_groups(
     Ok(groups)
 }
 
-/// Applies the ordered `by()`/`coalesce()` post-stages (issue #193) to one
-/// trace's flat matched set, returning the final `groups` layer. `By`
-/// regroups (enforcing the cardinality cap at production time); a trailing
-/// `Coalesce` collapses the groups back to the flat spanSet (releasing
-/// their retained charge — they are no longer retained); a `Coalesce`
-/// with no active grouping is a no-op.
+/// Counts one closed `by()` run's distinct group tuples against the
+/// cardinality cap without building a single group (issue #510).
+///
+/// The pre-#510 code reached the same count by building the whole group
+/// layer and releasing it again on the trailing `coalesce()`; this
+/// resolves the tuples, charges them transiently and drops them, so a
+/// `by()|coalesce()` query no longer allocates summaries it discards.
+fn count_group_tuples(
+    keys: &[PlannedGroupKey],
+    env: &EvalEnv<'_>,
+    matched_spans: &[&HydratedSpan],
+    counter: &mut GroupCardinalityCounter,
+    budget: &mut ByteBudget,
+) -> Result<(), ReadError> {
+    let mut transient = 0usize;
+    for span in matched_spans {
+        let tuple = resolve_group_tuple(keys, env, span, budget, &mut transient)?;
+        // `observe` dedups on its own `seen` set, so a repeated tuple
+        // charges nothing and the cap still sees the distinct count.
+        counter.observe(&tuple, budget)?;
+    }
+    budget.release(transient);
+    Ok(())
+}
+
+/// Partitions one trace's flat matched set into the final `groups` layer
+/// (issues #193, #510).
+///
+/// **Once, by the composed key tuple** — `SearchPlan::active_by_keys` is
+/// the tuple in effect at the end of the pipeline, built by the planner's
+/// single walk: a `by()` EXTENDS it and a `coalesce()` clears it. That is
+/// the same partition the reference reaches by sub-dividing at each
+/// `by()`, so the group SET matches — measured:
+/// `| by(name) | count() > 0 | by(status)` answers THREE span sets there,
+/// and answered two here while this function re-partitioned once per
+/// stage and let the last `by()` win.
+///
+/// Grouping the composed tuple once also removes a full re-partition from
+/// every stacked query. The distinct-group `422` counter now counts the
+/// FINAL tuples rather than each stage's; for a single `by()` — every
+/// shape the by-key freeze covers — that is the same number.
+///
+/// An empty tuple (no `by()`, or every `by()` cleared by a trailing
+/// `coalesce()`) returns `None`, which keeps the flat response
+/// byte-identical.
 fn apply_post_stages(
     plan: &SearchPlan,
+    aggregates: &[GroupValue],
     env: &EvalEnv<'_>,
     matched_spans: &[&HydratedSpan],
     counter: &mut GroupCardinalityCounter,
     budget: &mut ByteBudget,
 ) -> Result<Option<Vec<SpanSetGroup>>, ReadError> {
-    let mut groups: Option<Vec<SpanSetGroup>> = None;
-    for stage in plan.post_stages() {
-        match stage {
-            SpansetStage::By(keys) => {
-                if let Some(previous) = groups.take() {
-                    budget.release(groups_retained_bytes(&previous));
-                }
-                groups = Some(build_span_set_groups(
-                    plan,
-                    keys,
-                    env,
-                    matched_spans,
-                    counter,
-                    budget,
-                )?);
-            }
-            SpansetStage::Coalesce => {
-                if let Some(collapsed) = groups.take() {
-                    budget.release(groups_retained_bytes(&collapsed));
-                }
-            }
-        }
+    // A `by()` run a `coalesce()` closed produces no response groups, and
+    // its cardinality still counts against `reader.traceql_max_series`
+    // (docs/api.md §4.2 — `by()|coalesce()` cannot bypass the cap). Only
+    // the tuples are resolved: no group, no summary, nothing retained.
+    for keys in &plan.coalesced_by_keys {
+        count_group_tuples(keys, env, matched_spans, counter, budget)?;
     }
-    Ok(groups)
+    if plan.active_by_keys.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(build_span_set_groups(
+        plan,
+        &plan.active_by_keys,
+        aggregates,
+        env,
+        matched_spans,
+        counter,
+        budget,
+    )?))
 }
 
 /// Evaluates one hydrated batch → the exactly-matched traces, each as a
@@ -2600,11 +3059,19 @@ pub(crate) fn evaluate_batch(
             release_set(matched, budget);
             return Err(e);
         }
+        // Issue #510: each aggregate stage's TYPED value is kept for the
+        // response `attributes`. The scalar and the comparison are exactly
+        // what they were before.
+        let mut agg_wire: Vec<GroupValue> = Vec::with_capacity(plan.aggregates.len());
         for agg in &plan.aggregates {
-            let pass = match aggregate_value(agg, trace, &matched.set, attrs) {
-                Some(value) => cmp_f64(agg.cmp, value, agg.threshold),
+            let outcome = aggregate_value(agg, trace, &matched.set, attrs);
+            let pass = match &outcome {
+                Some(o) => cmp_f64(agg.cmp, o.scalar, agg.threshold),
                 None => false,
             };
+            if pass {
+                agg_wire.push(outcome.expect("a passing aggregate has an outcome").wire);
+            }
             if !pass {
                 budget.release(transients);
                 release_set(matched, budget);
@@ -2644,7 +3111,40 @@ pub(crate) fn evaluate_batch(
         // FULL (pre-`spss`) matched set. `None` (no post-stages, or a
         // trailing `coalesce()` collapse) keeps the flat response
         // byte-identical.
-        let groups = apply_post_stages(plan, &env, &matched_spans, counter, budget)?;
+        // Issue #510: the flat span set's own `attributes` — the
+        // aggregate contributors that survive the last `coalesce()` while
+        // no `by()` grouping is active. Empty (and so byte-identical to
+        // the pre-#510 response) for every query with neither stage.
+        let flat_attributes: Vec<(String, GroupValue)> = if plan.active_by_keys.is_empty()
+            && !plan.attr_contributors.is_empty()
+        {
+            // Charge the enclosing buffer at its exact capacity BEFORE
+            // reserving it, then each pair before its clone — the
+            // module's charge-before-allocate contract, and exactly
+            // what `flat_attributes_retained_bytes` releases.
+            let n = plan.attr_contributors.len();
+            budget.charge(
+                super::exec::RETAINED_ENTRY_OVERHEAD
+                    + n * std::mem::size_of::<(String, GroupValue)>(),
+            )?;
+            let mut out = Vec::with_capacity(n);
+            for contributor in &plan.attr_contributors {
+                // A `GroupKey` contributor cannot appear here: the
+                // planner pushes one only alongside an `active_by_keys`
+                // entry and clears both together, so an empty key tuple
+                // means every contributor is an aggregate.
+                let AttrContributor::Aggregate(k) = contributor else {
+                    unreachable!("a GroupKey contributor implies a non-empty active_by_keys tuple")
+                };
+                let display = &plan.aggregates[*k].display;
+                budget.charge(display.len() + agg_wire[*k].payload_bytes())?;
+                out.push((display.clone(), agg_wire[*k].clone()));
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        let groups = apply_post_stages(plan, &agg_wire, &env, &matched_spans, counter, budget)?;
         // `env`'s borrow of `nested_set` has ended (its last use was
         // `apply_post_stages`), so the numbering can now be released.
         if let Some(charged) = nested_set {
@@ -2659,6 +3159,7 @@ pub(crate) fn evaluate_batch(
             matched: matched_total,
             spans: summaries,
             groups,
+            attributes: flat_attributes,
         });
     }
     Ok(out)
@@ -2783,7 +3284,9 @@ mod tests {
         let mut attrs = BatchAttrs {
             membership: key_sets(plan.probes.len()),
             agg_values: vec![HashMap::new(); plan.agg_fields.len()],
+            agg_types: vec![HashMap::new(); plan.agg_fields.len()],
             select_values: vec![HashMap::new(); plan.select_attrs.len()],
+            select_types: vec![HashMap::new(); plan.select_attrs.len()],
             ..BatchAttrs::default()
         };
         for (probe_idx, trace_id, span_id) in entries {
@@ -2809,12 +3312,27 @@ mod tests {
     }
 
     /// The projected `(key, value)` pairs of one summary, for assertions
-    /// that predate [`ProjectedAttribute`].
+    /// that predate [`ProjectedAttribute`]. The value is TYPE-TAGGED
+    /// (issue #510), so a `stringValue` rendering of an int can never
+    /// compare equal to an `intValue` one.
     fn attr_pairs(s: &SpanSummary) -> Vec<(String, String)> {
         s.attributes
             .iter()
-            .map(|a| (a.key().to_string(), a.value().to_string()))
+            .map(|a| (a.key().to_string(), typed_token(a.value())))
             .collect()
+    }
+
+    /// One typed response value as `<arm>=<value>` — the same shape the
+    /// live differentials compare, so a hermetic assertion and a live one
+    /// fail on the same difference.
+    fn typed_token(v: &GroupValue) -> String {
+        match v {
+            GroupValue::Str(s) => format!("stringValue={s}"),
+            GroupValue::Int(i) => format!("intValue={i}"),
+            GroupValue::Double(bits) => format!("doubleValue={}", f64::from_bits(*bits)),
+            GroupValue::Bool(b) => format!("boolValue={b}"),
+            GroupValue::Nil => "nil".to_string(),
+        }
     }
 
     #[test]
@@ -3041,8 +3559,11 @@ mod tests {
         assert_eq!(
             attr_pairs(&matches[0].spans[0]),
             vec![
-                ("service.name".to_string(), "checkout".to_string()),
-                ("foo".to_string(), "bar".to_string()),
+                (
+                    "service.name".to_string(),
+                    "stringValue=checkout".to_string()
+                ),
+                ("foo".to_string(), "stringValue=bar".to_string()),
             ]
         );
     }
@@ -4478,8 +4999,21 @@ mod tests {
     /// Float `by()` grouping (issue #193 R2-F2): `+0.0` and `-0.0` collapse
     /// into one group, and every NaN into one group — the
     /// `canonical_double_bits` mechanism.
+    /// **This assertion was INVERTED on issue #510, deliberately.** It
+    /// used to assert `-0.0` and `+0.0` fell into ONE group, "matching the
+    /// reference". Measured on the reference — three spans carrying
+    /// `-0.0`, `+0.0`, `-0.0` — it answers TWO span sets:
+    /// `{"doubleValue":0}` over the `+0.0` span and `{"doubleValue":-0}`
+    /// over the two `-0.0` spans. The old assertion is left inverted
+    /// rather than deleted so the record shows the behaviour was chosen
+    /// and then measured to be wrong.
+    ///
+    /// The NaN half stays. It is NOT a parity claim in either direction:
+    /// the wire format carries one NaN spelling, so no end-to-end test can
+    /// observe a payload difference, and folding every NaN into one group
+    /// is our own choice recorded as unobservable.
     #[test]
-    fn float_by_key_collapses_signed_zero_and_all_nan() {
+    fn signed_zero_splits_and_every_nan_payload_groups_as_one() {
         let p = plan(r#"{ } | by(span.ratio)"#);
         let trace = TraceSpans {
             trace_id: tid(1),
@@ -4491,21 +5025,37 @@ mod tests {
             ],
         };
         let mut attrs = membership(&p, &[]);
-        // span.ratio interns into agg_fields[0] (numeric) — resolved as a
-        // canonical Double.
-        attrs.agg_values[0].insert((tid(1), sid(1)), 0.0);
-        attrs.agg_values[0].insert((tid(1), sid(2)), -0.0);
-        attrs.agg_values[0].insert((tid(1), sid(3)), f64::NAN);
-        attrs.agg_values[0].insert((tid(1), sid(4)), f64::from_bits(0x7ff8_0000_0000_0001)); // another NaN payload
+        // span.ratio interns into agg_fields[0] (numeric) and
+        // select_attrs[0] (string); the stored kind rides the string read.
+        for (sid_n, v) in [
+            (1u8, 0.0f64),
+            (2, -0.0),
+            (3, f64::NAN),
+            // another NaN payload
+            (4, f64::from_bits(0x7ff8_0000_0000_0001)),
+        ] {
+            attrs.agg_values[0].insert((tid(1), sid(sid_n)), v);
+            attrs.agg_types[0].insert((tid(1), sid(sid_n)), StoredType::Float);
+        }
         let matches = eval(&p, &[trace], &attrs);
         let groups = matches[0].groups.as_ref().expect("by() active");
-        assert_eq!(groups.len(), 2, "one zero group + one NaN group");
-        // The zero group holds spans 1 and 2 (+0.0 / -0.0 folded).
-        let zero_group = groups
+        assert_eq!(
+            groups.len(),
+            3,
+            "+0.0 and -0.0 are DIFFERENT groups, plus one NaN group"
+        );
+        let plus_zero = groups
             .iter()
-            .find(|g| g.attributes[0].1 == GroupValue::Double(canonical_double_bits(0.0)))
-            .expect("zero group");
-        assert_eq!(zero_group.matched, 2);
+            .find(|g| g.attributes[0].1 == GroupValue::Double(0.0_f64.to_bits()))
+            .expect("+0.0 group");
+        assert_eq!(plus_zero.matched, 1);
+        assert_eq!(plus_zero.spans[0].span_id, sid(1));
+        let minus_zero = groups
+            .iter()
+            .find(|g| g.attributes[0].1 == GroupValue::Double((-0.0_f64).to_bits()))
+            .expect("-0.0 group");
+        assert_eq!(minus_zero.matched, 1);
+        assert_eq!(minus_zero.spans[0].span_id, sid(2));
         let nan_group = groups
             .iter()
             .find(|g| g.attributes[0].1 == GroupValue::Double(CANONICAL_NAN_BITS))
@@ -4892,7 +5442,7 @@ mod tests {
         let s = build_summary(&p, tid(1), &hydrated_span, &env, &mut budget).expect("fits");
         assert_eq!(
             attr_pairs(&s),
-            vec![("status".to_string(), "error".to_string())]
+            vec![("status".to_string(), "stringValue=error".to_string())]
         );
         assert_eq!(budget.used(), s.heap_payload_bytes());
 
@@ -4903,7 +5453,13 @@ mod tests {
         let mut budget = ByteBudget::new(usize::MAX);
         let env = eval_env(&attrs, tid(1));
         let s = build_summary(&p, tid(1), &hydrated_span, &env, &mut budget).expect("fits");
-        assert_eq!(attr_pairs(&s), vec![("foo".to_string(), "bar".to_string())]);
+        // The literal path carries no stored type, so it stays a string
+        // (issue #510) — the reference matches no span at all for the one
+        // shape where that could differ.
+        assert_eq!(
+            attr_pairs(&s),
+            vec![("foo".to_string(), "stringValue=bar".to_string())]
+        );
         assert_eq!(budget.used(), s.heap_payload_bytes());
 
         // fused value
@@ -4912,14 +5468,17 @@ mod tests {
         let mut attrs = membership(&p, &[]);
         attrs.membership[0] = ProbeMembership::Values(HashMap::from([(
             (tid(1), sid(1)),
-            "bar-from-the-row".to_string(),
+            ("bar-from-the-row".to_string(), StoredType::String),
         )]));
         let mut budget = ByteBudget::new(usize::MAX);
         let env = eval_env(&attrs, tid(1));
         let s = build_summary(&p, tid(1), &hydrated_span, &env, &mut budget).expect("fits");
         assert_eq!(
             attr_pairs(&s),
-            vec![("foo".to_string(), "bar-from-the-row".to_string())],
+            vec![(
+                "foo".to_string(),
+                "stringValue=bar-from-the-row".to_string()
+            )],
             "the fused value is the SPAN's stored value, never the query's pattern"
         );
         assert_eq!(budget.used(), s.heap_payload_bytes());
@@ -4942,7 +5501,7 @@ mod tests {
         .expect("fits");
         assert_eq!(
             attr_pairs(&matches[0].spans[0]),
-            vec![("nestedSetLeft".to_string(), "1".to_string())]
+            vec![("nestedSetLeft".to_string(), "intValue=1".to_string())]
         );
 
         // (b) an absent value emits no entry and charges nothing for one.

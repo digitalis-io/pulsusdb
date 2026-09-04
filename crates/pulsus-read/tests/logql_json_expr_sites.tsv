@@ -238,4 +238,4 @@ Site	Literal	docs/benchmarks/logs-differential-ledger.md:6368	-	-	b]	accept	reje
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6368	-	-	b]	accept	reject	-	-	b26_json_expr.test's eval_fail row -- the `]`-key withdrawal, ledgered as `json-expression-bracket-key-unreachable`
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6369	-	-	["b]"]	reject	reject	-	-	
 Site	Literal	docs/benchmarks/logs-differential-ledger.md:6369	-	-	["b]"]	reject	reject	-	-	
-Site	Literal	docs/reference-defects-we-do-not-copy.md:665	-	-	o	accept	accept	-	-	
+Site	Literal	docs/reference-defects-we-do-not-copy.md:666	-	-	o	accept	accept	-	-	

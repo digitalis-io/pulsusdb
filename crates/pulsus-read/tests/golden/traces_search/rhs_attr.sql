@@ -20,7 +20,7 @@ ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
 LIMIT 10001 BY trace_id
 
 == phase2 aggregate values[0] ==
-SELECT trace_id, span_id, any(val_num) AS v
+SELECT trace_id, span_id, any(val_num) AS v, any(val_type) AS t
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND key = 'a'
@@ -30,7 +30,7 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
 GROUP BY trace_id, span_id
 
 == phase2 aggregate values[1] ==
-SELECT trace_id, span_id, any(val_num) AS v
+SELECT trace_id, span_id, any(val_num) AS v, any(val_type) AS t
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND key = 'b'
@@ -40,7 +40,7 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
 GROUP BY trace_id, span_id
 
 == phase2 select values[0] ==
-SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v
+SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v, any(val_type) AS t
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND key = 'a'
@@ -49,7 +49,7 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
 GROUP BY trace_id, span_id
 
 == phase2 select values[1] ==
-SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v
+SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v, any(val_type) AS t
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND key = 'b'
