@@ -840,20 +840,32 @@ fn parse_dotted_key(cursor: &mut Cursor<'_>) -> Result<(String, usize), TraceQlE
 /// `*_over_time` metrics functions are recognized here and rejected as
 /// `NotYetSupported` (M7, task-manager adjudication 1 on issue #59), as
 /// is metrics grouping `by` after a metric stage.
+///
+/// The three "expected a pipeline stage" messages below — end of input
+/// after the pipe, a non-identifier, and an unknown identifier — name the
+/// SAME legal set, including `by` and `coalesce`, which have been served
+/// pipeline stages since issue #185 (issue #492 item 2). All three, not
+/// one: otherwise the legal set a user is shown depends on which way they
+/// got it wrong. The metrics stage names (`rate`, `count_over_time`,
+/// `topk`, `compare`, ...) are deliberately absent — they parse here and
+/// are refused at plan time on the search route, so naming them would
+/// advertise stages that route does not serve.
 fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
     let tok = cursor.peek().clone();
     let name = match &tok.kind {
         TokenKind::Ident(name) => name.clone(),
         TokenKind::Eof => {
             return Err(TraceQlError::UnexpectedEof {
-                expected: "a pipeline stage (count, sum, avg, min, max, or select)".to_string(),
+                expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+                    .to_string(),
                 span: tok.span,
             });
         }
         _ => {
             return Err(TraceQlError::UnexpectedToken {
                 found: describe(&tok.kind),
-                expected: "a pipeline stage (count, sum, avg, min, max, or select)".to_string(),
+                expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+                    .to_string(),
                 span: tok.span,
             });
         }
@@ -892,7 +904,8 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
     }
     Err(TraceQlError::UnexpectedToken {
         found: describe(&tok.kind),
-        expected: "a pipeline stage (count, sum, avg, min, max, or select)".to_string(),
+        expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+            .to_string(),
         span: tok.span,
     })
 }
@@ -1558,6 +1571,38 @@ mod tests {
             },
             other => panic!("{q}: expected a single comparison, got {other:?}"),
         }
+    }
+
+    /// The three ways of getting a pipeline stage wrong name the SAME
+    /// legal set, and it includes `by` and `coalesce` (issue #492 item 2).
+    /// Two of the three arms had no test before this one: only the
+    /// end-of-input arm is pinned by a corpus golden, so reverting either
+    /// `UnexpectedToken` arm's message changed nothing anywhere in the
+    /// workspace.
+    #[test]
+    fn every_unknown_pipeline_stage_arm_names_the_same_legal_set() {
+        const LEGAL: &str = "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)";
+        // End of input after the pipe.
+        let err = parse("{ .a = 1 } |").expect_err("end of input after the pipe");
+        assert!(
+            matches!(&err, TraceQlError::UnexpectedEof { expected, .. } if expected == LEGAL),
+            "got {err:?}"
+        );
+        // A non-identifier where a stage was expected (the mid-pipeline
+        // spanset filter a user writes: `{...} | by(name) | {...}`).
+        let err = parse(r#"{ .a = 1 } | by(name) | { name = "b" }"#)
+            .expect_err("a spanset filter is not a pipeline stage here");
+        assert!(
+            matches!(&err, TraceQlError::UnexpectedToken { expected, found, .. }
+                if expected == LEGAL && found == "'{'"),
+            "got {err:?}"
+        );
+        // An identifier that names no stage.
+        let err = parse("{ .a = 1 } | nosuchstage()").expect_err("unknown stage identifier");
+        assert!(
+            matches!(&err, TraceQlError::UnexpectedToken { expected, .. } if expected == LEGAL),
+            "got {err:?}"
+        );
     }
 
     #[test]

@@ -2183,3 +2183,140 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
 - **Disposition.** Deliberate, adjudicated on issue #477, and documented
   in docs/api.md §4.4 where the precedence rule is stated.
+
+### `traceql-nested-by-composite-series-cap` (issue #492 item 2) — **two `by()` stages are capped on the composite key tuple, and a query that answered `200` can now answer `422`**
+
+- **Route.** `GET /api/traces/v1/search` (and its `/api/search` alias), for
+  the shape **`by(.a) | by(.b)`** — any query carrying two or more `| by()`
+  stages.
+
+- **What changed here, and it is a behaviour change for existing users.**
+  The distinct-group cap (`reader.traceql_max_series`, default 1000) used
+  to be charged on the tuples the LAST `by()` stage resolved, because the
+  second stage rebuilt its groups from the flat matched set and the first
+  stage's keys were thrown away. Since issue #492 item 2 the second stage
+  **sub-divides** the first stage's spanSets, so the cap is charged on the
+  **accumulated** `(.a, .b)` tuple the response actually retains. A query
+  with two `by()` stages over a high product cardinality can therefore
+  answer **`422 query_too_broad`** (`TraceSearchSeriesCap`) where it
+  answered `200` before. Nothing else about the cap moves: same limit,
+  same error class, same HTTP status, and a single `by()` charges exactly
+  what it charged before (the tuple is reserved at
+  `prefix.len() + keys.len()`, which is `keys.len()` when the prefix is
+  empty).
+
+- **The numbers, measured on the corpus the test uses.** On C-ORD2 — one
+  trace, four spans with cross-cutting keys `(a, server)`, `(a, client)`,
+  `(b, server)`, `(b, server)` — `{ } | by(name) | by(kind)` observes:
+
+  | accounting | distinct tuples | which |
+  |---|---|---|
+  | stage-local (before) | **4** | `[a]`, `[b]`, `[server]`, `[client]` |
+  | composite (now) | **5** | `[a]`, `[b]`, `[a,server]`, `[a,client]`, `[b,server]` |
+
+  **`max_series = 4` is the only cap that separates the two rules**: at 4
+  the old rule returns `Ok` and the new one refuses with
+  `TraceSearchSeriesCap { count: 5, cap: 4 }`; any cap ≤ 3 refuses under
+  both and any cap ≥ 5 accepts under both. Pinned, with that reasoning in
+  its own doc comment, by
+  `crates/pulsus-read/src/traces/search_eval.rs::tests::nested_by_charges_the_composite_tuple_not_the_stage_local_one`,
+  which also asserts that `max_series = 5` still answers `Ok` — so the
+  criterion cannot be satisfied by refusing everything.
+
+- **Why this direction.** The alternative is an unbounded retained set:
+  the composite tuples are what the response holds, so charging the last
+  stage's keys alone bounds something the engine does not keep. A refusal
+  the caller can see beats a memory ceiling they cannot. Adjudicated on
+  issue #492.
+
+- **Disposition.** Deliberate. Documented in docs/api.md §4.2 (the `by()`
+  series-cap paragraph).
+
+### `traceql-select-before-by-nil-group-key` (issue #492 item 2) — **the reference groups every span under `nil` when a `select()` precedes the `by()`; we group correctly**
+
+- **Route.** `GET /api/search` on the reference; `GET /api/traces/v1/search`
+  here. Query:
+  `{ resource.service.name = "grp492" } | select(name) | by(name)`.
+
+- **The reference's answer, captured 2026-09-04** against
+  `grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`
+  (the digest `.github/workflows/ci.yml` pins), started for this run with
+  `ci/tempo/tempo-compare.yaml` unmodified, corpus C-ORD1 (four spans:
+  three named `a`, one named `b`) pushed over its OTLP/JSON receiver:
+  `200`, **one** spanSet, its attribute
+  `{"key":"by(name)","value":{"stringValue":"nil"}}`, `matched` 4, all
+  four spans in it — **and the same response prints each span's own
+  `name` as `a`, `a`, `a`, `b`**. Written the other way round
+  (`| by(name) | select(name)`) the same instance answers two spanSets,
+  `a` over spans 1–3 and `b` over span 4.
+
+- **Our answer, and we keep it.** Two spanSets, `by(name)=a` over spans
+  1–3 and `by(name)=b` over span 4 — the same answer we give without the
+  `select()`, which is what our documented `by()` semantics say
+  (docs/api.md §4.2). Measured on this tree through the evaluator on the
+  same corpus.
+
+- **Why it is a defect there rather than a different choice.** In the
+  reference a `select()` switches every LATER pipeline element to the
+  second pass (`Pipeline.extractConditions`, `pkg/traceql/ast.go:198-215`
+  @ v3.0.2), and the second-pass columns are read only AFTER the pipeline
+  has been evaluated — the fetch builds the first-pass iterator, wraps it
+  in the bridge that calls the pipeline, and creates the second-pass
+  iterator around that (`fetch`,
+  `tempodb/encoding/vparquet4/block_traceql.go:1600-1615` @ v3.0.2). So
+  the grouping executes its key expression against a span whose key has
+  not been read (`GroupOperation.evaluate`,
+  `pkg/traceql/ast_execute.go:14-55`) and every span lands in one
+  `nil` group. Indexed as entry 23 of
+  docs/reference-defects-we-do-not-copy.md (tests A and D).
+
+- **Disposition.** Not copied, no code change: our answer was already the
+  documented one. Recorded so the difference is not read as our bug.
+
+### `traceql-midpipeline-spanset-filter-unsupported` (issue #492) — **a GAP record, not a divergence**
+
+- **What.** The reference's pipeline grammar admits a `{...}` spanset
+  expression as an element in ANY position; ours admits only an
+  identifier-led stage. So a filter written after another stage is a
+  `400` here and a `200` there:
+
+  ```
+  { resource.service.name = "grp492" } | by(name) | { name = "b" }
+  ```
+
+  Our exact body (`400`, `text/plain; charset=utf-8`, no trailing
+  newline, no `invalid TraceQL query: ` prefix on this route):
+
+  ```
+  unexpected '{' at byte 50: expected a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)
+  ```
+
+  The reference answers `200` with one spanSet, `by(name)=b` over the
+  single `b` span — measured 2026-09-04 against a reference instance
+  started for that run. Written the other way round
+  (`| { name = "b" } | by(name)`) both systems answer that same result,
+  because our parser folds a leading second filter into the spanset
+  expression.
+
+- **Why it is a gap and not a judgement.** Our `Query` carries ONE
+  `spanset: SpansetExpr` plus a `Vec<PipelineStage>`
+  (`crates/pulsus-traceql/src/ast.rs:62-70`) and `parse_pipeline_stage`
+  accepts only an identifier-led stage
+  (`crates/pulsus-traceql/src/parser.rs:843-897`), so the shape cannot be
+  represented at all. Closing it needs a new `PipelineStage` variant
+  carrying a `SpansetExpr`, a planner that can plan more than one filter,
+  and an evaluator stage that filters each spanSet's members — an AST,
+  planner and evaluator change.
+
+- **Tracked as** item 9 of the issue #492 enumeration (comment
+  5536956647), which records the same measurement and points back at this
+  row. Issue #492 item 2 changed the evaluator only and deliberately
+  neither widened nor narrowed this accept surface: `{a} | {b}` is still
+  the same `400`, with the stage list in the message now naming `by` and
+  `coalesce`.
+
+- **Disposition.** Recorded, not fixed here. Whether to close the gap or
+  keep the refusal is item 9's own decision — it widens the accept
+  surface, the direction this project has previously withdrawn from
+  (`traceql-spanset-by-multi-key-withdrawn`), while "works there, not
+  here" is the case it has previously treated as the worse defect.

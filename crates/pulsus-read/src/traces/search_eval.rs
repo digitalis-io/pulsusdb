@@ -1942,27 +1942,29 @@ fn union_sets(
     Ok(union)
 }
 
+/// The aggregate's value over ONE spanset's spans (issue #492 item 2 —
+/// it used to aggregate the whole trace filtered by the matched-id set,
+/// which is what made an aggregate's written position invisible).
+///
+/// `Count` is the spanset's member count. On the flat spanset that is the
+/// same number as the old matched-id-set size, because
+/// `group_hydrated_rows` dedupes hydration rows by `span_id`
+/// (`exec.rs:3375, 3401-3403`) and the matched set is drawn from those
+/// same spans — pinned by `count_matches_the_deduped_span_set`.
 fn aggregate_value(
     agg: &super::search_plan::PlannedAggregate,
-    trace: &TraceSpans,
-    matched: &HashSet<[u8; 8]>,
+    trace_id: [u8; 16],
+    spans: &[&HydratedSpan],
     attrs: &BatchAttrs,
 ) -> Option<f64> {
     let values: Vec<f64> = match &agg.source {
-        AggSource::Count => return Some(matched.len() as f64),
-        AggSource::DurationNs => trace
-            .spans
+        AggSource::Count => return Some(spans.len() as f64),
+        AggSource::DurationNs => spans.iter().map(|s| s.duration_ns as f64).collect(),
+        AggSource::Attr { field_idx } => spans
             .iter()
-            .filter(|s| matched.contains(&s.span_id))
-            .map(|s| s.duration_ns as f64)
-            .collect(),
-        AggSource::Attr { field_idx } => trace
-            .spans
-            .iter()
-            .filter(|s| matched.contains(&s.span_id))
             .filter_map(|s| {
                 attrs.agg_values[*field_idx]
-                    .get(&(trace.trace_id, s.span_id))
+                    .get(&(trace_id, s.span_id))
                     .copied()
             })
             .collect(),
@@ -2381,21 +2383,29 @@ fn resolve_group_value(
     })
 }
 
-/// Resolves one span's full group-key tuple (issue #193). The tuple `Vec`
-/// slot is charged into the transient total before allocation.
+/// Resolves one span's ACCUMULATED group-key tuple (issue #193, widened by
+/// #492 item 2): the enclosing spanset's already-resolved `by()` values,
+/// in pipeline order, followed by this stage's newly resolved ones. The
+/// tuple `Vec` slot is charged into the transient total before allocation,
+/// and it is reserved at EXACTLY `prefix.len() + keys.len()` — capacity is
+/// part of [`group_tuple_bytes`]'s formula, so a first `by()` (empty
+/// prefix) charges the counter precisely what it charged before this
+/// change.
 fn resolve_group_tuple(
+    prefix: &[(String, GroupValue)],
     keys: &[PlannedGroupKey],
     env: &EvalEnv<'_>,
     span: &HydratedSpan,
     budget: &mut ByteBudget,
     transient: &mut usize,
 ) -> Result<GroupTuple, ReadError> {
-    charge_transient(
-        budget,
-        transient,
-        keys.len() * std::mem::size_of::<GroupValue>(),
-    )?;
-    let mut tuple = Vec::with_capacity(keys.len());
+    let len = prefix.len() + keys.len();
+    charge_transient(budget, transient, len * std::mem::size_of::<GroupValue>())?;
+    let mut tuple = Vec::with_capacity(len);
+    for (_, value) in prefix {
+        charge_transient(budget, transient, value.payload_bytes())?;
+        tuple.push(value.clone());
+    }
     for key in keys {
         tuple.push(resolve_group_value(
             &key.resolver,
@@ -2408,122 +2418,260 @@ fn resolve_group_tuple(
     Ok(tuple)
 }
 
-/// Regroups one trace's FULL (pre-`spss`) matched span set into one
-/// [`SpanSetGroup`] per distinct `by()` key-tuple (issue #193), in
-/// first-appearance order, applying `spss` PER GROUP (matching the
-/// reference — regrouping the already-`spss`-capped flat spans would drop
-/// members). Enforces the distinct-group `422` via `counter` at
-/// production time (before any trailing `coalesce()` collapse). Every
-/// retained byte is charged BEFORE allocation so [`groups_retained_bytes`]
-/// releases exactly what was charged; the partition scaffolding is charged
-/// transiently and released here.
-fn build_span_set_groups(
-    plan: &SearchPlan,
-    keys: &[PlannedGroupKey],
-    env: &EvalEnv<'_>,
-    matched_spans: &[&HydratedSpan],
-    counter: &mut GroupCardinalityCounter,
-    budget: &mut ByteBudget,
-) -> Result<Vec<SpanSetGroup>, ReadError> {
-    let trace_id = env.ctx.trace_id;
-    let mut transient = 0usize;
-    charge_transient(
-        budget,
-        &mut transient,
-        matched_spans.len() * PER_SPAN_GROUP_TRANSIENT_BYTES,
-    )?;
-    // Distinct tuples in first-appearance order + their member indices.
-    let mut order: Vec<GroupTuple> = Vec::new();
-    let mut members: Vec<Vec<usize>> = Vec::new();
-    let mut index: HashMap<GroupTuple, usize> = HashMap::new();
-    for (i, span) in matched_spans.iter().enumerate() {
-        let tuple = resolve_group_tuple(keys, env, span, budget, &mut transient)?;
-        if let Some(&bucket) = index.get(&tuple) {
-            members[bucket].push(i);
-        } else {
-            // Charge + cap-check the distinct tuple (persisted) BEFORE it is
-            // retained; then the map's owned key copy (transient).
-            counter.observe(&tuple, budget)?;
-            charge_transient(budget, &mut transient, tuple_string_payload(&tuple))?;
-            index.insert(tuple.clone(), order.len());
-            members.push(vec![i]);
-            order.push(tuple);
-        }
-    }
-    // Retained groups: charge the enclosing Vec slot before the reservation.
-    budget.charge(
-        super::exec::RETAINED_ENTRY_OVERHEAD + order.len() * std::mem::size_of::<SpanSetGroup>(),
-    )?;
-    let mut groups = Vec::with_capacity(order.len());
-    for (tuple, member_idxs) in order.iter().zip(members.iter()) {
-        let take = member_idxs.len().min(plan.spss as usize);
-        // Per-group container: overhead + attribute slots + span slots.
-        budget.charge(
-            super::exec::RETAINED_ENTRY_OVERHEAD
-                + keys.len() * std::mem::size_of::<(String, GroupValue)>()
-                + take * std::mem::size_of::<SpanSummary>(),
-        )?;
-        let mut attributes = Vec::with_capacity(keys.len());
-        for (key, value) in keys.iter().zip(tuple.iter()) {
-            budget.charge(key.display.len() + value.payload_bytes())?;
-            attributes.push((key.display.clone(), value.clone()));
-        }
-        let mut spans = Vec::with_capacity(take);
-        for &idx in member_idxs.iter().take(take) {
-            spans.push(build_summary(
-                plan,
-                trace_id,
-                matched_spans[idx],
-                env,
-                budget,
-            )?);
-        }
-        groups.push(SpanSetGroup {
-            attributes,
-            matched: member_idxs.len() as u32,
-            spans,
-        });
-    }
-    drop(index);
-    budget.release(transient);
-    Ok(groups)
+/// One spanset inside the pipeline fold (issue #492 item 2): the `by()`
+/// attributes accumulated so far, in pipeline order, and this spanset's
+/// member spans in ascending `(timestamp_ns, span_id)`.
+///
+/// Every stage maps a spanset list to a spanset list and keeps it a
+/// PARTITION of a subset of the matched spans — `By` sub-divides each
+/// input set, `Coalesce` merges them, an aggregate drops whole sets — so
+/// the union of the survivors can never hold a span twice and needs no
+/// dedupe.
+#[derive(Debug)]
+struct PipelineSpanset<'a> {
+    attributes: Vec<(String, GroupValue)>,
+    spans: Vec<&'a HydratedSpan>,
 }
 
-/// Applies the ordered `by()`/`coalesce()` post-stages (issue #193) to one
-/// trace's flat matched set, returning the final `groups` layer. `By`
-/// regroups (enforcing the cardinality cap at production time); a trailing
-/// `Coalesce` collapses the groups back to the flat spanSet (releasing
-/// their retained charge — they are no longer retained); a `Coalesce`
-/// with no active grouping is a no-op.
-fn apply_post_stages(
-    plan: &SearchPlan,
+/// The bytes one spanset's `attributes` hold — the SAME `.len()`-payload /
+/// capacity-slot formula [`SpanSetGroup::retained_bytes`] uses, because
+/// materialisation MOVES this exact allocation into the retained group
+/// rather than cloning it. [`by_stage`] charges precisely this sum as it
+/// builds the attributes (slots first, then each payload before its
+/// clone), so the transient-to-retained hand-over is a re-attribution of
+/// bytes already charged, never a second charge.
+///
+/// `capacity() == len()` by construction: every producer reserves with
+/// `Vec::with_capacity` and pushes exactly that many.
+fn attributes_bytes(attributes: &[(String, GroupValue)]) -> usize {
+    std::mem::size_of_val(attributes)
+        + attributes
+            .iter()
+            .map(|(display, value)| display.len() + value.payload_bytes())
+            .sum::<usize>()
+}
+
+/// The transient charge for a ONE-spanset list holding `spans` span refs:
+/// the enclosing `Vec`'s slot + envelope and the member ref slots. Used by
+/// the fold's initial state and by `coalesce()`.
+fn single_spanset_bytes(spans: usize) -> usize {
+    super::exec::RETAINED_ENTRY_OVERHEAD
+        + std::mem::size_of::<PipelineSpanset<'_>>()
+        + spans * std::mem::size_of::<&HydratedSpan>()
+}
+
+/// One `| by(keys)` stage (issue #193's regroup, made positional by #492
+/// item 2): sub-divides EACH input spanset independently by the resolved
+/// key tuple, first-appearance order preserved, and appends this stage's
+/// `(display, value)` pairs to the input's attributes.
+///
+/// The distinct-group `422` is charged on the ACCUMULATED tuple (the
+/// input's values plus the new ones), so `by(.a) | by(.b)` is bounded by
+/// the composite cardinality it actually retains rather than by `.b`'s
+/// alone — see docs/api.md §4.2 and the
+/// `traceql-nested-by-composite-series-cap` ledger row.
+///
+/// Returns the output list and the exact byte total charged for it, which
+/// the fold releases when the next stage supersedes it.
+fn by_stage<'a>(
+    keys: &[PlannedGroupKey],
     env: &EvalEnv<'_>,
-    matched_spans: &[&HydratedSpan],
+    input: &[PipelineSpanset<'a>],
     counter: &mut GroupCardinalityCounter,
     budget: &mut ByteBudget,
-) -> Result<Option<Vec<SpanSetGroup>>, ReadError> {
-    let mut groups: Option<Vec<SpanSetGroup>> = None;
+) -> Result<(Vec<PipelineSpanset<'a>>, usize), ReadError> {
+    let mut live = 0usize;
+    let mut out: Vec<PipelineSpanset<'a>> = Vec::new();
+    for set in input {
+        // Upper bound (every span its own group), charged before the
+        // partition allocations exactly as the pre-#492 grouping did.
+        charge_transient(
+            budget,
+            &mut live,
+            set.spans.len() * PER_SPAN_GROUP_TRANSIENT_BYTES,
+        )?;
+        let mut order: Vec<GroupTuple> = Vec::new();
+        let mut members: Vec<Vec<&'a HydratedSpan>> = Vec::new();
+        let mut index: HashMap<GroupTuple, usize> = HashMap::new();
+        for span in &set.spans {
+            let tuple = resolve_group_tuple(&set.attributes, keys, env, span, budget, &mut live)?;
+            if let Some(&bucket) = index.get(&tuple) {
+                members[bucket].push(span);
+            } else {
+                // Charge + cap-check the distinct tuple (persisted) BEFORE
+                // it is retained; then the map's owned key copy (transient).
+                counter.observe(&tuple, budget)?;
+                charge_transient(budget, &mut live, tuple_string_payload(&tuple))?;
+                index.insert(tuple.clone(), order.len());
+                members.push(vec![span]);
+                order.push(tuple);
+            }
+        }
+        drop(index);
+        for (tuple, member_spans) in order.into_iter().zip(members) {
+            let attr_len = set.attributes.len() + keys.len();
+            charge_transient(
+                budget,
+                &mut live,
+                super::exec::RETAINED_ENTRY_OVERHEAD
+                    + std::mem::size_of::<PipelineSpanset<'_>>()
+                    + attr_len * std::mem::size_of::<(String, GroupValue)>(),
+            )?;
+            let mut attributes = Vec::with_capacity(attr_len);
+            let displays = set
+                .attributes
+                .iter()
+                .map(|(display, _)| display.as_str())
+                .chain(keys.iter().map(|key| key.display.as_str()));
+            for (display, value) in displays.zip(tuple.iter()) {
+                charge_transient(budget, &mut live, display.len() + value.payload_bytes())?;
+                attributes.push((display.to_string(), value.clone()));
+            }
+            out.push(PipelineSpanset {
+                attributes,
+                spans: member_spans,
+            });
+        }
+    }
+    Ok((out, live))
+}
+
+/// One `| coalesce()` stage (issue #193, positional since #492 item 2):
+/// merges whatever SURVIVES so far into a single attribute-free spanset,
+/// re-sorted ascending `(timestamp_ns, span_id)` — so
+/// `by(name) | count() > 2 | coalesce()` merges the three spans that
+/// passed, not the four that matched.
+fn coalesce_stage<'a>(
+    input: &[PipelineSpanset<'a>],
+    budget: &mut ByteBudget,
+) -> Result<(Vec<PipelineSpanset<'a>>, usize), ReadError> {
+    let total: usize = input.iter().map(|set| set.spans.len()).sum();
+    let mut live = 0usize;
+    charge_transient(budget, &mut live, single_spanset_bytes(total))?;
+    let mut spans: Vec<&'a HydratedSpan> = Vec::with_capacity(total);
+    for set in input {
+        spans.extend(set.spans.iter().copied());
+    }
+    spans.sort_by(|a, b| (a.timestamp_ns, a.span_id).cmp(&(b.timestamp_ns, b.span_id)));
+    Ok((
+        vec![PipelineSpanset {
+            attributes: Vec::new(),
+            spans,
+        }],
+        live,
+    ))
+}
+
+/// Folds one trace's matched spans through the query's ordered pipeline
+/// (issue #492 item 2) and returns the surviving spansets; an EMPTY vector
+/// means the trace does not match and is dropped, which is how
+/// `{...} | by(name) | count() > 3` removes a trace whose groups are all
+/// too small.
+///
+/// Every element is a `[]spanset -> []spanset` step applied in WRITTEN
+/// order, and the fold returns early the moment the list becomes empty.
+/// The previous stage's list is released as soon as its successor is
+/// built, so peak transient is bounded by two stages rather than by the
+/// pipeline's length; the surviving list's own charge is added to the
+/// caller's `transient` total, which the caller releases once the response
+/// has been materialised.
+fn run_pipeline<'a>(
+    plan: &SearchPlan,
+    env: &EvalEnv<'_>,
+    matched_spans: &[&'a HydratedSpan],
+    attrs: &BatchAttrs,
+    counter: &mut GroupCardinalityCounter,
+    budget: &mut ByteBudget,
+    transient: &mut usize,
+) -> Result<Vec<PipelineSpanset<'a>>, ReadError> {
+    // The initial state: ONE attribute-free spanset holding every
+    // selector-matched span, already ascending `(timestamp_ns, span_id)`.
+    let mut live = 0usize;
+    charge_transient(budget, &mut live, single_spanset_bytes(matched_spans.len()))?;
+    let mut sets = vec![PipelineSpanset {
+        attributes: Vec::new(),
+        spans: matched_spans.to_vec(),
+    }];
     for stage in plan.post_stages() {
         match stage {
             SpansetStage::By(keys) => {
-                if let Some(previous) = groups.take() {
-                    budget.release(groups_retained_bytes(&previous));
-                }
-                groups = Some(build_span_set_groups(
-                    plan,
-                    keys,
-                    env,
-                    matched_spans,
-                    counter,
-                    budget,
-                )?);
+                let (out, out_live) = by_stage(keys, env, &sets, counter, budget)?;
+                sets = out;
+                budget.release(live);
+                live = out_live;
             }
             SpansetStage::Coalesce => {
-                if let Some(collapsed) = groups.take() {
-                    budget.release(groups_retained_bytes(&collapsed));
-                }
+                let (out, out_live) = coalesce_stage(&sets, budget)?;
+                sets = out;
+                budget.release(live);
+                live = out_live;
+            }
+            SpansetStage::Aggregate(agg) => {
+                // Filters the list IN PLACE: the survivors keep the charge
+                // they already carry and the dropped sets' bytes stay
+                // charged (conservatively) until a later stage or the
+                // caller releases the list wholesale — charged once,
+                // released once.
+                let trace_id = env.ctx.trace_id;
+                sets.retain(
+                    |set| match aggregate_value(agg, trace_id, &set.spans, attrs) {
+                        Some(value) => cmp_f64(agg.cmp, value, agg.threshold),
+                        None => false,
+                    },
+                );
             }
         }
+        if sets.is_empty() {
+            budget.release(live);
+            return Ok(Vec::new());
+        }
+    }
+    *transient += live;
+    Ok(sets)
+}
+
+/// Materialises the fold's surviving spansets into the response's
+/// `groups` layer (issue #193's builder, reduced by #492 item 2 to the
+/// final step it always was): `spss` is applied PER spanset on its full
+/// membership, so `matched` reports the pre-`spss` count. Every retained
+/// byte is charged BEFORE allocation so [`groups_retained_bytes`] releases
+/// exactly what was charged.
+///
+/// The spansets are CONSUMED and each one's `attributes` allocation is
+/// MOVED into its group — so a wide group key is never held twice — and
+/// its already-charged bytes are subtracted from `transient` instead of
+/// being charged again, which re-attributes them from the fold's transient
+/// total to the group's retained total without moving `budget.used()`.
+fn build_span_set_groups(
+    plan: &SearchPlan,
+    trace_id: [u8; 16],
+    sets: Vec<PipelineSpanset<'_>>,
+    env: &EvalEnv<'_>,
+    budget: &mut ByteBudget,
+    transient: &mut usize,
+) -> Result<Vec<SpanSetGroup>, ReadError> {
+    // Retained groups: charge the enclosing Vec slot before the reservation.
+    budget.charge(
+        super::exec::RETAINED_ENTRY_OVERHEAD + sets.len() * std::mem::size_of::<SpanSetGroup>(),
+    )?;
+    let mut groups = Vec::with_capacity(sets.len());
+    for set in sets {
+        let take = set.spans.len().min(plan.spss as usize);
+        // Per-group container: overhead + span slots. The attribute slots
+        // and payloads are the fold's allocation, moved in below.
+        budget.charge(
+            super::exec::RETAINED_ENTRY_OVERHEAD + take * std::mem::size_of::<SpanSummary>(),
+        )?;
+        *transient -= attributes_bytes(&set.attributes);
+        let mut spans = Vec::with_capacity(take);
+        for span in set.spans.iter().take(take) {
+            spans.push(build_summary(plan, trace_id, span, env, budget)?);
+        }
+        groups.push(SpanSetGroup {
+            attributes: set.attributes,
+            matched: set.spans.len() as u32,
+            spans,
+        });
     }
     Ok(groups)
 }
@@ -2579,8 +2727,9 @@ pub(crate) fn evaluate_batch(
         let spanset = eval_spanset(&plan.spanset, plan, &mut filter_idx, trace, &env, budget)?;
         // The nested-set numbering (issue #181) now also feeds `by()`
         // grouping over the nested-set intrinsics (issue #193), so it is
-        // held until AFTER `apply_post_stages` and released on every exit
-        // path — never before grouping can read it.
+        // held until AFTER the pipeline fold and the response
+        // materialisation, and released on every exit path — never before
+        // grouping can read it.
         let Some(matched) = spanset else {
             if let Some(charged) = nested_set {
                 release_nested_set(charged, budget);
@@ -2600,20 +2749,6 @@ pub(crate) fn evaluate_batch(
             release_set(matched, budget);
             return Err(e);
         }
-        for agg in &plan.aggregates {
-            let pass = match aggregate_value(agg, trace, &matched.set, attrs) {
-                Some(value) => cmp_f64(agg.cmp, value, agg.threshold),
-                None => false,
-            };
-            if !pass {
-                budget.release(transients);
-                release_set(matched, budget);
-                if let Some(charged) = nested_set {
-                    release_nested_set(charged, budget);
-                }
-                continue 'traces;
-            }
-        }
         // `select()` never changes which traces match — response shaping
         // only (plan v2).
         let mut matched_spans: Vec<&HydratedSpan> = trace
@@ -2622,12 +2757,63 @@ pub(crate) fn evaluate_batch(
             .filter(|s| matched.set.contains(&s.span_id))
             .collect();
         matched_spans.sort_by(|a, b| (a.timestamp_ns, a.span_id).cmp(&(b.timestamp_ns, b.span_id)));
+        // The public inter-trace sort key stays on the SELECTOR-matched
+        // spans, not on what the pipeline leaves behind: the reference's
+        // `traces[]` order is insensitive to the pipeline (measured on a
+        // two-trace corpus for issue #492 item 2), so a filtering stage
+        // must not reorder the result.
         let sort_key = matched_spans
             .iter()
             .map(|s| s.timestamp_ns)
             .max()
             .unwrap_or(i64::MIN);
-        let take = matched_spans.len().min(plan.spss as usize);
+        // Issue #492 item 2: ONE ordered fold over the pipeline's stages —
+        // `by()`, `coalesce()` and the aggregate filters at their written
+        // positions. An empty result ends the trace here, which is how a
+        // grouped aggregate can remove a trace that the flat one keeps.
+        let mut pipeline_transient = 0usize;
+        let sets = run_pipeline(
+            plan,
+            &env,
+            &matched_spans,
+            attrs,
+            counter,
+            budget,
+            &mut pipeline_transient,
+        )?;
+        if sets.is_empty() {
+            budget.release(pipeline_transient);
+            budget.release(transients);
+            release_set(matched, budget);
+            if let Some(charged) = nested_set {
+                release_nested_set(charged, budget);
+            }
+            continue 'traces;
+        }
+        // The flat view of the response is the UNION of the surviving
+        // spansets (a partition, so no dedupe): with no filtering stage it
+        // is exactly the matched set, keeping the default response
+        // byte-identical. A single survivor is already sorted, so only a
+        // genuinely split list pays for a merge.
+        let mut merged_transient = 0usize;
+        let merged: Option<Vec<&HydratedSpan>> = if sets.len() == 1 {
+            None
+        } else {
+            let total: usize = sets.iter().map(|set| set.spans.len()).sum();
+            charge_transient(
+                budget,
+                &mut merged_transient,
+                super::exec::RETAINED_ENTRY_OVERHEAD + total * std::mem::size_of::<&HydratedSpan>(),
+            )?;
+            let mut union: Vec<&HydratedSpan> = Vec::with_capacity(total);
+            for set in &sets {
+                union.extend(set.spans.iter().copied());
+            }
+            union.sort_by(|a, b| (a.timestamp_ns, a.span_id).cmp(&(b.timestamp_ns, b.span_id)));
+            Some(union)
+        };
+        let surviving: &[&HydratedSpan] = merged.as_deref().unwrap_or(&sets[0].spans);
+        let take = surviving.len().min(plan.spss as usize);
         // Charge the match base + the summaries buffer (at its exact
         // capacity) BEFORE allocating it.
         budget.charge(
@@ -2636,20 +2822,36 @@ pub(crate) fn evaluate_batch(
                 + take * std::mem::size_of::<SpanSummary>(),
         )?;
         let mut summaries = Vec::with_capacity(take);
-        for span in matched_spans.iter().take(take) {
+        for span in surviving.iter().take(take) {
             summaries.push(build_summary(plan, trace.trace_id, span, &env, budget)?);
         }
-        let matched_total = matched_spans.len() as u32;
-        // Issue #193: reshape into `by()`/`coalesce()` spanSets from the
-        // FULL (pre-`spss`) matched set. `None` (no post-stages, or a
-        // trailing `coalesce()` collapse) keeps the flat response
-        // byte-identical.
-        let groups = apply_post_stages(plan, &env, &matched_spans, counter, budget)?;
-        // `env`'s borrow of `nested_set` has ended (its last use was
-        // `apply_post_stages`), so the numbering can now be released.
+        let matched_total = surviving.len() as u32;
+        // `groups` is `Some` iff a survivor carries `by()` attributes —
+        // only `By` adds them and only `Coalesce` collapses the list to
+        // one, so a list longer than one always has them and the rule is
+        // total. `None` (a flat query, or a trailing `coalesce()`) keeps
+        // the flat response byte-identical.
+        let groups = if sets.iter().any(|set| !set.attributes.is_empty()) {
+            Some(build_span_set_groups(
+                plan,
+                trace.trace_id,
+                sets,
+                &env,
+                budget,
+                &mut pipeline_transient,
+            )?)
+        } else {
+            drop(sets);
+            None
+        };
+        // `env`'s borrow of `nested_set` has ended (its last use was the
+        // response materialisation), so the numbering can now be released.
         if let Some(charged) = nested_set {
             release_nested_set(charged, budget);
         }
+        drop(merged);
+        budget.release(merged_transient);
+        budget.release(pipeline_transient);
         drop(matched_spans);
         budget.release(transients);
         release_set(matched, budget);
@@ -2666,6 +2868,8 @@ pub(crate) fn evaluate_batch(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use pulsus_traceql::parse;
 
     use super::super::filter::SpanFilterCtx;
@@ -4473,6 +4677,336 @@ mod tests {
             err,
             ReadError::QueryTooBroad(TooBroadReason::TraceSearchSeriesCap { count: 3, cap: 2 })
         ));
+    }
+
+    // -- issue #492 item 2: the WRITTEN order of the stages --------------
+
+    /// Corpus C-ORD1 — one trace, four spans: three named `a` (durations
+    /// 0.5s / 2s / 3s) and one named `b` (0.4s), ascending in time so the
+    /// LAST span is the one a `count() > 2` drops. Fixed literal
+    /// timestamps: no test input here is derived from the wall clock.
+    fn ord1_trace() -> TraceSpans {
+        TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "grp492", "a", 10, 500_000_000),
+                span(2, "grp492", "a", 20, 2_000_000_000),
+                span(3, "grp492", "a", 30, 3_000_000_000),
+                span(4, "grp492", "b", 40, 400_000_000),
+            ],
+        }
+    }
+
+    /// Corpus C-ORD2 — one trace, four spans with CROSS-CUTTING keys:
+    /// `(a, server)`, `(a, client)`, `(b, server)`, `(b, server)`. Neither
+    /// key alone separates the spans the other separates, which is what
+    /// makes a nested `by()` observable.
+    fn ord2_trace() -> TraceSpans {
+        let with_kind = |n: u8, name: &str, kind: i8, ts: i64| {
+            let mut s = span(n, "grp492b", name, ts, 1);
+            s.kind = kind;
+            s
+        };
+        TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                with_kind(1, "a", 2, 10),
+                with_kind(2, "a", 3, 20),
+                with_kind(3, "b", 2, 30),
+                with_kind(4, "b", 2, 40),
+            ],
+        }
+    }
+
+    /// One group's attribute KEY sequence, in the order the response
+    /// carries it.
+    fn group_key_sequence(group: &SpanSetGroup) -> Vec<String> {
+        group
+            .attributes
+            .iter()
+            .map(|(display, _)| display.clone())
+            .collect()
+    }
+
+    /// The group map a spanSet array reduces to: the ordered group-VALUE
+    /// tuple -> the member span-id low bytes. Compared as a map, never as
+    /// a sequence.
+    fn group_map(groups: &[SpanSetGroup]) -> BTreeMap<Vec<String>, Vec<u8>> {
+        groups
+            .iter()
+            .map(|g| {
+                let key: Vec<String> = g
+                    .attributes
+                    .iter()
+                    .map(|(_, value)| format!("{value:?}"))
+                    .collect();
+                let members: Vec<u8> = g.spans.iter().map(|s| s.span_id[7]).collect();
+                (key, members)
+            })
+            .collect()
+    }
+
+    /// The flat span-id low bytes of the one returned match.
+    fn flat_ids(matches: &[TraceMatch]) -> Vec<u8> {
+        matches[0].spans.iter().map(|s| s.span_id[7]).collect()
+    }
+
+    /// AC1 — the known pair. `by(name) | count() > 2` filters the GROUPS
+    /// (one survives, three spans); the SAME aggregate written BEFORE the
+    /// `by(name)` filters the whole matched set and leaves both groups.
+    /// The two queries send byte-identical SQL, so this difference is the
+    /// whole of item 2.
+    #[test]
+    fn by_then_count_and_count_then_by_differ() {
+        let p = plan_wide(r#"{ } | by(name) | count() > 2"#);
+        let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert_eq!(
+            m.len(),
+            1,
+            "the `a` group has three spans, so the trace stays"
+        );
+        let groups = m[0].groups.as_ref().expect("by() active");
+        assert_eq!(
+            groups.len(),
+            1,
+            "count() > 2 AFTER by(name) filters the groups"
+        );
+        assert_eq!(
+            groups[0].attributes,
+            vec![("by(name)".to_string(), GroupValue::Str("a".to_string()))]
+        );
+        assert_eq!(groups[0].matched, 3);
+        assert_eq!(
+            flat_ids(&m),
+            vec![1, 2, 3],
+            "the flat view is the survivors"
+        );
+        assert_eq!(m[0].matched, 3);
+
+        let p = plan_wide(r#"{ } | count() > 2 | by(name)"#);
+        let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        let groups = m[0].groups.as_ref().expect("by() active");
+        assert_eq!(
+            groups.len(),
+            2,
+            "the same aggregate BEFORE by(name) filters the whole matched set"
+        );
+        assert_eq!(groups[0].matched, 3);
+        assert_eq!(groups[1].matched, 1);
+        assert_eq!(flat_ids(&m), vec![1, 2, 3, 4]);
+        assert_eq!(m[0].matched, 4);
+    }
+
+    /// AC2 — the narrowest difference: the two queries differ by ONE
+    /// character from AC1's, and the grouped one removes the trace
+    /// entirely while the flat one keeps it whole. An empty spanset list
+    /// ends the trace; it does not fall back to the matched set.
+    #[test]
+    fn grouped_aggregate_can_empty_the_trace() {
+        let p = plan_wide(r#"{ } | by(name) | count() > 3"#);
+        let out = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert!(
+            out.is_empty(),
+            "no group holds more than three spans, so nothing survives"
+        );
+
+        let p = plan_wide(r#"{ } | count() > 3 | by(name)"#);
+        let out = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert_eq!(out.len(), 1, "four matched spans pass count() > 3");
+        assert_eq!(out[0].groups.as_ref().expect("by() active").len(), 2);
+    }
+
+    /// AC3 — a second `by()` SUB-DIVIDES the current spanSets and appends
+    /// its attribute; it does not rebuild from the flat matched set. The
+    /// attribute sequence is the WRITTEN order, so the two spellings
+    /// carry the same partition under different key orders.
+    #[test]
+    fn nested_by_stages_accumulate_attributes() {
+        let p = plan_wide(r#"{ } | by(name) | by(kind)"#);
+        let m = eval(&p, &[ord2_trace()], &membership(&p, &[]));
+        let groups = m[0].groups.as_ref().expect("by() active");
+        assert_eq!(groups.len(), 3, "(a,server) (a,client) (b,server)");
+        for g in groups {
+            assert_eq!(
+                group_key_sequence(g),
+                vec!["by(name)".to_string(), "by(kind)".to_string()]
+            );
+        }
+        assert_eq!(
+            group_map(groups),
+            BTreeMap::from([
+                (
+                    vec![r#"Str("a")"#.to_string(), r#"Str("server")"#.to_string()],
+                    vec![1]
+                ),
+                (
+                    vec![r#"Str("a")"#.to_string(), r#"Str("client")"#.to_string()],
+                    vec![2]
+                ),
+                (
+                    vec![r#"Str("b")"#.to_string(), r#"Str("server")"#.to_string()],
+                    vec![3, 4]
+                ),
+            ])
+        );
+
+        let p = plan_wide(r#"{ } | by(kind) | by(name)"#);
+        let m = eval(&p, &[ord2_trace()], &membership(&p, &[]));
+        let groups = m[0].groups.as_ref().expect("by() active");
+        assert_eq!(groups.len(), 3);
+        for g in groups {
+            assert_eq!(
+                group_key_sequence(g),
+                vec!["by(kind)".to_string(), "by(name)".to_string()]
+            );
+        }
+        assert_eq!(
+            group_map(groups),
+            BTreeMap::from([
+                (
+                    vec![r#"Str("server")"#.to_string(), r#"Str("a")"#.to_string()],
+                    vec![1]
+                ),
+                (
+                    vec![r#"Str("client")"#.to_string(), r#"Str("a")"#.to_string()],
+                    vec![2]
+                ),
+                (
+                    vec![r#"Str("server")"#.to_string(), r#"Str("b")"#.to_string()],
+                    vec![3, 4]
+                ),
+            ])
+        );
+    }
+
+    /// AC4 — `coalesce()` merges what SURVIVES at its written position,
+    /// not what matched: after a filtering stage it merges three spans,
+    /// before one it merges four.
+    #[test]
+    fn coalesce_after_a_filter_keeps_only_survivors() {
+        let p = plan_wide(r#"{ } | by(name) | count() > 2 | coalesce()"#);
+        let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert!(
+            m[0].groups.is_none(),
+            "coalesce() collapses to the flat set"
+        );
+        assert_eq!(m[0].matched, 3);
+        assert_eq!(flat_ids(&m), vec![1, 2, 3]);
+
+        let p = plan_wide(r#"{ } | by(name) | coalesce() | count() > 2"#);
+        let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
+        assert!(m[0].groups.is_none());
+        assert_eq!(m[0].matched, 4, "the coalesced set is what count() sees");
+        assert_eq!(flat_ids(&m), vec![1, 2, 3, 4]);
+    }
+
+    /// AC9 — `count()` now counts a SPANSET's members rather than the
+    /// matched-id set. On the flat spanset those are the same number
+    /// because the engine's own `group_hydrated_rows` dedupes hydration
+    /// rows by `span_id` BEFORE evaluation, so a replayed row cannot
+    /// inflate the count. Built through that real function, not a
+    /// hand-deduped fixture.
+    #[test]
+    fn count_matches_the_deduped_span_set() {
+        let row = |span_id: u8| super::super::rows::HydrationRow {
+            trace_id: tid(1),
+            span_id: sid(span_id),
+            parent_id: [0u8; 8],
+            service: "grp492".to_string(),
+            name: "hot".to_string(),
+            timestamp_ns: span_id as i64 * 10,
+            duration_ns: 1,
+            status_code: 0,
+            status_message: String::new(),
+            kind: 1,
+            scope_name: String::new(),
+            scope_version: String::new(),
+        };
+        let verdict = |q: &str, rows: Vec<super::super::rows::HydrationRow>| {
+            let p = plan_wide(q);
+            let mut budget = ByteBudget::new(usize::MAX);
+            let mut charged = 0usize;
+            let (traces, _) =
+                super::super::exec::group_hydrated_rows(rows, &mut budget, &mut charged)
+                    .expect("in budget");
+            assert_eq!(traces[0].spans.len(), 3, "the replay is deduped upstream");
+            !eval(&p, &traces, &membership(&p, &[])).is_empty()
+        };
+        let clean = || vec![row(1), row(2), row(3)];
+        let replayed = || vec![row(1), row(1), row(2), row(3)];
+        // The threshold sits ON the boundary in both directions, so a
+        // count that is one too high or one too low flips a verdict: with
+        // three distinct spans `> 2` must match and `> 3` must not, and a
+        // replayed row must change neither.
+        assert!(verdict(r#"{ } | count() > 2"#, clean()));
+        assert!(
+            verdict(r#"{ } | count() > 2"#, replayed()),
+            "the same three spans with one row replayed give the SAME verdict"
+        );
+        assert!(!verdict(r#"{ } | count() > 3"#, clean()));
+        assert!(
+            !verdict(r#"{ } | count() > 3"#, replayed()),
+            "a replayed row must not inflate the count past the threshold"
+        );
+    }
+
+    /// AC10 — the distinct-group cap charges the ACCUMULATED key tuple.
+    ///
+    /// **Why `max_series = 4` and not another number.** On C-ORD2 the
+    /// stage-local accounting this change replaces observes FOUR tuples —
+    /// `[a]`, `[b]`, `[server]`, `[client]` — and the composite accounting
+    /// observes FIVE — `[a]`, `[b]`, `[a,server]`, `[a,client]`,
+    /// `[b,server]`. Four is the ONLY cap that separates them: at 4 the
+    /// old rule returns `Ok` and the new rule must refuse. Any cap <= 3
+    /// refuses under both rules and any cap >= 5 accepts under both, so a
+    /// later edit that "simplifies" this number silently stops the test
+    /// discriminating. The second assertion pins the discrimination
+    /// itself: at 5 the query must still succeed, so the criterion cannot
+    /// pass by refusing everything.
+    #[test]
+    fn nested_by_charges_the_composite_tuple_not_the_stage_local_one() {
+        let q = r#"{ } | by(name) | by(kind)"#;
+        let p = plan_cap(q, 4);
+        let err = evaluate_batch(
+            &p,
+            &[ord2_trace()],
+            &membership(&p, &[]),
+            &mut GroupCardinalityCounter::new(4),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect_err("five composite tuples over a cap of 4 must 422");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(TooBroadReason::TraceSearchSeriesCap { count: 5, cap: 4 })
+            ),
+            "got {err:?}"
+        );
+
+        let p = plan_cap(q, 5);
+        evaluate_batch(
+            &p,
+            &[ord2_trace()],
+            &membership(&p, &[]),
+            &mut GroupCardinalityCounter::new(5),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect("cap 5 is the non-refusal guard: the same query must succeed");
+    }
+
+    /// The trace-ordering control: a filtering stage must not move the
+    /// public inter-trace `sort_key`. On C-ORD1 the LATEST span is the one
+    /// `count() > 2` drops, so a `sort_key` computed over the survivors
+    /// would move — measured on the reference, its `traces[]` order is
+    /// insensitive to the pipeline.
+    #[test]
+    fn pipeline_filtering_does_not_move_the_sort_key() {
+        let grouped = plan_wide(r#"{ } | by(name)"#);
+        let filtered = plan_wide(r#"{ } | by(name) | count() > 2"#);
+        let a = eval(&grouped, &[ord1_trace()], &membership(&grouped, &[]));
+        let b = eval(&filtered, &[ord1_trace()], &membership(&filtered, &[]));
+        assert_eq!(a[0].sort_key, 40, "max timestamp over the MATCHED spans");
+        assert_eq!(b[0].sort_key, a[0].sort_key);
     }
 
     /// Float `by()` grouping (issue #193 R2-F2): `+0.0` and `-0.0` collapse

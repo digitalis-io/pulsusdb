@@ -567,14 +567,24 @@ pub(crate) enum GroupKeyResolver {
     },
 }
 
-/// One ordered post-filter spanset stage (issue #193): `by()` regroups the
-/// matched spans into one spanSet per distinct key-tuple, `coalesce()`
-/// merges the current spanSets back into one. Ordered (not flattened
-/// flags) so `by()|coalesce()` and `coalesce()|by()` stay distinguishable.
+/// One ordered pipeline stage (issue #193, widened by #492 item 2):
+/// `by()` regroups the current spanSets into one spanSet per distinct
+/// key-tuple, `coalesce()` merges them back into one, and an aggregate
+/// filter keeps the spanSets whose aggregate passes its comparison.
+/// Ordered (not flattened flags) so `by()|coalesce()`, `coalesce()|by()`
+/// AND `by()|count()>n` vs `count()>n|by()` stay distinguishable.
+///
+/// **This is the single source of truth for the pipeline's shape.**
+/// [`SearchPlan::aggregates`] is derived from the `Aggregate` stages after
+/// planning and has no other producer, so the two carriers cannot drift.
 #[derive(Debug, Clone)]
 pub(crate) enum SpansetStage {
     By(Vec<PlannedGroupKey>),
     Coalesce,
+    /// An aggregate filter at its WRITTEN position (issue #492 item 2):
+    /// `| count() > 2` after a `by()` filters the GROUPS, before it
+    /// filters the whole matched set.
+    Aggregate(PlannedAggregate),
 }
 
 /// The complete, deterministic search plan — everything
@@ -637,6 +647,12 @@ pub struct SearchPlan {
     /// compare an `event:`/`link:` intrinsic against another field, so
     /// nothing else pays for the co-load.
     pub(crate) event_sets: Vec<EventSetField>,
+    /// The pipeline's aggregate filters, DERIVED from the
+    /// [`SpansetStage::Aggregate`] entries of [`Self::post_stages`] in
+    /// pipeline order (issue #492 item 2) — `post_stages` is the source of
+    /// truth and this vector has no other producer. Kept because it is the
+    /// cheap "does this query aggregate at all" question the planner and
+    /// its tests ask; the EVALUATOR reads the stages, not this.
     pub(crate) aggregates: Vec<PlannedAggregate>,
     /// Spanset-level `| by(fields)` grouping keys (issue #185); empty when
     /// absent. The executor enforces `reader.traceql_max_series` over the
@@ -644,10 +660,13 @@ pub struct SearchPlan {
     pub(crate) group_by: Vec<Field>,
     /// Whether a `| coalesce()` stage is present (issue #185).
     pub(crate) coalesce: bool,
-    /// The ordered spanset post-stages (issue #193): `by()`/`coalesce()`
-    /// in pipeline order, carrying the resolved group keys. Phase 2
-    /// reshapes the response from these; empty for a plain (flat) query,
-    /// keeping the default response byte-identical.
+    /// The ordered pipeline stages (issue #193, widened by #492 item 2):
+    /// `by()` / `coalesce()` / aggregate filters in pipeline order,
+    /// carrying the resolved group keys. **The source of truth for the
+    /// pipeline** — Phase 2 folds the matched spans through exactly these,
+    /// in this order, and [`Self::aggregates`] is derived from them. Empty
+    /// for a plain (flat) query, keeping the default response
+    /// byte-identical.
     pub(crate) post_stages: Vec<SpansetStage>,
     /// The `with(most_recent=true)` search hint (issue #185): the response
     /// keeps its recency ordering (the default), most-recent first.
@@ -695,8 +714,9 @@ impl SearchPlan {
         self.most_recent
     }
 
-    /// The ordered spanset post-stages (issue #193) — `by()`/`coalesce()`
-    /// in pipeline order. Empty when the query is flat.
+    /// The ordered pipeline stages (issue #193, widened by #492 item 2) —
+    /// `by()` / `coalesce()` / aggregate filters in pipeline order. Empty
+    /// when the query is flat.
     pub(crate) fn post_stages(&self) -> &[SpansetStage] {
         &self.post_stages
     }
@@ -735,6 +755,16 @@ impl SearchPlan {
     /// intrinsic against another field.
     pub fn event_sets_len(&self) -> usize {
         self.event_sets.len()
+    }
+
+    /// Number of aggregate filters in the pipeline (issue #492 item 2;
+    /// planner tests). This counts [`Self::aggregates`], the vector
+    /// DERIVED from the `Aggregate` entries of [`Self::post_stages`] — the
+    /// evaluator folds the stages themselves, so this is the reader that
+    /// keeps the derived carrier honest rather than a second execution
+    /// path.
+    pub fn aggregates_len(&self) -> usize {
+        self.aggregates.len()
     }
 
     /// One membership read's SQL for a candidate batch (exposed for the
@@ -1261,6 +1291,8 @@ fn aggregate_threshold(
 /// `select()` projections, and the spanset-level `by(...)`/`coalesce()`
 /// stages (issue #185).
 struct PlannedPipeline {
+    /// Derived from the [`SpansetStage::Aggregate`] entries of
+    /// [`Self::post_stages`] (issue #492 item 2); no other producer.
     aggregates: Vec<PlannedAggregate>,
     select_fields: Vec<SelectField>,
     /// Spanset-level `| by(fields)` grouping keys (issue #185); empty when
@@ -1270,8 +1302,9 @@ struct PlannedPipeline {
     group_by: Vec<Field>,
     /// Whether a `| coalesce()` stage is present (issue #185).
     coalesce: bool,
-    /// The ordered `by()`/`coalesce()` post-stages with resolved group
-    /// keys (issue #193).
+    /// The ordered `by()` / `coalesce()` / aggregate stages with resolved
+    /// group keys (issue #193, widened by #492 item 2) — the pipeline's
+    /// source of truth.
     post_stages: Vec<SpansetStage>,
 }
 
@@ -1283,7 +1316,6 @@ fn plan_pipeline(
     trace_ctx: &mut bool,
     child_count: &mut bool,
 ) -> Result<PlannedPipeline, PlanError> {
-    let mut aggregates = Vec::new();
     let mut select_fields = Vec::new();
     let mut group_by = Vec::new();
     let mut coalesce = false;
@@ -1410,12 +1442,17 @@ fn plan_pipeline(
                         )));
                     }
                 };
-                aggregates.push(PlannedAggregate {
+                // Issue #492 item 2: the aggregate joins the ONE ordered
+                // stage list at its written position. `aggregates` is
+                // derived from that list below, so a `| count() > 2`
+                // written after a `| by(name)` filters the groups and one
+                // written before it filters the whole matched set.
+                post_stages.push(SpansetStage::Aggregate(PlannedAggregate {
                     op: *op,
                     source,
                     cmp: *cmp,
                     threshold: aggregate_threshold(*op, field, value)?,
-                });
+                }));
             }
             // Metrics functions are `/api/traces/v1/metrics/*`-only (issue
             // #59): on the search surface a parsed `| rate()` is a caller
@@ -1544,6 +1581,16 @@ fn plan_pipeline(
             }
         }
     }
+    // Issue #492 item 2: `aggregates` is DERIVED from the ordered stage
+    // list and has nothing else that writes it — the two carriers cannot
+    // drift, and the evaluator reads the stages.
+    let aggregates: Vec<PlannedAggregate> = post_stages
+        .iter()
+        .filter_map(|s| match s {
+            SpansetStage::Aggregate(a) => Some(a.clone()),
+            SpansetStage::By(_) | SpansetStage::Coalesce => None,
+        })
+        .collect();
     Ok(PlannedPipeline {
         aggregates,
         select_fields,
@@ -3173,6 +3220,42 @@ mod tests {
         let p = plan(r#"{ .k = "v" } | avg(duration) > 100ms"#);
         assert!(matches!(p.aggregates[0].source, AggSource::DurationNs));
         assert_eq!(p.aggregates[0].threshold, 100_000_000.0);
+    }
+
+    /// AC8 (issue #492 item 2): `aggregates` is exactly the ordered
+    /// `Aggregate` stages of `post_stages`, in pipeline order, and
+    /// `post_stages` is the only producer — the derivation is the whole
+    /// relationship, so the two carriers cannot disagree about how many
+    /// aggregates a query has or where they sit.
+    ///
+    /// The other half of this criterion is a sweep for a second producer
+    /// — a push onto the derived vector anywhere under
+    /// `crates/pulsus-read/src` — which must find none: a second producer
+    /// would keep the equality below true while the ORDER stopped meaning
+    /// anything. (The sweep's own pattern is deliberately not spelled out
+    /// here, so this comment cannot be the hit that answers it.)
+    #[test]
+    fn plan_aggregates_are_exactly_the_ordered_aggregate_stages() {
+        let p = plan(r#"{ .x = 1 } | count() > 2 | by(name) | max(duration) > 1s"#);
+        assert_eq!(p.post_stages.len(), 3, "count(), by(name), max(duration)");
+        assert_eq!(p.aggregates_len(), 2);
+        let from_stages: Vec<String> = p
+            .post_stages
+            .iter()
+            .filter_map(|s| match s {
+                SpansetStage::Aggregate(a) => Some(format!("{a:?}")),
+                SpansetStage::By(_) | SpansetStage::Coalesce => None,
+            })
+            .collect();
+        let derived: Vec<String> = p.aggregates.iter().map(|a| format!("{a:?}")).collect();
+        assert_eq!(derived, from_stages);
+        assert!(
+            matches!(p.post_stages[0], SpansetStage::Aggregate(_))
+                && matches!(p.post_stages[1], SpansetStage::By(_))
+                && matches!(p.post_stages[2], SpansetStage::Aggregate(_)),
+            "the stages keep their WRITTEN positions: {:?}",
+            p.post_stages
+        );
     }
 
     #[test]
