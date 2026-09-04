@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
 use pulsus_read::traces::rows::{
-    CandidateRow, HydrationRow, MembershipRow, RootRow, StoredSpanRow, StrValueRow,
+    CandidateRow, HydrationRow, MembershipRow, RootRow, StoredSpanRow, TypedStrValueRow,
 };
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
 use pulsus_read::traces::sql::point_read_sql;
@@ -158,6 +158,157 @@ struct StageSpec {
     stage: &'static str,
     sql: String,
     roster: Roster,
+    /// The row type this stage's SQL is decoded into.
+    ///
+    /// **It lives on the spec, beside the SQL, on purpose.** RowBinary
+    /// decoding is positional, so a projection and its decoder are one
+    /// fact; when they were two — the SQL built here and the decoder
+    /// chosen by a `match` on `stage` further down — issue #510 widened
+    /// `membership_sql`'s fused projection from three columns to four,
+    /// moved production's call sites, and left this one behind. The
+    /// mismatch is a hard decode error, so it could not be silent, but no
+    /// local suite runs this bench and only the clustered CI leg saw it.
+    decoder: Decoder,
+}
+
+/// Which row struct a stage's projection decodes into.
+///
+/// [`Self::columns`] is the decoder's own `COLUMN_NAMES`, so
+/// `the_evidence_stages_project_exactly_what_they_decode` can compare it
+/// to the SQL without a second list to keep in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decoder {
+    StoredSpan,
+    Candidate,
+    Hydration,
+    /// The membership read with NO fused value — two columns.
+    Membership,
+    /// The membership read with the matched value AND its stored type
+    /// fused in (issues #479, #510) — four columns.
+    TypedStrValue,
+    Root,
+}
+
+impl Decoder {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn columns(self) -> &'static [&'static str] {
+        match self {
+            Decoder::StoredSpan => StoredSpanRow::COLUMN_NAMES,
+            Decoder::Candidate => CandidateRow::COLUMN_NAMES,
+            Decoder::Hydration => HydrationRow::COLUMN_NAMES,
+            Decoder::Membership => MembershipRow::COLUMN_NAMES,
+            Decoder::TypedStrValue => TypedStrValueRow::COLUMN_NAMES,
+            Decoder::Root => RootRow::COLUMN_NAMES,
+        }
+    }
+}
+
+/// The two REAL plans the evidence stages read their SQL from, built by
+/// the product planner against the `_dist` tables.
+///
+/// Pure, so the hermetic projection check builds the same plans the run
+/// does rather than a second set written beside it.
+fn evidence_plans(base: i64, now: i64) -> anyhow::Result<(SearchPlan, SearchPlan)> {
+    let ctx = SearchCtx {
+        filter: SpanFilterCtx {
+            spans_table: "trace_spans_dist",
+            attrs_table: "trace_attrs_idx_dist",
+        },
+        max_candidates: 100_000,
+        // The `reader.traceql_max_series` default (issue #185): the shared
+        // `by()` cardinality cap, matching the production sites.
+        max_series: 1_000,
+        distributed: true,
+    };
+    let params = SearchParams {
+        start_ns: base,
+        end_ns: now,
+        limit: 20,
+        spss: 3,
+    };
+    let service_query = pulsus_traceql_parse(
+        r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 }"#,
+    )?;
+    let plan: SearchPlan = plan_search(&service_query, &params, &ctx)
+        .map_err(|e| anyhow::anyhow!("plan_search failed: {e}"))?;
+    anyhow::ensure!(
+        plan.generator_sqls.len() == 1 && plan.probes_len() == 1,
+        "the evidence query must plan one generator + one membership probe"
+    );
+    let attr_query = pulsus_traceql_parse("{ span.http.status_code >= 500 }")?;
+    let attr_plan = plan_search(&attr_query, &params, &ctx)
+        .map_err(|e| anyhow::anyhow!("plan_search failed: {e}"))?;
+    Ok((plan, attr_plan))
+}
+
+/// The six evidence stages: each one's SQL and the row type it decodes
+/// into, from the SAME record.
+///
+/// Pure — no client, no cluster — so
+/// `the_evidence_stages_project_exactly_what_they_decode` can build the
+/// real list and check every projection against its real decoder without
+/// a two-shard ClickHouse.
+fn evidence_stages(
+    plan: &SearchPlan,
+    attr_plan: &SearchPlan,
+    batch: &[[u8; 16]],
+    target: [u8; 16],
+) -> Vec<StageSpec> {
+    vec![
+        StageSpec {
+            stage: "trace_by_id",
+            sql: point_read_sql("trace_spans_dist", &hex32(&target)),
+            roster: Roster::TraceIds(vec![target]),
+            decoder: Decoder::StoredSpan,
+        },
+        StageSpec {
+            stage: "phase1_generator_service",
+            sql: plan.generator_sqls[0].clone(),
+            roster: Roster::Full,
+            decoder: Decoder::Candidate,
+        },
+        StageSpec {
+            stage: "phase1_generator_attr",
+            sql: attr_plan.generator_sqls[0].clone(),
+            roster: Roster::Full,
+            decoder: Decoder::Candidate,
+        },
+        StageSpec {
+            stage: "phase2_hydration",
+            sql: plan.hydration_sql_for(batch),
+            roster: Roster::TraceIds(batch.to_vec()),
+            decoder: Decoder::Hydration,
+        },
+        StageSpec {
+            stage: "phase2_membership",
+            sql: plan.membership_sql_for(0, batch),
+            roster: Roster::TraceIds(batch.to_vec()),
+            // The membership read has TWO shapes: when a projection needs
+            // the probe's matched value, `membership_sql` fuses the
+            // byte-capped `val AS v` (issue #479) AND its `val_type AS t`
+            // (issue #510) into the SAME statement and the row is FOUR
+            // columns; otherwise it is two. Production dispatches on
+            // exactly this accessor
+            // (`traces/exec.rs::load_batch_attrs`, which decodes the fused
+            // arm as `TypedStrValueRow`), and this stage measures the read
+            // production issues — so it mirrors that dispatch rather than
+            // forcing the projection off, which would measure a statement
+            // no query ever sends. The evidence query's probe is
+            // `span.http.status_code >= 500`, a range predicate, so this
+            // run takes the fused arm.
+            decoder: if plan.probe_fuses_value(0) {
+                Decoder::TypedStrValue
+            } else {
+                Decoder::Membership
+            },
+        },
+        StageSpec {
+            stage: "root_hydration",
+            sql: plan.root_sql_for(&[target]),
+            roster: Roster::TraceIds(vec![target]),
+            decoder: Decoder::Root,
+        },
+    ]
 }
 
 fn reader_settings(query_id: &str) -> QuerySettings {
@@ -587,68 +738,9 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     }
 
     // The REAL plans, from the product planner, against the _dist tables.
-    let ctx = SearchCtx {
-        filter: SpanFilterCtx {
-            spans_table: "trace_spans_dist",
-            attrs_table: "trace_attrs_idx_dist",
-        },
-        max_candidates: 100_000,
-        // The `reader.traceql_max_series` default (issue #185): the shared
-        // `by()` cardinality cap, matching the production sites.
-        max_series: 1_000,
-        distributed: true,
-    };
-    let params = SearchParams {
-        start_ns: base,
-        end_ns: now,
-        limit: 20,
-        spss: 3,
-    };
-    let service_query = pulsus_traceql_parse(
-        r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 }"#,
-    )?;
-    let plan: SearchPlan = plan_search(&service_query, &params, &ctx)
-        .map_err(|e| anyhow::anyhow!("plan_search failed: {e}"))?;
-    anyhow::ensure!(
-        plan.generator_sqls.len() == 1 && plan.probes_len() == 1,
-        "the evidence query must plan one generator + one membership probe"
-    );
-    let attr_query = pulsus_traceql_parse("{ span.http.status_code >= 500 }")?;
-    let attr_plan = plan_search(&attr_query, &params, &ctx)
-        .map_err(|e| anyhow::anyhow!("plan_search failed: {e}"))?;
+    let (plan, attr_plan) = evidence_plans(base, now)?;
 
-    let stages: Vec<StageSpec> = vec![
-        StageSpec {
-            stage: "trace_by_id",
-            sql: point_read_sql("trace_spans_dist", &hex32(&target)),
-            roster: Roster::TraceIds(vec![target]),
-        },
-        StageSpec {
-            stage: "phase1_generator_service",
-            sql: plan.generator_sqls[0].clone(),
-            roster: Roster::Full,
-        },
-        StageSpec {
-            stage: "phase1_generator_attr",
-            sql: attr_plan.generator_sqls[0].clone(),
-            roster: Roster::Full,
-        },
-        StageSpec {
-            stage: "phase2_hydration",
-            sql: plan.hydration_sql_for(&batch),
-            roster: Roster::TraceIds(batch.clone()),
-        },
-        StageSpec {
-            stage: "phase2_membership",
-            sql: plan.membership_sql_for(0, &batch),
-            roster: Roster::TraceIds(batch.clone()),
-        },
-        StageSpec {
-            stage: "root_hydration",
-            sql: plan.root_sql_for(&[target]),
-            roster: Roster::TraceIds(vec![target]),
-        },
-    ];
+    let stages = evidence_stages(&plan, &attr_plan, &batch, target);
 
     eprintln!("=== running {} evidence stages ===", stages.len());
     // Per-run nonce: `system.query_log` outlives databases, so a
@@ -663,32 +755,19 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         let query_id = format!("pulsus-traces-read-{run_nonce}-{i}-{}", spec.stage);
         let settings = reader_settings(&query_id);
         let started = Instant::now();
-        let returned_rows = match spec.stage {
-            "trace_by_id" => drain::<StoredSpanRow>(&client, &spec.sql, &settings).await?,
-            "phase1_generator_service" | "phase1_generator_attr" => {
-                drain::<CandidateRow>(&client, &spec.sql, &settings).await?
+        // The decoder comes from the SPEC, beside the SQL it decodes —
+        // never from a second `match` on the stage name, which is how the
+        // membership read came to be built four-column and decoded
+        // three-column.
+        let returned_rows = match spec.decoder {
+            Decoder::StoredSpan => drain::<StoredSpanRow>(&client, &spec.sql, &settings).await?,
+            Decoder::Candidate => drain::<CandidateRow>(&client, &spec.sql, &settings).await?,
+            Decoder::Hydration => drain::<HydrationRow>(&client, &spec.sql, &settings).await?,
+            Decoder::Membership => drain::<MembershipRow>(&client, &spec.sql, &settings).await?,
+            Decoder::TypedStrValue => {
+                drain::<TypedStrValueRow>(&client, &spec.sql, &settings).await?
             }
-            "phase2_hydration" => drain::<HydrationRow>(&client, &spec.sql, &settings).await?,
-            // The membership read has TWO shapes (issue #479): when a
-            // projection needs the probe's matched value, `membership_sql`
-            // fuses `<byte-capped val> AS v` into the SAME statement and
-            // the row is three columns; otherwise it is two. Production
-            // dispatches on exactly this accessor
-            // (`traces/exec.rs::load_batch_attrs`), and this stage measures
-            // the read production issues — so it mirrors that dispatch
-            // rather than forcing the projection off, which would measure a
-            // statement no query ever sends. The evidence query's probe is
-            // `span.http.status_code >= 500`, a range predicate, so this
-            // run takes the fused arm.
-            "phase2_membership" => {
-                if plan.probe_fuses_value(0) {
-                    drain::<StrValueRow>(&client, &spec.sql, &settings).await?
-                } else {
-                    drain::<MembershipRow>(&client, &spec.sql, &settings).await?
-                }
-            }
-            "root_hydration" => drain::<RootRow>(&client, &spec.sql, &settings).await?,
-            other => anyhow::bail!("unknown stage {other:?}"),
+            Decoder::Root => drain::<RootRow>(&client, &spec.sql, &settings).await?,
         };
         let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
         anyhow::ensure!(
@@ -850,6 +929,103 @@ mod tests {
                 *byte = u8::from_str_radix(&hexid[i * 2..i * 2 + 2], 16).expect("hex");
             }
             assert_eq!(city_hash_64_16(&id), want, "vector {hexid}");
+        }
+    }
+
+    /// Every evidence stage projects exactly the columns its decoder
+    /// expects, by name and in order.
+    ///
+    /// **This is the check that was missing.** Issue #510 widened
+    /// `membership_sql`'s fused projection from `trace_id, span_id, v` to
+    /// `trace_id, span_id, v, t`, moved the three production call sites in
+    /// `traces/exec.rs`, and left this bench's decoder at the
+    /// three-column row. RowBinary is positional, so the run died with
+    /// `schema mismatch: database schema has 4 columns, but the struct
+    /// definition has 3 fields` — but only in the clustered CI leg,
+    /// because nothing local runs this bench.
+    ///
+    /// It needs no cluster and no client: [`evidence_stages`] is pure, and
+    /// the expected names are the decoder's own `COLUMN_NAMES` rather
+    /// than a second list.
+    ///
+    /// *RED when:* a shared SQL builder's projection changes and this
+    /// consumer is not moved with it — measured, `Decoder::TypedStrValue`
+    /// swapped back to `Decoder::Membership` fails on
+    /// `phase2_membership`.
+    #[test]
+    fn the_evidence_stages_project_exactly_what_they_decode() {
+        let base = 1_700_000_000_000_000_000i64;
+        let now = base + WINDOW_NS;
+        let (plan, attr_plan) = evidence_plans(base, now).expect("the evidence queries plan");
+        let batch = [trace_id_of(1), trace_id_of(2)];
+        let stages = evidence_stages(&plan, &attr_plan, &batch, batch[0]);
+        assert_eq!(stages.len(), 6, "every stage must be checked");
+        for spec in &stages {
+            assert_eq!(
+                projection_aliases(&spec.sql),
+                spec.decoder.columns(),
+                "stage {:?} projects columns its decoder ({:?}) does not expect.\nSQL:\n{}",
+                spec.stage,
+                spec.decoder,
+                spec.sql
+            );
+        }
+        // The membership stage takes the FUSED arm for this query, which
+        // is the arm issue #510 widened. Pinned so a planner change that
+        // silently stopped fusing would not turn this test into a check
+        // of the two-column shape.
+        let membership = stages
+            .iter()
+            .find(|s| s.stage == "phase2_membership")
+            .expect("the membership stage");
+        assert_eq!(membership.decoder, Decoder::TypedStrValue);
+        assert_eq!(
+            membership.decoder.columns(),
+            ["trace_id", "span_id", "v", "t"]
+        );
+    }
+
+    /// The outermost `SELECT` list's aliases, in order: everything between
+    /// the leading `SELECT [DISTINCT]` and the first depth-0 `FROM`, split
+    /// at depth-0 commas, each item reduced to its `AS <alias>` or to its
+    /// bare column name.
+    ///
+    /// Depth-aware because the projections nest function calls that carry
+    /// their own commas — `substringUTF8(val, 1, 2048)`.
+    fn projection_aliases(sql: &str) -> Vec<String> {
+        let head = sql
+            .strip_prefix("SELECT DISTINCT ")
+            .or_else(|| sql.strip_prefix("SELECT "))
+            .unwrap_or_else(|| panic!("a stage's SQL must start with SELECT:\n{sql}"));
+        let mut depth = 0usize;
+        let mut items: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for (i, c) in head.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    items.push(std::mem::take(&mut current));
+                    continue;
+                }
+                _ => {}
+            }
+            if depth == 0 && head[i..].starts_with("\nFROM ") {
+                items.push(std::mem::take(&mut current));
+                return items.iter().map(|item| alias_of(item)).collect();
+            }
+            current.push(c);
+        }
+        panic!("a stage's SQL must have a top-level FROM:\n{sql}")
+    }
+
+    /// One projection item's output name: the text after its last depth-0
+    /// ` AS `, or the item itself when it is a bare column.
+    fn alias_of(item: &str) -> String {
+        let item = item.trim();
+        match item.rsplit_once(" AS ") {
+            Some((_, alias)) => alias.trim().to_string(),
+            None => item.to_string(),
         }
     }
 
