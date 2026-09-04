@@ -750,7 +750,10 @@ async fn traces_search_grouping_differential() {
         if fx.coalesced {
             // BOTH sides must present a single flat spanSet (no groups).
             if pulsus.groups.keys().collect::<Vec<_>>() != vec![&flat_key] {
-                mism.push(format!("pulsus did not collapse: {:?}", pulsus.groups.keys()));
+                mism.push(format!(
+                    "pulsus did not collapse: {:?}",
+                    pulsus.groups.keys()
+                ));
             }
             if !tempo.groups.contains_key(&flat_key) || tempo.groups.len() != 1 {
                 mism.push(format!("tempo did not collapse: {:?}", tempo.groups.keys()));
