@@ -715,6 +715,17 @@ fn shipped_shapes_and_limits_are_documented() {
         "`max(bound_ts)` per trace",
         "response summaries only",
         "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
+        // Issue #502: this test's own doc comment says it gates
+        // schemas.md's "partiality sources", and until now its schemas.md
+        // needle list carried none — the api.md half was repaired at #464
+        // and this half kept passing while the document went on
+        // describing a `partial` wire field that #464 had removed. Each
+        // of the three sources, plus the signal itself.
+        "the response OMITS `metrics.completedJobs`",
+        "{\"totalJobs\":1}",
+        "(a) a generator returned `cap + 1` rows",
+        "(b) the consumption ceiling was reached with a lookahead candidate present",
+        "(c) a per-trace span overflow occurred",
     ] {
         assert!(
             schemas.contains(needle),

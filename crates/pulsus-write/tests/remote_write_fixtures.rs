@@ -502,3 +502,101 @@ fn over_budget_decode_rejects_decoded_bytes_before_parse() {
         other => panic!("over-budget request must reject whole-request, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #502 — our own answer to a sample the reference refuses.
+// ---------------------------------------------------------------------
+
+/// A `MetricSink` that records what the handler admitted. The 61-minute
+/// sample must reach it: a `204` alone would be satisfied by a handler
+/// that accepted the request and dropped the point.
+#[derive(Default)]
+struct RecordingSink {
+    admitted: std::sync::Mutex<Vec<pulsus_write::ParsedMetrics>>,
+}
+
+impl pulsus_write::MetricSink for RecordingSink {
+    fn admit(
+        &self,
+        batch: pulsus_write::ParsedMetrics,
+    ) -> Result<(), pulsus_write::Backpressure> {
+        self.admitted.lock().expect("sink lock").push(batch);
+        Ok(())
+    }
+
+    fn admit_flush(
+        &self,
+        batch: pulsus_write::ParsedMetrics,
+    ) -> Result<pulsus_write::FlushWait, pulsus_write::Backpressure> {
+        self.admitted.lock().expect("sink lock").push(batch);
+        Ok(pulsus_write::FlushWait::new(async { Ok(()) }))
+    }
+}
+
+/// The PulsusDB half of `otlp-reference-admission-window`
+/// (docs/benchmarks/metrics-differential-ledger.md): a sample 61 minutes
+/// old — the first offset the reference refuses with
+/// `400 out of bounds\n` on both of its receive paths — is `204` here and
+/// is stored.
+///
+/// **One clock read, and nothing compares it to anything else.** The
+/// sample's timestamp is the only value taken from the clock; the handler
+/// reads its own `now` for `remote_write::parse`, which has no admission
+/// window to apply it to, and this test asserts a status and the sample's
+/// own timestamp round-tripping. There is no second anchor that the first
+/// could drift against.
+///
+/// The ledger cell this measures is `204` on `POST /api/v1/write`, which
+/// is not the `200` its sibling OTLP route answers — that difference is
+/// the reason the row carries both statuses (docs/api.md §1.2).
+#[tokio::test]
+async fn a_sample_an_hour_old_is_accepted_and_stored() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the Unix epoch")
+        .as_millis() as i64;
+    let sample_ms = now_ms - 61 * 60 * 1_000;
+
+    let req = WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: vec![
+                label("__name__", "pulsus_admission_probe"),
+                label("job", "issue-502"),
+            ],
+            samples: vec![Sample {
+                value: 1.0,
+                timestamp: sample_ms,
+            }],
+            histograms: vec![],
+        }],
+        metadata: vec![],
+    };
+    let body = snappy_compress(&req.encode_to_vec());
+
+    let sink = RecordingSink::default();
+    let response = pulsus_write::ingest_remote_write(
+        &sink,
+        axum::http::HeaderMap::new(),
+        axum::body::Body::from(body),
+    )
+    .await;
+    let status = response.status();
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NO_CONTENT,
+        "PulsusDB has no admission window: an hour-old sample is accepted"
+    );
+
+    let admitted = sink.admitted.lock().expect("sink lock");
+    let points: Vec<(&str, i64, f64)> = admitted
+        .iter()
+        .flat_map(|batch| batch.samples.iter())
+        .map(|p| (&*p.metric_name, p.unix_milli, p.value))
+        .collect();
+    assert_eq!(
+        points,
+        vec![("pulsus_admission_probe", sample_ms, 1.0)],
+        "the hour-old sample must reach the sink with its timestamp verbatim"
+    );
+}

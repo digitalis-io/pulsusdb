@@ -1556,6 +1556,84 @@ mod tests {
         );
     }
 
+    /// Issue #502. `docs/schemas.md` described a `partial` response field
+    /// that issue #464 removed, and the check whose own doc comment
+    /// claimed to gate that document's "partiality sources"
+    /// (`crates/pulsus-read/tests/traces_search_sql.rs::shipped_shapes_and_limits_are_documented`)
+    /// carried no partiality needle on its `schemas.md` half at all — one
+    /// half of a check was repaired at #464 and the other half kept
+    /// passing.
+    ///
+    /// **Neither side of this assertion can produce the other.**
+    /// [`render`]'s truncated output is produced here, from the renderer
+    /// under test; the sentence describing it is read from another
+    /// directory. So a code change that stops omitting `completedJobs`
+    /// reddens it, and so does a document edit that renames the signal.
+    ///
+    /// **What it does not do:** it does not reach the HTTP boundary. That
+    /// the shipped route serves this block on a truncated search is
+    /// `crates/pulsus-server/tests/traces_api_live.rs::the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request_limit`.
+    #[test]
+    fn schemas_md_describes_the_partiality_signal_render_actually_emits() {
+        let metrics_keys = |partial: bool| -> std::collections::BTreeSet<String> {
+            let mut output = sample_output();
+            output.partial = partial;
+            render(&output)["metrics"]
+                .as_object()
+                .expect("metrics object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let truncated = metrics_keys(true);
+        let complete = metrics_keys(false);
+
+        assert_eq!(
+            truncated,
+            std::collections::BTreeSet::from(["totalJobs".to_string()]),
+            "a truncated search's metrics block is the jobs total alone"
+        );
+        let omitted: Vec<&String> = complete.difference(&truncated).collect();
+        assert_eq!(
+            omitted,
+            vec!["completedJobs"],
+            "truncation is signalled by omitting exactly one key"
+        );
+
+        // The rendered block, built from `render`'s own output rather than
+        // typed beside the assertion.
+        let mut output = sample_output();
+        output.partial = true;
+        let rendered = serde_json::to_string(&render(&output)["metrics"]).expect("render metrics");
+
+        let schemas = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/schemas.md"),
+        )
+        .expect("read docs/schemas.md");
+        assert!(
+            schemas.contains(&rendered),
+            "docs/schemas.md's partiality paragraph must carry the block render() emits, \
+             {rendered:?} — derived from render(), never restated"
+        );
+        for key in &omitted {
+            assert!(
+                schemas.contains(&format!("`metrics.{key}`")),
+                "docs/schemas.md must name the omitted key `metrics.{key}`"
+            );
+        }
+        // The retired wire field, in both spellings the document carried
+        // before issue #502. `partial` survives as the engine's own flag
+        // name, so a bare occurrence is not the thing being excluded.
+        for retired in ["`partial` flag", "response marked `partial`", "`partial = true`"] {
+            assert_eq!(
+                schemas.matches(retired).count(),
+                0,
+                "docs/schemas.md must not describe a {retired:?} wire field; \
+                 issue #464 replaced it with the omitted `metrics.completedJobs`"
+            );
+        }
+    }
+
     #[test]
     fn spans_without_selected_fields_omit_the_attributes_key() {
         let mut output = sample_output();
