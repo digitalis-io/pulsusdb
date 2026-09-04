@@ -100,9 +100,11 @@ const CAP_PROBE_PORT: u16 = 31_221;
 /// Issue #502's truncation-signal suite. It needs THREE spawns over ONE
 /// store and ONE throwaway database, differing in nothing but their
 /// listener port and `PULSUS_TRACEQL_MAX_CANDIDATES`, because that ceiling
-/// is process configuration and cannot be varied per request. Three
-/// ceilings are what make the trace count TRACK the ceiling rather than
-/// merely react to it being small — see the criterion's own doc comment.
+/// is process configuration: the plan takes it from the reader config
+/// (`crates/pulsus-server/src/traces_api/search.rs:84`) and no search
+/// request parameter carries it. Three ceilings rather than two is what
+/// makes the trace count TRACK the ceiling — the criterion's own doc
+/// comment says why, and names the break that establishes it.
 ///
 /// The suffix is the CEILING each process runs with, not an ordinal:
 /// `_ONE` is `1`, `_TWO` is `2`, `_HIGH` is `1000`.
@@ -2426,10 +2428,10 @@ async fn the_range_route_rejects_a_group_the_instant_route_serves() {
 /// ceiling**, and the request `limit` never raises it.
 ///
 /// `docs/schemas.md` described a `partial` response field that issue #464
-/// removed. The plan's first attempt to gate its replacement asked a
-/// pagination query for the signal — and pagination cannot produce it.
-/// `partial` is set by exactly three things
-/// (`crates/pulsus-read/src/traces/exec.rs:2259`, read at this revision):
+/// removed. A query that only narrows `limit` cannot produce the signal
+/// that replaced it, because the request `limit` is none of the three
+/// things that set it (`crates/pulsus-read/src/traces/exec.rs:2259`, read
+/// at this revision):
 ///
 /// ```text
 ///   let partial = generator_truncated || ceiling_hit || overflow_partial;
@@ -2455,21 +2457,33 @@ async fn the_range_route_rejects_a_group_the_instant_route_serves() {
 /// the ceiling was "small" and everything otherwise would satisfy every
 /// other row. Three ceilings, three different trace counts — 1, 2, 3 — is
 /// the difference between reacting to a small ceiling and following it.
+/// The break that establishes this, rather than asserting it: make
+/// `SearchPlan::max_candidates` (`crates/pulsus-read/src/traces/search_plan.rs:676`)
+/// return 1 whenever the configured value is below 10. The four rows fail
+/// on this one's trace count; the three-row version passes.
 ///
 /// **The last request stays in the set on purpose.** It is the shape that
 /// made the previous criterion unable to fail: one trace of three comes
 /// back and the answer is still complete. Dropping it once understood
 /// would make the same mistake reachable again.
 ///
-/// `PULSUS_TRACEQL_MAX_CANDIDATES=1` is a legal value — its only
-/// constraint is positivity (`crates/pulsus-config/src/validate.rs:483-486`)
-/// — so no configuration carve-out is needed. If a floor above 1 is ever
-/// added, this test moves to the next ceiling that still truncates a
-/// three-trace corpus; it does not get deleted.
+/// **All three ceilings this test spawns are legal values**, so no
+/// configuration carve-out is needed. The accepted range is
+/// `1..=TRACEQL_MAX_CANDIDATES_CEILING`, which is `1_000_000`
+/// (`crates/pulsus-config/src/validate.rs:149`): the lower bound is the
+/// positivity check at `:483-486` and the upper bound the ceiling check
+/// at `:487-498`, which carries its own reason and issue reference.
+/// `1`, `2` and `1000` are inside that range. If
+/// a floor above 1 is ever added, this test moves to the next ceiling
+/// that still truncates a three-trace corpus; it does not get deleted.
+/// The variable reaches that field directly
+/// (`crates/pulsus-config/src/env.rs:354-355`).
 ///
 /// Timestamps are FIXED and in the future, the idiom this file already
-/// uses: nothing here is derived from the wall clock, so the corpus and
-/// the search window share one anchor by construction.
+/// uses: the corpus spans and the search window are both literals
+/// (`START_S`/`END_S`, 2068-04-01), and the test body makes no wall-clock
+/// call at all, so there is no second anchor for the first to drift
+/// against.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request_limit() {
     if !should_run() {
