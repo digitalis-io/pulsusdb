@@ -969,7 +969,7 @@ mod tests {
         assert_eq!(stages.len(), 6, "every stage must be checked");
         for spec in &stages {
             assert_eq!(
-                projection_aliases(&spec.sql),
+                projection_names(&spec.sql),
                 spec.decoder.columns(),
                 "stage {:?} projects columns its decoder ({:?}) does not expect.\nSQL:\n{}",
                 spec.stage,
@@ -992,47 +992,237 @@ mod tests {
         );
     }
 
-    /// The outermost `SELECT` list's aliases, in order: everything between
-    /// the leading `SELECT [DISTINCT]` and the first depth-0 `FROM`, split
-    /// at depth-0 commas, each item reduced to its `AS <alias>` or to its
-    /// bare column name.
+    /// The outermost `SELECT` list's output names, in order.
     ///
-    /// Depth-aware because the projections nest function calls that carry
-    /// their own commas — `substringUTF8(val, 1, 2048)`.
-    fn projection_aliases(sql: &str) -> Vec<String> {
+    /// **Why this parses SQL at all.** The five builders render their
+    /// projections as inline `format!` strings — there is no alias list
+    /// inside them to expose, and giving them one means changing five
+    /// production read-path SQL builders and re-freezing the golden
+    /// corpus, which this change is not authorised to do. So the names
+    /// are recovered from the rendered statement, and the recovery is
+    /// written to FAIL LOUDLY on anything it does not model rather than
+    /// to return a plausible answer.
+    ///
+    /// It is literal-aware, because a naive depth counter is fooled by a
+    /// parenthesis inside a string:
+    ///
+    /// ```text
+    /// SELECT '(' AS extra, ')' AS x, y FROM t
+    /// ```
+    ///
+    /// is a valid THREE-column projection — the server returns three —
+    /// that a paren-counting split reads as two. Single-quoted literals
+    /// (with `''` escapes) and double-quoted / back-quoted identifiers
+    /// are skipped whole, so their contents can contain parentheses,
+    /// commas and the word `AS` without effect.
+    ///
+    /// It REFUSES, rather than guessing, on: an unterminated literal,
+    /// unbalanced parentheses, a comment (`--` or `/* */`, which no
+    /// builder here emits and which cannot be skipped without modelling
+    /// more syntax), and a missing top-level `FROM`.
+    fn projection_names(sql: &str) -> Vec<String> {
         let head = sql
             .strip_prefix("SELECT DISTINCT ")
             .or_else(|| sql.strip_prefix("SELECT "))
             .unwrap_or_else(|| panic!("a stage's SQL must start with SELECT:\n{sql}"));
-        let mut depth = 0usize;
+        let bytes: Vec<char> = head.chars().collect();
+        let mut depth = 0i32;
         let mut items: Vec<String> = Vec::new();
         let mut current = String::new();
-        for (i, c) in head.char_indices() {
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            // A quoted run is opaque: copied through whole, never
+            // inspected for depth, commas, `AS` or `FROM`.
+            if c == '\'' || c == '"' || c == '`' {
+                let quote = c;
+                current.push(c);
+                i += 1;
+                loop {
+                    assert!(
+                        i < bytes.len(),
+                        "unterminated {quote:?} literal in the projection of:\n{sql}"
+                    );
+                    let d = bytes[i];
+                    current.push(d);
+                    i += 1;
+                    if d == quote {
+                        // A doubled quote is an escape, not the end.
+                        if i < bytes.len() && bytes[i] == quote {
+                            current.push(quote);
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+            assert!(
+                !(c == '-' && bytes.get(i + 1) == Some(&'-')),
+                "a `--` comment in the projection is not modelled; write the projection \
+                 without it or extend this check:\n{sql}"
+            );
+            assert!(
+                !(c == '/' && bytes.get(i + 1) == Some(&'*')),
+                "a `/* */` comment in the projection is not modelled; write the projection \
+                 without it or extend this check:\n{sql}"
+            );
             match c {
                 '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
+                ')' => {
+                    depth -= 1;
+                    assert!(depth >= 0, "unbalanced `)` in the projection of:\n{sql}");
+                }
                 ',' if depth == 0 => {
                     items.push(std::mem::take(&mut current));
+                    i += 1;
                     continue;
                 }
                 _ => {}
             }
-            if depth == 0 && head[i..].starts_with("\nFROM ") {
+            // The top-level `FROM` ends the projection. A subquery's own
+            // `FROM` sits at depth > 0 and does not.
+            if depth == 0 && starts_keyword(&bytes, i, "FROM") {
+                assert!(
+                    !current.trim().is_empty(),
+                    "empty trailing projection item before FROM in:\n{sql}"
+                );
                 items.push(std::mem::take(&mut current));
-                return items.iter().map(|item| alias_of(item)).collect();
+                return items.iter().map(|item| output_name(item, sql)).collect();
             }
             current.push(c);
+            i += 1;
         }
-        panic!("a stage's SQL must have a top-level FROM:\n{sql}")
+        panic!("no top-level FROM in the projection of:\n{sql}")
     }
 
-    /// One projection item's output name: the text after its last depth-0
-    /// ` AS `, or the item itself when it is a bare column.
-    fn alias_of(item: &str) -> String {
-        let item = item.trim();
-        match item.rsplit_once(" AS ") {
-            Some((_, alias)) => alias.trim().to_string(),
-            None => item.to_string(),
+    /// `word` occurs at `i` bounded by whitespace on both sides — so
+    /// `FROM` matches and `FROMAGE` or `x_FROM` do not.
+    fn starts_keyword(chars: &[char], i: usize, word: &str) -> bool {
+        let w: Vec<char> = word.chars().collect();
+        if i == 0 || !chars[i - 1].is_whitespace() {
+            return false;
+        }
+        if i + w.len() > chars.len() || chars[i..i + w.len()] != w[..] {
+            return false;
+        }
+        match chars.get(i + w.len()) {
+            Some(c) => c.is_whitespace(),
+            None => true,
+        }
+    }
+
+    /// One projection item's output name: the text after its LAST
+    /// depth-0, outside-a-literal ` AS `, or the item itself when it is a
+    /// bare column. An ` AS ` inside a literal or a function call does
+    /// not count.
+    fn output_name(item: &str, sql: &str) -> String {
+        let chars: Vec<char> = item.chars().collect();
+        let mut depth = 0i32;
+        let mut last_as: Option<usize> = None;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\'' || c == '"' || c == '`' {
+                let quote = c;
+                i += 1;
+                loop {
+                    assert!(
+                        i < chars.len(),
+                        "unterminated literal in {item:?} of:\n{sql}"
+                    );
+                    let d = chars[i];
+                    i += 1;
+                    if d == quote {
+                        if i < chars.len() && chars[i] == quote {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                continue;
+            }
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && starts_keyword(&chars, i, "AS") {
+                last_as = Some(i + 2);
+            }
+            i += 1;
+        }
+        match last_as {
+            Some(at) => chars[at..].iter().collect::<String>().trim().to_string(),
+            None => item.trim().to_string(),
+        }
+    }
+
+    /// The projection reader refuses the shapes it does not model and
+    /// reads the ones it does — including the case that defeated the
+    /// first cut.
+    ///
+    /// *RED when:* the reader goes back to counting parentheses without
+    /// looking at quotes; the first case then returns two names for a
+    /// three-column projection, which is the hole
+    /// `the_evidence_stages_project_exactly_what_they_decode` exists to
+    /// close.
+    #[test]
+    fn the_projection_reader_is_literal_aware_and_refuses_what_it_cannot_read() {
+        let cases: [(&str, &[&str]); 8] = [
+            // The attack: parentheses inside string literals. The server
+            // returns THREE columns for this.
+            (
+                "SELECT '(' AS extra, ')' AS x, y FROM t",
+                &["extra", "x", "y"],
+            ),
+            // A doubled quote is an escape; the comma, the paren and the
+            // word AS inside the literal are all inert.
+            ("SELECT 'it''s, a (test) AS z' AS a, b FROM t", &["a", "b"]),
+            // Nested calls carrying their own commas.
+            ("SELECT f(a, g(b, c)) AS a, b FROM t", &["a", "b"]),
+            // A cast whose second operand is a quoted type name.
+            ("SELECT CAST(a, 'UInt64') AS n, b FROM t", &["n", "b"]),
+            // A subquery in the select list: its own FROM is at depth 1
+            // and must not end the projection.
+            ("SELECT (SELECT max(x) FROM u) AS m, b FROM t", &["m", "b"]),
+            // A back-quoted identifier containing a comma.
+            ("SELECT `a,b` AS c, d FROM t", &["c", "d"]),
+            // Bare columns, no aliases at all.
+            ("SELECT a, b FROM t", &["a", "b"]),
+            // The word FROM inside a literal does not end the projection.
+            ("SELECT 'FROM' AS a, b FROM t", &["a", "b"]),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(projection_names(sql), want, "reading {sql:?}");
+        }
+
+        // …and the shapes it refuses, each with the reason in the message.
+        for (sql, needle) in [
+            ("SELECT 'a AS x FROM t", "unterminated"),
+            ("SELECT f(a AS x FROM t", "no top-level FROM"),
+            ("SELECT a) AS x FROM t", "unbalanced"),
+            (
+                "SELECT a -- , b
+ AS x FROM t",
+                "comment",
+            ),
+            ("SELECT a /* , b */ AS x FROM t", "comment"),
+            ("SELECT a, b", "no top-level FROM"),
+        ] {
+            let err = std::panic::catch_unwind(|| projection_names(sql))
+                .expect_err(&format!("{sql:?} must be refused, not read"));
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains(needle),
+                "{sql:?} must be refused for {needle:?}; got {msg:?}"
+            );
         }
     }
 
