@@ -5241,6 +5241,13 @@ mod tests {
     /// `by(name)` filters the whole matched set and leaves both groups.
     /// The two queries send byte-identical SQL, so this difference is the
     /// whole of item 2.
+    ///
+    /// The attribute VALUES moved when issue #510 merged: an aggregate
+    /// stage contributes its own entry, and its value is the spanset's
+    /// own count. Written after the `by(name)` that is the surviving
+    /// group's THREE spans; written before it, the whole matched set's
+    /// FOUR. Those two numbers are what separates the two orderings on
+    /// the wire, so they are asserted rather than the shape alone.
     #[test]
     fn by_then_count_and_count_then_by_differ() {
         let p = plan_wide(r#"{ } | by(name) | count() > 2"#);
@@ -5258,7 +5265,12 @@ mod tests {
         );
         assert_eq!(
             groups[0].attributes,
-            vec![("by(name)".to_string(), GroupValue::Str("a".to_string()))]
+            vec![
+                ("by(name)".to_string(), GroupValue::Str("a".to_string())),
+                ("count()".to_string(), GroupValue::Int(3)),
+            ],
+            "the aggregate contributes at its written position, and its value is this \
+             GROUP's size"
         );
         assert_eq!(groups[0].matched, 3);
         assert_eq!(
@@ -5276,6 +5288,15 @@ mod tests {
             2,
             "the same aggregate BEFORE by(name) filters the whole matched set"
         );
+        for g in groups {
+            assert_eq!(
+                g.attributes[0],
+                ("count()".to_string(), GroupValue::Int(4)),
+                "written first, the aggregate sees the whole matched set — FOUR, not the \
+                 group's own size, and it leads the list"
+            );
+            assert_eq!(g.attributes[1].0, "by(name)");
+        }
         assert_eq!(groups[0].matched, 3);
         assert_eq!(groups[1].matched, 1);
         assert_eq!(flat_ids(&m), vec![1, 2, 3, 4]);
@@ -5367,20 +5388,40 @@ mod tests {
     /// AC4 — `coalesce()` merges what SURVIVES at its written position,
     /// not what matched: after a filtering stage it merges three spans,
     /// before one it merges four.
+    ///
+    /// The two queries also differ in what the merged span set CARRIES,
+    /// which moved when issue #510 merged. `coalesce()` clears both of a
+    /// spanset's lists, so a `coalesce()` written LAST leaves a span set
+    /// with no attributes at all — `groups` is `None` and the response is
+    /// the byte-identical flat one. An aggregate written AFTER the
+    /// `coalesce()` contributes to the cleared list, so the span set
+    /// carries `[count()]` and reaches the encoder as a one-entry
+    /// `groups`. Both are the reference's, and the second is what
+    /// `coalesce_then_count` pins live.
     #[test]
     fn coalesce_after_a_filter_keeps_only_survivors() {
         let p = plan_wide(r#"{ } | by(name) | count() > 2 | coalesce()"#);
         let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
         assert!(
             m[0].groups.is_none(),
-            "coalesce() collapses to the flat set"
+            "coalesce() written LAST clears the list, so the response is flat"
         );
         assert_eq!(m[0].matched, 3);
         assert_eq!(flat_ids(&m), vec![1, 2, 3]);
 
         let p = plan_wide(r#"{ } | by(name) | coalesce() | count() > 2"#);
         let m = eval(&p, &[ord1_trace()], &membership(&p, &[]));
-        assert!(m[0].groups.is_none());
+        let groups = m[0]
+            .groups
+            .as_ref()
+            .expect("the trailing count() contributes");
+        assert_eq!(groups.len(), 1, "one merged span set");
+        assert_eq!(
+            groups[0].attributes,
+            vec![("count()".to_string(), GroupValue::Int(4))],
+            "the by(name) contributor was cleared by the coalesce(); the aggregate that \
+             follows it counts the MERGED set"
+        );
         assert_eq!(m[0].matched, 4, "the coalesced set is what count() sees");
         assert_eq!(flat_ids(&m), vec![1, 2, 3, 4]);
     }
