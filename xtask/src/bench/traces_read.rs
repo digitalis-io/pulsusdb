@@ -1339,6 +1339,14 @@ mod tests {
         let refused: [(&str, &str, &str); 17] = [
             // (sql, what the SERVER names the columns, the refusal's needle)
             // --- round 5: literals that lex as identifiers -------------
+            // FIRST, because it is the case that decides the rule: the
+            // server names LOWERCASE `null` as `NULL`, so "a bare
+            // lowercase identifier names itself" mis-reads it.
+            (
+                "SELECT null, 1 AS z FROM t",
+                "NULL, z",
+                "\"null\" is not one of this check",
+            ),
             (
                 "SELECT TRUE, 1 AS z FROM t",
                 "true, z",
@@ -1353,13 +1361,6 @@ mod tests {
                 "SELECT FALSE, 1 AS z FROM t",
                 "false, z",
                 "\"FALSE\" is not one of this check",
-            ),
-            // The one that kills a lowercase-identifier rule: the server
-            // names lowercase `null` as `NULL`.
-            (
-                "SELECT null, 1 AS z FROM t",
-                "NULL, z",
-                "\"null\" is not one of this check",
             ),
             (
                 "SELECT NaN, 1 AS z FROM t",
