@@ -177,6 +177,10 @@ struct Fixture {
     name: &'static str,
     /// The TraceQL query.
     q: &'static str,
+    /// The `resource.service.name` this fixture's spans carry. The issue
+    /// #492 ordering fixtures scope their queries to it, so a reference
+    /// instance holding another suite's corpus cannot enter their answer.
+    service: &'static str,
     /// `true` when the query coalesces back to a single flat spanSet.
     coalesced: bool,
     spans: Vec<SpanDef>,
@@ -188,6 +192,7 @@ fn fixtures(base: i64) -> Vec<Fixture> {
         Fixture {
             name: "by_name_string_groups",
             q: "{} | by(name)",
+            service: "svc",
             coalesced: false,
             spans: vec![
                 SpanDef::new(1, "gold", base),
@@ -198,6 +203,7 @@ fn fixtures(base: i64) -> Vec<Fixture> {
         Fixture {
             name: "by_name_then_coalesce_collapses",
             q: "{} | by(name) | coalesce()",
+            service: "svc",
             coalesced: true,
             spans: vec![
                 SpanDef::new(1, "gold", base),
@@ -210,6 +216,7 @@ fn fixtures(base: i64) -> Vec<Fixture> {
         Fixture {
             name: "by_status_keyword_string",
             q: "{} | by(status)",
+            service: "svc",
             coalesced: false,
             spans: vec![
                 SpanDef::new(1, "s", base).status(2),           // error
@@ -221,6 +228,7 @@ fn fixtures(base: i64) -> Vec<Fixture> {
         Fixture {
             name: "by_kind_keyword_string",
             q: "{} | by(kind)",
+            service: "svc",
             coalesced: false,
             spans: vec![
                 SpanDef::new(1, "s", base).kind(2),           // server
@@ -232,6 +240,7 @@ fn fixtures(base: i64) -> Vec<Fixture> {
         Fixture {
             name: "by_duration_go_string",
             q: "{} | by(duration)",
+            service: "svc",
             coalesced: false,
             spans: vec![
                 SpanDef::new(1, "s", base).duration(1_500_000_000), // 1.5s
@@ -246,12 +255,99 @@ fn fixtures(base: i64) -> Vec<Fixture> {
         Fixture {
             name: "by_nested_set_parent_int",
             q: "{} | by(nestedSetParent)",
+            service: "svc",
             coalesced: false,
             spans: vec![
                 SpanDef::new(1, "root", base),
                 SpanDef::new(2, "child", base + sec).parent(1),
             ],
         },
+        // -- issue #492 item 2: the WRITTEN order of the stages ---------
+        //
+        // Six orderings whose SQL is byte-identical in pairs, so only the
+        // evaluator can tell them apart. Two of them must NOT move
+        // (`count() > 2 | by(name)` and `by(name) | coalesce() | count()`),
+        // which is the half a fix for the other four can silently break.
+        //
+        // Corpus C-ORD1 (`grp492`): three spans named `a` with durations
+        // 0.5s / 2s / 3s, one named `b` with 0.4s, one second apart.
+        // Corpus C-ORD2 (`grp492b`): cross-cutting keys — (a, server),
+        // (a, client), (b, server), (b, server) — so neither key alone
+        // separates what the other separates.
+        //
+        // Each is scoped to its own service so the answer cannot depend on
+        // what else the shared reference instance holds.
+        Fixture {
+            name: "ord_by_then_count_filters_the_groups",
+            q: r#"{ resource.service.name = "grp492" } | by(name) | count() > 2"#,
+            service: "grp492",
+            coalesced: false,
+            spans: ord1_spans(base, sec),
+        },
+        Fixture {
+            name: "ord_count_then_by_is_unchanged",
+            q: r#"{ resource.service.name = "grp492" } | count() > 2 | by(name)"#,
+            service: "grp492",
+            coalesced: false,
+            spans: ord1_spans(base, sec),
+        },
+        Fixture {
+            name: "ord_coalesce_merges_the_survivors",
+            q: r#"{ resource.service.name = "grp492" } | by(name) | count() > 2 | coalesce()"#,
+            service: "grp492",
+            coalesced: true,
+            spans: ord1_spans(base, sec),
+        },
+        Fixture {
+            name: "ord_coalesce_before_the_filter_is_unchanged",
+            q: r#"{ resource.service.name = "grp492" } | by(name) | coalesce() | count() > 2"#,
+            service: "grp492",
+            coalesced: true,
+            spans: ord1_spans(base, sec),
+        },
+        Fixture {
+            name: "ord_nested_by_name_then_kind",
+            q: r#"{ resource.service.name = "grp492b" } | by(name) | by(kind)"#,
+            service: "grp492b",
+            coalesced: false,
+            spans: ord2_spans(base, sec),
+        },
+        Fixture {
+            name: "ord_nested_by_kind_then_name",
+            q: r#"{ resource.service.name = "grp492b" } | by(kind) | by(name)"#,
+            service: "grp492b",
+            coalesced: false,
+            spans: ord2_spans(base, sec),
+        },
+    ]
+}
+
+/// Corpus C-ORD1 (issue #492 item 2): three spans named `a` (0.5s / 2s /
+/// 3s) and one named `b` (0.4s), starting one second apart, all children
+/// of the first. `count() > 2`, `max(duration) > 1s`, `avg(duration) > 1s`
+/// and `sum(duration) > 5s` all separate the two groups the same way.
+fn ord1_spans(base: i64, sec: i64) -> Vec<SpanDef> {
+    vec![
+        SpanDef::new(1, "a", base).duration(sec / 2),
+        SpanDef::new(2, "a", base + sec).duration(2 * sec).parent(1),
+        SpanDef::new(3, "a", base + 2 * sec)
+            .duration(3 * sec)
+            .parent(1),
+        SpanDef::new(4, "b", base + 3 * sec)
+            .duration(2 * sec / 5)
+            .parent(1),
+    ]
+}
+
+/// Corpus C-ORD2 (issue #492 item 2): cross-cutting `name` / `kind` keys,
+/// so a second `by()` that sub-divides gives three groups and one that
+/// rebuilds from the matched set gives two.
+fn ord2_spans(base: i64, sec: i64) -> Vec<SpanDef> {
+    vec![
+        SpanDef::new(1, "a", base).kind(2),
+        SpanDef::new(2, "a", base + sec).kind(3),
+        SpanDef::new(3, "b", base + 2 * sec).kind(2),
+        SpanDef::new(4, "b", base + 3 * sec).kind(2),
     ]
 }
 
@@ -273,7 +369,13 @@ fn sid_bytes(id: u8) -> [u8; 8] {
 // PulsusDB side
 // ---------------------------------------------------------------------------
 
-async fn pulsus_insert(client: &ChClient, db: &str, trace: &[u8; 16], spans: &[SpanDef]) {
+async fn pulsus_insert(
+    client: &ChClient,
+    db: &str,
+    trace: &[u8; 16],
+    spans: &[SpanDef],
+    service: &str,
+) {
     let mut rows = Vec::new();
     for s in spans {
         let parent = if s.parent == 0 {
@@ -283,7 +385,8 @@ async fn pulsus_insert(client: &ChClient, db: &str, trace: &[u8; 16], spans: &[S
         };
         rows.push(format!(
             "(toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), \
-             toFixedString(unhex('{parent}'),8), '{name}', 'svc', {ts}, {dur}, {status}, {kind}, 1, 'x')",
+             toFixedString(unhex('{parent}'),8), '{name}', '{service}', {ts}, {dur}, {status}, \
+             {kind}, 1, 'x')",
             tid = hex(trace),
             sid = hex(&sid_bytes(s.id)),
             name = s.name,
@@ -305,14 +408,25 @@ async fn pulsus_insert(client: &ChClient, db: &str, trace: &[u8; 16], spans: &[S
     .await;
 }
 
-/// The grouped spanSets PulsusDB returns for one single-trace fixture:
-/// group-value string → the set of member span-id low bytes. A coalesced
-/// (flat) response maps under the sentinel `"<flat>"` key.
-async fn pulsus_groups(
-    engine: &TraceEngine,
-    q: &str,
-    window: (i64, i64),
-) -> BTreeMap<String, BTreeSet<u8>> {
+/// One side's grouped answer (issue #492 item 2 widened this from a
+/// single attribute to the ordered `by(...)` SEQUENCE): the map from a
+/// spanSet's ordered `by(...)` `key=typed-value` tokens to its member
+/// span-id low bytes, plus the number of spanSets. A coalesced (flat)
+/// spanSet — one carrying no `by(...)` attribute — maps under the
+/// sentinel `"<flat>"` key.
+///
+/// The map is compared as a MAP and never as a sequence: the reference
+/// iterates its groups out of a hash map, so its spanSets array order is
+/// unstable between runs. The COUNT is compared separately, because a map
+/// alone cannot see two spanSets that reduce to the same key.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GroupedAnswer {
+    groups: BTreeMap<Vec<String>, BTreeSet<u8>>,
+    span_sets: usize,
+}
+
+/// The grouped spanSets PulsusDB returns for one single-trace fixture.
+async fn pulsus_groups(engine: &TraceEngine, q: &str, window: (i64, i64)) -> GroupedAnswer {
     let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("parse {q:?}: {e}"));
     let plan = plan_search(
         &query,
@@ -329,23 +443,43 @@ async fn pulsus_groups(
         .search(&plan)
         .await
         .unwrap_or_else(|e| panic!("search {q:?}: {e}"));
-    let mut map: BTreeMap<String, BTreeSet<u8>> = BTreeMap::new();
+    let mut answer = GroupedAnswer::default();
     for t in &out.traces {
         match &t.groups {
             Some(groups) => {
                 for g in groups {
-                    let key = group_value_typed(&g.attributes[0].1);
+                    // Only `by(...)`-keyed attributes take part: the
+                    // reference also emits the aggregate's own
+                    // `count()` / `max(duration)` attribute, which we do
+                    // not (issue #510), so it is excluded on BOTH sides.
+                    let key: Vec<String> = g
+                        .attributes
+                        .iter()
+                        .filter(|(display, _)| display.starts_with("by("))
+                        .map(|(display, value)| format!("{display}={}", group_value_typed(value)))
+                        .collect();
+                    let key = if key.is_empty() {
+                        vec!["<flat>".to_string()]
+                    } else {
+                        key
+                    };
                     let members: BTreeSet<u8> = g.spans.iter().map(|s| s.span_id[7]).collect();
-                    map.entry(key).or_default().extend(members);
+                    answer.span_sets += 1;
+                    answer.groups.entry(key).or_default().extend(members);
                 }
             }
             None => {
                 let members: BTreeSet<u8> = t.spans.iter().map(|s| s.span_id[7]).collect();
-                map.entry("<flat>".to_string()).or_default().extend(members);
+                answer.span_sets += 1;
+                answer
+                    .groups
+                    .entry(vec!["<flat>".to_string()])
+                    .or_default()
+                    .extend(members);
             }
         }
     }
-    map
+    answer
 }
 
 /// PulsusDB's group value as a TYPE-TAGGED token: the wire-type tag PLUS
@@ -367,7 +501,7 @@ fn group_value_typed(value: &GroupValue) -> String {
 // Tempo side
 // ---------------------------------------------------------------------------
 
-fn otlp_push(otlp_base: &str, trace: &[u8; 16], spans: &[SpanDef]) {
+fn otlp_push(otlp_base: &str, trace: &[u8; 16], spans: &[SpanDef], service: &str) {
     let otlp_spans: Vec<serde_json::Value> = spans
         .iter()
         .map(|s| {
@@ -389,7 +523,7 @@ fn otlp_push(otlp_base: &str, trace: &[u8; 16], spans: &[SpanDef]) {
     let body = serde_json::json!({
         "resourceSpans": [{
             "resource": {"attributes": [
-                {"key": "service.name", "value": {"stringValue": "svc"}}
+                {"key": "service.name", "value": {"stringValue": service}}
             ]},
             "scopeSpans": [{"spans": otlp_spans}],
         }]
@@ -423,15 +557,15 @@ fn otlp_push(otlp_base: &str, trace: &[u8; 16], spans: &[SpanDef]) {
 }
 
 /// Polls Tempo's search API until the pushed trace's grouped spanSets are
-/// queryable, returning group-value string → member span-id low bytes (or
-/// the `"<flat>"` sentinel for a coalesced response).
-fn tempo_groups(api_base: &str, q: &str, trace: &[u8; 16]) -> BTreeMap<String, BTreeSet<u8>> {
+/// queryable. Indexing is not instantaneous, so a single empty answer is
+/// inconclusive — this polls rather than reading once.
+fn tempo_groups(api_base: &str, q: &str, trace: &[u8; 16], window: (i64, i64)) -> GroupedAnswer {
     let trace_hex = hex(trace);
     for _ in 0..60 {
-        if let Some(map) = tempo_query_once(api_base, q, &trace_hex)
-            && !map.is_empty()
+        if let Some(answer) = tempo_query_once(api_base, q, &trace_hex, window)
+            && !answer.groups.is_empty()
         {
-            return map;
+            return answer;
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -442,13 +576,14 @@ fn tempo_query_once(
     api_base: &str,
     q: &str,
     trace_hex: &str,
-) -> Option<BTreeMap<String, BTreeSet<u8>>> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs();
-    let start = (now - 7200).to_string();
-    let end = (now + 120).to_string();
+    window: (i64, i64),
+) -> Option<GroupedAnswer> {
+    // The window is derived from the CORPUS BASE instant, never from a
+    // fresh clock reading: a query window that drifts away from the data
+    // it queries turns a passing case into a red one at some hour of the
+    // day (issue #492 item 2, plan v2 D7).
+    let start = (window.0 / 1_000_000_000).to_string();
+    let end = (window.1 / 1_000_000_000).to_string();
     let url = format!("{}/api/search", api_base.trim_end_matches('/'));
     let out = Command::new("curl")
         .args(["-s", "-G", "--max-time", "20"])
@@ -462,7 +597,7 @@ fn tempo_query_once(
         .expect("curl on PATH");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let traces = body.get("traces")?.as_array()?;
-    let mut map: BTreeMap<String, BTreeSet<u8>> = BTreeMap::new();
+    let mut answer = GroupedAnswer::default();
     for t in traces {
         // Tempo strips leading zero bytes from the traceID; match on the
         // trimmed hex suffix.
@@ -477,13 +612,33 @@ fn tempo_query_once(
         let flat = t.get("spanSet").map(std::slice::from_ref);
         let sets = span_sets.or(flat)?;
         for set in sets {
-            // A grouped spanSet carries `attributes`; a flat one does not.
-            let key = set
+            // A grouped spanSet carries at least one `by(...)` attribute;
+            // a flat one carries none — it may still carry the
+            // aggregate's own `count()` attribute, which is excluded here
+            // exactly as it is on the PulsusDB side (issue #510).
+            let key: Vec<String> = set
                 .get("attributes")
                 .and_then(|a| a.as_array())
-                .and_then(|a| a.first())
-                .and_then(tempo_attr_typed)
-                .unwrap_or_else(|| "<flat>".to_string());
+                .map(|attrs| {
+                    attrs
+                        .iter()
+                        .filter(|a| {
+                            a.get("key")
+                                .and_then(|k| k.as_str())
+                                .is_some_and(|k| k.starts_with("by("))
+                        })
+                        .filter_map(|a| {
+                            let key = a.get("key")?.as_str()?;
+                            Some(format!("{key}={}", tempo_attr_typed(a)?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let key = if key.is_empty() {
+                vec!["<flat>".to_string()]
+            } else {
+                key
+            };
             let members: BTreeSet<u8> = set
                 .get("spans")
                 .and_then(|s| s.as_array())
@@ -497,10 +652,11 @@ fn tempo_query_once(
                         .collect()
                 })
                 .unwrap_or_default();
-            map.entry(key).or_default().extend(members);
+            answer.span_sets += 1;
+            answer.groups.entry(key).or_default().extend(members);
         }
     }
-    Some(map)
+    Some(answer)
 }
 
 /// A Tempo group `attributes[0]` value as the SAME TYPE-TAGGED token
@@ -561,47 +717,65 @@ async fn traces_search_grouping_differential() {
     let bootstrap = ChClient::new(ch_config("default"))
         .await
         .expect("connect bootstrap");
+    // ONE clock reading, to anchor the corpus. Every window on BOTH sides
+    // is derived from it, so no case can drift away from the data it
+    // queries (issue #492 item 2, plan v2 D7).
     let base = now_ns();
     let sec = 1_000_000_000i64;
     let window = (base - 60 * sec, base + 60 * sec);
+    // The reference's own window, from the same corpus instant.
+    let reference_window = (base - 3600 * sec, base + 300 * sec);
     let mut diverged: Vec<String> = Vec::new();
 
     for fx in fixtures(base) {
         let trace = *uuid::Uuid::new_v4().as_bytes();
 
         // Tempo: push first so it has the whole poll window to index.
-        otlp_push(&otlp_base, &trace, &fx.spans);
+        otlp_push(&otlp_base, &trace, &fx.spans, fx.service);
 
         // PulsusDB: throwaway DB, real ingest + real grouped search readback.
         let db = pulsus_testkit::test_db(&format!("pulsus_grpdiff_it_{}", hex(&trace)));
         init_db(&bootstrap, &db).await;
         let client = ChClient::new(ch_config(&db)).await.expect("connect db");
-        pulsus_insert(&client, &db, &trace, &fx.spans).await;
+        pulsus_insert(&client, &db, &trace, &fx.spans, fx.service).await;
         let engine = TraceEngine::new(
             ChClient::new(ch_config(&db)).await.expect("connect engine"),
             engine_config(),
         );
         let pulsus = pulsus_groups(&engine, fx.q, window).await;
-        let tempo = tempo_groups(&api_base, fx.q, &trace);
+        let tempo = tempo_groups(&api_base, fx.q, &trace, reference_window);
 
+        let flat_key = vec!["<flat>".to_string()];
         let mut mism: Vec<String> = Vec::new();
         if fx.coalesced {
             // BOTH sides must present a single flat spanSet (no groups).
-            if pulsus.keys().collect::<Vec<_>>() != vec![&"<flat>".to_string()] {
-                mism.push(format!("pulsus did not collapse: {:?}", pulsus.keys()));
+            if pulsus.groups.keys().collect::<Vec<_>>() != vec![&flat_key] {
+                mism.push(format!("pulsus did not collapse: {:?}", pulsus.groups.keys()));
             }
-            if !tempo.contains_key("<flat>") || tempo.len() != 1 {
-                mism.push(format!("tempo did not collapse: {:?}", tempo.keys()));
+            if !tempo.groups.contains_key(&flat_key) || tempo.groups.len() != 1 {
+                mism.push(format!("tempo did not collapse: {:?}", tempo.groups.keys()));
             }
         }
-        if pulsus != tempo {
+        if pulsus.groups != tempo.groups {
             mism.push(format!(
-                "group map mismatch: pulsus {pulsus:?} != tempo {tempo:?}"
+                "group map mismatch: pulsus {:?} != tempo {:?}",
+                pulsus.groups, tempo.groups
+            ));
+        }
+        if pulsus.span_sets != tempo.span_sets {
+            mism.push(format!(
+                "spanSet count mismatch: pulsus {} != tempo {}",
+                pulsus.span_sets, tempo.span_sets
             ));
         }
 
         if mism.is_empty() {
-            eprintln!("[{}] AGREES — {} group(s)", fx.name, pulsus.len());
+            eprintln!(
+                "[{}] AGREES — {} spanSet(s), {} group key(s)",
+                fx.name,
+                pulsus.span_sets,
+                pulsus.groups.len()
+            );
         } else {
             eprintln!("[{}] DIVERGES:\n  {}", fx.name, mism.join("\n  "));
             diverged.push(fx.name.to_string());

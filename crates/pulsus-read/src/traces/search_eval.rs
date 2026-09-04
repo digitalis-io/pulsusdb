@@ -2444,7 +2444,7 @@ struct PipelineSpanset<'a> {
 /// `capacity() == len()` by construction: every producer reserves with
 /// `Vec::with_capacity` and pushes exactly that many.
 fn attributes_bytes(attributes: &[(String, GroupValue)]) -> usize {
-    attributes.len() * std::mem::size_of::<(String, GroupValue)>()
+    std::mem::size_of_val(attributes)
         + attributes
             .iter()
             .map(|(display, value)| display.len() + value.payload_bytes())
