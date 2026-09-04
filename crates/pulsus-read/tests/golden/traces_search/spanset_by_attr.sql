@@ -28,7 +28,7 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
 
 == phase2 aggregate values[0] ==
-SELECT trace_id, span_id, any(val_num) AS v
+SELECT trace_id, span_id, any(val_num) AS v, any(val_type) AS t
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND key = 'foo'
@@ -39,7 +39,7 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
 GROUP BY trace_id, span_id
 
 == phase2 select values[0] ==
-SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v
+SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v, any(val_type) AS t
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND key = 'foo'

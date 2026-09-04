@@ -98,10 +98,11 @@ use super::rows::{
     MetricLog2BucketInstantRow, MetricLog2BucketRow, MetricLog2ExemplarRow,
     MetricQuantileExemplarRow, MetricQuantileInstantRow, MetricQuantileRow, NumValueRow, RootRow,
     SpanNameRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow, TagValueRow, TraceCtxRow,
+    TypedNumValueRow, TypedStrValueRow,
 };
 use super::search_eval::{
     self, BatchAttrs, EventValues, GroupCardinalityCounter, HydratedSpan, ProbeMembership, SpanKey,
-    SpanSetGroup, SpanSummary, TraceCtxInfo, TraceMatch, TraceSpans,
+    SpanSetGroup, SpanSummary, StoredType, TraceCtxInfo, TraceMatch, TraceSpans,
 };
 use super::search_plan::{SearchCtx, SearchPlan};
 use super::tag_narrow::{TagNarrowing, narrowing_from_query};
@@ -2425,24 +2426,25 @@ impl TraceEngine {
             // projection with no new row type and no second statement —
             // the pattern the `select()` value read already uses.
             if plan.probe_fuses_value(probe_idx) {
-                let rows: Vec<StrValueRow> = self
+                let rows: Vec<TypedStrValueRow> = self
                     .collect_rows_charged(
                         &sql,
                         settings,
                         budget,
                         batch_charged,
                         map_trace_read_error,
-                        |row: &StrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
+                        |row: &TypedStrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
                     )
                     .await?;
                 let mut map = HashMap::with_capacity(rows.len());
                 for row in rows {
-                    // `SELECT DISTINCT trace_id, span_id, v` can return
+                    // `SELECT DISTINCT trace_id, span_id, v, t` can return
                     // several rows for one span under a range / regex /
                     // existence predicate. The FIRST wins; the reference
                     // also keeps one arbitrary value (its collector is a
                     // map).
-                    map.entry((row.trace_id, row.span_id)).or_insert(row.v);
+                    map.entry((row.trace_id, row.span_id))
+                        .or_insert_with(|| (row.v, StoredType::from_stored(&row.t)));
                 }
                 attrs.membership.push(ProbeMembership::Values(map));
             } else {
@@ -2470,7 +2472,7 @@ impl TraceEngine {
                 &sql,
                 Some(("aggregate field = ", &plan.agg_fields[field_idx].key)),
             )?;
-            let rows: Vec<NumValueRow> = self
+            let rows: Vec<TypedNumValueRow> = self
                 .collect_rows_charged(
                     &sql,
                     settings,
@@ -2480,11 +2482,20 @@ impl TraceEngine {
                     |_| NUM_VALUE_ENTRY_BYTES,
                 )
                 .await?;
-            attrs.agg_values.push(
-                rows.into_iter()
-                    .filter_map(|r| r.v.map(|v| ((r.trace_id, r.span_id), v)))
-                    .collect(),
-            );
+            // Issue #510: the stored kind rides the SAME read. Both maps
+            // are keyed on the same span, so a value with no type (a row
+            // written before the column existed) still lands in
+            // `agg_values` and reads back as `StoredType::Unknown`.
+            let mut values = HashMap::with_capacity(rows.len());
+            let mut types = HashMap::with_capacity(rows.len());
+            for row in rows {
+                let Some(v) = row.v else { continue };
+                let key = (row.trace_id, row.span_id);
+                values.insert(key, v);
+                types.insert(key, StoredType::from_stored(&row.t));
+            }
+            attrs.agg_values.push(values);
+            attrs.agg_types.push(types);
         }
         for field_idx in 0..plan.select_attrs.len() {
             let sql = plan.select_values_sql_for(field_idx, batch_ids);
@@ -2495,21 +2506,25 @@ impl TraceEngine {
                 &sql,
                 Some(("select field = ", &plan.select_attrs[field_idx].key)),
             )?;
-            let rows: Vec<StrValueRow> = self
+            let rows: Vec<TypedStrValueRow> = self
                 .collect_rows_charged(
                     &sql,
                     settings,
                     budget,
                     batch_charged,
                     map_trace_read_error,
-                    |row: &StrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
+                    |row: &TypedStrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
                 )
                 .await?;
             let mut map = HashMap::with_capacity(rows.len());
+            let mut types = HashMap::with_capacity(rows.len());
             for row in rows {
-                map.insert((row.trace_id, row.span_id), row.v);
+                let key = (row.trace_id, row.span_id);
+                types.insert(key, StoredType::from_stored(&row.t));
+                map.insert(key, row.v);
             }
             attrs.select_values.push(map);
+            attrs.select_types.push(types);
         }
         // Issue #351: the MULTI-VALUED event/link values — ONE ROW PER
         // VALUE, on the same `(key, scope)` index prefix the literal form
@@ -4666,7 +4681,7 @@ mod tests {
                         scope: pulsus_traceql::AttrScope::Span,
                         key: "k".to_string(),
                     },
-                    "v".to_string(),
+                    super::search_eval::GroupValue::Str("v".to_string()),
                 )],
             )],
             groups: None,

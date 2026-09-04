@@ -20,7 +20,7 @@ ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
 LIMIT 10001 BY trace_id
 
 == phase2 membership[0] ==
-SELECT DISTINCT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v
+SELECT DISTINCT trace_id, span_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v, val_type AS t
 FROM trace_attrs_idx
 WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND (key = 'timeSinceStart' AND val_num > 1000000 AND scope = 'event:intrinsic')

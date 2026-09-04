@@ -846,7 +846,14 @@ fn parse_dotted_key(cursor: &mut Cursor<'_>) -> Result<(String, usize), TraceQlE
 /// SAME legal set, including `by` and `coalesce`, which have been served
 /// pipeline stages since issue #185 (issue #492 item 2). All three, not
 /// one: otherwise the legal set a user is shown depends on which way they
-/// got it wrong. The metrics stage names (`rate`, `count_over_time`,
+/// got it wrong. **This refusal is the accept-surface gap recorded as
+/// `traceql-midpipeline-spanset-filter-unsupported` in
+/// docs/benchmarks/traces-differential-ledger.md**: the reference admits a
+/// `{...}` spanset filter in ANY pipeline position and this production
+/// admits only an identifier-led stage, so `{a} | by(name) | {b}` is a
+/// `400` here and a `200` there. Tracked as item 9 of the issue #492
+/// enumeration; widening it is that item's decision, not this one's.
+/// The metrics stage names (`rate`, `count_over_time`,
 /// `topk`, `compare`, ...) are deliberately absent — they parse here and
 /// are refused at plan time on the search route, so naming them would
 /// advertise stages that route does not serve.

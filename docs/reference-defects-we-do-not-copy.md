@@ -76,6 +76,7 @@ replaces one.
 | [21](#21-a-histogram-is-stored-whose-buckets-cannot-add-up-to-its-own-count) | Prometheus | ingest | C | A histogram is stored with one bucket count silently thrown away and a total that contradicts the buckets. |
 | [22](#22-a-fault-that-can-never-be-fixed-by-retrying-is-answered-500) | Prometheus | ingest | B | An OTLP exporter retries a payload forever that can never be accepted. |
 | [23](#23-a-grouping-after-a-select-puts-every-span-into-one-group-called-nil) | Tempo | queries | A, D | A query grouping four named spans by their name answers one group called `nil`, in a response that prints each span's name beside it. |
+| [24](#24-a-groups-sum-and-avg-over-one-attribute-give-different-answers-depending-on-which-span-arrived-first) | Tempo | queries | C, D | A group's `sum` and `avg` over one attribute give different answers depending on which span arrived first. |
 
 ---
 
@@ -1601,6 +1602,93 @@ entry contrasts with are pinned by
 and by the live two-system differential
 `crates/pulsus-read/tests/traces_search_grouping_differential.rs`
 (issue #492 item 2).
+
+---
+
+## 24. A group's `sum` and `avg` over one attribute give different answers depending on which span arrived first
+
+**Grafana Tempo v3.0.2 · queries · tests C, D**
+
+### What the reference does
+
+A TraceQL pipeline aggregate — `sum(.v)`, `avg(.v)` — walks the matched
+spans and folds each span's value for the key into a running total. The
+values arrive as typed cells, and the fold keeps ONE type: whichever the
+FIRST contributor had. A later value of a different type is skipped
+without a word. `avg` then divides that partial sum by the count of
+**all** contributors, including the ones whose values were dropped.
+
+Nothing checks that the values agree in type, and nothing reports that
+some were discarded.
+
+```
+   stored:  span 01  v = int 2
+            span 02  v = double 3.5
+
+   sum(.v):  running total starts as an int at 2.
+             3.5 is a double, so it is skipped.
+             answer: intValue "2"
+
+   avg(.v):  the same partial sum, 2, divided by 2 contributors.
+             answer: doubleValue 1
+
+   now push the SAME two values in the other order:
+
+   sum(.v):  running total starts as a double at 3.5.
+             2 is an int, so it is skipped.
+             answer: doubleValue 3.5
+
+   avg(.v):  3.5 / 2.
+             answer: doubleValue 1.75
+```
+
+Four different answers for two numbers, decided by which span the
+collector happened to see first.
+
+### Why that is wrong rather than different
+
+Two tests are met.
+
+**C — part of the input is discarded with no error.** One of the two
+values never reaches the answer and the response says nothing about it.
+The number the user gets is not a coarser answer or a differently
+rounded one; it is an answer computed over a subset of the data that
+nobody chose and nobody is told about.
+
+**D — no reading of the stated intent supports it.** `sum` over a set of
+numbers means the total of those numbers. There is no interpretation of
+"sum" under which `2 + 3.5 = 2`, and none under which the same two
+values sum to `2` one way round and `3.5` the other. The mean is worse
+again: it divides a partial numerator by a complete denominator, so it
+is not the mean of anything — not of the values it kept, and not of the
+values it was given.
+
+The order dependence is what makes it undetectable in practice. A user
+who re-runs the query gets the same answer, because the stored order
+does not change; only a different ingest run gives a different number,
+and by then there is nothing to compare it with.
+
+### What PulsusDB does
+
+Sums every numeric contributor, whatever type it was stored as, and
+divides by the same count it summed. Both push orders give `5.5` and
+`2.75`. A value that is not numeric contributes nothing, on either
+system.
+
+The wire ARM still follows the stored types — `sum(.attr)` is an
+`intValue` only when EVERY contributor was stored `int` — so a mixed-type
+sum is reported as the double it is rather than as an integer it is not.
+
+### Evidence
+
+Traces ledger, `traceql-spanset-aggregate-mixed-type-attribute` in
+docs/benchmarks/traces-differential-ledger.md, with both orders measured
+on a SEPARATE reference instance each — one order cannot show order
+dependence. Exercised live in both orders by the fixtures
+`mixed_type_int_first_sum`, `mixed_type_float_first_sum`,
+`mixed_type_int_first_avg` and `mixed_type_float_first_avg` in
+`crates/pulsus-read/tests/traces_search_grouping_differential.rs`, whose
+own hermetic guard fails if either order is deleted.
 
 ---
 

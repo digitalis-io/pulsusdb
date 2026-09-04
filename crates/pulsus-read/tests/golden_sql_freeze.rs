@@ -285,7 +285,40 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 56), ("traces_metrics", 2
 ///
 /// **Adding a golden is not moving SQL, but it does move this digest**,
 /// and moving the digest constant is the reviewable act.
-const PINNED_SQL_CORPUS: u64 = 0xa294_8576_b64b_6407;
+///
+/// **Digest-only on issue #510. The corpus stays at 83 entries: 13
+/// `traces_search` goldens were regenerated, 0 added, 0 removed**, and
+/// every `traces_metrics` golden is byte-identical to the row above.
+/// `git diff --name-only -- crates/pulsus-read/tests/golden/` lists
+/// exactly those 13 files, and
+/// `git diff -- crates/pulsus-read/tests/golden/traces_search/ | grep -E
+/// '^[-+][^-+]' | sort | uniq -c` shows SIX distinct lines and no others:
+/// three `SELECT` projections, each in its before and after form.
+///
+/// One column was added to each of the three attribute VALUE projections
+/// so the response can render a value in the arm the sender stored it as:
+///
+/// ```text
+/// SELECT trace_id, span_id, any(val_num) AS v                     -> …, any(val_type) AS t   (6 occurrences)
+/// SELECT trace_id, span_id, any(<byte-capped val>) AS v           -> …, any(val_type) AS t   (7 occurrences)
+/// SELECT DISTINCT trace_id, span_id, <byte-capped val> AS v       -> …, val_type AS t        (7 occurrences)
+/// ```
+///
+/// **The hot no-value membership read did NOT move.** `SELECT DISTINCT
+/// trace_id, span_id` — the statement every string-equality attribute
+/// condition issues — appears in the corpus unchanged, which is why no
+/// `-SELECT DISTINCT trace_id, span_id` line is in that diff at all. Only
+/// the `with_value` arm of `membership_sql` grew a column, and
+/// `existence_absent.sql` stays byte-identical while
+/// `existence_present.sql` moves, which is the pair that shows the split
+/// is the projection and not the predicate.
+///
+/// No `WHERE` clause, index prefix, date/time clause or `trace_id IN`
+/// restriction moved in any of the 13, so part and granule selection
+/// cannot have moved either —
+/// `traces_search_explain.rs::attr_value_reads_keep_their_index_selection`
+/// gates that as an identity rather than leaving it as this sentence.
+const PINNED_SQL_CORPUS: u64 = 0x5b8b_80d7_38cb_049b;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
