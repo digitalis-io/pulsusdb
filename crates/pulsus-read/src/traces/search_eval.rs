@@ -5209,11 +5209,12 @@ mod tests {
         );
     }
 
-    /// The aggregate stage charges the bytes its attribute retains.
+    /// The aggregate stage charges the bytes its attribute retains,
+    /// measured AT THE FOLD.
     ///
-    /// **Why a new test rather than the end-state equality.** An uncharged
-    /// append is invisible to any check taken after materialisation,
-    /// because the miss and the under-release cancel exactly:
+    /// **Why not the end-state equality.** An uncharged append is
+    /// invisible to any check taken after materialisation, because the
+    /// miss and the under-release cancel exactly:
     ///
     /// ```text
     /// by_stage charges A bytes for the attributes
@@ -5225,33 +5226,32 @@ mod tests {
     ///                        -> budget.used() = retained + counter   <- correct
     /// ```
     ///
-    /// So this measures the charge AT THE FOLD, before materialisation:
-    /// two folds of the same shape whose only difference is the aggregate
-    /// display's length. The charged difference must be exactly that
-    /// length difference, once per surviving spanset.
+    /// Measured: with the charge removed, `budget.used()` after
+    /// `evaluate_batch` does not move at all — this test was written that
+    /// way first and stayed green. So it calls [`run_pipeline`] itself and
+    /// reads the budget BEFORE the response is materialised.
     ///
-    /// *RED when:* the aggregate arm appends without charging.
+    /// Two folds of the same shape, differing in ONE respect: the
+    /// aggregated attribute's key is 1 character in one and 256 in the
+    /// other, so the response attribute's display (`max(span.<key>)`)
+    /// differs by exactly 255 bytes. Same aggregate, same source kind,
+    /// same number of agg fields, same corpus — so no other term can move.
+    ///
+    /// *RED when:* the aggregate arm appends without charging — measured,
+    /// `left: 0  right: 510`, while the three end-state equalities stay
+    /// green.
     #[test]
     fn the_aggregate_stage_charges_its_attributes_bytes() {
-        // Two `by(name)` groups survive, and the two queries differ in
-        // ONE respect: the aggregated attribute's key is 1 character in
-        // one and 256 in the other, so the response attribute's display
-        // (`max(span.<key>)`) differs by exactly 255 bytes. Same
-        // aggregate, same source kind, same number of agg fields, same
-        // corpus — so no other term can move.
         let short_key = "a";
         let long_key = "a".repeat(256);
         let short = plan_wide(&format!(r#"{{ }} | by(name) | max(span.{short_key}) > 0"#));
         let long = plan_wide(&format!(r#"{{ }} | by(name) | max(span.{long_key}) > 0"#));
-        let trace = || TraceSpans {
-            trace_id: tid(1),
-            spans: vec![
-                span(1, "chg", "a", 10, 5),
-                span(2, "chg", "a", 20, 7),
-                span(3, "chg", "b", 30, 9),
-            ],
-        };
-        let charged = |p: &SearchPlan| -> usize {
+        let spans = vec![
+            span(1, "chg", "a", 10, 5),
+            span(2, "chg", "a", 20, 7),
+            span(3, "chg", "b", 30, 9),
+        ];
+        let charged_at_the_fold = |p: &SearchPlan| -> usize {
             let mut attrs = membership(p, &[]);
             // Both queries aggregate an ATTRIBUTE, so every span carries
             // a value for the one interned agg field.
@@ -5261,19 +5261,36 @@ mod tests {
                     attrs.agg_types[field].insert((tid(1), sid(sid_n)), StoredType::Int);
                 }
             }
+            let refs: Vec<&HydratedSpan> = spans.iter().collect();
+            let env = eval_env(&attrs, tid(1));
             let mut budget = ByteBudget::new(usize::MAX);
-            let env_traces = [trace()];
             let mut counter = GroupCardinalityCounter::new(u64::MAX);
-            let matches = evaluate_batch(p, &env_traces, &attrs, &mut counter, &mut budget)
-                .expect("in budget");
-            assert_eq!(matches[0].groups.as_ref().expect("by() active").len(), 2);
-            budget.used()
+            let mut transient = 0usize;
+            let sets = run_pipeline(
+                p,
+                &env,
+                &refs,
+                &attrs,
+                &mut counter,
+                &mut budget,
+                &mut transient,
+            )
+            .expect("in budget");
+            assert_eq!(sets.len(), 2, "one surviving spanset per name");
+            for set in &sets {
+                assert_eq!(set.attributes.len(), 2, "by(name) then the aggregate");
+            }
+            // The counter's own charge is not this stage's, so it is
+            // subtracted out: it is identical for the two folds anyway
+            // (the same two group tuples), but leaving it in would make
+            // the difference depend on something this test is not about.
+            budget.used() - counter.charged
         };
         // Written out, not read back from the plan: `max(span.a)` against
         // `max(span.aaa…)`, 255 characters apart, once per surviving
         // spanset.
         assert_eq!(
-            charged(&long) - charged(&short),
+            charged_at_the_fold(&long) - charged_at_the_fold(&short),
             2 * 255,
             "the two folds differ only in the aggregate display's length, so the charged \
              bytes must differ by exactly that, once per surviving spanset"
