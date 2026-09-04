@@ -5246,7 +5246,7 @@ mod tests {
         let long_key = "a".repeat(256);
         let short = plan_wide(&format!(r#"{{ }} | by(name) | max(span.{short_key}) > 0"#));
         let long = plan_wide(&format!(r#"{{ }} | by(name) | max(span.{long_key}) > 0"#));
-        let spans = vec![
+        let spans = [
             span(1, "chg", "a", 10, 5),
             span(2, "chg", "a", 20, 7),
             span(3, "chg", "b", 30, 9),
