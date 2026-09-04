@@ -507,12 +507,13 @@ fn replay_478_sections(fx: &Value, api: &str, otlp: &str) {
             continue;
         }
         let route = case["route"].as_str().expect("route");
-        // The zero-width window case carries its own params.
+        // The zero-width window case carries its own params: it is
+        // issued at the CORPUS instant, the same instant our leg uses,
+        // so both legs replay the fixture's `params` literally. See
+        // `corpus::zero_width_probe_secs`.
         let mut url = if case.get("params").is_some() {
-            format!(
-                "{}{route}?start={start}&end={start}",
-                api.trim_end_matches('/')
-            )
+            let at = corpus::zero_width_probe_secs(base);
+            format!("{}{route}?start={at}&end={at}", api.trim_end_matches('/'))
         } else {
             format!("{}{route}?{window}", api.trim_end_matches('/'))
         };

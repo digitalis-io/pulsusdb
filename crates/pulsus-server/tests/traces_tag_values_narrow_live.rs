@@ -443,8 +443,12 @@ async fn our_answers_match_the_committed_fixture() {
     for (id, case) in fx["q_matrix"].as_object().expect("q_matrix") {
         let route = case["route"].as_str().expect("route");
         let mut path = if case.get("params").is_some() {
-            // The zero-width window case.
-            format!("{route}?start={start}&end={start}")
+            // The zero-width window case, issued at the CORPUS instant
+            // rather than at `start` — see
+            // `corpus::zero_width_probe_secs`, and the hermetic sweep
+            // `the_zero_width_probe_lands_on_the_corpus_day` below.
+            let at = corpus::zero_width_probe_secs(base);
+            format!("{route}?start={at}&end={at}")
         } else {
             format!("{route}?{window}")
         };
@@ -844,4 +848,54 @@ async fn the_q_tolerance_stops_at_input_that_is_not_well_formed() {
     }
 
     drop_db(db).await;
+}
+
+/// The zero-width case (`q_matrix.Q-AZ`) must resolve to the corpus's own
+/// UTC day at EVERY wall clock, and the corpus must not straddle a UTC
+/// midnight. Hermetic: pure arithmetic over the same two functions the
+/// live tests above call, swept over a whole day.
+///
+/// **This test exists because the live suite failed on a clock.** Until
+/// this change the zero-width probe was issued at `start` — an hour
+/// before the corpus — so between 00:01:00 and 01:01:00 UTC it landed on
+/// the previous UTC day and the day-granular read answered `[]` instead
+/// of the corpus's ten values. Measured by emulating the whole run at 14
+/// virtual wall clocks: 0 values inside that band, 10 outside it. The
+/// live suite cannot catch that itself, because it runs at one instant
+/// and 23 of every 24 hours are green.
+///
+/// It is a sweep and not a boundary pair on purpose: the old
+/// construction was wrong on a contiguous HOUR, and any single-instant
+/// check has 23 chances in 24 of sitting outside it.
+#[test]
+fn the_zero_width_probe_lands_on_the_corpus_day() {
+    // Day 20,699 since the epoch is an arbitrary anchor; only the
+    // offsets inside the day matter.
+    let day0 = 20_699u64 * corpus::NS_PER_DAY;
+    for sec in 0..86_400u64 {
+        for frac in [0u64, 1, 500_000_000, 999_999_999] {
+            let now_ns = day0 + sec * 1_000_000_000 + frac;
+            let base = corpus::base_ns_from(now_ns);
+
+            // The whole corpus block is on one UTC day: its first
+            // instant is `base` and its last is inside `CORPUS_BLOCK_NS`.
+            let first = corpus::utc_day((base / 1_000_000_000) as i64);
+            let last = corpus::utc_day(((base + corpus::CORPUS_BLOCK_NS) / 1_000_000_000) as i64);
+            assert_eq!(
+                first, last,
+                "now_ns={now_ns}: the corpus block straddles a UTC midnight \
+                 (base={base}), so a day-granular read answers a partial list"
+            );
+
+            // And the zero-width probe resolves to that same day.
+            let probe = corpus::zero_width_probe_secs(base);
+            assert_eq!(
+                corpus::utc_day(probe),
+                first,
+                "now_ns={now_ns}: the zero-width probe at {probe} resolves to UTC day {} \
+                 but the corpus is on day {first}",
+                corpus::utc_day(probe)
+            );
+        }
+    }
 }
