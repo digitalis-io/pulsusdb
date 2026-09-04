@@ -5138,6 +5138,197 @@ mod tests {
         );
     }
 
+    /// The composition defect neither branch could produce: an aggregate
+    /// stage's attribute must never enter the GROUPING tuple.
+    ///
+    /// `PipelineSpanset` carries two lists. `attributes` is what the
+    /// response shows; `key` is what [`GroupCardinalityCounter`] observes.
+    /// The counter is ONE per query across every batch and every candidate
+    /// trace and deduplicates on the tuple, so an aggregate value inside
+    /// the tuple stops two traces' identical group keys deduplicating.
+    ///
+    /// **Why `max_series = 2` and not another number.** The corpus is two
+    /// traces in one batch: `T1` = spans named a, a, b and `T2` = spans
+    /// named a, b. The correct rule observes exactly the two tuples `(a)`
+    /// and `(b)` across both traces. The leaking rule observes FOUR —
+    /// `(3, a)`, `(3, b)`, `(2, a)`, `(2, b)` — because `T1`'s `count()`
+    /// is 3 and `T2`'s is 2. Any cap <= 1 refuses under both rules and any
+    /// cap >= 4 accepts under both; only 2 and 3 discriminate, and 2 is
+    /// the tightest. At 2 the correct rule answers `Ok` and the leaking
+    /// rule answers `422 TraceSearchSeriesCap { count: 3, cap: 2 }`.
+    ///
+    /// *RED when:* `resolve_group_tuple` is fed `set.attributes`' values
+    /// instead of `set.key`.
+    #[test]
+    fn an_aggregate_attribute_is_not_part_of_the_cardinality_tuple() {
+        let p = plan_cap(r#"{ } | count() > 0 | by(name)"#, 2);
+        let traces = vec![
+            TraceSpans {
+                trace_id: tid(1),
+                spans: vec![
+                    span(1, "archcap", "a", 10, 1),
+                    span(2, "archcap", "a", 20, 1),
+                    span(3, "archcap", "b", 30, 1),
+                ],
+            },
+            TraceSpans {
+                trace_id: tid(2),
+                spans: vec![
+                    span(1, "archcap", "a", 40, 1),
+                    span(2, "archcap", "b", 50, 1),
+                ],
+            },
+        ];
+        let matches = evaluate_batch(
+            &p,
+            &traces,
+            &membership(&p, &[]),
+            &mut GroupCardinalityCounter::new(2),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect("two distinct group keys over a cap of 2 must NOT refuse");
+        assert_eq!(matches.len(), 2, "both traces come back");
+        for (i, m) in matches.iter().enumerate() {
+            let groups = m.groups.as_ref().expect("by() active");
+            assert_eq!(groups.len(), 2, "trace {i}: one group per name");
+        }
+        // …and the aggregate IS in the response, which is what makes the
+        // separation load-bearing rather than a way of not emitting it.
+        let counts: Vec<i64> = matches
+            .iter()
+            .flat_map(|m| m.groups.as_ref().expect("by() active"))
+            .map(|g| match &g.attributes[0] {
+                (display, GroupValue::Int(n)) if display == "count()" => *n,
+                other => panic!("the aggregate must lead each group's attributes: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            vec![3, 3, 2, 2],
+            "the two traces' aggregate values DIFFER, which is what would split the tuples"
+        );
+    }
+
+    /// The aggregate stage charges the bytes its attribute retains.
+    ///
+    /// **Why a new test rather than the end-state equality.** An uncharged
+    /// append is invisible to any check taken after materialisation,
+    /// because the miss and the under-release cancel exactly:
+    ///
+    /// ```text
+    /// by_stage charges A bytes for the attributes
+    /// aggregate appends B bytes, UNCHARGED
+    /// run_pipeline returns transient = A            budget.used() = A
+    /// build_span_set_groups: *transient -= attributes_bytes(...) = A + B
+    ///                        -> transient = other - B
+    /// caller: budget.release(transient) releases B FEWER bytes
+    ///                        -> budget.used() = retained + counter   <- correct
+    /// ```
+    ///
+    /// So this measures the charge AT THE FOLD, before materialisation:
+    /// two folds of the same shape whose only difference is the aggregate
+    /// display's length. The charged difference must be exactly that
+    /// length difference, once per surviving spanset.
+    ///
+    /// *RED when:* the aggregate arm appends without charging.
+    #[test]
+    fn the_aggregate_stage_charges_its_attributes_bytes() {
+        // Two `by(name)` groups survive, and the two queries differ in
+        // ONE respect: the aggregated attribute's key is 1 character in
+        // one and 256 in the other, so the response attribute's display
+        // (`max(span.<key>)`) differs by exactly 255 bytes. Same
+        // aggregate, same source kind, same number of agg fields, same
+        // corpus — so no other term can move.
+        let short_key = "a";
+        let long_key = "a".repeat(256);
+        let short = plan_wide(&format!(r#"{{ }} | by(name) | max(span.{short_key}) > 0"#));
+        let long = plan_wide(&format!(r#"{{ }} | by(name) | max(span.{long_key}) > 0"#));
+        let trace = || TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "chg", "a", 10, 5),
+                span(2, "chg", "a", 20, 7),
+                span(3, "chg", "b", 30, 9),
+            ],
+        };
+        let charged = |p: &SearchPlan| -> usize {
+            let mut attrs = membership(p, &[]);
+            // Both queries aggregate an ATTRIBUTE, so every span carries
+            // a value for the one interned agg field.
+            for field in 0..attrs.agg_values.len() {
+                for sid_n in 1..=3u8 {
+                    attrs.agg_values[field].insert((tid(1), sid(sid_n)), 1.0);
+                    attrs.agg_types[field].insert((tid(1), sid(sid_n)), StoredType::Int);
+                }
+            }
+            let mut budget = ByteBudget::new(usize::MAX);
+            let env_traces = [trace()];
+            let mut counter = GroupCardinalityCounter::new(u64::MAX);
+            let matches = evaluate_batch(p, &env_traces, &attrs, &mut counter, &mut budget)
+                .expect("in budget");
+            assert_eq!(matches[0].groups.as_ref().expect("by() active").len(), 2);
+            budget.used()
+        };
+        // Written out, not read back from the plan: `max(span.a)` against
+        // `max(span.aaa…)`, 255 characters apart, once per surviving
+        // spanset.
+        assert_eq!(
+            charged(&long) - charged(&short),
+            2 * 255,
+            "the two folds differ only in the aggregate display's length, so the charged \
+             bytes must differ by exactly that, once per surviving spanset"
+        );
+    }
+
+    /// The end-state equality, over a query that HAS an aggregate stage.
+    ///
+    /// Blind to the missing-charge defect above and sharp on a different
+    /// one: `SpanSetGroup::retained_bytes` accounts the attribute slot
+    /// vector by `capacity()` while the fold charges `len()`, so an
+    /// aggregate arm that pushes onto the existing vector — doubling its
+    /// capacity — breaks this and not the other. Both tests are required;
+    /// neither subsumes the other.
+    #[test]
+    fn grouped_charges_with_an_aggregate_attribute_equal_retained_plus_counter_exactly() {
+        let p = plan(r#"{ } | by(resource.service.name) | count() > 0"#);
+        let traces = vec![
+            TraceSpans {
+                trace_id: tid(1),
+                spans: vec![
+                    span(1, "checkout", "a", 10, 1),
+                    span(2, "billing", "b", 20, 1),
+                ],
+            },
+            TraceSpans {
+                trace_id: tid(2),
+                spans: vec![span(1, "checkout", "c", 30, 1)],
+            },
+        ];
+        let mut counter = GroupCardinalityCounter::new(u64::MAX);
+        let mut budget = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(&p, &traces, &membership(&p, &[]), &mut counter, &mut budget)
+            .expect("in budget");
+        // Every group carries its by-key AND the aggregate's own value.
+        for m in &matches {
+            for g in m.groups.as_ref().expect("by() active") {
+                assert_eq!(g.attributes.len(), 2, "by(...) then count()");
+            }
+        }
+        let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
+        let expected_counter: usize = [
+            vec![GroupValue::Str("checkout".to_string())],
+            vec![GroupValue::Str("billing".to_string())],
+        ]
+        .iter()
+        .map(group_tuple_bytes)
+        .sum();
+        assert_eq!(
+            budget.used(),
+            retained + expected_counter,
+            "budget == winners' retained_bytes + the counter's group_tuple_bytes"
+        );
+    }
+
     /// The cap is a CROSS-BATCH running total: distinct tuples accumulate
     /// across `evaluate_batch` calls on the same counter, so fan-out spread
     /// over multiple batches still trips.
