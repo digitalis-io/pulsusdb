@@ -1573,6 +1573,38 @@ mod tests {
         }
     }
 
+    /// The three ways of getting a pipeline stage wrong name the SAME
+    /// legal set, and it includes `by` and `coalesce` (issue #492 item 2).
+    /// Two of the three arms had no test before this one: only the
+    /// end-of-input arm is pinned by a corpus golden, so reverting either
+    /// `UnexpectedToken` arm's message changed nothing anywhere in the
+    /// workspace.
+    #[test]
+    fn every_unknown_pipeline_stage_arm_names_the_same_legal_set() {
+        const LEGAL: &str = "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)";
+        // End of input after the pipe.
+        let err = parse("{ .a = 1 } |").expect_err("end of input after the pipe");
+        assert!(
+            matches!(&err, TraceQlError::UnexpectedEof { expected, .. } if expected == LEGAL),
+            "got {err:?}"
+        );
+        // A non-identifier where a stage was expected (the mid-pipeline
+        // spanset filter a user writes: `{...} | by(name) | {...}`).
+        let err = parse(r#"{ .a = 1 } | by(name) | { name = "b" }"#)
+            .expect_err("a spanset filter is not a pipeline stage here");
+        assert!(
+            matches!(&err, TraceQlError::UnexpectedToken { expected, found, .. }
+                if expected == LEGAL && found == "'{'"),
+            "got {err:?}"
+        );
+        // An identifier that names no stage.
+        let err = parse("{ .a = 1 } | nosuchstage()").expect_err("unknown stage identifier");
+        assert!(
+            matches!(&err, TraceQlError::UnexpectedToken { expected, .. } if expected == LEGAL),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn colon_scoped_and_legacy_intrinsics_parse_to_normalized_variants() {
         // Every issue #184 construct (bare + scoped spellings) parses, and
