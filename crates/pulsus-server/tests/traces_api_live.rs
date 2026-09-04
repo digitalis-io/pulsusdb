@@ -97,6 +97,21 @@ const NULLABLE_WIRE_PORT: u16 = 31_215;
 /// what settles it.
 const CAP_PROBE_PORT: u16 = 31_221;
 
+/// Issue #502's truncation-signal suite. It needs THREE spawns over ONE
+/// store and ONE throwaway database, differing in nothing but their
+/// listener port and `PULSUS_TRACEQL_MAX_CANDIDATES`, because that ceiling
+/// is process configuration: the plan takes it from the reader config
+/// (`crates/pulsus-server/src/traces_api/search.rs:84`) and no search
+/// request parameter carries it. Three ceilings rather than two is what
+/// makes the trace count TRACK the ceiling — the criterion's own doc
+/// comment says why, and names the break that establishes it.
+///
+/// The suffix is the CEILING each process runs with, not an ordinal:
+/// `_ONE` is `1`, `_TWO` is `2`, `_HIGH` is `1000`.
+const CEILING_HIGH_PORT: u16 = 31_225;
+const CEILING_ONE_PORT: u16 = 31_226;
+const CEILING_TWO_PORT: u16 = 31_227;
+
 /// Retention for the issue #474 spawn only. The fixture's timestamps are
 /// FROZEN at 2023-11-14 so its captured bytes can be committed, and the
 /// delete-TTL `apply_ttl` installs is
@@ -2407,4 +2422,159 @@ async fn the_range_route_rejects_a_group_the_instant_route_serves() {
             "{ctx}: the instant body shape is untouched by this issue, body {json}"
         );
     }
+}
+
+/// Issue #502: the incomplete-search signal follows the **candidate
+/// ceiling**, and the request `limit` never raises it.
+///
+/// `docs/schemas.md` described a `partial` response field that issue #464
+/// removed. A query that only narrows `limit` cannot produce the signal
+/// that replaced it, because the request `limit` is none of the three
+/// things that set it (`crates/pulsus-read/src/traces/exec.rs:2259`, read
+/// at this revision):
+///
+/// ```text
+///   let partial = generator_truncated || ceiling_hit || overflow_partial;
+///
+///   request `limit`      how many traces the response carries
+///   candidate ceiling    how many candidates the engine may consider
+///                        — only this one sets the incomplete signal
+/// ```
+///
+/// So the four requests below differ in ONE input at a time, over one
+/// three-trace store served by three spawns — one per ceiling, since the
+/// ceiling is process configuration:
+///
+/// ```text
+///   ceiling=1     limit=10  ->  1 trace,  {"totalJobs":1}
+///   ceiling=2     limit=10  ->  2 traces, {"totalJobs":1}
+///   ceiling=1000  limit=10  ->  3 traces, {"completedJobs":1,"totalJobs":1}
+///   ceiling=1000  limit=1   ->  1 trace,  {"completedJobs":1,"totalJobs":1}
+/// ```
+///
+/// **The ceiling=2 row is what makes the count TRACK the ceiling.** With
+/// only 1 and 1000 in the set, an engine that returned one trace whenever
+/// the ceiling was "small" and everything otherwise would satisfy every
+/// other row. Three ceilings, three different trace counts — 1, 2, 3 — is
+/// the difference between reacting to a small ceiling and following it.
+/// The break that establishes this, rather than asserting it: make
+/// `SearchPlan::max_candidates` (`crates/pulsus-read/src/traces/search_plan.rs:676`)
+/// return 1 whenever the configured value is below 10. The four rows fail
+/// on this one's trace count; the three-row version passes.
+///
+/// **The last request stays in the set on purpose.** It is the shape that
+/// made the previous criterion unable to fail: one trace of three comes
+/// back and the answer is still complete. Dropping it once understood
+/// would make the same mistake reachable again.
+///
+/// **All three ceilings this test spawns are legal values**, so no
+/// configuration carve-out is needed. The accepted range is
+/// `1..=TRACEQL_MAX_CANDIDATES_CEILING`, which is `1_000_000`
+/// (`crates/pulsus-config/src/validate.rs:149`): the lower bound is the
+/// positivity check at `:483-486` and the upper bound the ceiling check
+/// at `:487-498`, which carries its own reason and issue reference.
+/// `1`, `2` and `1000` are inside that range. If
+/// a floor above 1 is ever added, this test moves to the next ceiling
+/// that still truncates a three-trace corpus; it does not get deleted.
+/// The variable reaches that field directly
+/// (`crates/pulsus-config/src/env.rs:354-355`).
+///
+/// Timestamps are FIXED and in the future, the idiom this file already
+/// uses: the corpus spans and the search window are both literals
+/// (`START_S`/`END_S`, 2068-04-01), and the test body makes no wall-clock
+/// call at all, so there is no second anchor for the first to drift
+/// against.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request_limit() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
+        return;
+    }
+    let db = pulsus_testkit::test_db("pulsus_traces_api_it_ceiling");
+    // The trace COUNT is the assertion, so a re-run must not find the
+    // previous run's rows.
+    drop_db(&db).await;
+
+    const NS: u64 = 1_000_000_000;
+    const START_S: u64 = 3_100_500_000;
+    const END_S: u64 = 3_100_500_300;
+
+    let high = spawn_ready_with_env(
+        CEILING_HIGH_PORT,
+        &db,
+        &[("PULSUS_TRACEQL_MAX_CANDIDATES", "1000")],
+    );
+    for (service, id, at_s) in [
+        ("ceil-a", 0xa1u8, START_S + 30),
+        ("ceil-b", 0xb2, START_S + 60),
+        ("ceil-c", 0xc3, START_S + 90),
+    ] {
+        let mut trace_id = [0u8; 16];
+        trace_id[15] = id;
+        let mut span_id = [0u8; 8];
+        span_id[7] = id;
+        ingest_as(
+            CEILING_HIGH_PORT,
+            service,
+            vec![span(trace_id, span_id, "op", at_s * NS)],
+            service,
+        );
+    }
+    let one = spawn_ready_with_env(
+        CEILING_ONE_PORT,
+        &db,
+        &[("PULSUS_TRACEQL_MAX_CANDIDATES", "1")],
+    );
+    let two = spawn_ready_with_env(
+        CEILING_TWO_PORT,
+        &db,
+        &[("PULSUS_TRACEQL_MAX_CANDIDATES", "2")],
+    );
+
+    let complete = serde_json::json!({"completedJobs": 1, "totalJobs": 1});
+    let truncated = serde_json::json!({"totalJobs": 1});
+
+    for (name, port, limit, want_traces, want_metrics) in [
+        ("ceiling=1 limit=10", CEILING_ONE_PORT, 10, 1, &truncated),
+        // The row that makes the trace count TRACK the ceiling rather
+        // than merely react to it being small.
+        ("ceiling=2 limit=10", CEILING_TWO_PORT, 10, 2, &truncated),
+        ("ceiling=1000 limit=10", CEILING_HIGH_PORT, 10, 3, &complete),
+        // The blind case of the criterion this one replaces.
+        ("ceiling=1000 limit=1", CEILING_HIGH_PORT, 1, 1, &complete),
+    ] {
+        let ctx = format!("[#502] {name}");
+        let path =
+            format!("/api/traces/v1/search?q=%7B%7D&start={START_S}&end={END_S}&limit={limit}");
+        let res = get(port, &path, &[], &ctx);
+        assert_eq!(
+            res.status,
+            200,
+            "{ctx}: status, body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+        let json = res.json(&ctx);
+        assert_eq!(
+            json["traces"].as_array().map(Vec::len),
+            Some(want_traces),
+            "{ctx}: trace count, body {json}"
+        );
+        assert_eq!(
+            json["metrics"], *want_metrics,
+            "{ctx}: a truncated search must omit completedJobs and a complete one must carry it, \
+             body {json}"
+        );
+        // Issue #464 retired the invented wire field; no shape of this
+        // request may bring it back.
+        assert!(
+            find_subslice(&res.body, b"\"partial\"").is_none(),
+            "{ctx}: the response must carry no `partial` field, body {:?}",
+            String::from_utf8_lossy(&res.body)
+        );
+    }
+
+    drop(two);
+    drop(one);
+    drop(high);
+    drop_db(&db).await;
 }

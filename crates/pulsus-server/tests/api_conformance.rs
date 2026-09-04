@@ -2891,3 +2891,161 @@ async fn prom_query_string_literal_renders_result_type_string_live_case() {
         "{ctx}: byte-exact string envelope"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #502: the §8.1 alias bullet said the opposite of what this suite
+// asserts, live, on the same four paths.
+//
+// `Surface::TracesMetrics`'s arm above has asserted the Tempo-native
+// `{series, metrics}` body on `/api/metrics/*` since #182, and passed
+// every run, while `docs/api.md` §8.1 told a reader the aliases serve a
+// Prometheus matrix/vector envelope. Both were green because nothing
+// joined them. The two tests below are the join: one reads the bullet,
+// one measures the aliases against the canonical routes.
+// ---------------------------------------------------------------------
+
+/// The §8.1 **Metrics envelope** bullet. Hermetic — a document read, no
+/// spawn — so it runs in the plain workspace test job as well as here.
+///
+/// Two scopes, because they catch different edits. The bullet line itself
+/// must not carry the words at all; the whole document must not carry the
+/// **claim**, which is a longer phrase because §4.4 legitimately uses the
+/// short one to record that the native body *replaced* a matrix/vector
+/// envelope. Asserting the short phrase document-wide would demand the
+/// deletion of a true sentence.
+#[test]
+fn the_alias_bullet_matches_the_body_the_aliases_serve() {
+    let api = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api.md"),
+    )
+    .expect("read docs/api.md");
+
+    let bullet = api
+        .lines()
+        .find(|l| l.starts_with("- **Metrics envelope:**"))
+        .expect("docs/api.md §8.1 must carry a `Metrics envelope` bullet");
+
+    assert_eq!(
+        bullet.matches("matrix/vector envelope").count(),
+        0,
+        "docs/api.md §8.1's alias bullet must not claim a matrix/vector envelope; \
+         §4.4 and this suite's Surface::TracesMetrics arm both say otherwise. Bullet: {bullet:?}"
+    );
+    assert_eq!(
+        api.matches("aliases serve the native Prometheus matrix/vector envelope")
+            .count(),
+        0,
+        "docs/api.md must not carry the retired alias-envelope claim anywhere"
+    );
+    // The corrected bullet's own content, so a deletion is a failure too
+    // rather than a vacuous pass.
+    for needle in [
+        "byte-identical to `/api/traces/v1/metrics/*` for the same request",
+        "`{series, metrics}`",
+    ] {
+        assert!(
+            bullet.contains(needle),
+            "docs/api.md §8.1's alias bullet must state {needle:?}. Bullet: {bullet:?}"
+        );
+    }
+}
+
+/// The measurement behind that bullet: each of the four `/api/metrics/*`
+/// aliases answers **the same bytes** as the canonical
+/// `/api/traces/v1/metrics/*` route it binds.
+///
+/// Against this suite's empty databases, as everywhere in this file. That
+/// is enough to fail if an alias stopped being a pure binding — a
+/// different handler answers a different envelope on an empty store just
+/// as it does on a full one — and it is not a claim about a populated
+/// store.
+///
+/// The rejecting path is in the comparison on purpose: a binding that only
+/// ever answered `200` could be a stub that ignores its query.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_metrics_aliases_are_byte_identical_to_the_native_routes() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_222;
+    let db = &pulsus_testkit::test_db("pulsus_api_conformance_it_alias_bytes");
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
+
+    let queries = [
+        ("range", manifest::TRACES_METRICS_BASE_QUERY),
+        (
+            "instant",
+            "q=%7B%7D%20%7C%20count_over_time()&start=1700000100&end=1700003700",
+        ),
+        // `traceql-metrics-fractional-ms-step-rejected`: a 400 the alias
+        // must reproduce byte for byte, body included.
+        (
+            "fractional-step-400",
+            "q=%7B%7D%20%7C%20rate()&start=1700000100&end=1700003700&step=1.5ms",
+        ),
+    ];
+
+    for (leaf, canonical) in [
+        ("query_range", "/api/traces/v1/metrics/query_range"),
+        ("query", "/api/traces/v1/metrics/query"),
+    ] {
+        for (case, query) in &queries {
+            // The instant query string is the one that belongs to the
+            // instant route; the range one carries `step`, which the
+            // instant route ignores. Both are run on both routes so the
+            // comparison is over the same request, whatever the route
+            // does with it.
+            let ctx = format!("[alias-identity] {canonical} case={case}");
+            let canonical_res = get(port, &format!("{canonical}?{query}"), &ctx);
+
+            for alias in [
+                format!("/api/metrics/{leaf}"),
+                format!("/tempo/api/metrics/{leaf}"),
+            ] {
+                let ctx = format!("[alias-identity] {alias} case={case}");
+                let alias_res = get(port, &format!("{alias}?{query}"), &ctx);
+                assert_eq!(
+                    alias_res.status, canonical_res.status,
+                    "{ctx}: {alias} must be a pure binding of {canonical} — status"
+                );
+                assert_eq!(
+                    alias_res.content_type(),
+                    canonical_res.content_type(),
+                    "{ctx}: {alias} must be a pure binding of {canonical} — Content-Type"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&alias_res.body),
+                    String::from_utf8_lossy(&canonical_res.body),
+                    "{ctx}: {alias} must be a pure binding of {canonical} — body bytes"
+                );
+            }
+
+            if *case == "fractional-step-400" {
+                assert_eq!(
+                    canonical_res.status,
+                    400,
+                    "{ctx}: the fractional-millisecond step is a 400 on both, body {:?}",
+                    String::from_utf8_lossy(&canonical_res.body)
+                );
+            } else {
+                assert_eq!(
+                    canonical_res.status,
+                    200,
+                    "{ctx}: status, body {:?}",
+                    String::from_utf8_lossy(&canonical_res.body)
+                );
+                // The envelope the bullet used to deny.
+                let json = canonical_res.json(&ctx);
+                assert!(
+                    json.get("series").is_some() && json["metrics"].is_object(),
+                    "{ctx}: the aliases serve §4.4's native {{series, metrics}} body, got {json}"
+                );
+                assert!(
+                    json.get("status").is_none() && json.get("data").is_none(),
+                    "{ctx}: never the Prometheus query envelope, got {json}"
+                );
+            }
+        }
+    }
+}

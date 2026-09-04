@@ -2196,14 +2196,31 @@ const LEDGER_ROWS: &[LedgerRow] = &[
     LedgerRow {
         id: "`otlp-reference-admission-window`",
         limit: "`60 min`",
-        our_route: "`POST /v1/metrics`",
-        our_status: "`200`",
-        their_route: "`POST /api/v1/otlp/v1/metrics`",
+        // Issue #502: the behaviour is reached from BOTH receive paths, and
+        // our two routes answer with different success codes, so one status
+        // cell would be a fresh false claim written while repairing one.
+        our_route: "`POST /v1/metrics`, `POST /api/v1/write`",
+        our_status: "`200` / `204`",
+        their_route: "`POST /api/v1/otlp/v1/metrics`, `POST /api/v1/write`",
         their_status: "`400`",
         required: &[
             "head-relative",
             "out of order sample",
             "one line per rejected emitted series",
+            // Issue #502. The measured per-route difference: appending the
+            // second route to the OTLP line rule would have been false from
+            // the second rejected series onward.
+            "exactly one line whatever the number of rejected series",
+            // The two anchors, and the reason nobody saw the split.
+            "two bounds with two different anchors",
+            "where they coincide",
+            "`maxAheadTime = 10 * time.Minute`",
+            "storage/remote/write_handler.go:53",
+            "tsdb/head_append.go:199-211",
+            // Which of our two statuses belongs to which of our two routes.
+            "`204` on `POST /api/v1/write`",
+            // The atomicity claim is about the v1 message only.
+            "remote-write **v1**",
             // Two bodies for one status: a gate pinning either alone
             // misreports the other.
             "out of bounds\\n",
@@ -2397,6 +2414,102 @@ fn every_divergence_has_a_ledger_row() {
     assert!(
         api.contains("metrics-differential-ledger.md"),
         "docs/api.md §3.5 must point at the ledger the row moved into"
+    );
+}
+
+/// The reference-derived capture the admission row's ROUTE claim is bound
+/// to (issue #502). One block per receive path, each carrying the image
+/// digest, the build's own version and revision, and the capture date.
+///
+/// **Why this file exists rather than another literal.**
+/// [`every_divergence_has_a_ledger_row`] compares the row's cells against
+/// literals in *this* file — both sides ours — so a route the reference
+/// answers on and the row omits cannot fail it in principle. The
+/// expectation below came from the reference instead.
+///
+/// **What it still cannot do.** It fixes what the reference did on one
+/// date at one digest. No CI job re-captures it, so a later release moving
+/// the boundary is invisible here; the `revision` and `captured` fields
+/// are what a reviewer checks a suspicious edit against.
+#[derive(serde::Deserialize)]
+struct AdmissionCapture {
+    routes: Vec<AdmissionRoute>,
+}
+
+#[derive(serde::Deserialize)]
+struct AdmissionRoute {
+    /// Spelled exactly as the ledger cell spells it, backticks included.
+    route: String,
+    image: String,
+    revision: String,
+    captured: String,
+}
+
+const ADMISSION_WINDOW_JSON: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/otlp-metrics/prom-translation/admission-window.json"
+);
+
+/// Issue #502. The admission row's *Reference route* cell, split on `, `,
+/// must EQUAL the capture's route set — not contain it. Set equality, with
+/// both differences printed, because a row that omits a measured route and
+/// a capture that carries an unmeasured one are different defects and the
+/// message has to say which one happened.
+#[test]
+fn the_admission_row_names_every_route_the_reference_was_measured_on() {
+    let raw = std::fs::read_to_string(ADMISSION_WINDOW_JSON)
+        .unwrap_or_else(|e| panic!("read {ADMISSION_WINDOW_JSON}: {e}"));
+    let capture: AdmissionCapture =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {ADMISSION_WINDOW_JSON}: {e}"));
+
+    // The capture's provenance is part of the expectation: a block whose
+    // digest or revision does not match the one this repository pins is
+    // not evidence about the pinned reference.
+    for route in &capture.routes {
+        assert_eq!(
+            route.revision, "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+            "{}: the capture must carry the revision this repository pins",
+            route.route
+        );
+        assert!(
+            route.image.contains(
+                "sha256:0e698e35e50d1ddc2d11a4a55b089fe62eb71358a5c204dfafd21bdf8ffe04b8"
+            ),
+            "{}: the capture must name the pinned image digest, got {:?}",
+            route.route,
+            route.image
+        );
+        assert!(
+            !route.captured.is_empty(),
+            "{}: the capture must date itself",
+            route.route
+        );
+    }
+
+    let capture_routes: BTreeSet<&str> = capture.routes.iter().map(|r| r.route.as_str()).collect();
+    assert_eq!(
+        capture_routes.len(),
+        capture.routes.len(),
+        "the capture lists a route twice: {:?}",
+        capture.routes.iter().map(|r| &r.route).collect::<Vec<_>>()
+    );
+
+    let (header, rows) = ledger_table();
+    let id_col = column(&header, "Divergence");
+    let their_route_col = column(&header, "Reference route");
+    let row = rows
+        .iter()
+        .find(|r| r[id_col] == "`otlp-reference-admission-window`")
+        .expect("the ledger must carry the admission-window row");
+    let row_routes: BTreeSet<&str> = row[their_route_col].split(", ").collect();
+
+    let only_row: Vec<&&str> = row_routes.difference(&capture_routes).collect();
+    let only_capture: Vec<&&str> = capture_routes.difference(&row_routes).collect();
+    assert_eq!(
+        row_routes, capture_routes,
+        "the admission row's Reference route cell and the capture disagree.\n\
+         only in the row (named but never measured): {only_row:?}\n\
+         only in the capture (measured but not named): {only_capture:?}"
     );
 }
 
