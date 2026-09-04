@@ -4922,8 +4922,8 @@ mod tests {
             scope_name: String::new(),
             scope_version: String::new(),
         };
-        let p = plan_wide(r#"{ } | count() > 2"#);
-        let verdict = |rows: Vec<super::super::rows::HydrationRow>| {
+        let verdict = |q: &str, rows: Vec<super::super::rows::HydrationRow>| {
+            let p = plan_wide(q);
             let mut budget = ByteBudget::new(usize::MAX);
             let mut charged = 0usize;
             let (traces, _) =
@@ -4932,13 +4932,21 @@ mod tests {
             assert_eq!(traces[0].spans.len(), 3, "the replay is deduped upstream");
             !eval(&p, &traces, &membership(&p, &[])).is_empty()
         };
+        let clean = || vec![row(1), row(2), row(3)];
+        let replayed = || vec![row(1), row(1), row(2), row(3)];
+        // The threshold sits ON the boundary in both directions, so a
+        // count that is one too high or one too low flips a verdict: with
+        // three distinct spans `> 2` must match and `> 3` must not, and a
+        // replayed row must change neither.
+        assert!(verdict(r#"{ } | count() > 2"#, clean()));
         assert!(
-            verdict(vec![row(1), row(2), row(3)]),
-            "three distinct spans pass count() > 2"
-        );
-        assert!(
-            verdict(vec![row(1), row(1), row(2), row(3)]),
+            verdict(r#"{ } | count() > 2"#, replayed()),
             "the same three spans with one row replayed give the SAME verdict"
+        );
+        assert!(!verdict(r#"{ } | count() > 3"#, clean()));
+        assert!(
+            !verdict(r#"{ } | count() > 3"#, replayed()),
+            "a replayed row must not inflate the count past the threshold"
         );
     }
 
