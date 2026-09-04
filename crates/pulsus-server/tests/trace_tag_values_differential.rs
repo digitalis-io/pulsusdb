@@ -509,7 +509,11 @@ fn replay_478_sections(fx: &Value, api: &str, otlp: &str) {
         // The zero-width window case carries its own params: it is
         // issued at the CORPUS instant, the same instant our leg uses,
         // so both legs replay the fixture's `params` literally. See
-        // `corpus::zero_width_probe_secs`.
+        // `corpus::zero_width_probe_secs`. NOT at `now`: measured
+        // against a fresh reference instance, a zero-width window there
+        // answers the WHOLE list rather than `[]`, which would turn this
+        // case's recorded divergence into two sides agreeing on
+        // everything without any assertion changing.
         let mut url = if case.get("params").is_some() {
             let at = corpus::zero_width_probe_secs(base);
             format!("{}{route}?start={at}&end={at}", api.trim_end_matches('/'))

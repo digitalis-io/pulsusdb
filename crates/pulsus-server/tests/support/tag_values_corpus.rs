@@ -292,6 +292,17 @@ pub fn base_ns_from(now_ns: u64) -> u64 {
 /// 01:01:01. Both answers obey the day-granular rule; only the input
 /// moved. Anchoring the probe on the corpus instant makes the day it
 /// resolves to the corpus's day at every wall clock.
+///
+/// **Do not move it to `now`, which is the obvious other fix and is
+/// worse than the defect.** Measured against a fresh reference instance:
+/// a zero-width window at the corpus instant, and at one second either
+/// side of it, answers `[]` for a span stamped mid-second and for one
+/// stamped exactly on a second — but the SAME zero-width window placed
+/// at `now` answers the whole list. The case exists to record that the
+/// reference answers nothing here where we answer the day's values, so a
+/// probe at `now` makes both sides return everything, both legs pass,
+/// and the divergence they are pinning stops being tested at all —
+/// silently, because a green run looks the same either way.
 pub fn zero_width_probe_secs(base_ns: u64) -> i64 {
     i64::try_from(base_ns / 1_000_000_000).expect("corpus second fits i64")
 }

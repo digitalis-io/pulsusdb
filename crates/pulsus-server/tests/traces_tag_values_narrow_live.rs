@@ -445,7 +445,11 @@ async fn our_answers_match_the_committed_fixture() {
             // The zero-width window case, issued at the CORPUS instant
             // rather than at `start` — see
             // `corpus::zero_width_probe_secs`, and the hermetic sweep
-            // `the_zero_width_probe_lands_on_the_corpus_day` below.
+            // `the_clock_derived_windows_land_on_the_intended_days`
+            // below. NOT at `now`: measured, the reference answers the
+            // whole list for a zero-width window there, so both sides
+            // would return everything and this case would stop testing
+            // the divergence it exists for.
             let at = corpus::zero_width_probe_secs(base);
             format!("{route}?start={at}&end={at}")
         } else {
