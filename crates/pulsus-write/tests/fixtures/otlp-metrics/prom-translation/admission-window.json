@@ -1,0 +1,315 @@
+{
+  "_note": [
+    "The reference's admission answers on BOTH receive paths, captured once and committed.",
+    "This file is the expectation the ledger row's `Reference route` cell is compared against",
+    "(otlp_prom_translation::the_admission_row_names_every_route_the_reference_was_measured_on),",
+    "so the row cannot name a route the reference was never asked on and cannot omit one it was.",
+    "",
+    "WHAT IT CANNOT DO. It fixes what the reference did on one date at one image digest. No CI",
+    "job re-captures it, so a later reference release that moves the boundary will not be noticed",
+    "here. Editing a value below to match a shortened ledger row without re-running the procedure",
+    "defeats the gate; the `revision` and `captured` fields are what a reviewer checks that",
+    "against.",
+    "",
+    "TWO ANCHORS. `boundary` and `body_lines` were taken with the head at the wall clock, where",
+    "the past bound (head.maxTime - 60 min) and the future bound (wall clock + 10 min) coincide.",
+    "`future_anchor` is the measurement that separates them: the head was warmed AHEAD of the",
+    "clock and the future cutoff did not follow it."
+  ],
+  "procedure": [
+    "podman run -d --name <unique> -p <port>:9090 docker.io/prom/prometheus@sha256:0e698e35e50d1ddc2d11a4a55b089fe62eb71358a5c204dfafd21bdf8ffe04b8",
+    "  --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus",
+    "  --web.enable-remote-write-receiver --web.enable-otlp-receiver",
+    "The stock config self-scrapes, which is what anchors the head at the wall clock.",
+    "Read the clock once per table with GET /api/v1/query?query=vector(time()) and the head's",
+    "maximum with GET /api/v1/status/tsdb (data.headStats.maxTime).",
+    "remote write: POST /api/v1/write, Content-Type application/x-protobuf,",
+    "  Content-Encoding snappy, X-Prometheus-Remote-Write-Version 0.1.0, body a v1",
+    "  prompb.WriteRequest with one series and one sample per rejected series.",
+    "OTLP: POST /api/v1/otlp/v1/metrics, Content-Type application/json, body an",
+    "  ExportMetricsServiceRequest with one gauge data point per emitted series and a",
+    "  per-run service.name (target_info is resource-level and a repeat run collides).",
+    "Offsets are measured from the clock read; `boundary` rejections do not move the head, so",
+    "the negative offsets are taken before the positive ones."
+  ],
+  "routes": [
+    {
+      "route": "`POST /api/v1/write`",
+      "image": "docker.io/prom/prometheus@sha256:0e698e35e50d1ddc2d11a4a55b089fe62eb71358a5c204dfafd21bdf8ffe04b8",
+      "version": "3.13.0",
+      "revision": "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+      "captured": "2026-09-04",
+      "success_status": 204,
+      "boundary": [
+        {
+          "offset_minutes": -90,
+          "status": 400,
+          "content_type": "text/plain; charset=utf-8",
+          "body": "out of bounds\n"
+        },
+        {
+          "offset_minutes": -65,
+          "status": 400,
+          "content_type": "text/plain; charset=utf-8",
+          "body": "out of bounds\n"
+        },
+        {
+          "offset_minutes": -61,
+          "status": 400,
+          "content_type": "text/plain; charset=utf-8",
+          "body": "out of bounds\n"
+        },
+        {
+          "offset_minutes": -60,
+          "status": 204,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": -59,
+          "status": 204,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": -55,
+          "status": 204,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": -30,
+          "status": 204,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": 10,
+          "status": 204,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": 15,
+          "status": 400,
+          "content_type": "text/plain; charset=utf-8",
+          "body": "out of bounds: timestamp is too far in the future\n"
+        }
+      ],
+      "body_lines": [
+        {
+          "rejected_series": 1,
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n"
+        },
+        {
+          "rejected_series": 2,
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n"
+        },
+        {
+          "rejected_series": 3,
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n"
+        },
+        {
+          "rejected_series": 4,
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n"
+        }
+      ],
+      "mixed_request": [
+        {
+          "order": "old-first",
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n",
+          "sibling_stored": false
+        },
+        {
+          "order": "new-first",
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n",
+          "sibling_stored": false
+        }
+      ],
+      "future_anchor": {
+        "clock_read_unix_ms": 1788510476997,
+        "head_max_unix_ms": 1788510596997,
+        "probes": [
+          {
+            "probe": "head + 10 min",
+            "anchor": "head max",
+            "status": 400,
+            "body": "out of bounds: timestamp is too far in the future\n"
+          },
+          {
+            "probe": "now + 8 min",
+            "anchor": "wall clock",
+            "status": 204,
+            "body": ""
+          },
+          {
+            "probe": "now + 9 min",
+            "anchor": "wall clock",
+            "status": 204,
+            "body": ""
+          },
+          {
+            "probe": "now + 10 min",
+            "anchor": "wall clock",
+            "status": 204,
+            "body": ""
+          },
+          {
+            "probe": "now + 10 min 30 s",
+            "anchor": "wall clock",
+            "status": 400,
+            "body": "out of bounds: timestamp is too far in the future\n"
+          },
+          {
+            "probe": "now + 11 min",
+            "anchor": "wall clock",
+            "status": 400,
+            "body": "out of bounds: timestamp is too far in the future\n"
+          }
+        ]
+      }
+    },
+    {
+      "route": "`POST /api/v1/otlp/v1/metrics`",
+      "image": "docker.io/prom/prometheus@sha256:0e698e35e50d1ddc2d11a4a55b089fe62eb71358a5c204dfafd21bdf8ffe04b8",
+      "version": "3.13.0",
+      "revision": "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+      "captured": "2026-09-04",
+      "success_status": 200,
+      "boundary": [
+        {
+          "offset_minutes": -90,
+          "status": 400,
+          "content_type": "text/plain; charset=utf-8",
+          "body": "out of bounds\n"
+        },
+        {
+          "offset_minutes": -65,
+          "status": 400,
+          "content_type": "text/plain; charset=utf-8",
+          "body": "out of bounds\n"
+        },
+        {
+          "offset_minutes": -61,
+          "status": 400,
+          "content_type": "text/plain; charset=utf-8",
+          "body": "out of bounds\n"
+        },
+        {
+          "offset_minutes": -60,
+          "status": 200,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": -59,
+          "status": 200,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": -55,
+          "status": 200,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": -30,
+          "status": 200,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": 10,
+          "status": 200,
+          "content_type": null,
+          "body": ""
+        },
+        {
+          "offset_minutes": 15,
+          "status": 400,
+          "content_type": "text/plain; charset=utf-8",
+          "body": "out of bounds: timestamp is too far in the future\n"
+        }
+      ],
+      "body_lines": [
+        {
+          "rejected_series": 1,
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n"
+        },
+        {
+          "rejected_series": 2,
+          "status": 400,
+          "lines": 2,
+          "body": "out of bounds\nout of bounds\n"
+        },
+        {
+          "rejected_series": 3,
+          "status": 400,
+          "lines": 3,
+          "body": "out of bounds\nout of bounds\nout of bounds\n"
+        },
+        {
+          "rejected_series": 4,
+          "status": 400,
+          "lines": 4,
+          "body": "out of bounds\nout of bounds\nout of bounds\nout of bounds\n"
+        }
+      ],
+      "mixed_request": [
+        {
+          "order": "old-first",
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n",
+          "sibling_stored": false
+        },
+        {
+          "order": "new-first",
+          "status": 400,
+          "lines": 1,
+          "body": "out of bounds\n",
+          "sibling_stored": false
+        }
+      ],
+      "future_anchor": {
+        "clock_read_unix_ms": 1788510495388,
+        "head_max_unix_ms": 1788511077346,
+        "probes": [
+          {
+            "probe": "head + 10 min",
+            "anchor": "head max",
+            "status": 400,
+            "body": "out of bounds: timestamp is too far in the future\n"
+          },
+          {
+            "probe": "now + 10 min",
+            "anchor": "wall clock",
+            "status": 200,
+            "body": ""
+          },
+          {
+            "probe": "now + 10 min 30 s",
+            "anchor": "wall clock",
+            "status": 400,
+            "body": "out of bounds: timestamp is too far in the future\n"
+          }
+        ]
+      }
+    }
+  ]
+}
