@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1080" viewBox="0 0 1200 1080" role="img" aria-labelledby="title desc">
+  <title id="title">Lowering as a per-link disposition over the whole chain, shown on four pipelines</title>
+  <desc id="desc">Lowering folds left over a chain whose links are the query's own stages plus three synthesised ones: Order, Limit and Emit. Every link is asked whether it can lower given the relation accumulated so far. A link that can lower does; a link that cannot becomes residual, still applies its effect on the accumulated state, and the fold continues to the next link. The lowered links need not form a prefix. A residual link is not always work done in our own process: the response builder is residual in every chain and is nevertheless served by a second SQL statement, which the legend's third entry marks and which the design calls a cut. Pipeline A lowers everything except the response builder. In pipeline B a count stage becomes residual because it cannot accept grouped rows, and the select stage after it still lowers. In pipeline C a filter lowers only partially, which clears the exactness flag and makes the aggregate, the ordering, the limit and the response builder residual. Pipeline C has no select stage: a select needs no exactness, as pipeline B shows. Pipeline D is a LogQL chain of three line filters whose middle filter cannot be lowered, followed by the same three synthesised links every chain carries. The shipped implementation skips the middle filter and pushes the other two; an earlier version of this design stopped at it and cost twenty-point-six times more metered bytes, and the corrected model matches the shipped behaviour. In D the ordering link lowers because a LogQL sort key is the row's own timestamp rather than an aggregate over the matched set, while the limit link is residual because the refused filter cleared exactness, and the response builder is residual as it is in every chain — though on the LogQL routes, unlike the three TraceQL pipelines, it opens no second statement. The oracle the enumeration table compares against is a transcription of the shipped filter compiler, not the shipped function itself.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #0f172a; stroke-width: 1.6; }
+      .low { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.8; }
+      .res { fill: #fffbeb; stroke: #d97706; stroke-width: 1.8; stroke-dasharray: 6 4; }
+      .res2 { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.8; stroke-dasharray: 6 4; }
+      .bad { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.8; }
+      .title { font: 700 17px Arial, sans-serif; fill: #0f172a; }
+      .sub { font: 600 13px Arial, sans-serif; fill: #0f172a; }
+      .label { font: 600 13px Arial, sans-serif; fill: #0f172a; }
+      .small { font: 12px Arial, sans-serif; fill: #334155; }
+      .tiny { font: 10.5px Arial, sans-serif; fill: #475569; }
+      .mono { font: 11px "DejaVu Sans Mono", monospace; fill: #0f172a; }
+      .flow { stroke: #64748b; stroke-width: 1.6; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1200" height="1080"/>
+
+  <text class="title" x="32" y="30">Every link is asked. A link lowers, or becomes residual and the fold continues.</text>
+  <text class="small" x="32" y="52">The lowered links need not be a prefix. Blocking is emergent from accumulated state — column provenance, shape, `exact` — never from position.</text>
+  <rect class="low" x="32" y="64" width="150" height="26" rx="5"/><text class="tiny" x="46" y="81">LOWERED — emits SQL</text>
+  <rect class="res" x="196" y="64" width="335" height="26" rx="5"/><text class="tiny" x="210" y="81">RESIDUAL — no SQL here, but still applies its state effect</text>
+  <rect class="res2" x="545" y="64" width="280" height="26" rx="5"/><text class="tiny" x="559" y="81">RESIDUAL, and served by its OWN SQL part — a cut</text>
+
+  <!-- A -->
+  <text class="sub" x="32" y="126">A.  { .service.namespace="prod" } | max(duration) &gt; 1s | select(span.http.method)</text>
+  <rect class="low" x="32" y="138" width="140" height="46" rx="5"/><text class="label" x="44" y="158">0 Source</text><text class="tiny" x="44" y="176">Spans exact=T</text>
+  <rect class="low" x="186" y="138" width="140" height="46" rx="5"/><text class="label" x="198" y="158">1 Aggregate</text><text class="tiny" x="198" y="176">Spans→Traces</text>
+  <rect class="low" x="340" y="138" width="140" height="46" rx="5"/><text class="label" x="352" y="158">2 Select</text><text class="tiny" x="352" y="176">cols wider</text>
+  <rect class="low" x="494" y="138" width="120" height="46" rx="5"/><text class="label" x="506" y="158">3 Order</text><text class="tiny" x="506" y="176">needs exact</text>
+  <rect class="low" x="628" y="138" width="120" height="46" rx="5"/><text class="label" x="640" y="158">4 Limit(20)</text><text class="tiny" x="640" y="176">needs order</text>
+  <rect class="res2" x="762" y="138" width="180" height="46" rx="5"/><text class="label" x="774" y="158">5 Emit</text><text class="tiny" x="774" y="176">cut: SourceHandoff</text>
+  <text class="small" x="956" y="156">5 lowered, 1 residual</text>
+  <text class="tiny" x="956" y="174">part 0: one statement, no wrap</text>
+  <text class="tiny" x="956" y="190">the plan has 2 SQL parts</text>
+  <text class="tiny" x="32" y="200">part 0 yields Reduced — 20 (trace_id, sort_key) rows = 4,616 B, seeding part 1: the winners' root read, 20 literal ids, 100 granules. Link 5 is residual AND is part 1 — the evaluator does not run it.</text>
+
+  <!-- B -->
+  <text class="sub" x="32" y="244">B.  { .service.namespace="prod" } | by(name) | count() &gt; 2 | select(.tier)   — a residual link with a LOWERED link after it</text>
+  <rect class="low" x="32" y="256" width="140" height="46" rx="5"/><text class="label" x="44" y="276">0 Source</text><text class="tiny" x="44" y="294">Spans exact=T</text>
+  <rect class="low" x="186" y="256" width="140" height="46" rx="5"/><text class="label" x="198" y="276">1 By(name)</text><text class="tiny" x="198" y="294">Spans→Groups</text>
+  <rect class="res" x="340" y="256" width="160" height="46" rx="5"/><text class="label" x="352" y="276">2 Count(&gt; 2)</text><text class="tiny" x="352" y="294">accepts Spans, has Groups</text>
+  <rect class="low" x="514" y="256" width="150" height="46" rx="5"/><text class="label" x="526" y="276">3 Select(.tier)</text><text class="tiny" x="526" y="294">LOWERS — asked, resolves</text>
+  <rect class="res" x="678" y="256" width="264" height="46" rx="5"/><text class="label" x="690" y="276">4 Order · 5 Limit · 6 Emit</text><text class="tiny" x="690" y="294">exact cleared by link 2; Emit cuts</text>
+  <text class="small" x="956" y="274">3 lowered, 4 residual</text>
+  <text class="tiny" x="32" y="318">Link 2's residual effect clears `exact`; that is what makes 4 and 5 residual, not their position. Link 3 needs no exactness, so it lowers — projecting a</text>
+  <text class="tiny" x="32" y="334">column onto rows the evaluator will later drop is harmless. A prefix model would have stopped at link 2 and lost link 3's projection for nothing.</text>
+
+  <!-- C -->
+  <text class="sub" x="32" y="378">C.  { .service.namespace="prod" &amp;&amp; trace:duration &gt; 5s } | max(duration) &gt; 1s   — the split falls INSIDE the filter</text>
+  <rect class="panel" x="32" y="390" width="470" height="104" rx="5"/>
+  <text class="mono" x="44" y="412">        AND                  sql   = (key=… AND val='prod' AND scope='resource') AND 1</text>
+  <text class="mono" x="44" y="428">       /   \                 exact = true &amp;&amp; false = FALSE</text>
+  <text class="mono" x="44" y="444">  .ns="prod"  trace:duration&gt;5s</text>
+  <text class="mono" x="44" y="460">  lowerable   Never (trace-wide co-load)</text>
+  <text class="mono" x="44" y="476">  key/val pred        "1"</text>
+  <text class="small" x="520" y="414">Dropping a conjunct keeps orig ⇒ sql.</text>
+  <text class="small" x="520" y="434">Dropping a disjunct would not: it gives a subset.</text>
+  <text class="small" x="520" y="454">Negating an over-approximation is unsound, so</text>
+  <text class="small" x="520" y="474">NOT refuses unless its operand was exact.</text>
+  <rect class="low" x="32" y="506" width="180" height="44" rx="5"/><text class="label" x="44" y="526">0 Source — PARTIAL</text><text class="tiny" x="44" y="542">Spans exact=FALSE</text>
+  <rect class="res" x="226" y="506" width="180" height="44" rx="5"/><text class="label" x="238" y="526">1 Aggregate</text><text class="tiny" x="238" y="542">max() over a superset</text>
+  <rect class="res" x="420" y="506" width="250" height="44" rx="5"/><text class="label" x="432" y="526">2 Order · 3 Limit · 4 Emit</text><text class="tiny" x="432" y="542">all residual; Emit cuts</text>
+  <text class="small" x="690" y="524">1 lowered, 4 residual</text>
+  <text class="tiny" x="32" y="566">The filter still lowered as far as it could — free, and it strictly reduces rows crossing the metered hop. Measured on corpus C1, lowering the aggregate</text>
+  <text class="tiny" x="32" y="582">over a superset instead would turn 333 qualifying traces into 1,000. Falls back to today's behaviour exactly. Order needs exact and Limit needs an ordering,</text>
+  <text class="tiny" x="32" y="598">so both refuse; Emit is Never in every chain. C carries no select() — a select has no exactness precondition, which is panel B's case, not this one.</text>
+  <text class="tiny" x="32" y="614">In B and C, as in A, Emit is residual AND is its own SQL part: Never says it cannot join THIS statement, not that no statement serves it.</text>
+
+  <!-- D -->
+  <text class="sub" x="32" y="628">D.  LogQL: {service_name="checkout"} |= "CONN_REFUSED" |= ip("10.0.0.1") |= "pod-044"   — why the stopping rule had to change</text>
+  <rect class="low" x="32" y="642" width="150" height="46" rx="5"/><text class="label" x="44" y="662">0 Source</text><text class="tiny" x="44" y="680">body = Stored</text>
+  <rect class="low" x="196" y="642" width="180" height="46" rx="5"/><text class="label" x="208" y="662">1 |= "CONN_REFUSED"</text><text class="tiny" x="208" y="680">literal, pushable</text>
+  <rect class="res" x="390" y="642" width="180" height="46" rx="5"/><text class="label" x="402" y="662">2 |= ip("10.0.0.1")</text><text class="tiny" x="402" y="680">no indexable predicate</text>
+  <rect class="low" x="584" y="642" width="180" height="46" rx="5"/><text class="label" x="596" y="662">3 |= "pod-044"</text><text class="tiny" x="596" y="680">LOWERS — body still Stored</text>
+  <rect class="low" x="778" y="642" width="120" height="46" rx="5"/><text class="label" x="790" y="662">4 Order</text><text class="tiny" x="790" y="680">row timestamp</text>
+  <rect class="res" x="912" y="642" width="130" height="46" rx="5"/><text class="label" x="924" y="662">5 Limit</text><text class="tiny" x="924" y="680">needs exact</text>
+  <rect class="res" x="1056" y="642" width="112" height="46" rx="5"/><text class="label" x="1068" y="662">6 Emit</text><text class="tiny" x="1068" y="680">residual, no cut</text>
+  <text class="tiny" x="32" y="704">4 lowered, 3 residual. D is drawn to the end of its chain, like A, B and C: every chain carries Order, Limit and Emit (query-lowering.md 7.1). Order LOWERS — LogQL's</text>
+  <text class="tiny" x="32" y="720">sort key is the row's own timestamp, so a superset does not reorder it, unlike TraceQL's max(matched-span timestamp). Limit is RESIDUAL: link 2 cleared `exact`, and a LIMIT</text>
+  <text class="tiny" x="32" y="736">over a superset would lose rows the residual filter would have kept — which is the oversample path that ships today. Emit is residual in every chain — but on the LogQL</text>
+  <text class="tiny" x="32" y="752">routes it opens no second statement, unlike A, B and C: the response is built from rows the last SQL part already returned.</text>
+
+  <rect class="panel" x="32" y="752" width="1136" height="118" rx="6"/>
+  <text class="sub" x="48" y="774">Measured on #507's corpus. The two literal filters together match 400 of 2,000,000 rows in the key range; the first alone matches 40,000.</text>
+  <text class="mono" x="48" y="800">                                        round trips   rows to server   metered bytes    rows read</text>
+  <text class="mono" x="48" y="818">  what ships today                                1              400         169,707      204,800</text>
+  <text class="mono" x="48" y="836">  this design's FIRST fold, stopping at link 2   10           10,000       3,501,588   24,133,632</text>
+  <text class="label" x="48" y="860">20.6x more metered bytes, 10x the round trips, 118x the rows read — a regression from an architecture whose purpose is to move fewer bytes.</text>
+
+  <rect class="panel" x="32" y="884" width="1136" height="158" rx="6"/>
+  <text class="sub" x="48" y="906">The enumeration that settled it: every chain of length 3 over 15 concrete LogQL atoms, parsed with our real parser, compared against a</text>
+  <text class="sub" x="48" y="924">TRANSCRIPTION of compile_line_filters as an oracle — not the shipped function, and not emitted SQL. An equality on the ORDERED</text>
+  <text class="sub" x="48" y="942">pushed-predicate list, not a count and not a containment. query-lowering.md 11.2 nominates the gates that replace it — wave 1, none at base.</text>
+  <text class="mono" x="48" y="968">  model                                                                        chains   oracle pushes &gt;= 1   MISMATCHES</text>
+  <text class="mono" x="48" y="986">  return at the first refusal (this document's first version)                   3,375               1,827          715</text>
+  <text class="mono" x="48" y="1004">  skip only a non-lowerable line filter, else return                           3,375               1,827          463</text>
+  <text class="mono" x="48" y="1022">  every non-lowering link becomes residual, applies its effect, fold continues  3,375               1,827            0</text>
+</svg>

@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="620" viewBox="0 0 1120 620" role="img" aria-labelledby="title desc">
+  <title id="title">Bytes per hop for one TraceQL search, evaluated after transport against lowered into SQL</title>
+  <desc id="desc">The query { .service.namespace = "prod" } | max(duration) &gt; 1s with limit 20 over a five-day window. Evaluated today it costs 1,110 sequential round trips between pulsus-server and ClickHouse, moving 76,616,608 result bytes of which 11,340 bytes reach the client. Lowered it costs 2 round trips moving 43,636 result bytes in total: one lowered statement of 4,616 bytes, plus the winners' root read of 39,020 bytes, which stays residual in every chain because the root summary is read trace-wide with no time predicate — residual meaning it cannot join the first statement, not that our own process performs it: it is the plan's second SQL part. The client hop is unchanged. The pulsus-server to ClickHouse hop and the client hop are metered in a multi-zone deployment; the parts-to-ClickHouse hop is local disk and is not. Database peak memory rises from 169,311,055 to 190,353,655 bytes.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #0f172a; stroke-width: 2; }
+      .node { fill: #ffffff; stroke: #64748b; stroke-width: 1.6; }
+      .store { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; }
+      .today { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.5; }
+      .after { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.5; }
+      .title { font: 700 18px Arial, sans-serif; fill: #0f172a; }
+      .label { font: 600 14px Arial, sans-serif; fill: #0f172a; }
+      .small { font: 12px Arial, sans-serif; fill: #334155; }
+      .tiny { font: 11px Arial, sans-serif; fill: #475569; }
+      .mono { font: 12px "DejaVu Sans Mono", monospace; fill: #0f172a; }
+      .metered { font: 700 11px Arial, sans-serif; fill: #b45309; }
+      .arrow { stroke: #334155; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .fat { stroke: #dc2626; stroke-width: 5; fill: none; marker-end: url(#arrow); }
+      .thin { stroke: #16a34a; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .local { stroke: #0891b2; stroke-width: 1.8; fill: none; marker-end: url(#arrow); stroke-dasharray: 6 5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1120" height="620"/>
+
+  <text class="title" x="40" y="36">{ .service.namespace = "prod" } | max(duration) &gt; 1s</text>
+  <text class="small" x="40" y="58">limit=20, 5-day window, 10,000,000-span corpus C1. Counters from one system.query_log row per query.</text>
+
+  <!-- TODAY -->
+  <rect class="today" x="32" y="78" width="1056" height="212" rx="8"/>
+  <text class="label" x="52" y="104">Evaluated after transport (today) — 1,110 sequential round trips</text>
+
+  <rect class="node" x="60" y="122" width="150" height="60" rx="6"/>
+  <text class="label" x="90" y="150">client</text>
+  <text class="tiny" x="74" y="170">no client assumed</text>
+
+  <rect class="node" x="330" y="122" width="180" height="60" rx="6"/>
+  <text class="label" x="368" y="150">pulsus-server</text>
+  <text class="tiny" x="366" y="170">evaluator</text>
+
+  <rect class="node" x="640" y="122" width="180" height="60" rx="6"/>
+  <text class="label" x="690" y="150">ClickHouse</text>
+  <text class="tiny" x="662" y="170">peak mem 169,311,055 B</text>
+
+  <rect class="store" x="940" y="122" width="120" height="60" rx="6"/>
+  <text class="label" x="982" y="157">parts</text>
+
+  <path class="arrow" d="M 330 152 L 214 152"/>
+  <text class="mono" x="224" y="144">11,340 B</text>
+  <text class="metered" x="224" y="196">METERED</text>
+
+  <path class="fat" d="M 640 152 L 516 152"/>
+  <text class="mono" x="524" y="144">76,616,608 B</text>
+  <text class="tiny" x="524" y="196">1,110 round trips</text>
+  <text class="metered" x="524" y="212">METERED</text>
+
+  <path class="local" d="M 940 152 L 826 152"/>
+  <text class="mono" x="828" y="144">14.09 GiB †</text>
+  <text class="tiny" x="828" y="196">5,705,629,767 rows</text>
+  <text class="tiny" x="828" y="212">696,630 granules</text>
+
+  <text class="small" x="60" y="238">1 candidate generator  +  554 x (hydration + membership)  +  1 winners' root read</text>
+  <text class="tiny" x="60" y="258">The membership read selects exactly 1,105 granules and reads exactly 9,052,160 rows on 553 of the 554 batches. The phase total is exactly 554 x that unit, which is consistent with all 554 but is not independent evidence (query-lowering.md 9.2).</text>
+  <text class="tiny" x="60" y="276">pulsus-server resident memory does not grow while it holds the matched set (383 MiB, unchanged from idle — measured on corpus C2).</text>
+
+  <!-- AFTER -->
+  <rect class="after" x="32" y="308" width="1056" height="196" rx="8"/>
+  <text class="label" x="52" y="334">Lowered into SQL — 2 round trips: a plan of 2 SQL parts, the second seeded by the first's 20 trace ids (Emit is Never)</text>
+
+  <rect class="node" x="60" y="352" width="150" height="60" rx="6"/>
+  <text class="label" x="90" y="380">client</text>
+  <text class="tiny" x="74" y="400">unchanged</text>
+
+  <rect class="node" x="330" y="352" width="180" height="60" rx="6"/>
+  <text class="label" x="368" y="380">pulsus-server</text>
+  <text class="tiny" x="366" y="400">renders the answer</text>
+
+  <rect class="node" x="640" y="352" width="180" height="60" rx="6"/>
+  <text class="label" x="690" y="380">ClickHouse</text>
+  <text class="tiny" x="662" y="400">peak mem 190,353,655 B</text>
+
+  <rect class="store" x="940" y="352" width="120" height="60" rx="6"/>
+  <text class="label" x="982" y="387">parts</text>
+
+  <path class="arrow" d="M 330 382 L 214 382"/>
+  <text class="mono" x="224" y="374">11,340 B</text>
+  <text class="metered" x="224" y="426">METERED</text>
+
+  <path class="thin" d="M 640 382 L 516 382"/>
+  <text class="mono" x="524" y="374">43,636 B</text>
+  <text class="tiny" x="524" y="426">2 round trips</text>
+  <text class="tiny" x="524" y="442">4,616 B lowered + 39,020 B root read</text>
+  <text class="metered" x="524" y="458">METERED</text>
+
+  <path class="local" d="M 940 382 L 826 382"/>
+  <text class="mono" x="828" y="374">103,882,082 B † + 4.01 MiB †</text>
+  <text class="tiny" x="828" y="426">9,871,360 rows</text>
+  <text class="tiny" x="828" y="442">1,205 granules</text>
+
+  <text class="small" x="60" y="474">2 SQL parts.  The root summary is trace-wide and unwindowed, and TraceSearchResult.root is not optional, so Emit is Never and the root read never goes away — Never means it cannot join part 0, not that no statement serves it.</text>
+  <text class="tiny" x="60" y="490">† moves with part layout (Compact against Wide). Granules, rows, result bytes and peak memory do not — measured, see the document.</text>
+
+  <!-- RATIOS -->
+  <rect class="panel" x="32" y="520" width="1056" height="70" rx="8"/>
+  <text class="label" x="52" y="546">Metered hop 1,756x fewer bytes  ·  555x fewer round trips  ·  578x fewer rows read  —  both sides counted whole request, root read included</text>
+  <text class="small" x="52" y="572">Database peak memory HIGHER — 169,311,055 B against 190,353,655 B, a ratio of 1.12x computed from those two figures — and spending database memory to move fewer bytes is the direction the cost model in query-lowering.md 9.1 takes.</text>
+</svg>
