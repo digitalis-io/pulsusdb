@@ -949,9 +949,16 @@ mod tests {
     /// than a second list.
     ///
     /// *RED when:* a shared SQL builder's projection changes and this
-    /// consumer is not moved with it — measured, `Decoder::TypedStrValue`
-    /// swapped back to `Decoder::Membership` fails on
-    /// `phase2_membership`.
+    /// consumer is not moved with it. Measured, three ways:
+    ///
+    /// * the exact CI defect, a `StrValueRow` decoder reintroduced on the
+    ///   fused arm — `left ["trace_id", "span_id", "v", "t"]` against
+    ///   `right ["trace_id", "span_id", "v"]`, the same two lists the
+    ///   server's decode error named;
+    /// * `phase2_hydration` given the root row's decoder — 12 columns
+    ///   against 7;
+    /// * the two arms of the membership dispatch swapped — 4 against 2,
+    ///   so the check is not specific to one direction.
     #[test]
     fn the_evidence_stages_project_exactly_what_they_decode() {
         let base = 1_700_000_000_000_000_000i64;
