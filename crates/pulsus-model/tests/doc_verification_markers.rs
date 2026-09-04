@@ -167,16 +167,33 @@ const MARKERS: &[Marker] = &[
     },
     Marker {
         file: "docs/api.md",
-        // ISSUE #510 OWNS THIS SENTENCE and the fixture behind it. The
-        // artefact named here compares by() group-attribute rendering
-        // live against the reference, which is what `FromReference`
-        // records — provenance, not coverage. Its fixture list reaches
-        // four of the five per-type arms and not the numeric-attribute
-        // one; that gap is #510's subject and is precisely the kind of
-        // thing this registry cannot see (see the module doc). If #510's
-        // rewrite drops the marker words, this entry goes with them and
-        // the constant below is unchanged, because the entry is not one
-        // of the four.
+        // `FromReference` here rests on what the artefact does at THIS
+        // revision, not on any issue landing later. Measured at
+        // `8f3d0c6d`, the tree this entry was written against:
+        //
+        //   git cat-file -e 8f3d0c6d:crates/pulsus-read/tests/\
+        //       traces_search_grouping_differential.rs   -> present, 618 lines
+        //
+        // It pushes spans to the reference's own trace receiver
+        // (`otlp_push`, `:370`), reads the grouped spanSets back
+        // (`tempo_groups`, `:428`), and compares TYPE-TAGGED tokens on
+        // both sides — `group_value_typed` (`:356`) on ours and
+        // `tempo_attr_typed` (`:512`) on theirs, each carrying the wire
+        // type alongside the value, so an `intValue 2` never compares
+        // equal to a `doubleValue 2.0` or a `stringValue "2"`. That is
+        // the per-type rendering this sentence claims, expected from the
+        // reference rather than from our own tree, which is what
+        // `Evidence` records.
+        //
+        // What `Evidence` does NOT record is coverage. The fixture list
+        // reaches four of the five per-type arms and not the
+        // numeric-attribute one; that gap is issue #510's subject and is
+        // precisely the kind of thing this registry says it cannot see
+        // (module doc). It is also why this entry is not one of the four
+        // counted below.
+        //
+        // If #510's rewrite drops the marker words from that sentence,
+        // this entry goes with them and the constant below is unchanged.
         key: "**rendered by its TraceQL type** (verified live against Tempo v3.0.2)",
         subject: Subject::Reference,
         evidence: Evidence::FromReference(
