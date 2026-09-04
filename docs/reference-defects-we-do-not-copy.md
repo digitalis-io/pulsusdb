@@ -75,6 +75,7 @@ replaces one.
 | [20](#20-an-otlp-point-with-no-value-is-stored-as-zero) | Prometheus | ingest | C | A data point that carries no value is stored as `0`, which reads as a real measurement. |
 | [21](#21-a-histogram-is-stored-whose-buckets-cannot-add-up-to-its-own-count) | Prometheus | ingest | C | A histogram is stored with one bucket count silently thrown away and a total that contradicts the buckets. |
 | [22](#22-a-fault-that-can-never-be-fixed-by-retrying-is-answered-500) | Prometheus | ingest | B | An OTLP exporter retries a payload forever that can never be accepted. |
+| [23](#23-a-grouping-after-a-select-puts-every-span-into-one-group-called-nil) | Tempo | queries | A, D | A query grouping four named spans by their name answers one group called `nil`, in a response that prints each span's name beside it. |
 
 ---
 
@@ -1502,6 +1503,104 @@ Metrics ledger rows `otlp-name-reject-status-400`,
 docs/benchmarks/metrics-differential-ledger.md. Adjudication on issue
 #259, applied verbatim. Note that Loki has the same defect on one of its
 own push endpoints, from a different mechanism — entry 11 above.
+
+---
+
+## 23. A grouping after a `select()` puts every span into one group called nil
+
+**Tempo v3.0.2 · queries · tests A, D**
+
+### What the reference does
+
+A `| by(<key>)` stage puts each span into the group named by that key's
+value. Written after a `| select(...)`, it puts **every** span into one
+group whose key is the string `nil` — while the same response prints each
+span's real value for that very key.
+
+Measured 2026-09-04 against
+`grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`
+(the digest `.github/workflows/ci.yml` pins), started for that run with
+`ci/tempo/tempo-compare.yaml` unmodified, over a four-span trace whose
+spans are named `a`, `a`, `a`, `b`:
+
+```
+{ resource.service.name = "grp492" } | select(name) | by(name)
+  -> 200, ONE spanSet
+     attributes: [{"key":"by(name)","value":{"stringValue":"nil"}}]
+     matched: 4, spans: 01 name=a, 02 name=a, 03 name=a, 04 name=b
+
+{ resource.service.name = "grp492" } | by(name) | select(name)
+  -> 200, TWO spanSets
+     by(name)=a over spans 01,02,03   and   by(name)=b over span 04
+```
+
+The mechanism is an ordering one. A `select()` switches every LATER
+pipeline element to the second pass:
+
+```go
+// pkg/traceql/ast.go, v3.0.2
+198:func (p Pipeline) extractConditions(req *FetchSpansRequest) {
+199:	forceSecondPass := false
+201:	for _, element := range p.Elements {
+202:		if forceSecondPass {
+203:			extractToSecondPass(req, element)
+...
+211:		if _, ok := element.(SelectOperation); ok {
+212:			forceSecondPass = true
+```
+
+and the second-pass columns are read only **after** the pipeline has run
+— the fetch builds the first-pass iterator, wraps it in the bridge that
+calls the pipeline, and only then creates the iterator that reads the
+second-pass columns:
+
+```go
+// tempodb/encoding/vparquet4/block_traceql.go, v3.0.2
+1601:	iter, err := createAllIterator(ctx, nil, req.Conditions, req.AllConditions, ...)
+1606:	if req.SecondPass != nil {
+1607:		iter = newBridgeIterator(newRebatchIterator(iter), req.SecondPass)
+1609:		iter, err = createAllIterator(ctx, iter, req.SecondPassConditions, ...)
+```
+
+(`req.SecondPass` is the whole pipeline: `pkg/traceql/engine.go:98-129`.)
+So the grouping executes its key expression against a span whose key has
+not been read yet (`GroupOperation.evaluate`,
+`pkg/traceql/ast_execute.go:14-55`), every span answers nil, and they all
+land in the one group that nil maps to.
+
+### Why that is wrong rather than different
+
+The response contradicts itself: it says the group key is `nil` for four
+spans and prints `a`, `a`, `a`, `b` as those spans' values for that same
+key, in the same body (**A**). And no reading of "group these spans by
+their name" supports one group called nil when the spans have names
+(**D**) — the reference's own grouping code copies the resolved value
+into the group attribute, so the label it publishes is the value it
+grouped on, and that value is wrong rather than merely unavailable.
+
+Nothing about the query is ambiguous or unsupported: written in the other
+order the same instance answers correctly, from the same data, in the same
+request shape.
+
+### What PulsusDB does
+
+Answers by the key, whichever side of the `select()` it is written on:
+two spanSets, `by(name)=a` over spans 1–3 and `by(name)=b` over span 4 —
+the same answer as the query without the `select()`. Our projection is
+resolved from values already fetched for the matched spans, so no pipeline
+stage can be evaluated against an unread column. The rule is published in
+docs/api.md §4.2.
+
+### Evidence
+
+Ledger row `traceql-select-before-by-nil-group-key` in
+docs/benchmarks/traces-differential-ledger.md carries the capture, both
+orderings and our own measured answer. The ordered-fold semantics this
+entry contrasts with are pinned by
+`crates/pulsus-read/src/traces/search_eval.rs::tests::nested_by_stages_accumulate_attributes`
+and by the live two-system differential
+`crates/pulsus-read/tests/traces_search_grouping_differential.rs`
+(issue #492 item 2).
 
 ---
 
