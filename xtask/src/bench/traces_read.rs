@@ -1037,6 +1037,19 @@ mod tests {
     ///
     /// A projection that grows a new construct fails loudly and somebody
     /// looks. That is the point.
+    ///
+    /// **Why the names are read from SQL at all.** None of the five
+    /// builders holds its output names as a list: `hydration_sql`,
+    /// `root_sql` and `point_read_sql` write the projection inline in a
+    /// `format!`, `membership_sql` builds a projection String first and
+    /// interpolates it, and `generator_sql` opens with a
+    /// `String::from("SELECT trace_id, max(timestamp_ns) AS bound_ts\n")`.
+    /// In every case the names are interleaved with the expressions
+    /// inside a string. Giving the builders an `(expression, alias)` list
+    /// to render from — the same "two facts in two places" fix one level
+    /// up — would delete this reader entirely, and it means changing five
+    /// production read-path SQL builders and re-freezing the golden
+    /// corpus. Proposed as separate work, deliberately not done here.
     fn projection_names(sql: &str) -> Vec<String> {
         let head = sql
             .strip_prefix("SELECT DISTINCT ")
