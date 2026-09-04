@@ -13,6 +13,12 @@ thiserror.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+# Issue #502: `doc_verification_markers.rs` applies the marker pattern
+# itself rather than a hand-expanded list of its four spellings, so the
+# constant in that file is the single definition of what "a marker" means.
+# Already a workspace dependency (`pulsus-read`, `pulsus-promql`,
+# `pulsus-re2`); no new crate enters the lockfile.
+regex.workspace = true
 # Issue #320: the shared live-gate guard for the environment-gated
 # suites in this crate — with `PULSUS_TEST_CLICKHOUSE` absent they used to
 # exit 0, so a CI wiring regression was silent.
