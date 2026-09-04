@@ -3023,7 +3023,8 @@ async fn the_metrics_aliases_are_byte_identical_to_the_native_routes() {
 
             if *case == "fractional-step-400" {
                 assert_eq!(
-                    canonical_res.status, 400,
+                    canonical_res.status,
+                    400,
                     "{ctx}: the fractional-millisecond step is a 400 on both, body {:?}",
                     String::from_utf8_lossy(&canonical_res.body)
                 );

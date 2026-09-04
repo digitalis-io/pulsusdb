@@ -1624,7 +1624,11 @@ mod tests {
         // The retired wire field, in both spellings the document carried
         // before issue #502. `partial` survives as the engine's own flag
         // name, so a bare occurrence is not the thing being excluded.
-        for retired in ["`partial` flag", "response marked `partial`", "`partial = true`"] {
+        for retired in [
+            "`partial` flag",
+            "response marked `partial`",
+            "`partial = true`",
+        ] {
             assert_eq!(
                 schemas.matches(retired).count(),
                 0,

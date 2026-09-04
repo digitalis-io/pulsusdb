@@ -516,10 +516,7 @@ struct RecordingSink {
 }
 
 impl pulsus_write::MetricSink for RecordingSink {
-    fn admit(
-        &self,
-        batch: pulsus_write::ParsedMetrics,
-    ) -> Result<(), pulsus_write::Backpressure> {
+    fn admit(&self, batch: pulsus_write::ParsedMetrics) -> Result<(), pulsus_write::Backpressure> {
         self.admitted.lock().expect("sink lock").push(batch);
         Ok(())
     }

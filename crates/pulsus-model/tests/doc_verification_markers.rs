@@ -531,9 +531,7 @@ fn the_blind_spot_witnesses_are_outside_the_population() {
             w.file
         );
         assert!(
-            !MARKERS
-                .iter()
-                .any(|m| m.file == w.file && m.key == w.key),
+            !MARKERS.iter().any(|m| m.file == w.file && m.key == w.key),
             "{}: the witness is now a MARKERS entry — it is no longer outside the population",
             w.file
         );

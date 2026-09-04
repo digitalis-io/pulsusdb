@@ -2459,8 +2459,8 @@ const ADMISSION_WINDOW_JSON: &str = concat!(
 fn the_admission_row_names_every_route_the_reference_was_measured_on() {
     let raw = std::fs::read_to_string(ADMISSION_WINDOW_JSON)
         .unwrap_or_else(|e| panic!("read {ADMISSION_WINDOW_JSON}: {e}"));
-    let capture: AdmissionCapture = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("parse {ADMISSION_WINDOW_JSON}: {e}"));
+    let capture: AdmissionCapture =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {ADMISSION_WINDOW_JSON}: {e}"));
 
     // The capture's provenance is part of the expectation: a block whose
     // digest or revision does not match the one this repository pins is
@@ -2486,8 +2486,7 @@ fn the_admission_row_names_every_route_the_reference_was_measured_on() {
         );
     }
 
-    let capture_routes: BTreeSet<&str> =
-        capture.routes.iter().map(|r| r.route.as_str()).collect();
+    let capture_routes: BTreeSet<&str> = capture.routes.iter().map(|r| r.route.as_str()).collect();
     assert_eq!(
         capture_routes.len(),
         capture.routes.len(),
