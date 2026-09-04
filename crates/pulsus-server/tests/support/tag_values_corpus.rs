@@ -296,6 +296,23 @@ pub fn zero_width_probe_secs(base_ns: u64) -> i64 {
     i64::try_from(base_ns / 1_000_000_000).expect("corpus second fits i64")
 }
 
+/// The request window every other case is issued over: an hour before
+/// the corpus to ten minutes after it, in whole seconds. Its UTC day
+/// span must CONTAIN the corpus's day at every wall clock.
+pub fn window_secs(base_ns: u64) -> (i64, i64) {
+    let base_secs = zero_width_probe_secs(base_ns);
+    (base_secs - 3_600, base_secs + 600)
+}
+
+/// The empty half of the occupied-day / empty-day pair: an hour-wide
+/// window 25 to 26 h before the corpus. Its UTC day span must EXCLUDE
+/// the corpus's day at every wall clock — an empty answer over a window
+/// that happened to touch the corpus's day would assert nothing.
+pub fn empty_day_window_secs(base_ns: u64) -> (i64, i64) {
+    let (start, _) = window_secs(base_ns);
+    (start - 90_000, start - 86_400)
+}
+
 /// The UTC day a second-resolution instant falls in — days since the
 /// epoch, the unit `DaySpan` resolves a request window to.
 pub fn utc_day(secs: i64) -> i64 {

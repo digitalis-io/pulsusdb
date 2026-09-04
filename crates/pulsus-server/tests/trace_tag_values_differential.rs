@@ -494,8 +494,7 @@ fn the_committed_capture_matches_the_live_reference() {
 /// The sections issue #478 captured, replayed in capture order.
 fn replay_478_sections(fx: &Value, api: &str, otlp: &str) {
     let base = corpus::base_ns();
-    let start = base / 1_000_000_000 - 3_600;
-    let end = base / 1_000_000_000 + 600;
+    let (start, end) = corpus::window_secs(base);
     let window = format!("start={start}&end={end}");
 
     push(otlp, &corpus::c10_request(base), "C10 push");
@@ -694,8 +693,7 @@ fn replay_478_sections(fx: &Value, api: &str, otlp: &str) {
 fn replay_476_sections(fx: &Value, api: &str, otlp: &str) {
     let base = corpus::base_ns();
     push(otlp, &corpus::ac_476_request(base), "#476 corpus push");
-    let start = base / 1_000_000_000 - 3_600;
-    let end = base / 1_000_000_000 + 600;
+    let (start, end) = corpus::window_secs(base);
     wait_for_names(
         api,
         &format!("start={start}&end={end}"),
