@@ -602,8 +602,9 @@ produced them — `SqlPart::yields` (§2.7.1) — because a request is not one s
 had no way to say which statement a kind belonged to. The kinds themselves, and the rule that
 derives them from the final accumulated `shape` and `exact`, are unchanged.
 
-**And what crosses BETWEEN two parts is a `Seed`, which is materialised values, never a subquery
-(ADR 0008 D3), and always bounded.** The bound is not a nicety: an unbounded seed is what turns a
+**And what crosses between parts is a `Seed`, which is materialised values, never a subquery
+(ADR 0008 D3), and always bounded.** It crosses from one part in every case but one: a seed drawn
+from the MERGE of several source statements names all of them (§2.7.4). The bound is not a nicety: an unbounded seed is what turns a
 plan into a mechanism that ships rewritten rows back to the database, so a link whose
 `handoff_bound` (§2.2) answers `None` does not get a cut at all (§2.7.6, rule 2).
 
@@ -630,7 +631,7 @@ root read — was being described as work in our own engine. A type that cannot 
 system already does is wrong independently of any new requirement.
 
 So the compiler emits a plan: an ordered list of parts, each part either one SQL statement or work
-in our own engine, with the value set that crosses between two parts named, typed and bounded.
+in our own engine, with the value set that crosses between parts named, typed and bounded.
 
 ```rust
 // crates/pulsus-read/src/compile/plan.rs
@@ -661,15 +662,22 @@ pub enum Part<L: Lang + ?Sized> {
 pub struct SqlPart<L: Lang + ?Sized> {
     /// The clause-slot term this statement renders from (ADR 0008 D1).
     pub rel: Relation<L>,
-    /// What this statement consumes from the part before it. `None` only
-    /// for the first SQL part of the plan.
+    /// What this statement consumes from the part or parts before it.
+    /// `None` for a part that OPENS the plan — and a plan can open with
+    /// SEVERAL, one per source of a disjunction, none of which consumes
+    /// anything (issue #492 part 3, code review round 2).
     pub seed: Option<Seed<L>>,
     /// What it produces for the part after it — §2.6's three kinds.
     pub yields: BoundaryOutput<L>,
     /// How many times the statement is sent.
     pub issue: Issue,
     /// Why this is its own statement and not folded into the previous
-    /// one. `None` only for the first SQL part.
+    /// one. `None` only for the FIRST SQL part — and unlike `seed` above
+    /// that really is only the first, because the second and later
+    /// branches of a disjunction each carry `Cut::DisjointSources`.
+    /// Measured over the 56 committed search goldens: the set of parts
+    /// with no cut is `[0]` in all 56, while the set with no seed is
+    /// `[0]` in 48 and `[0, 1]` in 8.
     pub cut: Option<Cut>,
 }
 
@@ -702,7 +710,7 @@ pub enum Driver {
     /// statement, so it is sent in chunks. `chunk` is the SMALLER of
     /// what the two ceilings of §2.7.3 admit and what the language
     /// batches at.
-    Chunks { bound: u64, chunk: usize },
+    Chunks { bound: u64, chunk: u64 },
     /// The request's LIMIT could not enter the statement, so pages are
     /// drawn, each resuming from the previous page's last sort key,
     /// until the limit fills, the window is exhausted, or a byte budget
@@ -913,7 +921,13 @@ not theoretical.
 #### 2.7.5 `Cut::InexactLimit` — the request's `LIMIT` cannot enter the statement; and why compiling is greedy
 
 **Recognised by:** `request.limit.is_some() && rel.limit.is_none() && !rel.exact` after the fold.
-The part becomes `Issue::PerSeed(Driver::Keyset { .. })`.
+The last SQL part becomes `Issue::PerSeed(Driver::Keyset { .. })` — **unless its seed is already
+bounded by the request's own `LIMIT`**, in which case it sits DOWNSTREAM of the limit rather than
+being the loop that fills it, and no driver is attached (issue #492 part 3, D4). Every TraceQL
+search's last statement is that shape: the winners' root read, seeded by at most `limit` trace ids
+and issued once after the limit is satisfied. Measured over the 56 committed search goldens, no part
+carries `Issue::PerSeed(Driver::Keyset { .. })` and none carries `Cut::InexactLimit`; the shipped
+instance below is LogQL's, and it is the only one.
 
 **Shipped instance:** `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:80`,
 set at `:1625` from `has_unpushed_dropping_stage`, `:1655`), and when it is set the read is one

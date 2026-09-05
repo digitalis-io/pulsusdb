@@ -284,10 +284,12 @@ pub struct Seed<L: Lang + ?Sized> {
 pub struct SqlPart<L: Lang + ?Sized> {
     /// The clause-slot term this statement renders from (ADR 0008 D1).
     pub rel: Relation<L>,
-    /// What this statement consumes from the part before it. `None` only
-    /// for a part that opens the plan.
+    /// What this statement consumes from the part or parts before it.
+    /// `None` for a part that OPENS the plan — and a plan can open with
+    /// several, one per source of a disjunction, none of which consumes
+    /// anything.
     pub seed: Option<Seed<L>>,
-    /// What it produces for the part after it.
+    /// What it produces for whatever comes after it.
     pub yields: BoundaryOutput<L>,
     /// How many times the statement is sent.
     pub issue: Issue,

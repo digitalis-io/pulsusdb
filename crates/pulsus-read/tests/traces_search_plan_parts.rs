@@ -533,3 +533,66 @@ fn the_first_seeded_part_names_every_generator_it_merges() {
          Without them this gate could not tell a merged seed from a single one"
     );
 }
+
+/// The two shape invariants the design record states about `seed` and
+/// `cut`, pinned so a third round does not find them stale.
+///
+/// They are NOT the same invariant, and the difference is the whole
+/// point: **only the first part has no cut**, because the second and
+/// later branches of a disjunction each carry `Cut::DisjointSources` —
+/// while **several parts may have no seed**, because each of those
+/// branches is a source statement that consumes nothing. Writing the
+/// second by symmetry with the first is what put a false sentence in
+/// `docs/query-lowering.md` (issue #492 part 3, code review round 2).
+///
+/// The unseeded parts are additionally asserted to be the LEADING run,
+/// which is what "opens the plan" means: a plan that acquired an
+/// unseeded statement in the middle would be describing a read with no
+/// input and no predicate.
+#[test]
+fn only_the_first_part_has_no_cut_and_the_unseeded_parts_open_the_plan() {
+    let mut cases_with_two_unseeded = 0usize;
+    for g in goldens() {
+        let plan = plan_query(&g.query, g.distributed);
+        let shape = plan.plan_shape();
+        let cutless: Vec<usize> = shape
+            .parts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| match p {
+                PartShape::Sql(s) if s.cut.is_none() => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cutless,
+            vec![0],
+            "{}: exactly one part may have no cut and it is the first; got {cutless:?}",
+            g.case
+        );
+        let unseeded: Vec<usize> = shape
+            .parts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| match p {
+                PartShape::Sql(s) if s.seed.is_none() => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unseeded,
+            (0..unseeded.len()).collect::<Vec<_>>(),
+            "{}: the parts with no seed must be the leading run that OPENS the plan; got \
+             {unseeded:?}",
+            g.case
+        );
+        if unseeded.len() > 1 {
+            cases_with_two_unseeded += 1;
+        }
+    }
+    assert_eq!(
+        cases_with_two_unseeded, 8,
+        "eight committed cases open the plan with more than one statement; without them this \
+         gate could not tell the seed rule from the cut rule"
+    );
+}
