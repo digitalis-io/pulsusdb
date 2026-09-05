@@ -571,3 +571,174 @@ fn no_test_source_reads_an_endpoint_variable_directly() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #523 review round 2 — property (5): the NAME, not just the call.
+//
+// Property (4) scans for the read spelled out with the variable's name
+// inside the call. (The spelling is not written here: this file is
+// scanned too, and a comment is text like any other.) A code review showed
+// (4) is dead for an equivalent read that names the variable in a constant
+// first:
+//
+//     const ENDPOINT_VAR: &str = "PULSUSDB_LOGQL_DIFF_URL";
+//     std::env::var(ENDPOINT_VAR)
+//
+// — `4 tests run: 4 passed`, and the suite is fail-open again. Unlike a
+// deliberate bypass, naming a constant is ordinary style, so the check has
+// to see it.
+//
+// Reaching it through the CALL would need to follow a value across a
+// binding, an array and a closure parameter, which is a parser. Property
+// (5) goes at the other end instead: it is about where the NAME may be
+// WRITTEN. A `PULSUSDB_*` variable name spelled as a complete string
+// literal in a test source must also be handed, in that same file, to one
+// of this crate's gate entry points. A constant holding the name and
+// nothing else then has nowhere to live, because the file that defines it
+// no longer routes it.
+// ---------------------------------------------------------------------
+
+/// This file. Its `PULSUSDB_*` literals are the check's own needles and
+/// its exemption entry, and there is no live comparison here for one of
+/// them to leave unguarded. Named as a constant, and asserted to resolve,
+/// so the exemption cannot quietly stop matching (the convention is
+/// `crates/pulsus-server/tests/live_db_naming.rs:547`).
+const SELF_PATH: &str = "crates/pulsus-testkit/tests/gated_suite_inventory.rs";
+
+/// The entry points a `PULSUSDB_*` name may be handed to.
+///
+/// Four, not one, because two kinds of gate exist: an ENDPOINT gate whose
+/// value is an address ([`pulsus_testkit::live_endpoint`]) and a BOOLEAN
+/// gate whose value is `1`. `PULSUSDB_TEMPO_VECTORS` is the second kind
+/// and is correctly routed through `require_live_gate`; demanding
+/// `live_endpoint` for it would be demanding the wrong classifier.
+const GATE_ENTRY_POINTS: &[&str] = &[
+    "live_endpoint(",
+    "require_live_endpoint_gate(",
+    "require_live_gate(",
+    "live_gate_enabled(",
+];
+
+/// Floor on the routed population, below the count at the time of writing
+/// (46 routed occurrences) with slack for ordinary deletion. Property (5)
+/// is an absence property, and an absence property over an empty
+/// population passes.
+const ROUTED_NAME_FLOOR: usize = 30;
+
+/// Every COMPLETE `PULSUSDB_*` variable name written as a string literal
+/// in `src`, as `(line, name)`.
+///
+/// "Complete" is what keeps the skip messages out: every converted suite
+/// prints something like `"PULSUSDB_X_URL unset; skipping …"`, and that
+/// literal's content is a sentence, not a name. A literal counts only
+/// when everything between the quotes is `PULSUSDB_` followed by at least
+/// one more character, all of them `A-Z`, `0-9` or `_`.
+fn endpoint_name_literals(src: &str) -> Vec<(usize, String)> {
+    let opening = concat!("\"", "PULSUSDB_");
+    let mut found = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find(opening) {
+        let quote_at = from + rel;
+        let name_at = quote_at + 1;
+        from = name_at;
+        let Some(close) = src[name_at..].find('"') else {
+            continue;
+        };
+        let name = &src[name_at..name_at + close];
+        let rest = &name["PULSUSDB_".len()..];
+        if !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            let line = src[..name_at].bytes().filter(|&b| b == b'\n').count() + 1;
+            found.push((line, name.to_string()));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// `true` when `src` hands `name` to one of [`GATE_ENTRY_POINTS`].
+fn is_routed(src: &str, name: &str) -> bool {
+    GATE_ENTRY_POINTS
+        .iter()
+        .any(|entry| src.contains(&format!("{entry}\"{name}\"")))
+}
+
+/// Property (5): a `PULSUSDB_*` name written out in a test source is also
+/// handed to a gate entry point in that file.
+///
+/// **What this adds over property (4).** (4) sees one spelling of the
+/// read. (5) sees the name wherever it is written, so the constant, the
+/// array element and the raw string are all reached — the definition is
+/// what they have in common, and the definition is a literal.
+///
+/// **What still escapes, said rather than implied.**
+///
+/// * **A name assembled from pieces** — `["PULSUS", "DB_X_URL"].concat()`,
+///   `format!("PULSUSDB_{kind}_URL")`, `concat!`. No literal in the file
+///   is a complete name. This is not hypothetical: two such splits exist
+///   in the tree on purpose, in files whose own sweeps must not match
+///   themselves, and this check is why one of them had to move its split
+///   point.
+/// * **A name defined in another file or crate** and imported. The scan
+///   is per file; a `pub const` in a `tests/common/` module would be seen
+///   where it is DEFINED, so it is only invisible if it comes from
+///   outside `crates/*/tests`.
+/// * **A file that keeps its routed call AND adds an unrouted read of the
+///   same name.** The name is routed somewhere, so (5) passes; (4) then
+///   catches it only if the second read spells the literal.
+/// * `#[ignore]`d tests, and anything outside `crates/`, as for (1)-(4).
+#[test]
+fn every_endpoint_name_written_in_a_test_source_is_routed_through_a_gate() {
+    let root = workspace_root();
+    assert!(
+        root.join(SELF_PATH).is_file(),
+        "{SELF_PATH} does not resolve — the one scan exemption names a file that is not \
+         there, so it is exempting nothing and this check is scanning itself"
+    );
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut routed = 0usize;
+    let mut skipped_self = false;
+
+    for path in test_sources() {
+        let relative = rel(&path).replace('\\', "/");
+        if relative == SELF_PATH {
+            skipped_self = true;
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        for (line, name) in endpoint_name_literals(&src) {
+            if NON_ENDPOINT_PULSUSDB_VARS.iter().any(|(v, _)| *v == name) {
+                continue;
+            }
+            if is_routed(&src, &name) {
+                routed += 1;
+            } else {
+                offenders.push(format!("{relative}:{line}: {name}"));
+            }
+        }
+    }
+
+    assert!(
+        skipped_self,
+        "the scan never reached {SELF_PATH}, so its walk no longer covers this crate and \
+         every name in it would be unexamined"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these test sources write out the name of a gate variable without handing it to a \
+         pulsus_testkit gate entry point, so the value can be read some other way and the \
+         suite is fail-open again (issue #523 review round 2): {offenders:?}. Pass the name \
+         directly — `pulsus_testkit::live_endpoint(\"<VAR>\")` for an address, \
+         `require_live_gate(\"<VAR>\")` for a `=1` gate — rather than by way of a constant."
+    );
+    assert!(
+        routed >= ROUTED_NAME_FLOOR,
+        "only {routed} gate-variable names are routed through an entry point, below the \
+         {ROUTED_NAME_FLOOR} floor — an absence property over an empty population passes, \
+         and this is what stops that"
+    );
+}

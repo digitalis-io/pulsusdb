@@ -763,7 +763,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   asserts each of the five facts above individually, so the entry cannot
   be satisfied by existing.
 
-### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **CLOSED as a CLASS, workspace-wide (issue #523)**
+### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **CLOSED against every accidental form; a deliberate bypass is still possible (issue #523)**
 
 - **What.** Reference-facing differential suites that read the URL of the
   container they compare against with a bare `std::env::var` and take a
@@ -793,26 +793,34 @@ when we are asking it to slow down, so we keep `429`; recorded as
   machine with no `GITHUB_JOB`, and otherwise returns the address. Every
   reference-facing suite in the workspace now makes that one call.
 
-- **What keeps it closed.** `crates/pulsus-testkit/tests/gated_suite_inventory.rs`,
-  test `no_test_source_reads_an_endpoint_variable_directly`: hermetic, in
-  the workspace lane, and it fails the build if any `.rs` file under
-  `crates/*/tests` reads a `PULSUSDB_*` variable itself. Confirmed to
-  detect an incorrect implementation — restoring one suite's bare read:
+- **What keeps it closed, and how far.** Two hermetic checks in
+  `crates/pulsus-testkit/tests/gated_suite_inventory.rs`, both in the
+  workspace lane, both scanning `.rs` files under `crates/*/tests`
+  recursively.
 
-  ```text
-  Starting 4 tests across 1 binary
-   Summary [0.178s] 4 tests run: 3 passed, 1 failed, 0 skipped     (exit 100)
+  | check | what it refuses | break, and what it printed |
+  |---|---|---|
+  | `no_test_source_reads_an_endpoint_variable_directly` | the name written inside an `env::var`/`env::var_os` call | one suite's bare read restored -> `4 tests run: 3 passed, 1 failed`, exit 100, naming `crates/pulsus-logql/tests/case_folding.rs:874: PULSUSDB_LOGQL_DIFF_URL` |
+  | `every_endpoint_name_written_in_a_test_source_is_routed_through_a_gate` | a complete `PULSUSDB_*` name written anywhere in a file that does not also hand it to a gate entry point | `const ENDPOINT_VAR: &str = "…"; env::var(ENDPOINT_VAR)` -> `4 tests run: 3 passed, 1 failed`, exit 100, naming the same file and the constant's line |
 
-  these test sources read a reference address themselves instead of calling
-  pulsus_testkit::live_endpoint … ["crates/pulsus-logql/tests/case_folding.rs:874:
-  PULSUSDB_LOGQL_DIFF_URL"]
-  ```
+  The second exists because the first is **dead** for the constant form: a
+  code review measured `4 tests run: 4 passed` against it, and naming a
+  constant is ordinary style rather than sabotage. The second goes at the
+  other end — where the name may be WRITTEN — so a constant holding the
+  name has nowhere to live.
 
-  Its boundary, because a substring scan has one: a raw string, an
-  interposed comment, or a variable name held in a constant reads the
-  address just as directly and is not matched. The check also carries a
-  floor on the number of `live_endpoint` call sites, so deleting them all
-  does not satisfy it by absence.
+  **What the pair does not reach.** A name assembled from pieces
+  (`["PULSUS", "DB_X_URL"].concat()`, `format!`, `concat!`): no literal in
+  the file is a complete name, and two such splits exist in the tree on
+  purpose. A name defined outside `crates/*/tests`. A file that keeps its
+  routed call and also reads the same name some other way. `xtask/` and
+  `e2e/`, which name no `PULSUSDB_*` variable at all today
+  (`git grep -n 'PULSUSDB_' -- e2e xtask` returns nothing).
+
+  So the claim is: **closed against every form written without the intent
+  to bypass it**, not closed against a deliberate one. Both checks carry
+  floors — on `live_endpoint` call sites and on routed names — so a tree
+  with the calls deleted does not satisfy them by absence.
 
 - **Why it mattered.** Each suite also checks `PULSUS_TEST_CLICKHOUSE`,
   which IS fail-closed. So with the ClickHouse gate still set and only the

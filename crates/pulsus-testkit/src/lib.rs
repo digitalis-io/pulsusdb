@@ -367,21 +367,41 @@ pub fn live_gate_enabled(var: &str) -> bool {
 /// acquired its other duplicated decisions, so the read and the decision
 /// live here together and every suite makes one call.
 ///
-/// ## What enforces "every suite"
+/// ## What enforces "every suite", and how far that reaches
 ///
-/// `crates/pulsus-testkit/tests/gated_suite_inventory.rs`, the test
-/// `no_test_source_reads_an_endpoint_variable_directly` — hermetic, and in
-/// the workspace lane on every push. It fails the build if any `.rs` file
-/// under `crates/*/tests` (recursively, so `tests/common/` modules count)
-/// reads a `PULSUSDB_*` variable itself — either `env::var` spelling.
-/// That check is what makes the class CLOSED, rather than leaving a list
-/// of instances that were fixed one at a time.
+/// Two hermetic checks in `crates/pulsus-testkit/tests/gated_suite_inventory.rs`,
+/// both in the workspace lane on every push. Their scope is `.rs` files
+/// under `crates/*/tests`, recursively, so `tests/common/` modules count.
 ///
-/// Its boundary, stated because a substring scan has one: a raw string, an
-/// interposed comment, or a variable name held in a constant reads the
-/// address just as directly and is not matched. Confirmed to detect an
-/// incorrect implementation — restoring one suite's bare read reddened it,
-/// naming the file, the line and the variable (issue #523 review round 1).
+/// * `no_test_source_reads_an_endpoint_variable_directly` — no file may
+///   read a `PULSUSDB_*` variable with the name written inside the
+///   `env::var`/`env::var_os` call.
+/// * `every_endpoint_name_written_in_a_test_source_is_routed_through_a_gate`
+///   — a `PULSUSDB_*` name written out as a complete string literal
+///   anywhere in a file must also be handed, in that file, to one of this
+///   crate's gate entry points. This is the one that reaches an
+///   indirection: `const V: &str = "PULSUSDB_X_URL"; env::var(V)` defeats
+///   the first check (measured: `4 tests run: 4 passed`) and is caught by
+///   the second, because the constant's DEFINITION is a literal.
+///
+/// **What the pair does not reach**, so that "closed" is not read wider
+/// than it is true:
+///
+/// * a name assembled from pieces — `["PULSUS", "DB_X_URL"].concat()`,
+///   `format!`, `concat!`. No literal in the file is a complete name.
+///   Two such splits exist in the tree on purpose;
+/// * a name defined outside `crates/*/tests` and imported;
+/// * a file that keeps its routed call and ALSO reads the same name some
+///   other way;
+/// * anything under `xtask/` or `e2e/` — which today name no `PULSUSDB_*`
+///   variable at all, measured with
+///   `git grep -n 'PULSUSDB_' -- e2e xtask`.
+///
+/// So: closed against every form a person writes without meaning to
+/// bypass it, and open to a deliberate one. Both checks are confirmed to
+/// detect an incorrect implementation — restoring a bare read, and
+/// restoring the constant-indirected read, each redden one of them naming
+/// file, line and variable (issue #523 review rounds 1 and 2).
 ///
 /// ## The value is returned exactly as the environment holds it
 ///

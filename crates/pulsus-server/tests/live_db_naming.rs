@@ -1039,14 +1039,21 @@ fn f() {
 // drop-on-entry-and-exit guard must not also acquire a name without it.
 //
 // `crates/pulsus-server/tests/support/live_db.rs`'s `ScopedDb` drops its
-// database on entry AND on scope exit, so a test cannot forget the second
-// half. `traces_api_live.rs` takes it, and its `spawn_ready` now demands
-// `&ScopedDb`, so a bare `pulsus_testkit::test_db(…)` handed to a server
-// spawn does not compile.
+// database on entry AND on scope exit, so a test does not have to remember
+// the second half. `traces_api_live.rs` takes it, and its `spawn_ready`
+// now demands `&ScopedDb`, so a bare `pulsus_testkit::test_db(…)` handed
+// to a server spawn does not compile.
 //
 // That leaves one path the type cannot reach: a name acquired and used
 // WITHOUT spawning a server — a direct `ChClient` against the database,
 // say. This rule closes it in source.
+//
+// What none of the three closes is a test that ENDS the guard's life on
+// purpose: `std::mem::forget(db)` skips `Drop`, and this rule stays green
+// because the acquisition is still written the guarded way. Measured in
+// the #523 review round 2 — `23 tests run: 23 passed` here, and a database
+// left resident. Left open deliberately; the failure being guarded against
+// is a test that does not clean up, not one that arranges not to.
 // ---------------------------------------------------------------------
 
 /// The guarded acquisition, matched as literal text for the same reason

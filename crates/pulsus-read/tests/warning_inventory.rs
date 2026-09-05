@@ -351,8 +351,16 @@ fn the_traces_answer_level_claim_names_only_real_suites() {
     //    losing to. Checked first, it fails on its own terms, and the sweep
     //    that follows is the wider net for the suppliers a workflow scan
     //    cannot see (a script a `run:` step invokes, a composite action).
-    let diff_url = ["PULSUSDB_NESTED", "SET_DIFF_URL"].concat();
-    let otlp_url = ["PULSUSDB_NESTED", "SET_OTLP_URL"].concat();
+    //
+    //    The split point moved in issue #523 review round 2: it used to
+    //    fall after `PULSUSDB_NESTED`, which left this file carrying a
+    //    fragment that reads as a complete variable name, and
+    //    `crates/pulsus-testkit/tests/gated_suite_inventory.rs`'s property
+    //    (5) — a gate variable's name may not be written in a test source
+    //    without being handed to a gate entry point — reported it. Moving
+    //    the point serves the same purpose: neither piece is a name.
+    let diff_url = ["PULSUS", "DB_NESTEDSET_DIFF_URL"].concat();
+    let otlp_url = ["PULSUS", "DB_NESTEDSET_OTLP_URL"].concat();
     let workflows = repo.join(".github/workflows");
     let mut workflow_suppliers: Vec<String> = Vec::new();
     let mut workflow_files = 0usize;

@@ -29,9 +29,24 @@
 //!
 //! [`drop_db`] is the primitive: one statement, called where the test says.
 //! [`ScopedDb`] wraps it in a guard that drops on entry AND on scope exit,
-//! so a test cannot forget the second half — which seven of the eleven
-//! tests in `traces_api_live.rs` had (issue #523). New live tests should
-//! take the guard.
+//! so a test does not have to remember the second half — which seven of
+//! the eleven tests in `traces_api_live.rs` had not (issue #523). New
+//! live tests should take the guard.
+//!
+//! **What the guard does and does not promise.** It removes the
+//! ACCIDENTAL omission: a test that takes the guard cannot leave the
+//! database behind by forgetting a line, and a test in an adopting file
+//! cannot obtain a name without it: the type refuses a bare `String` at
+//! the server spawn, and `live_db_naming`'s third rule refuses it in
+//! source.
+//! It does not survive a DELIBERATE one. `std::mem::forget(db)` ends the
+//! guard's life without running [`Drop`], and both checks stay green:
+//! measured in the #523 review round 2, `23 tests run: 23 passed` from the
+//! source scan, `1 test run: 1 passed` from the live test, and one
+//! database left resident afterwards. That is out of scope on purpose —
+//! nobody writes `mem::forget` on a database handle by accident, and
+//! machinery to defeat it would be built for the check rather than for the
+//! suite.
 
 #![allow(dead_code)]
 
@@ -81,7 +96,9 @@ pub fn conn_config(database: &str) -> ChConnConfig {
 /// every count a byte-exact golden depends on.
 ///
 /// Calling this is a *choice*, and a test can decline it. [`ScopedDb`]
-/// removes the choice; prefer it in new tests.
+/// takes the choice away from anyone who is not trying to defeat it —
+/// see its own note on `std::mem::forget`, which still works. Prefer it
+/// in new tests.
 pub async fn drop_db(db: &str) {
     if let Err(why) = try_drop_db(db).await {
         panic!("{why}");
@@ -133,6 +150,17 @@ async fn try_drop_db(db: &str) -> Result<(), String> {
 /// sees a database that no longer belongs to a running test. The exit drop
 /// closes that window, and it runs on the failing path as well, because
 /// [`Drop`] runs while the test's panic unwinds.
+///
+/// ## The one way past it, stated so it is not rediscovered
+///
+/// `std::mem::forget(db)` ends the guard's life without running [`Drop`],
+/// and the database stays. Measured in the #523 review round 2: the
+/// source scan reported `23 tests run: 23 passed`, the live test
+/// `1 test run: 1 passed`, and `SELECT count() FROM system.databases`
+/// matching the run's prefix returned 1 afterwards. Nothing here stops it,
+/// and nothing here tries to: the failure this guard exists for is a test
+/// that simply does not clean up, and defeating a deliberate leak would be
+/// engineering for the check instead of for the suite.
 ///
 /// ## Declaration order matters
 ///
