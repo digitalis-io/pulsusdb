@@ -77,6 +77,10 @@ impl SourceName for LqlSource {
     fn source_ref(&self) -> SourceRef {
         self.0
     }
+
+    fn named(s: SourceRef) -> Self {
+        LqlSource(s)
+    }
 }
 
 /// LogQL's shapes. Not a shared enum: one enum over both languages would

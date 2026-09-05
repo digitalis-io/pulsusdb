@@ -84,6 +84,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
+use super::compile::TqlLink;
 use super::graph_sql::{self, GraphWindow};
 use super::log2_histogram;
 use super::metrics_plan::{ExemplarSeriesKey, MetricsCtx, PlanKind, TraceMetricsPlan};
@@ -107,6 +108,7 @@ use super::search_eval::{
 use super::search_plan::{SearchCtx, SearchPlan};
 use super::tag_narrow::{TagNarrowing, narrowing_from_query};
 use super::tags_sql::DaySpan;
+use crate::compile::plan::{Cut, LinkShape, Part, PartShape};
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::explain::PlanExplain;
 
@@ -2106,6 +2108,16 @@ impl TraceEngine {
         let gen_settings = generator_settings(&self.config);
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
 
+        // Issue #492 part 3: the compiled plan's shape, in explained mode
+        // only. It is recorded first because it describes what the
+        // request WILL send — a plan is a plan-time answer, and the
+        // executor may send fewer statements than it names when the data
+        // runs out (a search with no winners issues no root read at all).
+        // Charged before it is rendered, like every other retention here.
+        // It lives in this function and not in `search_explained` because
+        // this is where the byte budget is.
+        charge_explain_plan(&mut explain, &mut budget, plan)?;
+
         // The spanset `by()` cardinality cap runs before any main-query
         // work (issue #185) — a static `422 query_too_broad` on breach.
         self.enforce_search_series_cap(plan).await?;
@@ -2411,288 +2423,338 @@ impl TraceEngine {
         explain: &mut Option<&mut PlanExplain>,
     ) -> Result<BatchAttrs, ReadError> {
         let mut attrs = BatchAttrs::default();
-        for probe_idx in 0..plan.probes.len() {
-            let sql = plan.membership_sql_for(probe_idx, batch_ids);
-            charge_explain(
-                explain,
-                budget,
-                "phase2_attr_membership",
-                &sql,
-                Some(("probe = ", &plan.probes[probe_idx].key)),
-            )?;
-            // Issue #479: a probe whose matched VALUE a projection needs
-            // decodes the SAME read's fused `v` column. RowBinary is
-            // positional, so `StrValueRow` reads the three-column
-            // projection with no new row type and no second statement —
-            // the pattern the `select()` value read already uses.
-            if plan.probe_fuses_value(probe_idx) {
-                let rows: Vec<TypedStrValueRow> = self
-                    .collect_rows_charged(
-                        &sql,
-                        settings,
+        // Issue #492 part 3: ONE walk over the compiled chain, in the
+        // order the plan says the statements are issued, replacing six
+        // hand-written index loops.
+        //
+        // **The alignment is the reason, not the tidiness.** Every
+        // `BatchAttrs` vector is index-aligned with the plan vector its
+        // reads came from — `attrs.membership[i]` answers
+        // `plan.probes[i]` — and six `for i in 0..n` loops guaranteed
+        // that by construction. The chain guarantees it now: it carries
+        // `Membership(0..probes)`, `AggValues(0..agg_fields)` and so on
+        // in exactly that order, and each arm pushes in walk order. A
+        // chain that dropped one link would misalign the vectors and
+        // produce WRONG MATCHES rather than an error, which is why the
+        // link's own part is asserted below and why the corpus gate
+        // compares the whole part SEQUENCE rather than a count.
+        for (i, link) in plan.chain().iter().enumerate() {
+            debug_assert!(
+                !is_phase_two_read(link)
+                    || matches!(
+                        plan.compiled()
+                            .links
+                            .get(i)
+                            .and_then(|l| plan.compiled().parts.get(l.part)),
+                        Some(Part::Sql(_))
+                    ),
+                "chain link {i} ({link:?}) issues a statement, so the plan must give it an \
+                 SQL part"
+            );
+            match link {
+                TqlLink::Membership(probe_idx) => {
+                    let probe_idx = *probe_idx;
+                    let sql = plan.membership_sql_for(probe_idx, batch_ids);
+                    charge_explain(
+                        explain,
                         budget,
-                        batch_charged,
-                        map_trace_read_error,
-                        |row: &TypedStrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
-                    )
-                    .await?;
-                let mut map = HashMap::with_capacity(rows.len());
-                for row in rows {
-                    // `SELECT DISTINCT trace_id, span_id, v, t` can return
-                    // several rows for one span under a range / regex /
-                    // existence predicate. The FIRST wins; the reference
-                    // also keeps one arbitrary value (its collector is a
-                    // map).
-                    map.entry((row.trace_id, row.span_id))
-                        .or_insert_with(|| (row.v, StoredType::from_stored(&row.t)));
+                        "phase2_attr_membership",
+                        &sql,
+                        Some(("probe = ", &plan.probes[probe_idx].key)),
+                    )?;
+                    // Issue #479: a probe whose matched VALUE a projection needs
+                    // decodes the SAME read's fused `v` column. RowBinary is
+                    // positional, so `StrValueRow` reads the three-column
+                    // projection with no new row type and no second statement —
+                    // the pattern the `select()` value read already uses.
+                    if plan.probe_fuses_value(probe_idx) {
+                        let rows: Vec<TypedStrValueRow> = self
+                            .collect_rows_charged(
+                                &sql,
+                                settings,
+                                budget,
+                                batch_charged,
+                                map_trace_read_error,
+                                |row: &TypedStrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
+                            )
+                            .await?;
+                        let mut map = HashMap::with_capacity(rows.len());
+                        for row in rows {
+                            // `SELECT DISTINCT trace_id, span_id, v, t` can return
+                            // several rows for one span under a range / regex /
+                            // existence predicate. The FIRST wins; the reference
+                            // also keeps one arbitrary value (its collector is a
+                            // map).
+                            map.entry((row.trace_id, row.span_id))
+                                .or_insert_with(|| (row.v, StoredType::from_stored(&row.t)));
+                        }
+                        attrs.membership.push(ProbeMembership::Values(map));
+                    } else {
+                        let rows: Vec<MembershipRow> = self
+                            .collect_rows_charged(
+                                &sql,
+                                settings,
+                                budget,
+                                batch_charged,
+                                map_trace_read_error,
+                                |_| MEMBERSHIP_ENTRY_BYTES,
+                            )
+                            .await?;
+                        attrs.membership.push(ProbeMembership::Keys(
+                            rows.into_iter().map(|r| (r.trace_id, r.span_id)).collect(),
+                        ));
+                    }
                 }
-                attrs.membership.push(ProbeMembership::Values(map));
-            } else {
-                let rows: Vec<MembershipRow> = self
-                    .collect_rows_charged(
-                        &sql,
-                        settings,
+                TqlLink::AggValues(field_idx) => {
+                    let field_idx = *field_idx;
+                    let sql = plan.agg_values_sql_for(field_idx, batch_ids);
+                    charge_explain(
+                        explain,
                         budget,
-                        batch_charged,
-                        map_trace_read_error,
-                        |_| MEMBERSHIP_ENTRY_BYTES,
-                    )
-                    .await?;
-                attrs.membership.push(ProbeMembership::Keys(
-                    rows.into_iter().map(|r| (r.trace_id, r.span_id)).collect(),
-                ));
+                        "phase2_attr_values",
+                        &sql,
+                        Some(("aggregate field = ", &plan.agg_fields[field_idx].key)),
+                    )?;
+                    let rows: Vec<TypedNumValueRow> = self
+                        .collect_rows_charged(
+                            &sql,
+                            settings,
+                            budget,
+                            batch_charged,
+                            map_trace_read_error,
+                            |_| NUM_VALUE_ENTRY_BYTES,
+                        )
+                        .await?;
+                    // Issue #510: the stored kind rides the SAME read. Both maps
+                    // are keyed on the same span, so a value with no type (a row
+                    // written before the column existed) still lands in
+                    // `agg_values` and reads back as `StoredType::Unknown`.
+                    let mut values = HashMap::with_capacity(rows.len());
+                    let mut types = HashMap::with_capacity(rows.len());
+                    for row in rows {
+                        let Some(v) = row.v else { continue };
+                        let key = (row.trace_id, row.span_id);
+                        values.insert(key, v);
+                        types.insert(key, StoredType::from_stored(&row.t));
+                    }
+                    attrs.agg_values.push(values);
+                    attrs.agg_types.push(types);
+                }
+                TqlLink::SelectValues(field_idx) => {
+                    let field_idx = *field_idx;
+                    let sql = plan.select_values_sql_for(field_idx, batch_ids);
+                    charge_explain(
+                        explain,
+                        budget,
+                        "phase2_attr_values",
+                        &sql,
+                        Some(("select field = ", &plan.select_attrs[field_idx].key)),
+                    )?;
+                    let rows: Vec<TypedStrValueRow> = self
+                        .collect_rows_charged(
+                            &sql,
+                            settings,
+                            budget,
+                            batch_charged,
+                            map_trace_read_error,
+                            |row: &TypedStrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
+                        )
+                        .await?;
+                    let mut map = HashMap::with_capacity(rows.len());
+                    let mut types = HashMap::with_capacity(rows.len());
+                    for row in rows {
+                        let key = (row.trace_id, row.span_id);
+                        types.insert(key, StoredType::from_stored(&row.t));
+                        map.insert(key, row.v);
+                    }
+                    attrs.select_values.push(map);
+                    attrs.select_types.push(types);
+                }
+                // Issue #351: the MULTI-VALUED event/link values — ONE ROW PER
+                // VALUE, on the same `(key, scope)` index prefix the literal form
+                // probes. Issued only when a leaf compares one against another
+                // field (`needs_event_sets()`), so every other query pays
+                // nothing.
+                //
+                // **Row-per-value is the memory contract.** The first cut read
+                // `groupUniqArray(...) GROUP BY trace_id, span_id`, which broke
+                // this module's own Layer-1 residual bound — "never a-priori
+                // row-unbounded", above — because an array column is an
+                // unbounded number of capped strings in ONE row: the server-side
+                // aggregate state AND the client's decoded row both grew with a
+                // span's distinct event count before any charge could run, and
+                // phase-2 reads carry no `max_memory_usage`, so a server-side
+                // blow-up would have been a 500 rather than the required 422.
+                //
+                // Now every row is fixed-width columns plus one byte-capped
+                // string — the documented block shape. Duplicate rows from
+                // at-least-once replays need no `DISTINCT`: ANY-match is
+                // unaffected by a repeat and ALL-match compares
+                // `matchCount == elemCount`, which a repeat increments on both
+                // sides.
+                //
+                // **The PEAK LIVE SET, stated as a set of structures rather than
+                // as what each charge covers** (the second review's point: the
+                // first row-per-value cut charged once and held twice — a
+                // `Vec<StrValueRow>` of every row AND the per-span map built from
+                // it, both live at the same instant). Streaming into the map
+                // through [`Self::stream_rows_charged`] means that at any moment
+                // the live structures holding a co-loaded value are exactly:
+                //
+                //   1. the per-span `Vec<String>`/`Vec<f64>` inside `map` — its
+                //      capacity, which is the initial 4-slot reservation and then
+                //      the doubling slack;
+                //   2. `map`'s own entry for that span — ONE per span, not per
+                //      value;
+                //   3. the string payload itself, which is MOVED out of the row
+                //      into (1) and so exists once, never copied;
+                //   4. the driver's transiently buffered BLOCK — up to
+                //      `max_block_size` (`TRACE_SEARCH_MAX_BLOCK_ROWS`, 4096)
+                //      decoded rows, not a single row (review 3's correction).
+                //      It is bounded: each row here is fixed-width columns plus
+                //      ONE `TRACE_STR_COL_CAP`-capped string, which is exactly
+                //      the Layer-1 residual shape this module's contract states,
+                //      and `max_result_bytes` (64 MiB, throw) bounds it besides.
+                //
+                // [`EVENT_VALUE_ENTRY_BYTES`] + the payload length upper-bounds
+                // (1)+(2)+(3) per value — see that constant for why the slot is
+                // charged at the 4-slot reservation rather than 2× — and (4) is
+                // the documented Layer-1 block residual. No second collection
+                // exists to hold anything a second time.
+                TqlLink::EventSet(set_idx) => {
+                    let set_idx = *set_idx;
+                    let sql = plan.event_set_sql_for(set_idx, batch_ids);
+                    charge_explain(
+                        explain,
+                        budget,
+                        "phase2_event_sets",
+                        &sql,
+                        Some(("event/link set = ", plan.event_sets[set_idx].display())),
+                    )?;
+                    let mut map: HashMap<SpanKey, EventValues> = HashMap::new();
+                    if plan.event_sets[set_idx].is_numeric() {
+                        let mut sink = FnRowSink {
+                            cost: |_: &NumValueRow| EVENT_VALUE_ENTRY_BYTES,
+                            accept: |row: NumValueRow| {
+                                let Some(v) = row.v else { return };
+                                match map
+                                    .entry((row.trace_id, row.span_id))
+                                    .or_insert_with(|| EventValues::Num(Vec::new()))
+                                {
+                                    EventValues::Num(values) => values.push(v),
+                                    EventValues::Text(_) => {
+                                        unreachable!("a numeric set never decodes text values")
+                                    }
+                                }
+                            },
+                        };
+                        self.stream_rows_charged(
+                            &sql,
+                            settings,
+                            budget,
+                            batch_charged,
+                            map_trace_read_error,
+                            &mut sink,
+                        )
+                        .await?;
+                    } else {
+                        let mut sink = FnRowSink {
+                            cost: |row: &StrValueRow| EVENT_VALUE_ENTRY_BYTES + row.v.len(),
+                            accept: |row: StrValueRow| match map
+                                .entry((row.trace_id, row.span_id))
+                                .or_insert_with(|| EventValues::Text(Vec::new()))
+                            {
+                                EventValues::Text(values) => values.push(row.v),
+                                EventValues::Num(_) => {
+                                    unreachable!("a text set never decodes numeric values")
+                                }
+                            },
+                        };
+                        self.stream_rows_charged(
+                            &sql,
+                            settings,
+                            budget,
+                            batch_charged,
+                            map_trace_read_error,
+                            &mut sink,
+                        )
+                        .await?;
+                    }
+                    attrs.event_sets.push(map);
+                }
+                // Issue #184: the trace-wide co-loads — deliberately WINDOW-FREE
+                // `trace_id IN` PK reads (the `root_sql` precedent generalized to
+                // the filter phase), so the trace-level intrinsics evaluate
+                // full-trace-exact regardless of the search window or the
+                // per-trace hydration cap. Issued only when the plan uses the
+                // corresponding intrinsics — every other query pays nothing.
+                TqlLink::TraceCtx => {
+                    let sql = plan.trace_ctx_sql_for(batch_ids);
+                    charge_explain(explain, budget, "phase2_trace_context", &sql, None)?;
+                    let rows: Vec<TraceCtxRow> = self
+                        .collect_rows_charged(
+                            &sql,
+                            settings,
+                            budget,
+                            batch_charged,
+                            map_trace_read_error,
+                            |row: &TraceCtxRow| {
+                                std::mem::size_of::<TraceCtxRow>()
+                                    + RETAINED_ENTRY_OVERHEAD
+                                    + row.root_name.len()
+                                    + row.root_service.len()
+                            },
+                        )
+                        .await?;
+                    let mut map = HashMap::with_capacity(rows.len());
+                    for row in rows {
+                        map.insert(
+                            row.trace_id,
+                            TraceCtxInfo {
+                                trace_start_ns: row.trace_start_ns,
+                                trace_end_ns: row.trace_end_ns,
+                                root_name: row.root_name,
+                                root_service: row.root_service,
+                            },
+                        );
+                    }
+                    attrs.trace_ctx = map;
+                }
+                TqlLink::ChildCount => {
+                    let sql = plan.child_count_sql_for(batch_ids);
+                    charge_explain(explain, budget, "phase2_child_counts", &sql, None)?;
+                    let rows: Vec<ChildCountRow> = self
+                        .collect_rows_charged(
+                            &sql,
+                            settings,
+                            budget,
+                            batch_charged,
+                            map_trace_read_error,
+                            |_| CHILD_COUNT_ENTRY_BYTES,
+                        )
+                        .await?;
+                    attrs.child_counts = rows
+                        .into_iter()
+                        .map(|r| ((r.trace_id, r.parent_id), r.child_count))
+                        .collect();
+                }
+                // The seed statement, the hydration read (issued by
+                // `hydrate_batch` before this call) and the engine links
+                // are not this walk's work. Listed rather than
+                // wildcarded so a new link variant fails to compile here
+                // instead of being silently skipped.
+                TqlLink::Source { .. }
+                | TqlLink::Hydrate
+                | TqlLink::Structural
+                | TqlLink::NestedSet
+                | TqlLink::BoolTruth
+                | TqlLink::Pipe(_)
+                | TqlLink::Order
+                | TqlLink::Limit(_)
+                | TqlLink::Emit => {}
             }
         }
-        for field_idx in 0..plan.agg_fields.len() {
-            let sql = plan.agg_values_sql_for(field_idx, batch_ids);
-            charge_explain(
-                explain,
-                budget,
-                "phase2_attr_values",
-                &sql,
-                Some(("aggregate field = ", &plan.agg_fields[field_idx].key)),
-            )?;
-            let rows: Vec<TypedNumValueRow> = self
-                .collect_rows_charged(
-                    &sql,
-                    settings,
-                    budget,
-                    batch_charged,
-                    map_trace_read_error,
-                    |_| NUM_VALUE_ENTRY_BYTES,
-                )
-                .await?;
-            // Issue #510: the stored kind rides the SAME read. Both maps
-            // are keyed on the same span, so a value with no type (a row
-            // written before the column existed) still lands in
-            // `agg_values` and reads back as `StoredType::Unknown`.
-            let mut values = HashMap::with_capacity(rows.len());
-            let mut types = HashMap::with_capacity(rows.len());
-            for row in rows {
-                let Some(v) = row.v else { continue };
-                let key = (row.trace_id, row.span_id);
-                values.insert(key, v);
-                types.insert(key, StoredType::from_stored(&row.t));
-            }
-            attrs.agg_values.push(values);
-            attrs.agg_types.push(types);
-        }
-        for field_idx in 0..plan.select_attrs.len() {
-            let sql = plan.select_values_sql_for(field_idx, batch_ids);
-            charge_explain(
-                explain,
-                budget,
-                "phase2_attr_values",
-                &sql,
-                Some(("select field = ", &plan.select_attrs[field_idx].key)),
-            )?;
-            let rows: Vec<TypedStrValueRow> = self
-                .collect_rows_charged(
-                    &sql,
-                    settings,
-                    budget,
-                    batch_charged,
-                    map_trace_read_error,
-                    |row: &TypedStrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
-                )
-                .await?;
-            let mut map = HashMap::with_capacity(rows.len());
-            let mut types = HashMap::with_capacity(rows.len());
-            for row in rows {
-                let key = (row.trace_id, row.span_id);
-                types.insert(key, StoredType::from_stored(&row.t));
-                map.insert(key, row.v);
-            }
-            attrs.select_values.push(map);
-            attrs.select_types.push(types);
-        }
-        // Issue #351: the MULTI-VALUED event/link values — ONE ROW PER
-        // VALUE, on the same `(key, scope)` index prefix the literal form
-        // probes. Issued only when a leaf compares one against another
-        // field (`needs_event_sets()`), so every other query pays
-        // nothing.
-        //
-        // **Row-per-value is the memory contract.** The first cut read
-        // `groupUniqArray(...) GROUP BY trace_id, span_id`, which broke
-        // this module's own Layer-1 residual bound — "never a-priori
-        // row-unbounded", above — because an array column is an
-        // unbounded number of capped strings in ONE row: the server-side
-        // aggregate state AND the client's decoded row both grew with a
-        // span's distinct event count before any charge could run, and
-        // phase-2 reads carry no `max_memory_usage`, so a server-side
-        // blow-up would have been a 500 rather than the required 422.
-        //
-        // Now every row is fixed-width columns plus one byte-capped
-        // string — the documented block shape. Duplicate rows from
-        // at-least-once replays need no `DISTINCT`: ANY-match is
-        // unaffected by a repeat and ALL-match compares
-        // `matchCount == elemCount`, which a repeat increments on both
-        // sides.
-        //
-        // **The PEAK LIVE SET, stated as a set of structures rather than
-        // as what each charge covers** (the second review's point: the
-        // first row-per-value cut charged once and held twice — a
-        // `Vec<StrValueRow>` of every row AND the per-span map built from
-        // it, both live at the same instant). Streaming into the map
-        // through [`Self::stream_rows_charged`] means that at any moment
-        // the live structures holding a co-loaded value are exactly:
-        //
-        //   1. the per-span `Vec<String>`/`Vec<f64>` inside `map` — its
-        //      capacity, which is the initial 4-slot reservation and then
-        //      the doubling slack;
-        //   2. `map`'s own entry for that span — ONE per span, not per
-        //      value;
-        //   3. the string payload itself, which is MOVED out of the row
-        //      into (1) and so exists once, never copied;
-        //   4. the driver's transiently buffered BLOCK — up to
-        //      `max_block_size` (`TRACE_SEARCH_MAX_BLOCK_ROWS`, 4096)
-        //      decoded rows, not a single row (review 3's correction).
-        //      It is bounded: each row here is fixed-width columns plus
-        //      ONE `TRACE_STR_COL_CAP`-capped string, which is exactly
-        //      the Layer-1 residual shape this module's contract states,
-        //      and `max_result_bytes` (64 MiB, throw) bounds it besides.
-        //
-        // [`EVENT_VALUE_ENTRY_BYTES`] + the payload length upper-bounds
-        // (1)+(2)+(3) per value — see that constant for why the slot is
-        // charged at the 4-slot reservation rather than 2× — and (4) is
-        // the documented Layer-1 block residual. No second collection
-        // exists to hold anything a second time.
-        for set_idx in 0..plan.event_sets.len() {
-            let sql = plan.event_set_sql_for(set_idx, batch_ids);
-            charge_explain(
-                explain,
-                budget,
-                "phase2_event_sets",
-                &sql,
-                Some(("event/link set = ", plan.event_sets[set_idx].display())),
-            )?;
-            let mut map: HashMap<SpanKey, EventValues> = HashMap::new();
-            if plan.event_sets[set_idx].is_numeric() {
-                let mut sink = FnRowSink {
-                    cost: |_: &NumValueRow| EVENT_VALUE_ENTRY_BYTES,
-                    accept: |row: NumValueRow| {
-                        let Some(v) = row.v else { return };
-                        match map
-                            .entry((row.trace_id, row.span_id))
-                            .or_insert_with(|| EventValues::Num(Vec::new()))
-                        {
-                            EventValues::Num(values) => values.push(v),
-                            EventValues::Text(_) => {
-                                unreachable!("a numeric set never decodes text values")
-                            }
-                        }
-                    },
-                };
-                self.stream_rows_charged(
-                    &sql,
-                    settings,
-                    budget,
-                    batch_charged,
-                    map_trace_read_error,
-                    &mut sink,
-                )
-                .await?;
-            } else {
-                let mut sink = FnRowSink {
-                    cost: |row: &StrValueRow| EVENT_VALUE_ENTRY_BYTES + row.v.len(),
-                    accept: |row: StrValueRow| match map
-                        .entry((row.trace_id, row.span_id))
-                        .or_insert_with(|| EventValues::Text(Vec::new()))
-                    {
-                        EventValues::Text(values) => values.push(row.v),
-                        EventValues::Num(_) => {
-                            unreachable!("a text set never decodes numeric values")
-                        }
-                    },
-                };
-                self.stream_rows_charged(
-                    &sql,
-                    settings,
-                    budget,
-                    batch_charged,
-                    map_trace_read_error,
-                    &mut sink,
-                )
-                .await?;
-            }
-            attrs.event_sets.push(map);
-        }
-        // Issue #184: the trace-wide co-loads — deliberately WINDOW-FREE
-        // `trace_id IN` PK reads (the `root_sql` precedent generalized to
-        // the filter phase), so the trace-level intrinsics evaluate
-        // full-trace-exact regardless of the search window or the
-        // per-trace hydration cap. Issued only when the plan uses the
-        // corresponding intrinsics — every other query pays nothing.
-        if plan.needs_trace_ctx() {
-            let sql = plan.trace_ctx_sql_for(batch_ids);
-            charge_explain(explain, budget, "phase2_trace_context", &sql, None)?;
-            let rows: Vec<TraceCtxRow> = self
-                .collect_rows_charged(
-                    &sql,
-                    settings,
-                    budget,
-                    batch_charged,
-                    map_trace_read_error,
-                    |row: &TraceCtxRow| {
-                        std::mem::size_of::<TraceCtxRow>()
-                            + RETAINED_ENTRY_OVERHEAD
-                            + row.root_name.len()
-                            + row.root_service.len()
-                    },
-                )
-                .await?;
-            let mut map = HashMap::with_capacity(rows.len());
-            for row in rows {
-                map.insert(
-                    row.trace_id,
-                    TraceCtxInfo {
-                        trace_start_ns: row.trace_start_ns,
-                        trace_end_ns: row.trace_end_ns,
-                        root_name: row.root_name,
-                        root_service: row.root_service,
-                    },
-                );
-            }
-            attrs.trace_ctx = map;
-        }
-        if plan.needs_child_counts() {
-            let sql = plan.child_count_sql_for(batch_ids);
-            charge_explain(explain, budget, "phase2_child_counts", &sql, None)?;
-            let rows: Vec<ChildCountRow> = self
-                .collect_rows_charged(
-                    &sql,
-                    settings,
-                    budget,
-                    batch_charged,
-                    map_trace_read_error,
-                    |_| CHILD_COUNT_ENTRY_BYTES,
-                )
-                .await?;
-            attrs.child_counts = rows
-                .into_iter()
-                .map(|r| ((r.trace_id, r.parent_id), r.child_count))
-                .collect();
-        }
+
         Ok(attrs)
     }
 }
@@ -3448,6 +3510,67 @@ pub(super) fn group_hydrated_rows(
             });
     }
     Ok((traces, overflowed))
+}
+
+/// Whether this chain link issues one of the per-batch phase-2
+/// statements [`TraceEngine::batch_attrs`] sends (issue #492 part 3).
+/// The seed statement, the hydration read and the winners' root read are
+/// issued elsewhere, and the engine links issue nothing.
+fn is_phase_two_read(link: &TqlLink) -> bool {
+    matches!(
+        link,
+        TqlLink::Membership(_)
+            | TqlLink::AggValues(_)
+            | TqlLink::SelectValues(_)
+            | TqlLink::EventSet(_)
+            | TqlLink::TraceCtx
+            | TqlLink::ChildCount
+    )
+}
+
+/// Charges and records the compiled plan's rendered shape (issue #492
+/// part 3), which the explained response retains for the whole request —
+/// the same class as [`charge_explain`]'s per-stage SQL clones and
+/// charged the same way, BEFORE the render.
+///
+/// **Priced without rendering.** Every string the renderer emits is
+/// either a `&'static` source or cut name already on the plan, or a stage
+/// name already held on it, so the payload is the sum of lengths this
+/// walk can take before a single `PlanShape` value exists.
+fn charge_explain_plan(
+    explain: &mut Option<&mut PlanExplain>,
+    budget: &mut ByteBudget,
+    plan: &SearchPlan,
+) -> Result<(), ReadError> {
+    if let Some(e) = explain.as_mut() {
+        let compiled = plan.compiled();
+        let mut bytes = RETAINED_ENTRY_OVERHEAD
+            + compiled.parts.len() * (std::mem::size_of::<PartShape>() + RETAINED_ENTRY_OVERHEAD)
+            + compiled.links.len() * (std::mem::size_of::<LinkShape>() + RETAINED_ENTRY_OVERHEAD);
+        for part in &compiled.parts {
+            match part {
+                Part::Sql(p) => {
+                    bytes += p.rel.source_ref().as_str().len();
+                    match &p.cut {
+                        Some(Cut::SourceHandoff { source, key }) => {
+                            bytes += source.as_str().len() + key.as_str().len();
+                        }
+                        Some(Cut::DisjointSources { sources }) => {
+                            bytes += sources.iter().map(|s| s.as_str().len()).sum::<usize>();
+                        }
+                        Some(Cut::HandoffExceedsBound { .. }) | Some(Cut::InexactLimit) | None => {}
+                    }
+                }
+                Part::Engine { links } => {
+                    bytes += links.len() * std::mem::size_of::<usize>();
+                }
+            }
+        }
+        bytes += plan.stage_names.iter().map(String::len).sum::<usize>();
+        budget.charge(bytes)?;
+        e.set_plan(plan.plan_shape());
+    }
+    Ok(())
 }
 
 /// Charges and records one explain stage (round-3 audit: `PlanExplain`

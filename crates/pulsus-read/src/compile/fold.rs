@@ -547,8 +547,26 @@ pub trait Shape: Clone + Eq + fmt::Debug {}
 
 /// How a language names one readable source, so the core can ask a
 /// relation which source it reads without knowing the language.
-pub trait SourceName {
+pub trait SourceName: Sized {
     fn source_ref(&self) -> SourceRef;
+
+    /// The language's own source value for a source the core holds only
+    /// a [`SourceRef`] for.
+    ///
+    /// **This is a FACT, not a policy hook** (issue #492 part 3,
+    /// adjudicated). The deleted `Lang` cost hook let a language change
+    /// what the engine DOES; this reports data — which table a
+    /// `SourceRef` names — that the engine cannot derive, and the core
+    /// still decides everything that happens with it. The test to apply
+    /// is *does the language decide what happens, or does it tell the
+    /// engine something only it knows?*, and naming a table is the
+    /// second, so the earlier ruling does not reach it.
+    ///
+    /// The core needs it so that a part built from a handoff carries its
+    /// OWN source rather than the seed's: before this, every part after
+    /// the first rendered the seed's table name on the explain surface
+    /// (issue #492 part 3, D1).
+    fn named(s: SourceRef) -> Self;
 }
 
 /// `Base(source)`, or a relation wrapped as a subquery when a clause slot

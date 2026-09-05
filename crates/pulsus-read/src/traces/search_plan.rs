@@ -16,12 +16,15 @@ use regex::Regex;
 use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
+use super::compile::{ChainFacts, Tql, TqlLink};
 use super::filter::{
     self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, LeafEval,
     NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx, TraceCtxPred, ValuePred,
 };
 use super::search_eval::StoredType;
 use super::search_sql;
+use crate::compile::fold::{LowerCx, Pred, RequestBounds, lower_chain};
+use crate::compile::plan::{PlanConfig, PlanCx, PlanShape, QueryPlan, SourceRef, plan_of};
 
 /// The caller-validated request window and response caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -694,6 +697,20 @@ pub struct SearchPlan {
     /// runs it before the main search and flips a `cap+1` result to a
     /// static `422 query_too_broad`.
     pub(crate) by_probe_sql: Option<String>,
+    /// The compiled chain (issue #492 part 3), in the order the executor
+    /// issues its statements. `exec::batch_attrs` walks this instead of
+    /// six hand-written index loops, so the per-batch reads and the
+    /// `BatchAttrs` vectors they fill cannot drift out of alignment.
+    pub(crate) chain: Vec<TqlLink>,
+    /// Each chain link's own name, in chain order — what
+    /// `QueryPlan::shape` renders for the explain surface.
+    pub(crate) stage_names: Vec<String>,
+    /// The plan the shared compile core produced for this request.
+    ///
+    /// **It changes no SQL.** Every statement still comes from the
+    /// shipped builders; this says WHICH statements a request sends,
+    /// which was previously written down only in the golden files.
+    pub(crate) compiled: QueryPlan<Tql>,
 }
 
 impl SearchPlan {
@@ -927,6 +944,23 @@ impl SearchPlan {
     /// gates the per-batch co-load so every other query pays nothing.
     pub fn needs_event_sets(&self) -> bool {
         !self.event_sets.is_empty()
+    }
+
+    /// The compiled chain, in the order the executor issues its
+    /// statements (issue #492 part 3).
+    pub(crate) fn chain(&self) -> &[TqlLink] {
+        &self.chain
+    }
+
+    /// The plan the compile core produced for this request.
+    pub(crate) fn compiled(&self) -> &QueryPlan<Tql> {
+        &self.compiled
+    }
+
+    /// The plan projected for the explain surface. Built only in
+    /// explained mode — an unexplained search never renders it.
+    pub fn plan_shape(&self) -> PlanShape {
+        self.compiled.shape(&self.stage_names)
     }
 }
 
@@ -2180,6 +2214,10 @@ pub fn plan_search(
     let mut probe_predicates: Vec<String> = Vec::new();
     let mut filters = Vec::new();
     let mut generator_sqls: Vec<String> = Vec::new();
+    // Issue #492 part 3: the generators themselves, index-aligned with
+    // the deduped `generator_sqls`, so the compile core can key the seed
+    // predicate's branches on the table each statement reads.
+    let mut generators: Vec<(SourceRef, filter::LeafGenerator)> = Vec::new();
     let mut nested_set = false;
     let mut trace_ctx = false;
     let mut child_count = false;
@@ -2236,6 +2274,10 @@ pub fn plan_search(
             );
             if !generator_sqls.contains(&sql) {
                 generator_sqls.push(sql);
+                generators.push((
+                    super::compile::generator_source(generator.table),
+                    generator.clone(),
+                ));
             }
         }
     }
@@ -2334,6 +2376,68 @@ pub fn plan_search(
         })
         .transpose()?;
 
+    // ---- issue #492 part 3: the compiled plan --------------------------
+    //
+    // Built from what the planner has just decided, and it decides
+    // nothing itself: the statements are still the ones the shipped
+    // builders render, and `plan_of` only says which of them a request
+    // sends and why each is its own statement. No I/O, no round trip —
+    // this runs before the pool is acquired.
+    let structural = spanset_has_structural(&query.spanset);
+    let bool_truth_leaves = filters
+        .iter()
+        .flat_map(|f| f.leaves.iter())
+        .filter(|leaf| matches!(leaf, PlannedLeafEval::BoolTruth { .. }))
+        .count();
+    let chain = super::compile::chain_of(
+        query,
+        &ChainFacts {
+            generators: &generators,
+            probes: probes.len(),
+            agg_fields: agg_fields.len(),
+            select_attrs: select_attrs.len(),
+            event_sets: event_sets.len(),
+            trace_ctx,
+            child_count,
+            nested_set,
+            structural,
+            bool_truth_leaves,
+        },
+        params.limit,
+    );
+    let seed_source = generators
+        .first()
+        .map_or(super::compile::TRACE_SPANS, |(source, _)| *source);
+    let bounds = RequestBounds {
+        start_ns: window.start_ns,
+        end_ns: window.end_ns,
+        step_ns: None,
+        limit: Some(params.limit),
+    };
+    let config = PlanConfig {
+        // The phase-2 batch is an operational choice at 32, not the
+        // ~25,000 the rendering ceilings would permit.
+        seed_chunk_rows: Some(super::exec::BATCH_TRACES as u32),
+        // Every phase-2 read is seeded from the phase-1 candidate list,
+        // which `reader.traceql_max_candidates` bounds.
+        seed_bound_rows: Some(ctx.max_candidates),
+        ..PlanConfig::default()
+    };
+    let lowering = lower_chain::<Tql>(
+        &chain,
+        super::compile::seed_relation(seed_source, generator_pred_of(&generators)),
+        &LowerCx::<Tql>::new(&bounds),
+    )?;
+    let compiled = plan_of::<Tql>(
+        &chain,
+        lowering,
+        &PlanCx {
+            bounds: &bounds,
+            config: &config,
+        },
+    )?;
+    let stage_names = super::compile::stage_names(&chain);
+
     Ok(SearchPlan {
         window,
         limit: params.limit,
@@ -2361,7 +2465,28 @@ pub fn plan_search(
         post_stages: pipeline.post_stages,
         most_recent,
         by_probe_sql,
+        chain,
+        stage_names,
+        compiled,
     })
+}
+
+/// Whether the spanset carries a structural relation (issue #172) — the
+/// one chain link whose reason is that the relation holds between two
+/// spans of one trace.
+fn spanset_has_structural(expr: &SpansetExpr) -> bool {
+    match expr {
+        SpansetExpr::Filter(_) => false,
+        SpansetExpr::Structural { .. } => true,
+        SpansetExpr::Binary { lhs, rhs, .. } => {
+            spanset_has_structural(lhs) || spanset_has_structural(rhs)
+        }
+    }
+}
+
+/// [`super::compile::generator_pred`] over the deduped generator list.
+fn generator_pred_of(generators: &[(SourceRef, filter::LeafGenerator)]) -> Pred {
+    super::compile::generator_pred(generators)
 }
 
 /// The grouping column for a spanset `| by(...)` cap probe, when the keys

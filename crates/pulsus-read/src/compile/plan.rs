@@ -25,7 +25,7 @@ use serde::Serialize;
 
 use super::fold::{
     BoundaryOutput, Disposition, Fidelity, Lang, Lowering, Name, Relation, RequestBounds,
-    ResidualReason, branch_sources_union,
+    ResidualReason, SourceName, branch_sources_union,
 };
 
 // ---------------------------------------------------------------------
@@ -118,6 +118,29 @@ pub struct PlanConfig {
     /// The over-fetch factor a keyset page applies when the request's
     /// `LIMIT` could not enter the statement.
     pub keyset_over_fetch: u32,
+    /// The largest seed the language puts in ONE statement when that is
+    /// smaller than the rendering ceilings allow. `None` — the default —
+    /// means the ceilings decide, which is what every language did
+    /// before.
+    ///
+    /// TraceQL passes `Some(BATCH_TRACES)`: its phase-2 batch is an
+    /// operational choice at 32, not the 24,998 the ceilings permit
+    /// (issue #492 part 3, D2). Reporting the ceiling would have put a
+    /// number on the explain surface that no statement this tree sends
+    /// has ever used.
+    pub seed_chunk_rows: Option<u32>,
+    /// The plan-time upper bound on a seed a language draws from its own
+    /// EARLIER statement, when the language has one and the bound is a
+    /// per-request config value rather than a request parameter or a
+    /// named constant. `None` — the default — means no such seed exists
+    /// and a link that would need one gets no cut.
+    ///
+    /// TraceQL passes `Some(reader.traceql_max_candidates)`: every
+    /// phase-2 read is seeded from the phase-1 candidate list, whose size
+    /// that config bounds. The core carries the NUMBER only; the language
+    /// names it, because `reader.traceql_max_candidates` is TraceQL's own
+    /// config key and the core has no business spelling it.
+    pub seed_bound_rows: Option<u64>,
 }
 
 impl Default for PlanConfig {
@@ -127,6 +150,8 @@ impl Default for PlanConfig {
             max_query_text_bytes: crate::querytext::MAX_QUERY_TEXT_BYTES,
             keyset_page_rows: 1_000,
             keyset_over_fetch: 10,
+            seed_chunk_rows: None,
+            seed_bound_rows: None,
         }
     }
 }
@@ -336,27 +361,39 @@ pub fn inexact_limit_fires<L: Lang + ?Sized>(rel: &Relation<L>, cx: &PlanCx<'_>)
 }
 
 /// The largest chunk of `bound` values whose rendered statement stays
-/// under both ceilings. Binary search over [`Lang::handoff_cost`], which
-/// is O(1) — no statement is rendered and no round trip is made.
+/// under both ceilings — **or the language's own smaller chunk, when it
+/// has one**. Binary search over [`Lang::handoff_cost`], which is O(1) —
+/// no statement is rendered and no round trip is made.
+///
+/// The ceilings say what a statement CAN hold; they do not say what the
+/// executor sends. A language that batches at a smaller size passes it as
+/// [`PlanConfig::seed_chunk_rows`] and it wins, because a plan reporting
+/// a chunk no statement uses is a wrong answer on the explain surface
+/// (issue #492 part 3, D2).
 fn chunk_for<L: Lang + ?Sized + 'static>(bound: u64, cx: &PlanCx<'_>) -> u64 {
     let fits = |n: u64| {
         let c = L::handoff_cost(n);
         c.text_bytes <= cx.config.max_query_text_bytes
             && c.ast_elements <= cx.config.max_ast_elements
     };
-    if fits(bound) {
-        return bound;
-    }
-    let (mut lo, mut hi) = (1u64, bound);
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
+    let ceiling_chunk = if fits(bound) {
+        bound
+    } else {
+        let (mut lo, mut hi) = (1u64, bound);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
+        lo.max(1)
+    };
+    match cx.config.seed_chunk_rows {
+        Some(n) => ceiling_chunk.min(u64::from(n)).max(1),
+        None => ceiling_chunk,
     }
-    lo.max(1)
 }
 
 // ---------------------------------------------------------------------
@@ -417,9 +454,17 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
             // The SAME derivation `cuts_firing` uses, so the cut's
             // source list and the parts built beside it cannot disagree.
             let sources: Vec<SourceRef> = branch_sources_union(bs);
-            for (i, (_, pred)) in bs.iter().enumerate() {
+            for (i, (branch_sources, pred)) in bs.iter().enumerate() {
                 let mut branch_rel = rel.clone();
                 branch_rel.predicate = pred.clone();
+                // D1 (issue #492 part 3): a branch reading exactly one
+                // source names THAT source, not the seed's. A branch
+                // spanning two is one statement over both, and there is
+                // no single name for it, so it keeps the seed's — stated
+                // rather than guessed.
+                if let [only] = branch_sources.as_slice() {
+                    branch_rel.source = super::fold::SourceTerm::Base(L::Source::named(*only));
+                }
                 parts.push(Part::Sql(Box::new(SqlPart {
                     yields: boundary_output(&branch_rel),
                     rel: branch_rel,
@@ -482,6 +527,12 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                         // the seed alone.
                         part_rel.predicate = super::fold::Pred::True;
                         part_rel.limit = None;
+                        // D1 (issue #492 part 3): and it is named for the
+                        // source it reads. Cloning the accumulated
+                        // relation and leaving `source` alone made every
+                        // part after the first report the SEED's table,
+                        // while its own cut named the right one.
+                        part_rel.source = super::fold::SourceTerm::Base(L::Source::named(h.source));
                         let bound = h.bound;
                         let issue = match cut {
                             Some(Cut::HandoffExceedsBound { .. }) => {
@@ -533,8 +584,21 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
         // Only a part sent ONCE becomes a page loop. A part already
         // issued once per seed chunk is bounded by the chunk driver, and
         // overwriting it would drop the bound the executor needs.
+        //
+        // **And only a part that the limit still has to FILL.** D4 (issue
+        // #492 part 3): a part seeded by a set the request's own `LIMIT`
+        // already bounds sits DOWNSTREAM of the limit — it reads the rows
+        // that won, once, after the limit is satisfied — so a page loop
+        // on it describes a loop that does not exist. Every TraceQL
+        // search's last statement is that shape (the winners' root read,
+        // seeded by at most `limit` trace ids), which is why the rule
+        // fired on every search before this.
         if let Some(Part::Sql(p)) = parts.get_mut(last_sql_part)
             && matches!(p.issue, Issue::Once)
+            && !matches!(
+                p.seed.as_ref().map(|s| s.bound),
+                Some(SeedBound::RequestLimit(_))
+            )
         {
             p.issue = Issue::PerSeed(Driver::Keyset {
                 page_rows,
@@ -934,6 +998,10 @@ mod tests {
     impl SourceName for TestSource {
         fn source_ref(&self) -> SourceRef {
             SourceRef(self.0)
+        }
+
+        fn named(s: SourceRef) -> Self {
+            TestSource(s.as_str())
         }
     }
 
