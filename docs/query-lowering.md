@@ -26,7 +26,7 @@ through the same interface **without changing it**, and where the sharing stops 
 reasons rather than left as a gap (§6).
 
 **What the compiler emits.** Not one statement: a **plan** — an ordered list of parts, each part
-either one SQL statement or work in our own engine, with the value set that crosses between two
+either one SQL statement or work in our own engine, with the value set that crosses between
 parts named, typed and bounded. §2.7 is the plan object and the four **cuts** that are the only ways
 a plan gets a second SQL part. That is not an ambition: §9.2's worked request already sends **1,110**
 statements, and an earlier form of this design had no field that could hold a number other than one.
