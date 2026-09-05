@@ -483,58 +483,123 @@ fn endpoint_read_needles() -> [String; 2] {
 ///
 /// Properties (4) and (5) are substring scans, and a comment is text like
 /// any other, so before this a comment could do BOTH wrong things: excuse
-/// a real unrouted read (a comment showing the recommended form counts as
+/// a real unrouted read (a comment showing the recommended form counted as
 /// routing evidence), and accuse an innocent file (a name written only in
 /// a comment, in a file with no read and no routed call, made (5) fail —
 /// measured `5 tests run: 4 passed, 1 failed`, exit 100).
 ///
 /// The second is the one that matters, because naming these variables in
-/// a comment is the house style, not an oddity: **69 comment mentions
-/// across 30 files** at the time of writing, every one of them in
-/// backticks rather than quotes. One editor preferring `"PULSUSDB_X_URL"`
-/// to `` `PULSUSDB_X_URL` `` in a file that does not route that name would
-/// have reddened the build for nothing, and the repair a person reaches
-/// for then is an exemption.
+/// a comment is the house style, not an oddity — **69 comment mentions
+/// across 30 files**:
 ///
 /// ```text
-/// $ python3 - <<'EOF'   # over crates/*/tests/**/*.rs, this file excluded
-///   count PULSUSDB_[A-Z0-9][A-Z0-9_]* preceded by "//" on its line
-/// EOF
-/// 69 mentions across 30 files
+/// over crates/*/tests/**/*.rs, this file excluded, for every line
+/// containing `//`, count matches of `PULSUSDB_[A-Z0-9][A-Z0-9_]*` in the
+/// text from the `//` onward, and separate those wrapped in backticks:
+///
+///   mentions 69   backticked 35   bare 34
+///   files carrying at least one 30, of which 27 carry a backticked one
 /// ```
+///
+/// Neither form is a string literal, so neither trips the check as
+/// written. The distance to tripping is punctuation: one editor preferring
+/// `"PULSUSDB_X_URL"` to `` `PULSUSDB_X_URL` `` in a file that does not
+/// route that name would have reddened the build for nothing, and the
+/// repair a person reaches for then is an exemption. (An earlier revision
+/// of this paragraph said all 69 were backticked. It was a measurement and
+/// it was wrong; the split is above.)
 ///
 /// Skipping them changed **no verdict in this tree**: of the 46 complete
 /// name literals in scope, 0 were in a comment position.
 ///
-/// ## What this is not
+/// ## String-aware, because the naive version accused a correct file
 ///
-/// Not a lexer, and the two places it is wrong are both stated:
+/// The first version asked only whether `//` appeared earlier on the line.
+/// That is wrong inside a string, and the damage is not confined to the
+/// safe direction — it hides the ROUTING EVIDENCE too. Measured (issue
+/// #523 review round 5): a file with a visible name literal and a
+/// correctly routed call placed after `"http://example/x"` **on the same
+/// line** was accused, `5 tests run: 4 passed, 1 failed`, exit 100. The
+/// same call one line lower passed. A URL in a test file is ordinary, so
+/// that is a false accusation waiting on ordinary code.
 ///
-/// * a `//` that is itself inside a string earlier on the same line
-///   (`"http://h"`) makes everything after it on that line invisible — a
-///   MISS, which is the safe direction. Probed: a line reading
-///   `let _probe = ("http://example/x", "PULSUSDB_GROUPING_DIFF_URL");`
-///   in a file that does not route that name is not reported,
-///   `5 tests run: 5 passed`, exit 0. 0 such lines carry a name in scope
-///   today;
-/// * a `/* … */` block comment is not a line comment, so a name inside
-///   one still counts as code, in both directions. Probed: the same name
-///   inside `/* … */` IS reported, `5 tests run: 4 passed, 1 failed`,
-///   exit 100. 0 in scope today.
+/// The walk below tracks string state instead: `//` starts a comment only
+/// when it is not inside a string, and a backslash inside a string
+/// consumes the next byte so `\"` does not close it. It changed no
+/// verdict either — over every position the two properties inspect (every
+/// complete name literal and every routed spelling in scope), the naive
+/// rule and this one **disagree in 0 places**.
 ///
-/// ## The four probes that fix the behaviour in place
+/// ## What it still is not: a lexer
 ///
-/// All on `crates/pulsus-logql/tests/case_folding.rs`, whole binary:
+/// Four residuals, each measured in scope rather than reasoned about. The
+/// count is of positions the check actually inspects — a line carrying a
+/// complete name literal or a routed spelling — because a construct the
+/// check never looks at cannot mislead it:
 ///
-/// | probe | before this change | after |
+/// | residual | why it would mislead | in scope |
 /// |---|---|---|
-/// | a name only in a comment, not routed in that file | `4 passed, 1 failed`, exit 100 — a FALSE accusation | `5 passed`, exit 0 |
-/// | a comment showing the routed form, with a constant read below it | `5 passed`, exit 0 — the read excused | `4 passed, 1 failed`, exit 100 |
-/// | the bare read restored | `3 passed, 2 failed`, exit 100 | unchanged |
-/// | the constant form | `4 passed, 1 failed`, exit 100 | unchanged |
+/// | a char literal holding a quote, `'"'` | toggles the string state with no string | **0** lines (71 lines carry one at all, none of them near a name or a routed call) |
+/// | a raw string, `r"…"` or `r#"…"#` | its delimiters and any interior quotes need not balance | **0** lines (2981 carry one at all) |
+/// | a string spanning source lines | the walk restarts at each line, so a continuation line is read as code | **0** (3558 lines end inside a string; none is followed by a line the check inspects) |
+/// | a `/* … */` block comment | not a line comment, so a name inside one counts as code both ways | **0** complete names inside one |
+///
+/// The block-comment residual is the only one with a probe, because it is
+/// the only one that can be built without a construct the tree does not
+/// have: the same name inside `/* … */` IS reported,
+/// `5 tests run: 4 passed, 1 failed`, exit 100.
+///
+/// ## The probes that fix the behaviour in place
+///
+/// Eight probes on `crates/pulsus-logql/tests/case_folding.rs`, each run
+/// against the whole binary under all three versions of this predicate, in
+/// one sitting so the columns are comparable. `p`/`f` are `passed` and
+/// `failed` out of `5 tests run`; the exit code follows.
+///
+/// * **scanned** — comments read as code, the state before round 4;
+/// * **naive** — `line.contains("//")`, round 4;
+/// * **aware** — the walk below, round 5.
+///
+/// | probe | scanned | naive | aware |
+/// |---|---|---|---|
+/// | a name only in a comment, not routed in that file | 4p 1f, 100 | 5p, 0 | 5p, 0 |
+/// | a comment showing the routed form, with a constant read below it | 5p, 0 | 4p 1f, 100 | 4p 1f, 100 |
+/// | the bare read restored | 3p 2f, 100 | 3p 2f, 100 | 3p 2f, 100 |
+/// | the constant form | 4p 1f, 100 | 4p 1f, 100 | 4p 1f, 100 |
+/// | a ROUTED call after `"http://example/x"` on the same line | 5p, 0 | 4p 1f, 100 | 5p, 0 |
+/// | an UNROUTED name after `"http://example/x"` on the same line | 4p 1f, 100 | 5p, 0 | 4p 1f, 100 |
+/// | a name inside a `/* … */` block comment | 4p 1f, 100 | 4p 1f, 100 | 4p 1f, 100 |
+/// | no probe at all — the control | 5p, 0 | 5p, 0 | 5p, 0 |
+///
+/// Read the columns rather than the rows. **`aware` differs from `scanned`
+/// on exactly the two rows about a real comment, and agrees with it
+/// everywhere else** — which is the property wanted: a real comment is
+/// ignored, and code that merely looks like one is not. `naive` is the
+/// odd column: it buys the first two rows at the price of the fifth, and
+/// the fifth is ordinary code.
+///
+/// The control row matters as much as the rest. Without it the table would
+/// not show that all three versions leave the tree itself green, which is
+/// the same fact as the 46-and-0 and the 0-disagreements counts above,
+/// arrived at a different way.
 fn is_in_line_comment(src: &str, at: usize) -> bool {
     let line_start = src[..at].rfind('\n').map_or(0, |nl| nl + 1);
-    src[line_start..at].contains("//")
+    let line = &src.as_bytes()[line_start..at];
+    let mut in_string = false;
+    let mut i = 0;
+    while i < line.len() {
+        match line[i] {
+            // Inside a string, a backslash consumes the next byte, so
+            // `\"` does not close it. Outside one, a backslash is not an
+            // escape and this arm must not fire.
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && line.get(i + 1) == Some(&b'/') => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn direct_pulsusdb_reads(src: &str) -> Vec<(usize, String)> {

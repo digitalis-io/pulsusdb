@@ -857,17 +857,56 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
   A previous revision of this row claimed the second could not happen. It
   was false, and it is the one that matters: naming these variables in a
-  comment is the house style — **69 comment mentions across 30 files**,
-  every one in backticks. One editor writing `"PULSUSDB_X_URL"` instead
-  would have reddened the build for nothing, and the repair a person
-  reaches for then is an exemption, which is how a check like this dies.
+  comment is the house style — **69 comment mentions across 30 files: 35
+  backticked, 34 bare.** (A previous revision said all 69 were backticked.
+  That too was a measurement and was wrong; the census command is at
+  `is_in_line_comment` in the check's source.) Neither form is a string
+  literal, so neither trips the check today. The distance to tripping is
+  punctuation: one editor writing `"PULSUSDB_X_URL"` instead of
+  `` `PULSUSDB_X_URL` `` in a file that does not route that name would have
+  reddened the build for nothing, and the repair a person reaches for then
+  is an exemption, which is how a check like this dies.
 
-  Skipping them changed no verdict in this tree: of the 46 complete name
-  literals in scope, 0 sat in a comment position. Two residuals, because
-  this is a line scan and not a lexer — a `//` inside a string earlier on
-  the same line hides the rest of that line (a miss, the safe direction;
-  0 such lines carry a name today), and a `/* … */` block comment still
-  counts as code both ways (0 in scope today).
+  **Recognising a comment is string-aware** (round 5). The first version
+  asked only whether `//` appeared earlier on the line, which is wrong
+  inside a string — and the damage was not confined to the safe direction,
+  because it hid the ROUTING EVIDENCE too:
+
+  Eight probes, each run against the whole five-test binary under all three
+  versions of the predicate in one sitting, so the columns are comparable —
+  **scanned** (comments read as code, before round 4), **naive**
+  (`line.contains("//")`, round 4), **aware** (string-aware, round 5).
+  `p`/`f` are `passed`/`failed` out of `5 tests run`, then the exit code:
+
+  | probe | scanned | naive | aware |
+  |---|---|---|---|
+  | a name only in a comment, not routed in that file | 4p 1f, 100 | 5p, 0 | 5p, 0 |
+  | a comment showing the routed form, with a constant read below it | 5p, 0 | 4p 1f, 100 | 4p 1f, 100 |
+  | the bare read restored | 3p 2f, 100 | 3p 2f, 100 | 3p 2f, 100 |
+  | the constant form | 4p 1f, 100 | 4p 1f, 100 | 4p 1f, 100 |
+  | a ROUTED call after `"http://example/x"` on the same line | 5p, 0 | 4p 1f, 100 | 5p, 0 |
+  | an UNROUTED name after `"http://example/x"` on the same line | 4p 1f, 100 | 5p, 0 | 4p 1f, 100 |
+  | a name inside a `/* … */` block comment | 4p 1f, 100 | 4p 1f, 100 | 4p 1f, 100 |
+  | no probe at all — the control | 5p, 0 | 5p, 0 | 5p, 0 |
+
+  Read the columns, not the rows. **`aware` differs from `scanned` on
+  exactly the two rows about a real comment and agrees with it everywhere
+  else**, which is the property wanted: a real comment is ignored, code
+  that merely looks like one is not. `naive` is the odd column — it buys
+  the first two rows at the price of the fifth, and the fifth is ordinary
+  code. The sixth row is the round-4 note's "safe direction" residual;
+  `aware` removes that too, rather than only removing the accusation.
+
+  Neither change moved a verdict in this tree: 0 of the 46 complete name
+  literals in scope sit in a comment position, and over every position the
+  two properties inspect the naive and the string-aware rules **disagree in
+  0 places**. Four residuals remain, because this is a walk and not a
+  lexer, each counted at the positions the check inspects: a `'"'` char
+  literal, a raw string, a string spanning source lines, and a `/* … */`
+  block comment — **0 instances of each**. Only the block comment can be
+  built out of constructs the tree has, and it is probed: the same name
+  inside `/* … */` IS reported, `5 tests run: 4 passed, 1 failed`,
+  exit 100.
 
   And the scope, part of the claim rather than a weakness: only
   `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`. `xtask/`

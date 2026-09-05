@@ -423,19 +423,29 @@ pub fn live_gate_enabled(var: &str) -> bool {
 /// of this paragraph claimed the second could not happen; it was false,
 /// and the second is the one that matters, because naming these variables
 /// in a comment is the house style — **69 comment mentions across 30
-/// files**, all in backticks. One editor writing `"PULSUSDB_X_URL"`
-/// instead would have reddened the build for nothing, and the repair a
-/// person reaches for then is an exemption.
+/// files: 35 backticked, 34 bare.** (A previous revision said all 69 were
+/// backticked. That too was a measurement and was wrong.) Neither form is
+/// a string literal, so neither trips the check today; the distance to
+/// tripping is punctuation, and one editor writing `"PULSUSDB_X_URL"`
+/// instead of `` `PULSUSDB_X_URL` `` in a file that does not route that
+/// name would have reddened the build for nothing. The repair a person
+/// reaches for then is an exemption.
 ///
-/// Skipping them changed no verdict here: of the 46 complete name
-/// literals in scope, 0 sat in a comment position. What remains, stated
-/// because this is a line-scan and not a lexer: a `//` inside a string
-/// earlier on the same line hides the rest of that line (a MISS, the safe
-/// direction; 0 such lines carry a name today, and a probe of that shape
-/// is not reported — `5 tests run: 5 passed`, exit 0), and a `/* … */`
-/// block comment still counts as code both ways (0 in scope today; the
-/// same probe inside `/* … */` IS reported, `5 tests run: 4 passed,
-/// 1 failed`, exit 100).
+/// **Recognising a comment is string-aware** (round 5). Asking only
+/// whether `//` appeared earlier on the line is wrong inside a string, and
+/// the damage is not confined to the safe direction — it hides the ROUTING
+/// EVIDENCE as well, so a file with a correctly routed call written after
+/// a URL on the same line was accused (`5 tests run: 4 passed, 1 failed`,
+/// exit 100; the same call one line lower passed). A URL in a test file is
+/// ordinary. `//` now starts a comment only outside a string.
+///
+/// Neither change moved a verdict here: 0 of the 46 complete name literals
+/// in scope sit in a comment position, and over every position the two
+/// properties inspect the naive and the string-aware rules disagree in 0
+/// places. What remains is at `is_in_line_comment` in the check's own
+/// source, with a count in scope beside each: a `'"'` char literal, a raw
+/// string, a string spanning source lines, and a `/* … */` block comment —
+/// **0 instances of each** at a position either property inspects.
 ///
 /// And the scope, which is not a weakness but is part of the claim: only
 /// `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`. `xtask/`
