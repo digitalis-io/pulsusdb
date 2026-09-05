@@ -216,7 +216,18 @@ impl Cut {
 /// How many times a statement is sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Issue {
-    /// Sent once.
+    /// Sent AT MOST once, and no driver is attached.
+    ///
+    /// **At most, not exactly**: a plan is a plan-time answer and the
+    /// executor sends fewer statements when the data runs out. Measured
+    /// live on a 7-span corpus, `{ traceDuration > 2s }` issued its
+    /// generator, its hydration and its co-load and then no root read at
+    /// all, because nothing matched and there were no winners to
+    /// summarise. Nothing branches on the stronger reading: the one
+    /// production site that reads this variant is the inexact-limit
+    /// rewrite below, which tests it for *no driver attached* rather
+    /// than *this will execute*, and overwriting is equally safe at zero
+    /// executions and at one (issue #492 part 3).
     Once,
     /// Sent once per seed drawn from `driver`, until the driver stops.
     PerSeed(Driver),
@@ -248,7 +259,18 @@ impl Issue {
 /// A value set crossing from one part to the next. Always materialised
 /// values, never a subquery (ADR 0008 D3), and always bounded.
 pub struct Seed<L: Lang + ?Sized> {
-    pub from_part: usize,
+    /// **Every part whose result the values are drawn from**, in plan
+    /// order — never only the most recent one.
+    ///
+    /// A list because a seed can be a MERGE. A TraceQL search whose
+    /// selector disjoins across two tables opens with two generator
+    /// statements and hydrates their merged candidate set, so a field
+    /// holding one index would have to credit one of the two and would
+    /// describe a dependency the executor does not have (issue #492
+    /// part 3, code review round 1). It holds exactly one index whenever
+    /// one statement produced the values, which is every other case in
+    /// both languages today.
+    pub from_parts: Vec<usize>,
     /// The language's own handoff type — trace ids, fingerprints, a
     /// keyset cursor. At plan time this is the EMPTY handoff: the plan
     /// describes the crossing, and the executor fills the values in.
@@ -490,7 +512,12 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
             })));
         }
     }
-    let mut last_sql_part = parts.len() - 1;
+    // Every part the NEXT seed is drawn from. It is the whole source run
+    // to begin with — a disjunction across two sources opens the plan
+    // with one statement per source and their results are merged — and
+    // one part after each handoff, because a handoff's own result is what
+    // the part after it consumes.
+    let mut seed_from: Vec<usize> = (0..parts.len()).collect();
 
     // --- the links --------------------------------------------------
     let mut links: Vec<LinkOutcome> = Vec::with_capacity(how.len());
@@ -560,16 +587,17 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                             yields: boundary_output(&part_rel),
                             rel: part_rel,
                             seed: Some(Seed {
-                                from_part: last_sql_part,
+                                from_parts: seed_from.clone(),
                                 values: L::Handoff::default(),
                                 bound,
                             }),
                             issue,
                             cut,
                         })));
-                        last_sql_part = parts.len() - 1;
+                        let this_part = parts.len() - 1;
+                        seed_from = vec![this_part];
                         links.push(LinkOutcome {
-                            part: last_sql_part,
+                            part: this_part,
                             how: *disp,
                         });
                     }
@@ -606,6 +634,10 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
         // search's last statement is that shape (the winners' root read,
         // seeded by at most `limit` trace ids), which is why the rule
         // fired on every search before this.
+        let last_sql_part = seed_from
+            .last()
+            .copied()
+            .expect("the source run puts at least one SQL part in seed_from");
         if let Some(Part::Sql(p)) = parts.get_mut(last_sql_part)
             && matches!(p.issue, Issue::Once)
             && !matches!(
@@ -675,7 +707,13 @@ pub struct PlanShape {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum PartShape {
-    Sql(SqlPartShape),
+    /// Boxed for the same reason [`Part::Sql`] is: a rendered statement
+    /// carries six fields including two optional nested structs, an
+    /// engine part carries a kind and a list of link indices, and without
+    /// the indirection every engine part in the vector would pay the
+    /// statement's width. `#[serde(untagged)]` renders through the box,
+    /// so the wire is unchanged.
+    Sql(Box<SqlPartShape>),
     Engine(EnginePartShape),
 }
 
@@ -710,7 +748,8 @@ pub struct CutShape {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SeedShape {
-    pub from: usize,
+    /// Every part index the seed's values come from, in plan order.
+    pub from: Vec<usize>,
     pub bound: BoundShape,
 }
 
@@ -743,13 +782,13 @@ impl<L: Lang + ?Sized> QueryPlan<L> {
             .parts
             .iter()
             .map(|p| match p {
-                Part::Sql(s) => PartShape::Sql(SqlPartShape {
+                Part::Sql(s) => PartShape::Sql(Box::new(SqlPartShape {
                     kind: "sql",
                     name: s.rel.source_ref().as_str().to_string(),
                     issue: s.issue.wire(),
                     cut: s.cut.as_ref().map(cut_shape),
                     seed: s.seed.as_ref().map(|seed| SeedShape {
-                        from: seed.from_part,
+                        from: seed.from_parts.clone(),
                         bound: BoundShape {
                             kind: seed.bound.kind(),
                             name: seed.bound.name(),
@@ -757,7 +796,7 @@ impl<L: Lang + ?Sized> QueryPlan<L> {
                         },
                     }),
                     yields: s.yields.kind(),
-                }),
+                })),
                 Part::Engine { links } => PartShape::Engine(EnginePartShape {
                     kind: "engine",
                     links: links.clone().collect(),
@@ -863,7 +902,7 @@ fn never_wire(n: super::fold::NeverReason) -> &'static str {
 impl<L: Lang + ?Sized> Clone for Seed<L> {
     fn clone(&self) -> Self {
         Self {
-            from_part: self.from_part,
+            from_parts: self.from_parts.clone(),
             values: self.values.clone(),
             bound: self.bound,
         }
@@ -873,7 +912,7 @@ impl<L: Lang + ?Sized> Clone for Seed<L> {
 impl<L: Lang + ?Sized> std::fmt::Debug for Seed<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Seed")
-            .field("from_part", &self.from_part)
+            .field("from_parts", &self.from_parts)
             .field("values", &self.values)
             .field("bound", &self.bound)
             .finish()
@@ -882,7 +921,7 @@ impl<L: Lang + ?Sized> std::fmt::Debug for Seed<L> {
 
 impl<L: Lang + ?Sized> PartialEq for Seed<L> {
     fn eq(&self, other: &Self) -> bool {
-        self.from_part == other.from_part
+        self.from_parts == other.from_parts
             && self.values == other.values
             && self.bound == other.bound
     }
@@ -1632,7 +1671,11 @@ mod tests {
                 key: Name::from("id")
             })
         );
-        assert_eq!(second.seed.as_ref().map(|s| s.from_part), Some(0));
+        assert_eq!(
+            second.seed.as_ref().map(|s| s.from_parts.clone()),
+            Some(vec![0]),
+            "one source statement produced the values, so the seed names exactly it"
+        );
         assert_eq!(
             second.seed.as_ref().map(|s| s.bound),
             Some(SeedBound::RequestLimit(20))

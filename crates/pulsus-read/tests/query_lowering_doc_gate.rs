@@ -78,15 +78,15 @@ fn keys(v: &serde_json::Value, out: &mut BTreeSet<String>) {
 fn maximal_shape() -> PlanShape {
     PlanShape {
         parts: vec![
-            PartShape::Sql(SqlPartShape {
+            PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
                 name: "log_streams_idx".to_string(),
                 issue: "once",
                 cut: None,
                 seed: None,
                 yields: "exact",
-            }),
-            PartShape::Sql(SqlPartShape {
+            })),
+            PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
                 name: "log_samples".to_string(),
                 issue: "per_seed:keyset",
@@ -98,7 +98,7 @@ fn maximal_shape() -> PlanShape {
                     cost: None,
                 }),
                 seed: Some(SeedShape {
-                    from: 0,
+                    from: vec![0],
                     bound: BoundShape {
                         kind: "constant",
                         name: Some("DEFAULT_MAX_STREAMS"),
@@ -106,8 +106,8 @@ fn maximal_shape() -> PlanShape {
                     },
                 }),
                 yields: "candidates",
-            }),
-            PartShape::Sql(SqlPartShape {
+            })),
+            PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
                 name: "trace_attrs_idx".to_string(),
                 issue: "per_seed:chunks",
@@ -122,7 +122,7 @@ fn maximal_shape() -> PlanShape {
                     }),
                 }),
                 seed: Some(SeedShape {
-                    from: 0,
+                    from: vec![0],
                     bound: BoundShape {
                         kind: "request_limit",
                         name: None,
@@ -130,8 +130,8 @@ fn maximal_shape() -> PlanShape {
                     },
                 }),
                 yields: "candidates",
-            }),
-            PartShape::Sql(SqlPartShape {
+            })),
+            PartShape::Sql(Box::new(SqlPartShape {
                 kind: "sql",
                 name: "trace_spans".to_string(),
                 issue: "once",
@@ -144,7 +144,7 @@ fn maximal_shape() -> PlanShape {
                 }),
                 seed: None,
                 yields: "reduced",
-            }),
+            })),
             PartShape::Engine(EnginePartShape {
                 kind: "engine",
                 links: vec![2, 3],

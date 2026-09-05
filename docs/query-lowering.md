@@ -297,15 +297,26 @@ pub enum ColSet {
     /// Known columns, plus open sets each of which can resolve a name to
     /// a SQL expression — or refuse.
     ///
-    /// `Rc`, not `Box`: `Shape: Clone` forces `ColSet: Clone`, and a boxed
-    /// trait object is not `Clone` (R1/R2 below).
-    Open { known: Vec<Name>, from: Vec<Rc<dyn OpenSource>> },
+    /// Not `Box`: `Shape: Clone` forces `ColSet: Clone`, and a boxed
+    /// trait object is not `Clone` (R1/R2 below). `Arc` and not `Rc`
+    /// because a `QueryPlan` holding one is carried across an `.await` —
+    /// see `OpenSource` below.
+    Open { known: Vec<Name>, from: Vec<Arc<dyn OpenSource>> },
 }
 
 /// `Debug` is a supertrait and `id()` is an identity, because `ColSet`
 /// must be `Clone + PartialEq + Eq + Debug` and `#[derive]` cannot see
 /// through `dyn`. `ColSet`'s `PartialEq` is written by hand over `id()`.
-pub trait OpenSource: std::fmt::Debug {
+///
+/// `Send + Sync` because the language's own plan object holds a
+/// `QueryPlan` across an `.await` — the TraceQL search handler builds one
+/// before it acquires a connection and still holds it when the last row
+/// arrives — and an axum handler's future must be `Send`. Measured: with
+/// `Rc` and no bounds, `pulsus-server` does not compile, twice, with
+/// `the trait bound … {search}: Handler<_, _> is not satisfied`
+/// (issue #492 part 3). One implementor exists in the tree and it is
+/// trivially `Send + Sync`.
+pub trait OpenSource: std::fmt::Debug + Send + Sync {
     /// `Some(expr)` if this name is resolvable to SQL here; `None` if the
     /// only way to know its value is to run the stage in the evaluator.
     fn resolve(&self, name: &Name) -> Option<SqlExpr>;
@@ -665,7 +676,11 @@ pub struct SqlPart<L: Lang + ?Sized> {
 /// A value set crossing from one part to the next. Always materialised
 /// values, never a subquery (ADR 0008 D3), and always bounded.
 pub struct Seed<L: Lang + ?Sized> {
-    pub from_part: usize,
+    /// EVERY part whose result the values are drawn from, in plan order.
+    /// A list because a seed can be a MERGE: a TraceQL search disjoining
+    /// across two tables opens with two statements and hydrates their
+    /// merged candidate set, and one index would credit one of the two.
+    pub from_parts: Vec<usize>,
     /// The language's own handoff type — trace ids, fingerprints, a
     /// keyset cursor. Unchanged: this is `L::Handoff` (§2.2).
     pub values: L::Handoff,
@@ -2020,7 +2035,7 @@ It did need widening, in five places:
 
 | finding | what broke | repair, now in this document |
 |---|---|---|
-| **R1** | `Vec<OpenSource>` names a trait as a type — `E0782` | `Vec<Rc<dyn OpenSource>>`; `Rc` and not `Box`, because `Shape: Clone` forces `ColSet: Clone` (§2.3) |
+| **R1** | `Vec<OpenSource>` names a trait as a type — `E0782` | `Vec<Arc<dyn OpenSource>>`; not `Box`, because `Shape: Clone` forces `ColSet: Clone`, and `Arc` rather than `Rc` because the plan crosses an `.await` (§2.3) |
 | **R2** | `Clone`/`Eq`/`Debug` cannot be derived through `dyn` — `E0277` ×4, `E0369` | `OpenSource` gains a `Debug` supertrait and `id()`; `ColSet`'s `PartialEq` is hand-written (§2.3). **Not a LogQL accommodation** — the TraceQL sketch clones `cols` too and hits the same wall |
 | **R3** | the dispatcher never received the stage, so no payload could reach it; and `Drop`/`Keep` share the payload type `Vec<DropKeepElem>`, so per-payload impls collide — `E0119` | `capability`/`apply` take `&L::Stage` (§2.2) |
 | **R3b** | a `&'static` dispatcher needs `Self: 'static` — `E0310` | bound added on `lower_of` and the fold (§2.2, §2.5) |

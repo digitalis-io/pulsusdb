@@ -1,10 +1,24 @@
-//! TraceQL against the shared compile core (issue #492, wave 1).
+//! TraceQL against the shared compile core (issue #492).
 //!
-//! **Compiled and unwired.** [`super::search_plan`] does not call
-//! anything here, so no TraceQL statement moves. What lands is the chain
-//! link set, the [`Lang`] impl, and the two rules the design rests on:
-//! `Emit` is `Never` **and served by its own SQL part**, and no regex leaf
-//! may claim [`Fidelity::Equivalent`].
+//! **Wired, and no TraceQL statement moves.** Since part 3
+//! [`super::search_plan::plan_search`] builds a chain here on every
+//! search request, folds it and plans it;
+//! [`super::exec::TraceEngine`]'s per-batch read dispatch walks that
+//! chain instead of six hand-written index loops; and
+//! `X-Pulsus-Explain: 1` on the search route returns the plan's shape.
+//! Every statement is still rendered by the shipped builders, so all 83
+//! frozen SQL goldens are byte-unchanged — which is what makes a moved
+//! golden, in whatever part next moves one, a renderer defect rather
+//! than an unattributable mix of two changes.
+//!
+//! What lands here is the chain link set, the [`Lang`] impl, the chain
+//! builder ([`chain_of`]), and the two rules the design rests on: `Emit`
+//! is `Never` **and served by its own SQL part**, and no regex leaf may
+//! claim [`Fidelity::Equivalent`].
+//!
+//! **Nothing here compiles a query stage into SQL.** The plan says WHICH
+//! statements a request sends and why each is its own statement; making
+//! one of them do more work belongs to a later part.
 //!
 //! **`Emit` is `Never`, so a lowered TraceQL search is two statements,
 //! not one.** The response's root summary is read trace-wide with **no

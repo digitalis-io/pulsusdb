@@ -238,7 +238,7 @@ Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":
 - **Range-query window semantics (issue #227):** a metric range query re-evaluates the `[range]` selector at every point of the **start-anchored** grid `{start + k·step ≤ end}`, over the **half-open** window `(t − range, t]` — the reference store's sliding evaluation, not fixed step-aligned buckets. Windows **overlap** when `range > step` (one entry contributes to several points), an **empty window emits no point** (a gap, never a zero), and `rate`/`bytes_rate` divide by the **`[range]`** seconds, so `rate({…}[1m])` and `rate({…}[10m])` differ. Instant queries are unaffected (one window `(time − range, time]`). The grid stays anchored on the request `start` — an **accepted divergence** from the reference, recorded below.
 - With `X-Pulsus-Explain: 1`, `data.explain = {"result_type","routing":{"chosen":"rollup"|"raw","reason":"..."}|null,"stages":[{"name","sql","note"|null},...]}` is added alongside `data.stats`. Since issue #492 the object may carry one **additive** fourth key, `plan` — the compiled plan's shape. It is **omitted entirely when absent**. Since issue #492 the **TraceQL search route carries it on every request**, because every search compiles a plan; the logs and the metrics routes still omit it, so an explain response from either of those is byte-identical to one from before the key existed. The three keys above have not moved on any route, and a search response WITHOUT the header is unchanged.
 
-**The `plan` key's complete shape** (issue #492): an ordered list of `parts` — each part either one SQL statement or work in our own process, with the value set crossing between two parts named, typed and bounded — plus one `links` entry per chain link, so every link in the user's pipeline can be traced to the part that runs it. `issue` is `once`, `per_seed:chunks` or `per_seed:keyset`; `yields` is `candidates`, `exact` or `reduced`; `cut` says why a part is its own statement and is `null` only on a part that opens the plan. The example below carries **every key the renderer can emit** — a real response carries only the keys its own plan has:
+**The `plan` key's complete shape** (issue #492): an ordered list of `parts` — each part either one SQL statement or work in our own process, with the value set crossing between two parts named, typed and bounded — plus one `links` entry per chain link, so every link in the user's pipeline can be traced to the part that runs it. `issue` is `once`, `per_seed:chunks` or `per_seed:keyset`; `yields` is `candidates`, `exact` or `reduced`; `cut` says why a part is its own statement and is `null` only on a part that opens the plan. `seed.from` is a **list** of part indices, because a seed can be a merge: a TraceQL search whose selector disjoins across two tables opens with one statement per table and hydrates their merged candidate set, so that part's `from` is `[0, 1]`. It holds one index whenever one statement produced the values. The example below carries **every key the renderer can emit** — a real response carries only the keys its own plan has:
 
 ```json
 {
@@ -247,13 +247,13 @@ Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":
      "seed": null, "yields": "exact"},
     {"kind": "sql", "name": "log_samples", "issue": "per_seed:keyset",
      "cut": {"why": "source_handoff", "source": "log_samples", "key": "fingerprint"},
-     "seed": {"from": 0,
+     "seed": {"from": [0],
               "bound": {"kind": "constant", "name": "DEFAULT_MAX_STREAMS", "value": 100000}},
      "yields": "candidates"},
     {"kind": "sql", "name": "trace_attrs_idx", "issue": "per_seed:chunks",
      "cut": {"why": "handoff_exceeds_bound",
              "cost": {"text_bytes": 1409081, "ast_elements": 65540}},
-     "seed": {"from": 0, "bound": {"kind": "request_limit", "value": 20}},
+     "seed": {"from": [0], "bound": {"kind": "request_limit", "value": 20}},
      "yields": "candidates"},
     {"kind": "sql", "name": "trace_spans", "issue": "once",
      "cut": {"why": "disjoint_sources", "sources": ["trace_spans", "trace_attrs_idx"]},

@@ -202,7 +202,7 @@ fn sql_parts(shape: &PlanShape) -> Vec<&pulsus_read::compile::plan::SqlPartShape
         .parts
         .iter()
         .filter_map(|p| match p {
-            PartShape::Sql(s) => Some(s),
+            PartShape::Sql(s) => Some(s.as_ref()),
             PartShape::Engine(_) => None,
         })
         .collect()
@@ -467,5 +467,69 @@ fn the_corpus_this_target_reads_is_the_committed_one() {
         kinds.len(),
         10,
         "the section vocabulary this target maps: {kinds:?}"
+    );
+}
+
+/// The seed of the first statement after the generators names EVERY
+/// generator it merges, not just the last one.
+///
+/// **The executor merges the generators' candidate lists and hydrates the
+/// merged set** — `merge_candidates` in `traces::exec` — so a plan
+/// crediting one of two generators describes a dependency the request
+/// does not have. It is D1's family: a part naming something other than
+/// what it reads.
+///
+/// The corpus makes the claim non-vacuous rather than an assumption: the
+/// count of two-generator cases is asserted, so a corpus that lost them
+/// would fail here instead of passing over cases that cannot discriminate.
+#[test]
+fn the_first_seeded_part_names_every_generator_it_merges() {
+    let mut multi_generator_cases = 0usize;
+    for g in goldens() {
+        let plan = plan_query(&g.query, g.distributed);
+        let shape = plan.plan_shape();
+        // Generator parts open the plan: SQL parts with no seed.
+        let generators: Vec<usize> = shape
+            .parts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| match p {
+                PartShape::Sql(s) if s.seed.is_none() => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !generators.is_empty(),
+            "{}: a plan always opens with at least one statement",
+            g.case
+        );
+        if generators.len() > 1 {
+            multi_generator_cases += 1;
+        }
+        let first_seeded = shape
+            .parts
+            .iter()
+            .find_map(|p| match p {
+                PartShape::Sql(s) if s.seed.is_some() => Some(s.as_ref()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{}: every search hydrates", g.case));
+        let from = &first_seeded
+            .seed
+            .as_ref()
+            .expect("filtered on Some above")
+            .from;
+        assert_eq!(
+            *from, generators,
+            "{}: the first seeded part draws from {generators:?} and the plan says {from:?}",
+            g.case
+        );
+    }
+    assert_eq!(
+        multi_generator_cases,
+        11 - SAME_SOURCE_GENERATOR_FAN_OUT.len(),
+        "eight committed cases plan TWO generator parts — the eleven that send two generator \
+         statements, less the three same-source ones the frozen exception collapses to one part. \
+         Without them this gate could not tell a merged seed from a single one"
     );
 }
