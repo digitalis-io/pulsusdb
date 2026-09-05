@@ -679,7 +679,7 @@ fn capture_probe(base_url: &str, nonce: u64, sp: &SourceProbe) -> ArtifactProbe 
 /// pinned version AND revision.
 #[test]
 fn the_committed_capture_matches_the_live_reference() {
-    let Ok(base_url) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base_url) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset; skipping the sm collision capture leg");
         return;
     };

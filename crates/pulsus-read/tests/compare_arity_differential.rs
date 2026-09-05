@@ -637,9 +637,14 @@ fn now_ns() -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn compare_arity_differential() {
-    let (Ok(api_base), Ok(otlp_base), true) = (
-        std::env::var("PULSUSDB_COMPARE_DIFF_URL"),
-        std::env::var("PULSUSDB_COMPARE_OTLP_URL"),
+    // FAIL-CLOSED (issue #523). `live_endpoint` panics when a URL is
+    // absent inside a CI job that exists to supply it, and returns `None`
+    // on a developer machine, so this `else` arm is a skip and never a
+    // green run that compared nothing. Both reads happen before the
+    // pattern is matched, so dropping either URL is caught.
+    let (Some(api_base), Some(otlp_base), true) = (
+        pulsus_testkit::live_endpoint("PULSUSDB_COMPARE_DIFF_URL"),
+        pulsus_testkit::live_endpoint("PULSUSDB_COMPARE_OTLP_URL"),
         pulsus_testkit::live_clickhouse_enabled(),
     ) else {
         eprintln!(

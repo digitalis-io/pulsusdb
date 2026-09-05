@@ -344,9 +344,135 @@ pub fn live_gate_enabled(var: &str) -> bool {
     require_live_gate(var).is_running()
 }
 
-/// [`live_gate_enabled`] for an ENDPOINT gate. See [`live_endpoint_gate`].
-pub fn live_endpoint_gate_enabled(var: &str) -> bool {
-    require_live_endpoint_gate(var).is_running()
+/// **The one endpoint read.** `Some(value)` when endpoint gate `var` is
+/// set, `None` when the suite should skip — and a panic, before anything
+/// is returned, when `var` is absent inside a CI job that exists to supply
+/// it (see [`require_live_endpoint_gate`]).
+///
+/// ## Why this exists rather than `env::var` behind a guard
+///
+/// Every reference-facing differential suite needs the same two things:
+/// the endpoint's value, and the fail-closed decision about its absence.
+/// Written by hand that is
+///
+/// ```text
+/// let Ok(base) = std::env::var("PULSUSDB_X_URL") else { return };   // fail-OPEN
+/// ```
+///
+/// which reports a pass having compared nothing, and the corrected form is
+/// three lines that have to be repeated identically at every site. Issue
+/// #458 recorded the hole, #492 part 3 and #523 closed it on three suites
+/// one at a time, and a review of #523 then found sixteen more carrying
+/// it. Sixteen copies of a three-line correction is how this repository
+/// acquired its other duplicated decisions, so the read and the decision
+/// live here together and every suite makes one call.
+///
+/// ## What enforces "every suite", and how far that reaches
+///
+/// Two hermetic checks in `crates/pulsus-testkit/tests/gated_suite_inventory.rs`,
+/// both in the workspace lane on every push. Their scope is `.rs` files
+/// under `crates/*/tests`, recursively, so `tests/common/` modules count.
+///
+/// * `no_test_source_reads_an_endpoint_variable_directly` — no file may
+///   read a `PULSUSDB_*` variable with the name written inside the
+///   `env::var`/`env::var_os` call.
+/// * `every_endpoint_name_written_in_a_test_source_is_routed_through_a_gate`
+///   — a `PULSUSDB_*` name written out as a complete string literal
+///   anywhere in a file must also be handed, in that file, to one of this
+///   crate's gate entry points. This is the one that reaches an
+///   indirection: `const V: &str = "PULSUSDB_X_URL"; env::var(V)` defeats
+///   the first check and is caught by the second, because the constant's
+///   DEFINITION is a literal. Measured on the whole binary:
+///   `5 tests run: 4 passed, 1 failed`, exit 100 — and the `4` is the
+///   load-bearing figure, because it says the first check stayed green.
+///
+/// # What the pair does not reach
+///
+/// Stated as ONE rule with measured instances, rather than a list that
+/// grows an entry per review. Property (5) can see exactly one thing:
+///
+/// > a COMPLETE `PULSUSDB_*` name, spelled as a string literal, in the
+/// > same file that reads it, with every character after the prefix an
+/// > ASCII capital, digit or underscore.
+///
+/// Anything that stops the name being that is invisible to it. Each of
+/// these was run against the whole inventory binary and left every test
+/// green — `5 tests run: 5 passed, 0 skipped`, exit 0:
+///
+/// * assembled at run time — `["PULSUS", "DB_X_URL"].concat()`, `format!`;
+/// * assembled at compile time — `concat!`;
+/// * produced by a macro expansion — `stringify!(PULSUSDB_X_URL)` inside
+///   a `macro_rules!` (issue #523 review round 3);
+/// * defined outside `crates/*/tests` and imported;
+/// * not all upper case — `const V: &str = "PULSUSDB_X_Url";`. Note the
+///   halves differ here: the same name read DIRECTLY is still caught, by
+///   property (4), which puts no case constraint on the name
+///   (`5 tests run: 4 passed, 1 failed`, exit 100).
+///
+/// Two more, of a different kind:
+///
+/// * a file that keeps its routed call and ALSO reads the same name some
+///   other way.
+///
+/// **Line comments are skipped, in both directions** (issue #523 review
+/// round 4). Until that round they were scanned like code, and that was
+/// wrong twice over: a comment showing the recommended form excused a real
+/// unrouted read (`5 tests run: 5 passed`, exit 0), and a name written
+/// ONLY in a comment, in a file with no read and no routed call, made (5)
+/// fail (`5 tests run: 4 passed, 1 failed`, exit 100). An earlier revision
+/// of this paragraph claimed the second could not happen; it was false,
+/// and the second is the one that matters, because naming these variables
+/// in a comment is the house style — **69 comment mentions across 30
+/// files: 35 backticked, 34 bare.** (A previous revision said all 69 were
+/// backticked. That too was a measurement and was wrong.) Neither form is
+/// a string literal, so neither trips the check today; the distance to
+/// tripping is punctuation, and one editor writing `"PULSUSDB_X_URL"`
+/// instead of `` `PULSUSDB_X_URL` `` in a file that does not route that
+/// name would have reddened the build for nothing. The repair a person
+/// reaches for then is an exemption.
+///
+/// **Recognising a comment is string-aware** (round 5). Asking only
+/// whether `//` appeared earlier on the line is wrong inside a string, and
+/// the damage is not confined to the safe direction — it hides the ROUTING
+/// EVIDENCE as well, so a file with a correctly routed call written after
+/// a URL on the same line was accused (`5 tests run: 4 passed, 1 failed`,
+/// exit 100; the same call one line lower passed). A URL in a test file is
+/// ordinary. `//` now starts a comment only outside a string.
+///
+/// Neither change moved a verdict here: 0 of the 46 complete name literals
+/// in scope sit in a comment position, and over every position the two
+/// properties inspect the naive and the string-aware rules disagree in 0
+/// places. What remains is at `is_in_line_comment` in the check's own
+/// source, with a count in scope beside each: a `'"'` char literal, a raw
+/// string, a string spanning source lines, and a `/* … */` block comment —
+/// **0 instances of each** at a position either property inspects.
+///
+/// And the scope, which is not a weakness but is part of the claim: only
+/// `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`. `xtask/`
+/// and `e2e/` name no `PULSUSDB_*` variable at all today, measured with
+/// `git grep -n 'PULSUSDB_' -- e2e xtask`.
+///
+/// So the claim, exactly: **closed against every form a person writes
+/// without meaning to bypass the check, and open to a deliberate one.**
+/// A `macro_rules!` that stringifies an endpoint name, like
+/// `std::mem::forget` on a database guard, is not something anyone
+/// reaches for by accident, and following either would mean a parser.
+///
+/// ## The value is returned exactly as the environment holds it
+///
+/// No trimming. A gate counts as set when its value is non-blank
+/// ([`GateValue::Endpoint`]), so `" "` skips, but `" http://x "` runs and
+/// yields the padded string — the same value a bare `env::var` yielded
+/// before this helper existed. Changing that here would change what every
+/// converted suite sends.
+pub fn live_endpoint(var: &str) -> Option<String> {
+    if require_live_endpoint_gate(var).is_running() {
+        // `Run` is only reachable through `GateValue::Endpoint::is_set`,
+        // which already matched `Some(v)` with a non-blank `v`.
+        Some(std::env::var(var).expect("the gate classified this variable as set"))
+    } else {
+        None
+    }
 }
 
 /// [`live_gate_enabled`] for the common [`CLICKHOUSE_GATE`].

@@ -135,7 +135,7 @@ fn tempo_verdict(base: &str, query: &str) -> Verdict {
 
 #[test]
 fn registry_probes_match_the_recorded_tempo_verdict() {
-    let Ok(base) = std::env::var("PULSUSDB_TEMPO_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_TEMPO_DIFF_URL") else {
         eprintln!("PULSUSDB_TEMPO_DIFF_URL unset; skipping the Tempo differential leg");
         return;
     };
@@ -226,7 +226,7 @@ fn validate_vectors_match_the_live_reference() {
         eprintln!("PULSUSDB_TEMPO_VECTORS unset; skipping the validate-vectors live leg");
         return;
     }
-    let base = std::env::var("PULSUSDB_TEMPO_DIFF_URL")
+    let base = pulsus_testkit::live_endpoint("PULSUSDB_TEMPO_DIFF_URL")
         .expect("PULSUSDB_TEMPO_VECTORS=1 requires PULSUSDB_TEMPO_DIFF_URL");
 
     #[derive(Deserialize)]

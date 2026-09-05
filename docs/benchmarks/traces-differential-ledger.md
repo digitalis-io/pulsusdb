@@ -763,54 +763,203 @@ when we are asking it to slow down, so we keep `429`; recorded as
   asserts each of the five facts above individually, so the entry cannot
   be satisfied by existing.
 
-### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **open wiring risk on TWO of the original three**
+### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **CLOSED against every accidental form; a deliberate bypass is still possible (issue #523)**
 
 - **What.** Reference-facing differential suites that read the URL of the
   container they compare against with a bare `std::env::var` and take a
-  skip arm when it is absent. Three carried it; **two still do**:
+  skip arm when it is absent. Three were fixed one at a time:
 
-  | suite | endpoint variables | state |
+  | suite | endpoint variables | fixed in |
   |---|---|---|
-  | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` | open |
-  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_DIFF_URL`, `PULSUSDB_NESTEDSET_OTLP_URL` | open |
-  | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` | **closed in issue #492 part 3** — both URLs now go through `require_live_endpoint_gate` |
+  | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` | issue #492 part 3 |
+  | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` | issue #523 |
+  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_DIFF_URL`, `PULSUSDB_NESTEDSET_OTLP_URL` | issue #523 |
 
-- **Why the grouping leg was closed out of order.** A code review of that
-  part ran the leg without endpoints and watched it report
-  `6 tests run: 6 passed` having compared nothing — the failure this entry
-  describes, observed rather than predicted, on a step that part's own
-  verification depends on. The fix is the two lines this entry already
-  named, so it was cheaper to apply than to re-record. The other two are
-  untouched and this entry stays open for them.
+  A code review of #523 then found **sixteen more** live differential
+  suites carrying the identical shape — none broken on the day, because
+  every checked-in step supplied its address, but each one green having
+  compared nothing the moment a step lost its `env:` block. Fixing
+  sixteen more instances would have left the class open, so the read and
+  the fail-closed decision were merged into one function:
 
-- **Why it matters.** Each also checks `PULSUS_TEST_CLICKHOUSE`, which IS
-  fail-closed. So with the ClickHouse gate still set and only the URL
-  variables dropped from a `schema-it` step, the suite prints a skip
-  notice and the step reports **green having compared nothing** — the
+  ```rust
+  let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_X_URL") else {
+      return;                      // developer machine: a clean skip
+  };                               // live CI job: panics before returning
+  ```
+
+  `live_endpoint` panics when the variable is absent inside a CI job that
+  is not in `pulsus_testkit::HERMETIC_CI_JOBS`, returns `None` on a
+  machine with no `GITHUB_JOB`, and otherwise returns the address. Every
+  reference-facing suite in the workspace now makes that one call.
+
+- **What keeps it closed, and how far.** Two hermetic checks in
+  `crates/pulsus-testkit/tests/gated_suite_inventory.rs`, both in the
+  workspace lane, both scanning `.rs` files under `crates/*/tests`
+  recursively.
+
+  | check | what it refuses |
+  |---|---|
+  | `no_test_source_reads_an_endpoint_variable_directly` | the name written inside an `env::var`/`env::var_os` call |
+  | `every_endpoint_name_written_in_a_test_source_is_routed_through_a_gate` | a complete `PULSUSDB_*` name written anywhere in a file that does not also hand it to a gate entry point |
+
+  Both breaks, run against the whole five-test binary at this revision, on
+  `crates/pulsus-logql/tests/case_folding.rs:874`:
+
+  | break | `Summary` line | exit |
+  |---|---|---|
+  | the bare read restored — `env::var("PULSUSDB_LOGQL_DIFF_URL")` | `5 tests run: 3 passed, 2 failed, 0 skipped` | 100 |
+  | the constant form — `const ENDPOINT_VAR: &str = "…"; env::var(ENDPOINT_VAR)` | `5 tests run: 4 passed, 1 failed, 0 skipped` | 100 |
+
+  The second row's **`4 passed`, not 3, is the load-bearing figure**: it
+  says the first check stayed green and the second one is doing the work.
+  That is why the second check exists — the first is dead for the constant
+  form, measured at the revision before it was added, when the binary held
+  four tests and all four passed. Naming a constant is ordinary style
+  rather than sabotage, so the check had to reach it; it does so by going
+  to the other end, where the name may be WRITTEN, so a constant holding
+  the name has nowhere to live.
+
+  **What the pair does not reach.** Stated as one rule with measured
+  instances, rather than a list that grows an entry per review. Property
+  (5) sees exactly one thing: *a complete `PULSUSDB_*` name, spelled as a
+  string literal, in the same file that reads it, with every character
+  after the prefix an ASCII capital, digit or underscore.* Anything that
+  stops the name being that is invisible. Each of these left every test in
+  the binary green — `5 tests run: 5 passed, 0 skipped`, exit 0:
+
+  - assembled at run time — `["PULSUS", "DB_X_URL"].concat()`, `format!`;
+  - assembled at compile time — `concat!`;
+  - produced by a macro expansion — `stringify!(PULSUSDB_X_URL)` inside a
+    `macro_rules!`;
+  - defined outside `crates/*/tests` and imported;
+  - not all upper case — `const V: &str = "PULSUSDB_X_Url";`. The halves
+    differ here: the same name read DIRECTLY is still caught, by the first
+    check, which puts no case constraint on the name
+    (`5 tests run: 4 passed, 1 failed`, exit 100).
+
+  Two more, of a different kind:
+
+  - a file that keeps its routed call and also reads the same name some
+    other way.
+
+  **Line comments are skipped, in both directions.** Until issue #523
+  review round 4 they were scanned like code, which was wrong twice over:
+
+  | comment form | before round 4 | after |
+  |---|---|---|
+  | a comment showing `live_endpoint("NAME")`, with a constant read of the same name below it | counted as routing evidence, so the read was excused — `5 tests run: 5 passed`, exit 0 | the read is caught — `5 tests run: 4 passed, 1 failed`, exit 100 |
+  | a name written ONLY in a comment, in a file with no read and no routed call | the file was accused — `5 tests run: 4 passed, 1 failed`, exit 100 | not accused — `5 tests run: 5 passed`, exit 0 |
+
+  The two breaks that must keep working are unchanged by it: the bare read
+  is still `5 tests run: 3 passed, 2 failed`, exit 100, and the constant
+  form still `5 tests run: 4 passed, 1 failed`, exit 100.
+
+  A previous revision of this row claimed the second could not happen. It
+  was false, and it is the one that matters: naming these variables in a
+  comment is the house style — **69 comment mentions across 30 files: 35
+  backticked, 34 bare.** (A previous revision said all 69 were backticked.
+  That too was a measurement and was wrong; the census command is at
+  `is_in_line_comment` in the check's source.) Neither form is a string
+  literal, so neither trips the check today. The distance to tripping is
+  punctuation: one editor writing `"PULSUSDB_X_URL"` instead of
+  `` `PULSUSDB_X_URL` `` in a file that does not route that name would have
+  reddened the build for nothing, and the repair a person reaches for then
+  is an exemption, which is how a check like this dies.
+
+  **Recognising a comment is string-aware** (round 5). The first version
+  asked only whether `//` appeared earlier on the line, which is wrong
+  inside a string — and the damage was not confined to the safe direction,
+  because it hid the ROUTING EVIDENCE too:
+
+  Eight probes, each run against the whole five-test binary under all three
+  versions of the predicate in one sitting, so the columns are comparable —
+  **scanned** (comments read as code, before round 4), **naive**
+  (`line.contains("//")`, round 4), **aware** (string-aware, round 5).
+  `p`/`f` are `passed`/`failed` out of `5 tests run`, then the exit code:
+
+  | probe | scanned | naive | aware |
+  |---|---|---|---|
+  | a name only in a comment, not routed in that file | 4p 1f, 100 | 5p, 0 | 5p, 0 |
+  | a comment showing the routed form, with a constant read below it | 5p, 0 | 4p 1f, 100 | 4p 1f, 100 |
+  | the bare read restored | 3p 2f, 100 | 3p 2f, 100 | 3p 2f, 100 |
+  | the constant form | 4p 1f, 100 | 4p 1f, 100 | 4p 1f, 100 |
+  | a ROUTED call after `"http://example/x"` on the same line | 5p, 0 | 4p 1f, 100 | 5p, 0 |
+  | an UNROUTED name after `"http://example/x"` on the same line | 4p 1f, 100 | 5p, 0 | 4p 1f, 100 |
+  | a name inside a `/* … */` block comment | 4p 1f, 100 | 4p 1f, 100 | 4p 1f, 100 |
+  | no probe at all — the control | 5p, 0 | 5p, 0 | 5p, 0 |
+
+  Read the columns, not the rows. **`aware` differs from `scanned` on
+  exactly the two rows about a real comment and agrees with it everywhere
+  else**, which is the property wanted: a real comment is ignored, code
+  that merely looks like one is not. `naive` is the odd column — it buys
+  the first two rows at the price of the fifth, and the fifth is ordinary
+  code. The sixth row is the round-4 note's "safe direction" residual;
+  `aware` removes that too, rather than only removing the accusation.
+
+  Neither change moved a verdict in this tree: 0 of the 46 complete name
+  literals in scope sit in a comment position, and over every position the
+  two properties inspect the naive and the string-aware rules **disagree in
+  0 places**. Four residuals remain, because this is a walk and not a
+  lexer, each counted at the positions the check inspects: a `'"'` char
+  literal, a raw string, a string spanning source lines, and a `/* … */`
+  block comment — **0 instances of each**. Only the block comment can be
+  built out of constructs the tree has, and it is probed: the same name
+  inside `/* … */` IS reported, `5 tests run: 4 passed, 1 failed`,
+  exit 100.
+
+  And the scope, part of the claim rather than a weakness: only
+  `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`. `xtask/`
+  and `e2e/` name no `PULSUSDB_*` variable at all today
+  (`git grep -n 'PULSUSDB_' -- e2e xtask` returns nothing).
+
+  So the claim is: **closed against every form written without the intent
+  to bypass it**, not closed against a deliberate one. A `macro_rules!`
+  that stringifies an endpoint name is in the same class as
+  `std::mem::forget` on a database guard — not something anyone reaches
+  for by accident, and following either would mean a parser. Both checks
+  carry floors — on `live_endpoint` call sites and on routed names — so a
+  tree with the calls deleted does not satisfy them by absence.
+
+- **Why it mattered.** Each suite also checks `PULSUS_TEST_CLICKHOUSE`,
+  which IS fail-closed. So with the ClickHouse gate still set and only the
+  URL variables dropped from a `schema-it` step, the suite printed a skip
+  notice and the step reported **green having compared nothing** — the
   issue #320 failure, inside the legs whose whole purpose is to compare
-  against the reference. Nothing currently detects it: the guard that
-  would (`pulsus_testkit::require_live_endpoint_gate`) is not reached,
-  because the bare `env::var` returns first.
+  against the reference. The guard that would have caught it was never
+  reached, because the bare `env::var` returned first.
 
-- **Measured, on the suite where it was fixed.** `traces_metrics_filter_differential.rs`
-  had the identical shape and now routes both URLs through
-  `require_live_endpoint_gate`. With the URLs dropped and
-  `PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it` set it fails loudly
-  (`PULSUSDB_METRICS_FILTER_DIFF_URL is not set, but this is CI job
-  "schema-it"…`); before the change the same invocation printed a skip
-  notice and exited `ok`.
+- **Measured on both remaining suites, before and after (issue #523).**
+  Same invocation each time, endpoint variables removed from the
+  environment, `PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it` set:
 
-- **Why the remaining two are not fixed here.** Neither is currently
-  failing, issue #458 is about span durations and metrics filters, and
-  each suite's gating is a change with its own review surface. They are
-  recorded rather than bundled — but this is a wiring hole, not a
-  divergence, and the failure mode is silence.
+  ```text
+  env -u PULSUSDB_COMPARE_DIFF_URL -u PULSUSDB_COMPARE_OTLP_URL \
+      PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it \
+      cargo nextest run -p pulsus-read --test compare_value_differential
+  ```
 
-- **The fix, when it is scheduled.** Two lines per suite:
-  `pulsus_testkit::require_live_endpoint_gate("<VAR>")` before the
-  `env::var` reads, once per endpoint variable. The endpoint kind exists
-  because these gates carry a URL and the boolean helper counts a gate as
-  set only when it is exactly `"1"`.
+  | suite | at `d542869b` | with the fix |
+  |---|---|---|
+  | `compare_value_differential` | `2 tests run: 2 passed, 0 skipped`, exit 0 | `2 tests run: 1 passed, 1 failed`, exit 100 |
+  | `nestedset_value_differential` | `1 test run: 1 passed, 0 skipped`, exit 0 | `1 test run: 0 passed, 1 failed`, exit 100 |
+
+  The failure message names the variable and the job:
+  `PULSUSDB_COMPARE_DIFF_URL is not set, but this is CI job "schema-it",
+  which exists to provide the live dependency …`.
+
+  The same two invocations with `GITHUB_JOB` **unset** — a developer
+  machine with no reference container — still report
+  `2 tests run: 2 passed` and `1 test run: 1 passed`, exit 0. The guard
+  fires on the wiring failure, not on the absence of a container.
+
+- **What the nested-set guard does today.** It is latent. No workflow
+  supplies that suite's two variables (`crates/pulsus-read/tests/warning_inventory.rs`
+  asserts the closed set of files that may name them), and the `ci` job is
+  in `HERMETIC_CI_JOBS`, so the aggregate `--workspace` run still skips.
+  Measured with `GITHUB_JOB=ci` and no URLs: `1 test run: 1 passed`,
+  exit 0. It fires the moment a step in a live job runs the suite without
+  its `env:` block.
 
 ### `traceql-compare-topn-tie-order` (issue #460) — **a deliberate refinement: our tie order is deterministic where the reference's is arbitrary**
 

@@ -986,13 +986,14 @@ fn the_projection_leg_does_not_share_an_instance_with_another_suite() {
 async fn traces_search_projection_differential() {
     // FAIL-CLOSED on all three: dropping any `env:` block from this
     // suite's CI step PANICS rather than skipping green. The endpoint
-    // gates go through `require_live_endpoint_gate`, not the boolean one —
-    // a URL-valued gate read by the boolean rule looks "not set" while the
-    // `env:` block is right there in the log.
-    let api_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_PROJECTION_DIFF_URL");
-    let otlp_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_PROJECTION_OTLP_URL");
-    if !(api_gate.is_running()
-        && otlp_gate.is_running()
+    // gates go through `pulsus_testkit::live_endpoint`, which applies the
+    // ENDPOINT rule and not the boolean one — a URL-valued gate read by
+    // the boolean rule looks "not set" while the `env:` block is right
+    // there in the log.
+    let api_endpoint = pulsus_testkit::live_endpoint("PULSUSDB_PROJECTION_DIFF_URL");
+    let otlp_endpoint = pulsus_testkit::live_endpoint("PULSUSDB_PROJECTION_OTLP_URL");
+    if !(api_endpoint.is_some()
+        && otlp_endpoint.is_some()
         && pulsus_testkit::live_clickhouse_enabled())
     {
         eprintln!(
@@ -1001,8 +1002,8 @@ async fn traces_search_projection_differential() {
         );
         return;
     }
-    let api_base = std::env::var("PULSUSDB_PROJECTION_DIFF_URL").expect("gate is running");
-    let otlp_base = std::env::var("PULSUSDB_PROJECTION_OTLP_URL").expect("gate is running");
+    let api_base = api_endpoint.expect("checked just above");
+    let otlp_base = otlp_endpoint.expect("checked just above");
 
     let base = now_ns() - 60_000_000_000;
     let window = (base - 60_000_000_000, base + 600_000_000_000);

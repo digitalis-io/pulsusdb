@@ -36,7 +36,7 @@ mod live_db;
 #[path = "support/wire_capture.rs"]
 mod wire_capture;
 
-use live_db::drop_db;
+use live_db::ScopedDb;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -483,15 +483,25 @@ impl Drop for ChildGuard {
     }
 }
 
-fn spawn_ready(port: u16, db: &str) -> ChildGuard {
+fn spawn_ready(port: u16, db: &ScopedDb) -> ChildGuard {
     spawn_ready_with_env(port, db, &[])
 }
 
 /// [`spawn_ready`] plus extra environment variables for the one suite that
 /// needs them (issue #474's frozen fixture needs a retention that covers
-/// its 2023 timestamps). Same parameter shape as
-/// `traces_search_live.rs`'s own `spawn_ready`.
-fn spawn_ready_with_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+/// its 2023 timestamps).
+///
+/// **`&ScopedDb`, not `&str` (issue #523 review round 1).** The name of the
+/// database this server writes to has to come from a guard that drops it
+/// on entry and on exit, and the type is what makes that so: a test cannot
+/// hand a bare `pulsus_testkit::test_db(…)` here, because `String` is not
+/// `ScopedDb` and `ScopedDb`'s only constructor is `ScopedDb::fresh`, which
+/// does the entry drop and installs the exit drop. Before this the
+/// parameter was `&str`, all ten tests happened to pass a guard, and
+/// replacing one with a bare name compiled and passed — measured by the
+/// review, which is why the signature changed rather than a comment being
+/// added.
+fn spawn_ready_with_env(port: u16, db: &ScopedDb, extra_env: &[(&str, &str)]) -> ChildGuard {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     let command = command
         .env("PULSUS_HOST", "127.0.0.1")
@@ -504,7 +514,7 @@ fn spawn_ready_with_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> Chil
             "CLICKHOUSE_HTTP_PORT",
             std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
         )
-        .env("CLICKHOUSE_DB", db)
+        .env("CLICKHOUSE_DB", db.name())
         // Issue #61 (T9): mount the Tempo compat aliases — needed by the
         // alias byte-identity suite; a no-op for the native assertions
         // (router-build-time merging only, no per-request behavior).
@@ -769,7 +779,8 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
         return;
     }
 
-    let _guard = spawn_ready(PORT, &pulsus_testkit::test_db("pulsus_traces_api_it_live"));
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_it_live")).await;
+    let _guard = spawn_ready(PORT, &db);
 
     // -- Seed trace A: 3 spans, start times chosen so canonical output
     // order (startTimeUnixNano, spanId) differs from insert order.
@@ -1021,10 +1032,8 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
     }
 
     let port = ALIAS_PORT;
-    let _guard = spawn_ready(
-        port,
-        &pulsus_testkit::test_db("pulsus_traces_compat_it_live"),
-    );
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_compat_it_live")).await;
+    let _guard = spawn_ready(port, &db);
 
     // Seed one trace: 2 spans, start times chosen so canonical output
     // order differs from insert order (a real, non-trivial body). Window
@@ -1198,10 +1207,11 @@ async fn zipkin_shared_span_trace_by_id_returns_both_the_server_and_client_sides
         return;
     }
 
-    let _guard = spawn_ready(
-        ZIPKIN_PORT,
-        &pulsus_testkit::test_db("pulsus_traces_api_it_zipkin_shared"),
-    );
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_api_it_zipkin_shared",
+    ))
+    .await;
+    let _guard = spawn_ready(ZIPKIN_PORT, &db);
 
     // Recent timestamp so the 7-day delete-TTL never drops the part; micros
     // on the wire, seconds for the search window.
@@ -1348,10 +1358,8 @@ async fn duration_seconds_reach_the_wire_exactly_as_the_reference_emits_them() {
         return;
     }
 
-    let _guard = spawn_ready(
-        ULP_PORT,
-        &pulsus_testkit::test_db("pulsus_traces_ulp_it_live"),
-    );
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_ulp_it_live")).await;
+    let _guard = spawn_ready(ULP_PORT, &db);
 
     // One single-span service per width (12 discriminating + 3 controls),
     // one `ResourceSpans` per service, one sync protobuf POST /v1/traces.
@@ -1516,10 +1524,11 @@ async fn span_summaries_carry_duration_nanos_as_a_protojson_string_on_the_wire()
     }
 
     let port = SPAN_DURATION_PORT;
-    let _guard = spawn_ready(
-        port,
-        &pulsus_testkit::test_db("pulsus_traces_span_duration_it_live"),
-    );
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_span_duration_it_live",
+    ))
+    .await;
+    let _guard = spawn_ready(port, &db);
 
     // The file's fixture instant; window math below is in unix SECONDS.
     let start_ns: u64 = 3_100_000_000_000_000_200;
@@ -1736,10 +1745,8 @@ async fn search_response_integers_stay_inside_their_wire_domain_on_the_wire() {
     }
 
     let port = WIRE_DOMAIN_PORT;
-    let _guard = spawn_ready(
-        port,
-        &pulsus_testkit::test_db("pulsus_traces_wire_domain_it_live"),
-    );
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_wire_domain_it_live")).await;
+    let _guard = spawn_ready(port, &db);
 
     // The file's fixture instant; window math below is in unix SECONDS.
     const START_NS: u64 = 3_100_000_000_000_000_200;
@@ -1899,10 +1906,8 @@ async fn the_trace_level_start_and_duration_are_the_trace_envelope_on_the_wire()
     }
 
     let port = TRACE_ENVELOPE_PORT;
-    let _guard = spawn_ready(
-        port,
-        &pulsus_testkit::test_db("pulsus_traces_envelope_it_live"),
-    );
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_envelope_it_live")).await;
+    let _guard = spawn_ready(port, &db);
 
     // The file's fixture instant; window math below is in unix SECONDS.
     const BASE_NS: u64 = 3_100_000_000_000_000_000;
@@ -2111,11 +2116,14 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
     );
 
     let capture = wire_capture::load();
-    let db = pulsus_testkit::test_db("pulsus_traces_nullable_wire_it_live");
     // A re-run against a server still holding the previous run's rows must
     // not be able to make the count assertion pass or fail for the wrong
-    // reason.
-    drop_db(&db).await;
+    // reason. The guard drops on entry AND on exit, including the panicking
+    // exit, so no arm of this test can leave the rows behind (issue #523).
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_nullable_wire_it_live",
+    ))
+    .await;
     let _guard = spawn_ready_with_env(
         NULLABLE_WIRE_PORT,
         &db,
@@ -2287,8 +2295,6 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
         "trace not found",
         "{ctx}: the v1 body is this surface's only live mounting oracle"
     );
-
-    drop_db(&db).await;
 }
 
 /// AC8(iv-c) (issue #477): the range route rejects with `422` a group the
@@ -2329,11 +2335,12 @@ async fn the_range_route_rejects_a_group_the_instant_route_serves() {
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
         return;
     }
-    let db = pulsus_testkit::test_db("pulsus_traces_api_it_cap");
     // A re-run against a server still holding the previous run's rows must
     // not be able to make the cap assertions pass or fail for the wrong
-    // reason.
-    drop_db(&db).await;
+    // reason. The guard drops on entry AND on exit (issue #523): before it,
+    // this test dropped only on entry and left its rows resident between
+    // runs.
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_it_cap")).await;
     let _child = spawn_ready_with_env(CAP_PROBE_PORT, &db, &[("PULSUS_TRACEQL_MAX_SERIES", "1")]);
 
     // E: `cap-b` sits at exactly `aE`, which the half-open instant window
@@ -2490,10 +2497,10 @@ async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request
         eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse");
         return;
     }
-    let db = pulsus_testkit::test_db("pulsus_traces_api_it_ceiling");
     // The trace COUNT is the assertion, so a re-run must not find the
-    // previous run's rows.
-    drop_db(&db).await;
+    // previous run's rows. The guard drops on entry AND on exit, including
+    // the panicking exit (issue #523).
+    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_it_ceiling")).await;
 
     const NS: u64 = 1_000_000_000;
     const START_S: u64 = 3_100_500_000;
@@ -2576,5 +2583,4 @@ async fn the_incomplete_signal_follows_the_candidate_ceiling_and_not_the_request
     drop(two);
     drop(one);
     drop(high);
-    drop_db(&db).await;
 }

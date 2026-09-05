@@ -71,13 +71,28 @@
 //! the fixtures are our own authorship and the Tempo values are read back
 //! as black-box runtime output.
 //!
-//! **Known wiring hole, recorded not fixed** (issue #458): this suite's
-//! endpoint URL variables are read with a bare `env::var` and taken as a
-//! skip when absent, while `PULSUS_TEST_CLICKHOUSE` is fail-closed. Drop
-//! only the URLs from a live step and it reports GREEN having compared
-//! nothing — ledger entry
-//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
-//! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
+//! **Fail-closed on all three gates** (issue #458 recorded the hole,
+//! issue #523 closed it here; the same fix landed on
+//! `traces_search_grouping_differential.rs` under #492 part 3). Both
+//! endpoint URLs go through `pulsus_testkit::live_endpoint` — the one
+//! endpoint read in the workspace (issue #523 review round 1) — and it
+//! classifies them as ENDPOINT gates, not boolean ones: a URL-valued variable read by the boolean rule
+//! looks "not set" while the `env:` block is right there in the log.
+//! Before this, the URLs were read with a bare `env::var` and taken as a
+//! skip, so dropping only them from a live step reported GREEN having
+//! compared nothing. Measured at `d542869b`
+//! (`PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it`, no URLs):
+//! `1 passed`; with this change the same invocation panics naming the
+//! variable and the job. A developer machine — no `GITHUB_JOB` — still
+//! skips cleanly. Ledger entry
+//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`.
+//!
+//! The guard is latent here rather than active: no workflow supplies this
+//! suite's two gate variables (`crates/pulsus-read/tests/warning_inventory.rs`
+//! asserts that closed set), and the `ci` job is in
+//! `pulsus_testkit::HERMETIC_CI_JOBS`, so the aggregate `--workspace` run
+//! still skips. It fires the moment a step in a live job runs this suite
+//! without its `env:` block.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -523,18 +538,23 @@ fn now_ns() -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nestedset_value_differential() {
-    let (Ok(api_base), Ok(otlp_base), true) = (
-        std::env::var("PULSUSDB_NESTEDSET_DIFF_URL"),
-        std::env::var("PULSUSDB_NESTEDSET_OTLP_URL"),
-        pulsus_testkit::live_clickhouse_enabled(),
-    ) else {
+    // FAIL-CLOSED on all three: see the module docs. The guard fires only
+    // when a gate is missing inside a CI job that exists to supply it, so
+    // a developer machine with no reference container still skips.
+    let api_endpoint = pulsus_testkit::live_endpoint("PULSUSDB_NESTEDSET_DIFF_URL");
+    let otlp_endpoint = pulsus_testkit::live_endpoint("PULSUSDB_NESTEDSET_OTLP_URL");
+    if !(api_endpoint.is_some()
+        && otlp_endpoint.is_some()
+        && pulsus_testkit::live_clickhouse_enabled())
+    {
         eprintln!(
             "skipping the nested-set value differential — set PULSUS_TEST_CLICKHOUSE=1, \
-             PULSUSDB_NESTEDSET_DIFF_URL (Tempo API) and PULSUSDB_NESTEDSET_OTLP_URL (Tempo OTLP). \
-             Env-gated, unenforced in fast CI; #185 activates enforcement."
+             PULSUSDB_NESTEDSET_DIFF_URL (Tempo API) and PULSUSDB_NESTEDSET_OTLP_URL (Tempo OTLP)."
         );
         return;
-    };
+    }
+    let api_base = api_endpoint.expect("checked just above");
+    let otlp_base = otlp_endpoint.expect("checked just above");
 
     let bootstrap = ChClient::new(ch_config("default"))
         .await

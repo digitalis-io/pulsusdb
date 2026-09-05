@@ -10,6 +10,11 @@ regex.workspace = true
 regex-syntax.workspace = true
 
 [dev-dependencies]
+# Issue #523: the ONE endpoint read, `pulsus_testkit::live_endpoint`.
+# This crate's reference-facing suites used a bare `env::var` and took a
+# missing endpoint as a skip, so a live CI step that lost its `env:` block
+# reported green having compared nothing. Dependency-free crate, dev-only.
+pulsus-testkit = { path = "../pulsus-testkit" }
 # Issue #291: the allocation gate asserts the intersection premise
 # (`[\p{L}&&\p{Nd}]` translates to an EMPTY class) against the same
 # parser the estimator uses, rather than restating it.

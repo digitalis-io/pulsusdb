@@ -341,7 +341,7 @@ fn the_committed_property_table_is_exactly_the_go_one() {
 #[test]
 #[ignore = "202 live HTTP probes against the pinned reference; ~86 s"]
 fn live_probe_every_property_name() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the 202-name live probe");
         return;
     };

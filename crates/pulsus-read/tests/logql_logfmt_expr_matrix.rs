@@ -1641,7 +1641,7 @@ fn reference_verdict(base: &str, query: &str) -> (Verdict, String) {
 /// is measured rather than assumed.
 #[test]
 fn live_matrix_against_the_reference() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live logfmt-expression matrix");
         return;
     };
@@ -1787,7 +1787,7 @@ const ROUTES: &[Route] = &[
 /// **"Only observable where a pipeline runs" is measured, not argued.**
 #[test]
 fn live_surface_axis_agrees() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live surface axis");
         return;
     };

@@ -9,6 +9,11 @@ rust-version.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# Issue #523: the ONE endpoint read, `pulsus_testkit::live_endpoint`.
+# This crate's reference-facing suites used a bare `env::var` and took a
+# missing endpoint as a skip, so a live CI step that lost its `env:` block
+# reported green having compared nothing. Dependency-free crate, dev-only.
+pulsus-testkit = { path = "../pulsus-testkit" }
 # Issue #392: the general-category source for `src/unicode_ident_tables.rs`.
 # DEV-ONLY on purpose — the tables are committed, so the runtime
 # dependency set stays `thiserror` alone. `tests/identifier_charset.rs`

@@ -474,7 +474,7 @@ fn reference_verdict(base: &str, query: &str) -> (Verdict, String) {
 /// individually, so the claim is measured rather than assumed.
 #[test]
 fn live_matrix_against_the_reference() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live nested-ip matrix");
         return;
     };
