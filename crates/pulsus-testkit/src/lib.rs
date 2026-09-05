@@ -381,27 +381,55 @@ pub fn live_gate_enabled(var: &str) -> bool {
 ///   anywhere in a file must also be handed, in that file, to one of this
 ///   crate's gate entry points. This is the one that reaches an
 ///   indirection: `const V: &str = "PULSUSDB_X_URL"; env::var(V)` defeats
-///   the first check (measured: `4 tests run: 4 passed`) and is caught by
-///   the second, because the constant's DEFINITION is a literal.
+///   the first check and is caught by the second, because the constant's
+///   DEFINITION is a literal. Measured on the whole binary:
+///   `5 tests run: 4 passed, 1 failed`, exit 100 — and the `4` is the
+///   load-bearing figure, because it says the first check stayed green.
 ///
-/// **What the pair does not reach**, so that "closed" is not read wider
-/// than it is true:
+/// # What the pair does not reach
 ///
-/// * a name assembled from pieces — `["PULSUS", "DB_X_URL"].concat()`,
-///   `format!`, `concat!`. No literal in the file is a complete name.
-///   Two such splits exist in the tree on purpose;
-/// * a name defined outside `crates/*/tests` and imported;
+/// Stated as ONE rule with measured instances, rather than a list that
+/// grows an entry per review. Property (5) can see exactly one thing:
+///
+/// > a COMPLETE `PULSUSDB_*` name, spelled as a string literal, in the
+/// > same file that reads it, with every character after the prefix an
+/// > ASCII capital, digit or underscore.
+///
+/// Anything that stops the name being that is invisible to it. Each of
+/// these was run against the whole inventory binary and left every test
+/// green — `5 tests run: 5 passed, 0 skipped`, exit 0:
+///
+/// * assembled at run time — `["PULSUS", "DB_X_URL"].concat()`, `format!`;
+/// * assembled at compile time — `concat!`;
+/// * produced by a macro expansion — `stringify!(PULSUSDB_X_URL)` inside
+///   a `macro_rules!` (issue #523 review round 3);
+/// * defined outside `crates/*/tests` and imported;
+/// * not all upper case — `const V: &str = "PULSUSDB_X_Url";`. Note the
+///   halves differ here: the same name read DIRECTLY is still caught, by
+///   property (4), which puts no case constraint on the name
+///   (`5 tests run: 4 passed, 1 failed`, exit 100).
+///
+/// Two more, of a different kind:
+///
+/// * **the routing evidence is text too.** A file whose only occurrence
+///   of `live_endpoint("NAME")` is inside a COMMENT counts as routed, so
+///   a comment showing the recommended form can excuse a constant read in
+///   the same file — measured, `5 tests run: 5 passed`, exit 0. The
+///   direction is at least safe: a comment can only make (5) MISS
+///   something, never accuse a file wrongly.
 /// * a file that keeps its routed call and ALSO reads the same name some
-///   other way;
-/// * anything under `xtask/` or `e2e/` — which today name no `PULSUSDB_*`
-///   variable at all, measured with
-///   `git grep -n 'PULSUSDB_' -- e2e xtask`.
+///   other way.
 ///
-/// So: closed against every form a person writes without meaning to
-/// bypass it, and open to a deliberate one. Both checks are confirmed to
-/// detect an incorrect implementation — restoring a bare read, and
-/// restoring the constant-indirected read, each redden one of them naming
-/// file, line and variable (issue #523 review rounds 1 and 2).
+/// And the scope, which is not a weakness but is part of the claim: only
+/// `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`. `xtask/`
+/// and `e2e/` name no `PULSUSDB_*` variable at all today, measured with
+/// `git grep -n 'PULSUSDB_' -- e2e xtask`.
+///
+/// So the claim, exactly: **closed against every form a person writes
+/// without meaning to bypass the check, and open to a deliberate one.**
+/// A `macro_rules!` that stringifies an endpoint name, like
+/// `std::mem::forget` on a database guard, is not something anyone
+/// reaches for by accident, and following either would mean a parser.
 ///
 /// ## The value is returned exactly as the environment holds it
 ///

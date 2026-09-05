@@ -584,9 +584,11 @@ fn no_test_source_reads_an_endpoint_variable_directly() {
 //     const ENDPOINT_VAR: &str = "PULSUSDB_LOGQL_DIFF_URL";
 //     std::env::var(ENDPOINT_VAR)
 //
-// — `4 tests run: 4 passed`, and the suite is fail-open again. Unlike a
-// deliberate bypass, naming a constant is ordinary style, so the check has
-// to see it.
+// — every test in the binary green, and the suite fail-open again. (That
+// measurement was taken when the binary held four tests; with this one
+// added, the same break gives `5 tests run: 4 passed, 1 failed`, and the
+// `4` is the point: property (4) is still green.) Unlike a deliberate
+// bypass, naming a constant is ordinary style, so the check has to see it.
 //
 // Reaching it through the CALL would need to follow a value across a
 // binding, an array and a closure parameter, which is a parser. Property
@@ -674,22 +676,54 @@ fn is_routed(src: &str, name: &str) -> bool {
 /// array element and the raw string are all reached — the definition is
 /// what they have in common, and the definition is a literal.
 ///
-/// **What still escapes, said rather than implied.**
+/// **What still escapes.** One rule, then its measured instances — a list
+/// enumerated once beats one that grows an entry per review. This check
+/// sees exactly:
 ///
-/// * **A name assembled from pieces** — `["PULSUS", "DB_X_URL"].concat()`,
-///   `format!("PULSUSDB_{kind}_URL")`, `concat!`. No literal in the file
-///   is a complete name. This is not hypothetical: two such splits exist
-///   in the tree on purpose, in files whose own sweeps must not match
-///   themselves, and this check is why one of them had to move its split
-///   point.
-/// * **A name defined in another file or crate** and imported. The scan
-///   is per file; a `pub const` in a `tests/common/` module would be seen
-///   where it is DEFINED, so it is only invisible if it comes from
-///   outside `crates/*/tests`.
-/// * **A file that keeps its routed call AND adds an unrouted read of the
-///   same name.** The name is routed somewhere, so (5) passes; (4) then
+/// > a COMPLETE `PULSUSDB_*` name, spelled as a string literal, in the
+/// > same file that reads it, with every character after the prefix an
+/// > ASCII capital, digit or underscore.
+///
+/// Anything that stops the name being that is invisible here. Each of
+/// these was run against the whole binary and left every test green —
+/// `5 tests run: 5 passed, 0 skipped`, exit 0:
+///
+/// * **assembled at run time** — `["PULSUS", "DB_X_URL"].concat()`,
+///   `format!("PULSUSDB_{kind}_URL")`. Not hypothetical: two such splits
+///   exist in the tree on purpose, in files whose own sweeps must not
+///   match themselves, and this check is why one of them had to move its
+///   split point.
+/// * **assembled at compile time** — `concat!`.
+/// * **produced by a macro expansion** — `stringify!(PULSUSDB_X_URL)`
+///   inside a `macro_rules!` (issue #523 review round 3). Deliberately not
+///   chased: reaching an expansion means expanding, which is a parser, and
+///   nobody generates an environment variable's name this way by accident.
+/// * **defined in another file or crate** and imported. The scan is per
+///   file; a `pub const` in a `tests/common/` module would be seen where
+///   it is DEFINED, so it is invisible only when it comes from outside
+///   `crates/*/tests`.
+/// * **not all upper case** — `const V: &str = "PULSUSDB_X_Url";`. The two
+///   properties differ here, which is worth knowing rather than
+///   generalising: the same name read DIRECTLY is still caught by (4),
+///   which puts no case constraint on the name (`5 tests run: 4 passed,
+///   1 failed`, exit 100).
+///
+/// Two of a different kind:
+///
+/// * **the routing evidence is text as well.** A file whose only
+///   occurrence of `live_endpoint("NAME")` is inside a COMMENT counts as
+///   routed, so a comment showing the recommended form excuses a constant
+///   read in the same file — measured, `5 tests run: 5 passed`, exit 0.
+///   Stripping comments would mean a second copy of a lexer this crate
+///   does not have. The direction is at least safe: a comment can only
+///   make this check MISS something, never accuse a file wrongly.
+/// * **a file that keeps its routed call AND adds an unrouted read of the
+///   same name.** The name is routed somewhere, so this passes; (4) then
 ///   catches it only if the second read spells the literal.
-/// * `#[ignore]`d tests, and anything outside `crates/`, as for (1)-(4).
+///
+/// And the scope, which is part of the claim rather than a hole in it:
+/// only `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`,
+/// and `#[ignore]`d tests are scanned like any other text, as for (1)-(4).
 #[test]
 fn every_endpoint_name_written_in_a_test_source_is_routed_through_a_gate() {
     let root = workspace_root();

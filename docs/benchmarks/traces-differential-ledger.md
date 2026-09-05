@@ -798,29 +798,69 @@ when we are asking it to slow down, so we keep `429`; recorded as
   workspace lane, both scanning `.rs` files under `crates/*/tests`
   recursively.
 
-  | check | what it refuses | break, and what it printed |
+  | check | what it refuses |
+  |---|---|
+  | `no_test_source_reads_an_endpoint_variable_directly` | the name written inside an `env::var`/`env::var_os` call |
+  | `every_endpoint_name_written_in_a_test_source_is_routed_through_a_gate` | a complete `PULSUSDB_*` name written anywhere in a file that does not also hand it to a gate entry point |
+
+  Both breaks, run against the whole five-test binary at this revision, on
+  `crates/pulsus-logql/tests/case_folding.rs:874`:
+
+  | break | `Summary` line | exit |
   |---|---|---|
-  | `no_test_source_reads_an_endpoint_variable_directly` | the name written inside an `env::var`/`env::var_os` call | one suite's bare read restored -> `4 tests run: 3 passed, 1 failed`, exit 100, naming `crates/pulsus-logql/tests/case_folding.rs:874: PULSUSDB_LOGQL_DIFF_URL` |
-  | `every_endpoint_name_written_in_a_test_source_is_routed_through_a_gate` | a complete `PULSUSDB_*` name written anywhere in a file that does not also hand it to a gate entry point | `const ENDPOINT_VAR: &str = "…"; env::var(ENDPOINT_VAR)` -> `4 tests run: 3 passed, 1 failed`, exit 100, naming the same file and the constant's line |
+  | the bare read restored — `env::var("PULSUSDB_LOGQL_DIFF_URL")` | `5 tests run: 3 passed, 2 failed, 0 skipped` | 100 |
+  | the constant form — `const ENDPOINT_VAR: &str = "…"; env::var(ENDPOINT_VAR)` | `5 tests run: 4 passed, 1 failed, 0 skipped` | 100 |
 
-  The second exists because the first is **dead** for the constant form: a
-  code review measured `4 tests run: 4 passed` against it, and naming a
-  constant is ordinary style rather than sabotage. The second goes at the
-  other end — where the name may be WRITTEN — so a constant holding the
-  name has nowhere to live.
+  The second row's **`4 passed`, not 3, is the load-bearing figure**: it
+  says the first check stayed green and the second one is doing the work.
+  That is why the second check exists — the first is dead for the constant
+  form, measured at the revision before it was added, when the binary held
+  four tests and all four passed. Naming a constant is ordinary style
+  rather than sabotage, so the check had to reach it; it does so by going
+  to the other end, where the name may be WRITTEN, so a constant holding
+  the name has nowhere to live.
 
-  **What the pair does not reach.** A name assembled from pieces
-  (`["PULSUS", "DB_X_URL"].concat()`, `format!`, `concat!`): no literal in
-  the file is a complete name, and two such splits exist in the tree on
-  purpose. A name defined outside `crates/*/tests`. A file that keeps its
-  routed call and also reads the same name some other way. `xtask/` and
-  `e2e/`, which name no `PULSUSDB_*` variable at all today
+  **What the pair does not reach.** Stated as one rule with measured
+  instances, rather than a list that grows an entry per review. Property
+  (5) sees exactly one thing: *a complete `PULSUSDB_*` name, spelled as a
+  string literal, in the same file that reads it, with every character
+  after the prefix an ASCII capital, digit or underscore.* Anything that
+  stops the name being that is invisible. Each of these left every test in
+  the binary green — `5 tests run: 5 passed, 0 skipped`, exit 0:
+
+  - assembled at run time — `["PULSUS", "DB_X_URL"].concat()`, `format!`;
+  - assembled at compile time — `concat!`;
+  - produced by a macro expansion — `stringify!(PULSUSDB_X_URL)` inside a
+    `macro_rules!`;
+  - defined outside `crates/*/tests` and imported;
+  - not all upper case — `const V: &str = "PULSUSDB_X_Url";`. The halves
+    differ here: the same name read DIRECTLY is still caught, by the first
+    check, which puts no case constraint on the name
+    (`5 tests run: 4 passed, 1 failed`, exit 100).
+
+  Two more, of a different kind:
+
+  - **the routing evidence is text too** — a file whose only occurrence of
+    `live_endpoint("NAME")` is inside a COMMENT counts as routed, so a
+    comment showing the recommended form excuses a constant read in the
+    same file (`5 tests run: 5 passed`, exit 0). The direction is at least
+    safe: a comment can only make the check MISS something, never accuse a
+    file wrongly;
+  - a file that keeps its routed call and also reads the same name some
+    other way.
+
+  And the scope, part of the claim rather than a weakness: only
+  `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`. `xtask/`
+  and `e2e/` name no `PULSUSDB_*` variable at all today
   (`git grep -n 'PULSUSDB_' -- e2e xtask` returns nothing).
 
   So the claim is: **closed against every form written without the intent
-  to bypass it**, not closed against a deliberate one. Both checks carry
-  floors — on `live_endpoint` call sites and on routed names — so a tree
-  with the calls deleted does not satisfy them by absence.
+  to bypass it**, not closed against a deliberate one. A `macro_rules!`
+  that stringifies an endpoint name is in the same class as
+  `std::mem::forget` on a database guard — not something anyone reaches
+  for by accident, and following either would mean a parser. Both checks
+  carry floors — on `live_endpoint` call sites and on routed names — so a
+  tree with the calls deleted does not satisfy them by absence.
 
 - **Why it mattered.** Each suite also checks `PULSUS_TEST_CLICKHOUSE`,
   which IS fail-closed. So with the ClickHouse gate still set and only the
