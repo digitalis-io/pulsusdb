@@ -194,7 +194,7 @@ fn oracle_verdict(base: &str, query: &str, endpoint: ProbeEndpoint) -> Verdict {
 
 #[test]
 fn registry_probes_match_the_recorded_oracle_verdict() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset; skipping the LogQL differential leg");
         return;
     };

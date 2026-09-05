@@ -871,7 +871,7 @@ const NON_FOLDING_REJECTS: &[&str] = &[
 /// counted as a rejection.
 #[test]
 fn captured_reference_verdicts_still_hold_against_a_live_container() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("skipping: set PULSUSDB_LOGQL_DIFF_URL to replay against the reference");
         return;
     };

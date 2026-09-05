@@ -483,15 +483,25 @@ impl Drop for ChildGuard {
     }
 }
 
-fn spawn_ready(port: u16, db: &str) -> ChildGuard {
+fn spawn_ready(port: u16, db: &ScopedDb) -> ChildGuard {
     spawn_ready_with_env(port, db, &[])
 }
 
 /// [`spawn_ready`] plus extra environment variables for the one suite that
 /// needs them (issue #474's frozen fixture needs a retention that covers
-/// its 2023 timestamps). Same parameter shape as
-/// `traces_search_live.rs`'s own `spawn_ready`.
-fn spawn_ready_with_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+/// its 2023 timestamps).
+///
+/// **`&ScopedDb`, not `&str` (issue #523 review round 1).** The name of the
+/// database this server writes to has to come from a guard that drops it
+/// on entry and on exit, and the type is what makes that so: a test cannot
+/// hand a bare `pulsus_testkit::test_db(…)` here, because `String` is not
+/// `ScopedDb` and `ScopedDb`'s only constructor is `ScopedDb::fresh`, which
+/// does the entry drop and installs the exit drop. Before this the
+/// parameter was `&str`, all ten tests happened to pass a guard, and
+/// replacing one with a bare name compiled and passed — measured by the
+/// review, which is why the signature changed rather than a comment being
+/// added.
+fn spawn_ready_with_env(port: u16, db: &ScopedDb, extra_env: &[(&str, &str)]) -> ChildGuard {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
     let command = command
         .env("PULSUS_HOST", "127.0.0.1")
@@ -504,7 +514,7 @@ fn spawn_ready_with_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> Chil
             "CLICKHOUSE_HTTP_PORT",
             std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
         )
-        .env("CLICKHOUSE_DB", db)
+        .env("CLICKHOUSE_DB", db.name())
         // Issue #61 (T9): mount the Tempo compat aliases — needed by the
         // alias byte-identity suite; a no-op for the native assertions
         // (router-build-time merging only, no per-request behavior).

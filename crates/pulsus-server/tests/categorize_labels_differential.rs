@@ -1443,7 +1443,7 @@ fn capture_reference(base_url: &str, host: &str, port: u16, nonce: &str) -> Vec<
 
 /// The reference endpoint, behind the workspace's FAIL-CLOSED gate.
 ///
-/// `live_endpoint_gate_enabled`, not a bare `env::var`: an endpoint gate
+/// `pulsus_testkit::live_endpoint`, not a bare `env::var`: an endpoint gate
 /// that merely returns `None` when its variable is missing turns a lost
 /// `env:` block into a suite that skips and reports green — which is the
 /// exact failure this project has now been protected from twice, and the
@@ -1455,10 +1455,7 @@ fn capture_reference(base_url: &str, host: &str, port: u16, nonce: &str) -> Vec<
 /// as "not `1`" and would panic saying the variable is unset with the
 /// `env:` block right there in the log.
 fn diff_url() -> Option<(String, String, u16)> {
-    if !pulsus_testkit::live_endpoint_gate_enabled("PULSUSDB_LOGQL_DIFF_URL") {
-        return None;
-    }
-    let url = std::env::var("PULSUSDB_LOGQL_DIFF_URL").ok()?;
+    let url = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL")?;
     let rest = url.strip_prefix("http://").unwrap_or(&url);
     let (host, port) = rest.split_once(':')?;
     Some((

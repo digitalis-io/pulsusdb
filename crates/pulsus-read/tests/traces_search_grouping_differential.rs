@@ -97,8 +97,10 @@
 //! back as black-box runtime output.
 //!
 //! **Fail-closed on all three gates** (issue #458 recorded the hole,
-//! issue #492 part 3 closed it here). Both endpoint URLs go through
-//! `pulsus_testkit::require_live_endpoint_gate`, not the boolean gate: a
+//! issue #492 part 3 closed it here, and issue #523 review round 1 moved
+//! it onto the shared read). Both endpoint URLs go through
+//! `pulsus_testkit::live_endpoint`, which classifies them as ENDPOINT
+//! gates and not boolean ones: a
 //! URL-valued variable read by the boolean rule looks "not set" while the
 //! `env:` block is right there in the log. Before this, the URLs were read
 //! with a bare `env::var` and taken as a skip, so dropping only them from
@@ -1183,10 +1185,10 @@ async fn traces_search_grouping_differential() {
     // machine with no reference container it still skips cleanly — the
     // guard fires only when the gate is missing inside a CI job that
     // exists to supply it.
-    let api_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_GROUPING_DIFF_URL");
-    let otlp_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_GROUPING_OTLP_URL");
-    if !(api_gate.is_running()
-        && otlp_gate.is_running()
+    let api_endpoint = pulsus_testkit::live_endpoint("PULSUSDB_GROUPING_DIFF_URL");
+    let otlp_endpoint = pulsus_testkit::live_endpoint("PULSUSDB_GROUPING_OTLP_URL");
+    if !(api_endpoint.is_some()
+        && otlp_endpoint.is_some()
         && pulsus_testkit::live_clickhouse_enabled())
     {
         eprintln!(
@@ -1196,8 +1198,8 @@ async fn traces_search_grouping_differential() {
         );
         return;
     }
-    let api_base = std::env::var("PULSUSDB_GROUPING_DIFF_URL").expect("gate is running");
-    let otlp_base = std::env::var("PULSUSDB_GROUPING_OTLP_URL").expect("gate is running");
+    let api_base = api_endpoint.expect("checked just above");
+    let otlp_base = otlp_endpoint.expect("checked just above");
 
     // ONE base instant for the whole run. Both windows are derived from
     // it, so no comparison can straddle a day boundary the corpus does

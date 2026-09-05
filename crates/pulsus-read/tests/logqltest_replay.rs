@@ -1389,7 +1389,7 @@ fn query_case(
 
 #[test]
 fn live_replay_of_the_reachable_rows_against_the_reference() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!(
             "skipping: set PULSUSDB_LOGQL_DIFF_URL to replay the corpus against the reference"
         );

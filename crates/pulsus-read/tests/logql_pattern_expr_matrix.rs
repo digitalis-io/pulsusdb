@@ -1529,7 +1529,7 @@ fn reference_status(base: &str, query: &str, back_s: u64) -> (u32, String) {
 /// after stripping the wrapper the reference puts around it.
 #[test]
 fn live_matrix_against_the_reference() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live pattern matrix");
         return;
     };
@@ -1585,7 +1585,7 @@ fn live_matrix_against_the_reference() {
 /// `Stage()`-layer rejections beside it become 200.
 #[test]
 fn live_the_pattern_rule_is_window_independent() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the stale-window probe");
         return;
     };

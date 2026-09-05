@@ -144,11 +144,9 @@ fn the_committed_capture_matches_the_live_reference() {
     // Fail-closed on both endpoint gates (issue #320): with the `env:`
     // block dropped, the `else` arm below would print a skip notice and
     // report GREEN in the very job that exists to run this leg.
-    pulsus_testkit::require_live_endpoint_gate("PULSUSDB_NULLABLE_WIRE_DIFF_URL");
-    pulsus_testkit::require_live_endpoint_gate("PULSUSDB_NULLABLE_WIRE_OTLP_URL");
-    let (Ok(api_base), Ok(otlp_base)) = (
-        std::env::var("PULSUSDB_NULLABLE_WIRE_DIFF_URL"),
-        std::env::var("PULSUSDB_NULLABLE_WIRE_OTLP_URL"),
+    let (Some(api_base), Some(otlp_base)) = (
+        pulsus_testkit::live_endpoint("PULSUSDB_NULLABLE_WIRE_DIFF_URL"),
+        pulsus_testkit::live_endpoint("PULSUSDB_NULLABLE_WIRE_OTLP_URL"),
     ) else {
         eprintln!(
             "skipping the nullable-submessage oracle leg — set \

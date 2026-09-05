@@ -2177,7 +2177,7 @@ fn reference_accepts(base: &str, query: &str) -> bool {
 
 #[test]
 fn recorded_reference_verdicts_still_hold() {
-    let Ok(base) = std::env::var("PULSUSDB_TEMPO_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_TEMPO_DIFF_URL") else {
         eprintln!("PULSUSDB_TEMPO_DIFF_URL unset; skipping the accept-surface oracle leg");
         return;
     };

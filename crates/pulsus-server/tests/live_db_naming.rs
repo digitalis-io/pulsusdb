@@ -1033,3 +1033,113 @@ fn f() {
         std::fs::remove_dir_all(&empty).ok();
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #523 review round 1 — rule 3: a suite that has adopted the
+// drop-on-entry-and-exit guard must not also acquire a name without it.
+//
+// `crates/pulsus-server/tests/support/live_db.rs`'s `ScopedDb` drops its
+// database on entry AND on scope exit, so a test cannot forget the second
+// half. `traces_api_live.rs` takes it, and its `spawn_ready` now demands
+// `&ScopedDb`, so a bare `pulsus_testkit::test_db(…)` handed to a server
+// spawn does not compile.
+//
+// That leaves one path the type cannot reach: a name acquired and used
+// WITHOUT spawning a server — a direct `ChClient` against the database,
+// say. This rule closes it in source.
+// ---------------------------------------------------------------------
+
+/// The guarded acquisition, matched as literal text for the same reason
+/// [`HELPER_CALLS`] are.
+const SCOPED_ACQUISITION: &str = "ScopedDb::fresh(";
+
+/// Rule 3, keyed on the FILE'S OWN choice rather than on a list of file
+/// names: **a scanned file that uses `ScopedDb` at all must obtain every
+/// database name through it.**
+///
+/// Keying it this way is deliberate. A per-file exemption list would make
+/// the rule true by naming which files it applies to, and the next suite
+/// to adopt the guard would be outside it by default — the shape where a
+/// carve-out becomes the place the defect lives. As written, adopting the
+/// guard is what opts a suite in, and the sixteen suites that have not
+/// adopted it are not silently declared compliant: they are simply not
+/// claimed to be, which is what the notes on this issue say.
+///
+/// What it establishes and what it does not: every `pulsus_testkit::test_db(`
+/// in such a file is immediately preceded by `ScopedDb::fresh(`. A name
+/// assembled some other way, or one threaded in through a parameter, is
+/// the boundary rule 1 and rule 2 already state for themselves.
+#[test]
+fn a_suite_that_uses_the_scoped_guard_uses_it_for_every_name() {
+    let root = workspace_root();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut adopting_files = 0usize;
+    let mut guarded_sites = 0usize;
+
+    let crates = root.join("crates");
+    let mut crate_dirs: Vec<PathBuf> = std::fs::read_dir(&crates)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    crate_dirs.sort();
+    for dir in crate_dirs {
+        for file in rs_files_under(&dir.join("tests")) {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == SELF_PATH || rel.ends_with("support/live_db.rs") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            // Comments blanked, string literals intact: a doc comment
+            // showing the guarded form must neither opt a file in nor
+            // satisfy the rule for it.
+            let (stripped, _) = preprocess_views(&src);
+            if !stripped.contains(SCOPED_ACQUISITION) {
+                continue;
+            }
+            adopting_files += 1;
+            let needle = "pulsus_testkit::test_db(";
+            let mut from = 0usize;
+            while let Some(at) = stripped[from..].find(needle) {
+                let at = from + at;
+                from = at + needle.len();
+                if stripped[..at].trim_end().ends_with(SCOPED_ACQUISITION) {
+                    guarded_sites += 1;
+                } else {
+                    offenders.push(format!("{rel}:{}", line_of(&stripped, at)));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these suites use the drop-on-entry-and-exit guard but acquire a database name \
+         without it, so that database survives the run and the next run reads doubled rows \
+         (issue #523): {offenders:?}. Wrap the name: \
+         `ScopedDb::fresh(pulsus_testkit::test_db(\"…\")).await`."
+    );
+
+    // Floors. The rule above is satisfied by a tree in which nothing uses
+    // the guard, which is the state this issue found and fixed; without
+    // these, deleting every guard would pass it green.
+    assert!(
+        adopting_files >= 1,
+        "no scanned file uses {SCOPED_ACQUISITION} any more — the guard this rule exists to \
+         enforce has been removed from the tree, and the rule now checks nothing"
+    );
+    assert!(
+        guarded_sites >= 10,
+        "only {guarded_sites} guarded acquisitions remain, below the 10 that adopted the \
+         guard in issue #523 — a live test has dropped back to an unguarded name"
+    );
+}

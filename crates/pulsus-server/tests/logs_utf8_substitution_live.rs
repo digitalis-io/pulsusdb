@@ -123,8 +123,13 @@ fn should_run() -> bool {
     pulsus_testkit::live_clickhouse_enabled()
 }
 
+/// The reference's HTTP base, or `None` when this run has no reference to
+/// compare against. Fail-closed through `pulsus_testkit::live_endpoint`
+/// (issue #523): the bare `env::var().ok()` this replaced returned `None`
+/// in a live CI job whose step had lost its `env:` block, and the caller
+/// then reported a pass having compared nothing.
 fn reference_base() -> Option<String> {
-    std::env::var("PULSUSDB_LOGQL_DIFF_URL").ok()
+    pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL")
 }
 
 // ---------------------------------------------------------------------

@@ -50,8 +50,9 @@
 //! **Fail-closed on all three gates** (issue #458 recorded the hole,
 //! issue #523 closed it here; the same fix landed on
 //! `traces_search_grouping_differential.rs` under #492 part 3). Both
-//! endpoint URLs go through `pulsus_testkit::require_live_endpoint_gate`,
-//! not the boolean gate: a URL-valued variable read by the boolean rule
+//! endpoint URLs go through `pulsus_testkit::live_endpoint` — the one
+//! endpoint read in the workspace (issue #523 review round 1) — and it
+//! classifies them as ENDPOINT gates, not boolean ones: a URL-valued variable read by the boolean rule
 //! looks "not set" while the `env:` block is right there in the log.
 //! Before this, the URLs were read with a bare `env::var` and taken as a
 //! skip, so dropping only them from this suite's `schema-it` step
@@ -599,10 +600,10 @@ async fn compare_value_differential() {
     // exists to supply it. Both URL gates take the ENDPOINT classifier,
     // because the boolean one counts a gate as set only when its value is
     // exactly `1`.
-    let api_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_COMPARE_DIFF_URL");
-    let otlp_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_COMPARE_OTLP_URL");
-    if !(api_gate.is_running()
-        && otlp_gate.is_running()
+    let api_endpoint = pulsus_testkit::live_endpoint("PULSUSDB_COMPARE_DIFF_URL");
+    let otlp_endpoint = pulsus_testkit::live_endpoint("PULSUSDB_COMPARE_OTLP_URL");
+    if !(api_endpoint.is_some()
+        && otlp_endpoint.is_some()
         && pulsus_testkit::live_clickhouse_enabled())
     {
         eprintln!(
@@ -612,8 +613,8 @@ async fn compare_value_differential() {
         );
         return;
     }
-    let api_base = std::env::var("PULSUSDB_COMPARE_DIFF_URL").expect("gate is running");
-    let otlp_base = std::env::var("PULSUSDB_COMPARE_OTLP_URL").expect("gate is running");
+    let api_base = api_endpoint.expect("checked just above");
+    let otlp_base = otlp_endpoint.expect("checked just above");
 
     // The reverse-order half of the projection leg's isolation hazard
     // (issue #479, code review wave 2). That suite refuses an instance

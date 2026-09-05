@@ -465,8 +465,13 @@ async fn logs_api_query_range_returns_200_with_surviving_variants_when_one_breac
 // AC 7 — live agreement against the pinned reference.
 // ---------------------------------------------------------------------
 
+/// The reference's HTTP base, or `None` when this run has no reference to
+/// compare against. Fail-closed through `pulsus_testkit::live_endpoint`
+/// (issue #523): the bare `env::var().ok()` this replaced returned `None`
+/// in a live CI job whose step had lost its `env:` block, and the caller
+/// then reported a pass having compared nothing.
 fn reference_base() -> Option<String> {
-    std::env::var("PULSUSDB_LOGQL_DIFF_URL").ok()
+    pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL")
 }
 
 /// One raw response from either side: the top-level key SEQUENCE (as it

@@ -15,8 +15,8 @@
 //! * **oracle** — gated on `PULSUSDB_TEMPO_DIFF_URL`, re-derives
 //!   `reference` live from the digest-pinned container and asserts it
 //!   equals the committed value. It is FAIL-CLOSED via
-//!   `require_live_endpoint_gate`: in a live CI job with the `env:` block
-//!   dropped it panics rather than skipping green (issue #320). The
+//!   `pulsus_testkit::live_endpoint`: in a live CI job with the `env:`
+//!   block dropped it panics rather than skipping green (issue #320). The
 //!   ENDPOINT spelling is load-bearing — this gate's value is a URL, and
 //!   the boolean helper treats anything but `"1"` as unset.
 //!
@@ -284,8 +284,7 @@ fn every_committed_reference_verdict_still_holds_against_the_pinned_oracle() {
     // as unset and the guard panics saying so while the `env:` block is
     // right there in the log — which is exactly how this suite reddened
     // `schema-it` on its first run (issue #458 review round 3).
-    pulsus_testkit::require_live_endpoint_gate("PULSUSDB_TEMPO_DIFF_URL");
-    let Ok(base) = std::env::var("PULSUSDB_TEMPO_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_TEMPO_DIFF_URL") else {
         eprintln!("PULSUSDB_TEMPO_DIFF_URL unset; skipping the metrics-filter oracle leg");
         return;
     };

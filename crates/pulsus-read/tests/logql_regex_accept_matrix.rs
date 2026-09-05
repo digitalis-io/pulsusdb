@@ -3583,7 +3583,7 @@ fn live_probe_is_affordable(_position: &str, pattern: &str) -> bool {
 /// mask.
 #[test]
 fn live_matrix_against_the_reference() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live regex accept matrix");
         return;
     };
@@ -3682,7 +3682,7 @@ fn live_matrix_against_the_reference() {
 ///    excuses.
 #[test]
 fn live_reference_error_codes_are_exactly_the_covered_set() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live error-code census");
         return;
     };
@@ -3797,7 +3797,7 @@ fn stale_verdict(base: &str, query: &str, end_s: u64) -> Verdict {
 /// memory.
 #[test]
 fn live_template_axis_against_the_reference() {
-    let Ok(base) = std::env::var("PULSUSDB_LOGQL_DIFF_URL") else {
+    let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_LOGQL_DIFF_URL") else {
         eprintln!("PULSUSDB_LOGQL_DIFF_URL unset — skipping the live template axis");
         return;
     };

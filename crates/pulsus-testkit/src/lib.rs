@@ -344,9 +344,60 @@ pub fn live_gate_enabled(var: &str) -> bool {
     require_live_gate(var).is_running()
 }
 
-/// [`live_gate_enabled`] for an ENDPOINT gate. See [`live_endpoint_gate`].
-pub fn live_endpoint_gate_enabled(var: &str) -> bool {
-    require_live_endpoint_gate(var).is_running()
+/// **The one endpoint read.** `Some(value)` when endpoint gate `var` is
+/// set, `None` when the suite should skip — and a panic, before anything
+/// is returned, when `var` is absent inside a CI job that exists to supply
+/// it (see [`require_live_endpoint_gate`]).
+///
+/// ## Why this exists rather than `env::var` behind a guard
+///
+/// Every reference-facing differential suite needs the same two things:
+/// the endpoint's value, and the fail-closed decision about its absence.
+/// Written by hand that is
+///
+/// ```text
+/// let Ok(base) = std::env::var("PULSUSDB_X_URL") else { return };   // fail-OPEN
+/// ```
+///
+/// which reports a pass having compared nothing, and the corrected form is
+/// three lines that have to be repeated identically at every site. Issue
+/// #458 recorded the hole, #492 part 3 and #523 closed it on three suites
+/// one at a time, and a review of #523 then found sixteen more carrying
+/// it. Sixteen copies of a three-line correction is how this repository
+/// acquired its other duplicated decisions, so the read and the decision
+/// live here together and every suite makes one call.
+///
+/// ## What enforces "every suite"
+///
+/// `crates/pulsus-testkit/tests/gated_suite_inventory.rs`, the test
+/// `no_test_source_reads_an_endpoint_variable_directly` — hermetic, and in
+/// the workspace lane on every push. It fails the build if any `.rs` file
+/// under `crates/*/tests` (recursively, so `tests/common/` modules count)
+/// reads a `PULSUSDB_*` variable itself — either `env::var` spelling.
+/// That check is what makes the class CLOSED, rather than leaving a list
+/// of instances that were fixed one at a time.
+///
+/// Its boundary, stated because a substring scan has one: a raw string, an
+/// interposed comment, or a variable name held in a constant reads the
+/// address just as directly and is not matched. Confirmed to detect an
+/// incorrect implementation — restoring one suite's bare read reddened it,
+/// naming the file, the line and the variable (issue #523 review round 1).
+///
+/// ## The value is returned exactly as the environment holds it
+///
+/// No trimming. A gate counts as set when its value is non-blank
+/// ([`GateValue::Endpoint`]), so `" "` skips, but `" http://x "` runs and
+/// yields the padded string — the same value a bare `env::var` yielded
+/// before this helper existed. Changing that here would change what every
+/// converted suite sends.
+pub fn live_endpoint(var: &str) -> Option<String> {
+    if require_live_endpoint_gate(var).is_running() {
+        // `Run` is only reachable through `GateValue::Endpoint::is_set`,
+        // which already matched `Some(v)` with a non-blank `v`.
+        Some(std::env::var(var).expect("the gate classified this variable as set"))
+    } else {
+        None
+    }
 }
 
 /// [`live_gate_enabled`] for the common [`CLICKHOUSE_GATE`].

@@ -464,19 +464,11 @@ fn expected_entries(answer: &Value) -> Vec<(String, String)> {
 
 #[test]
 fn the_committed_capture_matches_the_live_reference() {
-    for var in [
-        "PULSUSDB_TAG_VALUES_DIFF_URL",
-        "PULSUSDB_TAG_VALUES_OTLP_URL",
-        "PULSUSDB_TAG_VALUES_476_DIFF_URL",
-        "PULSUSDB_TAG_VALUES_476_OTLP_URL",
-    ] {
-        pulsus_testkit::require_live_endpoint_gate(var);
-    }
-    let (Ok(api), Ok(otlp), Ok(api476), Ok(otlp476)) = (
-        std::env::var("PULSUSDB_TAG_VALUES_DIFF_URL"),
-        std::env::var("PULSUSDB_TAG_VALUES_OTLP_URL"),
-        std::env::var("PULSUSDB_TAG_VALUES_476_DIFF_URL"),
-        std::env::var("PULSUSDB_TAG_VALUES_476_OTLP_URL"),
+    let (Some(api), Some(otlp), Some(api476), Some(otlp476)) = (
+        pulsus_testkit::live_endpoint("PULSUSDB_TAG_VALUES_DIFF_URL"),
+        pulsus_testkit::live_endpoint("PULSUSDB_TAG_VALUES_OTLP_URL"),
+        pulsus_testkit::live_endpoint("PULSUSDB_TAG_VALUES_476_DIFF_URL"),
+        pulsus_testkit::live_endpoint("PULSUSDB_TAG_VALUES_476_OTLP_URL"),
     ) else {
         eprintln!(
             "skipping the tag-values oracle leg — set PULSUSDB_TAG_VALUES_DIFF_URL, \

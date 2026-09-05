@@ -1721,6 +1721,7 @@ dependencies = [
 name = "pulsus-logql"
 version = "0.0.0"
 dependencies = [
+ "pulsus-testkit",
  "regex-syntax",
  "serde",
  "serde_json",
@@ -1765,6 +1766,7 @@ dependencies = [
 name = "pulsus-re2"
 version = "0.0.0"
 dependencies = [
+ "pulsus-testkit",
  "regex",
  "regex-syntax",
  "sha2",

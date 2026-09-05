@@ -763,23 +763,56 @@ when we are asking it to slow down, so we keep `429`; recorded as
   asserts each of the five facts above individually, so the entry cannot
   be satisfied by existing.
 
-### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **CLOSED on all three (issue #523)**
+### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **CLOSED as a CLASS, workspace-wide (issue #523)**
 
 - **What.** Reference-facing differential suites that read the URL of the
   container they compare against with a bare `std::env::var` and take a
-  skip arm when it is absent. Three carried it; **none does now**:
+  skip arm when it is absent. Three were fixed one at a time:
 
-  | suite | endpoint variables | closed in |
+  | suite | endpoint variables | fixed in |
   |---|---|---|
   | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` | issue #492 part 3 |
   | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` | issue #523 |
   | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_DIFF_URL`, `PULSUSDB_NESTEDSET_OTLP_URL` | issue #523 |
 
-  All six variables now go through
-  `pulsus_testkit::require_live_endpoint_gate`, which panics when a gate
-  is absent inside a CI job that is not in
-  `pulsus_testkit::HERMETIC_CI_JOBS`, and classifies a machine with no
-  `GITHUB_JOB` as a clean skip.
+  A code review of #523 then found **sixteen more** live differential
+  suites carrying the identical shape — none broken on the day, because
+  every checked-in step supplied its address, but each one green having
+  compared nothing the moment a step lost its `env:` block. Fixing
+  sixteen more instances would have left the class open, so the read and
+  the fail-closed decision were merged into one function:
+
+  ```rust
+  let Some(base) = pulsus_testkit::live_endpoint("PULSUSDB_X_URL") else {
+      return;                      // developer machine: a clean skip
+  };                               // live CI job: panics before returning
+  ```
+
+  `live_endpoint` panics when the variable is absent inside a CI job that
+  is not in `pulsus_testkit::HERMETIC_CI_JOBS`, returns `None` on a
+  machine with no `GITHUB_JOB`, and otherwise returns the address. Every
+  reference-facing suite in the workspace now makes that one call.
+
+- **What keeps it closed.** `crates/pulsus-testkit/tests/gated_suite_inventory.rs`,
+  test `no_test_source_reads_an_endpoint_variable_directly`: hermetic, in
+  the workspace lane, and it fails the build if any `.rs` file under
+  `crates/*/tests` reads a `PULSUSDB_*` variable itself. Confirmed to
+  detect an incorrect implementation — restoring one suite's bare read:
+
+  ```text
+  Starting 4 tests across 1 binary
+   Summary [0.178s] 4 tests run: 3 passed, 1 failed, 0 skipped     (exit 100)
+
+  these test sources read a reference address themselves instead of calling
+  pulsus_testkit::live_endpoint … ["crates/pulsus-logql/tests/case_folding.rs:874:
+  PULSUSDB_LOGQL_DIFF_URL"]
+  ```
+
+  Its boundary, because a substring scan has one: a raw string, an
+  interposed comment, or a variable name held in a constant reads the
+  address just as directly and is not matched. The check also carries a
+  floor on the number of `live_endpoint` call sites, so deleting them all
+  does not satisfy it by absence.
 
 - **Why it mattered.** Each suite also checks `PULSUS_TEST_CLICKHOUSE`,
   which IS fail-closed. So with the ClickHouse gate still set and only the

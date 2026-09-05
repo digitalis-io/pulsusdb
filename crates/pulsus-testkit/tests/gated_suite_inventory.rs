@@ -379,3 +379,195 @@ fn every_gated_suite_has_a_ci_step_or_a_committed_reason() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Issue #523 — property (4): the ENDPOINT read.
+//
+// Properties (1)-(3) are about the BOOLEAN gates. The endpoint gates —
+// the ones whose value is the address of the reference container a
+// differential compares against — carried the identical hole, and it was
+// closed one suite at a time: #492 part 3 on one, #523 on two more. A
+// code review of #523 then found sixteen more still reading their address
+// with a bare `env::var` and taking absence as a skip, which reports a
+// pass having compared nothing.
+//
+// Sixteen copies of the same three-line correction is how this repository
+// acquired its other duplicated decisions, so the read and the fail-closed
+// decision now live together in `pulsus_testkit::live_endpoint` and every
+// suite makes one call. THIS check is what makes that "every suite"
+// rather than "the seventeen we happened to convert".
+// ---------------------------------------------------------------------
+
+/// `PULSUSDB_*` variables that are NOT a reference address, and so are not
+/// [`pulsus_testkit::live_endpoint`]'s business.
+///
+/// One entry, and the two assertions in [`no_test_source_reads_an_endpoint_variable_directly`]
+/// are what stop it becoming the place a real endpoint hides: an entry
+/// that no longer occurs anywhere is a stale excuse and fails, and an
+/// entry whose name ends in `_URL` is refused outright, because that is
+/// the shape every endpoint in this workspace has.
+const NON_ENDPOINT_PULSUSDB_VARS: &[(&str, &str)] = &[(
+    "PULSUSDB_PROMQLTEST_CACHE_DIR",
+    "a directory the corpus fetcher caches downloads in, not an address to \
+     compare answers against — absent, it downloads instead of skipping",
+)];
+
+/// Floors on the converted population, set below the counts at the time of
+/// writing (43 call sites in 27 files) with slack for ordinary deletion.
+/// Without these, a change that deleted every `live_endpoint` call would
+/// satisfy property (4)'s absence half and pass green.
+const ENDPOINT_CALL_FLOOR: usize = 35;
+const ENDPOINT_CALL_FILE_FLOOR: usize = 20;
+
+/// Every `.rs` file under `crates/*/tests/`, **recursively**.
+///
+/// Deliberately wider than [`test_binaries`], which stops at the top level
+/// because only top-level files are test binaries. An endpoint read moved
+/// into a `tests/common/mod.rs` reads the address just as directly, and
+/// that is a boundary properties (1)-(3) name as out of scope. This one
+/// does not have it.
+fn test_sources() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let crates = workspace_root().join("crates");
+    let entries = std::fs::read_dir(&crates).unwrap_or_else(|e| panic!("read {crates:?}: {e}"));
+    for krate in entries {
+        walk(
+            &krate.expect("crate dir entry").path().join("tests"),
+            &mut out,
+        );
+    }
+    out.sort();
+    assert!(
+        out.len() > 100,
+        "the recursive scan found only {} test sources — the workspace layout moved and this \
+         check is no longer looking where the suites are",
+        out.len()
+    );
+    out
+}
+
+/// The two spellings of a direct environment read, assembled at run time
+/// so that **this file does not itself contain either** — the same reason
+/// [`gate_read_spelling_needles`] is built the same way.
+fn endpoint_read_needles() -> [String; 2] {
+    [
+        concat!("env::", "var(\"").to_string(),
+        concat!("env::", "var_os(\"").to_string(),
+    ]
+}
+
+/// Every `PULSUSDB_*` variable read directly by `path`, as
+/// `(line, variable)`. Reads the name that follows the needle up to the
+/// closing quote, so the check can distinguish an endpoint from the one
+/// exempt non-endpoint variable rather than treating the prefix as the
+/// whole rule.
+fn direct_pulsusdb_reads(src: &str) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    for needle in endpoint_read_needles() {
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(needle.as_str()) {
+            let name_at = from + rel + needle.len();
+            from = name_at;
+            let Some(close) = src[name_at..].find('"') else {
+                continue;
+            };
+            let name = &src[name_at..name_at + close];
+            if name.starts_with("PULSUSDB_") {
+                let line = src[..name_at].bytes().filter(|&b| b == b'\n').count() + 1;
+                found.push((line, name.to_string()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Property (4): no test source reads a `PULSUSDB_*` endpoint variable
+/// itself. The address and the fail-closed decision come together, from
+/// [`pulsus_testkit::live_endpoint`], or they do not come at all.
+///
+/// Same substring nature as property (1), and the same boundary: a raw
+/// string, an interposed comment, or a name held in a constant all read
+/// the variable and all pass this. What that leaves is the runtime census
+/// in the module docs — run the suite with its address removed and
+/// `GITHUB_JOB` set to a live job id, and require a nonzero exit.
+#[test]
+fn no_test_source_reads_an_endpoint_variable_directly() {
+    let sources = test_sources();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut exempt_seen: Vec<&str> = Vec::new();
+    let mut call_sites = 0usize;
+    let mut call_files = 0usize;
+
+    for path in &sources {
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        let n = src.matches("pulsus_testkit::live_endpoint(").count();
+        call_sites += n;
+        if n > 0 {
+            call_files += 1;
+        }
+        for (line, var) in direct_pulsusdb_reads(&src) {
+            match NON_ENDPOINT_PULSUSDB_VARS.iter().find(|(v, _)| *v == var) {
+                Some((v, _)) => exempt_seen.push(v),
+                None => offenders.push(format!("{}:{line}: {var}", rel(path))),
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these test sources read a reference address themselves instead of calling \
+         pulsus_testkit::live_endpoint, so with the address absent they return success in a \
+         live CI job having compared nothing (issue #523): {offenders:?}. Replace the read \
+         with `pulsus_testkit::live_endpoint(\"<VAR>\")`, which yields `None` on a developer \
+         machine and panics in a job that exists to supply the address."
+    );
+
+    // The floors. Property (4)'s absence half is satisfied by a tree with
+    // no endpoint reads at all, including one where every call was
+    // deleted, so the population is asserted too.
+    assert!(
+        call_sites >= ENDPOINT_CALL_FLOOR,
+        "only {call_sites} pulsus_testkit::live_endpoint call sites remain, below the \
+         {ENDPOINT_CALL_FLOOR} floor — a differential suite has lost its endpoint guard"
+    );
+    assert!(
+        call_files >= ENDPOINT_CALL_FILE_FLOOR,
+        "only {call_files} test sources call pulsus_testkit::live_endpoint, below the \
+         {ENDPOINT_CALL_FILE_FLOOR} floor"
+    );
+
+    // Exemption hygiene, both halves: an exemption for a variable that is
+    // gone excuses nothing and hides the next one, and no exemption may
+    // wear an endpoint's name.
+    for (var, reason) in NON_ENDPOINT_PULSUSDB_VARS {
+        assert!(
+            !reason.trim().is_empty(),
+            "{var} is exempt with an empty reason, which exempts nothing"
+        );
+        assert!(
+            !var.ends_with("_URL"),
+            "{var} is exempt from the endpoint check but is named like an endpoint — every \
+             reference address in this workspace ends in _URL, so this is the shape the \
+             exemption list must never admit"
+        );
+        assert!(
+            exempt_seen.contains(var),
+            "NON_ENDPOINT_PULSUSDB_VARS exempts {var}, which no test source reads any more — \
+             the entry is stale and is now only a hole for the next endpoint to hide in"
+        );
+    }
+}
