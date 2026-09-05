@@ -2574,6 +2574,58 @@ mod tests {
         plan_search(&parse(q).expect("parse"), &PARAMS, &ctx()).expect("plan")
     }
 
+    /// Issue #492 part 3: **the PLANNER supplies the phase-2 batch as the
+    /// chunk**, and this asserts the wiring rather than the rule.
+    ///
+    /// `traces::compile::tests::the_phase_two_chunk_is_the_batch_constant`
+    /// pins the rule — that a language-supplied chunk beats the rendering
+    /// ceiling — but it builds its own `PlanConfig`, so it cannot see
+    /// `plan_search` failing to supply one. Setting `seed_chunk_rows` to
+    /// `None` in `plan_search` left that test green, and the value is not
+    /// on the wire either (`Issue::wire()` renders the WORD
+    /// `per_seed:chunks` and no number), so the chunk was unguarded end to
+    /// end. A test that builds its own input cannot detect the production
+    /// path failing to supply it (code review round 6).
+    ///
+    /// The candidate bound has to be large enough for the seed not to fit
+    /// one statement, or no chunk driver is chosen at all and the
+    /// assertion would be about the wrong branch — hence a local context
+    /// rather than the module's, whose bound of 100 fits comfortably.
+    #[test]
+    fn the_planner_supplies_the_batch_as_the_phase_two_chunk() {
+        use crate::compile::plan::{Driver, Issue, Part};
+
+        let big = SearchCtx {
+            max_candidates: 100_000,
+            ..ctx()
+        };
+        let plan = plan_search(
+            &parse(r#"{ resource.service.name = "checkout" }"#).expect("parse"),
+            &PARAMS,
+            &big,
+        )
+        .expect("plan");
+
+        // The hydration read is chain link 1; its part is where the seed
+        // first crosses.
+        let compiled = plan.compiled();
+        let Part::Sql(hydration) = &compiled.parts[compiled.links[1].part] else {
+            panic!(
+                "the hydration read must be an SQL part: {:?}",
+                compiled.parts
+            )
+        };
+        assert_eq!(
+            hydration.issue,
+            Issue::PerSeed(Driver::Chunks {
+                bound: 100_000,
+                chunk: u64::from(super::super::exec::BATCH_TRACES as u32),
+            }),
+            "the planner must hand the compile core its own batch: the chunk is BATCH_TRACES, \
+             not the 24998 the rendering ceilings would permit"
+        );
+    }
+
     // ---- issue #479: the matched-span projection ------------------------
 
     /// AC1 — every projected attribute key is the BARE field spelling, for
