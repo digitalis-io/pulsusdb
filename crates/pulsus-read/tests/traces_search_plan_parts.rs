@@ -373,11 +373,58 @@ fn the_two_orderings_share_a_part_list_and_differ_in_the_link_list() {
 ///
 /// One link per statement the request may send and one per stage our own
 /// process runs; nothing here counts rows, candidates or spans.
+///
+/// **Two identities, and the second is what makes the first about this
+/// corpus rather than about arithmetic.** The chain-length identity is
+/// computed entirely from the plan, so it is insensitive to the golden
+/// files: it would hold over a corpus of one case, or none. The
+/// statement-count identity compares the plan's counters against the
+/// number of sections the golden RENDERS, so a golden that gains or
+/// loses a statement reddens it. Without the second, adding a recognised
+/// section to a golden left this test green (issue #492 part 3, code
+/// review round 3).
+///
+/// The `by()` cardinality pre-flight probe is subtracted where it
+/// applies: it is a statement the executor sends and deliberately not a
+/// chain link, because it refuses the request before phase 1 rather than
+/// producing or consuming a candidate. Exactly one committed case
+/// carries one.
 #[test]
 fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
+    let mut total_sections = 0usize;
+    let mut total_statements = 0usize;
+    let mut preflight_cases = Vec::new();
     for g in goldens() {
         let plan = plan_query(&g.query, g.distributed);
         let shape = plan.plan_shape();
+        // The statements the plan's own counters say this request sends,
+        // against the sections the golden renders. `generator_sqls` and
+        // not the generator PART count, because the three same-source
+        // cases send two statements from one part.
+        let by_probe = usize::from(plan.by_probe_sql().is_some());
+        if by_probe == 1 {
+            preflight_cases.push(g.case.clone());
+        }
+        let statements = plan.generator_sqls.len()
+            + 1                                                 // hydration
+            + plan.probes_len()
+            + plan.agg_fields_len()
+            + plan.select_attrs_len()
+            + plan.event_sets_len()
+            + usize::from(plan.needs_trace_ctx())
+            + usize::from(plan.needs_child_counts())
+            + by_probe
+            + 1; // the winners' root read
+        assert_eq!(
+            statements,
+            g.sections.len(),
+            "{}: the plan's counters say {statements} statements and the golden renders {} \
+             sections",
+            g.case,
+            g.sections.len()
+        );
+        total_sections += g.sections.len();
+        total_statements += statements;
         let pipeline = pulsus_traceql::parse(&g.query)
             .expect("the golden's query parses")
             .pipeline
@@ -402,6 +449,17 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
             g.case
         );
     }
+    assert_eq!(
+        (total_statements, total_sections),
+        (239, 239),
+        "the committed corpus renders 239 statements and the plans account for all of them"
+    );
+    assert_eq!(
+        preflight_cases,
+        vec!["spanset_by_service".to_string()],
+        "exactly one case carries the by() pre-flight probe, which is the one statement the \
+         chain deliberately does not name"
+    );
 }
 
 /// Criterion 14: no part claims a keyset page loop, and none carries the

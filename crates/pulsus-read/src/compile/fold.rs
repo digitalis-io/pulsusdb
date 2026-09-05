@@ -828,7 +828,7 @@ pub trait Lang {
     /// A SQL column expression fragment.
     type ColExpr: Clone + Eq + fmt::Debug;
     type Shape: Shape;
-    /// What crosses between two parts — trace ids, fingerprints, a
+    /// What crosses between parts — trace ids, fingerprints, a
     /// keyset cursor. `Default` is the EMPTY handoff: a plan describes
     /// the crossing at plan time, and the executor fills the values in.
     type Handoff: Clone + Eq + fmt::Debug + Default;

@@ -10,7 +10,7 @@
 //!
 //! So the compiler emits a plan: an ordered list of [`Part`]s, each part
 //! either one SQL statement or work in our own process, with the value
-//! set that crosses between two parts named, typed and bounded
+//! set that crosses between parts named, typed and bounded
 //! ([`Seed`]).
 //!
 //! **The plan already exists in the shipped code; what was missing is a
@@ -256,8 +256,9 @@ impl Issue {
     }
 }
 
-/// A value set crossing from one part to the next. Always materialised
-/// values, never a subquery (ADR 0008 D3), and always bounded.
+/// A value set crossing from one part — or from several merged — to the
+/// next. Always materialised values, never a subquery (ADR 0008 D3), and
+/// always bounded.
 pub struct Seed<L: Lang + ?Sized> {
     /// **Every part whose result the values are drawn from**, in plan
     /// order — never only the most recent one.
@@ -442,8 +443,9 @@ fn chunk_for<L: Lang + ?Sized + 'static>(bound: u64, cx: &PlanCx<'_>) -> u64 {
 ///    [`Lang::handoff_bound`] returning `None` is what refuses the cut.
 /// 3. A predicate that engages no index does not cut and is not declined.
 ///
-/// **`chain` is a parameter, which the design record's signature did not
-/// carry.** Two of the three facts the builder needs — `source_of` and
+/// **`chain` is a parameter**, and the design record's signature carries
+/// it too since issue #492 part 3 — it did not when that section was
+/// written. Two of the three facts the builder needs — `source_of` and
 /// `handoff_bound` — take the link, and [`Lowering`] holds only the
 /// accumulated relation and the per-link dispositions. Nothing else about
 /// the signature moves; the chain is borrowed and never mutated.

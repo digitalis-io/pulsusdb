@@ -653,7 +653,10 @@ pub struct LinkOutcome {
 }
 
 pub enum Part<L: Lang + ?Sized> {
-    Sql(SqlPart<L>),
+    /// Boxed: an `SqlPart` carries a whole `Relation` and an engine part
+    /// carries two `usize`s, so without the indirection every engine part
+    /// in the vector would pay the statement's width.
+    Sql(Box<SqlPart<L>>),
     /// Work in our own process: the residual links, applied in chain
     /// order. `links` indexes `QueryPlan::links`.
     Engine { links: std::ops::Range<usize> },
@@ -681,8 +684,9 @@ pub struct SqlPart<L: Lang + ?Sized> {
     pub cut: Option<Cut>,
 }
 
-/// A value set crossing from one part to the next. Always materialised
-/// values, never a subquery (ADR 0008 D3), and always bounded.
+/// A value set crossing from one part — or from several merged — to the
+/// next. Always materialised values, never a subquery (ADR 0008 D3), and
+/// always bounded.
 pub struct Seed<L: Lang + ?Sized> {
     /// EVERY part whose result the values are drawn from, in plan order.
     /// A list because a seed can be a MERGE: a TraceQL search disjoining
@@ -762,6 +766,7 @@ pub enum SeedBound {
 /// link whether to cut — it asks what the link reads and how big the
 /// crossing would be, and applies the four rules of §2.7.2 to §2.7.5.
 pub fn plan_of<L: Lang + ?Sized + 'static>(
+    chain: &[L::Stage],
     lowering: Lowering<L>,
     cx: &PlanCx<'_>,
 ) -> Result<QueryPlan<L>, L::Err>;
@@ -1401,7 +1406,7 @@ it cannot fail to.
 | columns | `ColSet`, the `OpenSource` resolver, and per-column provenance | which open sources exist and what each resolves |
 | predicates | the `orig ⟹ sql` lattice including `NOT`-refuses-unless-exact | every SQL *fragment*: predicates, column expressions, escaping |
 | composition | `Relation` as a clause-slot term and ADR 0008's wrap-on-slot-collision rule; the renderer **skeleton** | fragment construction, regex handling, time-bucket expressions |
-| the boundary | `BoundaryOutput`'s three kinds as `SqlPart::yields`, the `Seed` that crosses between two parts, and the cap placement that follows (§8) | the `Handoff` type and the evaluator that consumes it |
+| the boundary | `BoundaryOutput`'s three kinds as `SqlPart::yields`, the `Seed` that crosses between parts, and the cap placement that follows (§8) | the `Handoff` type and the evaluator that consumes it |
 | plan shape | the four cuts (§2.7.2–§2.7.5), the three must-not-cut rules (§2.7.6), and the refusal of any cut whose seed has no plan-time bound | the three facts of §2.2 — `source_of`, `handoff_bound`, `handoff_cost` — and each link's `fidelity` |
 | errors | `L::Err` as an associated type | the error taxonomy and its HTTP mapping |
 
