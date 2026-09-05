@@ -962,6 +962,29 @@ impl SearchPlan {
     pub fn plan_shape(&self) -> PlanShape {
         self.compiled.shape(&self.stage_names)
     }
+
+    /// Whether any planned leaf is a nested-set structural intrinsic
+    /// (issue #181) — one chain link when true.
+    pub fn needs_nested_set(&self) -> bool {
+        self.nested_set
+    }
+
+    /// Whether the spanset carries a structural relation (issue #172) —
+    /// one chain link when true.
+    ///
+    /// Derived from the stored spanset rather than from a second stored
+    /// flag, so the chain builder and this accessor cannot disagree:
+    /// there is one derivation and both call it.
+    pub fn has_structural_relation(&self) -> bool {
+        spanset_has_structural(&self.spanset)
+    }
+
+    /// How many `!`-operand truthiness leaves the query carries (issue
+    /// #335) — one chain link each. Derived from the planned filters, the
+    /// same walk the chain builder makes.
+    pub fn bool_truth_leaves(&self) -> usize {
+        count_bool_truth_leaves(&self.filters)
+    }
 }
 
 /// The full positive predicate of one membership probe, pre-escaped.
@@ -2384,11 +2407,7 @@ pub fn plan_search(
     // sends and why each is its own statement. No I/O, no round trip —
     // this runs before the pool is acquired.
     let structural = spanset_has_structural(&query.spanset);
-    let bool_truth_leaves = filters
-        .iter()
-        .flat_map(|f| f.leaves.iter())
-        .filter(|leaf| matches!(leaf, PlannedLeafEval::BoolTruth { .. }))
-        .count();
+    let bool_truth_leaves = count_bool_truth_leaves(&filters);
     let chain = super::compile::chain_of(
         query,
         &ChainFacts {
@@ -2482,6 +2501,17 @@ fn spanset_has_structural(expr: &SpansetExpr) -> bool {
             spanset_has_structural(lhs) || spanset_has_structural(rhs)
         }
     }
+}
+
+/// How many `!`-operand truthiness leaves the planned filters carry — the
+/// ONE derivation, read by both the chain builder and
+/// [`SearchPlan::bool_truth_leaves`].
+fn count_bool_truth_leaves(filters: &[PlannedFilter]) -> usize {
+    filters
+        .iter()
+        .flat_map(|f| f.leaves.iter())
+        .filter(|leaf| matches!(leaf, PlannedLeafEval::BoolTruth { .. }))
+        .count()
 }
 
 /// [`super::compile::generator_pred`] over the deduped generator list.

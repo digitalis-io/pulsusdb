@@ -520,7 +520,6 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                             debug_assert_eq!(part, parts.len());
                             parts.push(Part::Engine { links: start..i });
                         }
-                        let cut = cuts_firing::<L>(&rel, Some(&h), cx).into_iter().next();
                         let mut part_rel = rel.clone();
                         // The second read is over a different source and
                         // carries no predicate of its own: it is keyed on
@@ -533,6 +532,20 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                         // part after the first report the SEED's table,
                         // while its own cut named the right one.
                         part_rel.source = super::fold::SourceTerm::Base(L::Source::named(h.source));
+                        // **The cut is asked of THIS part's relation, not
+                        // of the seed's** (issue #492 part 3). Asking the
+                        // accumulated relation made every part after a
+                        // disjunctive seed inherit
+                        // `Cut::DisjointSources` — an answer about the
+                        // FIRST statement, repeated on statements that
+                        // carry no predicate at all — and, because the
+                        // issue count is chosen from the cut, it also
+                        // suppressed the chunk driver those parts need.
+                        // Measured on
+                        // `{ resource.service.name = "checkout" || span.http.method = "GET" }`:
+                        // four of its six parts said `disjoint_sources`,
+                        // including the winners' root read.
+                        let cut = cuts_firing::<L>(&part_rel, Some(&h), cx).into_iter().next();
                         let bound = h.bound;
                         let issue = match cut {
                             Some(Cut::HandoffExceedsBound { .. }) => {
@@ -1655,6 +1668,64 @@ mod tests {
 
     /// A seed too large to render in one statement is chunked, and the
     /// chunk is the largest that stays under both ceilings.
+    /// Issue #492 part 3, criterion 13 (the core's half): **a chunk the
+    /// language supplies wins over the ceilings'.**
+    ///
+    /// The ceilings say what a statement CAN hold. They do not say what
+    /// the executor sends, and a plan that reports the ceiling describes
+    /// a batch no statement uses. This asserts the two answers to one
+    /// input differ in exactly the field the config names, and that the
+    /// language's number is the one that survives.
+    #[test]
+    fn a_language_supplied_chunk_wins_over_the_ceiling() {
+        let b = bounds(None);
+        let ceilings_decide = PlanConfig::default();
+        assert_eq!(ceilings_decide.seed_chunk_rows, None, "the default");
+
+        let p = plan(&[TestStage::BigHandoff], &b, &ceilings_decide);
+        let Part::Sql(second) = &p.parts[1] else {
+            panic!("parts: {:?}", p.parts)
+        };
+        let Issue::PerSeed(Driver::Chunks { bound, chunk }) = second.issue else {
+            panic!("issue: {:?}", second.issue)
+        };
+        assert_eq!(bound, 40_000);
+        // 8 + 2n <= 50_000 is the binding ceiling for this language.
+        assert_eq!(chunk, 24_996, "the largest chunk the ceilings admit");
+
+        let language_batches_at = PlanConfig {
+            seed_chunk_rows: Some(100),
+            ..PlanConfig::default()
+        };
+        let p = plan(&[TestStage::BigHandoff], &b, &language_batches_at);
+        let Part::Sql(second) = &p.parts[1] else {
+            panic!("parts: {:?}", p.parts)
+        };
+        let Issue::PerSeed(Driver::Chunks { bound, chunk }) = second.issue else {
+            panic!("issue: {:?}", second.issue)
+        };
+        assert_eq!(bound, 40_000, "the BOUND is the seed's and does not move");
+        assert_eq!(
+            chunk, 100,
+            "the language's own chunk wins over the ceiling chunk 24996"
+        );
+
+        // And it is a MINIMUM, not an override: a language chunk larger
+        // than the ceilings admit does not raise the ceiling.
+        let language_asks_too_much = PlanConfig {
+            seed_chunk_rows: Some(30_000),
+            ..PlanConfig::default()
+        };
+        let p = plan(&[TestStage::BigHandoff], &b, &language_asks_too_much);
+        let Part::Sql(second) = &p.parts[1] else {
+            panic!("parts: {:?}", p.parts)
+        };
+        let Issue::PerSeed(Driver::Chunks { chunk, .. }) = second.issue else {
+            panic!("issue: {:?}", second.issue)
+        };
+        assert_eq!(chunk, 24_996, "the ceilings still bind");
+    }
+
     #[test]
     fn an_oversized_seed_becomes_a_chunked_issue_under_both_ceilings() {
         let config = PlanConfig::default();

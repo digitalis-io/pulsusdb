@@ -2883,6 +2883,35 @@ async fn two_phase_search_explain_and_budget_gates() {
             .await
             .unwrap_or_else(|e| panic!("{label} B: {e}"));
 
+        // ---- issue #492 part 3: the explained response carries the
+        // compiled plan, and its FIRST part is named for the table the
+        // first phase-1 generator reads.
+        //
+        // The expected name comes from the generator's own SQL — the
+        // `FROM` line of the statement this request sends — not from a
+        // constant in this file, so a renderer that named the wrong
+        // source could not satisfy it by agreeing with itself.
+        let shape = ea
+            .plan
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: an explained search must carry its plan"));
+        assert!(
+            !shape.parts.is_empty(),
+            "{label}: the plan names no parts at all"
+        );
+        let generator_table = a.generator_sqls[0]
+            .lines()
+            .find_map(|l| l.strip_prefix("FROM "))
+            .unwrap_or_else(|| panic!("{label}: the generator SQL names no table"))
+            .trim_end_matches("_dist");
+        match &shape.parts[0] {
+            pulsus_read::compile::plan::PartShape::Sql(part) => assert_eq!(
+                part.name, generator_table,
+                "{label}: the first part must be named for the generator's own table"
+            ),
+            other => panic!("{label}: the plan must open with a statement, not {other:?}"),
+        }
+
         // (3a) direction-neutral validity gate, BEFORE the comparison:
         // both traces are non-empty and both reached hydration, so a
         // no-op implementation cannot satisfy (1) vacuously.

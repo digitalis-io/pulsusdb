@@ -600,9 +600,15 @@ plan into a mechanism that ships rewritten rows back to the database, so a link 
 
 ### 2.7 The compiler's output is a PLAN, not a statement
 
-**Everything in §2.7 is specified and none of it is compiled.** §2.5's probe was built against the
-interface as it stood before this section existed, and nothing has built the types below. §10
-records that, and closing it is the first thing wave 1 does.
+**§2.7 is built, and since issue #492 part 3 it RUNS on a served route.** The types below are
+`crates/pulsus-read/src/compile/plan.rs`; `traces::search_plan::plan_search` builds one plan per
+TraceQL search request, `traces::exec::batch_attrs` walks the resulting chain instead of six
+hand-written index loops, and `X-Pulsus-Explain: 1` on the search route returns the plan's shape as
+`data.explain.plan` (docs/api.md §2.1, §4.2). **No SQL moved**: every statement is still rendered by
+the shipped builders, all 83 SQL goldens are byte-unchanged and `PINNED_SQL_CORPUS` is still
+`0x5b8b_80d7_38cb_049b`. Nothing in §2.7 compiles a query stage yet; what it now does is say WHICH
+statements a request sends and why each is its own statement. §10 records what that establishes and
+what it does not.
 
 #### 2.7.1 The plan object
 
@@ -670,7 +676,7 @@ pub struct Seed<L: Lang + ?Sized> {
 }
 
 pub enum Issue {
-    /// Sent once.
+    /// Sent AT MOST once, and no driver is attached.
     Once,
     /// Sent once per seed drawn from `driver`, until the driver stops.
     PerSeed(Driver),
@@ -678,8 +684,9 @@ pub enum Issue {
 
 pub enum Driver {
     /// The seed set is bounded but too large to write into one
-    /// statement, so it is sent in chunks. `chunk` is chosen so the
-    /// rendered statement stays under both ceilings of §2.7.3.
+    /// statement, so it is sent in chunks. `chunk` is the SMALLER of
+    /// what the two ceilings of §2.7.3 admit and what the language
+    /// batches at.
     Chunks { bound: u64, chunk: usize },
     /// The request's LIMIT could not enter the statement, so pages are
     /// drawn, each resuming from the previous page's last sort key,
@@ -689,8 +696,8 @@ pub enum Driver {
 }
 
 /// Why a part is its own statement and not folded into the previous one.
-/// CLOSED: these four are the whole set, §2.7.9 says what would falsify
-/// that, and §11.3's `every_cut_variant_has_a_row_in_the_design_record`
+/// See §2.7.9 for what the set rests on and for the one measured shape it
+/// does not cover, and §11.3's `every_cut_variant_has_a_row_in_the_design_record`
 /// — **wave 1**, and it does not exist at base — makes a fifth a build
 /// failure rather than a silent addition.
 pub enum Cut {
@@ -741,6 +748,23 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
 §2.2 to §2.6 give them. `Lowering<L>` becomes an internal value the plan builder consumes rather
 than the compiler's public output.
 
+**`Issue::Once` means AT MOST once, not exactly once** (issue #492 part 3). A plan is a plan-time
+answer and the executor sends fewer statements when the data runs out. Measured live on a 7-span
+corpus: `{ traceDuration > 2s }` and `{ span:childCount > 2 }` each issued their generator, their
+hydration and their co-load and then **no root read at all**, because nothing matched and there were
+no winners to summarise.
+
+Nothing branches on the stronger reading. The variant's consumers were enumerated by renaming it at
+its declaration and reading the compiler's error list, then rewriting all seven and re-running
+`cargo check --workspace --all-targets` to exit 0 — which is what turned seven into *all* of them,
+since `cargo check` stops at the first crate that fails and would otherwise never have reached the
+packages downstream of `pulsus-read`. Of the seven, five construct the value, two are test
+assertions on the wire word, and exactly one is a production branch: the inexact-limit rewrite in
+`plan_of`, whose own comment reads `Once` as **no driver is attached** rather than *this will
+execute*. Overwriting it is equally safe at zero executions and at one. Had any of the seven read it
+as a guaranteed execution, a separate variant would have been owed and that site would have been a
+defect; none does, so the repair is this sentence and the type is unchanged.
+
 **The plan already exists in the shipped code; what is missing is a type that can say so.** The
 committed TraceQL SQL goldens are written per part and index the repeated ones —
 `== phase1 generator[0] ==`, `== phase2 hydration (sample batch) ==`, `== phase2 membership[0] ==`,
@@ -750,8 +774,9 @@ drawn by hand, one case at a time.
 
 #### 2.7.2 `Cut::SourceHandoff` — the next read is over a different source, keyed by this one's result
 
-A **cut** is the only way a plan gets a second SQL part. There are four, they are closed, and each
-is decided from something the planner already holds — no probe, no round trip, no statistics.
+A **cut** is the only way a plan gets a second SQL part. There are four, each decided from something
+the planner already holds — no probe, no round trip, no statistics. **They were declared CLOSED and
+they are not**: §2.7.9 records the measured shape none of the four explains.
 
 **Recognised by:** `L::source_of(stage, &rel) != rel.source`, where the differing source is
 reachable by a key `rel` projects. ADR 0008 D3 forbids expressing that as a subquery, on
@@ -788,17 +813,47 @@ link's `source_of` and emits an `Sql` part, not an `Engine` part.
 Over either, the part becomes `Issue::PerSeed(Driver::Chunks { .. })`. That is today's phase-2 batch
 loop named for what it is: `BATCH_TRACES = 32` (`crates/pulsus-read/src/traces/exec.rs:115`).
 
+**And the chunk is 32 because the language says so, not because a ceiling says so** (issue #492
+part 3). The ceilings above answer *what a statement CAN hold*; they do not answer *what the
+executor sends*. Measured for a TraceQL search whose candidate seed is bounded at 100,000:
+
+```
+handoff_cost(100_000) = HandoffCost { text_bytes: 4_300_048, ast_elements: 200_004 }
+handoff_cost( 24_998) = HandoffCost { text_bytes: 1_074_962, ast_elements:  50_000 }
+handoff_cost( 24_999) = HandoffCost { text_bytes: 1_075_005, ast_elements:  50_002 }
+```
+
+so the AST ceiling binds at **24,998** — and the executor batches **32**. A plan reporting 24,998
+would describe a batch no statement this tree has ever sent. `PlanConfig::seed_chunk_rows` carries
+the language's own batch and `chunk_for` returns the smaller of the two; TraceQL passes
+`Some(BATCH_TRACES)` and `None` — the default — leaves the ceilings deciding, which is what every
+language did before. Pinned by `compile::plan::tests::a_language_supplied_chunk_wins_over_the_ceiling`
+and `traces::compile::tests::the_phase_two_chunk_is_the_batch_constant`.
+
 #### 2.7.4 `Cut::DisjointSources` — the disjuncts do not resolve against one source
 
 **Recognised by:** the lattice of §2.4 already walks the boolean tree; the cut fires when an `OR`
 node's two sides return different `source_of`. One `WHERE` cannot hold them, ADR 0008 D2 bans the
 common-table form on measurement, and the union form is a second statement merged in our process.
 
-**Shipped instance:** `SearchPlan::generator_sqls` is a `Vec<String>`
-(`crates/pulsus-read/src/traces/search_plan.rs:594`), deduped and appended per disjunct at
-`search_plan.rs:2157-2158`, and executed one at a time in the phase-1 loop
-(`crates/pulsus-read/src/traces/exec.rs`, module header lines 9-10). A structural query registers
-two (`search_plan.rs` test `structural_registers_both_operands_generators_and_probes`).
+**Shipped instance, and the part of it this cut does NOT cover.**
+`SearchPlan::generator_sqls` is a `Vec<String>`, deduped and appended per disjunct, and executed one
+at a time in the phase-1 loop (`crates/pulsus-read/src/traces/exec.rs`, module header lines 9-10). A
+structural query registers two (`search_plan.rs` test
+`structural_registers_both_operands_generators_and_probes`).
+
+**It is not all of `generator_sqls`.** Measured over the 56 committed search goldens: eleven send two
+phase-1 generators, and for **eight** of them the two read different tables — those eight are this
+cut. For the other three (`nested_boolean`, `structural_sibling`, `structural_descendant`) both
+generators read ONE table, so no `OR` over differing sources exists and this cut does not fire; the
+planner sends two statements anyway. `filter.rs::collect`'s rule is about **completeness** — `a || b`
+needs both sides' sets, because a match may satisfy either — and completeness is not a statement
+about sources: one `WHERE` could hold `nested_boolean`'s two. Whether one `WHERE` over an `OR` prunes
+as well as two ranked reads is a pushdown measurement nobody has taken, and it is owed by the part
+that compiles a generator, not by the part whose contract is that no SQL moves. The three cases are a
+frozen, named exception, asserted as an EQUALITY by
+`traces_search_plan_parts::the_generator_fan_out_exception_is_exactly_these_three`, so a fourth
+cannot join them silently.
 
 **The literal SQL is committed and byte-frozen, so this is not a prediction.**
 `crates/pulsus-read/tests/golden/traces_search/mixed_or.sql` is
@@ -983,13 +1038,35 @@ to repair — it ships today, independently of anything here.
 
 #### 2.7.9 What the four cuts rest on, and what would falsify it
 
-The argument that the four are **closed** is that each is derived from one of exactly two things a
+The argument that the four were **closed** is that each is derived from one of exactly two things a
 single statement cannot do — read a second source keyed by its own result, or hold more than fits —
 plus the two forms of "more than fits": the seed's size (§2.7.3), and the answer's when the `LIMIT`
 cannot enter (§2.7.5). **What would falsify it:** a query in either language whose correct plan has
-two SQL parts and no cut in the list. §11.3's `every_cut_variant_has_a_row_in_the_design_record` —
-**wave 1**, and it does not exist at base — makes a fifth cut a build failure rather than a silent
-addition, but no gate can discover that a fifth is *needed*.
+two SQL parts and no cut in the list.
+
+**That witness exists, it is committed, and the closure claim is therefore withdrawn** (issue #492
+part 3). `crates/pulsus-read/tests/golden/traces_search/nested_boolean.sql` is
+`{ (.a = "1" || .b = "2") && (.c = "3" || .d = "4") }` and it holds two phase-1 generator
+statements, **both reading `trace_attrs_idx`**; `structural_sibling.sql` is the same shape and
+`structural_descendant.sql` is the same shape against `trace_spans`. Two SQL parts, and no cut in
+the set of four explains the second: `Cut::SourceHandoff` needs a different source,
+`Cut::DisjointSources` needs an `OR` whose sides read different sources, `Cut::HandoffExceedsBound`
+needs a seed that does not fit, and `Cut::InexactLimit` is about the answer's size. See §2.7.4 for
+the rule that produces them and why it is not a rule about sources.
+
+**No fifth cut is added here, and the reason is not caution.** Choosing between two ranked reads and
+one `OR`ed read changes what SQL is sent; part 3's whole contract is that no SQL moves, so that
+choice cannot be made inside it without destroying the one property that makes a moved golden
+unambiguously a defect. The measurement — does one `WHERE` over an `OR` prune as well as two ranked
+reads — is owed by the part that compiles a generator, and the three cases are frozen as a named
+exception with the reason attached until then.
+
+§11.3's `every_cut_variant_has_a_row_in_the_design_record` — **wave 1**, and it does not exist at
+base — makes a fifth cut a build failure rather than a silent addition, but no gate can discover
+that a fifth is *needed*: this one was found by building the plan and comparing it against what the
+goldens render, which is what
+`traces_search_plan_parts::the_plan_sql_parts_match_the_sections_each_golden_case_renders` now does
+on every run.
 
 **The measurements this rests on, and which of them we have.**
 
@@ -1878,6 +1955,25 @@ now records the two-language fit as **disproved** rather than unproven.
 
 This document describes a design. Its evidence is uneven and the unevenness is the point of this
 section.
+
+**Wired, and labelled as wired (issue #492 part 3).** The plan object is no longer a specification:
+`plan_search` builds one on every TraceQL search request and the executor consults it. What that
+establishes is that the model can describe a real request — the part sequence the plan produces
+equals the statement sequence each of the 56 committed goldens renders, case by case
+(`traces_search_plan_parts::the_plan_sql_parts_match_the_sections_each_golden_case_renders`). What
+it does **not** establish is that anything is faster or narrower, and it is not meant to: the
+contract of that part is that **no SQL moves**, so that when a later part does move a statement, a
+moved golden is unambiguously a defect in the renderer rather than an unattributable mix of the two.
+Nothing about pushdown, pruning or bytes on the wire is settled by it.
+
+**Four claims in this document were measurably false once the plan was built, and are corrected in
+place rather than annotated.** The plan named the seed's table on every part after the first; the
+phase-2 chunk was the rendering ceiling (24,998) instead of the batch the executor sends (32); a
+regex-free multi-leaf selector was called `Equivalent` where its generator is a documented superset;
+and the keyset page loop landed on the winners' root read, which is issued once. The first two show
+on the explain surface the moment it is rendered, the third inverts `orig ⟹ sql` into `orig ⟺ sql`
+and can DROP rows, and the fourth describes a loop that does not exist. §2.7.3, §2.7.4 and §2.7.9
+carry the corrections.
 
 **Demonstrated by measurement.** Everything in §9, on corpus C1: the per-stage decomposition, the
 333-against-1,000 correctness consequence, the granule tables for groups 2 and 3, the pruning

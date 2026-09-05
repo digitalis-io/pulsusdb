@@ -1482,7 +1482,254 @@ mod tests {
         // D4: and it is issued ONCE. The root read is seeded by the
         // traces that already won, so the request's own limit bounds it
         // and there is no page loop to run.
-        assert_eq!(p.cut.as_ref().map(crate::compile::plan::Cut::why), Some("source_handoff"));
+        assert_eq!(
+            p.cut.as_ref().map(crate::compile::plan::Cut::why),
+            Some("source_handoff")
+        );
+    }
+
+    /// Issue #492 part 3, criterion 12: **every [`NeverReason`] variant
+    /// has a producing query.**
+    ///
+    /// Four of the eight had no producer anywhere in the tree until this
+    /// part — a variant nothing can construct is documentation shaped
+    /// like control flow, and the quiet half of a broken bijection. The
+    /// `match` below has **no `_` arm**, so a ninth variant fails to
+    /// build this binary rather than joining them.
+    ///
+    /// **Two of the eight are LogQL's and are witnessed by a LogQL
+    /// chain**, not pretended to be TraceQL's: `NoRowToComputeFrom` is
+    /// `absent_over_time`'s (the answer is a statement about rows that
+    /// are absent) and `ResponseBuild` is that language's `Emit`.
+    ///
+    /// **`TraceLevelIntrinsic` has TWO producers, and that is
+    /// deliberate**: one reason, two trace-wide co-loads. This asserts
+    /// coverage of the variant SET, never a bijection with links.
+    #[test]
+    fn every_never_reason_variant_has_a_producing_query() {
+        use crate::compile::fold::{Disposition, NeverReason as N, ResidualReason};
+
+        /// Does any link of this TraceQL query's plan carry the reason?
+        fn tql_carries(q: &str, want: N) -> bool {
+            let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            let params = super::super::search_plan::SearchParams {
+                start_ns: 1_700_000_000_000_000_000,
+                end_ns: 1_700_010_800_000_000_000,
+                limit: 20,
+                spss: 3,
+            };
+            let ctx = super::super::search_plan::SearchCtx {
+                filter: super::super::filter::SpanFilterCtx {
+                    spans_table: "trace_spans",
+                    attrs_table: "trace_attrs_idx",
+                },
+                max_candidates: 100_000,
+                max_series: 1_000,
+                distributed: false,
+            };
+            let plan = super::super::search_plan::plan_search(&query, &params, &ctx)
+                .unwrap_or_else(|e| panic!("{q}: {e:?}"));
+            plan.compiled()
+                .links
+                .iter()
+                .any(|l| l.how == Disposition::Residual(ResidualReason::Never(want)))
+        }
+
+        /// The same question of a LogQL chain.
+        fn lql_carries(chain: &[crate::logql::compile::LqlLink], want: N) -> bool {
+            let bounds = crate::compile::fold::RequestBounds {
+                start_ns: 0,
+                end_ns: 1,
+                step_ns: None,
+                limit: Some(20),
+            };
+            let cx = LowerCx::<crate::logql::compile::Lql>::new(&bounds);
+            let lowering = crate::compile::fold::lower_chain::<crate::logql::compile::Lql>(
+                chain,
+                crate::logql::compile::seed_relation(),
+                &cx,
+            )
+            .expect("fold");
+            lowering
+                .how
+                .contains(&Disposition::Residual(ResidualReason::Never(want)))
+        }
+
+        for variant in [
+            N::NeedsUnwindowedRootRead,
+            N::StructuralRelation,
+            N::NestedSetNumbering,
+            N::TraceLevelIntrinsic,
+            N::WholeQueryTypeFailure,
+            N::NoRowToComputeFrom,
+            N::ResponseBuild,
+            N::NotASearchLink,
+        ] {
+            let (witness, carried): (&str, bool) = match variant {
+                // Every TraceQL search: the response's root summary is
+                // read trace-wide with no time bound.
+                N::NeedsUnwindowedRootRead => (
+                    r#"{ resource.service.name = "checkout" }"#,
+                    tql_carries(r#"{ resource.service.name = "checkout" }"#, variant),
+                ),
+                N::StructuralRelation => (
+                    r#"{ resource.service.name = "checkout" } > { span.foo = "x" }"#,
+                    tql_carries(
+                        r#"{ resource.service.name = "checkout" } > { span.foo = "x" }"#,
+                        variant,
+                    ),
+                ),
+                N::NestedSetNumbering => (
+                    "{ nestedSetParent < 0 }",
+                    tql_carries("{ nestedSetParent < 0 }", variant),
+                ),
+                // Two producers, one reason. Both must carry it.
+                N::TraceLevelIntrinsic => (
+                    "{ traceDuration > 2s } and { span:childCount > 2 }",
+                    tql_carries("{ traceDuration > 2s }", variant)
+                        && tql_carries("{ span:childCount > 2 }", variant),
+                ),
+                N::WholeQueryTypeFailure => ("{ !.a }", tql_carries("{ !.a }", variant)),
+                N::NoRowToComputeFrom => (
+                    r#"absent_over_time({app="a"}[5m])"#,
+                    lql_carries(
+                        &[crate::logql::compile::LqlLink::RangeAgg {
+                            op: pulsus_logql::RangeAggOp::AbsentOverTime,
+                            grouping: None,
+                            param: None,
+                        }],
+                        variant,
+                    ),
+                ),
+                N::ResponseBuild => (
+                    r#"{app="a"} (every LogQL query)"#,
+                    lql_carries(&[crate::logql::compile::LqlLink::Emit], variant),
+                ),
+                // The one variant no ACCEPTED query can produce, and the
+                // arm says so rather than inventing a witness: the
+                // shipped planner answers 400 for all three metrics
+                // stages on the search route, so `chain_of` never builds
+                // the link. Both halves are asserted — the rejection
+                // that makes it unreachable, and the classification a
+                // hand-built link would get — because either alone would
+                // be a claim about the other.
+                N::NotASearchLink => {
+                    let q = r#"{ } | rate()"#;
+                    let query = pulsus_traceql::parse(q).expect("parses");
+                    let params = super::super::search_plan::SearchParams {
+                        start_ns: 1_700_000_000_000_000_000,
+                        end_ns: 1_700_010_800_000_000_000,
+                        limit: 20,
+                        spss: 3,
+                    };
+                    let ctx = super::super::search_plan::SearchCtx {
+                        filter: super::super::filter::SpanFilterCtx {
+                            spans_table: "trace_spans",
+                            attrs_table: "trace_attrs_idx",
+                        },
+                        max_candidates: 100_000,
+                        max_series: 1_000,
+                        distributed: false,
+                    };
+                    assert!(
+                        super::super::search_plan::plan_search(&query, &params, &ctx).is_err(),
+                        "{q}: the search route must refuse a metrics stage, which is what makes \
+                         this variant unreachable from a query"
+                    );
+                    let metric = query.pipeline.first().expect("one stage").clone();
+                    let link = TqlLink::Pipe(metric);
+                    let carried = matches!(
+                        Tql::lower_of(&link).capability(&link, &base(TqlShape::Spans)),
+                        Capability::Never(NeverReason::NotASearchLink)
+                    );
+                    (q, carried)
+                }
+            };
+            assert!(
+                carried,
+                "{variant:?}: no link in {witness}'s plan carries it"
+            );
+        }
+    }
+
+    /// Issue #492 part 3, criterion 13 (TraceQL's half): **the phase-2
+    /// chunk is the batch constant.**
+    ///
+    /// The hydration read is seeded from the phase-1 candidate list,
+    /// which `reader.traceql_max_candidates` bounds at 100,000 here. That
+    /// exceeds the database's AST ceiling, so the part is chunked — and
+    /// the chunk the executor actually sends is [`super::super::exec::BATCH_TRACES`],
+    /// not the largest chunk the ceilings would admit.
+    #[test]
+    fn the_phase_two_chunk_is_the_batch_constant() {
+        let bounds = crate::compile::fold::RequestBounds {
+            start_ns: 0,
+            end_ns: 1,
+            step_ns: None,
+            limit: Some(20),
+        };
+        let chain = vec![
+            TqlLink::Source {
+                expr: Box::new(parse_selector(r#"{ resource.service.name = "checkout" }"#)),
+                generator_is_exact: false,
+            },
+            TqlLink::Hydrate,
+            TqlLink::Order,
+            TqlLink::Limit(20),
+            TqlLink::Emit,
+        ];
+
+        let hydration_issue = |seed_chunk_rows: Option<u32>| -> Issue {
+            let cx = LowerCx::<Tql>::new(&bounds);
+            let lowering = crate::compile::fold::lower_chain::<Tql>(
+                &chain,
+                seed_relation(TRACE_SPANS, Pred::True),
+                &cx,
+            )
+            .expect("fold");
+            let config = PlanConfig {
+                seed_chunk_rows,
+                seed_bound_rows: Some(100_000),
+                ..PlanConfig::default()
+            };
+            let plan = plan_of::<Tql>(
+                &chain,
+                lowering,
+                &PlanCx {
+                    bounds: &bounds,
+                    config: &config,
+                },
+            )
+            .expect("plan");
+            // The Hydrate link is chain index 1.
+            let Part::Sql(p) = &plan.parts[plan.links[1].part] else {
+                panic!("the hydration read must be an SQL part: {:?}", plan.parts)
+            };
+            assert!(
+                matches!(p.cut, Some(Cut::HandoffExceedsBound { .. })),
+                "a 100,000-candidate seed does not fit one statement: {:?}",
+                p.cut
+            );
+            p.issue
+        };
+
+        assert_eq!(
+            hydration_issue(Some(super::super::exec::BATCH_TRACES as u32)),
+            Issue::PerSeed(Driver::Chunks {
+                bound: 100_000,
+                chunk: 32,
+            }),
+            "the phase-2 chunk is the rendering ceiling (24998), not the batch the executor \
+             uses (32)"
+        );
+        assert_eq!(
+            hydration_issue(None),
+            Issue::PerSeed(Driver::Chunks {
+                bound: 100_000,
+                chunk: 24_998,
+            }),
+            "without the language's own chunk the ceilings decide, and 24998 is what they say"
+        );
     }
 
     /// A physical `=` leaf still classifies through the same rule, so the
