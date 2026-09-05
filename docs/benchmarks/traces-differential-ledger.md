@@ -763,54 +763,63 @@ when we are asking it to slow down, so we keep `429`; recorded as
   asserts each of the five facts above individually, so the entry cannot
   be satisfied by existing.
 
-### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **open wiring risk on TWO of the original three**
+### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **CLOSED on all three (issue #523)**
 
 - **What.** Reference-facing differential suites that read the URL of the
   container they compare against with a bare `std::env::var` and take a
-  skip arm when it is absent. Three carried it; **two still do**:
+  skip arm when it is absent. Three carried it; **none does now**:
 
-  | suite | endpoint variables | state |
+  | suite | endpoint variables | closed in |
   |---|---|---|
-  | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` | open |
-  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_DIFF_URL`, `PULSUSDB_NESTEDSET_OTLP_URL` | open |
-  | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` | **closed in issue #492 part 3** — both URLs now go through `require_live_endpoint_gate` |
+  | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` | issue #492 part 3 |
+  | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` | issue #523 |
+  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_DIFF_URL`, `PULSUSDB_NESTEDSET_OTLP_URL` | issue #523 |
 
-- **Why the grouping leg was closed out of order.** A code review of that
-  part ran the leg without endpoints and watched it report
-  `6 tests run: 6 passed` having compared nothing — the failure this entry
-  describes, observed rather than predicted, on a step that part's own
-  verification depends on. The fix is the two lines this entry already
-  named, so it was cheaper to apply than to re-record. The other two are
-  untouched and this entry stays open for them.
+  All six variables now go through
+  `pulsus_testkit::require_live_endpoint_gate`, which panics when a gate
+  is absent inside a CI job that is not in
+  `pulsus_testkit::HERMETIC_CI_JOBS`, and classifies a machine with no
+  `GITHUB_JOB` as a clean skip.
 
-- **Why it matters.** Each also checks `PULSUS_TEST_CLICKHOUSE`, which IS
-  fail-closed. So with the ClickHouse gate still set and only the URL
-  variables dropped from a `schema-it` step, the suite prints a skip
-  notice and the step reports **green having compared nothing** — the
+- **Why it mattered.** Each suite also checks `PULSUS_TEST_CLICKHOUSE`,
+  which IS fail-closed. So with the ClickHouse gate still set and only the
+  URL variables dropped from a `schema-it` step, the suite printed a skip
+  notice and the step reported **green having compared nothing** — the
   issue #320 failure, inside the legs whose whole purpose is to compare
-  against the reference. Nothing currently detects it: the guard that
-  would (`pulsus_testkit::require_live_endpoint_gate`) is not reached,
-  because the bare `env::var` returns first.
+  against the reference. The guard that would have caught it was never
+  reached, because the bare `env::var` returned first.
 
-- **Measured, on the suite where it was fixed.** `traces_metrics_filter_differential.rs`
-  had the identical shape and now routes both URLs through
-  `require_live_endpoint_gate`. With the URLs dropped and
-  `PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it` set it fails loudly
-  (`PULSUSDB_METRICS_FILTER_DIFF_URL is not set, but this is CI job
-  "schema-it"…`); before the change the same invocation printed a skip
-  notice and exited `ok`.
+- **Measured on both remaining suites, before and after (issue #523).**
+  Same invocation each time, endpoint variables removed from the
+  environment, `PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it` set:
 
-- **Why the remaining two are not fixed here.** Neither is currently
-  failing, issue #458 is about span durations and metrics filters, and
-  each suite's gating is a change with its own review surface. They are
-  recorded rather than bundled — but this is a wiring hole, not a
-  divergence, and the failure mode is silence.
+  ```text
+  env -u PULSUSDB_COMPARE_DIFF_URL -u PULSUSDB_COMPARE_OTLP_URL \
+      PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it \
+      cargo nextest run -p pulsus-read --test compare_value_differential
+  ```
 
-- **The fix, when it is scheduled.** Two lines per suite:
-  `pulsus_testkit::require_live_endpoint_gate("<VAR>")` before the
-  `env::var` reads, once per endpoint variable. The endpoint kind exists
-  because these gates carry a URL and the boolean helper counts a gate as
-  set only when it is exactly `"1"`.
+  | suite | at `d542869b` | with the fix |
+  |---|---|---|
+  | `compare_value_differential` | `2 tests run: 2 passed, 0 skipped`, exit 0 | `2 tests run: 1 passed, 1 failed`, exit 100 |
+  | `nestedset_value_differential` | `1 test run: 1 passed, 0 skipped`, exit 0 | `1 test run: 0 passed, 1 failed`, exit 100 |
+
+  The failure message names the variable and the job:
+  `PULSUSDB_COMPARE_DIFF_URL is not set, but this is CI job "schema-it",
+  which exists to provide the live dependency …`.
+
+  The same two invocations with `GITHUB_JOB` **unset** — a developer
+  machine with no reference container — still report
+  `2 tests run: 2 passed` and `1 test run: 1 passed`, exit 0. The guard
+  fires on the wiring failure, not on the absence of a container.
+
+- **What the nested-set guard does today.** It is latent. No workflow
+  supplies that suite's two variables (`crates/pulsus-read/tests/warning_inventory.rs`
+  asserts the closed set of files that may name them), and the `ci` job is
+  in `HERMETIC_CI_JOBS`, so the aggregate `--workspace` run still skips.
+  Measured with `GITHUB_JOB=ci` and no URLs: `1 test run: 1 passed`,
+  exit 0. It fires the moment a step in a live job runs the suite without
+  its `env:` block.
 
 ### `traceql-compare-topn-tie-order` (issue #460) — **a deliberate refinement: our tie order is deterministic where the reference's is arbitrary**
 

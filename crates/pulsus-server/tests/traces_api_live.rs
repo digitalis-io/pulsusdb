@@ -1197,7 +1197,10 @@ async fn zipkin_shared_span_trace_by_id_returns_both_the_server_and_client_sides
         return;
     }
 
-    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_api_it_zipkin_shared")).await;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_api_it_zipkin_shared",
+    ))
+    .await;
     let _guard = spawn_ready(ZIPKIN_PORT, &db);
 
     // Recent timestamp so the 7-day delete-TTL never drops the part; micros
@@ -1511,7 +1514,10 @@ async fn span_summaries_carry_duration_nanos_as_a_protojson_string_on_the_wire()
     }
 
     let port = SPAN_DURATION_PORT;
-    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_span_duration_it_live")).await;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_span_duration_it_live",
+    ))
+    .await;
     let _guard = spawn_ready(port, &db);
 
     // The file's fixture instant; window math below is in unix SECONDS.
@@ -2104,7 +2110,10 @@ async fn absent_submessages_are_materialized_present_and_empty_on_the_wire() {
     // not be able to make the count assertion pass or fail for the wrong
     // reason. The guard drops on entry AND on exit, including the panicking
     // exit, so no arm of this test can leave the rows behind (issue #523).
-    let db = ScopedDb::fresh(pulsus_testkit::test_db("pulsus_traces_nullable_wire_it_live")).await;
+    let db = ScopedDb::fresh(pulsus_testkit::test_db(
+        "pulsus_traces_nullable_wire_it_live",
+    ))
+    .await;
     let _guard = spawn_ready_with_env(
         NULLABLE_WIRE_PORT,
         &db,
