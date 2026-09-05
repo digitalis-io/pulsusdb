@@ -763,17 +763,25 @@ when we are asking it to slow down, so we keep `429`; recorded as
   asserts each of the five facts above individually, so the entry cannot
   be satisfied by existing.
 
-### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **open wiring risk, recorded not fixed**
+### `traceql-differential-legs-skip-green-on-a-missing-endpoint` (issue #458) — **open wiring risk on TWO of the original three**
 
-- **What.** Three reference-facing differential suites read the URL of the
+- **What.** Reference-facing differential suites that read the URL of the
   container they compare against with a bare `std::env::var` and take a
-  skip arm when it is absent:
+  skip arm when it is absent. Three carried it; **two still do**:
 
-  | suite | endpoint variables |
-  |---|---|
-  | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` |
-  | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` |
-  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_DIFF_URL`, `PULSUSDB_NESTEDSET_OTLP_URL` |
+  | suite | endpoint variables | state |
+  |---|---|---|
+  | `crates/pulsus-read/tests/compare_value_differential.rs` | `PULSUSDB_COMPARE_DIFF_URL`, `PULSUSDB_COMPARE_OTLP_URL` | open |
+  | `crates/pulsus-read/tests/nestedset_value_differential.rs` | `PULSUSDB_NESTEDSET_DIFF_URL`, `PULSUSDB_NESTEDSET_OTLP_URL` | open |
+  | `crates/pulsus-read/tests/traces_search_grouping_differential.rs` | `PULSUSDB_GROUPING_DIFF_URL`, `PULSUSDB_GROUPING_OTLP_URL` | **closed in issue #492 part 3** — both URLs now go through `require_live_endpoint_gate` |
+
+- **Why the grouping leg was closed out of order.** A code review of that
+  part ran the leg without endpoints and watched it report
+  `6 tests run: 6 passed` having compared nothing — the failure this entry
+  describes, observed rather than predicted, on a step that part's own
+  verification depends on. The fix is the two lines this entry already
+  named, so it was cheaper to apply than to re-record. The other two are
+  untouched and this entry stays open for them.
 
 - **Why it matters.** Each also checks `PULSUS_TEST_CLICKHOUSE`, which IS
   fail-closed. So with the ClickHouse gate still set and only the URL
@@ -792,11 +800,11 @@ when we are asking it to slow down, so we keep `429`; recorded as
   "schema-it"…`); before the change the same invocation printed a skip
   notice and exited `ok`.
 
-- **Why it is not fixed here.** Three suites' gating is a change with its
-  own review surface, none of them is currently failing, and issue #458 is
-  about span durations and metrics filters. It is recorded rather than
-  bundled — but it is a wiring hole, not a divergence, and the failure
-  mode is silence.
+- **Why the remaining two are not fixed here.** Neither is currently
+  failing, issue #458 is about span durations and metrics filters, and
+  each suite's gating is a change with its own review surface. They are
+  recorded rather than bundled — but this is a wiring hole, not a
+  divergence, and the failure mode is silence.
 
 - **The fix, when it is scheduled.** Two lines per suite:
   `pulsus_testkit::require_live_endpoint_gate("<VAR>")` before the

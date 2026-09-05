@@ -96,13 +96,15 @@
 //! fixtures are our own authorship and the reference's values are read
 //! back as black-box runtime output.
 //!
-//! **Known wiring hole, recorded not fixed** (issue #458): this suite's
-//! endpoint URL variables are read with a bare `env::var` and taken as a
-//! skip when absent, while `PULSUS_TEST_CLICKHOUSE` is fail-closed. Drop
-//! only the URLs from a live step and it reports GREEN having compared
-//! nothing — ledger entry
-//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
-//! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
+//! **Fail-closed on all three gates** (issue #458 recorded the hole,
+//! issue #492 part 3 closed it here). Both endpoint URLs go through
+//! `pulsus_testkit::require_live_endpoint_gate`, not the boolean gate: a
+//! URL-valued variable read by the boolean rule looks "not set" while the
+//! `env:` block is right there in the log. Before this, the URLs were read
+//! with a bare `env::var` and taken as a skip, so dropping only them from
+//! a live step reported GREEN having compared nothing. Ledger entry
+//! `traceql-differential-legs-skip-green-on-a-missing-endpoint` records
+//! the class and which suites still carry it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
@@ -1176,18 +1178,26 @@ fn now_ns() -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn traces_search_grouping_differential() {
-    let (Ok(api_base), Ok(otlp_base), true) = (
-        std::env::var("PULSUSDB_GROUPING_DIFF_URL"),
-        std::env::var("PULSUSDB_GROUPING_OTLP_URL"),
-        pulsus_testkit::live_clickhouse_enabled(),
-    ) else {
+    // FAIL-CLOSED on all three: dropping any `env:` block from this
+    // suite's CI step PANICS rather than skipping green. On a developer
+    // machine with no reference container it still skips cleanly — the
+    // guard fires only when the gate is missing inside a CI job that
+    // exists to supply it.
+    let api_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_GROUPING_DIFF_URL");
+    let otlp_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_GROUPING_OTLP_URL");
+    if !(api_gate.is_running()
+        && otlp_gate.is_running()
+        && pulsus_testkit::live_clickhouse_enabled())
+    {
         eprintln!(
             "skipping the spanSet-attributes differential — set PULSUS_TEST_CLICKHOUSE=1, \
              PULSUSDB_GROUPING_DIFF_URL (the reference's search API) and \
              PULSUSDB_GROUPING_OTLP_URL (its OTLP receiver)."
         );
         return;
-    };
+    }
+    let api_base = std::env::var("PULSUSDB_GROUPING_DIFF_URL").expect("gate is running");
+    let otlp_base = std::env::var("PULSUSDB_GROUPING_OTLP_URL").expect("gate is running");
 
     // ONE base instant for the whole run. Both windows are derived from
     // it, so no comparison can straddle a day boundary the corpus does

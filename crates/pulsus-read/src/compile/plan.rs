@@ -10,7 +10,7 @@
 //!
 //! So the compiler emits a plan: an ordered list of [`Part`]s, each part
 //! either one SQL statement or work in our own process, with the value
-//! set that crosses between two parts named, typed and bounded
+//! set that crosses between parts named, typed and bounded
 //! ([`Seed`]).
 //!
 //! **The plan already exists in the shipped code; what was missing is a
@@ -25,7 +25,7 @@ use serde::Serialize;
 
 use super::fold::{
     BoundaryOutput, Disposition, Fidelity, Lang, Lowering, Name, Relation, RequestBounds,
-    ResidualReason, branch_sources_union,
+    ResidualReason, SourceName, branch_sources_union,
 };
 
 // ---------------------------------------------------------------------
@@ -118,6 +118,29 @@ pub struct PlanConfig {
     /// The over-fetch factor a keyset page applies when the request's
     /// `LIMIT` could not enter the statement.
     pub keyset_over_fetch: u32,
+    /// The largest seed the language puts in ONE statement when that is
+    /// smaller than the rendering ceilings allow. `None` — the default —
+    /// means the ceilings decide, which is what every language did
+    /// before.
+    ///
+    /// TraceQL passes `Some(BATCH_TRACES)`: its phase-2 batch is an
+    /// operational choice at 32, not the 24,998 the ceilings permit
+    /// (issue #492 part 3, D2). Reporting the ceiling would have put a
+    /// number on the explain surface that no statement this tree sends
+    /// has ever used.
+    pub seed_chunk_rows: Option<u32>,
+    /// The plan-time upper bound on a seed a language draws from its own
+    /// EARLIER statement, when the language has one and the bound is a
+    /// per-request config value rather than a request parameter or a
+    /// named constant. `None` — the default — means no such seed exists
+    /// and a link that would need one gets no cut.
+    ///
+    /// TraceQL passes `Some(reader.traceql_max_candidates)`: every
+    /// phase-2 read is seeded from the phase-1 candidate list, whose size
+    /// that config bounds. The core carries the NUMBER only; the language
+    /// names it, because `reader.traceql_max_candidates` is TraceQL's own
+    /// config key and the core has no business spelling it.
+    pub seed_bound_rows: Option<u64>,
 }
 
 impl Default for PlanConfig {
@@ -127,6 +150,8 @@ impl Default for PlanConfig {
             max_query_text_bytes: crate::querytext::MAX_QUERY_TEXT_BYTES,
             keyset_page_rows: 1_000,
             keyset_over_fetch: 10,
+            seed_chunk_rows: None,
+            seed_bound_rows: None,
         }
     }
 }
@@ -191,7 +216,18 @@ impl Cut {
 /// How many times a statement is sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Issue {
-    /// Sent once.
+    /// Sent AT MOST once, and no driver is attached.
+    ///
+    /// **At most, not exactly**: a plan is a plan-time answer and the
+    /// executor sends fewer statements when the data runs out. Measured
+    /// live on a 7-span corpus, `{ traceDuration > 2s }` issued its
+    /// generator, its hydration and its co-load and then no root read at
+    /// all, because nothing matched and there were no winners to
+    /// summarise. Nothing branches on the stronger reading: the one
+    /// production site that reads this variant is the inexact-limit
+    /// rewrite below, which tests it for *no driver attached* rather
+    /// than *this will execute*, and overwriting is equally safe at zero
+    /// executions and at one (issue #492 part 3).
     Once,
     /// Sent once per seed drawn from `driver`, until the driver stops.
     PerSeed(Driver),
@@ -220,10 +256,22 @@ impl Issue {
     }
 }
 
-/// A value set crossing from one part to the next. Always materialised
-/// values, never a subquery (ADR 0008 D3), and always bounded.
+/// A value set crossing from one part — or from several merged — to the
+/// next. Always materialised values, never a subquery (ADR 0008 D3), and
+/// always bounded.
 pub struct Seed<L: Lang + ?Sized> {
-    pub from_part: usize,
+    /// **Every part whose result the values are drawn from**, in plan
+    /// order — never only the most recent one.
+    ///
+    /// A list because a seed can be a MERGE. A TraceQL search whose
+    /// selector disjoins across two tables opens with two generator
+    /// statements and hydrates their merged candidate set, so a field
+    /// holding one index would have to credit one of the two and would
+    /// describe a dependency the executor does not have (issue #492
+    /// part 3, code review round 1). It holds exactly one index whenever
+    /// one statement produced the values, which is every other case in
+    /// both languages today.
+    pub from_parts: Vec<usize>,
     /// The language's own handoff type — trace ids, fingerprints, a
     /// keyset cursor. At plan time this is the EMPTY handoff: the plan
     /// describes the crossing, and the executor fills the values in.
@@ -237,10 +285,12 @@ pub struct Seed<L: Lang + ?Sized> {
 pub struct SqlPart<L: Lang + ?Sized> {
     /// The clause-slot term this statement renders from (ADR 0008 D1).
     pub rel: Relation<L>,
-    /// What this statement consumes from the part before it. `None` only
-    /// for a part that opens the plan.
+    /// What this statement consumes from the part or parts before it.
+    /// `None` for a part that OPENS the plan — and a plan can open with
+    /// several, one per source of a disjunction, none of which consumes
+    /// anything.
     pub seed: Option<Seed<L>>,
-    /// What it produces for the part after it.
+    /// What it produces for whatever comes after it.
     pub yields: BoundaryOutput<L>,
     /// How many times the statement is sent.
     pub issue: Issue,
@@ -336,27 +386,39 @@ pub fn inexact_limit_fires<L: Lang + ?Sized>(rel: &Relation<L>, cx: &PlanCx<'_>)
 }
 
 /// The largest chunk of `bound` values whose rendered statement stays
-/// under both ceilings. Binary search over [`Lang::handoff_cost`], which
-/// is O(1) — no statement is rendered and no round trip is made.
+/// under both ceilings — **or the language's own smaller chunk, when it
+/// has one**. Binary search over [`Lang::handoff_cost`], which is O(1) —
+/// no statement is rendered and no round trip is made.
+///
+/// The ceilings say what a statement CAN hold; they do not say what the
+/// executor sends. A language that batches at a smaller size passes it as
+/// [`PlanConfig::seed_chunk_rows`] and it wins, because a plan reporting
+/// a chunk no statement uses is a wrong answer on the explain surface
+/// (issue #492 part 3, D2).
 fn chunk_for<L: Lang + ?Sized + 'static>(bound: u64, cx: &PlanCx<'_>) -> u64 {
     let fits = |n: u64| {
         let c = L::handoff_cost(n);
         c.text_bytes <= cx.config.max_query_text_bytes
             && c.ast_elements <= cx.config.max_ast_elements
     };
-    if fits(bound) {
-        return bound;
-    }
-    let (mut lo, mut hi) = (1u64, bound);
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
+    let ceiling_chunk = if fits(bound) {
+        bound
+    } else {
+        let (mut lo, mut hi) = (1u64, bound);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
+        lo.max(1)
+    };
+    match cx.config.seed_chunk_rows {
+        Some(n) => ceiling_chunk.min(u64::from(n)).max(1),
+        None => ceiling_chunk,
     }
-    lo.max(1)
 }
 
 // ---------------------------------------------------------------------
@@ -381,8 +443,9 @@ fn chunk_for<L: Lang + ?Sized + 'static>(bound: u64, cx: &PlanCx<'_>) -> u64 {
 ///    [`Lang::handoff_bound`] returning `None` is what refuses the cut.
 /// 3. A predicate that engages no index does not cut and is not declined.
 ///
-/// **`chain` is a parameter, which the design record's signature did not
-/// carry.** Two of the three facts the builder needs — `source_of` and
+/// **`chain` is a parameter**, and the design record's signature carries
+/// it too since issue #492 part 3 — it did not when that section was
+/// written. Two of the three facts the builder needs — `source_of` and
 /// `handoff_bound` — take the link, and [`Lowering`] holds only the
 /// accumulated relation and the per-link dispositions. Nothing else about
 /// the signature moves; the chain is borrowed and never mutated.
@@ -417,9 +480,17 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
             // The SAME derivation `cuts_firing` uses, so the cut's
             // source list and the parts built beside it cannot disagree.
             let sources: Vec<SourceRef> = branch_sources_union(bs);
-            for (i, (_, pred)) in bs.iter().enumerate() {
+            for (i, (branch_sources, pred)) in bs.iter().enumerate() {
                 let mut branch_rel = rel.clone();
                 branch_rel.predicate = pred.clone();
+                // D1 (issue #492 part 3): a branch reading exactly one
+                // source names THAT source, not the seed's. A branch
+                // spanning two is one statement over both, and there is
+                // no single name for it, so it keeps the seed's — stated
+                // rather than guessed.
+                if let [only] = branch_sources.as_slice() {
+                    branch_rel.source = super::fold::SourceTerm::Base(L::Source::named(*only));
+                }
                 parts.push(Part::Sql(Box::new(SqlPart {
                     yields: boundary_output(&branch_rel),
                     rel: branch_rel,
@@ -445,7 +516,12 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
             })));
         }
     }
-    let mut last_sql_part = parts.len() - 1;
+    // Every part the NEXT seed is drawn from. It is the whole source run
+    // to begin with — a disjunction across two sources opens the plan
+    // with one statement per source and their results are merged — and
+    // one part after each handoff, because a handoff's own result is what
+    // the part after it consumes.
+    let mut seed_from: Vec<usize> = (0..parts.len()).collect();
 
     // --- the links --------------------------------------------------
     let mut links: Vec<LinkOutcome> = Vec::with_capacity(how.len());
@@ -475,13 +551,32 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                             debug_assert_eq!(part, parts.len());
                             parts.push(Part::Engine { links: start..i });
                         }
-                        let cut = cuts_firing::<L>(&rel, Some(&h), cx).into_iter().next();
                         let mut part_rel = rel.clone();
                         // The second read is over a different source and
                         // carries no predicate of its own: it is keyed on
                         // the seed alone.
                         part_rel.predicate = super::fold::Pred::True;
                         part_rel.limit = None;
+                        // D1 (issue #492 part 3): and it is named for the
+                        // source it reads. Cloning the accumulated
+                        // relation and leaving `source` alone made every
+                        // part after the first report the SEED's table,
+                        // while its own cut named the right one.
+                        part_rel.source = super::fold::SourceTerm::Base(L::Source::named(h.source));
+                        // **The cut is asked of THIS part's relation, not
+                        // of the seed's** (issue #492 part 3). Asking the
+                        // accumulated relation made every part after a
+                        // disjunctive seed inherit
+                        // `Cut::DisjointSources` — an answer about the
+                        // FIRST statement, repeated on statements that
+                        // carry no predicate at all — and, because the
+                        // issue count is chosen from the cut, it also
+                        // suppressed the chunk driver those parts need.
+                        // Measured on
+                        // `{ resource.service.name = "checkout" || span.http.method = "GET" }`:
+                        // four of its six parts said `disjoint_sources`,
+                        // including the winners' root read.
+                        let cut = cuts_firing::<L>(&part_rel, Some(&h), cx).into_iter().next();
                         let bound = h.bound;
                         let issue = match cut {
                             Some(Cut::HandoffExceedsBound { .. }) => {
@@ -496,16 +591,17 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
                             yields: boundary_output(&part_rel),
                             rel: part_rel,
                             seed: Some(Seed {
-                                from_part: last_sql_part,
+                                from_parts: seed_from.clone(),
                                 values: L::Handoff::default(),
                                 bound,
                             }),
                             issue,
                             cut,
                         })));
-                        last_sql_part = parts.len() - 1;
+                        let this_part = parts.len() - 1;
+                        seed_from = vec![this_part];
                         links.push(LinkOutcome {
-                            part: last_sql_part,
+                            part: this_part,
                             how: *disp,
                         });
                     }
@@ -533,8 +629,25 @@ pub fn plan_of<L: Lang + ?Sized + 'static>(
         // Only a part sent ONCE becomes a page loop. A part already
         // issued once per seed chunk is bounded by the chunk driver, and
         // overwriting it would drop the bound the executor needs.
+        //
+        // **And only a part that the limit still has to FILL.** D4 (issue
+        // #492 part 3): a part seeded by a set the request's own `LIMIT`
+        // already bounds sits DOWNSTREAM of the limit — it reads the rows
+        // that won, once, after the limit is satisfied — so a page loop
+        // on it describes a loop that does not exist. Every TraceQL
+        // search's last statement is that shape (the winners' root read,
+        // seeded by at most `limit` trace ids), which is why the rule
+        // fired on every search before this.
+        let last_sql_part = seed_from
+            .last()
+            .copied()
+            .expect("the source run puts at least one SQL part in seed_from");
         if let Some(Part::Sql(p)) = parts.get_mut(last_sql_part)
             && matches!(p.issue, Issue::Once)
+            && !matches!(
+                p.seed.as_ref().map(|s| s.bound),
+                Some(SeedBound::RequestLimit(_))
+            )
         {
             p.issue = Issue::PerSeed(Driver::Keyset {
                 page_rows,
@@ -598,7 +711,13 @@ pub struct PlanShape {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum PartShape {
-    Sql(SqlPartShape),
+    /// Boxed for the same reason [`Part::Sql`] is: a rendered statement
+    /// carries six fields including two optional nested structs, an
+    /// engine part carries a kind and a list of link indices, and without
+    /// the indirection every engine part in the vector would pay the
+    /// statement's width. `#[serde(untagged)]` renders through the box,
+    /// so the wire is unchanged.
+    Sql(Box<SqlPartShape>),
     Engine(EnginePartShape),
 }
 
@@ -633,7 +752,8 @@ pub struct CutShape {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SeedShape {
-    pub from: usize,
+    /// Every part index the seed's values come from, in plan order.
+    pub from: Vec<usize>,
     pub bound: BoundShape,
 }
 
@@ -666,13 +786,13 @@ impl<L: Lang + ?Sized> QueryPlan<L> {
             .parts
             .iter()
             .map(|p| match p {
-                Part::Sql(s) => PartShape::Sql(SqlPartShape {
+                Part::Sql(s) => PartShape::Sql(Box::new(SqlPartShape {
                     kind: "sql",
                     name: s.rel.source_ref().as_str().to_string(),
                     issue: s.issue.wire(),
                     cut: s.cut.as_ref().map(cut_shape),
                     seed: s.seed.as_ref().map(|seed| SeedShape {
-                        from: seed.from_part,
+                        from: seed.from_parts.clone(),
                         bound: BoundShape {
                             kind: seed.bound.kind(),
                             name: seed.bound.name(),
@@ -680,7 +800,7 @@ impl<L: Lang + ?Sized> QueryPlan<L> {
                         },
                     }),
                     yields: s.yields.kind(),
-                }),
+                })),
                 Part::Engine { links } => PartShape::Engine(EnginePartShape {
                     kind: "engine",
                     links: links.clone().collect(),
@@ -786,7 +906,7 @@ fn never_wire(n: super::fold::NeverReason) -> &'static str {
 impl<L: Lang + ?Sized> Clone for Seed<L> {
     fn clone(&self) -> Self {
         Self {
-            from_part: self.from_part,
+            from_parts: self.from_parts.clone(),
             values: self.values.clone(),
             bound: self.bound,
         }
@@ -796,7 +916,7 @@ impl<L: Lang + ?Sized> Clone for Seed<L> {
 impl<L: Lang + ?Sized> std::fmt::Debug for Seed<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Seed")
-            .field("from_part", &self.from_part)
+            .field("from_parts", &self.from_parts)
             .field("values", &self.values)
             .field("bound", &self.bound)
             .finish()
@@ -805,7 +925,7 @@ impl<L: Lang + ?Sized> std::fmt::Debug for Seed<L> {
 
 impl<L: Lang + ?Sized> PartialEq for Seed<L> {
     fn eq(&self, other: &Self) -> bool {
-        self.from_part == other.from_part
+        self.from_parts == other.from_parts
             && self.values == other.values
             && self.bound == other.bound
     }
@@ -934,6 +1054,10 @@ mod tests {
     impl SourceName for TestSource {
         fn source_ref(&self) -> SourceRef {
             SourceRef(self.0)
+        }
+
+        fn named(s: SourceRef) -> Self {
+            TestSource(s.as_str())
         }
     }
 
@@ -1551,7 +1675,11 @@ mod tests {
                 key: Name::from("id")
             })
         );
-        assert_eq!(second.seed.as_ref().map(|s| s.from_part), Some(0));
+        assert_eq!(
+            second.seed.as_ref().map(|s| s.from_parts.clone()),
+            Some(vec![0]),
+            "one source statement produced the values, so the seed names exactly it"
+        );
         assert_eq!(
             second.seed.as_ref().map(|s| s.bound),
             Some(SeedBound::RequestLimit(20))
@@ -1587,6 +1715,64 @@ mod tests {
 
     /// A seed too large to render in one statement is chunked, and the
     /// chunk is the largest that stays under both ceilings.
+    /// Issue #492 part 3, criterion 13 (the core's half): **a chunk the
+    /// language supplies wins over the ceilings'.**
+    ///
+    /// The ceilings say what a statement CAN hold. They do not say what
+    /// the executor sends, and a plan that reports the ceiling describes
+    /// a batch no statement uses. This asserts the two answers to one
+    /// input differ in exactly the field the config names, and that the
+    /// language's number is the one that survives.
+    #[test]
+    fn a_language_supplied_chunk_wins_over_the_ceiling() {
+        let b = bounds(None);
+        let ceilings_decide = PlanConfig::default();
+        assert_eq!(ceilings_decide.seed_chunk_rows, None, "the default");
+
+        let p = plan(&[TestStage::BigHandoff], &b, &ceilings_decide);
+        let Part::Sql(second) = &p.parts[1] else {
+            panic!("parts: {:?}", p.parts)
+        };
+        let Issue::PerSeed(Driver::Chunks { bound, chunk }) = second.issue else {
+            panic!("issue: {:?}", second.issue)
+        };
+        assert_eq!(bound, 40_000);
+        // 8 + 2n <= 50_000 is the binding ceiling for this language.
+        assert_eq!(chunk, 24_996, "the largest chunk the ceilings admit");
+
+        let language_batches_at = PlanConfig {
+            seed_chunk_rows: Some(100),
+            ..PlanConfig::default()
+        };
+        let p = plan(&[TestStage::BigHandoff], &b, &language_batches_at);
+        let Part::Sql(second) = &p.parts[1] else {
+            panic!("parts: {:?}", p.parts)
+        };
+        let Issue::PerSeed(Driver::Chunks { bound, chunk }) = second.issue else {
+            panic!("issue: {:?}", second.issue)
+        };
+        assert_eq!(bound, 40_000, "the BOUND is the seed's and does not move");
+        assert_eq!(
+            chunk, 100,
+            "the language's own chunk wins over the ceiling chunk 24996"
+        );
+
+        // And it is a MINIMUM, not an override: a language chunk larger
+        // than the ceilings admit does not raise the ceiling.
+        let language_asks_too_much = PlanConfig {
+            seed_chunk_rows: Some(30_000),
+            ..PlanConfig::default()
+        };
+        let p = plan(&[TestStage::BigHandoff], &b, &language_asks_too_much);
+        let Part::Sql(second) = &p.parts[1] else {
+            panic!("parts: {:?}", p.parts)
+        };
+        let Issue::PerSeed(Driver::Chunks { chunk, .. }) = second.issue else {
+            panic!("issue: {:?}", second.issue)
+        };
+        assert_eq!(chunk, 24_996, "the ceilings still bind");
+    }
+
     #[test]
     fn an_oversized_seed_becomes_a_chunked_issue_under_both_ceilings() {
         let config = PlanConfig::default();

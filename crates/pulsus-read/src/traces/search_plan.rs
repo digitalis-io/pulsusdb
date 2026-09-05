@@ -16,12 +16,15 @@ use regex::Regex;
 use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
+use super::compile::{ChainFacts, Tql, TqlLink};
 use super::filter::{
     self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, LeafEval,
     NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx, TraceCtxPred, ValuePred,
 };
 use super::search_eval::StoredType;
 use super::search_sql;
+use crate::compile::fold::{LowerCx, Pred, RequestBounds, lower_chain};
+use crate::compile::plan::{PlanConfig, PlanCx, PlanShape, QueryPlan, SourceRef, plan_of};
 
 /// The caller-validated request window and response caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -694,6 +697,20 @@ pub struct SearchPlan {
     /// runs it before the main search and flips a `cap+1` result to a
     /// static `422 query_too_broad`.
     pub(crate) by_probe_sql: Option<String>,
+    /// The compiled chain (issue #492 part 3), in the order the executor
+    /// issues its statements. `exec::batch_attrs` walks this instead of
+    /// six hand-written index loops, so the per-batch reads and the
+    /// `BatchAttrs` vectors they fill cannot drift out of alignment.
+    pub(crate) chain: Vec<TqlLink>,
+    /// Each chain link's own name, in chain order — what
+    /// `QueryPlan::shape` renders for the explain surface.
+    pub(crate) stage_names: Vec<String>,
+    /// The plan the shared compile core produced for this request.
+    ///
+    /// **It changes no SQL.** Every statement still comes from the
+    /// shipped builders; this says WHICH statements a request sends,
+    /// which was previously written down only in the golden files.
+    pub(crate) compiled: QueryPlan<Tql>,
 }
 
 impl SearchPlan {
@@ -927,6 +944,46 @@ impl SearchPlan {
     /// gates the per-batch co-load so every other query pays nothing.
     pub fn needs_event_sets(&self) -> bool {
         !self.event_sets.is_empty()
+    }
+
+    /// The compiled chain, in the order the executor issues its
+    /// statements (issue #492 part 3).
+    pub(crate) fn chain(&self) -> &[TqlLink] {
+        &self.chain
+    }
+
+    /// The plan the compile core produced for this request.
+    pub(crate) fn compiled(&self) -> &QueryPlan<Tql> {
+        &self.compiled
+    }
+
+    /// The plan projected for the explain surface. Built only in
+    /// explained mode — an unexplained search never renders it.
+    pub fn plan_shape(&self) -> PlanShape {
+        self.compiled.shape(&self.stage_names)
+    }
+
+    /// Whether any planned leaf is a nested-set structural intrinsic
+    /// (issue #181) — one chain link when true.
+    pub fn needs_nested_set(&self) -> bool {
+        self.nested_set
+    }
+
+    /// Whether the spanset carries a structural relation (issue #172) —
+    /// one chain link when true.
+    ///
+    /// Derived from the stored spanset rather than from a second stored
+    /// flag, so the chain builder and this accessor cannot disagree:
+    /// there is one derivation and both call it.
+    pub fn has_structural_relation(&self) -> bool {
+        spanset_has_structural(&self.spanset)
+    }
+
+    /// How many `!`-operand truthiness leaves the query carries (issue
+    /// #335) — one chain link each. Derived from the planned filters, the
+    /// same walk the chain builder makes.
+    pub fn bool_truth_leaves(&self) -> usize {
+        count_bool_truth_leaves(&self.filters)
     }
 }
 
@@ -2180,6 +2237,10 @@ pub fn plan_search(
     let mut probe_predicates: Vec<String> = Vec::new();
     let mut filters = Vec::new();
     let mut generator_sqls: Vec<String> = Vec::new();
+    // Issue #492 part 3: the generators themselves, index-aligned with
+    // the deduped `generator_sqls`, so the compile core can key the seed
+    // predicate's branches on the table each statement reads.
+    let mut generators: Vec<(SourceRef, filter::LeafGenerator)> = Vec::new();
     let mut nested_set = false;
     let mut trace_ctx = false;
     let mut child_count = false;
@@ -2236,6 +2297,10 @@ pub fn plan_search(
             );
             if !generator_sqls.contains(&sql) {
                 generator_sqls.push(sql);
+                generators.push((
+                    super::compile::generator_source(generator.table),
+                    generator.clone(),
+                ));
             }
         }
     }
@@ -2334,6 +2399,64 @@ pub fn plan_search(
         })
         .transpose()?;
 
+    // ---- issue #492 part 3: the compiled plan --------------------------
+    //
+    // Built from what the planner has just decided, and it decides
+    // nothing itself: the statements are still the ones the shipped
+    // builders render, and `plan_of` only says which of them a request
+    // sends and why each is its own statement. No I/O, no round trip —
+    // this runs before the pool is acquired.
+    let structural = spanset_has_structural(&query.spanset);
+    let bool_truth_leaves = count_bool_truth_leaves(&filters);
+    let chain = super::compile::chain_of(
+        query,
+        &ChainFacts {
+            generators: &generators,
+            probes: probes.len(),
+            agg_fields: agg_fields.len(),
+            select_attrs: select_attrs.len(),
+            event_sets: event_sets.len(),
+            trace_ctx,
+            child_count,
+            nested_set,
+            structural,
+            bool_truth_leaves,
+        },
+        params.limit,
+    );
+    let seed_source = generators
+        .first()
+        .map_or(super::compile::TRACE_SPANS, |(source, _)| *source);
+    let bounds = RequestBounds {
+        start_ns: window.start_ns,
+        end_ns: window.end_ns,
+        step_ns: None,
+        limit: Some(params.limit),
+    };
+    let config = PlanConfig {
+        // The phase-2 batch is an operational choice at 32, not the
+        // ~25,000 the rendering ceilings would permit.
+        seed_chunk_rows: Some(super::exec::BATCH_TRACES as u32),
+        // Every phase-2 read is seeded from the phase-1 candidate list,
+        // which `reader.traceql_max_candidates` bounds.
+        seed_bound_rows: Some(ctx.max_candidates),
+        ..PlanConfig::default()
+    };
+    let lowering = lower_chain::<Tql>(
+        &chain,
+        super::compile::seed_relation(seed_source, generator_pred_of(&generators)),
+        &LowerCx::<Tql>::new(&bounds),
+    )?;
+    let compiled = plan_of::<Tql>(
+        &chain,
+        lowering,
+        &PlanCx {
+            bounds: &bounds,
+            config: &config,
+        },
+    )?;
+    let stage_names = super::compile::stage_names(&chain);
+
     Ok(SearchPlan {
         window,
         limit: params.limit,
@@ -2361,7 +2484,39 @@ pub fn plan_search(
         post_stages: pipeline.post_stages,
         most_recent,
         by_probe_sql,
+        chain,
+        stage_names,
+        compiled,
     })
+}
+
+/// Whether the spanset carries a structural relation (issue #172) — the
+/// one chain link whose reason is that the relation holds between two
+/// spans of one trace.
+fn spanset_has_structural(expr: &SpansetExpr) -> bool {
+    match expr {
+        SpansetExpr::Filter(_) => false,
+        SpansetExpr::Structural { .. } => true,
+        SpansetExpr::Binary { lhs, rhs, .. } => {
+            spanset_has_structural(lhs) || spanset_has_structural(rhs)
+        }
+    }
+}
+
+/// How many `!`-operand truthiness leaves the planned filters carry — the
+/// ONE derivation, read by both the chain builder and
+/// [`SearchPlan::bool_truth_leaves`].
+fn count_bool_truth_leaves(filters: &[PlannedFilter]) -> usize {
+    filters
+        .iter()
+        .flat_map(|f| f.leaves.iter())
+        .filter(|leaf| matches!(leaf, PlannedLeafEval::BoolTruth { .. }))
+        .count()
+}
+
+/// [`super::compile::generator_pred`] over the deduped generator list.
+fn generator_pred_of(generators: &[(SourceRef, filter::LeafGenerator)]) -> Pred {
+    super::compile::generator_pred(generators)
 }
 
 /// The grouping column for a spanset `| by(...)` cap probe, when the keys
@@ -2417,6 +2572,58 @@ mod tests {
 
     fn plan(q: &str) -> SearchPlan {
         plan_search(&parse(q).expect("parse"), &PARAMS, &ctx()).expect("plan")
+    }
+
+    /// Issue #492 part 3: **the PLANNER supplies the phase-2 batch as the
+    /// chunk**, and this asserts the wiring rather than the rule.
+    ///
+    /// `traces::compile::tests::the_phase_two_chunk_is_the_batch_constant`
+    /// pins the rule — that a language-supplied chunk beats the rendering
+    /// ceiling — but it builds its own `PlanConfig`, so it cannot see
+    /// `plan_search` failing to supply one. Setting `seed_chunk_rows` to
+    /// `None` in `plan_search` left that test green, and the value is not
+    /// on the wire either (`Issue::wire()` renders the WORD
+    /// `per_seed:chunks` and no number), so the chunk was unguarded end to
+    /// end. A test that builds its own input cannot detect the production
+    /// path failing to supply it (code review round 6).
+    ///
+    /// The candidate bound has to be large enough for the seed not to fit
+    /// one statement, or no chunk driver is chosen at all and the
+    /// assertion would be about the wrong branch — hence a local context
+    /// rather than the module's, whose bound of 100 fits comfortably.
+    #[test]
+    fn the_planner_supplies_the_batch_as_the_phase_two_chunk() {
+        use crate::compile::plan::{Driver, Issue, Part};
+
+        let big = SearchCtx {
+            max_candidates: 100_000,
+            ..ctx()
+        };
+        let plan = plan_search(
+            &parse(r#"{ resource.service.name = "checkout" }"#).expect("parse"),
+            &PARAMS,
+            &big,
+        )
+        .expect("plan");
+
+        // The hydration read is chain link 1; its part is where the seed
+        // first crosses.
+        let compiled = plan.compiled();
+        let Part::Sql(hydration) = &compiled.parts[compiled.links[1].part] else {
+            panic!(
+                "the hydration read must be an SQL part: {:?}",
+                compiled.parts
+            )
+        };
+        assert_eq!(
+            hydration.issue,
+            Issue::PerSeed(Driver::Chunks {
+                bound: 100_000,
+                chunk: u64::from(super::super::exec::BATCH_TRACES as u32),
+            }),
+            "the planner must hand the compile core its own batch: the chunk is BATCH_TRACES, \
+             not the 24998 the rendering ceilings would permit"
+        );
     }
 
     // ---- issue #479: the matched-span projection ------------------------

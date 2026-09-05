@@ -2464,10 +2464,122 @@ async fn the_traces_search_route_answers_the_explain_header() {
     );
     // The plan key is additive and ABSENT today: no read path calls the
     // compile core yet, so wave 1 adds a field and no byte of response.
+    // The plan key, and its CONTENT (issue #492 part 3). This assertion
+    // used to say the key was absent "until a read path compiles a plan";
+    // this part is that read path, so the same sentence now has the
+    // opposite answer and the test asserts what the plan says rather than
+    // that something is there.
+    //
+    // The whole object, not a probe of it: an existence check would pass
+    // on a renderer that emitted `{}`, and every earlier defect in this
+    // part was a plan that was PRESENT and wrong — a part named for the
+    // seed's table, a chunk of 24,998, a page loop on a statement issued
+    // once, a seed crediting one of two generators. Each of those would
+    // sit inside this key and satisfy a presence test.
+    //
+    // Reading it: `{ resource.service.name = "explain-checkout" }` is a
+    // service-equality selector, so one generator reads `trace_spans` and
+    // the request sends three statements — that generator, the batch
+    // hydration seeded from it, and the winners' root read — with the
+    // pipeline's own work between the last two. `bound.value` is this
+    // suite's configured `reader.traceql_max_candidates`, and it belongs
+    // in the assertion: the plan REPORTS the ceiling, so a config change
+    // must move it.
+    let expected_plan = serde_json::json!({
+        "parts": [
+            {"kind": "sql", "name": "trace_spans", "issue": "once",
+             "cut": null, "seed": null, "yields": "candidates"},
+            {"kind": "sql", "name": "trace_spans:hydration", "issue": "per_seed:chunks",
+             "cut": {"why": "handoff_exceeds_bound",
+                     "cost": {"text_bytes": 4_300_048u64, "ast_elements": 200_004u64}},
+             "seed": {"from": [0],
+                      "bound": {"kind": "config",
+                                "name": "reader.traceql_max_candidates",
+                                "value": 100_000u64}},
+             "yields": "candidates"},
+            {"kind": "engine", "links": [2, 3]},
+            {"kind": "sql", "name": "trace_spans:root", "issue": "once",
+             "cut": {"why": "source_handoff", "source": "trace_spans:root", "key": "trace_id"},
+             "seed": {"from": [1], "bound": {"kind": "request_limit", "value": 20u64}},
+             "yields": "candidates"},
+        ],
+        "links": [
+            {"i": 0, "part": 0, "stage": "Source",     "how": "lowered",  "fidelity": "wider"},
+            {"i": 1, "part": 1, "stage": "Hydrate",    "how": "residual", "why": "not_yet_lowered"},
+            {"i": 2, "part": 2, "stage": "Order",      "how": "residual", "why": "not_exact"},
+            {"i": 3, "part": 2, "stage": "Limit(20)",  "how": "residual",
+             "why": "ordering_not_established"},
+            {"i": 4, "part": 3, "stage": "Emit",       "how": "residual",
+             "why": "needs_unwindowed_root_read"},
+        ],
+    });
     assert_eq!(
         explain.get("plan"),
-        None,
-        "the plan key is absent until a read path compiles a plan: {with}"
+        Some(&expected_plan),
+        "the compiled plan this route now carries: {with}"
+    );
+
+    // A SECOND request, disjoint across the two tables, because the one
+    // above cannot see two of the defects this part fixed: it has one
+    // generator, so a seed naming only its last contributing part is
+    // indistinguishable from one naming all of them. This query opens the
+    // plan with TWO statements — the service column lives in
+    // `trace_spans` and an attribute lives in `trace_attrs_idx`, and one
+    // `WHERE` cannot hold both — so `seed.from` is `[0, 1]` and the
+    // second generator carries the cut that says why.
+    //
+    // `span.zzz` matches nothing on purpose: the plan's shape is decided
+    // at plan time and does not depend on what the data holds, so the
+    // answer beside it is the same two traces as above.
+    let or_q = r#"{ resource.service.name = "explain-checkout" || span.zzz = "no-such" }"#;
+    let or_path = format!("/api/traces/v1/search?q={}&start={w0}&end={w1}", enc(or_q));
+    let or_raw = request_with_headers(port, "GET", &or_path, None, &[("X-Pulsus-Explain", "1")])
+        .expect("explain: the disjunctive request must be reachable");
+    assert_eq!(
+        or_raw.status,
+        200,
+        "body {:?}",
+        String::from_utf8_lossy(&or_raw.body)
+    );
+    let or_body: serde_json::Value =
+        serde_json::from_slice(&or_raw.body).expect("explain response parses");
+    let or_plan = &or_body["explain"]["plan"];
+    let or_parts = or_plan["parts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no parts in {or_body}"));
+    assert_eq!(
+        or_parts
+            .iter()
+            .map(|p| p["name"].as_str().unwrap_or("engine"))
+            .collect::<Vec<_>>(),
+        vec![
+            "trace_spans",
+            "trace_attrs_idx",
+            "trace_spans:hydration",
+            "trace_attrs_idx:membership",
+            "engine",
+            "trace_spans:root",
+        ],
+        "two sources open the plan, and the attribute leaf adds its membership read: {or_body}"
+    );
+    assert_eq!(
+        or_parts[1]["cut"],
+        serde_json::json!({
+            "why": "disjoint_sources",
+            "sources": ["trace_spans", "trace_attrs_idx"],
+        }),
+        "the second generator says why it is its own statement: {or_body}"
+    );
+    assert_eq!(
+        or_parts[0]["seed"],
+        serde_json::Value::Null,
+        "both generator statements open the plan and consume nothing: {or_body}"
+    );
+    assert_eq!(or_parts[1]["seed"], serde_json::Value::Null, "{or_body}");
+    assert_eq!(
+        or_parts[2]["seed"]["from"],
+        serde_json::json!([0, 1]),
+        "the hydration read is seeded by the MERGE of both generators, and names both: {or_body}"
     );
 
     drop_db(db).await;

@@ -29,7 +29,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::plan::{PlanCx, SeedBound, SourceRef};
 
@@ -183,7 +183,13 @@ pub struct OpenSourceId(pub &'static str);
 /// `Debug` is a supertrait and [`OpenSource::id`] is an identity, because
 /// [`ColSet`] must be `Clone + PartialEq + Eq + Debug` and `#[derive]`
 /// cannot see through `dyn`.
-pub trait OpenSource: fmt::Debug {
+///
+/// `Send + Sync` because a [`super::plan::QueryPlan`] is held by a
+/// language's own plan object across an `.await` — the TraceQL search
+/// handler builds one before it acquires a connection and still holds it
+/// when the last row arrives — and an axum handler's future must be
+/// `Send` (issue #492 part 3).
+pub trait OpenSource: fmt::Debug + Send + Sync {
     /// `Some(expr)` if this name is resolvable to SQL here; `None` if the
     /// only way to know its value is to run the stage in the evaluator.
     fn resolve(&self, name: &Name) -> Option<SqlExpr>;
@@ -198,14 +204,15 @@ pub trait OpenSource: fmt::Debug {
 /// that is not a column and resolves to a JSON extraction over the line.
 /// They are one concept.
 ///
-/// `Rc`, not `Box`: `ColSet` must be `Clone`, and a boxed trait object is
-/// not.
+/// `Arc`, not `Box`: `ColSet` must be `Clone`, and a boxed trait object
+/// is not. `Arc` rather than `Rc` because the plan object crosses an
+/// `.await` — see [`OpenSource`].
 #[derive(Debug, Clone)]
 pub enum ColSet {
     Closed(Vec<Col>),
     Open {
         known: Vec<Col>,
-        from: Vec<Rc<dyn OpenSource>>,
+        from: Vec<Arc<dyn OpenSource>>,
     },
 }
 
@@ -257,7 +264,7 @@ impl ColSet {
     }
 
     /// Widens the set with an open source.
-    pub fn widen(self, source: Rc<dyn OpenSource>) -> Self {
+    pub fn widen(self, source: Arc<dyn OpenSource>) -> Self {
         match self {
             ColSet::Closed(known) => ColSet::Open {
                 known,
@@ -547,8 +554,26 @@ pub trait Shape: Clone + Eq + fmt::Debug {}
 
 /// How a language names one readable source, so the core can ask a
 /// relation which source it reads without knowing the language.
-pub trait SourceName {
+pub trait SourceName: Sized {
     fn source_ref(&self) -> SourceRef;
+
+    /// The language's own source value for a source the core holds only
+    /// a [`SourceRef`] for.
+    ///
+    /// **This is a FACT, not a policy hook** (issue #492 part 3,
+    /// adjudicated). The deleted `Lang` cost hook let a language change
+    /// what the engine DOES; this reports data — which table a
+    /// `SourceRef` names — that the engine cannot derive, and the core
+    /// still decides everything that happens with it. The test to apply
+    /// is *does the language decide what happens, or does it tell the
+    /// engine something only it knows?*, and naming a table is the
+    /// second, so the earlier ruling does not reach it.
+    ///
+    /// The core needs it so that a part built from a handoff carries its
+    /// OWN source rather than the seed's: before this, every part after
+    /// the first rendered the seed's table name on the explain surface
+    /// (issue #492 part 3, D1).
+    fn named(s: SourceRef) -> Self;
 }
 
 /// `Base(source)`, or a relation wrapped as a subquery when a clause slot
@@ -803,7 +828,7 @@ pub trait Lang {
     /// A SQL column expression fragment.
     type ColExpr: Clone + Eq + fmt::Debug;
     type Shape: Shape;
-    /// What crosses between two parts — trace ids, fingerprints, a
+    /// What crosses between parts — trace ids, fingerprints, a
     /// keyset cursor. `Default` is the EMPTY handoff: a plan describes
     /// the crossing at plan time, and the executor fills the values in.
     type Handoff: Clone + Eq + fmt::Debug + Default;

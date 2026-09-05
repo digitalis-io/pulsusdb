@@ -15,7 +15,7 @@
 //!   `logql::plan::compile_line_filters` ships today.
 //! - [`plan`] — partitioning a completed fold into an ordered list of
 //!   **parts**, each part either one SQL statement or work in our own
-//!   process, with the value set crossing between two parts named, typed
+//!   process, with the value set crossing between parts named, typed
 //!   and bounded. The RULES live here; the FACTS come from
 //!   [`fold::Lang`].
 //!

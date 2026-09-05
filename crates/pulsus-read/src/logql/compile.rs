@@ -77,6 +77,10 @@ impl SourceName for LqlSource {
     fn source_ref(&self) -> SourceRef {
         self.0
     }
+
+    fn named(s: SourceRef) -> Self {
+        LqlSource(s)
+    }
 }
 
 /// LogQL's shapes. Not a shared enum: one enum over both languages would
@@ -391,7 +395,7 @@ impl Lower<Lql> for ParserLower {
             LqlLink::Pipe(Stage::Parser(ParserStage::Pattern(_))) => "parser:pattern",
             _ => "parser",
         };
-        rel.cols = rel.cols.widen(std::rc::Rc::new(EvaluatorOnlyLabels(
+        rel.cols = rel.cols.widen(std::sync::Arc::new(EvaluatorOnlyLabels(
             crate::compile::fold::OpenSourceId(id),
         )));
         rel
@@ -560,7 +564,7 @@ impl Lower<Lql> for UnpackLower {
     /// source the evaluator owns.
     fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>) -> Relation<Lql> {
         let mut rel = mark_line_rewritten(rel);
-        rel.cols = rel.cols.widen(std::rc::Rc::new(EvaluatorOnlyLabels(
+        rel.cols = rel.cols.widen(std::sync::Arc::new(EvaluatorOnlyLabels(
             crate::compile::fold::OpenSourceId("unpack:labels"),
         )));
         rel
@@ -931,7 +935,7 @@ mod tests {
     }
 
     fn widened(mut rel: Relation<Lql>, id: &'static str) -> Relation<Lql> {
-        rel.cols = rel.cols.widen(std::rc::Rc::new(EvaluatorOnlyLabels(
+        rel.cols = rel.cols.widen(std::sync::Arc::new(EvaluatorOnlyLabels(
             crate::compile::fold::OpenSourceId(id),
         )));
         rel
