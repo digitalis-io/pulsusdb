@@ -47,13 +47,20 @@
 //!   cargo test -p pulsus-read --test compare_value_differential -- --nocapture
 //! ```
 //!
-//! **Known wiring hole, recorded not fixed** (issue #458): the two
-//! `PULSUSDB_COMPARE_*` URLs below are read with a bare `env::var` and
-//! taken as a skip when absent, while `PULSUS_TEST_CLICKHOUSE` is
-//! fail-closed. Drop only the URLs from this suite's `schema-it` step and
-//! it reports GREEN having compared nothing — ledger entry
-//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`, which
-//! names the two-line fix (`pulsus_testkit::require_live_endpoint_gate`).
+//! **Fail-closed on all three gates** (issue #458 recorded the hole,
+//! issue #523 closed it here; the same fix landed on
+//! `traces_search_grouping_differential.rs` under #492 part 3). Both
+//! endpoint URLs go through `pulsus_testkit::require_live_endpoint_gate`,
+//! not the boolean gate: a URL-valued variable read by the boolean rule
+//! looks "not set" while the `env:` block is right there in the log.
+//! Before this, the URLs were read with a bare `env::var` and taken as a
+//! skip, so dropping only them from this suite's `schema-it` step
+//! reported GREEN having compared nothing. Measured at `d542869b`
+//! (`PULSUS_TEST_CLICKHOUSE=1 GITHUB_JOB=schema-it`, no URLs):
+//! `1 passed`; with this change the same invocation panics naming the
+//! variable and the job. A developer machine — no `GITHUB_JOB` — still
+//! skips cleanly. Ledger entry
+//! `traceql-differential-legs-skip-green-on-a-missing-endpoint`.
 //!
 //! **Two differential binaries against ONE reference endpoint contaminate
 //! each other. Recorded, not fixed** (issue #477 wave 4 review). This
@@ -585,18 +592,28 @@ fn now_ns() -> i64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn compare_value_differential() {
-    let (Ok(api_base), Ok(otlp_base), true) = (
-        std::env::var("PULSUSDB_COMPARE_DIFF_URL"),
-        std::env::var("PULSUSDB_COMPARE_OTLP_URL"),
-        pulsus_testkit::live_clickhouse_enabled(),
-    ) else {
+    // FAIL-CLOSED on all three: dropping any `env:` block from this
+    // suite's CI step PANICS rather than skipping green. On a developer
+    // machine with no reference container it still skips cleanly — the
+    // guard fires only when the gate is missing inside a CI job that
+    // exists to supply it. Both URL gates take the ENDPOINT classifier,
+    // because the boolean one counts a gate as set only when its value is
+    // exactly `1`.
+    let api_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_COMPARE_DIFF_URL");
+    let otlp_gate = pulsus_testkit::require_live_endpoint_gate("PULSUSDB_COMPARE_OTLP_URL");
+    if !(api_gate.is_running()
+        && otlp_gate.is_running()
+        && pulsus_testkit::live_clickhouse_enabled())
+    {
         eprintln!(
             "skipping the compare() value differential — set PULSUS_TEST_CLICKHOUSE=1, \
              PULSUSDB_COMPARE_DIFF_URL (Tempo metrics API) and PULSUSDB_COMPARE_OTLP_URL \
-             (Tempo OTLP). Env-gated, unenforced in fast CI; #185 activates enforcement."
+             (Tempo OTLP)."
         );
         return;
-    };
+    }
+    let api_base = std::env::var("PULSUSDB_COMPARE_DIFF_URL").expect("gate is running");
+    let otlp_base = std::env::var("PULSUSDB_COMPARE_OTLP_URL").expect("gate is running");
 
     // The reverse-order half of the projection leg's isolation hazard
     // (issue #479, code review wave 2). That suite refuses an instance
