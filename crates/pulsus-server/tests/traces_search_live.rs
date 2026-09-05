@@ -1045,17 +1045,26 @@ async fn search_semantics_against_real_clickhouse() {
         2,
         "one spanSet per distinct span.retries, body {json}"
     );
-    let mut group_values: Vec<f64> = sets
+    // Issue #510: an INT attribute's group value renders in the
+    // `intValue` arm, as a protojson JSON string. It rendered
+    // `{"doubleValue":1.0}` before, where the reference sends
+    // `{"intValue":"1"}` — the arm this assertion used to demand.
+    let mut group_values: Vec<String> = sets
         .iter()
         .map(|s| {
             assert_eq!(s["matched"], 1, "each retries group has one matched span");
-            s["attributes"][0]["value"]["doubleValue"]
-                .as_f64()
-                .unwrap_or_else(|| panic!("group attr doubleValue, body {json}"))
+            s["attributes"][0]["value"]["intValue"]
+                .as_str()
+                .unwrap_or_else(|| panic!("group attr intValue, body {json}"))
+                .to_string()
         })
         .collect();
-    group_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    assert_eq!(group_values, vec![1.0, 3.0], "the two group key values");
+    group_values.sort();
+    assert_eq!(
+        group_values,
+        vec!["1".to_string(), "3".to_string()],
+        "the two group key values"
+    );
     for set in sets {
         assert_eq!(
             set["attributes"][0]["key"], "by(span.retries)",
@@ -1975,7 +1984,14 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
             .cloned()
             .unwrap_or_default()
     }
-    /// The projected `(key, value)` pairs of one span object.
+    /// The projected `(key, value)` pairs of one span object, with the
+    /// value TYPE-TAGGED as `<arm>=<text>` (issue #510).
+    ///
+    /// It read `stringValue` alone before, so an int attribute rendered
+    /// in the `intValue` arm came back as the empty string and every
+    /// expectation here was written against the wrong arm. Tagging the
+    /// arm means a wrong wire type fails this suite instead of silently
+    /// reading as an absent value.
     fn attrs_of(span: &serde_json::Value) -> Vec<(String, String)> {
         span["attributes"]
             .as_array()
@@ -1983,13 +1999,20 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
             .unwrap_or_default()
             .iter()
             .map(|a| {
-                (
-                    a["key"].as_str().unwrap_or_default().to_string(),
-                    a["value"]["stringValue"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                )
+                let v = &a["value"];
+                let tagged = ["stringValue", "intValue", "doubleValue", "boolValue"]
+                    .iter()
+                    .find_map(|arm| {
+                        v.get(*arm).map(|x| {
+                            let text = x
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| x.to_string());
+                            format!("{arm}={text}")
+                        })
+                    })
+                    .unwrap_or_else(|| format!("<no arm> {v}"));
+                (a["key"].as_str().unwrap_or_default().to_string(), tagged)
             })
             .collect()
     }
@@ -2054,7 +2077,7 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
     );
     assert_eq!(
         attrs_of(&pay),
-        vec![("http.method".to_string(), "GET".to_string())],
+        vec![("http.method".to_string(), "stringValue=GET".to_string())],
         "…and its own stored value, body {json}"
     );
     // The positive control: the SAME span, the SAME key, under a condition
@@ -2064,7 +2087,7 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
     let json = search(port, q, w0, w1, "", q).json(q);
     assert_eq!(
         attrs_of(&span_by_id(&json, &hex(&sid(21)))),
-        vec![("http.method".to_string(), "DELETE".to_string())],
+        vec![("http.method".to_string(), "stringValue=DELETE".to_string())],
         "control: the same span DOES carry http.method when the condition matched it, body {json}"
     );
 
@@ -2122,8 +2145,8 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
     assert_eq!(
         pairs,
         vec![
-            ("foo".to_string(), "R-resource".to_string()),
-            ("foo".to_string(), "S-span".to_string()),
+            ("foo".to_string(), "stringValue=R-resource".to_string()),
+            ("foo".to_string(), "stringValue=S-span".to_string()),
         ],
         "the identity is (scope, key), never the wire key, body {json}"
     );
@@ -2136,7 +2159,7 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
     for (id, want) in [(sid(1), "GET"), (sid(2), "POST"), (sid(11), "GET")] {
         assert_eq!(
             attrs_of(&span_by_id(&json, &hex(&id))),
-            vec![("http.method".to_string(), want.to_string())],
+            vec![("http.method".to_string(), format!("stringValue={want}"))],
             "each span carries its own stored value, body {json}"
         );
     }
@@ -2146,17 +2169,18 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
     let s = span_by_id(&json, &hex(&sid(1)));
     assert_eq!(
         attrs_of(&s),
-        vec![("note".to_string(), String::new())],
+        vec![("note".to_string(), "stringValue=".to_string())],
         "an empty value is a value, not an absence, body {json}"
     );
     assert!(s.get("name").is_none(), "body {json}");
-    // A numeric attribute renders as a string in this wave (typing is a
-    // separate issue); the KEY is the bare one either way.
+    // Issue #510: a numeric attribute renders in the arm the SENDER
+    // STORED it as. It rendered `{"stringValue":"500"}` before, where the
+    // reference sends `{"intValue":"500"}`.
     let q = r#"{ span.http.status_code >= 500 }"#;
     let json = search(port, q, w0, w1, "", q).json(q);
     assert_eq!(
         attrs_of(&span_by_id(&json, &hex(&sid(1)))),
-        vec![("http.status_code".to_string(), "500".to_string())],
+        vec![("http.status_code".to_string(), "intValue=500".to_string())],
         "body {json}"
     );
     // A condition and a `select()` of the SAME field dedupe to ONE entry.
@@ -2164,7 +2188,7 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
     let json = search(port, q, w0, w1, "", q).json(q);
     assert_eq!(
         attrs_of(&span_by_id(&json, &hex(&sid(1)))),
-        vec![("http.method".to_string(), "GET".to_string())],
+        vec![("http.method".to_string(), "stringValue=GET".to_string())],
         "one group per field identity, body {json}"
     );
     // A comparison whose two operands are the SAME field is a single-field
@@ -2184,7 +2208,7 @@ async fn the_matched_span_projection_follows_the_reference_rule() {
     ] {
         assert_eq!(
             attrs_of(&span_by_id(&json, &hex(&id))),
-            vec![("http.method".to_string(), want.to_string())],
+            vec![("http.method".to_string(), format!("stringValue={want}"))],
             "a same-field comparison projects the compared field, body {json}"
         );
     }

@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, ChRow, Idempotency, QuerySettings, Row};
 use pulsus_read::traces::rows::{
-    CandidateRow, HydrationRow, MembershipRow, RootRow, StoredSpanRow, StrValueRow,
+    CandidateRow, HydrationRow, MembershipRow, RootRow, StoredSpanRow, TypedStrValueRow,
 };
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
 use pulsus_read::traces::sql::point_read_sql;
@@ -158,6 +158,157 @@ struct StageSpec {
     stage: &'static str,
     sql: String,
     roster: Roster,
+    /// The row type this stage's SQL is decoded into.
+    ///
+    /// **It lives on the spec, beside the SQL, on purpose.** RowBinary
+    /// decoding is positional, so a projection and its decoder are one
+    /// fact; when they were two — the SQL built here and the decoder
+    /// chosen by a `match` on `stage` further down — issue #510 widened
+    /// `membership_sql`'s fused projection from three columns to four,
+    /// moved production's call sites, and left this one behind. The
+    /// mismatch is a hard decode error, so it could not be silent, but no
+    /// local suite runs this bench and only the clustered CI leg saw it.
+    decoder: Decoder,
+}
+
+/// Which row struct a stage's projection decodes into.
+///
+/// [`Self::columns`] is the decoder's own `COLUMN_NAMES`, so
+/// `the_evidence_stages_project_exactly_what_they_decode` can compare it
+/// to the SQL without a second list to keep in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decoder {
+    StoredSpan,
+    Candidate,
+    Hydration,
+    /// The membership read with NO fused value — two columns.
+    Membership,
+    /// The membership read with the matched value AND its stored type
+    /// fused in (issues #479, #510) — four columns.
+    TypedStrValue,
+    Root,
+}
+
+impl Decoder {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn columns(self) -> &'static [&'static str] {
+        match self {
+            Decoder::StoredSpan => StoredSpanRow::COLUMN_NAMES,
+            Decoder::Candidate => CandidateRow::COLUMN_NAMES,
+            Decoder::Hydration => HydrationRow::COLUMN_NAMES,
+            Decoder::Membership => MembershipRow::COLUMN_NAMES,
+            Decoder::TypedStrValue => TypedStrValueRow::COLUMN_NAMES,
+            Decoder::Root => RootRow::COLUMN_NAMES,
+        }
+    }
+}
+
+/// The two REAL plans the evidence stages read their SQL from, built by
+/// the product planner against the `_dist` tables.
+///
+/// Pure, so the hermetic projection check builds the same plans the run
+/// does rather than a second set written beside it.
+fn evidence_plans(base: i64, now: i64) -> anyhow::Result<(SearchPlan, SearchPlan)> {
+    let ctx = SearchCtx {
+        filter: SpanFilterCtx {
+            spans_table: "trace_spans_dist",
+            attrs_table: "trace_attrs_idx_dist",
+        },
+        max_candidates: 100_000,
+        // The `reader.traceql_max_series` default (issue #185): the shared
+        // `by()` cardinality cap, matching the production sites.
+        max_series: 1_000,
+        distributed: true,
+    };
+    let params = SearchParams {
+        start_ns: base,
+        end_ns: now,
+        limit: 20,
+        spss: 3,
+    };
+    let service_query = pulsus_traceql_parse(
+        r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 }"#,
+    )?;
+    let plan: SearchPlan = plan_search(&service_query, &params, &ctx)
+        .map_err(|e| anyhow::anyhow!("plan_search failed: {e}"))?;
+    anyhow::ensure!(
+        plan.generator_sqls.len() == 1 && plan.probes_len() == 1,
+        "the evidence query must plan one generator + one membership probe"
+    );
+    let attr_query = pulsus_traceql_parse("{ span.http.status_code >= 500 }")?;
+    let attr_plan = plan_search(&attr_query, &params, &ctx)
+        .map_err(|e| anyhow::anyhow!("plan_search failed: {e}"))?;
+    Ok((plan, attr_plan))
+}
+
+/// The six evidence stages: each one's SQL and the row type it decodes
+/// into, from the SAME record.
+///
+/// Pure — no client, no cluster — so
+/// `the_evidence_stages_project_exactly_what_they_decode` can build the
+/// real list and check every projection against its real decoder without
+/// a two-shard ClickHouse.
+fn evidence_stages(
+    plan: &SearchPlan,
+    attr_plan: &SearchPlan,
+    batch: &[[u8; 16]],
+    target: [u8; 16],
+) -> Vec<StageSpec> {
+    vec![
+        StageSpec {
+            stage: "trace_by_id",
+            sql: point_read_sql("trace_spans_dist", &hex32(&target)),
+            roster: Roster::TraceIds(vec![target]),
+            decoder: Decoder::StoredSpan,
+        },
+        StageSpec {
+            stage: "phase1_generator_service",
+            sql: plan.generator_sqls[0].clone(),
+            roster: Roster::Full,
+            decoder: Decoder::Candidate,
+        },
+        StageSpec {
+            stage: "phase1_generator_attr",
+            sql: attr_plan.generator_sqls[0].clone(),
+            roster: Roster::Full,
+            decoder: Decoder::Candidate,
+        },
+        StageSpec {
+            stage: "phase2_hydration",
+            sql: plan.hydration_sql_for(batch),
+            roster: Roster::TraceIds(batch.to_vec()),
+            decoder: Decoder::Hydration,
+        },
+        StageSpec {
+            stage: "phase2_membership",
+            sql: plan.membership_sql_for(0, batch),
+            roster: Roster::TraceIds(batch.to_vec()),
+            // The membership read has TWO shapes: when a projection needs
+            // the probe's matched value, `membership_sql` fuses the
+            // byte-capped `val AS v` (issue #479) AND its `val_type AS t`
+            // (issue #510) into the SAME statement and the row is FOUR
+            // columns; otherwise it is two. Production dispatches on
+            // exactly this accessor
+            // (`traces/exec.rs::load_batch_attrs`, which decodes the fused
+            // arm as `TypedStrValueRow`), and this stage measures the read
+            // production issues — so it mirrors that dispatch rather than
+            // forcing the projection off, which would measure a statement
+            // no query ever sends. The evidence query's probe is
+            // `span.http.status_code >= 500`, a range predicate, so this
+            // run takes the fused arm.
+            decoder: if plan.probe_fuses_value(0) {
+                Decoder::TypedStrValue
+            } else {
+                Decoder::Membership
+            },
+        },
+        StageSpec {
+            stage: "root_hydration",
+            sql: plan.root_sql_for(&[target]),
+            roster: Roster::TraceIds(vec![target]),
+            decoder: Decoder::Root,
+        },
+    ]
 }
 
 fn reader_settings(query_id: &str) -> QuerySettings {
@@ -587,68 +738,9 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     }
 
     // The REAL plans, from the product planner, against the _dist tables.
-    let ctx = SearchCtx {
-        filter: SpanFilterCtx {
-            spans_table: "trace_spans_dist",
-            attrs_table: "trace_attrs_idx_dist",
-        },
-        max_candidates: 100_000,
-        // The `reader.traceql_max_series` default (issue #185): the shared
-        // `by()` cardinality cap, matching the production sites.
-        max_series: 1_000,
-        distributed: true,
-    };
-    let params = SearchParams {
-        start_ns: base,
-        end_ns: now,
-        limit: 20,
-        spss: 3,
-    };
-    let service_query = pulsus_traceql_parse(
-        r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 }"#,
-    )?;
-    let plan: SearchPlan = plan_search(&service_query, &params, &ctx)
-        .map_err(|e| anyhow::anyhow!("plan_search failed: {e}"))?;
-    anyhow::ensure!(
-        plan.generator_sqls.len() == 1 && plan.probes_len() == 1,
-        "the evidence query must plan one generator + one membership probe"
-    );
-    let attr_query = pulsus_traceql_parse("{ span.http.status_code >= 500 }")?;
-    let attr_plan = plan_search(&attr_query, &params, &ctx)
-        .map_err(|e| anyhow::anyhow!("plan_search failed: {e}"))?;
+    let (plan, attr_plan) = evidence_plans(base, now)?;
 
-    let stages: Vec<StageSpec> = vec![
-        StageSpec {
-            stage: "trace_by_id",
-            sql: point_read_sql("trace_spans_dist", &hex32(&target)),
-            roster: Roster::TraceIds(vec![target]),
-        },
-        StageSpec {
-            stage: "phase1_generator_service",
-            sql: plan.generator_sqls[0].clone(),
-            roster: Roster::Full,
-        },
-        StageSpec {
-            stage: "phase1_generator_attr",
-            sql: attr_plan.generator_sqls[0].clone(),
-            roster: Roster::Full,
-        },
-        StageSpec {
-            stage: "phase2_hydration",
-            sql: plan.hydration_sql_for(&batch),
-            roster: Roster::TraceIds(batch.clone()),
-        },
-        StageSpec {
-            stage: "phase2_membership",
-            sql: plan.membership_sql_for(0, &batch),
-            roster: Roster::TraceIds(batch.clone()),
-        },
-        StageSpec {
-            stage: "root_hydration",
-            sql: plan.root_sql_for(&[target]),
-            roster: Roster::TraceIds(vec![target]),
-        },
-    ];
+    let stages = evidence_stages(&plan, &attr_plan, &batch, target);
 
     eprintln!("=== running {} evidence stages ===", stages.len());
     // Per-run nonce: `system.query_log` outlives databases, so a
@@ -663,32 +755,19 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         let query_id = format!("pulsus-traces-read-{run_nonce}-{i}-{}", spec.stage);
         let settings = reader_settings(&query_id);
         let started = Instant::now();
-        let returned_rows = match spec.stage {
-            "trace_by_id" => drain::<StoredSpanRow>(&client, &spec.sql, &settings).await?,
-            "phase1_generator_service" | "phase1_generator_attr" => {
-                drain::<CandidateRow>(&client, &spec.sql, &settings).await?
+        // The decoder comes from the SPEC, beside the SQL it decodes —
+        // never from a second `match` on the stage name, which is how the
+        // membership read came to be built four-column and decoded
+        // three-column.
+        let returned_rows = match spec.decoder {
+            Decoder::StoredSpan => drain::<StoredSpanRow>(&client, &spec.sql, &settings).await?,
+            Decoder::Candidate => drain::<CandidateRow>(&client, &spec.sql, &settings).await?,
+            Decoder::Hydration => drain::<HydrationRow>(&client, &spec.sql, &settings).await?,
+            Decoder::Membership => drain::<MembershipRow>(&client, &spec.sql, &settings).await?,
+            Decoder::TypedStrValue => {
+                drain::<TypedStrValueRow>(&client, &spec.sql, &settings).await?
             }
-            "phase2_hydration" => drain::<HydrationRow>(&client, &spec.sql, &settings).await?,
-            // The membership read has TWO shapes (issue #479): when a
-            // projection needs the probe's matched value, `membership_sql`
-            // fuses `<byte-capped val> AS v` into the SAME statement and
-            // the row is three columns; otherwise it is two. Production
-            // dispatches on exactly this accessor
-            // (`traces/exec.rs::load_batch_attrs`), and this stage measures
-            // the read production issues — so it mirrors that dispatch
-            // rather than forcing the projection off, which would measure a
-            // statement no query ever sends. The evidence query's probe is
-            // `span.http.status_code >= 500`, a range predicate, so this
-            // run takes the fused arm.
-            "phase2_membership" => {
-                if plan.probe_fuses_value(0) {
-                    drain::<StrValueRow>(&client, &spec.sql, &settings).await?
-                } else {
-                    drain::<MembershipRow>(&client, &spec.sql, &settings).await?
-                }
-            }
-            "root_hydration" => drain::<RootRow>(&client, &spec.sql, &settings).await?,
-            other => anyhow::bail!("unknown stage {other:?}"),
+            Decoder::Root => drain::<RootRow>(&client, &spec.sql, &settings).await?,
         };
         let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
         anyhow::ensure!(
@@ -850,6 +929,528 @@ mod tests {
                 *byte = u8::from_str_radix(&hexid[i * 2..i * 2 + 2], 16).expect("hex");
             }
             assert_eq!(city_hash_64_16(&id), want, "vector {hexid}");
+        }
+    }
+
+    /// Every evidence stage projects exactly the columns its decoder
+    /// expects, by name and in order.
+    ///
+    /// **This is the check that was missing.** Issue #510 widened
+    /// `membership_sql`'s fused projection from `trace_id, span_id, v` to
+    /// `trace_id, span_id, v, t`, moved the three production call sites in
+    /// `traces/exec.rs`, and left this bench's decoder at the
+    /// three-column row. RowBinary is positional, so the run died with
+    /// `schema mismatch: database schema has 4 columns, but the struct
+    /// definition has 3 fields` — but only in the clustered CI leg,
+    /// because nothing local runs this bench.
+    ///
+    /// It needs no cluster and no client: [`evidence_stages`] is pure, and
+    /// the expected names are the decoder's own `COLUMN_NAMES` rather
+    /// than a second list.
+    ///
+    /// It is also the check that EVERY real projection parses under
+    /// [`projection_names`]'s accepted grammar: that reader refuses what
+    /// it cannot read, so a builder emitting a construct outside the
+    /// grammar reddens here rather than being read as something
+    /// plausible.
+    ///
+    /// *RED when:* a shared SQL builder's projection changes and this
+    /// consumer is not moved with it. Measured, three ways:
+    ///
+    /// * the exact CI defect, a `StrValueRow` decoder reintroduced on the
+    ///   fused arm — `left ["trace_id", "span_id", "v", "t"]` against
+    ///   `right ["trace_id", "span_id", "v"]`, the same two lists the
+    ///   server's decode error named;
+    /// * `phase2_hydration` given the root row's decoder — 12 columns
+    ///   against 7;
+    /// * the two arms of the membership dispatch swapped — 4 against 2,
+    ///   so the check is not specific to one direction.
+    #[test]
+    fn the_evidence_stages_project_exactly_what_they_decode() {
+        let base = 1_700_000_000_000_000_000i64;
+        let now = base + WINDOW_NS;
+        let (plan, attr_plan) = evidence_plans(base, now).expect("the evidence queries plan");
+        let batch = [trace_id_of(1), trace_id_of(2)];
+        let stages = evidence_stages(&plan, &attr_plan, &batch, batch[0]);
+        assert_eq!(stages.len(), 6, "every stage must be checked");
+        for spec in &stages {
+            assert_eq!(
+                projection_names(&spec.sql),
+                spec.decoder.columns(),
+                "stage {:?} projects columns its decoder ({:?}) does not expect.\nSQL:\n{}",
+                spec.stage,
+                spec.decoder,
+                spec.sql
+            );
+        }
+        // The membership stage takes the FUSED arm for this query, which
+        // is the arm issue #510 widened. Pinned so a planner change that
+        // silently stopped fusing would not turn this test into a check
+        // of the two-column shape.
+        let membership = stages
+            .iter()
+            .find(|s| s.stage == "phase2_membership")
+            .expect("the membership stage");
+        assert_eq!(membership.decoder, Decoder::TypedStrValue);
+        assert_eq!(
+            membership.decoder.columns(),
+            ["trace_id", "span_id", "v", "t"]
+        );
+    }
+
+    /// The outermost `SELECT` list's output names, in order — read by
+    /// ACCEPTING a narrow grammar and refusing everything else.
+    ///
+    /// **The grammar is the definition, not a description of what happens
+    /// to pass:**
+    ///
+    /// ```text
+    /// projection := item ("," item)*
+    /// item       := expr ["AS" ident]
+    /// expr       := term (cmp term)*
+    /// term       := call | ident | integer
+    /// call       := ident "(" [expr ("," expr)*] ")"
+    /// ident      := [A-Za-z_][A-Za-z0-9_]*
+    /// integer    := [0-9]+
+    /// cmp        := "<=" | ">=" | "!=" | "<" | ">" | "="
+    /// ```
+    ///
+    /// An item that is a bare `ident` is named by that identifier ONLY
+    /// when that identifier is in [`BARE_TERMS`], the frozen set of bare
+    /// columns these five builders actually emit. Every other item MUST
+    /// carry an `AS ident`, because guessing the name the server gives an
+    /// unaliased expression is the mis-read this check exists to prevent.
+    /// Measured: `SELECT max(number), 1 AS z` is named `max(number)`, `z`
+    /// by the server, and `SELECT TRUE, 1 AS z` is named `true`, `z`.
+    ///
+    /// **Why an accept-list and not a longer list of refusals.** Three
+    /// review rounds found three fresh holes in a reader that tried to
+    /// handle every projection and refuse the bad shapes it knew about:
+    /// parentheses inside string literals, then square-bracket array
+    /// literals, backslash-escaped quotes, and quoted aliases. Each was a
+    /// PLAUSIBLE WRONG ANSWER, and a plausible wrong answer is
+    /// indistinguishable from a pass. The set of shapes a reader must
+    /// handle is unbounded; the set these five builders emit is not. So
+    /// the alphabet is closed — identifiers, integers, `(`, `)`, `,` and
+    /// the comparison operators, nothing else — and every other character
+    /// is refused BY NAME. Square brackets, backslashes, quotes and
+    /// backticks need no special handling: they are simply not in the
+    /// alphabet, and neither is the next construct nobody has thought of.
+    ///
+    /// A projection that grows a new construct fails loudly and somebody
+    /// looks. That is the point.
+    ///
+    /// **Why the bare-term rule is a frozen SET and not a shape test.**
+    /// "A bare identifier names itself" is false for the literals that
+    /// lex as identifiers, and narrowing it to *lowercase* identifiers
+    /// does not save it — measured against ClickHouse 26.3, `SELECT null,
+    /// 1 AS z` is named **`NULL`**, `z`. Nothing about a token's spelling
+    /// separates our columns from the server's literals: `kind` and
+    /// `payload` are single lowercase words and so are `true`, `nan` and
+    /// `inf`. Nor is a keyword list the answer — that is the
+    /// handle-everything approach again, enumerating a set the server
+    /// owns and can extend. So the accepted set is the one WE own and
+    /// have written down. `TRUE`, `null`, `NaN`, `inf` and `CURRENT_DATE`
+    /// all refuse for free, and so does the next literal nobody has
+    /// enumerated.
+    ///
+    /// **Why the names are read from SQL at all.** None of the five
+    /// builders holds its output names as a list: `hydration_sql`,
+    /// `root_sql` and `point_read_sql` write the projection inline in a
+    /// `format!`, `membership_sql` builds a projection String first and
+    /// interpolates it, and `generator_sql` opens with a
+    /// `String::from("SELECT trace_id, max(timestamp_ns) AS bound_ts\n")`.
+    /// In every case the names are interleaved with the expressions
+    /// inside a string. Giving the builders an `(expression, alias)` list
+    /// to render from — the same "two facts in two places" fix one level
+    /// up — would delete this reader entirely, and it means changing five
+    /// production read-path SQL builders and re-freezing the golden
+    /// corpus. Proposed as separate work, deliberately not done here.
+    fn projection_names(sql: &str) -> Vec<String> {
+        let head = sql
+            .strip_prefix("SELECT DISTINCT ")
+            .or_else(|| sql.strip_prefix("SELECT "))
+            .unwrap_or_else(|| panic!("a stage's SQL must start with SELECT:\n{sql}"));
+        let tokens = tokenize_projection(head, sql);
+        parse_projection(&tokens, sql)
+    }
+
+    /// The bare (unaliased) columns the five evidence projections emit.
+    ///
+    /// Every one is a declared column of the tables those stages read, and
+    /// a declared column named `X` is named `X` by the server — measured
+    /// on ClickHouse 26.3 over a table carrying exactly these nine names,
+    /// `FORMAT TSVWithNames`, header row identical to the projection.
+    ///
+    /// Frozen by hand, not derived from the builders: a builder that
+    /// starts emitting a bare term outside this set makes
+    /// `projection_names` REFUSE, which reddens
+    /// `the_evidence_stages_project_exactly_what_they_decode` and puts a
+    /// person in the loop. That loud failure is the intended behaviour,
+    /// not an inconvenience.
+    const BARE_TERMS: [&str; 9] = [
+        "trace_id",
+        "span_id",
+        "parent_id",
+        "payload_type",
+        "kind",
+        "payload",
+        "timestamp_ns",
+        "duration_ns",
+        "status_code",
+    ];
+
+    /// One token of the closed alphabet.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Tok {
+        Ident(String),
+        Int,
+        Open,
+        Close,
+        Comma,
+        Cmp,
+    }
+
+    /// Lexes the projection up to the first `FROM` at paren depth 0.
+    ///
+    /// Refuses, naming what it saw, on any character outside the closed
+    /// alphabet, on an unbalanced `)`, and on running out of input without
+    /// a top-level `FROM`.
+    fn tokenize_projection(head: &str, sql: &str) -> Vec<Tok> {
+        let chars: Vec<char> = head.chars().collect();
+        let mut out: Vec<Tok> = Vec::new();
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+            if c.is_ascii_alphabetic() || c == '_' {
+                let from = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[from..i].iter().collect();
+                if word == "FROM" && depth == 0 {
+                    return out;
+                }
+                out.push(Tok::Ident(word));
+                continue;
+            }
+            if c.is_ascii_digit() {
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                out.push(Tok::Int);
+                continue;
+            }
+            match c {
+                '(' => {
+                    depth += 1;
+                    out.push(Tok::Open);
+                    i += 1;
+                }
+                ')' => {
+                    depth -= 1;
+                    assert!(depth >= 0, "unbalanced `)` in the projection of:\n{sql}");
+                    out.push(Tok::Close);
+                    i += 1;
+                }
+                ',' => {
+                    out.push(Tok::Comma);
+                    i += 1;
+                }
+                '<' | '>' | '!' | '=' => {
+                    if chars.get(i + 1) == Some(&'=') {
+                        i += 2;
+                    } else {
+                        assert!(
+                            c != '!',
+                            "unexpected character {c:?} in the projection of:\n{sql}"
+                        );
+                        i += 1;
+                    }
+                    out.push(Tok::Cmp);
+                }
+                other => panic!(
+                    "unexpected character {other:?} in the projection of:\n{sql}\n\
+                     The accepted alphabet is identifiers, integers, `(`, `)`, `,` and the \
+                     comparison operators. A projection outside that shape is REFUSED rather \
+                     than read, because a plausible wrong answer here is indistinguishable \
+                     from a pass — extend the grammar deliberately if a builder needs it."
+                ),
+            }
+        }
+        panic!("no top-level FROM in the projection of:\n{sql}")
+    }
+
+    /// `projection := item ("," item)*`, consumed to the end.
+    fn parse_projection(tokens: &[Tok], sql: &str) -> Vec<String> {
+        let mut at = 0usize;
+        let mut names = Vec::new();
+        loop {
+            names.push(parse_item(tokens, &mut at, sql));
+            match tokens.get(at) {
+                Some(Tok::Comma) => at += 1,
+                None => break,
+                Some(other) => {
+                    panic!("expected `,` or the end of the projection, found {other:?}, in:\n{sql}")
+                }
+            }
+        }
+        names
+    }
+
+    /// `item := expr ["AS" ident]`. A bare identifier names itself;
+    /// anything else must be aliased.
+    fn parse_item(tokens: &[Tok], at: &mut usize, sql: &str) -> String {
+        let from = *at;
+        parse_expr(tokens, at, sql);
+        let bare = *at == from + 1 && matches!(tokens[from], Tok::Ident(_));
+        if tokens.get(*at) == Some(&Tok::Ident("AS".to_string())) {
+            *at += 1;
+            let Some(Tok::Ident(alias)) = tokens.get(*at) else {
+                panic!(
+                    "`AS` must be followed by a plain identifier, found {:?}, in:\n{sql}",
+                    tokens.get(*at)
+                );
+            };
+            assert!(alias != "AS", "`AS AS` in the projection of:\n{sql}");
+            *at += 1;
+            return alias.clone();
+        }
+        assert!(
+            bare,
+            "an unaliased projection item that is not a bare column is REFUSED: the server \
+             names it from its own rendering of the expression, which this check will not \
+             guess. Add `AS <name>`, in:\n{sql}"
+        );
+        let Tok::Ident(name) = &tokens[from] else {
+            unreachable!("bare implies Ident")
+        };
+        assert!(
+            BARE_TERMS.contains(&name.as_str()),
+            "the bare term {name:?} is not one of this check's known columns, so its output \
+             name is NOT safe to read as itself: the server normalises the literals that lex \
+             as identifiers ({{`TRUE` -> `true`, `null` -> `NULL`, `NaN` -> `nan`}}), and \
+             nothing about a token's spelling separates those from a column. Alias it, or add \
+             it to BARE_TERMS deliberately. In:\n{sql}"
+        );
+        name.clone()
+    }
+
+    /// `expr := term (cmp term)*`
+    fn parse_expr(tokens: &[Tok], at: &mut usize, sql: &str) {
+        parse_term(tokens, at, sql);
+        while tokens.get(*at) == Some(&Tok::Cmp) {
+            *at += 1;
+            parse_term(tokens, at, sql);
+        }
+    }
+
+    /// `term := call | ident | integer`
+    fn parse_term(tokens: &[Tok], at: &mut usize, sql: &str) {
+        match tokens.get(*at) {
+            Some(Tok::Int) => *at += 1,
+            Some(Tok::Ident(word)) => {
+                assert!(
+                    word != "AS",
+                    "`AS` where an expression was expected, in:\n{sql}"
+                );
+                *at += 1;
+                if tokens.get(*at) == Some(&Tok::Open) {
+                    *at += 1;
+                    if tokens.get(*at) != Some(&Tok::Close) {
+                        loop {
+                            parse_expr(tokens, at, sql);
+                            match tokens.get(*at) {
+                                Some(Tok::Comma) => *at += 1,
+                                _ => break,
+                            }
+                        }
+                    }
+                    assert!(
+                        tokens.get(*at) == Some(&Tok::Close),
+                        "unclosed call in the projection of:\n{sql}"
+                    );
+                    *at += 1;
+                }
+            }
+            other => panic!("expected an expression, found {other:?}, in:\n{sql}"),
+        }
+    }
+
+    /// The accepted grammar reads what the five builders emit, and
+    /// REFUSES every construct outside it — including the shapes four
+    /// separate review rounds found the earlier, handle-everything reader
+    /// mis-reading.
+    ///
+    /// Every "server" column below is ground truth from ClickHouse 26.3
+    /// (`FORMAT TSVWithNames`, header row), not read from source. The
+    /// bare-column readings were taken over a table declaring exactly
+    /// [`BARE_TERMS`]'s nine names; the literal readings were taken in the
+    /// same query position on the same table.
+    ///
+    /// *RED when:* the alphabet or the bare-term set is widened without
+    /// the naming rule being widened with it — measured, accepting `[` as
+    /// an ordinary character, and dropping the `AS` requirement so
+    /// `SELECT max(x), 1 AS z` reads `["max", "z"]` where the server says
+    /// `max(x)`, `z`.
+    #[test]
+    fn the_projection_reader_accepts_one_narrow_grammar_and_refuses_the_rest() {
+        // Accepted: exactly the constructs the five builders emit. Every
+        // bare term here is one of BARE_TERMS.
+        let accepted: [(&str, &[&str]); 6] = [
+            // bare columns
+            ("SELECT trace_id, span_id FROM t", &["trace_id", "span_id"]),
+            // an aggregate with an alias — the generator stage's shape
+            (
+                "SELECT trace_id, max(timestamp_ns) AS bound_ts FROM t",
+                &["trace_id", "bound_ts"],
+            ),
+            // nested calls carrying their own commas, and a comparison
+            // inside an argument — the byte-cap expression's shape
+            (
+                "SELECT trace_id, if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)) AS v, \
+                 val_type AS t FROM x",
+                &["trace_id", "v", "t"],
+            ),
+            // server ground truth: plus(1, multiply(2, 3)) AS a, 4 AS b -> a, b
+            (
+                "SELECT plus(1, multiply(2, 3)) AS a, 4 AS b FROM t",
+                &["a", "b"],
+            ),
+            // a call with no arguments, beside a bare column
+            ("SELECT now() AS n, kind FROM t", &["n", "kind"]),
+            // SELECT DISTINCT
+            (
+                "SELECT DISTINCT trace_id, span_id FROM t",
+                &["trace_id", "span_id"],
+            ),
+        ];
+        for (sql, want) in accepted {
+            assert_eq!(projection_names(sql), want, "reading {sql:?}");
+        }
+
+        // Refused, each asserted on the REASON in its message, with the
+        // server's own answer recorded beside it.
+        let refused: [(&str, &str, &str); 17] = [
+            // (sql, what the SERVER names the columns, the refusal's needle)
+            // --- round 5: literals that lex as identifiers -------------
+            // FIRST, because it is the case that decides the rule: the
+            // server names LOWERCASE `null` as `NULL`, so "a bare
+            // lowercase identifier names itself" mis-reads it.
+            (
+                "SELECT null, 1 AS z FROM t",
+                "NULL, z",
+                "\"null\" is not one of this check",
+            ),
+            (
+                "SELECT TRUE, 1 AS z FROM t",
+                "true, z",
+                "\"TRUE\" is not one of this check",
+            ),
+            (
+                "SELECT true, 1 AS z FROM t",
+                "true, z",
+                "\"true\" is not one of this check",
+            ),
+            (
+                "SELECT FALSE, 1 AS z FROM t",
+                "false, z",
+                "\"FALSE\" is not one of this check",
+            ),
+            (
+                "SELECT NaN, 1 AS z FROM t",
+                "nan, z",
+                "\"NaN\" is not one of this check",
+            ),
+            (
+                "SELECT inf, 1 AS z FROM t",
+                "inf, z",
+                "\"inf\" is not one of this check",
+            ),
+            (
+                "SELECT CURRENT_DATE, 1 AS z FROM t",
+                "CURRENT_DATE, z",
+                "\"CURRENT_DATE\" is not one of this check",
+            ),
+            // …and an ordinary unknown column: refused too, because
+            // nothing in the text separates it from the literals above.
+            (
+                "SELECT a, b FROM t",
+                "a, b",
+                "\"a\" is not one of this check",
+            ),
+            // --- round 4 -----------------------------------------------
+            ("SELECT [1, 2] AS arr, 3 AS z FROM t", "arr, z", "'['"),
+            (
+                "SELECT 'fake \\' actual' AS actual, 2 AS z FROM t",
+                "actual, z",
+                "'\\''",
+            ),
+            (
+                "SELECT 1 AS `left AS right`, 2 AS z FROM t",
+                "left AS right, z",
+                "'`'",
+            ),
+            // --- round 3 -----------------------------------------------
+            (
+                "SELECT '(' AS extra, ')' AS x, 1 AS y FROM t",
+                "extra, x, y",
+                "'\\''",
+            ),
+            // --- shapes this reader will not model ---------------------
+            ("SELECT CAST(a, 'UInt64') AS n, b FROM t", "n, b", "'\\''"),
+            (
+                "SELECT (SELECT max(x) FROM u) AS m, b FROM t",
+                "m, b",
+                "expected an expression",
+            ),
+            ("SELECT max(x), 1 AS z FROM t", "max(x), z", "unaliased"),
+            ("SELECT a) AS x FROM t", "(a parse error)", "unbalanced"),
+            (
+                "SELECT trace_id, span_id",
+                "(a parse error)",
+                "no top-level FROM",
+            ),
+        ];
+        for (sql, server, needle) in refused {
+            let err = std::panic::catch_unwind(|| projection_names(sql)).expect_err(&format!(
+                "{sql:?} must be refused, not read (server: {server})"
+            ));
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains(needle),
+                "{sql:?} must be refused naming {needle:?}; got {msg:?}"
+            );
+        }
+
+        // The remaining refusals from earlier rounds, whose inputs cannot
+        // carry a server answer because they do not parse at all.
+        for (sql, needle) in [
+            ("SELECT 'a AS x FROM t", "'\\''"),
+            ("SELECT a -- , b\n AS x FROM t", "'-'"),
+            ("SELECT a /* , b */ AS x FROM t", "'/'"),
+            ("SELECT f(trace_id AS x FROM t", "no top-level FROM"),
+        ] {
+            let err = std::panic::catch_unwind(|| projection_names(sql))
+                .expect_err(&format!("{sql:?} must be refused, not read"));
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains(needle),
+                "{sql:?} must be refused naming {needle:?}; got {msg:?}"
+            );
         }
     }
 

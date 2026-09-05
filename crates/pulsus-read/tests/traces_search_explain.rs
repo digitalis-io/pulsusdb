@@ -455,6 +455,119 @@ fn matched_span_hex(span: &pulsus_read::SpanSummary) -> String {
     span.span_id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Issue #510 — the granule-identity gate for the `val_type` projection.
+///
+/// The three attribute VALUE reads each gained `val_type` in their SELECT
+/// list and nothing else: the `WHERE` clause, the `(key, scope)` index
+/// prefix, the date/time pruning and the `trace_id IN` restriction are
+/// byte-identical. Adding a projected column to rows already being read
+/// cannot move part or granule selection — so this runs `EXPLAIN indexes
+/// = 1` on the real statement and on the SAME string with the projection
+/// removed, and asserts the two index-selection blocks are byte-identical.
+///
+/// **A pinned granule COUNT would be the wrong gate**: it moves with the
+/// corpus and says nothing about the projection. An identity between two
+/// renders of one query on one corpus is scale-invariant, and it is what
+/// fails if `val_type` is ever moved into the `WHERE` clause instead
+/// (which would prune differently and change the answer).
+///
+/// The control side is built by string surgery on the production
+/// statement rather than by a second builder, so the two differ in the
+/// projection and in nothing else by construction; `assert_ne!` on the
+/// pair first is what stops a no-op edit passing vacuously.
+async fn attr_value_reads_keep_their_index_selection(
+    client: &ChClient,
+    engine: &TraceEngine,
+    base: i64,
+    now: i64,
+) {
+    /// The `MinMax` / `Partition` / `PrimaryKey` / `Skip` blocks of an
+    /// `EXPLAIN indexes = 1` render, with the SELECT list dropped — the
+    /// part index selection is decided by.
+    fn index_blocks(raw: &str) -> String {
+        const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+        let mut out = String::new();
+        let mut inside = false;
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if BLOCK_TITLES.contains(&trimmed) {
+                inside = true;
+            } else if trimmed.starts_with("ReadFromMergeTree")
+                || trimmed.starts_with("Expression")
+                || trimmed.starts_with("Aggregating")
+            {
+                inside = false;
+            }
+            if inside {
+                out.push_str(trimmed);
+                out.push('\n');
+            }
+        }
+        assert!(!out.is_empty(), "no index blocks in EXPLAIN output:\n{raw}");
+        out
+    }
+
+    let ids = [[0u8; 16], [1u8; 16]];
+    // One query per read shape: a numeric aggregate read, a `select()`
+    // string read, and a value-fusing membership probe.
+    let agg = plan_for(engine, r#"{ } | avg(span.http.status_code) > 1"#, base, now);
+    let sel = plan_for(engine, r#"{ } | select(span.http.method)"#, base, now);
+    let probe = plan_for(engine, r#"{ span.http.status_code >= 500 }"#, base, now);
+    assert!(
+        probe.probe_fuses_value(0),
+        "the range probe must fuse a value, or this leg tests nothing"
+    );
+    let cases: [(&str, String, &str); 3] = [
+        (
+            "aggregate val_num read",
+            agg.agg_values_sql_for(0, &ids),
+            ", any(val_type) AS t",
+        ),
+        (
+            "select() val read",
+            sel.select_values_sql_for(0, &ids),
+            ", any(val_type) AS t",
+        ),
+        (
+            "fused membership read",
+            probe.membership_sql_for(0, &ids),
+            ", val_type AS t",
+        ),
+    ];
+    for (label, sql, projection) in cases {
+        assert!(
+            sql.contains(projection),
+            "{label}: the production statement must carry {projection:?}:\n{sql}"
+        );
+        let control = sql.replace(projection, "");
+        assert_ne!(control, sql, "{label}: the control must differ");
+        let with = explain_raw(client, &sql).await;
+        let without = explain_raw(client, &control).await;
+        assert_eq!(
+            index_blocks(&with),
+            index_blocks(&without),
+            "{label}: projecting val_type moved part/granule selection.\nwith:\n{with}\n\
+             without:\n{without}"
+        );
+
+        // POSITIVE CONTROL, on the SAME statement and the same corpus: an
+        // identity between two renders proves nothing unless the
+        // comparison can tell two renders apart. Narrowing the DATE
+        // clause is a change that MUST move part selection, so this
+        // asserts the blocks DIFFER — without it, an `index_blocks` that
+        // returned a constant would satisfy every case above.
+        let narrowed = sql.replace("date >= toDate(", "date > toDate(");
+        assert_ne!(narrowed, sql, "{label}: the positive control must differ");
+        let narrowed_blocks = index_blocks(&explain_raw(client, &narrowed).await);
+        assert_ne!(
+            index_blocks(&with),
+            narrowed_blocks,
+            "{label}: the comparison cannot tell two index selections apart, so the identity \
+             above is vacuous"
+        );
+    }
+}
+
 /// One `#[tokio::test]` running every gate in sequence — the corpus is
 /// seeded once; ordering between gates never matters but re-seeding per
 /// gate would be pure waste.
@@ -2735,6 +2848,16 @@ async fn two_phase_search_explain_and_budget_gates() {
     // (label, query, does it fuse a value?)
     let ac6: &[(&str, &str, bool)] = &[
         ("physical-only", r#"{ status = error }"#, false),
+        // Issue #510: a query that issues an attribute VALUE read, so the
+        // `phase2_attr_values` identity below is over a non-zero count.
+        // Without one, `agg_fields_len()` and `select_attrs_len()` were
+        // both 0 for every row of this table and a second read on the
+        // aggregate path could not move the census.
+        (
+            "aggregate-value-read",
+            r#"{ } | avg(span.http.status_code) > 1"#,
+            false,
+        ),
         ("string-equality", r#"{ .env = "prod" }"#, false),
         ("nested-set", r#"{ nestedSetLeft > 0 }"#, false),
         ("regex", r#"{ span.http.status_code =~ "5.*" }"#, true),
@@ -2747,6 +2870,7 @@ async fn two_phase_search_explain_and_budget_gates() {
         ),
     ];
     let mut fusing_seen = 0usize;
+    let mut value_read_seen = 0usize;
     for (label, q, fuses) in ac6 {
         let a = plan_for(&engine, q, base, now);
         let b = a.without_fused_probe_values();
@@ -2785,7 +2909,7 @@ async fn two_phase_search_explain_and_budget_gates() {
         // comparisons would be `"" == ""`.
         match *label {
             "string-equality" => assert!(!sa.is_empty(), "{label}: one probe, one read"),
-            "physical-only" | "nested-set" => {
+            "physical-only" | "nested-set" | "aggregate-value-read" => {
                 assert!(
                     sa.is_empty(),
                     "{label}: this query issues no membership read"
@@ -2813,16 +2937,26 @@ async fn two_phase_search_explain_and_budget_gates() {
             a.probes_len() * batches,
             "{label}: one membership read per probe per batch"
         );
+        let value_reads = a.select_attrs_len() + a.agg_fields_len();
+        if value_reads > 0 {
+            value_read_seen += 1;
+        }
         assert_eq!(
             ma.get("phase2_attr_values").copied().unwrap_or(0),
-            (a.select_attrs_len() + a.agg_fields_len()) * batches,
-            "{label}: the projection adds NO phase2_attr_values statement"
+            value_reads * batches,
+            "{label}: the projection adds NO phase2_attr_values statement, and issue #510's \
+             stored-type column adds none either — it rides the read that was already issued"
         );
     }
     assert_eq!(
         fusing_seen, 4,
-        "exactly four of the seven AC6 queries fuse a value; a table that no longer says so \
+        "exactly four of the eight AC6 queries fuse a value; a table that no longer says so \
          would accept an implementation that fuses nothing"
+    );
+    assert_eq!(
+        value_read_seen, 1,
+        "exactly one AC6 query issues an attribute VALUE read; without it the \
+         phase2_attr_values identity is 0 == 0 on every row and a second read is invisible"
     );
 
     // ---- AC5 (issue #193): a `by()` query adds NO new scan --------------
@@ -2950,4 +3084,7 @@ async fn two_phase_search_explain_and_budget_gates() {
             other => panic!("a name group value must be a string, got {other:?}"),
         }
     }
+
+    // ---- issue #510: the val_type projection is granule-neutral --------
+    attr_value_reads_keep_their_index_selection(&client, &engine, base, now).await;
 }

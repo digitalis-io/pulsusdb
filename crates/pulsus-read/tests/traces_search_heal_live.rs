@@ -415,13 +415,27 @@ async fn healed_attr_registration_is_found_by_attribute_scoped_traceql_search() 
     assert_eq!(trace.spans[0].name(), None);
     // …and the condition's own field IS projected, keyed by the bare
     // attribute name.
+    //
+    // The value is a `Str`, and that is CORRECT here (issue #510): the
+    // query is `{ span.http.status_code = "500" }`, a STRING equality, so
+    // the probe reads no value column at all and the projection is the
+    // query's OWN literal — rendered in the LITERAL's type, which is
+    // `string`. The stored `val_type` is `int` and is deliberately not
+    // consulted, because no column is read. The typed arms of this
+    // surface are pinned where a value IS read, by the `projected_int`,
+    // `projected_double`, `projected_bool` and
+    // `projected_int_beyond_2_53` fixtures of
+    // `tests/traces_search_grouping_differential.rs`.
     assert_eq!(
         trace.spans[0]
             .attributes
             .iter()
-            .map(|a| (a.key(), a.value()))
+            .map(|a| (a.key(), a.value().clone()))
             .collect::<Vec<_>>(),
-        vec![("http.status_code", "500")]
+        vec![(
+            "http.status_code",
+            pulsus_read::GroupValue::Str("500".to_string())
+        )]
     );
 
     writer.shutdown(Duration::from_secs(5)).await;

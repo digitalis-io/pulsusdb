@@ -20,6 +20,7 @@ use super::filter::{
     self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, LeafEval,
     NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx, TraceCtxPred, ValuePred,
 };
+use super::search_eval::StoredType;
 use super::search_sql;
 
 /// The caller-validated request window and response caps.
@@ -139,9 +140,15 @@ pub(crate) enum ProjectionValue {
     ParentIdHex,
     ScopeName,
     ScopeVersion,
-    /// [`super::filter::ValuePred::StringEq`]'s own literal — the value is
-    /// the query's, so no column is read at all.
-    ProbeLiteral(String),
+    /// The condition's OWN literal — [`super::filter::ValuePred::StringEq`]'s
+    /// text or [`super::filter::ValuePred::BoolEq`]'s boolean — so no
+    /// column is read at all. The `StoredType` is the LITERAL's type, not
+    /// a column reading: a boolean condition projects `{"boolValue":true}`
+    /// and a string one `{"stringValue":"…"}` (issue #510).
+    ProbeLiteral {
+        text: String,
+        literal_type: StoredType,
+    },
     /// The value fused into `probes[probe_idx]`'s membership read.
     ProbeValue {
         probe_idx: usize,
@@ -474,6 +481,14 @@ pub(crate) struct PlannedAggregate {
     pub(crate) source: AggSource,
     pub(crate) cmp: ComparisonOp,
     pub(crate) threshold: f64,
+    /// The response spanSet `attributes` key for this stage (issue #510):
+    /// the aggregate rendered from the PARSED stage — `format!("{op}()")`
+    /// for `count()`, `format!("{op}({field})")` otherwise. CANONICAL, not
+    /// the text the user typed, because it is built from the AST `Field`
+    /// whose `Display` normalises the spelling: `max(span:duration)` keys
+    /// `max(duration)`. Measured against the reference, which keys the
+    /// attribute from its own parsed stage the same way.
+    pub(crate) display: String,
 }
 
 #[derive(Debug, Clone)]
@@ -631,8 +646,9 @@ pub struct SearchPlan {
     /// Whether each probe's membership read must also FUSE the matched
     /// `val` into its projection (issue #479), index-aligned with
     /// [`Self::probes`]. `false` for every probe no projection needs a
-    /// value from — and for `ValuePred::StringEq`, whose value is the
-    /// query's own literal — so the read shape is unchanged for those.
+    /// value from — and for `ValuePred::StringEq`/`ValuePred::BoolEq`,
+    /// whose value is the query's own literal — so the read shape is
+    /// unchanged for those.
     pub(crate) probe_values: Vec<bool>,
     /// The matched-span projection groups (issue #479), in
     /// first-appearance order: filter order, leaf pre-order, then
@@ -1447,11 +1463,21 @@ fn plan_pipeline(
                 // derived from that list below, so a `| count() > 2`
                 // written after a `| by(name)` filters the groups and one
                 // written before it filters the whole matched set.
+                // Issue #510: the response attribute key, rendered from the
+                // PARSED stage so it is canonical rather than the text the
+                // user typed.
+                let display = match field {
+                    Some(FieldExpr::Field(f)) => format!("{op}({f})"),
+                    // `count()` takes no field; every other fieldless shape
+                    // returned above.
+                    _ => format!("{op}()"),
+                };
                 post_stages.push(SpansetStage::Aggregate(PlannedAggregate {
                     op: *op,
                     source,
                     cmp: *cmp,
                     threshold: aggregate_threshold(*op, field, value)?,
+                    display,
                 }));
             }
             // Metrics functions are `/api/traces/v1/metrics/*`-only (issue
@@ -1939,7 +1965,14 @@ fn projection_value(
         } => match &probes[*probe_idx].pred {
             // The literal IS the matched value, so this class needs no
             // column at all — the read shape is byte-identical.
-            ValuePred::StringEq(v) => Some(ProjectionValue::ProbeLiteral(v.clone())),
+            ValuePred::StringEq(v) => Some(ProjectionValue::ProbeLiteral {
+                text: v.clone(),
+                literal_type: StoredType::String,
+            }),
+            ValuePred::BoolEq(b) => Some(ProjectionValue::ProbeLiteral {
+                text: b.to_string(),
+                literal_type: StoredType::Bool,
+            }),
             ValuePred::Regex(_)
             | ValuePred::Num { .. }
             | ValuePred::KeyExists
@@ -2764,7 +2797,7 @@ mod tests {
             ProjectionValue::ParentIdHex => "value:parent-id",
             ProjectionValue::ScopeName => "value:scope-name",
             ProjectionValue::ScopeVersion => "value:scope-version",
-            ProjectionValue::ProbeLiteral(_) => "value:probe-literal",
+            ProjectionValue::ProbeLiteral { .. } => "value:probe-literal",
             ProjectionValue::ProbeValue { .. } => "value:probe-value",
             ProjectionValue::SelectValue { .. } => "value:select-value",
             ProjectionValue::NestedSet(_) => "value:nested-set",

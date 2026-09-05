@@ -229,6 +229,24 @@ pub fn hydration_sql(
 /// granule count, no wall-time). The cap is [`byte_cap_expr`], the same
 /// one [`hydration_sql`] applies, so a projected value obeys the same
 /// 8192-byte source truncation as every other projected string.
+///
+/// **Issue #510 adds `val_type AS t` to that arm and to that arm ONLY.**
+/// A probe with `with_value == false` — the hot membership read every
+/// string-equality condition issues — emits a byte-identical statement.
+/// The same granule argument covers the extra column: it is one more
+/// `LowCardinality(String)` read inside granules the value predicate has
+/// already selected, the `WHERE` clause does not move, and the identity is
+/// gated rather than asserted.
+///
+/// **`SELECT DISTINCT` over one more column can return more rows.** A span
+/// carrying the same key at the same TEXT under two different stored types
+/// (a string `"8080"` and an int `8080`) now yields two membership rows
+/// where it yielded one, so that span could project two entries. That is
+/// the case the catalog's `(scope, key, val, val_type)` sorting-key
+/// extension exists for, and it is not reachable through our own ingest
+/// for one span and one key — an OTLP attribute carries one value of one
+/// kind. Stated rather than guarded: a `DISTINCT ON` would add server-side
+/// state to a hot read to close a shape ingest cannot produce.
 pub fn membership_sql(
     attrs_table: &str,
     predicate: &str,
@@ -237,7 +255,10 @@ pub fn membership_sql(
     with_value: bool,
 ) -> String {
     let projection = if with_value {
-        format!("trace_id, span_id, {} AS v", byte_cap_expr("val"))
+        format!(
+            "trace_id, span_id, {} AS v, val_type AS t",
+            byte_cap_expr("val")
+        )
     } else {
         "trace_id, span_id".to_string()
     };
@@ -255,6 +276,16 @@ pub fn membership_sql(
 /// (`avg(.attr)`-style aggregates read `val_num`; `select(.attr)` reads
 /// `val`). `any(…)` + `GROUP BY (trace_id, span_id)` dedups replays
 /// without `FINAL`.
+///
+/// **Both arms project `any(val_type) AS t`** (issue #510) so the response
+/// renders a value in the arm the sender stored it as, rather than in
+/// whichever of the two reads happened to answer. It is one more
+/// `LowCardinality(String)` column over rows already being read: the
+/// `WHERE` clause, the `(key, scope)` index prefix, the date/time
+/// pruning and the `trace_id IN` restriction are untouched, so part and
+/// granule selection cannot move — gated by
+/// `tests/traces_search_explain.rs`'s
+/// `attr_value_reads_keep_their_index_selection`.
 pub fn attr_values_sql(
     attrs_table: &str,
     key_literal: &str,
@@ -264,9 +295,9 @@ pub fn attr_values_sql(
     window: TimeWindow,
 ) -> String {
     let value_col = if numeric {
-        "any(val_num) AS v".to_string()
+        "any(val_num) AS v, any(val_type) AS t".to_string()
     } else {
-        format!("{} AS v", byte_capped_agg("val"))
+        format!("{} AS v, any(val_type) AS t", byte_capped_agg("val"))
     };
     let extra = if numeric {
         "\n  AND isNotNull(val_num)"

@@ -138,8 +138,20 @@ impl LeafGenerator {
 /// [`crate::traces::search_sql::membership_sql`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValuePred {
-    /// `val = '<v>'` — string/bool equality (prefix-served).
+    /// `val = '<v>'` — STRING equality (prefix-served).
     StringEq(String),
+    /// `val = 'true'` / `val = 'false'` — BOOLEAN equality, rendered by
+    /// the same `val = '<text>'` form and so prefix-served identically.
+    ///
+    /// A separate variant from [`Self::StringEq`] because the projection
+    /// renders the matched value from the query's own literal — no column
+    /// is read — and the literal's TYPE is what decides the wire arm
+    /// (issue #510). Folded into `StringEq`, a boolean condition's
+    /// projected value came back `{"stringValue":"true"}` where the
+    /// reference sends `{"boolValue":true}`; the type was erased here and
+    /// nothing downstream could recover it. Rendering is byte-identical,
+    /// which `render_value_pred`'s two arms make checkable.
+    BoolEq(bool),
     /// `match(val, '^(?:<pat>)$')` — anchored full-value regex.
     Regex(String),
     /// `val_num <op> <n>` — numeric comparison (key-only scan).
@@ -807,6 +819,11 @@ fn string_column_sql(column: &str, op: ComparisonOp, value: &str) -> Result<Stri
 pub(crate) fn value_pred_sql(pred: &ValuePred) -> Result<String, PlanError> {
     Ok(match pred {
         ValuePred::StringEq(v) => format!("val = {}", escape::ch_string(v)),
+        // Byte-identical to the `StringEq` render of the same text: a
+        // boolean attribute is stored as `'true'`/`'false'` and the
+        // variant exists to carry the literal's TYPE to the projection,
+        // never to change the SQL.
+        ValuePred::BoolEq(b) => format!("val = {}", escape::ch_string(&b.to_string())),
         ValuePred::Regex(pat) => format!("match(val, {})", anchored_regex_sql(pat)?),
         ValuePred::Num { op, value } => {
             let sym = sql_op(*op).expect("numeric ops are ordering/equality by construction");
@@ -981,14 +998,8 @@ fn compile_attr_probe_leaf(
         (ComparisonOp::Neq, Value::String(s)) => {
             (ValuePred::StringEq(s.clone()), true, GenClass::TimeRange)
         }
-        (ComparisonOp::Eq, Value::Bool(b)) => {
-            (ValuePred::StringEq(b.to_string()), false, GenClass::AttrEq)
-        }
-        (ComparisonOp::Neq, Value::Bool(b)) => (
-            ValuePred::StringEq(b.to_string()),
-            true,
-            GenClass::TimeRange,
-        ),
+        (ComparisonOp::Eq, Value::Bool(b)) => (ValuePred::BoolEq(*b), false, GenClass::AttrEq),
+        (ComparisonOp::Neq, Value::Bool(b)) => (ValuePred::BoolEq(*b), true, GenClass::TimeRange),
         (ComparisonOp::Re, Value::String(s)) => {
             (ValuePred::Regex(s.clone()), false, GenClass::AttrKeyScan)
         }
