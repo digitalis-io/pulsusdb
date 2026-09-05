@@ -411,14 +411,31 @@ pub fn live_gate_enabled(var: &str) -> bool {
 ///
 /// Two more, of a different kind:
 ///
-/// * **the routing evidence is text too.** A file whose only occurrence
-///   of `live_endpoint("NAME")` is inside a COMMENT counts as routed, so
-///   a comment showing the recommended form can excuse a constant read in
-///   the same file — measured, `5 tests run: 5 passed`, exit 0. The
-///   direction is at least safe: a comment can only make (5) MISS
-///   something, never accuse a file wrongly.
 /// * a file that keeps its routed call and ALSO reads the same name some
 ///   other way.
+///
+/// **Line comments are skipped, in both directions** (issue #523 review
+/// round 4). Until that round they were scanned like code, and that was
+/// wrong twice over: a comment showing the recommended form excused a real
+/// unrouted read (`5 tests run: 5 passed`, exit 0), and a name written
+/// ONLY in a comment, in a file with no read and no routed call, made (5)
+/// fail (`5 tests run: 4 passed, 1 failed`, exit 100). An earlier revision
+/// of this paragraph claimed the second could not happen; it was false,
+/// and the second is the one that matters, because naming these variables
+/// in a comment is the house style — **69 comment mentions across 30
+/// files**, all in backticks. One editor writing `"PULSUSDB_X_URL"`
+/// instead would have reddened the build for nothing, and the repair a
+/// person reaches for then is an exemption.
+///
+/// Skipping them changed no verdict here: of the 46 complete name
+/// literals in scope, 0 sat in a comment position. What remains, stated
+/// because this is a line-scan and not a lexer: a `//` inside a string
+/// earlier on the same line hides the rest of that line (a MISS, the safe
+/// direction; 0 such lines carry a name today, and a probe of that shape
+/// is not reported — `5 tests run: 5 passed`, exit 0), and a `/* … */`
+/// block comment still counts as code both ways (0 in scope today; the
+/// same probe inside `/* … */` IS reported, `5 tests run: 4 passed,
+/// 1 failed`, exit 100).
 ///
 /// And the scope, which is not a weakness but is part of the claim: only
 /// `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`. `xtask/`

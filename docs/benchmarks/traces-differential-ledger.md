@@ -840,14 +840,34 @@ when we are asking it to slow down, so we keep `429`; recorded as
 
   Two more, of a different kind:
 
-  - **the routing evidence is text too** — a file whose only occurrence of
-    `live_endpoint("NAME")` is inside a COMMENT counts as routed, so a
-    comment showing the recommended form excuses a constant read in the
-    same file (`5 tests run: 5 passed`, exit 0). The direction is at least
-    safe: a comment can only make the check MISS something, never accuse a
-    file wrongly;
   - a file that keeps its routed call and also reads the same name some
     other way.
+
+  **Line comments are skipped, in both directions.** Until issue #523
+  review round 4 they were scanned like code, which was wrong twice over:
+
+  | comment form | before round 4 | after |
+  |---|---|---|
+  | a comment showing `live_endpoint("NAME")`, with a constant read of the same name below it | counted as routing evidence, so the read was excused — `5 tests run: 5 passed`, exit 0 | the read is caught — `5 tests run: 4 passed, 1 failed`, exit 100 |
+  | a name written ONLY in a comment, in a file with no read and no routed call | the file was accused — `5 tests run: 4 passed, 1 failed`, exit 100 | not accused — `5 tests run: 5 passed`, exit 0 |
+
+  The two breaks that must keep working are unchanged by it: the bare read
+  is still `5 tests run: 3 passed, 2 failed`, exit 100, and the constant
+  form still `5 tests run: 4 passed, 1 failed`, exit 100.
+
+  A previous revision of this row claimed the second could not happen. It
+  was false, and it is the one that matters: naming these variables in a
+  comment is the house style — **69 comment mentions across 30 files**,
+  every one in backticks. One editor writing `"PULSUSDB_X_URL"` instead
+  would have reddened the build for nothing, and the repair a person
+  reaches for then is an exemption, which is how a check like this dies.
+
+  Skipping them changed no verdict in this tree: of the 46 complete name
+  literals in scope, 0 sat in a comment position. Two residuals, because
+  this is a line scan and not a lexer — a `//` inside a string earlier on
+  the same line hides the rest of that line (a miss, the safe direction;
+  0 such lines carry a name today), and a `/* … */` block comment still
+  counts as code both ways (0 in scope today).
 
   And the scope, part of the claim rather than a weakness: only
   `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`. `xtask/`

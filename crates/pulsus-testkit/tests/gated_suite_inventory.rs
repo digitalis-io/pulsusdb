@@ -474,6 +474,69 @@ fn endpoint_read_needles() -> [String; 2] {
 /// closing quote, so the check can distinguish an endpoint from the one
 /// exempt non-endpoint variable rather than treating the prefix as the
 /// whole rule.
+/// `true` when byte offset `at` in `src` sits after a `//` on its own
+/// line — i.e. inside a line comment (`//`, `///`, `//!` all begin with
+/// it).
+///
+/// ## Why comments are skipped rather than scanned (issue #523 review
+/// round 4)
+///
+/// Properties (4) and (5) are substring scans, and a comment is text like
+/// any other, so before this a comment could do BOTH wrong things: excuse
+/// a real unrouted read (a comment showing the recommended form counts as
+/// routing evidence), and accuse an innocent file (a name written only in
+/// a comment, in a file with no read and no routed call, made (5) fail —
+/// measured `5 tests run: 4 passed, 1 failed`, exit 100).
+///
+/// The second is the one that matters, because naming these variables in
+/// a comment is the house style, not an oddity: **69 comment mentions
+/// across 30 files** at the time of writing, every one of them in
+/// backticks rather than quotes. One editor preferring `"PULSUSDB_X_URL"`
+/// to `` `PULSUSDB_X_URL` `` in a file that does not route that name would
+/// have reddened the build for nothing, and the repair a person reaches
+/// for then is an exemption.
+///
+/// ```text
+/// $ python3 - <<'EOF'   # over crates/*/tests/**/*.rs, this file excluded
+///   count PULSUSDB_[A-Z0-9][A-Z0-9_]* preceded by "//" on its line
+/// EOF
+/// 69 mentions across 30 files
+/// ```
+///
+/// Skipping them changed **no verdict in this tree**: of the 46 complete
+/// name literals in scope, 0 were in a comment position.
+///
+/// ## What this is not
+///
+/// Not a lexer, and the two places it is wrong are both stated:
+///
+/// * a `//` that is itself inside a string earlier on the same line
+///   (`"http://h"`) makes everything after it on that line invisible — a
+///   MISS, which is the safe direction. Probed: a line reading
+///   `let _probe = ("http://example/x", "PULSUSDB_GROUPING_DIFF_URL");`
+///   in a file that does not route that name is not reported,
+///   `5 tests run: 5 passed`, exit 0. 0 such lines carry a name in scope
+///   today;
+/// * a `/* … */` block comment is not a line comment, so a name inside
+///   one still counts as code, in both directions. Probed: the same name
+///   inside `/* … */` IS reported, `5 tests run: 4 passed, 1 failed`,
+///   exit 100. 0 in scope today.
+///
+/// ## The four probes that fix the behaviour in place
+///
+/// All on `crates/pulsus-logql/tests/case_folding.rs`, whole binary:
+///
+/// | probe | before this change | after |
+/// |---|---|---|
+/// | a name only in a comment, not routed in that file | `4 passed, 1 failed`, exit 100 — a FALSE accusation | `5 passed`, exit 0 |
+/// | a comment showing the routed form, with a constant read below it | `5 passed`, exit 0 — the read excused | `4 passed, 1 failed`, exit 100 |
+/// | the bare read restored | `3 passed, 2 failed`, exit 100 | unchanged |
+/// | the constant form | `4 passed, 1 failed`, exit 100 | unchanged |
+fn is_in_line_comment(src: &str, at: usize) -> bool {
+    let line_start = src[..at].rfind('\n').map_or(0, |nl| nl + 1);
+    src[line_start..at].contains("//")
+}
+
 fn direct_pulsusdb_reads(src: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     for needle in endpoint_read_needles() {
@@ -485,7 +548,7 @@ fn direct_pulsusdb_reads(src: &str) -> Vec<(usize, String)> {
                 continue;
             };
             let name = &src[name_at..name_at + close];
-            if name.starts_with("PULSUSDB_") {
+            if name.starts_with("PULSUSDB_") && !is_in_line_comment(src, name_at) {
                 let line = src[..name_at].bytes().filter(|&b| b == b'\n').count() + 1;
                 found.push((line, name.to_string()));
             }
@@ -652,6 +715,7 @@ fn endpoint_name_literals(src: &str) -> Vec<(usize, String)> {
             && rest
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            && !is_in_line_comment(src, quote_at)
         {
             let line = src[..name_at].bytes().filter(|&b| b == b'\n').count() + 1;
             found.push((line, name.to_string()));
@@ -661,11 +725,26 @@ fn endpoint_name_literals(src: &str) -> Vec<(usize, String)> {
     found
 }
 
-/// `true` when `src` hands `name` to one of [`GATE_ENTRY_POINTS`].
+/// `true` when `src` hands `name` to one of [`GATE_ENTRY_POINTS`] in CODE.
+///
+/// A comment showing the recommended form is not evidence that the file
+/// calls it — before [`is_in_line_comment`] was applied here, a comment
+/// reading `live_endpoint("PULSUSDB_X_URL")` excused a constant read of
+/// the same name three lines below it (measured, `5 tests run: 5 passed`,
+/// exit 0).
 fn is_routed(src: &str, name: &str) -> bool {
-    GATE_ENTRY_POINTS
-        .iter()
-        .any(|entry| src.contains(&format!("{entry}\"{name}\"")))
+    GATE_ENTRY_POINTS.iter().any(|entry| {
+        let spelling = format!("{entry}\"{name}\"");
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(&spelling) {
+            let at = from + rel;
+            if !is_in_line_comment(src, at) {
+                return true;
+            }
+            from = at + spelling.len();
+        }
+        false
+    })
 }
 
 /// Property (5): a `PULSUSDB_*` name written out in a test source is also
@@ -710,16 +789,14 @@ fn is_routed(src: &str, name: &str) -> bool {
 ///
 /// Two of a different kind:
 ///
-/// * **the routing evidence is text as well.** A file whose only
-///   occurrence of `live_endpoint("NAME")` is inside a COMMENT counts as
-///   routed, so a comment showing the recommended form excuses a constant
-///   read in the same file — measured, `5 tests run: 5 passed`, exit 0.
-///   Stripping comments would mean a second copy of a lexer this crate
-///   does not have. The direction is at least safe: a comment can only
-///   make this check MISS something, never accuse a file wrongly.
 /// * **a file that keeps its routed call AND adds an unrouted read of the
 ///   same name.** The name is routed somewhere, so this passes; (4) then
 ///   catches it only if the second read spells the literal.
+///
+/// Comments are no longer among these: since issue #523 review round 4
+/// both properties skip a line comment, in both directions. The reasoning,
+/// the two measured wrong behaviours it removes and the two residuals it
+/// leaves are at [`is_in_line_comment`].
 ///
 /// And the scope, which is part of the claim rather than a hole in it:
 /// only `PULSUSDB_`-prefixed names, only `.rs` under `crates/*/tests`,
