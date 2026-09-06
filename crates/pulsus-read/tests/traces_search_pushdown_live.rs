@@ -1114,3 +1114,197 @@ async fn the_same_corpus_without_the_pushed_aggregate_answers_two_hundred() {
     );
     exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
+
+// ---------------------------------------------------------------------
+// Round 1 — the two paths agree at the precision boundary
+// ---------------------------------------------------------------------
+
+/// Corpus B: one trace per duration, one matched span each, all carrying
+/// `http.method = 'GET'`.
+///
+/// The durations straddle 2^53 ns, which is the only region where the
+/// pushed path's exact `Int64` reading of a span and the evaluator's
+/// `f64` one can put that span on different sides of a threshold. Below
+/// it both readings are the same integer.
+///
+/// ```text
+///           2^53-1     2^53     2^53+1     2^53+3
+///   exact   ...991    ...992    ...993     ...995
+///   f64     ...991    ...992    ...992     ...996     <- rounds both ways
+/// ```
+///
+/// `...993` rounds DOWN and `...995` rounds UP (ties-to-even at a step of
+/// 2), so a threshold sitting between two of these traces separates them
+/// differently under the two readings, in both directions.
+const B_DURATIONS: [i64; 5] = [
+    1_000_000_000,
+    9_007_199_254_740_991,
+    9_007_199_254_740_992,
+    9_007_199_254_740_993,
+    9_007_199_254_740_995,
+];
+
+/// The thresholds every operator is run against: the same four boundary
+/// values plus one ordinary one, as they would be typed.
+const B_THRESHOLDS: [&str; 5] = [
+    "1000000000",
+    "9007199254740991",
+    "9007199254740992",
+    "9007199254740993",
+    "9007199254740995",
+];
+
+const B_OPS: [&str; 6] = ["=", "!=", ">", ">=", "<", "<="];
+
+fn corpus_b(base_ns: i64) -> Vec<Seeded> {
+    B_DURATIONS
+        .iter()
+        .enumerate()
+        .map(|(n, &duration_ns)| Seeded {
+            trace: n as u32,
+            span: 0,
+            ts_ns: base_ns + (n as i64) * Q_TRACE_STEP_NS,
+            duration_ns,
+            method_attr: true,
+            k_attr: false,
+        })
+        .collect()
+}
+
+/// The traces the UNPUSHED path admits, computed from `B_DURATIONS` by
+/// the rule the evaluator applies — `f64(max duration) <op> f64(t)` —
+/// in the order a search returns them: newest matched span first, and the
+/// corpus puts trace `n`'s span later than trace `n-1`'s.
+fn b_expected(op: &str, threshold: &str) -> Vec<[u8; 16]> {
+    let t: f64 = threshold.parse().expect("a threshold literal parses");
+    let mut ids: Vec<[u8; 16]> = B_DURATIONS
+        .iter()
+        .enumerate()
+        .filter(|&(_, &d)| {
+            let v = d as f64;
+            match op {
+                "=" => v == t,
+                "!=" => v != t,
+                ">" => v > t,
+                ">=" => v >= t,
+                "<" => v < t,
+                "<=" => v <= t,
+                other => panic!("no such operator: {other}"),
+            }
+        })
+        .map(|(n, _)| trace_id(n as u32))
+        .collect();
+    ids.reverse();
+    ids
+}
+
+/// **The pushed path and the unpushed path return the same traces at the
+/// precision boundary, under every comparison operator** (issue #492
+/// part 4, round 1).
+///
+/// The two paths are the same query with two selectors: `=` on the
+/// attribute compiles the aggregate into the generator's `HAVING`, and
+/// `=~` on the same value does not, because a regex selector is not an
+/// exact generator (`NotExact::ValuePredIsNotEquality`). Both select the
+/// same span — the pattern is anchored, so `=~ "GET"` matches `GET` and
+/// nothing else — so the ONLY difference between the two runs is where
+/// the aggregate was evaluated.
+///
+/// **This test carries the boundary rather than one number.** Round 1
+/// found the defect on `| max(duration) = 9007199254740993`, which
+/// returned 0 traces pushed and 1 unpushed. A build that special-cased
+/// that literal would pass a test naming only it. The thresholds here run
+/// from `2^53 - 1` (still pushed, and still exact) through `2^53`,
+/// `2^53 + 1` and `2^53 + 3`, and the corpus holds a span at each of
+/// those four durations, so a threshold and a span duration meet at every
+/// point where the two readings begin to differ.
+///
+/// Each of the six operators is run against each of the five thresholds:
+/// a rounded threshold LOSES a qualifying trace on some operators and
+/// ADMITS a non-qualifying one on others, so an operator-by-operator
+/// answer would be six answers where the threshold rule is one.
+///
+/// The third producer is `b_expected`, which computes the answer from the
+/// seeded durations and never asks the planner anything; without it "the
+/// two agree" could be two empty lists.
+#[tokio::test]
+async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_pushdown_boundary");
+    let client = fresh_db(db).await;
+    let base = now_ns() - (B_DURATIONS.len() as i64) * Q_TRACE_STEP_NS - 3_600_000_000_000;
+    let rows = corpus_b(base);
+    seed(&client, db, &rows, 1).await;
+
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = params(base, (B_DURATIONS.len() as i64) * Q_TRACE_STEP_NS + 1_000_000_000);
+
+    // How many (operator, threshold) cases each answer shape occurred in,
+    // so the agreement cannot be an agreement about nothing.
+    let (mut empty, mut full, mut between) = (0usize, 0usize, 0usize);
+    for threshold in B_THRESHOLDS {
+        // Every threshold at or past 2^53 refuses to push; the one below
+        // it still does. Asserted per threshold rather than described,
+        // because "they agree" is also true when nothing pushes at all.
+        let pushes = threshold.parse::<i64>().expect("an integer literal") < (1i64 << 53);
+        for op in B_OPS {
+            let pushed_q = format!(r#"{{ span.http.method = "GET" }} | max(duration) {op} {threshold}"#);
+            let plain_q = format!(r#"{{ span.http.method =~ "GET" }} | max(duration) {op} {threshold}"#);
+            let pushed_plan = plan_for(&engine, &pushed_q, &p);
+            let plain_plan = plan_for(&engine, &plain_q, &p);
+            assert_eq!(
+                pushed_plan.pushed_having().is_some(),
+                pushes,
+                "{pushed_q}: the aggregate {} have compiled into the generator, and it {}",
+                if pushes { "must" } else { "must not" },
+                match pushed_plan.pushed_having() {
+                    Some(f) => format!("rendered {f:?}"),
+                    None => "did not".to_string(),
+                }
+            );
+            assert_eq!(
+                plain_plan.pushed_having(),
+                None,
+                "{plain_q}: the control must evaluate the aggregate in the engine"
+            );
+
+            let pushed_out = engine
+                .search(&pushed_plan)
+                .await
+                .unwrap_or_else(|e| panic!("{pushed_q}: {e:?}"));
+            let plain_out = engine
+                .search(&plain_plan)
+                .await
+                .unwrap_or_else(|e| panic!("{plain_q}: {e:?}"));
+            let got: Vec<String> = pushed_out.traces.iter().map(|t| hex32(&t.trace_id)).collect();
+            let control: Vec<String> =
+                plain_out.traces.iter().map(|t| hex32(&t.trace_id)).collect();
+            let want: Vec<String> = b_expected(op, threshold).iter().map(hex32).collect();
+
+            assert_eq!(
+                got, control,
+                "{pushed_q}: pushed returned {got:?} and the same query unpushed returned \
+                 {control:?}"
+            );
+            assert_eq!(
+                got, want,
+                "{pushed_q}: expected {want:?} from the seeded durations, got {got:?}"
+            );
+
+            match want.len() {
+                0 => empty += 1,
+                n if n == B_DURATIONS.len() => full += 1,
+                _ => between += 1,
+            }
+        }
+    }
+    assert!(
+        empty > 0 && full > 0 && between > 0,
+        "the matrix must contain an empty, a full and a partial answer — it held {empty}, {full} \
+         and {between}"
+    );
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
