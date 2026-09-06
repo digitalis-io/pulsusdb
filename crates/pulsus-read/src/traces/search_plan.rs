@@ -1487,9 +1487,11 @@ pub(crate) fn exact_aggregate_threshold(
     aggregate_threshold(op, field, value).ok()?;
     let exact: i128 = match value {
         Value::Number(raw) => exact_decimal_integer(raw)?,
-        // A `Duration` is already an exact integer count of nanoseconds
-        // (`std::time::Duration::as_nanos`), so nothing has rounded yet.
-        Value::Duration(d) => i128::try_from(d.as_nanos()).ok()?,
+        // A `Duration` is already an exact `u64` count of nanoseconds
+        // (`pulsus_traceql::Duration::as_nanos`), so nothing has rounded
+        // yet and the widening cannot fail. The bound below is what
+        // refuses `2600h`.
+        Value::Duration(d) => i128::from(d.as_nanos()),
         _ => return None,
     };
     const LIMIT: i128 = 1 << 53;

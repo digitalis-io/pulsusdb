@@ -2248,12 +2248,22 @@ mod tests {
                 if frag.is_some() != wants_push {
                     wrong.push(format!(
                         "{q}: expected {}, got {frag:?}",
-                        if wants_push { "a fragment" } else { "no fragment" }
+                        if wants_push {
+                            "a fragment"
+                        } else {
+                            "no fragment"
+                        }
                     ));
                 }
                 let Some(frag) = frag else { continue };
                 // The fragment's integer IS the evaluator's `f64`.
-                let PipelineStage::Aggregate { op: agg, field, value, .. } = stage else {
+                let PipelineStage::Aggregate {
+                    op: agg,
+                    field,
+                    value,
+                    ..
+                } = stage
+                else {
                     unreachable!("filtered above")
                 };
                 let evaluator = super::super::search_plan::aggregate_threshold(*agg, field, value)

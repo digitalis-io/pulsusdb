@@ -1240,7 +1240,10 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
         ChClient::new(conn(db)).await.expect("connect (engine)"),
         engine_config(100_000, 536_870_912),
     );
-    let p = params(base, (B_DURATIONS.len() as i64) * Q_TRACE_STEP_NS + 1_000_000_000);
+    let p = params(
+        base,
+        (B_DURATIONS.len() as i64) * Q_TRACE_STEP_NS + 1_000_000_000,
+    );
 
     // How many (operator, threshold) cases each answer shape occurred in,
     // so the agreement cannot be an agreement about nothing.
@@ -1255,8 +1258,10 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
         // because "they agree" is also true when nothing pushes at all.
         let pushes = threshold.parse::<i64>().expect("an integer literal") < (1i64 << 53);
         for op in B_OPS {
-            let pushed_q = format!(r#"{{ span.http.method = "GET" }} | max(duration) {op} {threshold}"#);
-            let plain_q = format!(r#"{{ span.http.method =~ "GET" }} | max(duration) {op} {threshold}"#);
+            let pushed_q =
+                format!(r#"{{ span.http.method = "GET" }} | max(duration) {op} {threshold}"#);
+            let plain_q =
+                format!(r#"{{ span.http.method =~ "GET" }} | max(duration) {op} {threshold}"#);
             let pushed_plan = plan_for(&engine, &pushed_q, &p);
             let plain_plan = plan_for(&engine, &plain_q, &p);
             if pushed_plan.pushed_having().is_some() != pushes {
@@ -1283,9 +1288,16 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
                 .search(&plain_plan)
                 .await
                 .unwrap_or_else(|e| panic!("{plain_q}: {e:?}"));
-            let got: Vec<String> = pushed_out.traces.iter().map(|t| hex32(&t.trace_id)).collect();
-            let control: Vec<String> =
-                plain_out.traces.iter().map(|t| hex32(&t.trace_id)).collect();
+            let got: Vec<String> = pushed_out
+                .traces
+                .iter()
+                .map(|t| hex32(&t.trace_id))
+                .collect();
+            let control: Vec<String> = plain_out
+                .traces
+                .iter()
+                .map(|t| hex32(&t.trace_id))
+                .collect();
             let want: Vec<String> = b_expected(op, threshold).iter().map(hex32).collect();
 
             if got != control {
