@@ -16,22 +16,40 @@
 //! is `Never` **and served by its own SQL part**, and no regex leaf may
 //! claim [`Fidelity::Equivalent`].
 //!
-//! **Nothing here compiles a query stage into SQL.** The plan says WHICH
-//! statements a request sends and why each is its own statement; making
-//! one of them do more work belongs to a later part.
+//! **Since part 4 one stage does compile into SQL.** A spanset aggregate
+//! over an exact single-leaf attribute-equality selector renders a
+//! `HAVING` into the phase-1 generator statement
+//! ([`aggregate_having_sql`]), so the database discards the traces that
+//! do not qualify instead of transporting them. Every other stage still
+//! contributes no SQL.
 //!
-//! **`Emit` is `Never`, so a lowered TraceQL search is two statements,
-//! not one.** The response's root summary is read trace-wide with **no
-//! time predicate** — the true root may predate the search window — and
-//! `TraceSearchResult.root` is not optional, so every search response
-//! needs it. `Never` is the right classification and it does not mean the
-//! evaluator does the work: the way the evaluator owns that link is to
-//! send a second statement, so the plan builder gives it an SQL part.
-//! "Cannot be lowered into THIS statement" and "is not SQL" are different
-//! claims, and only the first is made here.
+//! **A lowered TraceQL search is four statements, not two, and the
+//! aggregate pushdown does not change the count.** The four are the
+//! compiled generator, the window-bounded hydration read, the membership
+//! read and the winners' root read. The middle two survive lowering
+//! because `spanSets[].matched` and `spanSets[].spans[]` are written
+//! unconditionally
+//! (`pulsus-server/src/traces_api/search_response.rs:428-430`,
+//! `:507-512`), and a statement projecting `trace_id, max(timestamp_ns)`
+//! produces neither. The fourth is `Emit`'s: the response's root summary
+//! is read trace-wide with **no time predicate** — the true root may
+//! predate the search window — and `TraceSearchResult.root` is not
+//! optional, so every search response needs it. `Never` is the right
+//! classification and it does not mean the evaluator does the work: the
+//! way the evaluator owns that link is to send a second statement, so the
+//! plan builder gives it an SQL part. "Cannot be lowered into THIS
+//! statement" and "is not SQL" are different claims, and only the first
+//! is made here.
+//!
+//! The saving is in what each statement carries, not in how many there
+//! are: on the corpus part 4 measured, 46 statements and 166,450 result
+//! bytes become 4 and 19,710, because every candidate the generator
+//! returns already qualifies and the batch loop stops on the first
+//! batch.
 
 use pulsus_traceql::{
-    ComparisonOp, FieldExpr, FieldOp, PipelineStage, Query, SpansetExpr, SpansetFilter, UnaryOp,
+    AggregateOp, ComparisonOp, Field, FieldExpr, FieldOp, Intrinsic, PipelineStage, Query,
+    SpansetExpr, SpansetFilter, UnaryOp,
 };
 
 use super::filter::{GenTable, LeafGenerator, PlanError};
@@ -125,9 +143,12 @@ pub enum TqlLink {
         /// Whether the phase-1 generator set is EXACTLY the selector's
         /// match set rather than a superset of it.
         ///
-        /// **Part 3 sets this `false` for every query, and that is not a
-        /// placeholder for a missing computation — it is the measured
-        /// truth today.** `CompiledSpanFilter`'s own contract calls the
+        /// **Computed since part 4** by
+        /// [`super::search_plan::generator_is_exact`], which compares the
+        /// membership read's predicate against the generator's for THIS
+        /// query rather than arguing about them. It is `false` for almost
+        /// every query, and that is the measured truth rather than a
+        /// placeholder: `CompiledSpanFilter`'s own contract calls the
         /// generator set "a superset of the filter's matches by
         /// construction", and `search_eval::evaluate_batch` re-evaluates
         /// every leaf against every hydrated span on every search. A
@@ -140,9 +161,8 @@ pub enum TqlLink {
         /// re-filter*, that inversion can DROP rows (issue #492 part 3,
         /// D3).
         ///
-        /// Computing it belongs to the part that pushes an aggregate
-        /// down, because an exact generator is that pushdown's
-        /// precondition.
+        /// An exact generator is the aggregate pushdown's precondition,
+        /// which is why the computation landed with it.
         generator_is_exact: bool,
     },
     /// The batch hydration read.
@@ -284,6 +304,112 @@ pub fn selector_fidelity(expr: &SpansetExpr) -> Fidelity {
     let mut out = Fidelity::Equivalent;
     walk(expr, &mut out);
     out
+}
+
+// ---------------------------------------------------------------------
+// The spanset aggregate's HAVING
+// ---------------------------------------------------------------------
+
+/// The `HAVING` fragment a spanset aggregate compiles to, or `None` when
+/// this aggregate may not be pushed (issue #492 part 4).
+///
+/// **The one renderer.** [`AggregateLower::apply`] records what this
+/// returns on the relation and [`super::search_plan::plan_search`] puts
+/// the same string into the statement, so the plan's account of the
+/// query and the query cannot disagree.
+///
+/// Three families push, and the rule is duplicate-idempotence rather
+/// than taste. `trace_attrs_idx` is a `ReplacingMergeTree` read without
+/// `FINAL`, so an at-least-once replay leaves two rows for one span
+/// (which is why [`super::search_sql::membership_sql`] uses `SELECT
+/// DISTINCT`), and the evaluator deduplicates hydrated spans by
+/// `span_id` (`exec::group_hydrated_rows`). Measured on ClickHouse 26.3
+/// over one trace with two matched spans of 1.5 s and 0.5 s and one of
+/// them replayed: the engine sees `count=2 sum=2.0e9 avg=1.0e9
+/// max=1.5e9 min=0.5e9`; the raw index rows give `count()=3 sum=2.5e9
+/// avg=833333333.33 max=1.5e9 min=0.5e9`, and `uniqExact(span_id)=2`.
+/// `min`, `max` and `uniqExact` agree with the engine; `count()`, `sum`
+/// and `avg` do not.
+///
+/// | stage | fragment |
+/// |---|---|
+/// | `min(duration) <op> t` | `min(duration_ns) <op> <t as i64>` |
+/// | `max(duration) <op> t` | `max(duration_ns) <op> <t as i64>` |
+/// | `count() <op> t`       | `uniqExact(span_id) <op> <t as i64>` |
+///
+/// `uniqExact` and not `count(DISTINCT span_id)`: the latter resolves
+/// through the `count_distinct_implementation` session setting, and a
+/// read whose meaning depends on a setting we do not send is a read
+/// whose meaning we do not know. It also reaches a case a replay does
+/// not: one span with two events carrying the same attribute produces
+/// two index rows identical in every ordering-key column, collapsed on
+/// merge but visible before it, and `count()` would inflate over them.
+///
+/// `None` for `sum` and `avg` (the measurement above), for an attribute
+/// source (`max(.retries)` reads a `val_num` for a different `key` than
+/// the generator's, which is a join), and for any threshold whose LEXEME
+/// is not an exact integer strictly inside ±2^53
+/// ([`super::search_plan::exact_aggregate_threshold`], which carries the
+/// argument for the bound). `| count() > 2.5` and
+/// `| max(duration) = 9007199254740993` are both accepted queries today
+/// and neither pushes.
+///
+/// **A pushed aggregate reads `duration_ns` from `trace_attrs_idx`; the
+/// evaluator reads it from `trace_spans`.** They are two copies of one
+/// fact, and they are bound together at one site:
+/// `pulsus-write/src/protocols/otlp_traces.rs:404` binds `duration_ns`
+/// once per span, and every attribute record for that span and the span
+/// record itself take that same binding. `writer/rows.rs`'s
+/// `trace_attrs_idx` backfill note already states the invariant in prose
+/// — the non-key columns are deterministic functions of the same attr
+/// record — which is what makes the versionless `ReplacingMergeTree`
+/// collapse safe on a key tuple that does not include `duration_ns`.
+/// This is a documented invariant and not a guard: a guard in the read
+/// path would have to re-read `trace_spans` to check it, which is the
+/// read the pushdown exists to avoid.
+pub fn aggregate_having_sql(stage: &PipelineStage) -> Option<String> {
+    let PipelineStage::Aggregate {
+        op,
+        field,
+        cmp,
+        value,
+    } = stage
+    else {
+        return None;
+    };
+    // The aggregation source. `sum`/`avg` are refused because a
+    // duplicated index row moves them; an attribute source is refused
+    // because its `val_num` lives on a different `key` than the
+    // generator's rows.
+    let agg = match (op, field) {
+        (AggregateOp::Count, None) => "uniqExact(span_id)",
+        (AggregateOp::Min, Some(FieldExpr::Field(Field::Intrinsic(Intrinsic::Duration)))) => {
+            "min(duration_ns)"
+        }
+        (AggregateOp::Max, Some(FieldExpr::Field(Field::Intrinsic(Intrinsic::Duration)))) => {
+            "max(duration_ns)"
+        }
+        _ => return None,
+    };
+    let cmp_sql = match cmp {
+        ComparisonOp::Eq => "=",
+        ComparisonOp::Neq => "!=",
+        ComparisonOp::Gt => ">",
+        ComparisonOp::Gte => ">=",
+        ComparisonOp::Lt => "<",
+        ComparisonOp::Lte => "<=",
+        // The planner answers 400 for a regex aggregate comparison
+        // before a chain is ever built; refusing here as well means this
+        // renderer never depends on that having happened.
+        ComparisonOp::Re | ComparisonOp::Nre => return None,
+    };
+    // The threshold is read from the stage's LEXEME, not from the
+    // evaluator's `f64`, and the read refuses whenever the integer
+    // comparison here — `Int64` for the two duration aggregates,
+    // `UInt64` for `uniqExact(span_id)` — and the evaluator's `f64` one
+    // could put a span on different sides of it.
+    let threshold = super::search_plan::exact_aggregate_threshold(*op, field, value)?;
+    Some(format!("{agg} {cmp_sql} {threshold}"))
 }
 
 // ---------------------------------------------------------------------
@@ -630,14 +756,21 @@ impl Lower<Tql> for BoolTruthLower {
 }
 
 impl Lower<Tql> for AggregateLower {
-    /// `exact` **and** `grouping.is_none()`.
+    /// `exact` **and** `grouping.is_none()` **and** a fragment
+    /// [`aggregate_having_sql`] will render.
     ///
     /// An aggregate over a superset is not merely wide, it is wrong:
     /// `max()` can exceed the true maximum and admit a trace that should
     /// not match, `min()` errs the other way, and `count()` inflates.
     /// Measured, the cost of getting this wrong is 333 qualifying traces
     /// becoming 1,000.
-    fn capability(&self, _s: &TqlLink, rel: &Relation<Tql>) -> Capability {
+    ///
+    /// The fourth condition is issue #492 part 4's: the aggregate
+    /// families whose value a duplicated index row moves — `sum` and
+    /// `avg` — and an attribute source and a non-integral threshold get
+    /// `No(NotYetLowered)`, because a SQL form for them exists in
+    /// principle and none has been written that is safe over this index.
+    fn capability(&self, s: &TqlLink, rel: &Relation<Tql>) -> Capability {
         if rel.shape != TqlShape::Spans {
             return Capability::No(BlockReason::ShapeMismatch);
         }
@@ -647,15 +780,43 @@ impl Lower<Tql> for AggregateLower {
         if rel.grouping.is_some() {
             return Capability::No(BlockReason::ShapeMismatch);
         }
-        Capability::No(BlockReason::NotYetLowered)
+        let TqlLink::Pipe(stage) = s else {
+            return Capability::No(BlockReason::NotYetLowered);
+        };
+        if aggregate_having_sql(stage).is_none() {
+            return Capability::No(BlockReason::NotYetLowered);
+        }
+        Capability::Yes
     }
+    /// Pushes the fragment onto `rel.having`. The relation is what
+    /// `plan_search` reads back to render the same text into the
+    /// generator statement.
     fn apply(
         &self,
-        _s: &TqlLink,
-        rel: Relation<Tql>,
+        s: &TqlLink,
+        mut rel: Relation<Tql>,
         _cx: &LowerCx<'_, Tql>,
     ) -> Result<Relation<Tql>, PlanError> {
+        if let TqlLink::Pipe(stage) = s
+            && let Some(frag) = aggregate_having_sql(stage)
+        {
+            rel.having.push(frag);
+        }
         Ok(rel)
+    }
+    /// [`Fidelity::Equivalent`]: `capability` admits the link only when
+    /// the accumulated relation is already `exact` — the generator's
+    /// rows are the selector's matched spans — and the fragment
+    /// aggregates the same column over the same set the evaluator does.
+    /// So `orig ⟺ sql` and not merely `orig ⟹ sql`.
+    ///
+    /// The evaluator still recomputes the aggregate, because the
+    /// response's spanSet `attributes` carries its VALUE (issue #510);
+    /// what `Equivalent` says is that no trace the SQL returned will be
+    /// dropped by that recomputation, which is what keeps `exact` set
+    /// for the links after it.
+    fn fidelity(&self, _s: &TqlLink, _rel: &Relation<Tql>) -> Fidelity {
+        Fidelity::Equivalent
     }
     /// **Shape unchanged** — whatever the fold has accumulated, not reset
     /// to `Spans`; **clears `exact`**, because the evaluator will drop
@@ -887,6 +1048,7 @@ pub fn seed_relation(source: SourceRef, predicate: Pred) -> Relation<Tql> {
         shape: TqlShape::Spans,
         exact: true,
         depth: 0,
+        having: Vec::new(),
     }
 }
 
@@ -986,7 +1148,17 @@ pub struct ChainFacts<'a> {
 /// `chain.len()` is an identity of the counters above plus three — one
 /// `Source`, one `Hydrate`, and `Order`/`Limit`/`Emit` — which is the
 /// scale-invariant form of "this adds no per-row work".
-pub fn chain_of(query: &Query, facts: &ChainFacts<'_>, limit: u32) -> Vec<TqlLink> {
+///
+/// `generator_is_exact` is computed by
+/// [`super::search_plan::generator_exactness`] and passed in rather than
+/// derived here: the comparison it makes is between two rendered
+/// predicates, and only the planner holds both.
+pub fn chain_of(
+    query: &Query,
+    generator_is_exact: bool,
+    facts: &ChainFacts<'_>,
+    limit: u32,
+) -> Vec<TqlLink> {
     let mut chain = Vec::with_capacity(
         3 + 1
             + facts.probes
@@ -1002,7 +1174,7 @@ pub fn chain_of(query: &Query, facts: &ChainFacts<'_>, limit: u32) -> Vec<TqlLin
     );
     chain.push(TqlLink::Source {
         expr: Box::new(query.spanset.clone()),
-        generator_is_exact: false,
+        generator_is_exact,
     });
     chain.push(TqlLink::Hydrate);
     for i in 0..facts.probes {
@@ -1744,6 +1916,437 @@ mod tests {
             }),
             "without the language's own chunk the ceilings decide, and 24998 is what they say"
         );
+    }
+
+    /// Issue #492 part 4 criterion 7: **the pushdown refuses every unsafe
+    /// shape, and each refusal names the condition that refused it.**
+    ///
+    /// Three things can stop a spanset aggregate reaching the generator
+    /// statement, and the table separates them rather than lumping them
+    /// into "not pushed":
+    ///
+    /// ```text
+    ///   Refusal::Renderer   aggregate_having_sql said None — the aggregate
+    ///                       family, its source, or its threshold
+    ///   Refusal::NotExact   the generator's rows are not the selector's
+    ///                       matched spans (which of the six conditions)
+    ///   Refusal::FoldState  both of the above are satisfied and the FOLD
+    ///                       still refuses: a `by()` before the aggregate
+    ///                       has cleared `exact`
+    /// ```
+    ///
+    /// The last row is the one a reader would not predict: `{ .k = "v" }
+    /// | by(name) | count() > 2` has an exact generator AND a renderable
+    /// fragment, and must still not push, because the aggregate then
+    /// filters GROUPS and `uniqExact(span_id)` over the whole trace is a
+    /// different question.
+    ///
+    /// The list is CLOSED at the other end too: over the golden corpus,
+    /// `traces_search_sql.rs`'s
+    /// `the_generator_having_is_the_fragment_the_plan_recorded` asserts
+    /// the set of pushing cases equals a frozen four-name list.
+    #[test]
+    fn the_pushdown_precondition_refuses_every_unsafe_shape() {
+        use super::super::search_plan::NotExact;
+
+        /// What a query's aggregate did, as one value.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Verdict {
+            /// The fragment the generator statement carries.
+            Push(String),
+            /// `aggregate_having_sql` returned `None`.
+            RefusedByRenderer,
+            /// The generator is not exactly the selector's match set.
+            RefusedNotExact(NotExact),
+            /// Renderer and precondition both admit it; the fold does not.
+            RefusedByFoldState,
+        }
+
+        fn verdict(q: &str) -> Verdict {
+            let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            let params = super::super::search_plan::SearchParams {
+                start_ns: 1_700_000_000_000_000_000,
+                end_ns: 1_700_010_800_000_000_000,
+                limit: 20,
+                spss: 3,
+            };
+            let ctx = super::super::search_plan::SearchCtx {
+                filter: super::super::filter::SpanFilterCtx {
+                    spans_table: "trace_spans",
+                    attrs_table: "trace_attrs_idx",
+                },
+                max_candidates: 100_000,
+                max_series: 1_000,
+                distributed: false,
+            };
+            let plan = super::super::search_plan::plan_search(&query, &params, &ctx)
+                .unwrap_or_else(|e| panic!("{q}: {e:?}"));
+            if let Some(frag) = plan.pushed_having() {
+                return Verdict::Push(frag.to_string());
+            }
+            // The renderer alone, read straight off the AST.
+            let renders = query
+                .pipeline
+                .iter()
+                .filter(|s| matches!(s, PipelineStage::Aggregate { .. }))
+                .all(|s| aggregate_having_sql(s).is_some());
+            if !renders {
+                return Verdict::RefusedByRenderer;
+            }
+            match plan.generator_exact() {
+                Err(why) => Verdict::RefusedNotExact(why),
+                Ok(()) => Verdict::RefusedByFoldState,
+            }
+        }
+
+        let push = |frag: &str| Verdict::Push(frag.to_string());
+        let rows: [(&str, Verdict); 18] = [
+            // --- pushed ------------------------------------------------
+            (
+                r#"{ span.http.method = "GET" } | max(duration) > 1s"#,
+                push("max(duration_ns) > 1000000000"),
+            ),
+            (
+                r#"{ span.http.method = "GET" } | min(duration) >= 1s"#,
+                push("min(duration_ns) >= 1000000000"),
+            ),
+            (
+                r#"{ span.http.method = "GET" } | count() > 2"#,
+                push("uniqExact(span_id) > 2"),
+            ),
+            // Unscoped: no `scope` term on either side, so the two
+            // predicates are byte-equal and condition (5) decides it.
+            (
+                r#"{ .k = "v" } | max(duration) > 1s"#,
+                push("max(duration_ns) > 1000000000"),
+            ),
+            // A boolean equality renders `val = 'true'`, the same
+            // prefix-served form a string equality does.
+            (
+                r#"{ span.a = true } | max(duration) > 1s"#,
+                push("max(duration_ns) > 1000000000"),
+            ),
+            // --- refused because the generator is not exact ------------
+            // An attribute regex compiles to `ValuePred::Regex`, so
+            // condition (3) refuses it BEFORE condition (6) is reached.
+            // Condition (6) is not thereby redundant — the second half of
+            // this test builds the input where it is the one that
+            // refuses.
+            (
+                r#"{ span.http.method =~ "GE.*" } | max(duration) > 1s"#,
+                Verdict::RefusedNotExact(NotExact::ValuePredIsNotEquality),
+            ),
+            // A PHYSICAL regex leaf is refused one condition earlier
+            // still: it is not an attribute-membership leaf at all.
+            (
+                r#"{ name =~ "a.*" } | max(duration) > 1s"#,
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAPositiveAttrMatch),
+            ),
+            (
+                r#"{ span.http.method != "GET" } | max(duration) > 1s"#,
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAPositiveAttrMatch),
+            ),
+            (
+                "{ span.http.status_code >= 500 } | max(duration) > 1s",
+                Verdict::RefusedNotExact(NotExact::ValuePredIsNotEquality),
+            ),
+            (
+                r#"{ resource.service.name = "checkout" } | max(duration) > 1s"#,
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAPositiveAttrMatch),
+            ),
+            (
+                "{ duration > 2s } | max(duration) > 1s",
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAPositiveAttrMatch),
+            ),
+            (
+                r#"{ .a = "1" && .b = "2" } | max(duration) > 1s"#,
+                Verdict::RefusedNotExact(NotExact::NotOneLeaf),
+            ),
+            (
+                r#"{ duration > 2s || span.foo = "x" } | max(duration) > 1s"#,
+                Verdict::RefusedNotExact(NotExact::NotOneLeaf),
+            ),
+            // --- refused because the aggregate does not render ---------
+            (
+                r#"{ span.http.method = "GET" } | avg(duration) > 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | sum(duration) > 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | max(span.retries) > 1"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | count() > 2.5"#,
+                Verdict::RefusedByRenderer,
+            ),
+            // --- refused by the fold, with both other checks passing ---
+            (
+                r#"{ span.http.method = "GET" } | by(name) | count() > 2"#,
+                Verdict::RefusedByFoldState,
+            ),
+        ];
+        for (q, want) in rows {
+            let got = verdict(q);
+            assert_eq!(got, want, "{q}: expected {want:?}, got {got:?}");
+        }
+
+        // --- condition (6) is live, and no parsed query reaches it -----
+        //
+        // Every regex the planner can build is refused earlier: an
+        // attribute regex by (3), a physical one by (2). So the only way
+        // to show (6) is not dead code is to hand it the input where
+        // (1)-(5) hold and the SELECTOR still carries a regex. That input
+        // is not one `plan_search` produces — it is the input `(3)` would
+        // hand it if `(3)` were ever widened to admit a regex probe, and
+        // the aggregate over that generator's rows would be wrong,
+        // because the SQL reading of a pattern is the NARROWER one and an
+        // aggregate over a subset can err in either direction.
+        {
+            use super::super::filter::{GenClass, GenTable, LeafGenerator, ValuePred};
+            use super::super::search_plan::{PlannedFilter, PlannedLeafEval, generator_exactness};
+
+            let probe = super::super::filter::AttrProbe {
+                key: "http.method".to_string(),
+                scope: Some("span"),
+                pred: ValuePred::StringEq("GET".to_string()),
+            };
+            let predicate = "key = 'http.method' AND val = 'GET' AND scope = 'span'".to_string();
+            let filters = vec![PlannedFilter {
+                leaves: vec![PlannedLeafEval::Attr {
+                    probe_idx: 0,
+                    negated: false,
+                }],
+            }];
+            let probes = vec![probe];
+            let predicates = vec![predicate.clone()];
+            let generators = vec![(
+                TRACE_ATTRS_IDX,
+                LeafGenerator {
+                    class: GenClass::AttrEq,
+                    table: GenTable::Attrs,
+                    predicate,
+                    prewhere: None,
+                },
+            )];
+            // (1)-(5) hold and the selector is regex-free: exact.
+            assert_eq!(
+                generator_exactness(
+                    &filters,
+                    &probes,
+                    &predicates,
+                    &generators,
+                    &parse_selector(r#"{ span.http.method = "GET" }"#),
+                ),
+                Ok(()),
+                "the control: with a regex-free selector this input is exact"
+            );
+            // The ONE thing that moves is the selector's fidelity.
+            assert_eq!(
+                generator_exactness(
+                    &filters,
+                    &probes,
+                    &predicates,
+                    &generators,
+                    &parse_selector(r#"{ span.http.method =~ "GE.*" }"#),
+                ),
+                Err(NotExact::SelectorIsWider),
+                "condition (6) must refuse a selector carrying a regex even when the two \
+                 predicates are byte-equal"
+            );
+        }
+    }
+
+    /// Issue #492 part 4: **the boundary the pushdown refuses at is where
+    /// the two readings START to differ, not the one number that was
+    /// reported.** That the rule leaves no disagreeing threshold at all
+    /// is argued at `search_plan::exact_aggregate_threshold`; what this
+    /// test pins is where the boundary sits.
+    ///
+    /// The pushed comparison is `d <op> t` over exact integers in
+    /// ClickHouse — `max(duration_ns)` is `Int64` and `uniqExact(span_id)`
+    /// `UInt64`, by `toTypeName` on 26.3 — and the unpushed one is
+    /// `f64(d) <op> f64(t)` in the evaluator. Below 2^53 every integer is
+    /// an exact `f64`, so the two readings cannot part. From 2^53 up a
+    /// data value `d` can round ONTO a `t` it is not equal to, and that,
+    /// rather than whether `t` itself is exact, is what the bound is
+    /// drawn against: rows two and four are both exact `f64`s and are
+    /// refused anyway.
+    ///
+    /// ```text
+    ///   9007199254740991  2^53 - 1  exact f64, and no `d` can straddle it   push
+    ///   9007199254740992  2^53      exact f64, but d = 2^53+1 reads `==` in
+    ///                               f64 and `!=` in SQL                     refuse
+    ///   9007199254740993  2^53 + 1  no f64 holds it; becomes ...992         refuse
+    ///   9007199254740994  2^53 + 2  an exact f64, still past the bound      refuse
+    /// ```
+    ///
+    /// The third row is the one the review found. **A build that fixed
+    /// only the literal's rounding — refusing a lexeme no `f64` holds,
+    /// which is exactly that number — would pass a test naming it and
+    /// fail this one on rows two and four**, and on `2600h`, the same
+    /// case in duration form. Measured by building it: 18 of these 84
+    /// cases failed, six operators on each of those three literals.
+    ///
+    /// Every row runs under all six comparison operators, and the rule
+    /// refuses for all six. Four of them can actually diverge, measured
+    /// on the pre-fix build (the bound inclusive, so `t = 2^53` pushes)
+    /// against corpus B of `traces_search_pushdown_live.rs`, whose five
+    /// traces have `max(duration)` 1s / 2^53-1 / 2^53 / 2^53+1 / 2^53+3
+    /// ns. Suffix `03` is the trace `f64` rounds down onto `t`:
+    ///
+    /// ```text
+    ///   op   generator candidates   evaluator (f64)   answer moves?
+    ///   =    02                     02,03             yes — 03 lost
+    ///   <=   00,01,02               00,01,02,03       yes — 03 lost
+    ///   !=   00,01,03,04            00,01,04          no  — 03 admitted
+    ///   >    03,04                  04                no  — 03 admitted
+    ///   >=   02,03,04               02,03,04          no  — identical
+    ///   <    00,01                  00,01             no  — identical
+    /// ```
+    ///
+    /// `>=` and `<` cannot be made to differ: the only splitting case is
+    /// `d = 2^53 + 1` against `t = 2^53`, where `>=` is true under both
+    /// readings and `<` false under both. Of the four that do, only `=`
+    /// and `<=` move an ANSWER — they LOSE a qualifying trace, and a lost
+    /// trace has no second chance. `!=` and `>` ADMIT one that does not
+    /// qualify, and `search_eval`'s aggregate stage re-applies
+    /// `cmp_f64(agg.cmp, …, agg.threshold)` to the hydrated spans, so the
+    /// extra candidate costs a transported span set and never reaches the
+    /// client. One threshold rule rather than six operator rules, and the
+    /// test runs all six so a per-operator carve-out would redden it.
+    ///
+    /// The second half asserts the property the doc comment on
+    /// `search_plan::aggregate_threshold` now claims: whenever this
+    /// pushes, the integer in the fragment and the `f64` the evaluator
+    /// compares against are the same number, bit for bit.
+    #[test]
+    fn the_pushdown_refuses_every_threshold_the_two_readings_could_disagree_on() {
+        /// `true` when this literal may be pushed.
+        const PUSHES: bool = true;
+        const REFUSES: bool = false;
+
+        let rows: [(&str, bool); 14] = [
+            // --- plain integers ---------------------------------------
+            ("2", PUSHES),
+            ("0", PUSHES),
+            // An integer spelled with a zero fraction is still an integer.
+            ("2.0", PUSHES),
+            // ...and one spelled with a NON-zero fraction is not, however
+            // far down it sits. `2.0000000000000000001` parses to exactly
+            // `2.0` as an `f64`, so the old `fract() != 0.0` rule pushed
+            // it; the lexeme rule refuses it. No answer moves — the
+            // evaluator then does the same comparison — and the rule is
+            // one sentence instead of two.
+            ("2.5", REFUSES),
+            ("2.0000000000000000001", REFUSES),
+            // --- the boundary, in number form -------------------------
+            ("9007199254740991", PUSHES),
+            ("9007199254740992", REFUSES),
+            ("9007199254740993", REFUSES),
+            ("9007199254740994", REFUSES),
+            ("9007199254740995", REFUSES),
+            // --- the same boundary, in duration form ------------------
+            ("1s", PUSHES),
+            ("9007199254740991ns", PUSHES),
+            ("9007199254740993ns", REFUSES),
+            // 2600 h is 9,360,000,000,000,000 ns, past 2^53; 2500 h is
+            // 9,000,000,000,000,000 ns and inside it. A duration literal
+            // is an exact nanosecond count before this function sees it,
+            // so only the bound can refuse one.
+            ("2600h", REFUSES),
+        ];
+        let ops = ["=", "!=", ">", ">=", "<", "<="];
+
+        // Collected rather than asserted one at a time: on a build with
+        // the defect several rows are wrong at once, and the whole set is
+        // what says where the boundary moved to.
+        let mut wrong: Vec<String> = Vec::new();
+        for (literal, wants_push) in rows {
+            for op in ops {
+                let q = format!(r#"{{ span.http.method = "GET" }} | max(duration) {op} {literal}"#);
+                let query = pulsus_traceql::parse(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
+                let stage = query
+                    .pipeline
+                    .iter()
+                    .find(|s| matches!(s, PipelineStage::Aggregate { .. }))
+                    .unwrap_or_else(|| panic!("{q}: parsed without an aggregate stage"));
+                let frag = aggregate_having_sql(stage);
+                if frag.is_some() != wants_push {
+                    wrong.push(format!(
+                        "{q}: expected {}, got {frag:?}",
+                        if wants_push {
+                            "a fragment"
+                        } else {
+                            "no fragment"
+                        }
+                    ));
+                }
+                let Some(frag) = frag else { continue };
+                // The fragment's integer IS the evaluator's `f64`.
+                let PipelineStage::Aggregate {
+                    op: agg,
+                    field,
+                    value,
+                    ..
+                } = stage
+                else {
+                    unreachable!("filtered above")
+                };
+                let evaluator = super::super::search_plan::aggregate_threshold(*agg, field, value)
+                    .unwrap_or_else(|e| panic!("{q}: {e:?}"));
+                let rendered: i64 = frag
+                    .rsplit(' ')
+                    .next()
+                    .unwrap_or_else(|| panic!("{q}: {frag:?} ends in a literal"))
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{q}: {frag:?} does not end in an integer: {e}"));
+                if (rendered as f64).to_bits() != evaluator.to_bits() {
+                    wrong.push(format!(
+                        "{q}: the statement compares against {rendered} and the evaluator \
+                         against {evaluator}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} cases disagree with the boundary:\n{}",
+            wrong.len(),
+            rows.len() * ops.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// A negative threshold cannot reach the renderer from a parsed
+    /// query, and this is how that was established rather than read: the
+    /// aggregate grammar takes a `Number` or `Duration` TOKEN and the
+    /// lexer never puts a sign inside either
+    /// (`pulsus-traceql/src/lexer.rs::scan_number_or_duration`), so `-1`
+    /// arrives as a `Minus` token the aggregate production refuses.
+    ///
+    /// It matters because `count()` pushes down to `uniqExact(span_id)`,
+    /// an unsigned aggregate: a negative literal in that comparison is
+    /// the one shape where ClickHouse's own type promotion, rather than
+    /// our threshold rule, would decide the answer. The sign handling in
+    /// `exact_decimal_integer` therefore covers a form only
+    /// `parser::static_value` can build, and this test is what says so.
+    #[test]
+    fn an_aggregate_threshold_cannot_be_negative() {
+        for q in [
+            r#"{ span.http.method = "GET" } | count() > -1"#,
+            r#"{ span.http.method = "GET" } | max(duration) = -9007199254740993"#,
+        ] {
+            let err = pulsus_traceql::parse(q).expect_err("a signed threshold must not parse");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("a number or a duration"),
+                "{q}: expected the aggregate value production to refuse, got {rendered:?}"
+            );
+        }
     }
 
     /// A physical `=` leaf still classifies through the same rule, so the

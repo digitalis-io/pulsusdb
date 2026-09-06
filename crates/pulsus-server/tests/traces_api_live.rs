@@ -525,6 +525,15 @@ fn spawn_ready_with_env(port: u16, db: &ScopedDb, extra_env: &[(&str, &str)]) ->
     let child = command.spawn().expect("spawn pulsusdb");
     let guard = ChildGuard(child);
 
+    // A few `503`s before the first `200` are the expected shape and not
+    // a fault: the process answers on the port as soon as it binds, and
+    // `/ready` stays `503` until the ClickHouse pool is up and the schema
+    // has been initialised (`logs_api/handlers.rs:33`). This loop simply
+    // does not count them. A probe written by hand rather than through
+    // this helper sees them and should ignore every response before the
+    // first `200`. Measured against ClickHouse 26.3 on 18123 with a debug
+    // build, polling `/ready` every 100 ms from `curl` on a fresh
+    // database: 3, 3, 3, 3 non-`200` polls over four cold starts.
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if request(port, "GET", "/ready", &[], None).is_some_and(|r| r.status == 200) {

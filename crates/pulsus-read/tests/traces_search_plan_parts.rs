@@ -39,12 +39,29 @@ const MAX_CANDIDATES: u64 = 100_000;
 /// needs both sides' sets) and not about sources — one `WHERE` could hold
 /// both.
 ///
-/// Whether one `WHERE` over an `OR` prunes as well as two ranked reads is
-/// a pushdown measurement nobody has taken, and taking it inside the part
-/// whose contract is "no SQL moves" is the confusion that part exists to
-/// prevent. The measurement is owed by the part that compiles a
-/// generator; `docs/query-lowering.md` §2.7.4 and §2.7.9 carry the same
-/// exception with the same reason.
+/// **The measurement this comment used to say nobody had taken is
+/// taken.** Issue #492 part 4 ran it on ClickHouse 26.3 over a
+/// 4,000,000-row `trace_attrs_idx` corpus, one statement per row, with
+/// `use_query_condition_cache = 0`:
+///
+/// ```text
+///                                    granules   read_rows   result_bytes   memory
+/// ranked read A (key,val prefix)        25       204,800     3,145,744     32.9 MB
+/// ranked read B (key-only + val_num)   123     1,007,616     3,145,744     35.1 MB
+/// one WHERE over the OR                148     1,212,416     3,145,744     83.4 MB
+/// ```
+///
+/// `148 = 25 + 123` and `1,212,416 = 204,800 + 1,007,616` exactly, with
+/// `Ranges: 2` on the merged plan: **one `WHERE` prunes exactly as well
+/// as two ranked reads**, reads the same rows, halves the metered result
+/// bytes (one 100,001-row result instead of two), halves the round
+/// trips, and costs about 2.4x the peak memory of one of them.
+///
+/// So the exception below is a saving left on the table rather than a
+/// necessity — and merging same-source generators is a code change part
+/// 4 does not make. It belongs to **part 5**, which is where the wrap
+/// and the `by()` lowering land. `docs/query-lowering.md` §2.7.4 and
+/// §2.7.9 carry the same exception with the same reason.
 ///
 /// The gate below asserts this list EQUALS the measured set, so it cannot
 /// grow silently.
@@ -120,7 +137,7 @@ fn goldens() -> Vec<Golden> {
             distributed,
         });
     }
-    assert_eq!(out.len(), 56, "the committed search corpus");
+    assert_eq!(out.len(), 64, "the committed search corpus");
     out
 }
 
@@ -451,8 +468,8 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
     }
     assert_eq!(
         (total_statements, total_sections),
-        (239, 239),
-        "the committed corpus renders 239 statements and the plans account for all of them"
+        (272, 272),
+        "the committed corpus renders 272 statements and the plans account for all of them"
     );
     assert_eq!(
         preflight_cases,
@@ -501,7 +518,7 @@ fn no_part_carries_the_keyset_driver_or_the_inexact_limit_cut() {
 #[test]
 fn the_corpus_this_target_reads_is_the_committed_one() {
     let gs = goldens();
-    assert_eq!(gs.len(), 56);
+    assert_eq!(gs.len(), 64);
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut total = 0usize;
     for g in &gs {
@@ -514,7 +531,7 @@ fn the_corpus_this_target_reads_is_the_committed_one() {
             *kinds.entry(kind).or_insert(0) += 1;
         }
     }
-    assert_eq!(total, 239, "the committed corpus renders 239 statements");
+    assert_eq!(total, 272, "the committed corpus renders 272 statements");
     assert_eq!(
         kinds.get("by() cardinality probe").copied().unwrap_or(0),
         1,

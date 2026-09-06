@@ -2661,3 +2661,140 @@ when we are asking it to slow down, so we keep `429`; recorded as
   that retired it, so the reasoning is not re-derived from scratch by the
   next reader. The corrected behaviour is pinned by the `by_agg_by`
   fixture, whose group SET and key ORDER are the reference's.
+
+### `traceql-pushed-aggregate-reaches-older-traces` (issue #492 part 4) — **a spanset aggregate compiled into the generator changes which traces a truncated search returns, and whether it says it was truncated**
+
+- **Route.** `GET /api/traces/v1/search` (and its `/api/search` alias), for a
+  query whose pipeline is a single spanset aggregate — `min(duration)`,
+  `max(duration)` or `count()` — over a selector that is exactly one
+  attribute-equality condition. Nothing else: every other shape renders the
+  statement it rendered before.
+
+- **What changed, and it is a behaviour change for existing users.** The
+  aggregate used to contribute no SQL. The phase-1 candidate generator
+  returned the traces the SELECTOR matched, ranked newest-first and capped at
+  `reader.traceql_max_candidates`, and our own process then hydrated them a
+  batch at a time and dropped the ones the aggregate refused. Since part 4
+  the generator statement carries a `HAVING`, so the cap is charged against
+  the traces that PASS the aggregate. Two consequences follow, and both are
+  visible to a client:
+
+  1. a query can return traces it did not return before — the qualifying
+     traces older than the cap's cut-off were previously never reached;
+  2. a query can stop reporting itself incomplete — no bound engaged, so
+     `metrics` goes from `{"totalJobs":1}` to
+     `{"completedJobs":1,"totalJobs":1}`.
+
+- **The numbers, measured on the corpus the test seeds.** 1,000 traces of two
+  spans each; one span per trace carries `http.method = GET` and lasts 1.5 s
+  in the 333 traces with the OLDEST timestamps and 0.5 s in the other 667;
+  the second span is 5 s and carries no attribute. The qualifying traces are
+  deliberately the oldest, because a corpus where they are also the newest
+  cannot tell the two paths apart. With `reader.traceql_max_candidates = 400`
+  and `{ span.http.method = "GET" } | max(duration) > 1s`:
+
+  | | generator rows | traces returned | `metrics` |
+  |---|---|---|---|
+  | before | 401 (the `cap + 1` probe fired, so truncated) | **0** | `{"totalJobs":1}` |
+  | after | 333 | **20** | `{"completedJobs":1,"totalJobs":1}` |
+
+  Both halves are run by
+  `crates/pulsus-read/tests/traces_search_pushdown_live.rs::a_broad_selector_with_a_selective_aggregate_completes_where_it_used_to_truncate`,
+  which executes the same statement with its `HAVING` line removed to
+  reproduce the "before" row rather than quoting it.
+
+- **The edge this does not close.** Hydration is capped at
+  `MAX_SPANS_PER_TRACE` (10,000) spans per trace in the window, so for a
+  trace above that cap the database aggregates the whole set while the
+  evaluator aggregates a truncated one, and the pushed statement can admit a
+  trace the evaluator then drops. It needs more than 10,000 in-window spans in
+  ONE trace, and `exec::group_hydrated_rows` already marks exactly that trace
+  overflowed, so the response already omits `metrics.completedJobs`. No code
+  guards it: a guard would need the span count before the read, which is the
+  read the pushdown exists to avoid.
+
+- **Why this direction.** Returning the traces that qualify is the answer the
+  query asked for. The old behaviour returned an empty answer for a query
+  whose data contained 333 matches, and marked it incomplete — which is
+  truthful but useless. Both directions of change here make the answer
+  strictly closer to the unbounded one.
+
+- **Disposition.** Deliberate. Documented in docs/api.md §4.2 (the partial
+  results paragraph) and docs/schemas.md §4.2 (clause (a) of the partiality
+  list).
+
+### `traceql-pushed-aggregate-generator-memory` (issue #492 part 4) — **the pushdown enlarges the phase-1 grouping state, so the ceiling that already bounds it bites on smaller selectors**
+
+- **Route.** `GET /api/traces/v1/search` (and its `/api/search` alias), same
+  shape as the row above.
+
+- **What changed.** The phase-1 generator already carried a memory ceiling —
+  `max_memory_usage = reader.traceql_generator_max_memory_bytes` (default
+  536,870,912) with `max_bytes_before_external_group_by = 0`, so it throws
+  rather than spilling; server code 241 maps to
+  `TooBroadReason::TraceGeneratorMemory` and a `422`. A pushed aggregate adds
+  per-group aggregation state to that same `GROUP BY trace_id`, so the same
+  selector can breach the ceiling where it did not before. No new setting, no
+  new reason, no new status code.
+
+- **The numbers, in BYTES and with their corpus.** The group count that trips
+  the ceiling is a property of the data and of which aggregate was pushed, so
+  no group-count ceiling is quoted anywhere. Peak `memory_usage` from
+  `system.query_log`, ClickHouse 26.3, one query per row,
+  `max_bytes_before_external_group_by = 0`, no ceiling applied:
+
+  | corpus | pushed `HAVING` | peak bytes | B/group |
+  |---|---|---|---|
+  | 1,000,000 groups, 1 row each | none | 193,310,747 | 193 |
+  | 1,000,000 groups, 1 row each | `max(duration_ns) > 1000000000` | 241,806,811 | 242 |
+  | 1,000,000 groups, 1 row each | `uniqExact(span_id) > 0` | 533,993,666 | 534 |
+  | 500,000 groups, 1 row each | `uniqExact(span_id) > 0` | 228,250,943 | 457 |
+  | 2,000,000 groups, 2 rows each | `uniqExact(span_id) > 0` | 1,392,219,367 | 696 |
+
+  At the shipped default ceiling those per-group costs put the refusal point
+  somewhere between roughly 0.8M and 2.8M groups **on these corpora**; no
+  other corpus was measured and no claim is made about any other. On a
+  1,300,000-group corpus at the shipped default, three repetitions each,
+  `{ span.http.method = "GET" }` and
+  `{ span.http.method = "GET" } | max(duration) > 1s` both answer `200` while
+  `{ span.http.method = "GET" } | count() > 0` answers `422` — so "pushing
+  makes it refuse" is wrong, and that pair is the counter-example.
+
+- **Why the mechanism ruled in `5479441796` was declined.** That ruling
+  adopted `max_rows_to_group_by` with `group_by_overflow_mode = 'throw'`
+  because nothing was thought to bound the grouping. The premise was wrong —
+  the memory ceiling above already bounds it and already refuses — and the
+  adopted mechanism carries the defect the same option table rejected option
+  C for: **its refusal point moves with `max_threads`**, so one query text and
+  one corpus give two answers on two nodes. Re-measured on ClickHouse 26.3
+  over a 4,000,000-row / 2,000,000-group corpus with the same statement:
+
+  ```text
+                                                          threads=1            threads=8
+  max_rows_to_group_by = 100000,  overflow_mode = throw   Code: 158 (refuses)  Code: 158 (refuses)
+  max_rows_to_group_by = 1000000, overflow_mode = throw   Code: 158 (refuses)  200, 100001 rows
+  max_rows_to_group_by = 2000000, overflow_mode = throw   200, 100001 rows     200, 100001 rows
+
+  max_memory_usage = 536870912, external_group_by = 0     Code: 241 (refuses)  Code: 241 (refuses)
+                                            threads=16    Code: 241 (refuses)
+  ```
+
+  The shipped mechanism gives one answer; the ruled one gives two. Adjudicated
+  on issue #492 (`5556416192`), which amended the earlier ruling rather than
+  dropping it: **on a breach, refuse — never truncate and never spill** stands
+  unchanged; only the mechanism that refuses is the shipped one.
+
+- **What holds the "already bounded" claim to a check.** Prose has no failure
+  mode, so two tests carry it.
+  `crates/pulsus-read/tests/traces_search_pushdown_live.rs::the_pushed_aggregate_outgrows_the_generator_memory_ceiling_and_refuses`
+  runs the refusal against a 1,000,000-group corpus at a 320 MiB ceiling, with
+  `…::the_same_corpus_without_the_pushed_aggregate_answers_two_hundred` as the
+  control that makes it a statement about the aggregate rather than about the
+  corpus. `traces::exec::tests::generator_settings_pin_the_memory_ceiling_and_throw_not_spill`
+  asserts `max_bytes_before_external_group_by` is `"0"` and not merely
+  present: with a non-zero value the same statement spills and answers a slow
+  `200`, which is the silent widening the ruling existed to prevent, and the
+  presence-only form of that assertion did not notice.
+
+- **Disposition.** Deliberate. Documented in docs/api.md §4.2 (the `422` row
+  of the error table).

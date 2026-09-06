@@ -876,6 +876,9 @@ pub fn seed_relation() -> Relation<Lql> {
         shape: LqlShape::Lines,
         exact: true,
         depth: 0,
+        // Issue #492 part 4 added the slot; the LogQL fit lowers no
+        // aggregate into a `HAVING`, so it seeds empty and stays empty.
+        having: Vec::new(),
     }
 }
 

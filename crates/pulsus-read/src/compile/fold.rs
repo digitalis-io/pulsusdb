@@ -636,6 +636,16 @@ pub struct Relation<L: Lang + ?Sized> {
     pub exact: bool,
     /// Subquery nesting, for ADR 0008's wrap rule.
     pub depth: u8,
+    /// The aggregate predicates that landed in this statement's
+    /// `HAVING`, in fold order. Empty for every relation no aggregate
+    /// lowered into.
+    ///
+    /// The emitter renders these after `GROUP BY` and before `ORDER BY`;
+    /// until an emitter exists, this is what a language reads back to
+    /// put the same text into the statement it renders itself
+    /// (issue #492 part 4 — `traces::search_plan::plan_search` reads it
+    /// and re-renders the generator statement with the same fragment).
+    pub having: Vec<L::ColExpr>,
 }
 
 impl<L: Lang + ?Sized> Relation<L> {
@@ -1060,6 +1070,7 @@ impl<L: Lang + ?Sized> Clone for Relation<L> {
             shape: self.shape.clone(),
             exact: self.exact,
             depth: self.depth,
+            having: self.having.clone(),
         }
     }
 }
@@ -1077,6 +1088,7 @@ impl<L: Lang + ?Sized> fmt::Debug for Relation<L> {
             .field("shape", &self.shape)
             .field("exact", &self.exact)
             .field("depth", &self.depth)
+            .field("having", &self.having)
             .finish()
     }
 }
@@ -1093,6 +1105,7 @@ impl<L: Lang + ?Sized> PartialEq for Relation<L> {
             && self.shape == other.shape
             && self.exact == other.exact
             && self.depth == other.depth
+            && self.having == other.having
     }
 }
 

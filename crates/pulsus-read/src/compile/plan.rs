@@ -1213,6 +1213,7 @@ mod tests {
             shape: TestShape("rows"),
             exact: true,
             depth: 0,
+            having: Vec::new(),
         }
     }
 

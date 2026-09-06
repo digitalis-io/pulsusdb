@@ -1744,6 +1744,24 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test traces_search_explain
 
+      # Issue #492 part 4: the spanset aggregate compiled into the phase-1
+      # generator statement. The hermetic suites pin the SQL text; these
+      # seven say what it returns — the winners equal an expectation the
+      # test computes from the rows it wrote, the HAVING selects the same
+      # parts/granules/ranges as the same statement without it, a broad
+      # selector with a selective aggregate completes where it truncated,
+      # a replayed index row moves no pushed min/max/count, the grouping
+      # state the pushdown adds is refused by the ceiling the generator
+      # already carries rather than spilling, and the pushed and unpushed
+      # readings of a threshold agree at the 2^53 precision boundary under
+      # all six comparison operators. Reuses this job's ClickHouse 26.3
+      # container.
+      - name: TraceQL aggregate pushdown gates (Tier 1)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test traces_search_pushdown_live
+
       # Issue #57 AC3/AC5: spawns the real `pulsusdb` binary and drives
       # `GET /api/traces/v1/search` end-to-end — exact trace-ID sets for
       # the pre-committed q= cases, legacy-params equivalence, ordering/
