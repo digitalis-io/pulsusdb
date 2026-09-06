@@ -76,18 +76,39 @@ choosing candidate generators, and
 So a shared core is not an abstraction invented for a hypothetical future. It is the fourth
 hand-written copy being replaced by the thing all four already are.
 
-**And the cost of not having it is measurable.** TraceQL's spanset aggregate has no SQL path at
-all: `PlannedAggregate` is built at `search_plan.rs:1218` and read at exactly one place,
-`search_eval.rs:2420`. Every matching span is therefore transported and then discarded. On corpus
+**And the cost of not having it was measurable.** TraceQL's spanset aggregate had no SQL path at
+all when this record was written: `PlannedAggregate` was built at `search_plan.rs:1218` and read at
+exactly one place, `search_eval.rs:2420`. Every matching span was therefore transported and then
+discarded. (Issue #492 part 4 gave `min(duration)`, `max(duration)` and `count()` over a
+single attribute-equality selector a `HAVING` in the generator statement; every other aggregate
+shape still has no SQL path.) On corpus
 C1 (§9), `{ .service.namespace = "prod" } | max(duration) > 1s` at `limit=20` costs **1,110
 sequential round trips** and moves **76,616,608 result bytes**; of that, the ~11 KB the client
 receives is all that was wanted (11,340 B, measured on C2 — see §9.1).
 
-**The same answer lowered is two statements, not one: 2 round trips and 43,636 result bytes.** The
-lowered statement is 1 round trip and 4,616 B; the winners' root read stays residual in **every**
-chain, because the root summary is read trace-wide with no time predicate (§3.1's `Emit` row, §5),
-and it is the second — 1 round trip and 39,020 B, measured as its own row in §9.2. So the metered
-hop carries **1,756× fewer bytes** (76,616,608 ÷ 43,636) over **555× fewer round trips**.
+**The same answer lowered is four statements, not one: 4 round trips.** The compiled generator is
+the first; the window-bounded hydration read and the membership read survive lowering, because
+`spanSets[].matched` and `spanSets[].spans[]` are written unconditionally
+(`crates/pulsus-server/src/traces_api/search_response.rs:428-430`, `:507-512`); the winners' root
+read is the fourth and stays residual in **every** chain, because the root summary is read
+trace-wide with no time predicate (§3.1's `Emit` row, §5). §9.2's own round-trip formula
+`1 + 2·ceil(k/32) + 1` agrees: after lowering every candidate the generator returns already
+qualifies, so `k` is the request's `limit` of 20 and the count is 4.
+
+> **Superseded figure.** `43,636 B` is **seed + root only**: it was computed from a two-statement
+> model and omits the hydration and membership reads, and its seed row was measured on a statement
+> carrying `LIMIT 20` — the collapsed candidate cap, which arrives with the `Order`/`Limit`
+> lowering and not with the aggregate pushdown. Every figure derived from it — the `1,756×` ratio,
+> the `2` round trips, `9,871,360` rows, `1,205` granules — carries the same omission, and so do
+> the counters in [the hops diagram](diagrams/query-lowering-hops.svg). The replacement totals, and
+> the diagram's redraw, are owed by **part 8's §9.2 re-measurement** (issue #492).
+
+> **Two figures are unverified survivors.** The client's `11,340 B` (measured on C2, §9.1) and the
+> peak-memory pair `169,311,055` / `190,353,655 B` with its `1.12×` (C1, §9.2) are **not**
+> superseded by the statement-count correction, and nothing found in part 4 suggests they are wrong
+> — but nobody has re-measured them, and neither corpus is standing, so the verdict rests on
+> argument alone. **Part 8 re-measures both** alongside its §9.2 re-measurement, or records here
+> that the corpus was not rebuilt and carries the figure forward still flagged.
 
 > **16,598× is not this document's figure and appears nowhere as one.** It is 76,616,608 ÷ 4,616 —
 > today's whole request divided by the lowered *statement* alone, with the root read the lowered
@@ -1202,13 +1223,17 @@ Four consequences fall out of the table rather than being written down.
 - **`Coalesce` after `By` lowers by wrapping**, because its grouping slot is occupied, while
   `Coalesce` with no preceding `By` is the identity and costs nothing — one rule, not two special
   cases.
-- **`Emit` is `Never`, so a lowered TraceQL search is two statements, not one.** The root summary is
-  read trace-wide with **no time predicate** (the true root may predate the search window —
+- **`Emit` is `Never`, and a lowered TraceQL search is four statements, not one.** The root summary
+  is read trace-wide with **no time predicate** (the true root may predate the search window —
   [schemas.md §4.2](schemas.md)), and `TraceSearchResult.root` is not optional
   (`crates/pulsus-read/src/traces/exec.rs:385`), so every search response needs it. That is exactly
   why the winners' root read exists today (`exec.rs:2063`), and lowering does not remove it: it
-  removes the 1,108 round trips between it and the generator. §1, §4, §9.2 and
-  [the hops diagram](diagrams/query-lowering-hops.svg) all count **2**.
+  removes the 1,108 round trips between it and the generator. The window-bounded hydration read and
+  the membership read survive lowering for their own reason — `spanSets[].matched` and
+  `spanSets[].spans[]` are written unconditionally
+  (`crates/pulsus-server/src/traces_api/search_response.rs:428-430`, `:507-512`) — so the count is
+  the generator plus those two plus the root read. §1, §4 and §9.2 count **4**; the hops diagram
+  still counts 2 and says so on its own face, until part 8 redraws it.
 - **The three metrics variants are not chain links at all on this route.** They are listed so the
   enumeration is complete against the AST rather than against the search planner's subset; a reader
   checking `PipelineStage` against this table finds every variant.
@@ -1307,9 +1332,10 @@ WHERE date >= … AND date <= …
   AND trace_id IN (unhex('…'), … the same 32)
 ```
 
-**Lowered** — **two statements**: one lowered statement, plus the same winners' root read the
-evaluator still owns because `Emit` is `Never` (§3.1). The second is unchanged from today, so only
-the first is shown in full:
+**Lowered** — **four statements**: the lowered generator below, the window-bounded per-batch
+hydration read, the membership read for the selector's one attribute condition, and the same
+winners' root read the evaluator still owns because `Emit` is `Never` (§3.1). The last three are
+unchanged from today, so only the first is shown in full:
 
 ```sql
 SELECT trace_id, max(timestamp_ns) AS sort_key
@@ -1337,10 +1363,13 @@ WHERE trace_id IN (unhex('…'), … the 20 winners)
 a single-attribute-leaf selector with a `duration`- or `count`-sourced aggregate **the attribute
 index covers the whole query** — no join, no subquery, no second table.
 
-**Two round trips, not one, and that is the number every other section quotes.** 1,110 → **2**;
+**Four round trips, not one, and that is the number every other section quotes.** 1,110 → **4**;
 76,616,608 B → **43,636 B** (4,616 + 39,020); 5,705,629,767 rows → **9,871,360** (9,052,160 +
 819,200); 696,630 granules → **1,205** (1,105 + 100). Both sides of every ratio include the root
 read, so the comparison is like for like — today's 1,110 round trips include it too (§9.2).
+**The three lowered totals here are `seed + root only`**: they add the generator's row to the root
+read's and omit the hydration and membership reads that survive lowering, so each is a lower bound
+rather than the total. Part 8's §9.2 re-measurement replaces them.
 
 ---
 
@@ -1837,10 +1866,18 @@ file system †, 100 granules, 39,020 result bytes.
 | | round trips | rows read | granules | result bytes |
 |---|---|---|---|---|
 | today | 1,110 | 5,705,629,767 | 696,630 | 76,616,608 |
-| lowered | **2** | **9,871,360** | **1,205** | **43,636** |
-| ratio | **555×** | **578×** | **578×** | **1,756×** |
+| lowered (`seed + root only`) | **4** | **9,871,360** | **1,205** | **43,636** |
+| ratio | **277.5×** | **578×** | **578×** | **1,756×** |
 
-**The root read is why the lowered side is 2 and not 1.** It is not an artefact of the measurement:
+**The `lowered` row's three totals are `seed + root only`, and its ratios inherit that.** They were
+computed under a two-statement model: the round-trip count is corrected to 4 here, but the rows,
+granules and result bytes still add only the generator's row to the root read's and omit the
+window-bounded hydration read and the membership read, which survive lowering because
+`spanSets[].matched` and `spanSets[].spans[]` are written unconditionally. The `578×` and `1,756×`
+ratios are therefore upper bounds on the true saving, not the saving. **Part 8's §9.2
+re-measurement replaces every figure in the `lowered` and `ratio` rows.**
+
+**The root read is why the lowered side is more than 1.** It is not an artefact of the measurement:
 `Emit` is `Never` (§3.1) because the root summary is trace-wide and unwindowed, so no chain removes
 it. **16,598× is not a figure this document reports**, here or anywhere: it is the lowered
 statement's 4,616 B alone against today's total, which compares a whole request against part of one.
@@ -2211,9 +2248,16 @@ What changed, so the redraw is reviewable as a redraw:
 | hops caption / `<desc>` | *"2 statements."* / *"stays residual in every chain"* | *"2 SQL parts."* / the same clause the legend gained |
 
 **No number moved.** The hops diagram's counters — 1,110 against 2 round trips, 76,616,608 against
-43,636 result bytes, the 553-of-554 batch note — are untouched, and so is every box and arrow
-position; the boundary diagram went from 87 text nodes to 90 (one legend entry, two caption lines).
-Both files parse as XML.
+43,636 result bytes (`seed + root only`), the 553-of-554 batch note — are untouched, and so is
+every box and arrow position; the boundary diagram went from 87 text nodes to 90 (one legend entry,
+two caption lines). Both files parse as XML.
+
+**The table above is a record of a past edit, and the drawing has since grown.** Part 4 (issue
+#492) marked the hops diagram and moved no number. The canvas grew from 620 to 764 px and the ratio
+panel moved down 144 px to make room; every existing `<title>`, `<desc>` and `<text>` node keeps its
+content, and `<desc>` gained a superseded sentence at its end. The drawing therefore carries **43**
+`<text>` nodes where the enumeration above counted 42. Which of its lowered figures are superseded
+and which are not is stated in §1 and on the face of the drawing; the redraw is part 8's.
 
 **The three diagram gates are still wave 1 and are still owed** —
 `the_hops_diagram_and_the_document_agree_on_the_lowered_request`,
@@ -2239,7 +2283,12 @@ measured and a derived total look like, so the total cannot corroborate the per-
 it. Wave 1 must **re-measure** the phase-2 loop on C1 and **retain the raw `system.query_log` rows
 for all 554 membership reads as an artefact**, not as a quoted figure, then replace both the total
 and the "553 of the 554" with what those rows say. Until that lands, §9.2 carries the 553 alone and
-says the total is not independent evidence.
+says the total is not independent evidence. The drawing carries the same two claims in its
+own text node at `y=258` (`diagrams/query-lowering-hops.svg`), so the replacement is not complete
+until that node says what the retained rows say. That node, the lowered band's `y=474` sentence and
+the ratio panel's second line each run past the canvas today — measured at `right` 1255.6, 1276.2
+and 1344.7 against a canvas of 1120 — and the rewrite is where the overflow gets fixed. Part 4
+neither widened nor narrowed any of the three.
 
 **Two behaviours change with the chain, and both were measured rather than ruled on.** Corpus
 **C3**: one trace, four spans, three named `a` and one named `b`, under one resource
@@ -3001,6 +3050,15 @@ set against [api.md](api.md).
 | every `Cut` variant has a row in §2.7 — an exhaustive `match` over `Cut` with no `_` arm on one side, a parse of §2.7's headings on the other, so a fifth cut is a build failure rather than a silent addition | `test(=every_cut_variant_has_a_row_in_the_design_record)` | exit **101**, no such target — **wave 1** |
 | every row of §3.1's and §7.1's three link tables states a continuation, and every continuation naming a cut names one of the four | `test(=every_chain_link_row_states_a_continuation)` | exit **101**, no such target — **wave 1** |
 | every key `QueryPlan::shape()` renders is a key [api.md](api.md) documents for `data.explain.plan`, and no other | `test(=the_plan_shape_json_keys_match_the_api_document)` | exit **101**, no such target — **wave 1** |
+
+**A twelfth gate exists as of part 4 and is not one of the eleven.**
+`the_hops_diagram_marks_its_superseded_figures_on_its_own_face` asserts only that the drawing
+carries its superseded marker while it still carries two-statement figures. It is **not**
+`the_hops_diagram_and_the_document_agree_on_the_lowered_request`, which compares the drawing's
+lowered round-trip count and result-byte total against §9.2 and **cannot go green until part 8
+redraws**: §9.2 counts 4 and the drawing counts 2, deliberately. A thirteenth,
+`the_record_flags_the_two_survivors_nobody_re_measured`, asserts that this record still flags the
+two figures nobody re-measured; it is not one of the eleven either.
 
 **Pre-measured only as far as they can be.** These eight name a test binary that does not exist
 either, so `cargo nextest run -p pulsus-read --test query_lowering_doc_gate -E '…'` fails at target

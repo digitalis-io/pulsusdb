@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 56), ("traces_metrics", 27)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 64), ("traces_metrics", 27)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -276,12 +276,12 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 56), ("traces_metrics", 2
 /// sentence to take on trust: `issue492_attr_eq`,
 /// `issue492_attr_eq_with_max_duration`, `issue492_by_then_count`,
 /// `issue492_count_then_by`, `issue492_select_span_attr` and
-/// `issue492_mixed_source_or`. Two of them are PAIRS whose SQL is
-/// byte-identical below the header — an aggregate that contributes no
-/// SQL, and a pipeline order the SQL cannot see — and
-/// `traces_search_sql.rs`'s
-/// `the_aggregate_and_the_ordering_pairs_send_byte_identical_sql`
-/// asserts that on the rendered composite rather than on the files.
+/// `issue492_mixed_source_or`. Two of them were PAIRS whose SQL was
+/// byte-identical below the header — an aggregate that contributed no
+/// SQL, and a pipeline order the SQL cannot see. Part 4 removed the
+/// first of those two identities on purpose; what asserts the pairs now
+/// is `traces_search_sql.rs`'s
+/// `the_pushed_aggregate_pair_differs_and_the_three_control_pairs_do_not`.
 ///
 /// **Adding a golden is not moving SQL, but it does move this digest**,
 /// and moving the digest constant is the reviewable act.
@@ -318,7 +318,31 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 56), ("traces_metrics", 2
 /// cannot have moved either —
 /// `traces_search_explain.rs::attr_value_reads_keep_their_index_selection`
 /// gates that as an identity rather than leaving it as this sentence.
-const PINNED_SQL_CORPUS: u64 = 0x5b8b_80d7_38cb_049b;
+/// **Moved on issue #492 part 4: 83 -> 91 entries, eight ADDED
+/// `traces_search` goldens and ONE existing golden modified.**
+/// `git diff --stat -- crates/pulsus-read/tests/golden/` shows eight new
+/// files and exactly one modification,
+/// `issue492_attr_eq_with_max_duration.sql`, which gained a single line:
+///
+/// ```text
+/// +HAVING max(duration_ns) > 1000000000
+/// ```
+///
+/// That is the whole SQL change in this part. The spanset aggregate of
+/// `{ span.http.method = "GET" } | max(duration) > 1s` now compiles into
+/// the phase-1 generator statement, so the database discards the traces
+/// that do not qualify instead of returning them to be discarded here.
+/// No `WHERE` clause, index prefix, date/time clause, `GROUP BY`,
+/// `ORDER BY` or `LIMIT` moved in any golden, so part and granule
+/// selection cannot have moved either — `traces_search_pushdown_live.rs`'s
+/// `the_pushed_statement_reads_the_same_granules_as_the_unpushed_one`
+/// gates that as an identity against a running database rather than
+/// leaving it as this sentence.
+///
+/// Four of the eight new goldens carry a `HAVING` and four do not; the
+/// four that do not are the refusals, each rendering the statement its
+/// aggregate-free twin renders.
+const PINNED_SQL_CORPUS: u64 = 0x5474_b853_454f_9b42;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -450,7 +474,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 83, "the frozen SQL corpus is 56 + 27 = 83 entries");
+    assert_eq!(total, 91, "the frozen SQL corpus is 64 + 27 = 91 entries");
 }
 
 #[test]
@@ -495,7 +519,7 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
     }
     assert_eq!(
         h, PINNED_SQL_CORPUS,
-        "the 83 frozen SQL goldens changed. This is not a constant to refresh: it means the \
+        "the 91 frozen SQL goldens changed. This is not a constant to refresh: it means the \
          planner's or the SQL builders' output moved. If that was deliberate, regenerate the \
          goldens, say in the notes which query's SQL changed and why, and update \
          PINNED_SQL_CORPUS to {h:#x} in the same change — that edit is what makes 'zero SQL \
@@ -509,12 +533,18 @@ fn the_sql_golden_corpus_matches_its_committed_digest() {
 /// the decision needs a check that fails when a wave writes one — the
 /// alternative is a rule nobody can see being broken.
 ///
-/// **This is vacuous today and says so.** At base the corpus contains no
-/// lowered SQL at all, so the assertion is green over a population
-/// holding none of the case it exists for. It becomes a real check the
-/// moment a wave emits a wrapped statement into the corpus (ADR 0008 D1),
-/// which is why it is written now rather than then: a gate added
-/// alongside the first violation is a gate nobody ever saw fail.
+/// **This is still vacuous after issue #492 part 4, and says so.** Part 4
+/// is the first part that compiles a query stage into SQL, and it adds a
+/// `HAVING` clause to an existing single-level statement — it wraps
+/// nothing, so the corpus still holds none of the case this gate exists
+/// for. The first corpus that can fail it for a real reason is the one
+/// with a WRAPPED statement, which is part 5's (`by()`, `coalesce()` and
+/// the wrap). The gate is written now rather than then because a gate
+/// added alongside the first violation is a gate nobody ever saw fail.
+///
+/// It CAN fail: inserting `WITH q AS (SELECT 1)` into one golden reddens
+/// it with `traces_search/<file>.sql:5: ADR 0008 D2 bans the common-table
+/// form`.
 ///
 /// The word is matched case-insensitively and only where it stands as a
 /// whole token, so `WITH`, `with` and a leading `\nWITH` all trip it
@@ -564,11 +594,11 @@ fn the_golden_sql_corpus_contains_no_with_clause() {
     // the corpus. (It IS vacuous in the direction that matters until a
     // wave emits a wrapped statement, which the doc comment states.)
     assert_eq!(
-        entries, 83,
-        "every committed corpus entry is walked (the same 83 the membership gate counts)"
+        entries, 91,
+        "every committed corpus entry is walked (the same 91 the membership gate counts)"
     );
     assert_eq!(
-        scanned, 82,
+        scanned, 90,
         "every SQL golden is scanned; the one entry that is not a statement is          `traces_metrics/log2_reference_capture.json`"
     );
     assert!(

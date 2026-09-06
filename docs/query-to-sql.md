@@ -520,7 +520,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `traceDuration`, `rootName`, `rootServiceName`, `span:childCount` | none | *never becomes SQL*, `docs/query-lowering.md:778`. Part 5 |
 | ordering | `ORDER BY sort_key DESC, trace_id ASC` | *from the design*, `docs/query-lowering.md:616`. Refuses over a wider-than-needed set: the sort key is the newest matching span's timestamp, so a row the SQL should not have returned changes the order, not only the set |
 | `limit=20` | `LIMIT 20` | *from the design*, `docs/query-lowering.md:617`. Requires an ordering to be set; since the ordering itself requires exactness, an inexact predicate refuses both |
-| the response | none | *never becomes SQL*, `docs/query-lowering.md:780`. The trace's root summary is read across the whole trace with **no time bound**, because the true root may start before the search window, and `TraceSearchResult.root` is not optional (`exec.rs:385`). **So a compiled TraceQL search is two statements, not one** |
+| the response | none | *never becomes SQL*, `docs/query-lowering.md:780`. The trace's root summary is read across the whole trace with **no time bound**, because the true root may start before the search window, and `TraceSearchResult.root` is not optional (`exec.rs:385`). **So A compiled TraceQL search is never one statement**: the compiled generator, then the per-batch hydration read and one membership read per attribute probe, then the trace-root read with no time bound. The middle two cannot be dropped, because `spanSets[].matched` and `spanSets[].spans[]` are written unconditionally (`crates/pulsus-server/src/traces_api/search_response.rs:428-430` and `:507-512`), and a statement projecting `trace_id, max(timestamp_ns)` produces neither |
 
 ### 2.5 The one worked TraceQL query, before and after
 
@@ -577,10 +577,22 @@ FROM trace_spans
 WHERE trace_id IN (unhex('…'), … the 20 that won)
 ```
 
-**After this work** — two statements in total. `trace_attrs_idx` carries `timestamp_ns` and
-`duration_ns` on every attribute row (`catalog.rs:376`, `:379`), so for a single-condition selector
-with a `duration`- or `count`-sourced aggregate the attribute index answers the whole query: no
+**After this work** — **four statements in total**, and the first of them is the one that
+changes. `trace_attrs_idx` carries `timestamp_ns` and `duration_ns` on every attribute row
+(`catalog.rs:376`, `:379`), so for a single-condition selector with a `duration`- or
+`count`-sourced aggregate the attribute index answers the FILTER inside the first statement: no
 join, no subquery, no second table.
+
+The four are the compiled generator below, the window-bounded per-batch hydration read, the
+membership read for the selector's one attribute condition, and the winners' root read. The two
+in the middle were omitted from the earlier "two statements" count and they cannot be dropped:
+`spanSets[].matched` and `spanSets[].spans[]` are written unconditionally
+(`crates/pulsus-server/src/traces_api/search_response.rs:428-430`, `:507-512`), and the root read
+is trace-wide and unwindowed so it cannot say which spans matched inside the window. The saving is
+in what each statement carries and in how many times the batch loop runs, not in the number of
+statement KINDS — measured on the part-4 corpus, 46 statements and 166,450 result bytes become 4
+and 19,710, because every candidate the generator returns already qualifies and the loop stops on
+the first batch.
 
 ```sql
 -- from the design, docs/query-lowering.md:737-745
@@ -614,9 +626,12 @@ corresponds to `resource.service.namespace`, not to the `.service.namespace` it 
 Recorded as an open question at the end of this document rather than resolved here.
 
 **Round trips and bytes, from the design's measurement** (`docs/query-lowering.md:762-766`): 1,110
-statements become **2**; 76,616,608 bytes become **43,636**; 5,705,629,767 rows read become
-**9,871,360**; 696,630 granules become **1,205**. Both sides of every ratio include the final
-statement, so the two are counted the same way.
+statements become **4**; 76,616,608 bytes become **43,636**; 5,705,629,767 rows read become
+**9,871,360**; 696,630 granules become **1,205**.
+**The three totals on the right are `seed + root only`**: they were computed under a two-statement
+model and omit the window-bounded hydration read and the membership read, so the true lowered
+totals are larger by those two statements' cost. The replacements are owed by part 8's §9.2
+re-measurement (issue #492); the left-hand side of every ratio is unaffected.
 
 ### 2.6 What decides how the statement is assembled
 
@@ -760,7 +775,7 @@ date (`catalog.rs:381-382`), and `trace_spans`, ordered by `(trace_id, timestamp
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | — | `metrics_sql.rs:90`. Still refused with `400` on the search route (`search_plan.rs:1228`) |
 | ordering | `ORDER BY sort_key DESC, trace_id ASC` | `ORDER BY` | *from the design*, `docs/query-lowering.md:616`. Refuses over a set wider than the query: the sort key is the newest matching span's timestamp, so an extra row changes the order, not only the set |
 | `limit=20` | `LIMIT 20` | `LIMIT` | *from the design*, `docs/query-lowering.md:617` |
-| the response | none | — | **cannot become SQL.** The trace's root summary is read across the whole trace with no time bound and `TraceSearchResult.root` is not optional (`exec.rs:385`), so a compiled search is two statements, not one |
+| the response | none | — | **cannot become SQL.** The trace's root summary is read across the whole trace with no time bound and `TraceSearchResult.root` is not optional (`exec.rs:385`), so A compiled TraceQL search is never one statement**: the compiled generator, then the per-batch hydration read and one membership read per attribute probe, then the trace-root read with no time bound. The middle two cannot be dropped, because `spanSets[].matched` and `spanSets[].spans[]` are written unconditionally (`crates/pulsus-server/src/traces_api/search_response.rs:428-430` and `:507-512`), and a statement projecting `trace_id, max(timestamp_ns)` produces neither |
 
 ### 2.8 Fourteen worked LogQL pipelines
 
@@ -1282,9 +1297,10 @@ captured. What is stated is the statement, that it runs, what it returns in shap
 reads — all three checkable.
 
 Every entry assumes `limit=20` and a window of `timestamp_ns > 1700000000000000000 AND
-timestamp_ns <= 1700000200000000000`, whose dates are `2023-11-14` and `2023-11-15`. **A compiled
-search is two statements, not one**: each of these, then the trace-root read with no time bound
-(§2.4's last row). The second is identical in all eight and is not repeated.
+timestamp_ns <= 1700000200000000000`, whose dates are `2023-11-14` and `2023-11-15`. **A compiled search is never one
+statement**: each of these, then the per-batch hydration read and one membership read per
+attribute probe, then the trace-root read with no time bound (§2.4's last row). Those trailing
+reads are not repeated per example.
 
 #### TraceQL25 — a physical column and an indexed attribute in one statement
 
@@ -3582,8 +3598,9 @@ ORDER BY sort_key DESC, trace_id ASC
 LIMIT 20
 ```
 
-This is the query part 2.5 measures: 1,110 statements become 2, and 76,616,608 bytes become
-43,636.
+This is the query part 2.5 measures: 1,110 statements become 4, and 76,616,608 bytes become
+43,636 — a figure that is `seed + root only` and omits the hydration and membership reads, which
+part 8's §9.2 re-measurement replaces.
 
 #### TraceQL11 — grouping the matched spans
 

@@ -18,12 +18,13 @@ use crate::logql::sql::TimeWindow;
 
 use super::compile::{ChainFacts, Tql, TqlLink};
 use super::filter::{
-    self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, LeafEval,
-    NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx, TraceCtxPred, ValuePred,
+    self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, GenTable,
+    LeafEval, LeafGenerator, NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx,
+    TraceCtxPred, ValuePred,
 };
 use super::search_eval::StoredType;
 use super::search_sql;
-use crate::compile::fold::{LowerCx, Pred, RequestBounds, lower_chain};
+use crate::compile::fold::{Fidelity, LowerCx, Pred, RequestBounds, lower_chain};
 use crate::compile::plan::{PlanConfig, PlanCx, PlanShape, QueryPlan, SourceRef, plan_of};
 
 /// The caller-validated request window and response caps.
@@ -707,15 +708,46 @@ pub struct SearchPlan {
     pub(crate) stage_names: Vec<String>,
     /// The plan the shared compile core produced for this request.
     ///
-    /// **It changes no SQL.** Every statement still comes from the
-    /// shipped builders; this says WHICH statements a request sends,
-    /// which was previously written down only in the golden files.
+    /// **It says which statements a request sends.** Since issue #492
+    /// part 4 it also decides one clause of one of them: the spanset
+    /// aggregate's `HAVING`, recorded in [`Self::pushed_having`].
     pub(crate) compiled: QueryPlan<Tql>,
+    /// The `HAVING` fragment the compiled pipeline put into
+    /// `generator_sqls[0]`, or `None` when no aggregate compiled (issue
+    /// #492 part 4).
+    ///
+    /// The fragment, not a flag: the plan records the text the statement
+    /// carries, so a test can compare the two rather than trusting that
+    /// one produced the other.
+    pub(crate) pushed_having: Option<String>,
+    /// Whether the single phase-1 generator's rows are exactly the
+    /// selector's matched spans, and when not, which of
+    /// [`generator_exactness`]'s six conditions refused (issue #492
+    /// part 4).
+    pub(crate) generator_exact: Result<(), NotExact>,
 }
 
 impl SearchPlan {
     pub fn limit(&self) -> u32 {
         self.limit
+    }
+
+    /// The `HAVING` fragment the spanset aggregate compiled into the
+    /// phase-1 generator statement, or `None` (issue #492 part 4).
+    pub fn pushed_having(&self) -> Option<&str> {
+        self.pushed_having.as_deref()
+    }
+
+    /// Whether a spanset aggregate compiled into the generator statement.
+    pub fn aggregate_pushed(&self) -> bool {
+        self.pushed_having.is_some()
+    }
+
+    /// The exactness verdict for this query's phase-1 generator — `Ok`
+    /// when the generator's rows are the selector's matched spans, and
+    /// otherwise the condition that refused (issue #492 part 4).
+    pub fn generator_exact(&self) -> Result<(), NotExact> {
+        self.generator_exact
     }
 
     /// The spans-per-spanset cap (issue #57 re-audit v7, visibility-only:
@@ -798,6 +830,17 @@ impl SearchPlan {
     /// path.
     pub fn aggregates_len(&self) -> usize {
         self.aggregates.len()
+    }
+
+    /// Each pipeline aggregate's numeric threshold, in pipeline order
+    /// (issue #492 part 4).
+    ///
+    /// Exposed so the golden suite can compare the threshold the
+    /// STATEMENT carries against the one the PLANNER derived, which are
+    /// two readings of the same stage by two functions. Nothing in
+    /// production reads it.
+    pub fn aggregate_thresholds(&self) -> Vec<f64> {
+        self.aggregates.iter().map(|a| a.threshold).collect()
     }
 
     /// One membership read's SQL for a candidate batch (exposed for the
@@ -1331,7 +1374,13 @@ fn plan_arith(
     }
 }
 
-fn aggregate_threshold(
+/// The numeric threshold one aggregate stage compares against.
+///
+/// `pub(crate)` since issue #492 part 4: the `HAVING` renderer
+/// ([`super::compile::aggregate_having_sql`]) reads the threshold from
+/// this one derivation rather than re-reading the AST, so the statement
+/// and the plan cannot disagree about what the stage said.
+pub(crate) fn aggregate_threshold(
     op: AggregateOp,
     field: &Option<FieldExpr>,
     value: &Value,
@@ -2220,6 +2269,121 @@ fn push_projection_source(
 
 /// Plans one search request. Pure and deterministic — the same inputs
 /// always produce byte-identical SQL (the golden-suite contract).
+/// Why a query's phase-1 generator set is NOT exactly the selector's
+/// match set (issue #492 part 4).
+///
+/// One variant per condition of [`generator_exactness`], in the order it
+/// checks them, so a refusal names the check that refused rather than
+/// "not exact".
+///
+/// `pub` because the pushdown's gates read it: a refusal that says only
+/// "not exact" would let a test pass while the wrong condition refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotExact {
+    /// Not exactly one `{...}` filter carrying exactly one leaf.
+    NotOneLeaf,
+    /// The one leaf is not a POSITIVE attribute-membership leaf: a
+    /// physical column, a negation, a structural intrinsic, an
+    /// arithmetic comparison, and so on.
+    LeafIsNotAPositiveAttrMatch,
+    /// The probe's value predicate is not a string or boolean equality —
+    /// a `val_num` comparison, a key-existence probe or a regex.
+    ValuePredIsNotEquality,
+    /// Not exactly one generator, or the one generator is not a bare
+    /// `trace_attrs_idx` read (a `PREWHERE`-carrying `ServiceEq`
+    /// generator reads `trace_spans`; a `TimeRange` fallback reads every
+    /// span in the window).
+    GeneratorIsNotASingleAttrIndexRead,
+    /// The generator's `WHERE` fragment and the membership read's
+    /// predicate are not the same bytes.
+    PredicatesDiffer,
+    /// Some leaf of the selector compiles to a regex comparison, so the
+    /// SQL reading of the pattern is the narrower one.
+    SelectorIsWider,
+}
+
+/// Whether the single phase-1 generator's rows are EXACTLY the selector's
+/// matched spans, which is what [`TqlLink::Source::generator_is_exact`]
+/// asserts and what an aggregate pushdown needs.
+///
+/// It is not argued, it is compared. The membership read's predicate
+/// ([`membership_predicate`]) and the generator's
+/// (`filter::attr_generator_predicate`) are two functions with the same
+/// body in two modules; this asks whether they produced the same bytes
+/// for THIS query rather than assuming they always will. If they ever
+/// drift the pushdown stops applying, a golden moves, and
+/// `every_case_matches_its_committed_golden_byte_for_byte` says so.
+///
+/// All six must hold:
+///   1. exactly one planned filter, carrying exactly one leaf;
+///   2. that leaf is `PlannedLeafEval::Attr { probe_idx, negated: false }`;
+///   3. `probes[probe_idx].pred` is `ValuePred::StringEq` or `BoolEq`;
+///   4. exactly one generator, `table == GenTable::Attrs`, `prewhere.is_none()`;
+///   5. `generator.predicate == probe_predicates[probe_idx]`, byte for byte;
+///   6. `compile::selector_fidelity(spanset) == Fidelity::Equivalent`.
+///
+/// (6) is not implied by (5): `attr_generator_predicate` ignores its
+/// `GenClass` argument, so a regex leaf renders the SAME predicate on
+/// both sides and passes (5). The regex must still refuse, because one
+/// pattern gets two readings on this path and the SQL reading is the
+/// NARROWER one (`compile::StrOpKind::fidelity`) — the generator's rows
+/// would be a SUBSET of the matched spans, and an aggregate over a
+/// subset can be wrong in either direction.
+///
+/// **No query the planner can build reaches (6), and that is measured
+/// rather than assumed.** An attribute regex compiles to
+/// `ValuePred::Regex`, which (3) refuses; a physical regex
+/// (`{ name =~ … }`, `{ resource.service.name =~ … }`) is not an
+/// attribute-membership leaf at all, which (2) refuses. So (6) is the
+/// condition that would carry the rule if (3) were widened, and
+/// `compile::tests::the_pushdown_precondition_refuses_every_unsafe_shape`
+/// keeps it live by calling this function with exactly that input: the
+/// same byte-equal predicates, one selector with a regex and one
+/// without.
+pub(crate) fn generator_exactness(
+    filters: &[PlannedFilter],
+    probes: &[AttrProbe],
+    probe_predicates: &[String],
+    generators: &[(SourceRef, LeafGenerator)],
+    spanset: &SpansetExpr,
+) -> Result<(), NotExact> {
+    let [only_filter] = filters else {
+        return Err(NotExact::NotOneLeaf);
+    };
+    let [only_leaf] = only_filter.leaves.as_slice() else {
+        return Err(NotExact::NotOneLeaf);
+    };
+    let PlannedLeafEval::Attr {
+        probe_idx,
+        negated: false,
+    } = only_leaf
+    else {
+        return Err(NotExact::LeafIsNotAPositiveAttrMatch);
+    };
+    let probe = probes
+        .get(*probe_idx)
+        .ok_or(NotExact::LeafIsNotAPositiveAttrMatch)?;
+    if !matches!(probe.pred, ValuePred::StringEq(_) | ValuePred::BoolEq(_)) {
+        return Err(NotExact::ValuePredIsNotEquality);
+    }
+    let [(_, generator)] = generators else {
+        return Err(NotExact::GeneratorIsNotASingleAttrIndexRead);
+    };
+    if generator.table != GenTable::Attrs || generator.prewhere.is_some() {
+        return Err(NotExact::GeneratorIsNotASingleAttrIndexRead);
+    }
+    let membership = probe_predicates
+        .get(*probe_idx)
+        .ok_or(NotExact::PredicatesDiffer)?;
+    if &generator.predicate != membership {
+        return Err(NotExact::PredicatesDiffer);
+    }
+    if super::compile::selector_fidelity(spanset) != Fidelity::Equivalent {
+        return Err(NotExact::SelectorIsWider);
+    }
+    Ok(())
+}
+
 pub fn plan_search(
     query: &Query,
     params: &SearchParams,
@@ -2294,6 +2458,10 @@ pub fn plan_search(
                 ctx.filter.spans_table,
                 ctx.filter.attrs_table,
                 ctx.max_candidates,
+                // The pipeline has not been folded yet, so no aggregate
+                // can have compiled into this statement. When one does,
+                // the single generator is re-rendered below.
+                None,
             );
             if !generator_sqls.contains(&sql) {
                 generator_sqls.push(sql);
@@ -2408,8 +2576,20 @@ pub fn plan_search(
     // this runs before the pool is acquired.
     let structural = spanset_has_structural(&query.spanset);
     let bool_truth_leaves = count_bool_truth_leaves(&filters);
+    // Issue #492 part 4: the value part 3 left as a literal `false`.
+    // Computed here, where both predicate renderings are in scope, and
+    // handed to the chain builder rather than to the fold, because the
+    // seed link is what asserts it.
+    let exactness = generator_exactness(
+        &filters,
+        &probes,
+        &probe_predicates,
+        &generators,
+        &query.spanset,
+    );
     let chain = super::compile::chain_of(
         query,
+        exactness.is_ok(),
         &ChainFacts {
             generators: &generators,
             probes: probes.len(),
@@ -2447,6 +2627,31 @@ pub fn plan_search(
         super::compile::seed_relation(seed_source, generator_pred_of(&generators)),
         &LowerCx::<Tql>::new(&bounds),
     )?;
+    // Issue #492 part 4: the fragment the fold recorded on the final
+    // relation IS the fragment the statement carries. One renderer
+    // (`compile::aggregate_having_sql`) produced it; reading it back here
+    // is what stops the plan's account of the query and the query itself
+    // from disagreeing.
+    //
+    // `generators.len() == 1` is belt and braces: `generator_exactness`
+    // already refuses anything else, so a second generator cannot reach
+    // this. Re-rendering the statement is the smallest change that lets
+    // the pipeline decide — `generator_sqls` is built before the chain is
+    // folded, so there is nothing to decide it at render time.
+    let pushed_having: Option<String> = match lowering.rel.having.as_slice() {
+        [frag] if generators.len() == 1 => Some(frag.clone()),
+        _ => None,
+    };
+    if let Some(frag) = &pushed_having {
+        generator_sqls[0] = search_sql::generator_sql(
+            &generators[0].1,
+            window,
+            ctx.filter.spans_table,
+            ctx.filter.attrs_table,
+            ctx.max_candidates,
+            Some(frag),
+        );
+    }
     let compiled = plan_of::<Tql>(
         &chain,
         lowering,
@@ -2487,6 +2692,8 @@ pub fn plan_search(
         chain,
         stage_names,
         compiled,
+        pushed_having,
+        generator_exact: exactness,
     })
 }
 

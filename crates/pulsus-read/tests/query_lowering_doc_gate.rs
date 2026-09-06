@@ -4,19 +4,27 @@
 //! # What is here, and what is not
 //!
 //! The design record for this work nominates **eleven** document gates.
-//! Ten of them parse artefacts that are **not in this repository**: the
-//! query-lowering design record, the query-to-SQL table, ADR 0008 and the
-//! two diagrams are untracked working notes, so a committed test that
-//! read one would fail on every checkout that does not happen to have
-//! them on disk — including CI. They are recorded as owed rather than
-//! written against a file the build cannot see.
+//! **The records they parse are committed** — `8f3d0c6d` (#517) added
+//! `docs/query-lowering.md`, `docs/query-to-sql.md` and both diagrams to
+//! the tree, and `git ls-files docs/` lists all four. The paragraph that
+//! used to stand here said they were untracked working notes a committed
+//! test could not read; that was true when it was written and is not
+//! true now.
 //!
-//! The eleventh reads [`docs/api.md`](../../../docs/api.md), which IS
-//! committed, and it is the one that matters most for a wire surface: it
-//! is the only gate of the eleven whose two sides are genuinely
-//! independent producers — the keys come from a serializer and the
-//! expectation from a document in another directory, so neither can
-//! produce the other.
+//! **Two of the eleven exist.** One reads
+//! [`docs/api.md`](../../../docs/api.md), and it is the one that matters
+//! most for a wire surface: its two sides are genuinely independent
+//! producers — the keys come from a serializer and the expectation from a
+//! document in another directory, so neither can produce the other. The
+//! second is `every_superseded_lowered_cost_figure_carries_its_marker`,
+//! added by issue #492 part 4. The other **nine remain owed by part 8**
+//! (item 3 of that issue's scope enumeration).
+//!
+//! **Two further tests in this file are not among the eleven** and are
+//! not claimed to be: `the_hops_diagram_marks_its_superseded_figures_on_its_own_face`
+//! and `the_record_flags_the_two_survivors_nobody_re_measured` assert
+//! that a superseded figure carries its marker, which is a different
+//! question from whether two artefacts agree.
 
 use std::collections::BTreeSet;
 
@@ -247,4 +255,278 @@ fn the_documented_plan_example_round_trips_through_the_renderer_shape() {
         "the example shows three of the four cuts; the fourth carries no extra key and is \
          described in the sentence beneath it"
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #492 part 4 — the superseded lowered-cost figure and its markers
+// ---------------------------------------------------------------------
+
+const QUERY_LOWERING: &str = "docs/query-lowering.md";
+const QUERY_TO_SQL: &str = "docs/query-to-sql.md";
+const HOPS_SVG: &str = "docs/diagrams/query-lowering-hops.svg";
+
+/// The sentence both markers open with, so the record and the drawing
+/// cannot drift apart silently.
+const MARKER_SENTENCE: &str = "The same answer lowered is four statements, not one: 4 round trips.";
+/// The tag every surviving copy of the figure carries.
+const MARKER_TAG: &str = "seed + root only";
+/// The superseded figure itself.
+const SUPERSEDED_FIGURE: &str = "43,636";
+/// The wordings the correction replaces. Each was checked against both
+/// records: together they matched the seven changing sites and nothing
+/// else, so a contributor who edits an unrelated "two statements" line
+/// does not have to touch them.
+const SUPERSEDED_WORDING: [&str; 5] = [
+    "lowered is two statements",
+    "**Lowered** — **two statements**",
+    "Two round trips, not one",
+    "two statements in total",
+    "search is two statements, not one",
+];
+
+/// The strings on the DRAWING that say it still carries the
+/// two-statement model. While any of them is present the marker must be
+/// too; when part 8 redraws and none is, the gate passes trivially.
+const TWO_STATEMENT_WORDING: [&str; 8] = [
+    "2 round trips",
+    "2 SQL parts",
+    "43,636 B",
+    "43,636 result bytes",
+    "9,871,360 rows",
+    "1,205 granules",
+    "1,756x fewer bytes",
+    "555x fewer round trips",
+];
+
+const UNVERIFIED_TAG: &str = "Unverified survivors, nobody re-measured them";
+const UNVERIFIED_FIGURES: [&str; 3] = ["11,340", "169,311,055", "190,353,655"];
+
+fn repo_file(rel: &str) -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+}
+
+/// Blocks separated by blank lines. Paragraph-scoped rather than
+/// line-scoped because both records are hard-wrapped: a line rule would
+/// turn a re-wrap into a failure.
+fn paragraphs(md: &str) -> Vec<&str> {
+    md.split("\n\n").collect()
+}
+
+/// Issue #492 part 4. The two design records quote a lowered-cost figure
+/// that covers two of the four statements a lowered search issues. The
+/// figure stays until part 8 re-measures §9.2; what may not stay is an
+/// UNMARKED copy of it.
+///
+/// Three mechanical rules:
+///
+/// 1. `docs/query-lowering.md` carries the marker sentence and the tag;
+/// 2. in BOTH records, every paragraph naming the figure also carries the
+///    tag — which is what makes the marker findable by someone reading
+///    only one of them;
+/// 3. neither record still carries any of the five superseded wordings.
+#[test]
+fn every_superseded_lowered_cost_figure_carries_its_marker() {
+    let lowering = repo_file(QUERY_LOWERING);
+    assert!(
+        lowering.contains(MARKER_SENTENCE),
+        "{QUERY_LOWERING} carries no superseded marker: the sentence {MARKER_SENTENCE:?} appears \
+         nowhere in it"
+    );
+    assert!(
+        lowering.contains(MARKER_TAG),
+        "{QUERY_LOWERING} carries the marker sentence but not the tag {MARKER_TAG:?}, so a reader \
+         cannot tell WHICH figures are superseded"
+    );
+    for rel in [QUERY_LOWERING, QUERY_TO_SQL] {
+        let text = repo_file(rel);
+        let mut seen = 0usize;
+        for para in paragraphs(&text) {
+            if !para.contains(SUPERSEDED_FIGURE) {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                para.contains(MARKER_TAG),
+                "{rel}: a paragraph quotes {SUPERSEDED_FIGURE} without the tag {MARKER_TAG:?}. It \
+                 opens: {:?}",
+                para.lines().next().unwrap_or("")
+            );
+        }
+        assert!(
+            seen > 0,
+            "{rel} quotes {SUPERSEDED_FIGURE} nowhere — this rule is checking nothing"
+        );
+        for wording in SUPERSEDED_WORDING {
+            assert!(
+                !text.contains(wording),
+                "{rel} still carries the superseded wording {wording:?}: the lowered form is four \
+                 statements, not two"
+            );
+        }
+    }
+}
+
+/// Issue #492 part 4. **The drawing says on its own face that its lowered
+/// figures are superseded.**
+///
+/// A marker in a paragraph of the record does not reach the person who
+/// opens the picture, and a picture asserts a design more confidently
+/// than a sentence does. Six assertions, in order:
+///
+/// 1. the conditional — while the drawing carries any two-statement
+///    figure it must carry the marker sentence; when part 8 redraws and
+///    none is left, this returns early;
+/// 2. the tag is present, so a reader can tell which figures are meant;
+/// 3. the marker appears AFTER `</desc>`, i.e. in drawn content — a
+///    marker only in the metadata is grep-visible and invisible to a
+///    person opening the file;
+/// 4. the marker's last baseline is inside the `viewBox` height;
+/// 5. the `.supersede` rule renders at 13px or more, and `<text>` /
+///    `<tspan>` open and close counts balance (no XML parser is in this
+///    workspace's lock file and part 4 does not add one);
+/// 6. the drawn marker carries the unverified-survivor line and names all
+///    three of its figures.
+///
+/// **What this cannot see is whether the marker is VISIBLE.** Painting
+/// `.supersede` and the banner's stroke in the background colour leaves
+/// every string above in place and this test green. That is criterion
+/// 19's job: a headless render and a bounding-box measurement, run on a
+/// host shell at part 4's landing and recorded in the implementation
+/// notes.
+#[test]
+fn the_hops_diagram_marks_its_superseded_figures_on_its_own_face() {
+    let svg = repo_file(HOPS_SVG);
+    let stale: Vec<&str> = TWO_STATEMENT_WORDING
+        .into_iter()
+        .filter(|w| svg.contains(w))
+        .collect();
+    if stale.is_empty() {
+        // Part 8 has redrawn: there is nothing left to mark.
+        return;
+    }
+    assert!(
+        svg.contains(MARKER_SENTENCE),
+        "{HOPS_SVG} still carries two-statement figures {stale:?} but no superseded marker: the \
+         sentence {MARKER_SENTENCE:?} appears nowhere in the file"
+    );
+    assert!(
+        svg.contains(MARKER_TAG),
+        "{HOPS_SVG} carries the marker sentence but not the tag {MARKER_TAG:?}"
+    );
+
+    let drawn = svg
+        .split_once("</desc>")
+        .unwrap_or_else(|| panic!("{HOPS_SVG} must carry a <desc>"))
+        .1;
+    assert!(
+        drawn.contains(MARKER_SENTENCE),
+        "the marker is only in <desc>: it is grep-visible but nobody opening {HOPS_SVG} sees it"
+    );
+
+    let node = drawn
+        .split_once("<text id=\"supersede\"")
+        .unwrap_or_else(|| panic!("{HOPS_SVG} must carry a <text id=\"supersede\"> node"))
+        .1
+        .split_once("</text>")
+        .expect("the marker node is closed")
+        .0;
+    let baseline = attr_number(node, " y=\"").expect("the marker node carries a baseline")
+        + node
+            .match_indices(" dy=\"")
+            .filter_map(|(i, _)| number_after(&node[i + 5..]))
+            .sum::<f64>();
+    let view_height = attr_number(&svg, "viewBox=\"0 0 1120 ").expect("the viewBox names a height");
+    assert!(
+        baseline <= view_height,
+        "the marker's last baseline is at y={baseline} but the viewBox ends at {view_height}: it \
+         is drawn off the canvas and is invisible when the file is opened"
+    );
+
+    let size = svg
+        .split_once(".supersede { font: ")
+        .map(|(_, rest)| rest)
+        .and_then(number_after)
+        .expect("the .supersede rule names a font size");
+    assert!(
+        size >= 13.0,
+        "the marker renders at {size}px; below 13px it is not legible beside 12px body text"
+    );
+    assert_eq!(
+        svg.matches("<tspan").count(),
+        svg.matches("</tspan>").count(),
+        "unbalanced <tspan> elements in {HOPS_SVG}: a hand edit left the file malformed"
+    );
+    assert_eq!(
+        svg.matches("<text").count(),
+        svg.matches("</text>").count(),
+        "unbalanced <text> elements in {HOPS_SVG}: a hand edit left the file malformed"
+    );
+
+    assert!(
+        node.contains(UNVERIFIED_TAG),
+        "the drawn marker does not carry {UNVERIFIED_TAG:?}: part 8 re-measures what the marker \
+         lists, and a survivor nobody checked is not on the list"
+    );
+    let line = node
+        .lines()
+        .find(|l| l.contains(UNVERIFIED_TAG))
+        .expect("the tag sits on one line");
+    let missing: Vec<&str> = UNVERIFIED_FIGURES
+        .into_iter()
+        .filter(|f| !line.contains(f))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the drawn marker's unverified-survivor line does not name {missing:?}"
+    );
+}
+
+/// Issue #492 part 4. **The record flags the two figures nobody
+/// re-measured.**
+///
+/// The client's `11,340 B` and the peak-memory pair are not superseded by
+/// the statement-count correction — and nobody has re-measured them
+/// either, and neither corpus is standing, so the verdict rests on
+/// argument alone. A figure marked *survives* is never looked at again;
+/// this keeps the flag in the record so part 8 either re-measures both or
+/// says it did not.
+#[test]
+fn the_record_flags_the_two_survivors_nobody_re_measured() {
+    let text = repo_file(QUERY_LOWERING);
+    let para = paragraphs(&text)
+        .into_iter()
+        .find(|p| p.to_lowercase().contains("unverified survivor"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{QUERY_LOWERING} carries no paragraph containing \"unverified survivor\": part 8 \
+                 re-measures what the marker lists"
+            )
+        });
+    for figure in UNVERIFIED_FIGURES {
+        assert!(
+            para.contains(figure),
+            "the unverified-survivor paragraph in {QUERY_LOWERING} does not name {figure:?}; it \
+             reads: {:?}",
+            &para[..para.len().min(160)]
+        );
+    }
+}
+
+/// The first decimal number in `text`, or `None`.
+fn number_after(text: &str) -> Option<f64> {
+    let digits: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    digits.parse().ok()
+}
+
+/// The number following the first occurrence of `key`.
+fn attr_number(text: &str, key: &str) -> Option<f64> {
+    text.split_once(key)
+        .and_then(|(_, rest)| number_after(rest))
 }

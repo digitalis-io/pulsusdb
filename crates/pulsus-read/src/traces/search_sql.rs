@@ -153,6 +153,7 @@ fn hex32(id: &[u8; 16]) -> String {
 /// [PREWHERE service = '…']
 /// WHERE <date/time pruning> [AND (<leaf predicate>)]
 /// GROUP BY trace_id
+/// [HAVING <pushed spanset aggregate>]
 /// ORDER BY bound_ts DESC, trace_id ASC
 /// LIMIT {gen_cap + 1}
 /// ```
@@ -161,12 +162,20 @@ fn hex32(id: &[u8; 16]) -> String {
 /// bound on the trace's final public sort key (docs/api.md §4.2 ordering
 /// contract), which licenses the engine's threshold termination. The
 /// `+ 1` row is the per-generator truncation probe.
+///
+/// `having` is issue #492 part 4's: the fragment
+/// [`super::compile::aggregate_having_sql`] rendered, pre-built from
+/// closed enums and one integer, so no user text reaches it — exactly as
+/// no user text reaches `generator.predicate` unescaped. It is `None` for
+/// every statement no aggregate compiled into, which is every statement
+/// the corpus rendered before part 4.
 pub fn generator_sql(
     generator: &LeafGenerator,
     window: TimeWindow,
     spans_table: &str,
     attrs_table: &str,
     gen_cap: u64,
+    having: Option<&str>,
 ) -> String {
     let mut sql = String::from("SELECT trace_id, max(timestamp_ns) AS bound_ts\n");
     match generator.table {
@@ -189,8 +198,12 @@ pub fn generator_sql(
     if !generator.predicate.is_empty() {
         sql.push_str(&format!("\n  AND ({})", generator.predicate));
     }
+    sql.push_str("\nGROUP BY trace_id");
+    if let Some(having) = having {
+        sql.push_str(&format!("\nHAVING {having}"));
+    }
     sql.push_str(&format!(
-        "\nGROUP BY trace_id\nORDER BY bound_ts DESC, trace_id ASC\nLIMIT {}",
+        "\nORDER BY bound_ts DESC, trace_id ASC\nLIMIT {}",
         gen_cap + 1
     ));
     sql
@@ -643,6 +656,7 @@ mod tests {
             "trace_spans",
             "trace_attrs_idx",
             100,
+            None,
         );
         assert!(sql.starts_with("SELECT trace_id, max(timestamp_ns) AS bound_ts\n"));
         assert!(sql.contains("FROM trace_spans\n"));
@@ -664,6 +678,7 @@ mod tests {
             "trace_spans",
             "trace_attrs_idx",
             pulsus_config::TRACEQL_MAX_CANDIDATES_CEILING,
+            None,
         );
         assert!(sql.ends_with("LIMIT 1000001"), "got: {sql}");
     }
@@ -754,6 +769,7 @@ mod tests {
             "trace_spans",
             "trace_attrs_idx",
             100,
+            None,
         );
         assert!(!generator.contains("substringUTF8"), "{generator}");
         let membership = membership_sql("trace_attrs_idx", "key = 'foo'", &[[7u8; 16]], W, false);

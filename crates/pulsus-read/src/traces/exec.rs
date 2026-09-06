@@ -5226,9 +5226,32 @@ mod tests {
 
     /// Issue #57 re-audit AC-A1: the phase-1 generator settings pin —
     /// `search_settings` plus the memory ceiling, throw-not-spill.
+    ///
+    /// **Issue #492 part 4 asserts the VALUE of
+    /// `max_bytes_before_external_group_by`, not just that the key is
+    /// there**, and that is the whole of the change to this test.
+    ///
+    /// The presence check was not a check of the thing it names. Setting
+    /// `exec.rs`'s `0u64` to `8_388_608u64` left all 1,260
+    /// `pulsus-read --lib` tests green, and left the live sweep
+    /// `query_log_gates.rs`'s
+    /// `every_trace_engine_query_carries_the_memory_ceiling` green too,
+    /// because that sweep selects `Settings['max_memory_usage']` and
+    /// nothing else. Under the same edit the statement's BEHAVIOUR flips:
+    /// on a 1,000,000-group corpus at a 320 MiB ceiling, the pushed
+    /// generator answers `Code: 241` with `0` and `200` with 1,001 rows
+    /// with 8 MiB, measured at 2, 4 and 16 threads.
+    ///
+    /// That matters more since part 4: a spanset aggregate now compiles
+    /// into this statement's `HAVING`, which enlarges the per-group
+    /// aggregation state, and the memory ceiling is the ONE mechanism
+    /// that refuses when the grouping outgrows the budget. A non-zero
+    /// value turns that refusal into a slow `200` — the silent widening
+    /// this settings block exists to prevent.
     #[test]
     fn generator_settings_pin_the_memory_ceiling_and_throw_not_spill() {
-        let rendered = format!("{:?}", generator_settings(&cfg()));
+        let settings = generator_settings(&cfg());
+        let rendered = format!("{settings:?}");
         for expected in [
             "max_memory_usage",
             "536870912",
@@ -5242,6 +5265,13 @@ mod tests {
                 "missing {expected} in {rendered}"
             );
         }
+        assert_eq!(
+            settings.get("max_bytes_before_external_group_by"),
+            Some("0"),
+            "the generator read must THROW rather than spill: a non-zero \
+             max_bytes_before_external_group_by turns the memory ceiling from a refusal into a \
+             slow 200"
+        );
     }
 
     #[test]

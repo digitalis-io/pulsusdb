@@ -498,6 +498,79 @@ const CASES: &[Case] = &[
         q: r#"{ resource.service.name = "checkout" || span.http.method = "GET" }"#,
         distributed: false,
     },
+    // --- Issue #492 part 4: the pushdown's accept surface, in statement
+    // --- text. Three more queries whose aggregate compiles into the
+    // --- generator, and five whose aggregate must not — each refused by
+    // --- a different condition, and each rendering the statement its
+    // --- aggregate-free twin renders.
+    Case {
+        // `count()` pushes as `uniqExact(span_id)`, never `count()`: the
+        // index is a ReplacingMergeTree read without FINAL, so a replayed
+        // row would inflate a plain count.
+        name: "issue492_attr_eq_with_count",
+        q: r#"{ span.http.method = "GET" } | count() > 2"#,
+        distributed: false,
+    },
+    Case {
+        // `min` pushes for the same reason `max` does, and `>=` renders
+        // as `>=` — the comparison is the stage's, not a fixed one.
+        name: "issue492_attr_eq_with_min_duration",
+        q: r#"{ span.http.method = "GET" } | min(duration) >= 1s"#,
+        distributed: false,
+    },
+    Case {
+        // Unscoped: neither the generator nor the membership read carries
+        // a `scope` term, so the two predicates are byte-equal and the
+        // exactness comparison decides it — the same way it does for the
+        // scoped form.
+        name: "issue492_unscoped_attr_with_max_duration",
+        q: r#"{ .k = "v" } | max(duration) > 1s"#,
+        distributed: false,
+    },
+    Case {
+        // The left-hand side of the regex control pair.
+        name: "issue492_regex_attr_eq",
+        q: r#"{ span.http.method =~ "GE.*" }"#,
+        distributed: false,
+    },
+    Case {
+        // One character class from `issue492_attr_eq_with_max_duration`,
+        // and it must NOT push: the pattern gets two readings on this
+        // path and the SQL reading is the narrower one, so the
+        // generator's rows are a SUBSET of the matched spans and an
+        // aggregate over a subset can be wrong in either direction.
+        name: "issue492_regex_with_max_duration",
+        q: r#"{ span.http.method =~ "GE.*" } | max(duration) > 1s"#,
+        distributed: false,
+    },
+    Case {
+        // `avg` must not push: a replayed index row moves it. Measured on
+        // 26.3 over one trace with two matched spans of 1.5 s and 0.5 s
+        // and one replayed — the engine averages 1.0e9, the raw index
+        // rows average 8.33e8.
+        name: "issue492_attr_eq_with_avg_duration",
+        q: r#"{ span.http.method = "GET" } | avg(duration) > 1s"#,
+        distributed: false,
+    },
+    Case {
+        // The narrowest refusal in the corpus: the same aggregate over
+        // the same selector as `issue492_attr_eq_with_count`, differing
+        // only in the threshold. `2.5` is not an integer, so the
+        // evaluator's `f64` comparison and an `Int64` comparison in SQL
+        // could disagree, and the statement stays unchanged.
+        name: "issue492_attr_eq_with_fractional_count",
+        q: r#"{ span.http.method = "GET" } | count() > 2.5"#,
+        distributed: false,
+    },
+    Case {
+        // An attribute source: `max(span.retries)` reads a `val_num` for
+        // a different `key` than the generator's rows carry, which is a
+        // join, not a `HAVING`. The golden shows the aggregate-values
+        // read beside the unchanged generator.
+        name: "issue492_attr_eq_with_max_attr",
+        q: r#"{ span.http.method = "GET" } | max(span.retries) > 1"#,
+        distributed: false,
+    },
     Case {
         // Issue #476 Wave B: a cross-type `=` on `resource.service.name`
         // — the query a client builds from an UNQUOTED tag value. The
@@ -952,31 +1025,42 @@ fn the_cross_type_service_golden_carries_no_service_predicate_or_attr_join() {
     );
 }
 
-/// Issue #492 acceptance criterion 9, and the strongest evidence in this
-/// change: **two golden PAIRS are byte-identical below their two header
-/// lines.**
+/// Issue #492 part 4: **one golden pair now DIVERGES and three do not.**
 ///
-/// The files themselves differ, because each carries its own `-- case:`
-/// and `-- q:` lines; the SQL below them does not. The two pairs say two
-/// different things:
+/// The files themselves always differ, because each carries its own
+/// `-- case:` and `-- q:` lines; the assertion is on the rendered
+/// composite past those two lines, so it cannot be satisfied by two
+/// goldens regenerated together from a broken planner that happen to
+/// agree on disk.
 ///
-/// - `{ span.http.method = "GET" }` and the same query with
-///   `| max(duration) > 1s` send **exactly the same statements**. A
-///   spanset aggregate contributes NO SQL — every matching span is
-///   transported and most of it discarded — which is this issue's
-///   premise, in statement text rather than in prose.
-/// - `| by(name) | count() > 2` and `| count() > 2 | by(name)` also send
-///   exactly the same statements, while the reference answers them
-///   differently: one span set with `count()` 3 against three span sets
-///   with `count()` 5, and the span-set attributes in the opposite
-///   order. The written order is invisible to the SQL.
+/// This test replaces part 3's
+/// `the_aggregate_and_the_ordering_pairs_send_byte_identical_sql`, whose
+/// first pair asserted the OPPOSITE — that a spanset aggregate
+/// contributes no SQL. That was true at part 3 and is the premise this
+/// part removes.
 ///
-/// The assertion is on the RENDERED composite with the header stripped,
-/// not on the files, so it cannot be satisfied by two goldens that were
-/// regenerated together from a broken planner and happen to agree on
-/// disk.
+/// ```text
+///   diverges   { span.http.method = "GET" }
+///              { span.http.method = "GET" } | max(duration) > 1s
+///                  -> the second gains `HAVING max(duration_ns) > 1000000000`
+///
+///   identical  { span.http.method =~ "GE.*" }        (a regex leaf is Wider)
+///              { span.http.method =~ "GE.*" } | max(duration) > 1s
+///
+///   identical  { span.http.method = "GET" }          (avg is duplicate-sensitive)
+///              { span.http.method = "GET" } | avg(duration) > 1s
+///
+///   identical  | by(name) | count() > 2              (the written order is
+///              | count() > 2 | by(name)               invisible to the SQL)
+/// ```
+///
+/// **The three controls are what make the first row a property of the
+/// pushdown rather than of the renderer.** The regex pair differs from
+/// the diverging pair by one character class; an implementation that
+/// never reads the exactness verdict renders the `HAVING` there too and
+/// this test says so.
 #[test]
-fn the_aggregate_and_the_ordering_pairs_send_byte_identical_sql() {
+fn the_pushed_aggregate_pair_differs_and_the_three_control_pairs_do_not() {
     fn body(name: &str) -> String {
         let case = CASES
             .iter()
@@ -988,11 +1072,24 @@ fn the_aggregate_and_the_ordering_pairs_send_byte_identical_sql() {
             .unwrap_or_else(|| panic!("{name}: body past the 2 header lines"))
             .to_string()
     }
+    assert_ne!(
+        body("issue492_attr_eq"),
+        body("issue492_attr_eq_with_max_duration"),
+        "issue492_attr_eq vs issue492_attr_eq_with_max_duration: the aggregate must now \
+         compile into the generator, so the two queries must NOT send the same statements"
+    );
     for (a, b, why) in [
         (
+            "issue492_regex_attr_eq",
+            "issue492_regex_with_max_duration",
+            "a regex leaf is Fidelity::Wider, so the aggregate must NOT compile into the \
+             generator",
+        ),
+        (
             "issue492_attr_eq",
-            "issue492_attr_eq_with_max_duration",
-            "a spanset aggregate contributes no SQL",
+            "issue492_attr_eq_with_avg_duration",
+            "avg over a ReplacingMergeTree read without FINAL moves when a row is replayed, so \
+             the aggregate must NOT compile into the generator",
         ),
         (
             "issue492_by_then_count",
@@ -1009,6 +1106,128 @@ fn the_aggregate_and_the_ordering_pairs_send_byte_identical_sql() {
         body("issue492_attr_eq"),
         body("issue492_select_span_attr"),
         "two unrelated queries must not render the same SQL"
+    );
+}
+
+/// Issue #492 part 4 criterion 6: the aggregate link's DISPOSITION moves
+/// on the explain surface, and the part list does not.
+///
+/// `X-Pulsus-Explain: 1` on `{ span.http.method = "GET" } | max(duration)
+/// > 1s` renders the `Pipe(Aggregate)` link as
+/// `{"how":"lowered","fidelity":"equivalent"}` where it rendered
+/// `{"how":"residual","why":"not_yet_lowered"}`. Two controls, one per
+/// route a refusal can take: the regex query's generator is not exact,
+/// so the link never reaches the fragment renderer and reads
+/// `not_exact`; the `avg` query's generator IS exact and the renderer is
+/// what refuses, so it keeps `not_yet_lowered`.
+#[test]
+fn the_pushed_aggregate_link_is_lowered_and_the_refused_one_is_residual() {
+    for (case, how, fidelity, why) in [
+        (
+            "issue492_attr_eq_with_max_duration",
+            "lowered",
+            Some("equivalent"),
+            None,
+        ),
+        (
+            "issue492_regex_with_max_duration",
+            "residual",
+            None,
+            Some("not_exact"),
+        ),
+        (
+            "issue492_attr_eq_with_avg_duration",
+            "residual",
+            None,
+            Some("not_yet_lowered"),
+        ),
+    ] {
+        let plan = plan_for(
+            CASES
+                .iter()
+                .find(|c| c.name == case)
+                .unwrap_or_else(|| panic!("case {case}")),
+        );
+        let shape = plan.plan_shape();
+        let link = shape
+            .links
+            .iter()
+            .find(|l| l.stage == "Pipe(Aggregate)")
+            .unwrap_or_else(|| panic!("{case}: the chain must carry the aggregate link"));
+        assert_eq!(
+            (link.how, link.fidelity, link.why),
+            (how, fidelity, why),
+            "{case}: the aggregate link renders {:?}",
+            (link.how, link.fidelity, link.why)
+        );
+    }
+}
+
+/// Issue #492 part 4 criterion 8: **the statement carries the fragment
+/// the plan recorded**, and the threshold inside it is the one the
+/// planner derived.
+///
+/// This is the anti-drift gate between `aggregate_having_sql`'s reading
+/// of the AST and `plan_pipeline`'s own `AggSource`/`threshold`
+/// derivation. Two producers, compared: if either moves without the
+/// other, the statement and the plan stop agreeing and this reddens.
+///
+/// The closed set is asserted too — over the WHOLE corpus, the cases
+/// whose plan carries a pushed `HAVING` are exactly these four — so a
+/// widened accept surface cannot arrive unnoticed.
+#[test]
+fn the_generator_having_is_the_fragment_the_plan_recorded() {
+    const PUSHES: [&str; 4] = [
+        "issue492_attr_eq_with_count",
+        "issue492_attr_eq_with_max_duration",
+        "issue492_attr_eq_with_min_duration",
+        "issue492_unscoped_attr_with_max_duration",
+    ];
+    let mut pushed: Vec<&str> = Vec::new();
+    // Sorted, so the frozen list is a SET and reordering `CASES` cannot
+    // redden it.
+    for case in CASES {
+        let plan = plan_for(case);
+        let Some(frag) = plan.pushed_having() else {
+            assert!(
+                !plan.generator_sqls.iter().any(|s| s.contains("\nHAVING ")),
+                "{}: the plan records no pushed HAVING but a statement carries one",
+                case.name
+            );
+            continue;
+        };
+        pushed.push(case.name);
+        let statement = &plan.generator_sqls[0];
+        assert!(
+            statement.contains(&format!("\nHAVING {frag}\n")),
+            "{}: the statement carries {statement:?} and the plan recorded {frag:?}",
+            case.name
+        );
+        // The threshold inside the fragment is the one the planner
+        // derived for the same stage, parsed back out of the text.
+        let literal = frag
+            .rsplit(' ')
+            .next()
+            .unwrap_or_else(|| panic!("{}: the fragment ends in a literal", case.name));
+        let rendered: f64 = literal
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: {literal:?} is not a number: {e}", case.name));
+        let recorded = plan
+            .aggregate_thresholds()
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("{}: a pushed plan carries an aggregate", case.name));
+        assert_eq!(
+            rendered.to_bits(),
+            recorded.to_bits(),
+            "{}: the statement carries {rendered} and the plan recorded {recorded}",
+            case.name
+        );
+    }
+    pushed.sort_unstable();
+    assert_eq!(
+        pushed, PUSHES,
+        "the set of cases whose aggregate compiles into the generator moved"
     );
 }
 

@@ -1,5 +1,5 @@
--- case: issue492_attr_eq_with_max_duration
--- q: { span.http.method = "GET" } | max(duration) > 1s
+-- case: issue492_attr_eq_with_max_attr
+-- q: { span.http.method = "GET" } | max(span.retries) > 1
 
 == phase1 generator[0] ==
 SELECT trace_id, max(timestamp_ns) AS bound_ts
@@ -8,7 +8,6 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
   AND (key = 'http.method' AND val = 'GET' AND scope = 'span')
 GROUP BY trace_id
-HAVING max(duration_ns) > 1000000000
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
 
@@ -27,6 +26,17 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND (key = 'http.method' AND val = 'GET' AND scope = 'span')
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
   AND trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
+
+== phase2 aggregate values[0] ==
+SELECT trace_id, span_id, any(val_num) AS v, any(val_type) AS t
+FROM trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
+  AND key = 'retries'
+  AND scope = 'span'
+  AND isNotNull(val_num)
+  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
+GROUP BY trace_id, span_id
 
 == root hydration (sample winners) ==
 SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns

@@ -1,5 +1,5 @@
--- case: issue492_attr_eq_with_max_duration
--- q: { span.http.method = "GET" } | max(duration) > 1s
+-- case: issue492_attr_eq_with_count
+-- q: { span.http.method = "GET" } | count() > 2
 
 == phase1 generator[0] ==
 SELECT trace_id, max(timestamp_ns) AS bound_ts
@@ -8,7 +8,7 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
   AND (key = 'http.method' AND val = 'GET' AND scope = 'span')
 GROUP BY trace_id
-HAVING max(duration_ns) > 1000000000
+HAVING uniqExact(span_id) > 2
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
 
