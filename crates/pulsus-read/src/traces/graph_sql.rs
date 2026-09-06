@@ -25,7 +25,7 @@
 //! complete and the initiator merges only per-`(client, server, conn_type)`
 //! partial states.
 
-use super::search_sql::date_literal;
+use super::window_sql::WindowSql;
 
 /// Response cap on distinct `(client, server, conn_type)` edges the
 /// service-graph read returns (docs/api.md §4.5; promoted to config only on
@@ -34,8 +34,6 @@ use super::search_sql::date_literal;
 /// the engine returns at most `SERVICE_GRAPH_MAX_EDGES` edges plus a
 /// non-silent `truncated` flag.
 pub const SERVICE_GRAPH_MAX_EDGES: u64 = 1_000;
-
-const NS_PER_DAY: i64 = 86_400_000_000_000;
 
 /// The snapped, left-closed/right-open service-graph window `[start_ns,
 /// end_ns)` — an edge is reported iff BOTH its halves' own timestamps fall
@@ -46,29 +44,32 @@ pub struct GraphWindow {
     pub end_ns: i64,
 }
 
-/// The `trace_edges` daily-partition pruning clause for a right-open
-/// window: the end day comes from the last **included** nanosecond
-/// (`end_ns - 1`), so a window ending exactly at midnight never drags in an
-/// extra day's partition (the `metrics_sql` convention).
-fn date_clause(w: GraphWindow) -> String {
-    let start_days = w.start_ns.div_euclid(NS_PER_DAY);
-    let end_days = (w.end_ns - 1).div_euclid(NS_PER_DAY);
-    format!(
-        "date >= {} AND date <= {}",
-        date_literal(start_days),
-        date_literal(end_days)
-    )
+/// The service-graph window's bound convention, declared ONCE for this
+/// whole module: `ts >= start AND ts < end` (docs/api.md §4.5), so
+/// `end_ns` is OUT of the window and the last nanosecond it contains is
+/// `end_ns - 1`.
+///
+/// Both the day-partition prune and the row bound in [`half_where`]
+/// render from the value this returns, so they cannot disagree about
+/// which nanosecond is last. Changing the constructor here to
+/// [`WindowSql::start_open_end_closed`] — [`super::search_sql`]'s
+/// convention — changes the row bound too and moves
+/// `golden/traces_graph/*.sql`; see [`super::window_sql`] for why the
+/// day bound alone would have changed nothing observable.
+fn bounds(w: GraphWindow) -> WindowSql {
+    WindowSql::start_closed_end_open(w.start_ns, w.end_ns)
 }
 
 /// The shared per-half `WHERE` body: the leading-`side` PK prune, the
 /// daily-partition prune, and the left-closed/right-open time bound (each
 /// half's own plain `timestamp_ns` — window membership is merge-invariant).
+/// Both bounds come from one [`bounds`] value.
 fn half_where(side: u8, w: GraphWindow) -> String {
+    let b = bounds(w);
     format!(
-        "WHERE side = {side} AND {}\n      AND timestamp_ns >= {} AND timestamp_ns < {}",
-        date_clause(w),
-        w.start_ns,
-        w.end_ns
+        "WHERE side = {side} AND {}\n      AND {}",
+        b.date_clause(),
+        b.time_clause()
     )
 }
 
@@ -133,7 +134,7 @@ mod tests {
             end_ns: 1_700_006_400_000_000_000,   // 2023-11-15 00:00:00 (excluded)
         };
         assert_eq!(
-            date_clause(w),
+            bounds(w).date_clause(),
             "date >= toDate('2023-11-14') AND date <= toDate('2023-11-14')"
         );
     }

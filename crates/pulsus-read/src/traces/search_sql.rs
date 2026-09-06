@@ -18,6 +18,7 @@ use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{GenTable, LeafGenerator, ZERO_PARENT_SQL};
+use super::window_sql::WindowSql;
 
 /// Hard **byte** ceiling on every string value the search response
 /// returns (`name`/`service`/`select()`-projected attribute values) —
@@ -90,28 +91,33 @@ pub(crate) fn date_literal(days: i64) -> String {
     format!("toDate('{y:04}-{m:02}-{d:02}')")
 }
 
-const NS_PER_DAY: i64 = 86_400_000_000_000;
-
-/// The `trace_attrs_idx` partition-pruning clause for a window:
-/// `date >= toDate('…') AND date <= toDate('…')` (daily partitions,
-/// docs/schemas.md §4.1).
-fn date_clause(w: TimeWindow) -> String {
-    let start_days = w.start_ns.div_euclid(NS_PER_DAY);
-    let end_days = w.end_ns.div_euclid(NS_PER_DAY);
-    format!(
-        "date >= {} AND date <= {}",
-        date_literal(start_days),
-        date_literal(end_days)
-    )
+/// The search window's bound convention, declared ONCE for this whole
+/// module: `ts > start AND ts <= end` (docs/schemas.md §4.2), so
+/// `end_ns` is IN the window.
+///
+/// Both [`date_clause`] and [`time_clause`] render from the value this
+/// returns, which is what keeps the day-partition prune agreeing with
+/// the row bound. Changing the constructor here to
+/// [`WindowSql::start_closed_end_open`] — the convention
+/// [`super::graph_sql`] and [`super::metrics_sql`] use, and the obvious
+/// "fix" for three files that look inconsistent — changes the row bound
+/// too and moves every `golden/traces_search/*.sql`. That is deliberate:
+/// see [`super::window_sql`] for why the day bound alone would have
+/// changed nothing observable.
+fn bounds(w: TimeWindow) -> WindowSql {
+    WindowSql::start_open_end_closed(w.start_ns, w.end_ns)
 }
 
-/// The shared half-open time bound (`ts > start AND ts <= end`,
+/// The `trace_attrs_idx` daily-partition pruning clause for a window
+/// (docs/schemas.md §4.1).
+fn date_clause(w: TimeWindow) -> String {
+    bounds(w).date_clause()
+}
+
+/// The row-level time bound (`ts > start AND ts <= end`,
 /// docs/schemas.md §4.2).
 fn time_clause(w: TimeWindow) -> String {
-    format!(
-        "timestamp_ns > {} AND timestamp_ns <= {}",
-        w.start_ns, w.end_ns
-    )
+    bounds(w).time_clause()
 }
 
 /// Renders a candidate `trace_id` list as `IN (unhex('…'), …)` — hex is
@@ -577,6 +583,34 @@ mod tests {
         assert_eq!(
             date_clause(W),
             "date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')"
+        );
+    }
+
+    /// The search window's end is INCLUDED (`ts <= end`), so a window
+    /// ending exactly at midnight still contains one nanosecond of the
+    /// next UTC day and must keep that day's partition — the opposite of
+    /// the rule `graph_sql`/`metrics_sql` correctly apply to their
+    /// right-OPEN windows (issue #525).
+    ///
+    /// `date_clause_spans_the_windows_utc_days` above cannot see this:
+    /// its window ends mid-day, where both conventions agree. A window
+    /// ending on a day boundary is the only input that discriminates,
+    /// and giving this module the right-open rule is silent without
+    /// one — the answers stay correct and one extra partition is read.
+    #[test]
+    fn date_clause_keeps_the_end_day_because_the_search_end_is_included() {
+        let w = TimeWindow {
+            start_ns: 1_699_920_000_000_000_000, // 2023-11-14 00:00:00
+            end_ns: 1_700_006_400_000_000_000,   // 2023-11-15 00:00:00 (INCLUDED)
+        };
+        assert_eq!(
+            date_clause(w),
+            "date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')"
+        );
+        // And the row bound this day bound has to agree with.
+        assert_eq!(
+            time_clause(w),
+            "timestamp_ns > 1699920000000000000 AND timestamp_ns <= 1700006400000000000"
         );
     }
 

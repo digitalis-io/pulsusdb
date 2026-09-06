@@ -43,7 +43,8 @@ use crate::logql::escape;
 use super::filter::{
     self, AttrProbe, CompiledLeaf, LeafEval, NestedSetField, PlanError, ValuePred,
 };
-use super::search_sql::{byte_cap_expr, date_literal, root_ordering_tuple};
+use super::search_sql::{byte_cap_expr, root_ordering_tuple};
+use super::window_sql::WindowSql;
 
 /// The snapped, left-closed/right-open metrics evaluation window
 /// `[start_ns, end_ns)` — produced by `metrics_plan`'s epoch snapping,
@@ -55,28 +56,38 @@ pub struct SnappedWindow {
     pub end_ns: i64,
 }
 
-const NS_PER_DAY: i64 = 86_400_000_000_000;
-
-/// The `trace_attrs_idx` daily-partition pruning clause for a right-open
-/// window: the end day comes from the last **included** nanosecond
-/// (`end_ns - 1`), so a window ending exactly at midnight never drags in
-/// an extra day's partition.
-fn date_clause(w: SnappedWindow) -> String {
-    let start_days = w.start_ns.div_euclid(NS_PER_DAY);
-    let end_days = (w.end_ns - 1).div_euclid(NS_PER_DAY);
-    format!(
-        "date >= {} AND date <= {}",
-        date_literal(start_days),
-        date_literal(end_days)
-    )
+/// The metrics EVALUATION window's bound convention, declared ONCE for
+/// this whole module: `ts >= start AND ts < end`, so `end_ns` is OUT of
+/// the window and the last nanosecond it contains is `end_ns - 1`.
+///
+/// Both [`date_clause`] and [`time_clause`] render from the value this
+/// returns, which keeps the day-partition prune agreeing with the row
+/// bound. Changing the constructor here to
+/// [`WindowSql::start_open_end_closed`] — [`super::search_sql`]'s
+/// convention, and the one `compare()`'s SELECTION window uses a few
+/// hundred lines below — changes the row bound too and moves every
+/// `golden/traces_metrics/*.sql`; see [`super::window_sql`] for why the
+/// day bound alone would have changed nothing observable.
+///
+/// **This module renders BOTH conventions, and that is not an
+/// inconsistency.** The evaluation window here is right-open; the
+/// `compare()` selection window in [`CompareSqlInput::sel_window`] is
+/// right-closed because the reference defines it that way. Each is built
+/// through the constructor named after its own operators, so neither can
+/// be mistaken for the other.
+fn bounds(w: SnappedWindow) -> WindowSql {
+    WindowSql::start_closed_end_open(w.start_ns, w.end_ns)
 }
 
-/// The left-closed/right-open metrics time bound.
+/// The `trace_attrs_idx` daily-partition pruning clause for the
+/// evaluation window.
+fn date_clause(w: SnappedWindow) -> String {
+    bounds(w).date_clause()
+}
+
+/// The left-closed/right-open metrics row-level time bound.
 fn time_clause(w: SnappedWindow) -> String {
-    format!(
-        "timestamp_ns >= {} AND timestamp_ns < {}",
-        w.start_ns, w.end_ns
-    )
+    bounds(w).time_clause()
 }
 
 /// One compiled spanset filter, rendered for the single-query metrics
@@ -1186,7 +1197,11 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     // [`CompareSqlInput::sel_window`].
     let is_sel = match sel_window {
         Some((start_ns, end_ns)) => {
-            format!("(({inner_bool}) AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns})")
+            // Right-CLOSED, unlike this module's evaluation window: built
+            // through the constructor named for its own operators so the
+            // two conventions in this file cannot be confused (#525).
+            let sel = WindowSql::start_open_end_closed(start_ns, end_ns);
+            format!("(({inner_bool}) AND {})", sel.time_clause())
         }
         None => format!("({inner_bool})"),
     };
@@ -1370,7 +1385,11 @@ pub fn metrics_compare_exemplar_range_sql(input: &CompareExemplarSqlInput<'_>) -
     // Byte-identical construction to `metrics_compare_sql`'s `is_sel`.
     let is_sel = match sel_window {
         Some((start_ns, end_ns)) => {
-            format!("(({inner_bool}) AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns})")
+            // Right-CLOSED, unlike this module's evaluation window: built
+            // through the constructor named for its own operators so the
+            // two conventions in this file cannot be confused (#525).
+            let sel = WindowSql::start_open_end_closed(start_ns, end_ns);
+            format!("(({inner_bool}) AND {})", sel.time_clause())
         }
         None => format!("({inner_bool})"),
     };

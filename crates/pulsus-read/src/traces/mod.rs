@@ -17,7 +17,10 @@
 //! (the pure §4.3
 //! tag-discovery builders — the two catalog-only ones of issue #58 and
 //! the two store-backed ones of issue #478), [`tag_narrow`] (the issue
-//! #478 `q`-to-terms lowering), [`sql`]/[`rows`]
+//! #478 `q`-to-terms lowering), [`window_sql`] (the issue #525 shared
+//! time-window bound conventions — the one place a window's row bound
+//! and its day-partition bound are rendered from, so the two cannot
+//! disagree), [`sql`]/[`rows`]
 //! (point-read builder + `ChClient` result-row shapes), `dispatch` (the
 //! private issue #509 choke point that owns the `ChClient` and is the
 //! only place a `?` in query text is doubled), and [`exec`]
@@ -52,6 +55,7 @@ pub mod search_sql;
 pub mod sql;
 pub mod tag_narrow;
 pub mod tags_sql;
+pub mod window_sql;
 
 pub use exec::{
     BATCH_TRACES, CANDIDATE_TUPLE_BYTES, HYDRATION_BYTE_BUDGET, MAX_SPANS_PER_TRACE,
