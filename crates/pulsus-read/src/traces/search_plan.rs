@@ -1439,13 +1439,16 @@ pub(crate) fn aggregate_threshold(
 /// The two paths compare different things:
 ///
 /// ```text
-///   pushed     d  <op>  t      exact Int64 in ClickHouse
+///   pushed     d  <op>  t      exact integers in ClickHouse
 ///   unpushed  f64(d) <op> f64(t)   in the evaluator
 /// ```
 ///
-/// `d` is `duration_ns` (Int64) or a span count, and both are exact
-/// integers on both sides while they stay inside ±2^53. So the whole of
-/// the agreement question is: does either `d` or `t` round?
+/// `d` is `min(duration_ns)`/`max(duration_ns)`, which ClickHouse reports
+/// as `Int64`, or `uniqExact(span_id)`, which it reports as `UInt64`
+/// (`toTypeName` on 26.3); `t` is rendered from this function's `i64`.
+/// All three are exact integers on both sides while they stay inside
+/// ±2^53. So the whole of the agreement question is: does either `d` or
+/// `t` round?
 ///
 /// - **`t` rounds** when the LEXEME denotes an integer no `f64` holds.
 ///   `9007199254740993` becomes `…992`, and `f64::fract` and any range

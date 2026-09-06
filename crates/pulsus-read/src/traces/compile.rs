@@ -404,9 +404,10 @@ pub fn aggregate_having_sql(stage: &PipelineStage) -> Option<String> {
         ComparisonOp::Re | ComparisonOp::Nre => return None,
     };
     // The threshold is read from the stage's LEXEME, not from the
-    // evaluator's `f64`, and the read refuses whenever an `Int64`
-    // comparison here and the evaluator's `f64` one could put a span on
-    // different sides of it.
+    // evaluator's `f64`, and the read refuses whenever the integer
+    // comparison here — `Int64` for the two duration aggregates,
+    // `UInt64` for `uniqExact(span_id)` — and the evaluator's `f64` one
+    // could put a span on different sides of it.
     let threshold = super::search_plan::exact_aggregate_threshold(*op, field, value)?;
     Some(format!("{agg} {cmp_sql} {threshold}"))
 }

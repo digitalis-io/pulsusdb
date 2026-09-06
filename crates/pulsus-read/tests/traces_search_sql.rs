@@ -556,8 +556,9 @@ const CASES: &[Case] = &[
         // The narrowest refusal in the corpus: the same aggregate over
         // the same selector as `issue492_attr_eq_with_count`, differing
         // only in the threshold. `2.5` is not an integer, so the
-        // evaluator's `f64` comparison and an `Int64` comparison in SQL
-        // could disagree, and the statement stays unchanged.
+        // evaluator's `f64` comparison and the SQL one — over
+        // `uniqExact(span_id)`, a `UInt64` — could disagree, and the
+        // statement stays unchanged.
         name: "issue492_attr_eq_with_fractional_count",
         q: r#"{ span.http.method = "GET" } | count() > 2.5"#,
         distributed: false,

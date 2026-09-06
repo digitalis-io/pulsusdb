@@ -1123,9 +1123,12 @@ async fn the_same_corpus_without_the_pushed_aggregate_answers_two_hundred() {
 /// `http.method = 'GET'`.
 ///
 /// The durations straddle 2^53 ns, which is the only region where the
-/// pushed path's exact `Int64` reading of a span and the evaluator's
-/// `f64` one can put that span on different sides of a threshold. Below
-/// it both readings are the same integer.
+/// pushed path's exact reading of a span and the evaluator's `f64` one
+/// can put that span on different sides of a threshold. Below it both
+/// readings are the same integer. The exact reading here is
+/// `max(duration_ns)`, an `Int64`; this corpus runs `max(duration)` and
+/// no other aggregate, and the third pushed family, `uniqExact(span_id)`,
+/// is a `UInt64`.
 ///
 /// ```text
 ///           2^53-1     2^53     2^53+1     2^53+3
