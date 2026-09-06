@@ -2231,6 +2231,10 @@ mod tests {
         ];
         let ops = ["=", "!=", ">", ">=", "<", "<="];
 
+        // Collected rather than asserted one at a time: on a build with
+        // the defect several rows are wrong at once, and the whole set is
+        // what says where the boundary moved to.
+        let mut wrong: Vec<String> = Vec::new();
         for (literal, wants_push) in rows {
             for op in ops {
                 let q = format!(r#"{{ span.http.method = "GET" }} | max(duration) {op} {literal}"#);
@@ -2241,12 +2245,12 @@ mod tests {
                     .find(|s| matches!(s, PipelineStage::Aggregate { .. }))
                     .unwrap_or_else(|| panic!("{q}: parsed without an aggregate stage"));
                 let frag = aggregate_having_sql(stage);
-                assert_eq!(
-                    frag.is_some(),
-                    wants_push,
-                    "{q}: expected {}, got {frag:?}",
-                    if wants_push { "a fragment" } else { "no fragment" }
-                );
+                if frag.is_some() != wants_push {
+                    wrong.push(format!(
+                        "{q}: expected {}, got {frag:?}",
+                        if wants_push { "a fragment" } else { "no fragment" }
+                    ));
+                }
                 let Some(frag) = frag else { continue };
                 // The fragment's integer IS the evaluator's `f64`.
                 let PipelineStage::Aggregate { op: agg, field, value, .. } = stage else {
@@ -2260,14 +2264,21 @@ mod tests {
                     .unwrap_or_else(|| panic!("{q}: {frag:?} ends in a literal"))
                     .parse()
                     .unwrap_or_else(|e| panic!("{q}: {frag:?} does not end in an integer: {e}"));
-                assert_eq!(
-                    (rendered as f64).to_bits(),
-                    evaluator.to_bits(),
-                    "{q}: the statement compares against {rendered} and the evaluator against \
-                     {evaluator}"
-                );
+                if (rendered as f64).to_bits() != evaluator.to_bits() {
+                    wrong.push(format!(
+                        "{q}: the statement compares against {rendered} and the evaluator \
+                         against {evaluator}"
+                    ));
+                }
             }
         }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} cases disagree with the boundary:\n{}",
+            wrong.len(),
+            rows.len() * ops.len(),
+            wrong.join("\n")
+        );
     }
 
     /// A negative threshold cannot reach the renderer from a parsed

@@ -583,6 +583,22 @@ changes. `trace_attrs_idx` carries `timestamp_ns` and `duration_ns` on every att
 `count`-sourced aggregate the attribute index answers the FILTER inside the first statement: no
 join, no subquery, no second table.
 
+**The threshold has to survive the trip, or the aggregate does not go.** The `HAVING` compares
+exact `Int64`s in ClickHouse; the engine, when it evaluates the same stage itself, compares `f64`s,
+because its aggregate scalar is one. The two readings are the same number while both stay inside
+±2^53, so the pushdown takes a threshold only when the LITERAL AS WRITTEN is an integer strictly
+inside that range — `| max(duration) > 1s` and `| count() > 2` push, `| count() > 2.5`,
+`| max(duration) = 9007199254740993` and `| max(duration) >= 2600h` do not, and neither does
+`| max(duration) = 9007199254740992` itself, because a span of 9007199254740993 ns reads as *equal*
+to it in `f64` and as *greater* in SQL. Reading the parsed `f64` instead of the literal cannot
+decide this: `9007199254740993` has already become `…992` by then, and `…992` passes every test one
+could apply. A refused threshold changes no answer — the engine evaluates the stage as it did
+before — and the rule is measured end to end by
+`crates/pulsus-read/tests/traces_search_pushdown_live.rs::the_two_paths_agree_at_the_precision_boundary_under_every_operator`,
+which runs all six comparison operators against five thresholds either side of 2^53 and requires
+the pushed and unpushed answers to match each other and a third expectation computed from the
+seeded span durations.
+
 The four are the compiled generator below, the window-bounded per-batch hydration read, the
 membership read for the selector's one attribute condition, and the winners' root read. The two
 in the middle were omitted from the earlier "two statements" count and they cannot be dropped:

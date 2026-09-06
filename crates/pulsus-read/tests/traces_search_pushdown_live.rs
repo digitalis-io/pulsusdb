@@ -1245,6 +1245,10 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
     // How many (operator, threshold) cases each answer shape occurred in,
     // so the agreement cannot be an agreement about nothing.
     let (mut empty, mut full, mut between) = (0usize, 0usize, 0usize);
+    // Every case that failed, not the first: on a build that pushes a
+    // rounded threshold several operators are wrong at once and in
+    // OPPOSITE directions, and the whole set is the finding.
+    let mut wrong: Vec<String> = Vec::new();
     for threshold in B_THRESHOLDS {
         // Every threshold at or past 2^53 refuses to push; the one below
         // it still does. Asserted per threshold rather than described,
@@ -1255,16 +1259,16 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
             let plain_q = format!(r#"{{ span.http.method =~ "GET" }} | max(duration) {op} {threshold}"#);
             let pushed_plan = plan_for(&engine, &pushed_q, &p);
             let plain_plan = plan_for(&engine, &plain_q, &p);
-            assert_eq!(
-                pushed_plan.pushed_having().is_some(),
-                pushes,
-                "{pushed_q}: the aggregate {} have compiled into the generator, and it {}",
-                if pushes { "must" } else { "must not" },
-                match pushed_plan.pushed_having() {
-                    Some(f) => format!("rendered {f:?}"),
-                    None => "did not".to_string(),
-                }
-            );
+            if pushed_plan.pushed_having().is_some() != pushes {
+                wrong.push(format!(
+                    "{pushed_q}: the aggregate {} have compiled into the generator, and it {}",
+                    if pushes { "must" } else { "must not" },
+                    match pushed_plan.pushed_having() {
+                        Some(f) => format!("rendered {f:?}"),
+                        None => "did not".to_string(),
+                    }
+                ));
+            }
             assert_eq!(
                 plain_plan.pushed_having(),
                 None,
@@ -1284,15 +1288,20 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
                 plain_out.traces.iter().map(|t| hex32(&t.trace_id)).collect();
             let want: Vec<String> = b_expected(op, threshold).iter().map(hex32).collect();
 
-            assert_eq!(
-                got, control,
-                "{pushed_q}: pushed returned {got:?} and the same query unpushed returned \
-                 {control:?}"
-            );
-            assert_eq!(
-                got, want,
-                "{pushed_q}: expected {want:?} from the seeded durations, got {got:?}"
-            );
+            if got != control {
+                wrong.push(format!(
+                    "{pushed_q}: pushed returned {} trace(s) {got:?} and the same query unpushed \
+                     returned {} {control:?}",
+                    got.len(),
+                    control.len()
+                ));
+            }
+            if control != want {
+                wrong.push(format!(
+                    "{plain_q}: the unpushed path returned {control:?} where the seeded durations \
+                     give {want:?}"
+                ));
+            }
 
             match want.len() {
                 0 => empty += 1,
@@ -1301,6 +1310,13 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
             }
         }
     }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases failed:\n{}",
+        wrong.len(),
+        B_THRESHOLDS.len() * B_OPS.len(),
+        wrong.join("\n")
+    );
     assert!(
         empty > 0 && full > 0 && between > 0,
         "the matrix must contain an empty, a full and a partial answer — it held {empty}, {full} \
