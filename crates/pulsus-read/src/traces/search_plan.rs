@@ -1374,12 +1374,31 @@ fn plan_arith(
     }
 }
 
-/// The numeric threshold one aggregate stage compares against.
+/// The numeric threshold one aggregate stage compares against **in the
+/// evaluator** — an `f64`, because the evaluator's own aggregate scalar
+/// is one (`search_eval::aggregate_value`).
 ///
-/// `pub(crate)` since issue #492 part 4: the `HAVING` renderer
-/// ([`super::compile::aggregate_having_sql`]) reads the threshold from
-/// this one derivation rather than re-reading the AST, so the statement
-/// and the plan cannot disagree about what the stage said.
+/// **This is not the number the statement compares against, and an
+/// earlier version of this comment claimed it was.** It said the `HAVING`
+/// renderer read the threshold from here "so the statement and the plan
+/// cannot disagree about what the stage said". They did not disagree —
+/// they agreed, and both were wrong, because both read the same already
+/// rounded number. `| max(duration) = 9007199254740993` parses to
+/// `9007199254740992.0` here, and every test the renderer could then
+/// apply — finite, integral, in range — sits downstream of the rounding
+/// and so cannot see it. Measured on ClickHouse 26.3 over one trace with
+/// one 9007199254740993 ns span: the rendered statement returned 0 traces
+/// and the evaluator admitted 1.
+///
+/// The statement's integer therefore comes from
+/// [`exact_aggregate_threshold`], which reads the LEXEME. The two are
+/// bound the other way round: that function refuses to push unless the
+/// exact integer is one this `f64` reproduces exactly, so a pushed
+/// statement and this value are the same number by construction rather
+/// than by a shared derivation. `traces_search_sql.rs`'s
+/// `the_generator_having_is_the_fragment_the_plan_recorded` parses the
+/// integer back out of the rendered fragment and compares its `to_bits()`
+/// against this value over the golden corpus.
 pub(crate) fn aggregate_threshold(
     op: AggregateOp,
     field: &Option<FieldExpr>,
@@ -1407,6 +1426,120 @@ pub(crate) fn aggregate_threshold(
                 .to_string(),
         )),
     }
+}
+
+/// The EXACT integer a **pushed** aggregate compares against, or `None`
+/// when this stage may not be pushed at all (issue #492 part 4, round 1).
+///
+/// **Exact or refuse.** For every literal the parser accepts, the pushed
+/// comparison returns the same traces as the unpushed one, or the
+/// aggregate does not push. Refusing costs a transported span set;
+/// a wrong answer costs the answer.
+///
+/// The two paths compare different things:
+///
+/// ```text
+///   pushed     d  <op>  t      exact Int64 in ClickHouse
+///   unpushed  f64(d) <op> f64(t)   in the evaluator
+/// ```
+///
+/// `d` is `duration_ns` (Int64) or a span count, and both are exact
+/// integers on both sides while they stay inside ±2^53. So the whole of
+/// the agreement question is: does either `d` or `t` round?
+///
+/// - **`t` rounds** when the LEXEME denotes an integer no `f64` holds.
+///   `9007199254740993` becomes `…992`, and `f64::fract` and any range
+///   test then see a clean integer. That is why this function reads
+///   `Value` and never [`aggregate_threshold`]'s return value: a check
+///   downstream of the rounding cannot see the rounding.
+/// - **`d` rounds** when a span is longer than 2^53 ns (about 104 days).
+///   That is a property of the data, not of the query, and no plan-time
+///   check can see it — so the bound below is **strict** rather than
+///   inclusive, which makes it unreachable. For any exact integer `t`
+///   with `|t| < 2^53`: a `d` inside ±2^53 is exact on both sides, and a
+///   `d` above 2^53 has `f64(d) >= 2^53 > t`, so both readings put it on
+///   the same side of `t` for all six operators. At `t = 2^53` exactly
+///   that argument fails and a witness exists — `d = 2^53 + 1` is `!= t`
+///   exactly and `== t` in `f64` — which is why 2^53 itself does not
+///   push.
+///
+/// The aggregate families this can be asked about are `min(duration)`,
+/// `max(duration)` and `count()` — [`super::compile::aggregate_having_sql`]
+/// has already refused everything else. All three read exact integers in
+/// SQL, so exactness is available and this function takes it. An
+/// **attribute** aggregate is a different case and is refused for a
+/// second, independent reason: its value comes from the `Float64`
+/// `val_num` column, which has already rounded past 2^53 before any
+/// aggregate runs (ledger `traceql-attribute-aggregate-float64-precision`,
+/// issue #510), so no threshold rule could make the two readings agree.
+///
+/// `None`, never an error: a refusal to push is not a refusal to answer.
+pub(crate) fn exact_aggregate_threshold(
+    op: AggregateOp,
+    field: &Option<FieldExpr>,
+    value: &Value,
+) -> Option<i64> {
+    // The acceptance gate stays in ONE place. A stage the evaluator
+    // refuses must never render SQL, so ask the evaluator's own
+    // derivation whether the stage is well-typed and discard the value it
+    // returns — that value is the rounded one this function exists to
+    // avoid.
+    aggregate_threshold(op, field, value).ok()?;
+    let exact: i128 = match value {
+        Value::Number(raw) => exact_decimal_integer(raw)?,
+        // A `Duration` is already an exact integer count of nanoseconds
+        // (`std::time::Duration::as_nanos`), so nothing has rounded yet.
+        Value::Duration(d) => i128::try_from(d.as_nanos()).ok()?,
+        _ => return None,
+    };
+    const LIMIT: i128 = 1 << 53;
+    if !(-LIMIT < exact && exact < LIMIT) {
+        return None;
+    }
+    Some(exact as i64)
+}
+
+/// The exact integer a TraceQL number lexeme denotes, or `None` when it
+/// denotes something else.
+///
+/// The lexer produces an unsigned decimal run with at most one `.` and no
+/// exponent (`lexer::scan_number_or_duration`), and `parser::static_value`
+/// can additionally produce a `-`-prefixed one, so those are the forms
+/// handled. Anything else — a fractional part with a non-zero digit, more
+/// digits than an `i128` holds — is a refusal, which is always safe.
+///
+/// `2.0` denotes 2 and pushes; `2.5` and `2.0000000000000000001` do not.
+/// The last of those three parses to exactly `2.0` as an `f64`, so the
+/// old rule pushed it; refusing is a deliberate narrowing, and it changes
+/// no answer because the evaluator then does the same comparison.
+fn exact_decimal_integer(raw: &str) -> Option<i128> {
+    let (negative, body) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    let (int_digits, frac_digits) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+    if !int_digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // A fractional part leaves the literal an integer only when every one
+    // of its digits is `0`.
+    if !frac_digits.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    // `.0` lexes with an empty integer part, and `str::parse` refuses an
+    // empty string. Overflow past `i128` is a refusal like any other.
+    let magnitude: i128 = if int_digits.is_empty() {
+        0
+    } else {
+        int_digits.parse().ok()?
+    };
+    Some(if negative { -magnitude } else { magnitude })
 }
 
 /// The result of planning a search pipeline: engine-side aggregates,

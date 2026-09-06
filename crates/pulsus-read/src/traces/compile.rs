@@ -347,11 +347,12 @@ pub fn selector_fidelity(expr: &SpansetExpr) -> Fidelity {
 ///
 /// `None` for `sum` and `avg` (the measurement above), for an attribute
 /// source (`max(.retries)` reads a `val_num` for a different `key` than
-/// the generator's, which is a join), and for any threshold that is not
-/// a finite integer in `[-2^53, 2^53]` — outside that range the
-/// evaluator's own `f64` comparison and an `Int64` comparison in SQL can
-/// disagree, and `| count() > 2.5` is an accepted query today
-/// ([`super::search_plan::aggregate_threshold`]).
+/// the generator's, which is a join), and for any threshold whose LEXEME
+/// is not an exact integer strictly inside ±2^53
+/// ([`super::search_plan::exact_aggregate_threshold`], which carries the
+/// argument for the bound). `| count() > 2.5` and
+/// `| max(duration) = 9007199254740993` are both accepted queries today
+/// and neither pushes.
 ///
 /// **A pushed aggregate reads `duration_ns` from `trace_attrs_idx`; the
 /// evaluator reads it from `trace_spans`.** They are two copies of one
@@ -402,26 +403,12 @@ pub fn aggregate_having_sql(stage: &PipelineStage) -> Option<String> {
         // renderer never depends on that having happened.
         ComparisonOp::Re | ComparisonOp::Nre => return None,
     };
-    // The threshold comes from the ONE derivation the evaluator uses, so
-    // the statement and the plan cannot read the same stage differently.
-    let threshold = super::search_plan::aggregate_threshold(*op, field, value).ok()?;
-    let rounded = integral_threshold(threshold)?;
-    Some(format!("{agg} {cmp_sql} {rounded}"))
-}
-
-/// A threshold that an `Int64` comparison in SQL and the evaluator's own
-/// `f64` comparison cannot read differently: a finite integer inside
-/// `[-2^53, 2^53]`, where every `i64` is exactly representable as `f64`
-/// and back.
-fn integral_threshold(t: f64) -> Option<i64> {
-    if !t.is_finite() || t.fract() != 0.0 {
-        return None;
-    }
-    const LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
-    if !(-LIMIT..=LIMIT).contains(&t) {
-        return None;
-    }
-    Some(t as i64)
+    // The threshold is read from the stage's LEXEME, not from the
+    // evaluator's `f64`, and the read refuses whenever an `Int64`
+    // comparison here and the evaluator's `f64` one could put a span on
+    // different sides of it.
+    let threshold = super::search_plan::exact_aggregate_threshold(*op, field, value)?;
+    Some(format!("{agg} {cmp_sql} {threshold}"))
 }
 
 // ---------------------------------------------------------------------
@@ -2168,6 +2155,145 @@ mod tests {
                 Err(NotExact::SelectorIsWider),
                 "condition (6) must refuse a selector carrying a regex even when the two \
                  predicates are byte-equal"
+            );
+        }
+    }
+
+    /// Issue #492 part 4 round 1: **the pushdown refuses every threshold
+    /// the two readings could disagree on, and the boundary is where the
+    /// two readings START to differ rather than one number that was
+    /// reported.**
+    ///
+    /// The pushed comparison is `d <op> t` over exact `Int64`s in
+    /// ClickHouse; the unpushed one is `f64(d) <op> f64(t)` in the
+    /// evaluator. Below 2^53 every integer is exact on both sides, at and
+    /// above it they part company, and the four literals around that
+    /// point are what this table is built from:
+    ///
+    /// ```text
+    ///   9007199254740991  2^53 - 1  exact f64, and no `d` can straddle it   push
+    ///   9007199254740992  2^53      exact f64, but d = 2^53+1 reads `==` in
+    ///                               f64 and `!=` in SQL                     refuse
+    ///   9007199254740993  2^53 + 1  no f64 holds it; becomes ...992         refuse
+    ///   9007199254740994  2^53 + 2  an exact f64, still past the bound      refuse
+    /// ```
+    ///
+    /// The third row is the one the review found. **A build that
+    /// special-cased it would pass a test naming only that number and
+    /// fail this one**, on rows two and four.
+    ///
+    /// Every row runs under all six comparison operators, because the
+    /// rounding moves the boundary in both directions: on `=` and `<=` a
+    /// rounded threshold LOSES a qualifying trace, on `!=`, `>` and `<`
+    /// it ADMITS one that does not qualify. Which one it is depends on
+    /// the operator, so a per-operator answer would be six answers; the
+    /// threshold rule is one.
+    ///
+    /// The second half asserts the property the doc comment on
+    /// `search_plan::aggregate_threshold` now claims: whenever this
+    /// pushes, the integer in the fragment and the `f64` the evaluator
+    /// compares against are the same number, bit for bit.
+    #[test]
+    fn the_pushdown_refuses_every_threshold_the_two_readings_could_disagree_on() {
+        /// `true` when this literal may be pushed.
+        const PUSHES: bool = true;
+        const REFUSES: bool = false;
+
+        let rows: [(&str, bool); 14] = [
+            // --- plain integers ---------------------------------------
+            ("2", PUSHES),
+            ("0", PUSHES),
+            // An integer spelled with a zero fraction is still an integer.
+            ("2.0", PUSHES),
+            // ...and one spelled with a NON-zero fraction is not, however
+            // far down it sits. `2.0000000000000000001` parses to exactly
+            // `2.0` as an `f64`, so the old `fract() != 0.0` rule pushed
+            // it; the lexeme rule refuses it. No answer moves — the
+            // evaluator then does the same comparison — and the rule is
+            // one sentence instead of two.
+            ("2.5", REFUSES),
+            ("2.0000000000000000001", REFUSES),
+            // --- the boundary, in number form -------------------------
+            ("9007199254740991", PUSHES),
+            ("9007199254740992", REFUSES),
+            ("9007199254740993", REFUSES),
+            ("9007199254740994", REFUSES),
+            ("9007199254740995", REFUSES),
+            // --- the same boundary, in duration form ------------------
+            ("1s", PUSHES),
+            ("9007199254740991ns", PUSHES),
+            ("9007199254740993ns", REFUSES),
+            // 2600 h is 9,360,000,000,000,000 ns, past 2^53; 2500 h is
+            // 9,000,000,000,000,000 ns and inside it. A duration literal
+            // is an exact nanosecond count before this function sees it,
+            // so only the bound can refuse one.
+            ("2600h", REFUSES),
+        ];
+        let ops = ["=", "!=", ">", ">=", "<", "<="];
+
+        for (literal, wants_push) in rows {
+            for op in ops {
+                let q = format!(r#"{{ span.http.method = "GET" }} | max(duration) {op} {literal}"#);
+                let query = pulsus_traceql::parse(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
+                let stage = query
+                    .pipeline
+                    .iter()
+                    .find(|s| matches!(s, PipelineStage::Aggregate { .. }))
+                    .unwrap_or_else(|| panic!("{q}: parsed without an aggregate stage"));
+                let frag = aggregate_having_sql(stage);
+                assert_eq!(
+                    frag.is_some(),
+                    wants_push,
+                    "{q}: expected {}, got {frag:?}",
+                    if wants_push { "a fragment" } else { "no fragment" }
+                );
+                let Some(frag) = frag else { continue };
+                // The fragment's integer IS the evaluator's `f64`.
+                let PipelineStage::Aggregate { op: agg, field, value, .. } = stage else {
+                    unreachable!("filtered above")
+                };
+                let evaluator = super::super::search_plan::aggregate_threshold(*agg, field, value)
+                    .unwrap_or_else(|e| panic!("{q}: {e:?}"));
+                let rendered: i64 = frag
+                    .rsplit(' ')
+                    .next()
+                    .unwrap_or_else(|| panic!("{q}: {frag:?} ends in a literal"))
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{q}: {frag:?} does not end in an integer: {e}"));
+                assert_eq!(
+                    (rendered as f64).to_bits(),
+                    evaluator.to_bits(),
+                    "{q}: the statement compares against {rendered} and the evaluator against \
+                     {evaluator}"
+                );
+            }
+        }
+    }
+
+    /// A negative threshold cannot reach the renderer from a parsed
+    /// query, and this is how that was established rather than read: the
+    /// aggregate grammar takes a `Number` or `Duration` TOKEN and the
+    /// lexer never puts a sign inside either
+    /// (`pulsus-traceql/src/lexer.rs::scan_number_or_duration`), so `-1`
+    /// arrives as a `Minus` token the aggregate production refuses.
+    ///
+    /// It matters because `count()` pushes down to `uniqExact(span_id)`,
+    /// an unsigned aggregate: a negative literal in that comparison is
+    /// the one shape where ClickHouse's own type promotion, rather than
+    /// our threshold rule, would decide the answer. The sign handling in
+    /// `exact_decimal_integer` therefore covers a form only
+    /// `parser::static_value` can build, and this test is what says so.
+    #[test]
+    fn an_aggregate_threshold_cannot_be_negative() {
+        for q in [
+            r#"{ span.http.method = "GET" } | count() > -1"#,
+            r#"{ span.http.method = "GET" } | max(duration) = -9007199254740993"#,
+        ] {
+            let err = pulsus_traceql::parse(q).expect_err("a signed threshold must not parse");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("a number or a duration"),
+                "{q}: expected the aggregate value production to refuse, got {rendered:?}"
             );
         }
     }
