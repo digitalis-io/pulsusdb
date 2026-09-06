@@ -2159,16 +2159,21 @@ mod tests {
         }
     }
 
-    /// Issue #492 part 4 round 1: **the pushdown refuses every threshold
-    /// the two readings could disagree on, and the boundary is where the
-    /// two readings START to differ rather than one number that was
-    /// reported.**
+    /// Issue #492 part 4: **the boundary the pushdown refuses at is where
+    /// the two readings START to differ, not the one number that was
+    /// reported.** That the rule leaves no disagreeing threshold at all
+    /// is argued at `search_plan::exact_aggregate_threshold`; what this
+    /// test pins is where the boundary sits.
     ///
-    /// The pushed comparison is `d <op> t` over exact `Int64`s in
-    /// ClickHouse; the unpushed one is `f64(d) <op> f64(t)` in the
-    /// evaluator. Below 2^53 every integer is exact on both sides, at and
-    /// above it they part company, and the four literals around that
-    /// point are what this table is built from:
+    /// The pushed comparison is `d <op> t` over exact integers in
+    /// ClickHouse — `max(duration_ns)` is `Int64` and `uniqExact(span_id)`
+    /// `UInt64`, by `toTypeName` on 26.3 — and the unpushed one is
+    /// `f64(d) <op> f64(t)` in the evaluator. Below 2^53 every integer is
+    /// an exact `f64`, so the two readings cannot part. From 2^53 up a
+    /// data value `d` can round ONTO a `t` it is not equal to, and that,
+    /// rather than whether `t` itself is exact, is what the bound is
+    /// drawn against: rows two and four are both exact `f64`s and are
+    /// refused anyway.
     ///
     /// ```text
     ///   9007199254740991  2^53 - 1  exact f64, and no `d` can straddle it   push
@@ -2178,16 +2183,40 @@ mod tests {
     ///   9007199254740994  2^53 + 2  an exact f64, still past the bound      refuse
     /// ```
     ///
-    /// The third row is the one the review found. **A build that
-    /// special-cased it would pass a test naming only that number and
-    /// fail this one**, on rows two and four.
+    /// The third row is the one the review found. **A build that fixed
+    /// only the literal's rounding — refusing a lexeme no `f64` holds,
+    /// which is exactly that number — would pass a test naming it and
+    /// fail this one on rows two and four**, and on `2600h`, the same
+    /// case in duration form. Measured by building it: 18 of these 84
+    /// cases failed, six operators on each of those three literals.
     ///
-    /// Every row runs under all six comparison operators, because the
-    /// rounding moves the boundary in both directions: on `=` and `<=` a
-    /// rounded threshold LOSES a qualifying trace, on `!=`, `>` and `<`
-    /// it ADMITS one that does not qualify. Which one it is depends on
-    /// the operator, so a per-operator answer would be six answers; the
-    /// threshold rule is one.
+    /// Every row runs under all six comparison operators, and the rule
+    /// refuses for all six. Four of them can actually diverge, measured
+    /// on the pre-fix build (the bound inclusive, so `t = 2^53` pushes)
+    /// against corpus B of `traces_search_pushdown_live.rs`, whose five
+    /// traces have `max(duration)` 1s / 2^53-1 / 2^53 / 2^53+1 / 2^53+3
+    /// ns. Suffix `03` is the trace `f64` rounds down onto `t`:
+    ///
+    /// ```text
+    ///   op   generator candidates   evaluator (f64)   answer moves?
+    ///   =    02                     02,03             yes — 03 lost
+    ///   <=   00,01,02               00,01,02,03       yes — 03 lost
+    ///   !=   00,01,03,04            00,01,04          no  — 03 admitted
+    ///   >    03,04                  04                no  — 03 admitted
+    ///   >=   02,03,04               02,03,04          no  — identical
+    ///   <    00,01                  00,01             no  — identical
+    /// ```
+    ///
+    /// `>=` and `<` cannot be made to differ: the only splitting case is
+    /// `d = 2^53 + 1` against `t = 2^53`, where `>=` is true under both
+    /// readings and `<` false under both. Of the four that do, only `=`
+    /// and `<=` move an ANSWER — they LOSE a qualifying trace, and a lost
+    /// trace has no second chance. `!=` and `>` ADMIT one that does not
+    /// qualify, and `search_eval`'s aggregate stage re-applies
+    /// `cmp_f64(agg.cmp, …, agg.threshold)` to the hydrated spans, so the
+    /// extra candidate costs a transported span set and never reaches the
+    /// client. One threshold rule rather than six operator rules, and the
+    /// test runs all six so a per-operator carve-out would redden it.
     ///
     /// The second half asserts the property the doc comment on
     /// `search_plan::aggregate_threshold` now claims: whenever this

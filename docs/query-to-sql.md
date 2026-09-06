@@ -584,7 +584,7 @@ changes. `trace_attrs_idx` carries `timestamp_ns` and `duration_ns` on every att
 join, no subquery, no second table.
 
 **The threshold has to survive the trip, or the aggregate does not go.** The `HAVING` compares
-exact `Int64`s in ClickHouse; the engine, when it evaluates the same stage itself, compares `f64`s,
+exact integers in ClickHouse; the engine, when it evaluates the same stage itself, compares `f64`s,
 because its aggregate scalar is one. The two readings are the same number while both stay inside
 ±2^53, so the pushdown takes a threshold only when the LITERAL AS WRITTEN is an integer strictly
 inside that range — `| max(duration) > 1s` and `| count() > 2` push, `| count() > 2.5`,
