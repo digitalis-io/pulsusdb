@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 /// count is of EVERY file in the directory tree, not of `.sql` files —
 /// today the two coincide, and a file of any other kind appearing is
 /// precisely the thing the count should report.
-const CORPORA: [(&str, usize); 2] = [("traces_search", 64), ("traces_metrics", 27)];
+const CORPORA: [(&str, usize); 2] = [("traces_search", 72), ("traces_metrics", 27)];
 
 /// A 64-bit rolling digest over every entry, in sorted path order —
 /// FNV-1a's shape with the same mixing constants `accept_surface.rs`
@@ -342,7 +342,7 @@ const CORPORA: [(&str, usize); 2] = [("traces_search", 64), ("traces_metrics", 2
 /// Four of the eight new goldens carry a `HAVING` and four do not; the
 /// four that do not are the refusals, each rendering the statement its
 /// aggregate-free twin renders.
-const PINNED_SQL_CORPUS: u64 = 0x5474_b853_454f_9b42;
+const PINNED_SQL_CORPUS: u64 = 0x1247_7586_664d_c3fa;
 
 fn golden_dir(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -474,7 +474,7 @@ fn the_sql_golden_corpus_has_exactly_its_committed_membership() {
         );
         total += entries.len();
     }
-    assert_eq!(total, 91, "the frozen SQL corpus is 64 + 27 = 91 entries");
+    assert_eq!(total, 99, "the frozen SQL corpus is 72 + 27 = 99 entries");
 }
 
 #[test]
@@ -594,11 +594,11 @@ fn the_golden_sql_corpus_contains_no_with_clause() {
     // the corpus. (It IS vacuous in the direction that matters until a
     // wave emits a wrapped statement, which the doc comment states.)
     assert_eq!(
-        entries, 91,
-        "every committed corpus entry is walked (the same 91 the membership gate counts)"
+        entries, 99,
+        "every committed corpus entry is walked (the same 99 the membership gate counts)"
     );
     assert_eq!(
-        scanned, 90,
+        scanned, 98,
         "every SQL golden is scanned; the one entry that is not a statement is          `traces_metrics/log2_reference_capture.json`"
     );
     assert!(

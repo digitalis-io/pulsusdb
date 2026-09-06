@@ -7,6 +7,7 @@ FROM trace_spans
 PREWHERE service = 'grp'
 WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 GROUP BY trace_id
+HAVING uniqExact(span_id) > 2
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
 

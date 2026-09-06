@@ -3116,4 +3116,129 @@ async fn two_phase_search_explain_and_budget_gates() {
 
     // ---- issue #510: the val_type projection is granule-neutral --------
     attr_value_reads_keep_their_index_selection(&client, &engine, base, now).await;
+
+    // ---- issue #492 part 5: the pushdown is granule-neutral ------------
+    the_pushdown_keeps_the_generators_index_selection(&client, &engine, base, now).await;
+}
+
+/// Issue #492 part 5 criterion 14 — **the granule-identity gate for the
+/// pushed `HAVING`, grouped and ungrouped.**
+///
+/// A `HAVING` filters rows the statement has already read and grouped,
+/// so it can neither add nor remove a granule. The saving is entirely on
+/// the metered hop — fewer candidate traces cross to us, and phase 2
+/// issues fewer hydration round trips — and the read side must not move
+/// at all. This asserts that on the REAL statements `plan_search` emits.
+///
+/// Three renders of one selector, `{ resource.service.name = "checkout" }`:
+/// the bare generator, the same with `HAVING uniqExact(span_id) > 2`, and
+/// the same with the grouped `HAVING arrayMax(mapValues(uniqExactMap(…)))
+/// > 2`. All three must select the same parts and granules.
+///
+/// **A pinned granule COUNT would be the wrong gate**: it moves with the
+/// corpus and says nothing about the pushdown. An identity between three
+/// renders of one selector on one corpus is scale-invariant.
+///
+/// The positive control is the same one the `val_type` gate uses: a
+/// narrowed time predicate MUST move part selection, so without it an
+/// `index_blocks` returning a constant would satisfy every comparison
+/// above.
+async fn the_pushdown_keeps_the_generators_index_selection(
+    client: &ChClient,
+    engine: &TraceEngine,
+    base: i64,
+    now: i64,
+) {
+    /// The `MinMax` / `Partition` / `PrimaryKey` / `Skip` blocks of an
+    /// `EXPLAIN indexes = 1` render — what part and granule selection is
+    /// decided by.
+    fn index_blocks(raw: &str) -> String {
+        const BLOCK_TITLES: &[&str] = &["MinMax", "Partition", "PrimaryKey", "Skip"];
+        let mut out = String::new();
+        let mut inside = false;
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if BLOCK_TITLES.contains(&trimmed) {
+                inside = true;
+            } else if trimmed.starts_with("ReadFromMergeTree")
+                || trimmed.starts_with("Expression")
+                || trimmed.starts_with("Aggregating")
+            {
+                inside = false;
+            }
+            if inside {
+                out.push_str(trimmed);
+                out.push('\n');
+            }
+        }
+        assert!(!out.is_empty(), "no index blocks in EXPLAIN output:\n{raw}");
+        out
+    }
+
+    let bare = plan_for(
+        engine,
+        r#"{ resource.service.name = "checkout" }"#,
+        base,
+        now,
+    );
+    let ungrouped = plan_for(
+        engine,
+        r#"{ resource.service.name = "checkout" } | count() > 2"#,
+        base,
+        now,
+    );
+    let grouped = plan_for(
+        engine,
+        r#"{ resource.service.name = "checkout" } | by(name) | count() > 2"#,
+        base,
+        now,
+    );
+    assert_eq!(bare.pushed_having(), None);
+    assert_eq!(
+        ungrouped.pushed_having(),
+        Some("uniqExact(span_id) > 2"),
+        "the ungrouped arm must have pushed, or this gate measures nothing"
+    );
+    assert_eq!(
+        grouped.pushed_having(),
+        Some(
+            "arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, \
+             substringUTF8(name, 1, 2048)), span_id)))) > 2"
+        ),
+        "the grouped arm must have pushed, or this gate measures nothing"
+    );
+
+    let statements = [
+        ("bare generator", &bare.generator_sqls[0]),
+        ("ungrouped HAVING", &ungrouped.generator_sqls[0]),
+        ("grouped HAVING", &grouped.generator_sqls[0]),
+    ];
+    // The three really are three different statements, so the identity
+    // below is not comparing one text with itself.
+    assert_ne!(statements[0].1, statements[1].1);
+    assert_ne!(statements[1].1, statements[2].1);
+
+    let reference = index_blocks(&explain_raw(client, statements[0].1).await);
+    for (label, sql) in &statements[1..] {
+        let blocks = index_blocks(&explain_raw(client, sql).await);
+        assert_eq!(
+            blocks, reference,
+            "{label}: the pushed HAVING moved part/granule selection:\n{sql}"
+        );
+    }
+
+    // POSITIVE CONTROL, on the same corpus: narrowing the time predicate
+    // MUST move part selection.
+    let narrowed = statements[0]
+        .1
+        .replace("timestamp_ns > ", &format!("timestamp_ns > {now} + "));
+    assert_ne!(
+        &narrowed, statements[0].1,
+        "the positive control must differ"
+    );
+    assert_ne!(
+        index_blocks(&explain_raw(client, &narrowed).await),
+        reference,
+        "the comparison cannot tell two index selections apart, so the identity above is vacuous"
+    );
 }

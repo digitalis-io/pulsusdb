@@ -91,7 +91,7 @@ Site	Literal	docs/benchmarks/logs-differential-ledger.md:4190	-	-	<a> <a>	accept
 Site	Literal	docs/features.md:72	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
 Site	Literal	docs/query-to-sql.md:200	-	-	…	panicked	reject	-	-	a doc-comment/CI-comment ELISION, not an argument. It is listed because `5d91ef1` PANICKED on it -- `compile_pattern` sliced `rest[1..]` and any pattern beginning with a multi-byte character was an unwind, measured by running the shipped bytes under catch_unwind -- and this change refuses it cleanly instead. No argument that pre-dates this issue moves ACCEPT/REJECT
 Site	Literal	docs/query-to-sql.md:466	-	-	p	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:693	-	-	) | write the comparison as 	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:725	-	-	p	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:726	-	-	 the group may be empty where the reference still produced a value, so it is 	reject	reject	-	-	-
-Site	Literal	docs/query-to-sql.md:957	-	-	path=<path> status=<code>	accept	accept	-	-	-
+Site	Literal	docs/query-to-sql.md:694	-	-	) | write the comparison as 	reject	reject	-	-	-
+Site	Literal	docs/query-to-sql.md:726	-	-	p	reject	reject	-	-	-
+Site	Literal	docs/query-to-sql.md:727	-	-	 the group may be empty where the reference still produced a value, so it is 	reject	reject	-	-	-
+Site	Literal	docs/query-to-sql.md:959	-	-	path=<path> status=<code>	accept	accept	-	-	-

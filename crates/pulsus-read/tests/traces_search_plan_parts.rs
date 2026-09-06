@@ -137,7 +137,7 @@ fn goldens() -> Vec<Golden> {
             distributed,
         });
     }
-    assert_eq!(out.len(), 64, "the committed search corpus");
+    assert_eq!(out.len(), 72, "the committed search corpus");
     out
 }
 
@@ -468,8 +468,8 @@ fn the_chain_length_is_an_identity_of_the_plans_own_counters() {
     }
     assert_eq!(
         (total_statements, total_sections),
-        (272, 272),
-        "the committed corpus renders 272 statements and the plans account for all of them"
+        (301, 301),
+        "the committed corpus renders 301 statements and the plans account for all of them"
     );
     assert_eq!(
         preflight_cases,
@@ -518,7 +518,7 @@ fn no_part_carries_the_keyset_driver_or_the_inexact_limit_cut() {
 #[test]
 fn the_corpus_this_target_reads_is_the_committed_one() {
     let gs = goldens();
-    assert_eq!(gs.len(), 64);
+    assert_eq!(gs.len(), 72);
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut total = 0usize;
     for g in &gs {
@@ -531,7 +531,7 @@ fn the_corpus_this_target_reads_is_the_committed_one() {
             *kinds.entry(kind).or_insert(0) += 1;
         }
     }
-    assert_eq!(total, 272, "the committed corpus renders 272 statements");
+    assert_eq!(total, 301, "the committed corpus renders 301 statements");
     assert_eq!(
         kinds.get("by() cardinality probe").copied().unwrap_or(0),
         1,

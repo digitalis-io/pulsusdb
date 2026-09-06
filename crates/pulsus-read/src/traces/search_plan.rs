@@ -18,9 +18,9 @@ use crate::logql::sql::TimeWindow;
 
 use super::compile::{ChainFacts, Tql, TqlLink};
 use super::filter::{
-    self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, GenTable,
-    LeafEval, LeafGenerator, NestedSetField, PhysicalPredicate, PlanError, SetSide, SpanFilterCtx,
-    TraceCtxPred, ValuePred,
+    self, ArithNode, AttrProbe, BoolMatch, BoolTerm, CompareOperand, EventSetField, GenClass,
+    GenTable, LeafEval, LeafGenerator, NestedSetField, PhysicalPredicate, PlanError, SetSide,
+    SpanFilterCtx, TraceCtxPred, ValuePred,
 };
 use super::search_eval::StoredType;
 use super::search_sql;
@@ -720,6 +720,27 @@ pub struct SearchPlan {
     /// carries, so a test can compare the two rather than trusting that
     /// one produced the other.
     pub(crate) pushed_having: Option<String>,
+    /// The statement `generator_sqls[0]` falls back to when the pushed
+    /// `HAVING` breaches the generator memory ceiling: the SAME
+    /// generator with no `HAVING` (issue #492 part 5). `None` when
+    /// nothing was pushed.
+    ///
+    /// **`Some` exactly when [`Self::pushed_having`] is `Some`** —
+    /// grouped or not, part 4's cells or part 5's. A rule that fired
+    /// only for "the queries part 4 would not have pushed" would have to
+    /// encode what an earlier revision did, and nothing in the plan can
+    /// check that.
+    ///
+    /// The text is `generator_sqls[0]` as rendered BEFORE [`plan_search`]
+    /// re-renders it with the fragment, which is byte-identical to what
+    /// the same selector sends with nothing pushed. That identity is
+    /// what makes the fallback a no-regression rule rather than an
+    /// approximation of one: measured over 9,425 planned queries, at the
+    /// base tree `generator_sqls[0]` for `{selector} | <any pipeline>`
+    /// equals `generator_sqls[0]` for `{selector}` alone in every case
+    /// where nothing is pushed, with no exceptions, and differs in every
+    /// case where something is.
+    pub(crate) generator_fallback_sql: Option<String>,
     /// Whether the single phase-1 generator's rows are exactly the
     /// selector's matched spans, and when not, which of
     /// [`generator_exactness`]'s six conditions refused (issue #492
@@ -741,6 +762,13 @@ impl SearchPlan {
     /// Whether a spanset aggregate compiled into the generator statement.
     pub fn aggregate_pushed(&self) -> bool {
         self.pushed_having.is_some()
+    }
+
+    /// The statement the first phase-1 generator falls back to when the
+    /// pushed `HAVING` breaches the generator memory ceiling, or `None`
+    /// when nothing was pushed (issue #492 part 5).
+    pub fn generator_fallback_sql(&self) -> Option<&str> {
+        self.generator_fallback_sql.as_deref()
     }
 
     /// The exactness verdict for this query's phase-1 generator — `Ok`
@@ -2420,21 +2448,37 @@ fn push_projection_source(
 pub enum NotExact {
     /// Not exactly one `{...}` filter carrying exactly one leaf.
     NotOneLeaf,
-    /// The one leaf is not a POSITIVE attribute-membership leaf: a
-    /// physical column, a negation, a structural intrinsic, an
-    /// arithmetic comparison, and so on.
-    LeafIsNotAPositiveAttrMatch,
+    /// The one leaf belongs to neither exact family: it is neither a
+    /// POSITIVE attribute-membership leaf nor a
+    /// `resource.service.name` equality. A negation, a structural
+    /// intrinsic, an arithmetic comparison, `{ name = … }`, and so on.
+    ///
+    /// Renamed from `LeafIsNotAPositiveAttrMatch` in issue #492 part 5,
+    /// when the second family landed and "not an attribute match"
+    /// stopped being the whole reason.
+    LeafIsNotAnExactLeafFamily,
     /// The probe's value predicate is not a string or boolean equality —
     /// a `val_num` comparison, a key-existence probe or a regex.
     ValuePredIsNotEquality,
     /// Not exactly one generator, or the one generator is not a bare
-    /// `trace_attrs_idx` read (a `PREWHERE`-carrying `ServiceEq`
-    /// generator reads `trace_spans`; a `TimeRange` fallback reads every
-    /// span in the window).
+    /// `trace_attrs_idx` read (a `TimeRange` fallback reads every span in
+    /// the window).
     GeneratorIsNotASingleAttrIndexRead,
     /// The generator's `WHERE` fragment and the membership read's
     /// predicate are not the same bytes.
     PredicatesDiffer,
+    /// Not exactly one generator, or the one generator is not the
+    /// `PREWHERE`-carrying `ServiceEq` read over `trace_spans` (issue
+    /// #492 part 5).
+    ServiceGeneratorIsNotAPrewhereSpanRead,
+    /// The generator's `PREWHERE` fragment is not the one this leaf's
+    /// literal renders (issue #492 part 5).
+    ServicePrewhereDiffers,
+    /// The service literal is [`super::search_sql::TRACE_STR_COL_CP_FALLBACK`]
+    /// code points or longer, which is where the generator's raw
+    /// `service` reading and the evaluator's byte-capped one can first
+    /// agree on a value they should not (issue #492 part 5).
+    ServiceLiteralAtTheCapBoundary,
     /// Some leaf of the selector compiles to a regex comparison, so the
     /// SQL reading of the pattern is the narrower one.
     SelectorIsWider,
@@ -2444,36 +2488,45 @@ pub enum NotExact {
 /// matched spans, which is what [`TqlLink::Source::generator_is_exact`]
 /// asserts and what an aggregate pushdown needs.
 ///
-/// It is not argued, it is compared. The membership read's predicate
-/// ([`membership_predicate`]) and the generator's
-/// (`filter::attr_generator_predicate`) are two functions with the same
-/// body in two modules; this asks whether they produced the same bytes
-/// for THIS query rather than assuming they always will. If they ever
-/// drift the pushdown stops applying, a golden moves, and
+/// It is not argued, it is compared: for each family, the two renderings
+/// that must agree are asked whether they produced the same bytes for
+/// THIS query, rather than assumed always to agree. If they ever drift
+/// the pushdown stops applying, a golden moves, and
 /// `every_case_matches_its_committed_golden_byte_for_byte` says so.
 ///
-/// All six must hold:
-///   1. exactly one planned filter, carrying exactly one leaf;
-///   2. that leaf is `PlannedLeafEval::Attr { probe_idx, negated: false }`;
-///   3. `probes[probe_idx].pred` is `ValuePred::StringEq` or `BoolEq`;
-///   4. exactly one generator, `table == GenTable::Attrs`, `prewhere.is_none()`;
-///   5. `generator.predicate == probe_predicates[probe_idx]`, byte for byte;
-///   6. `compile::selector_fidelity(spanset) == Fidelity::Equivalent`.
+/// # Two exact families, dispatched on the one leaf
 ///
-/// (6) is not implied by (5): `attr_generator_predicate` ignores its
-/// `GenClass` argument, so a regex leaf renders the SAME predicate on
-/// both sides and passes (5). The regex must still refuse, because one
-/// pattern gets two readings on this path and the SQL reading is the
-/// NARROWER one (`compile::StrOpKind::fidelity`) — the generator's rows
+/// ```text
+///   PlannedLeafEval::Attr { negated: false }          -> the attribute-index family
+///   PhysicalEval::Service { op: StrOp::Eq }           -> the ServiceEq / trace_spans family
+///   anything else                                     -> LeafIsNotAnExactLeafFamily
+/// ```
+///
+/// **The attribute-index family** ([`attr_generator_exactness`]) needs
+/// the membership read's predicate ([`membership_predicate`]) and the
+/// generator's (`filter::attr_generator_predicate`) — two functions with
+/// the same body in two modules — to have produced the same bytes.
+///
+/// **The `ServiceEq` family** ([`service_generator_exactness`], issue
+/// #492 part 5) needs the generator's `PREWHERE` to be exactly the
+/// fragment this leaf's literal renders, and the literal to be short
+/// enough that the raw column the `PREWHERE` compares and the byte-capped
+/// column the evaluator compares cannot disagree.
+///
+/// Both then require condition (6): no leaf of the selector compiles to
+/// a regex, because one pattern gets two readings on this path and the
+/// SQL reading is the NARROWER one
+/// ([`super::compile::StrOpKind::fidelity`]) — the generator's rows
 /// would be a SUBSET of the matched spans, and an aggregate over a
 /// subset can be wrong in either direction.
 ///
-/// **No query the planner can build reaches (6), and that is measured
-/// rather than assumed.** An attribute regex compiles to
-/// `ValuePred::Regex`, which (3) refuses; a physical regex
-/// (`{ name =~ … }`, `{ resource.service.name =~ … }`) is not an
-/// attribute-membership leaf at all, which (2) refuses. So (6) is the
-/// condition that would carry the rule if (3) were widened, and
+/// **No query the planner can build reaches (6) through the attribute
+/// family, and that is measured rather than assumed.** An attribute
+/// regex compiles to `ValuePred::Regex`, which the value-predicate
+/// condition refuses; a physical regex (`{ name =~ … }`,
+/// `{ resource.service.name =~ … }`) is not one of the two exact leaf
+/// families at all. So (6) is the condition that would carry the rule if
+/// either family were widened, and
 /// `compile::tests::the_pushdown_precondition_refuses_every_unsafe_shape`
 /// keeps it live by calling this function with exactly that input: the
 /// same byte-equal predicates, one selector with a regex and one
@@ -2491,16 +2544,34 @@ pub(crate) fn generator_exactness(
     let [only_leaf] = only_filter.leaves.as_slice() else {
         return Err(NotExact::NotOneLeaf);
     };
-    let PlannedLeafEval::Attr {
-        probe_idx,
-        negated: false,
-    } = only_leaf
-    else {
-        return Err(NotExact::LeafIsNotAPositiveAttrMatch);
-    };
+    match only_leaf {
+        PlannedLeafEval::Attr {
+            probe_idx,
+            negated: false,
+        } => attr_generator_exactness(*probe_idx, probes, probe_predicates, generators)?,
+        PlannedLeafEval::Physical(PhysicalEval::Service {
+            op: StrOp::Eq,
+            value,
+        }) => service_generator_exactness(value, generators)?,
+        _ => return Err(NotExact::LeafIsNotAnExactLeafFamily),
+    }
+    if super::compile::selector_fidelity(spanset) != Fidelity::Equivalent {
+        return Err(NotExact::SelectorIsWider);
+    }
+    Ok(())
+}
+
+/// The attribute-index exact family: one bare `trace_attrs_idx` read
+/// whose `WHERE` fragment is byte-identical to the membership read's.
+fn attr_generator_exactness(
+    probe_idx: usize,
+    probes: &[AttrProbe],
+    probe_predicates: &[String],
+    generators: &[(SourceRef, LeafGenerator)],
+) -> Result<(), NotExact> {
     let probe = probes
-        .get(*probe_idx)
-        .ok_or(NotExact::LeafIsNotAPositiveAttrMatch)?;
+        .get(probe_idx)
+        .ok_or(NotExact::LeafIsNotAnExactLeafFamily)?;
     if !matches!(probe.pred, ValuePred::StringEq(_) | ValuePred::BoolEq(_)) {
         return Err(NotExact::ValuePredIsNotEquality);
     }
@@ -2511,13 +2582,64 @@ pub(crate) fn generator_exactness(
         return Err(NotExact::GeneratorIsNotASingleAttrIndexRead);
     }
     let membership = probe_predicates
-        .get(*probe_idx)
+        .get(probe_idx)
         .ok_or(NotExact::PredicatesDiffer)?;
     if &generator.predicate != membership {
         return Err(NotExact::PredicatesDiffer);
     }
-    if super::compile::selector_fidelity(spanset) != Fidelity::Equivalent {
-        return Err(NotExact::SelectorIsWider);
+    Ok(())
+}
+
+/// The `ServiceEq` exact family (issue #492 part 5): one
+/// `PREWHERE`-carrying `trace_spans` read whose fragment is the one this
+/// leaf's literal renders, at a literal short enough that the two
+/// readings of `service` cannot disagree.
+///
+/// **The cap boundary, as a value.** The generator compares the RAW
+/// `service` column and the evaluator the byte-capped one
+/// (`search_sql::byte_cap_expr`, which `hydration_sql` projects through),
+/// so the two disagree exactly when the literal is something a capped
+/// value can equal but a raw value cannot. Measured on ClickHouse 26.3
+/// with a stored `service` of `'\u{1D11E}' x 2048 + '0'` — 8193 bytes,
+/// 2049 code points — against a literal of `'\u{1D11E}' x 2048`:
+///
+/// ```text
+///   stored = literal        -> 0   the generator does not return the span
+///   cap(stored) = literal   -> 1   the evaluator matches it
+/// ```
+///
+/// A literal of 2047 code points cannot be a capped value's whole
+/// content, because a capped value is either its own raw self (at or
+/// under 8192 bytes) or exactly 2048 code points. So the boundary is
+/// [`super::search_sql::TRACE_STR_COL_CP_FALLBACK`], inclusive: 2047
+/// pushes, 2048 refuses.
+///
+/// The exactness owed here is the OTHER direction from the usual one. A
+/// generator that returns fewer spans than the selector matches makes
+/// `R ⊇ D` false, and that containment is what
+/// [`super::compile::aggregate_having_sql`]'s whole six-cell rule rests
+/// on.
+fn service_generator_exactness(
+    value: &str,
+    generators: &[(SourceRef, LeafGenerator)],
+) -> Result<(), NotExact> {
+    let [(_, generator)] = generators else {
+        return Err(NotExact::ServiceGeneratorIsNotAPrewhereSpanRead);
+    };
+    if generator.table != GenTable::Spans
+        || generator.class != GenClass::ServiceEq
+        || !generator.predicate.is_empty()
+    {
+        return Err(NotExact::ServiceGeneratorIsNotAPrewhereSpanRead);
+    }
+    let Some(prewhere) = &generator.prewhere else {
+        return Err(NotExact::ServiceGeneratorIsNotAPrewhereSpanRead);
+    };
+    if prewhere != &format!("service = {}", escape::ch_string(value)) {
+        return Err(NotExact::ServicePrewhereDiffers);
+    }
+    if value.chars().count() as u64 >= search_sql::TRACE_STR_COL_CP_FALLBACK {
+        return Err(NotExact::ServiceLiteralAtTheCapBoundary);
     }
     Ok(())
 }
@@ -2780,6 +2902,13 @@ pub fn plan_search(
         [frag] if generators.len() == 1 => Some(frag.clone()),
         _ => None,
     };
+    // Issue #492 part 5: the fallback is captured BEFORE the re-render,
+    // so it is the statement this query sends with nothing pushed, byte
+    // for byte. The executor runs it when the pushed statement raises
+    // ClickHouse code 241 — the only thing `generator_settings`'
+    // `max_memory_usage` raises — so a query that answers `200` without
+    // the pushdown still answers `200` with it.
+    let generator_fallback_sql = pushed_having.as_ref().map(|_| generator_sqls[0].clone());
     if let Some(frag) = &pushed_having {
         generator_sqls[0] = search_sql::generator_sql(
             &generators[0].1,
@@ -2831,6 +2960,7 @@ pub fn plan_search(
         stage_names,
         compiled,
         pushed_having,
+        generator_fallback_sql,
         generator_exact: exactness,
     })
 }

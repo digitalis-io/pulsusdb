@@ -1,13 +1,13 @@
--- case: count_pipeline
--- q: { resource.service.name = "checkout" } | count() > 2
+-- case: issue492_by_duration_then_count
+-- q: { resource.service.name = "grp" } | by(duration) | count() > 2
 
 == phase1 generator[0] ==
 SELECT trace_id, max(timestamp_ns) AS bound_ts
 FROM trace_spans
-PREWHERE service = 'checkout'
+PREWHERE service = 'grp'
 WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 GROUP BY trace_id
-HAVING uniqExact(span_id) > 2
+HAVING arrayMax(mapValues(uniqExactMap(map(duration_ns, span_id)))) > 2
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
 

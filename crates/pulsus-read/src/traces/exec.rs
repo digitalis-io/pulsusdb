@@ -2134,7 +2134,7 @@ impl TraceEngine {
         let mut generator_truncated = false;
         let mut per_generator: Vec<Vec<([u8; 16], i64)>> = Vec::new();
         let mut phase1_charged = 0usize;
-        for sql in &plan.generator_sqls {
+        for (gen_idx, sql) in plan.generator_sqls.iter().enumerate() {
             charge_explain(
                 &mut explain,
                 &mut budget,
@@ -2142,7 +2142,8 @@ impl TraceEngine {
                 sql,
                 None,
             )?;
-            let rows: Vec<CandidateRow> = self
+            let before_attempt = phase1_charged;
+            let attempt: Result<Vec<CandidateRow>, ReadError> = self
                 .collect_rows_charged(
                     sql,
                     &gen_settings,
@@ -2151,7 +2152,58 @@ impl TraceEngine {
                     map_trace_generator_error,
                     |_| CANDIDATE_TUPLE_BYTES,
                 )
-                .await?;
+                .await;
+            // Issue #492 part 5: the pushed `HAVING` holds one
+            // aggregation state per (trace x group) where the bare
+            // statement holds one per trace, so a query that answers
+            // `200` at the ceiling without the pushdown could answer
+            // `422` with it. It must not: the fallback re-runs the SAME
+            // read with no `HAVING` — the statement this query sends
+            // when nothing is pushed, byte for byte
+            // (`SearchPlan::generator_fallback_sql`) — so the refusal
+            // point is where it was.
+            //
+            // Only generator index 0 carries a fragment
+            // (`plan_search` re-renders `generator_sqls[0]` and only
+            // when there is exactly one generator), and only code 241
+            // takes this branch: `map_trace_generator_error` maps that
+            // alone to `TraceGeneratorMemory` and delegates everything
+            // else.
+            let rows: Vec<CandidateRow> = match attempt {
+                Ok(rows) => rows,
+                Err(ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory { .. }))
+                    if gen_idx == 0 && plan.generator_fallback_sql().is_some() =>
+                {
+                    let fallback = plan
+                        .generator_fallback_sql()
+                        .expect("checked by the guard above");
+                    // Release the failed attempt's charge before
+                    // re-running. A 241 raised in `AggregatingTransform`
+                    // delivers no row, so the delta is expected to be
+                    // zero — this releases the difference regardless
+                    // rather than relying on that, because
+                    // `stream_rows_charged` does not roll back on error.
+                    budget.release(phase1_charged - before_attempt);
+                    phase1_charged = before_attempt;
+                    charge_explain(
+                        &mut explain,
+                        &mut budget,
+                        "phase1_candidate_generator_fallback",
+                        fallback,
+                        Some(("reason", "generator memory ceiling")),
+                    )?;
+                    self.collect_rows_charged(
+                        fallback,
+                        &gen_settings,
+                        &mut budget,
+                        &mut phase1_charged,
+                        map_trace_generator_error,
+                        |_| CANDIDATE_TUPLE_BYTES,
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e),
+            };
             if rows.len() as u64 == gen_probe {
                 generator_truncated = true;
             }

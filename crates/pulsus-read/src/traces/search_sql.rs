@@ -36,7 +36,19 @@ pub const TRACE_STR_COL_CAP: u64 = 8192;
 /// UTF-8 sequence is at most 4 bytes per code point, so
 /// `TRACE_STR_COL_CP_FALLBACK` code points can never exceed
 /// `TRACE_STR_COL_CAP` bytes even at the worst-case 4-byte width.
-const TRACE_STR_COL_CP_FALLBACK: u64 = TRACE_STR_COL_CAP / 4;
+///
+/// `pub(crate)` since issue #492 part 5, for one further consumer:
+/// [`super::search_plan::generator_exactness`] refuses a
+/// `resource.service.name` literal of this many code points or more,
+/// because that is exactly where a capped reading and a raw one can
+/// first agree on a value they should not. Measured on ClickHouse 26.3:
+/// with a stored `service` of `'\u{1D11E}' x 2048 + '0'` (8193 bytes,
+/// 2049 code points) and a literal of `'\u{1D11E}' x 2048` (2048 code
+/// points), `stored = literal` is `0` and `cap(stored) = literal` is
+/// `1` — the generator's `PREWHERE` compares the raw column and the
+/// evaluator the capped one, so below 2048 code points they cannot
+/// disagree and at 2048 they can.
+pub(crate) const TRACE_STR_COL_CP_FALLBACK: u64 = TRACE_STR_COL_CAP / 4;
 
 /// The unaliased, unwrapped byte-bound truncation expression — the ONE
 /// definition of the cap (issue #184 plan v4: `byte_capped`,

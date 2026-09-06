@@ -35,6 +35,8 @@
 //!
 //! [#492]: https://github.com/digitalis-io/pulsusdb/issues/492
 
+#[cfg(test)]
+pub mod criterion_fields;
 pub mod fold;
 pub mod plan;
 #[cfg(test)]

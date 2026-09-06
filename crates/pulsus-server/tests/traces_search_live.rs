@@ -2381,6 +2381,44 @@ async fn a_regex_leaf_loses_a_candidate_in_the_database_before_the_evaluator_see
     drop_db(db).await;
 }
 
+/// The JSON paths on which two values differ, in dotted/indexed form —
+/// `links[0].fidelity`, `parts[1].yields`.
+///
+/// A path is reported when the two sides disagree at it and neither side
+/// descends further: a whole object present on one side and absent on
+/// the other is reported at the parent path, not enumerated.
+fn differing_paths(a: &serde_json::Value, b: &serde_json::Value, at: &str) -> Vec<String> {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            keys.into_iter()
+                .flat_map(|k| {
+                    let path = if at.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{at}.{k}")
+                    };
+                    match (x.get(k), y.get(k)) {
+                        (Some(l), Some(r)) => differing_paths(l, r, &path),
+                        _ => vec![path],
+                    }
+                })
+                .collect()
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => x
+            .iter()
+            .zip(y)
+            .enumerate()
+            .flat_map(|(i, (l, r))| differing_paths(l, r, &format!("{at}[{i}]")))
+            .collect(),
+        _ if a == b => Vec::new(),
+        _ => vec![at.to_string()],
+    }
+}
+
 /// Issue #492 acceptance criterion 8: **the traces search route answers
 /// the explain header.**
 ///
@@ -2485,10 +2523,30 @@ async fn the_traces_search_route_answers_the_explain_header() {
     // suite's configured `reader.traceql_max_candidates`, and it belongs
     // in the assertion: the plan REPORTS the ceiling, so a config change
     // must move it.
+    //
+    // **Issue #492 part 5 criterion 33: three fields of this object
+    // move, and this file is one no hermetic sweep can redden.** The
+    // suite is `skip_unless_live!`-gated, so a `cargo test --workspace`
+    // run SELECTS this test and it self-skips green. It was updated by
+    // inspection and run under `PULSUS_TEST_CLICKHOUSE=1`.
+    //
+    // The selector is a bare `resource.service.name` equality, which
+    // part 5 makes the second exact generator family. So the seed link
+    // stops being a superset:
+    //
+    //   links[0].fidelity   "wider"      -> "equivalent"
+    //   links[2].why        "not_exact"  -> "not_yet_lowered"
+    //   parts[*].yields     "candidates" -> "exact"   (all three SQL parts)
+    //
+    // `links[2]` is `Order`, whose precondition is exactness: it used to
+    // refuse because the relation was not exact and now refuses because
+    // no SQL form has been written for it. `yields` renders
+    // `BoundaryOutput`, whose `Exact` arm means "the evaluator must not
+    // re-filter" — true of this query, which carries no pipeline at all.
     let expected_plan = serde_json::json!({
         "parts": [
             {"kind": "sql", "name": "trace_spans", "issue": "once",
-             "cut": null, "seed": null, "yields": "candidates"},
+             "cut": null, "seed": null, "yields": "exact"},
             {"kind": "sql", "name": "trace_spans:hydration", "issue": "per_seed:chunks",
              "cut": {"why": "handoff_exceeds_bound",
                      "cost": {"text_bytes": 4_300_048u64, "ast_elements": 200_004u64}},
@@ -2496,17 +2554,17 @@ async fn the_traces_search_route_answers_the_explain_header() {
                       "bound": {"kind": "config",
                                 "name": "reader.traceql_max_candidates",
                                 "value": 100_000u64}},
-             "yields": "candidates"},
+             "yields": "exact"},
             {"kind": "engine", "links": [2, 3]},
             {"kind": "sql", "name": "trace_spans:root", "issue": "once",
              "cut": {"why": "source_handoff", "source": "trace_spans:root", "key": "trace_id"},
              "seed": {"from": [1], "bound": {"kind": "request_limit", "value": 20u64}},
-             "yields": "candidates"},
+             "yields": "exact"},
         ],
         "links": [
-            {"i": 0, "part": 0, "stage": "Source",     "how": "lowered",  "fidelity": "wider"},
+            {"i": 0, "part": 0, "stage": "Source",     "how": "lowered",  "fidelity": "equivalent"},
             {"i": 1, "part": 1, "stage": "Hydrate",    "how": "residual", "why": "not_yet_lowered"},
-            {"i": 2, "part": 2, "stage": "Order",      "how": "residual", "why": "not_exact"},
+            {"i": 2, "part": 2, "stage": "Order",      "how": "residual", "why": "not_yet_lowered"},
             {"i": 3, "part": 2, "stage": "Limit(20)",  "how": "residual",
              "why": "ordering_not_established"},
             {"i": 4, "part": 3, "stage": "Emit",       "how": "residual",
@@ -2518,6 +2576,56 @@ async fn the_traces_search_route_answers_the_explain_header() {
         Some(&expected_plan),
         "the compiled plan this route now carries: {with}"
     );
+
+    // Issue #492 part 5 criterion 37: **the object moved on exactly
+    // these paths and no others.**
+    //
+    // The assertion above is satisfied by any update, including one that
+    // moved a fourth field by accident. Its operands are the response
+    // and one expectation, so it cannot say what CHANGED. This keeps the
+    // pre-part-5 object beside the new one and compares the two
+    // expectations, which is a question about the edit rather than about
+    // the response.
+    //
+    // Every path in the list must also appear verbatim inside a backtick
+    // span of `CRITERION_33`, so the list cannot silently grow past the
+    // sentence.
+    const CRITERION_33: &str = "Criterion 33: the frozen plan object for a bare service \
+        selector moves on exactly three fields — `links[0].fidelity` becomes \"equivalent\", \
+        `links[2].why` becomes \"not_yet_lowered\", and `parts[0].yields`, `parts[1].yields` \
+        and `parts[3].yields` become \"exact\".";
+    let before_part_5 = {
+        let mut o = expected_plan.clone();
+        o["parts"][0]["yields"] = serde_json::json!("candidates");
+        o["parts"][1]["yields"] = serde_json::json!("candidates");
+        o["parts"][3]["yields"] = serde_json::json!("candidates");
+        o["links"][0]["fidelity"] = serde_json::json!("wider");
+        o["links"][2]["why"] = serde_json::json!("not_exact");
+        o
+    };
+    let mut differing = differing_paths(&before_part_5, &expected_plan, "");
+    differing.sort();
+    let expected_paths = [
+        "links[0].fidelity",
+        "links[2].why",
+        "parts[0].yields",
+        "parts[1].yields",
+        "parts[3].yields",
+    ];
+    assert_eq!(
+        differing, expected_paths,
+        "the part-5 edit moved a path its criterion does not name"
+    );
+    for path in expected_paths {
+        assert!(
+            CRITERION_33
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .any(|span| span == path),
+            "{path} is asserted and is not named in the criterion's own sentence"
+        );
+    }
 
     // A SECOND request, disjoint across the two tables, because the one
     // above cannot see two of the defects this part fixed: it has one

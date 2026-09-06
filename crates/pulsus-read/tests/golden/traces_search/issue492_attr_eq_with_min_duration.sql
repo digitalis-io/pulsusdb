@@ -8,7 +8,6 @@ WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
   AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
   AND (key = 'http.method' AND val = 'GET' AND scope = 'span')
 GROUP BY trace_id
-HAVING min(duration_ns) >= 1000000000
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
 
