@@ -362,6 +362,82 @@ fn vector_value(result: &TraceMetricsResult) -> f64 {
     result.series[0].samples[0].1
 }
 
+/// A result's series stripped of their exemplars — each series' labels
+/// and samples, which is the whole of what running the same metrics
+/// query twice promises to reproduce.
+///
+/// **Exemplars are excluded on purpose and must stay excluded.** Every
+/// exemplar statement draws its representatives with
+/// `groupArraySample(k, 1)` (`crates/pulsus-read/src/traces/metrics_sql.rs:966`
+/// for the `Count`/`Agg` shapes this suite's replay gates use, and
+/// `:1044`, `:1071`, `:1432` for the other three). That is a reservoir
+/// sample: the seed is fixed, but which rows the reservoir keeps depends
+/// on the ORDER the rows reach the aggregator, and that order is a
+/// property of how ClickHouse parallelises the read rather than of the
+/// data. Measured against this suite's own duplicated corpus (1 200
+/// rows, 600 distinct spans) on ClickHouse 26.3, changing nothing but
+/// the thread count changes the draw in 10 of the 11 buckets — only the
+/// leading bucket, which holds a single span, is forced:
+///
+/// ```text
+/// $ for s in 1 8; do curl -s --data-binary @ex.sql \
+///     "http://localhost:18123/?database=<db>&max_threads=$s" > ex_t$s.tsv; done
+/// $ diff ex_t1.tsv ex_t8.tsv | head -1
+/// 2,11c2,11
+/// ```
+///
+/// (`ex.sql` is `metrics_exemplar_range_sql`'s output for
+/// `{} | sum_over_time(duration)` over the corpus window, `k = 9`.)
+///
+/// So an exemplar list is not a value the database undertakes to repeat,
+/// and asserting two of them equal is asserting that a sampler is
+/// idempotent. Nothing in the product depends on it: an exemplar is an
+/// illustrative representative a caller follows to a trace, not data.
+type LabelledSamples = Vec<(Vec<pulsus_read::MetricLabel>, Vec<(i64, f64)>)>;
+
+/// See [`LabelledSamples`].
+fn labelled_samples(r: &TraceMetricsResult) -> LabelledSamples {
+    r.series
+        .iter()
+        .map(|s| (s.labels.clone(), s.samples.clone()))
+        .collect()
+}
+
+/// How many exemplars each series of a result carries. `groupArraySample`
+/// keeps `min(k, rows_in_group)` rows, so the COUNT is a function of the
+/// data and does repeat — it is WHICH rows that does not. Comparing the
+/// counts and pointedly not the contents is how these gates say that the
+/// exemplar lists are examined and are allowed to differ.
+fn exemplar_counts(r: &TraceMetricsResult) -> Vec<usize> {
+    r.series.iter().map(|s| s.exemplars.len()).collect()
+}
+
+/// Asserts everything two runs of the same metrics query must reproduce:
+/// the series' labels and samples, and the NUMBER of exemplars each
+/// series carries.
+///
+/// It deliberately does not compare the exemplars themselves. Replacing
+/// this with `assert_eq!(before, after)` over the whole
+/// [`TraceMetricsResult`] would put a `groupArraySample` draw inside the
+/// assertion; that is what made
+/// `metrics_internal_consistency_identities` fail in CI on 2026-09-05
+/// with all 11 buckets' samples identical and 92 exemplars a side that
+/// held the same values at different timestamps. See [`LabelledSamples`]
+/// for the measurement.
+fn assert_repeats(before: &TraceMetricsResult, after: &TraceMetricsResult, what: &str) {
+    assert_eq!(
+        labelled_samples(before),
+        labelled_samples(after),
+        "{what}: labels and samples must reproduce"
+    );
+    assert_eq!(
+        exemplar_counts(before),
+        exemplar_counts(after),
+        "{what}: each series keeps min(k, rows) exemplars, so the COUNT reproduces — \
+         WHICH traces were drawn does not, and is not compared"
+    );
+}
+
 /// Asserts the full AC4 identity set for one filter over the aligned
 /// primary window `[base_s(), base_s() + CORPUS_SPANS)`, step 60 s,
 /// against an independently-computed expected span count.
@@ -538,10 +614,18 @@ async fn assert_aggregation_identities(engine: &TraceEngine) {
 
     // Replay-dedup: sum is invariant under duplicate inserts (the inner
     // any(duration_ns) per (t, trace_id, span_id) collapses replays).
+    // The corpus was already duplicated earlier in the test run, so both
+    // of these read the doubled rows; what is asserted is that the
+    // doubling did not move a bucket, and that a second identical
+    // request answers identically.
     let before = engine.metrics_range(&sum_plan).await.expect("sum before");
-    // (the corpus was already duplicated earlier in the test run)
     let after = engine.metrics_range(&sum_plan).await.expect("sum after");
-    assert_eq!(before, after, "sum_over_time is replay-invariant");
+    // NOT `assert_eq!(before, after)`: that compares the exemplars too,
+    // and the exemplars are a `groupArraySample` draw the database does
+    // not undertake to repeat. See [`assert_repeats`] and
+    // [`LabelledSamples`] — including the measurement showing the draw
+    // moves with the thread count alone.
+    assert_repeats(&before, &after, "sum_over_time is replay-invariant");
 }
 
 /// P3 (issue #182): `by(resource.service.name)` grouping. The corpus has
@@ -1476,21 +1560,21 @@ async fn metrics_internal_consistency_identities() {
     // default. Asserting the whole result would be asserting that a
     // sampler is idempotent, which it is not and which no criterion asks
     // for (`traceql-metrics-exemplar-count-not-a-parity-surface`).
-    /// A result's series stripped of their exemplars — the labels and the
-    /// samples, which is what replay-dedup is a claim about.
-    type LabelledSamples = Vec<(Vec<pulsus_read::MetricLabel>, Vec<(i64, f64)>)>;
-    fn samples_of(r: &TraceMetricsResult) -> LabelledSamples {
-        r.series
-            .iter()
-            .map(|s| (s.labels.clone(), s.samples.clone()))
-            .collect()
-    }
+    //
+    // This pair straddles the duplicate insert, so [`assert_repeats`] is
+    // the wrong helper here: it also compares the exemplar COUNTS, and a
+    // bucket holding fewer rows than the per-bucket budget `k` returns
+    // all of them — the leading bucket goes from its 1 span to 2. Only
+    // the labels and the samples carry across the insert.
     assert_eq!(
-        samples_of(&before_range),
-        samples_of(&after_range),
+        labelled_samples(&before_range),
+        labelled_samples(&after_range),
         "at-least-once replays must never inflate a bucket (uniqExact dedup)"
     );
-    assert_eq!(samples_of(&before_instant), samples_of(&after_instant));
+    assert_eq!(
+        labelled_samples(&before_instant),
+        labelled_samples(&after_instant)
+    );
 
     // ---- Unaligned window: outward snap, full-width edge buckets ------
     // [BASE+30, BASE+90) at step 60 snaps to [BASE, BASE+120): two
