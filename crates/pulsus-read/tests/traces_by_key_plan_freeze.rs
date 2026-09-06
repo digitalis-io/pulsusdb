@@ -166,6 +166,85 @@ fn every_served_by_key_plans_as_it_did_before_the_grammar_change() {
     );
 }
 
+/// Issue #492 part 5 criterion 9: **no served by-key's SQL moves.**
+///
+/// # Why the whole-plan freeze above cannot say this
+///
+/// `every_served_by_key_plans_as_it_did_before_the_grammar_change`
+/// compares whole `SearchPlan` `Debug` renderings, so it reddens for any
+/// field. Measured on the base tree with two one-line perturbations:
+///
+/// ```text
+///   perturbation                       whole-plan freeze          this projection
+///   a new plan field, no statement     FAIL, 19 keys              PASS
+///   the generator's ORDER BY moves     FAIL, 19 keys, SAME text   FAIL, naming the statement
+///   the stage spelling moves           FAIL, 19 keys, SAME text   PASS
+/// ```
+///
+/// Three channels, one message. And `git diff --stat` cannot separate
+/// them either: `tests/golden/traces_by_key_plans.json` is one JSON line
+/// per key, so a moved statement and a moved unrelated field produce the
+/// same 19-line diff.
+///
+/// # The field list is derived, not written
+///
+/// `CRITERION_9`'s own backticked tokens, intersected with the plan's
+/// top-level `Debug` field set. So the assertion cannot read a field the
+/// criterion does not name, nor skip one it does — including through
+/// part 5's own addition of `generator_fallback_sql`, which appears on
+/// the rendered side before the fixture is regenerated and which this
+/// projection is what says is the ONLY thing that moved.
+#[test]
+fn no_served_by_key_statement_moved() {
+    // The file is `#[path]`-included rather than imported: it is
+    // `#[cfg(test)] pub mod` in the library, which an integration test
+    // binary cannot reach.
+    #[allow(dead_code)]
+    #[path = "../src/compile/criterion_fields.rs"]
+    mod criterion_fields;
+
+    const CRITERION_9: &str = "Criterion 9: no served by-key's SQL moves — for every served \
+        key, the plan's `generator_sqls` and its `by_probe_sql` are the ones the fixture \
+        pinned.";
+
+    let path = fixture_path();
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "read {}: {e} — regenerate with PULSUS_REGEN_BY_KEY_PLANS=1 and review the diff",
+            path.display()
+        )
+    });
+    let pinned: BTreeMap<String, String> =
+        serde_json::from_str(&raw).expect("traces_by_key_plans.json must parse");
+
+    let mut moved: Vec<String> = Vec::new();
+    for key in SERVED_BY_KEYS {
+        let Some(want) = pinned.get(key) else {
+            panic!("{key:?} has no pinned plan");
+        };
+        let got = render_plan(key);
+        // Collected rather than asserted one at a time: a renderer
+        // change moves every key at once, and the whole list is what
+        // says whether one statement moved or all of them did.
+        if let Err(e) = std::panic::catch_unwind(|| {
+            criterion_fields::assert_named_debug_fields(CRITERION_9, &got, want, key);
+        }) {
+            moved.push(
+                e.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_else(|| format!("{key}: panicked")),
+            );
+        }
+    }
+    assert!(
+        moved.is_empty(),
+        "{} served by-key(s) send a different statement:\n{}",
+        moved.len(),
+        moved.join("\n")
+    );
+}
+
 /// The freeze covers the set `docs/api.md` promises, not a sample of it.
 /// A gate whose domain silently narrows is the defect this issue exists
 /// to remove, so the arity is asserted rather than assumed.

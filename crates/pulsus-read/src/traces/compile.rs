@@ -54,8 +54,8 @@ use pulsus_traceql::{
 
 use super::filter::{GenTable, LeafGenerator, PlanError};
 use crate::compile::fold::{
-    BlockReason, Capability, Col, ColSet, Fidelity, Lang, Lower, LowerCx, Name, NeverReason, Pred,
-    Provenance, Relation, Shape, SourceName, SourceTerm,
+    BlockReason, Capability, Col, ColSet, Fidelity, Grouping, Lang, Lower, LowerCx, Name,
+    NeverReason, Pred, Provenance, Relation, Shape, SourceName, SourceTerm,
 };
 use crate::compile::plan::{HandoffCost, PlanCx, SeedBound, SourceRef};
 
@@ -311,63 +311,124 @@ pub fn selector_fidelity(expr: &SpansetExpr) -> Fidelity {
 // ---------------------------------------------------------------------
 
 /// The `HAVING` fragment a spanset aggregate compiles to, or `None` when
-/// this aggregate may not be pushed (issue #492 part 4).
+/// this aggregate may not be pushed (issue #492 parts 4 and 5).
 ///
 /// **The one renderer.** [`AggregateLower::apply`] records what this
 /// returns on the relation and [`super::search_plan::plan_search`] puts
 /// the same string into the statement, so the plan's account of the
 /// query and the query cannot disagree.
 ///
-/// Three families push, and the rule is duplicate-idempotence rather
-/// than taste. `trace_attrs_idx` is a `ReplacingMergeTree` read without
-/// `FINAL`, so an at-least-once replay leaves two rows for one span
-/// (which is why [`super::search_sql::membership_sql`] uses `SELECT
-/// DISTINCT`), and the evaluator deduplicates hydrated spans by
-/// `span_id` (`exec::group_hydrated_rows`). Measured on ClickHouse 26.3
-/// over one trace with two matched spans of 1.5 s and 0.5 s and one of
-/// them replayed: the engine sees `count=2 sum=2.0e9 avg=1.0e9
-/// max=1.5e9 min=0.5e9`; the raw index rows give `count()=3 sum=2.5e9
-/// avg=833333333.33 max=1.5e9 min=0.5e9`, and `uniqExact(span_id)=2`.
-/// `min`, `max` and `uniqExact` agree with the engine; `count()`, `sum`
-/// and `avg` do not.
+/// `group_key` is the SQL expression a preceding `by()` lowered to
+/// ([`group_key_sql`]), or `None` for the ungrouped form. Both arms pass
+/// through the SAME `(aggregate, operator)` rule below, so a per-arm
+/// carve-out cannot be written.
 ///
-/// | stage | fragment |
-/// |---|---|
-/// | `min(duration) <op> t` | `min(duration_ns) <op> <t as i64>` |
-/// | `max(duration) <op> t` | `max(duration_ns) <op> <t as i64>` |
-/// | `count() <op> t`       | `uniqExact(span_id) <op> <t as i64>` |
+/// # The containment, and the six cells it admits
 ///
-/// `uniqExact` and not `count(DISTINCT span_id)`: the latter resolves
-/// through the `count_distinct_implementation` session setting, and a
-/// read whose meaning depends on a setting we do not send is a read
-/// whose meaning we do not know. It also reaches a case a replay does
-/// not: one span with two events carrying the same attribute produces
-/// two index rows identical in every ordering-key column, collapsed on
-/// merge but visible before it, and `count()` would inflate over them.
+/// Write `R` for the generator statement's rows and `D` for the spans
+/// the evaluator aggregates. Every span in `D` is the survivor of one or
+/// more rows of `R` carrying the same `span_id`
+/// (`exec::group_hydrated_rows` keeps the FIRST row per `span_id` in the
+/// hydration read's `(trace_id, timestamp_ns, span_id)` order), and the
+/// selector is then applied to that survivor. So
 ///
-/// `None` for `sum` and `avg` (the measurement above), for an attribute
-/// source (`max(.retries)` reads a `val_num` for a different `key` than
-/// the generator's, which is a join), and for any threshold whose LEXEME
-/// is not an exact integer strictly inside ±2^53
-/// ([`super::search_plan::exact_aggregate_threshold`], which carries the
-/// argument for the bound). `| count() > 2.5` and
-/// `| max(duration) = 9007199254740993` are both accepted queries today
-/// and neither pushes.
+/// ```text
+///    generator rows R  ─────────────────────►  one row per delivery
+///         │  first-row-per-span_id, then the selector
+///         ▼
+///    evaluator spans D ─────────────────────►  R ⊇ D,  ALWAYS
+/// ```
 ///
-/// **A pushed aggregate reads `duration_ns` from `trace_attrs_idx`; the
-/// evaluator reads it from `trace_spans`.** They are two copies of one
-/// fact, and they are bound together at one site:
-/// `pulsus-write/src/protocols/otlp_traces.rs:404` binds `duration_ns`
-/// once per span, and every attribute record for that span and the span
-/// record itself take that same binding. `writer/rows.rs`'s
-/// `trace_attrs_idx` backfill note already states the invariant in prose
-/// — the non-key columns are deterministic functions of the same attr
-/// record — which is what makes the versionless `ReplacingMergeTree`
-/// collapse safe on a key tuple that does not include `duration_ns`.
-/// This is a documented invariant and not a guard: a guard in the read
-/// path would have to re-read `trace_spans` to check it, which is the
-/// read the pushdown exists to avoid.
-pub fn aggregate_having_sql(stage: &PipelineStage) -> Option<String> {
+/// `min` over a superset reads **low**; `max` and `uniqExact` over a
+/// superset read **high**. A HIGH-reading aggregate under `>` or `>=`
+/// admits traces phase 2 then drops; under `<`, `<=`, `=` or `!=` it
+/// LOSES a trace, and a lost trace has no second chance
+/// (`search_eval.rs:3039` filters the spanset list in place and an empty
+/// list ends the trace). A LOW-reading aggregate is the mirror image.
+///
+/// ```text
+///   aggregate      reads   safe operators   ungrouped fragment
+///   count()        HIGH    >   >=           uniqExact(span_id) <op> <t>
+///   max(duration)  HIGH    >   >=           max(duration_ns)   <op> <t>
+///   min(duration)  LOW     <   <=           min(duration_ns)   <op> <t>
+/// ```
+///
+/// **Twelve of the eighteen (aggregate, operator) cells therefore
+/// refuse, and part 4 shipped them pushing.** Measured over corpus U —
+/// seven traces where a `(trace_id, span_id)` can carry two rows that
+/// disagree on `duration_ns` or on the selector — on ClickHouse 26.3,
+/// engine against engine (`{ span.http.method = "GET" } | <cell>` with
+/// `aggregate_pushed()` asserted `true`, against the same rows planned
+/// unpushed):
+///
+/// ```text
+///   cell               engine(unpushed)     engine(pushed)      verdict
+///   count()   >  1     0e 0d 03 01          0e 0d 03 01         PUSH
+///   count()   <  2     0b 0a 02             0b 0a 02            REFUSE (10 002-span cap, below)
+///   min(dur)  <  2s    0b 01                0b 01               PUSH
+///   min(dur)  >  2s    0e 0d 0a 03 02       0e 03 02            REFUSE — loses 0d, 0a
+///   min(dur)  >= 5s    0a                   (none)              REFUSE — loses 0a
+///   max(dur)  >  2s    0e 0d 0a 03 02 01    0e 0d 0a 03 02 01   PUSH
+///   max(dur)  <  2s    0b                   (none)              REFUSE — loses 0b
+///   max(dur)  != 5s    0e 0b 03 02          0e 03 02            REFUSE — loses 0b
+/// ```
+///
+/// `count()` is not exempt, and the witness is the hydration cap rather
+/// than a re-delivery: `search_sql::hydration_sql` carries
+/// `LIMIT MAX_SPANS_PER_TRACE + 1 BY trace_id` (10 000), so a trace with
+/// 10 002 matched spans is evaluated on 10 000 of them while
+/// `uniqExact(span_id)` counts all 10 002. On that corpus
+/// `count() < 10001`, `<= 10000`, `= 10000` and `!= 10002` each return
+/// one trace unpushed and none pushed.
+///
+/// The two refusal rules **compose and neither subsumes the other**: a
+/// cell must be one of these six AND its threshold must survive
+/// [`super::search_plan::exact_aggregate_threshold`] (part 4's ±2^53
+/// lexeme rule). That threshold note, at
+/// `the_pushdown_refuses_every_threshold_the_two_readings_could_disagree_on`,
+/// says `!=` and `>` are the harmless directions — that is true of a
+/// ROUNDED THRESHOLD and does not transfer here, where `!=` loses for
+/// every aggregate.
+///
+/// # The grouped arm
+///
+/// With `V = mapValues(<agg>Map(map(<key>, <arg>)))` the trace-level
+/// question is "does any group satisfy the predicate?", and the same six
+/// cells are the safe ones for the same reason:
+///
+/// ```text
+///   count()        uniqExactMap  span_id      >  >=   arrayMax(V) <op> <t>
+///   max(duration)  maxMap        duration_ns  >  >=   arrayMax(V) <op> <t>
+///   min(duration)  minMap        duration_ns  <  <=   arrayMin(V) <op> <t>
+/// ```
+///
+/// `mapValues(…)` is never empty — a trace in the `GROUP BY` has at
+/// least one row and every column a key may push to is non-nullable —
+/// so `arrayMax`/`arrayMin` are never called on an empty array. Types
+/// were printed rather than inferred:
+/// `toTypeName(mapValues(uniqExactMap(map('a','x'))))` is
+/// `Array(UInt64)` and `toTypeName(mapValues(maxMap(map('a',
+/// toInt64(1)))))` is `Array(Int64)`; ClickHouse compares an
+/// `Array(UInt64)` element against a negative or 2^53+1 literal
+/// accurately, measured on 26.3.
+///
+/// # What still refuses for part 4's reasons
+///
+/// `None` for `sum` and `avg` (a duplicated index row moves them:
+/// measured on one trace with two matched spans of 1.5 s and 0.5 s and
+/// one replayed, the engine sees `avg=1.0e9` and the raw rows
+/// `8.33e8`), for an attribute source (`max(.retries)` reads a
+/// `val_num` for a different `key` than the generator's, which is a
+/// join), and for any threshold whose LEXEME is not an exact integer
+/// strictly inside ±2^53.
+///
+/// `uniqExact` and not `count()`: under the containment above a plain
+/// `count()` would also be sound for `>`/`>=` and is cheaper (245 MB
+/// against 526 MB on the 2,000,000-row corpus), but it makes the
+/// CANDIDATE set move under a byte-identical replay, which
+/// `duplicate_index_rows_do_not_move_a_pushed_min_max_or_count` exists
+/// to prevent. Considered and not taken.
+pub fn aggregate_having_sql(stage: &PipelineStage, group_key: Option<&str>) -> Option<String> {
     let PipelineStage::Aggregate {
         op,
         field,
@@ -377,31 +438,38 @@ pub fn aggregate_having_sql(stage: &PipelineStage) -> Option<String> {
     else {
         return None;
     };
-    // The aggregation source. `sum`/`avg` are refused because a
-    // duplicated index row moves them; an attribute source is refused
-    // because its `val_num` lives on a different `key` than the
-    // generator's rows.
-    let agg = match (op, field) {
-        (AggregateOp::Count, None) => "uniqExact(span_id)",
-        (AggregateOp::Min, Some(FieldExpr::Field(Field::Intrinsic(Intrinsic::Duration)))) => {
-            "min(duration_ns)"
+    // The (aggregate, operator) rule, and it is ONE match both arms pass
+    // through. `arg` is the column the per-group aggregate reads;
+    // `scalar` is the ungrouped aggregate; `map_agg` is its `-Map`
+    // combinator; `wrapper` is the array reduction that asks the
+    // trace-level question. Every other pair returns `None` before the
+    // threshold is read.
+    let is_duration = matches!(
+        field,
+        Some(FieldExpr::Field(Field::Intrinsic(Intrinsic::Duration)))
+    );
+    let (scalar, map_agg, arg, wrapper) = match (op, cmp) {
+        (AggregateOp::Count, ComparisonOp::Gt | ComparisonOp::Gte) if field.is_none() => {
+            ("uniqExact(span_id)", "uniqExactMap", "span_id", "arrayMax")
         }
-        (AggregateOp::Max, Some(FieldExpr::Field(Field::Intrinsic(Intrinsic::Duration)))) => {
-            "max(duration_ns)"
+        (AggregateOp::Max, ComparisonOp::Gt | ComparisonOp::Gte) if is_duration => {
+            ("max(duration_ns)", "maxMap", "duration_ns", "arrayMax")
+        }
+        (AggregateOp::Min, ComparisonOp::Lt | ComparisonOp::Lte) if is_duration => {
+            ("min(duration_ns)", "minMap", "duration_ns", "arrayMin")
         }
         _ => return None,
     };
     let cmp_sql = match cmp {
-        ComparisonOp::Eq => "=",
-        ComparisonOp::Neq => "!=",
         ComparisonOp::Gt => ">",
         ComparisonOp::Gte => ">=",
         ComparisonOp::Lt => "<",
         ComparisonOp::Lte => "<=",
-        // The planner answers 400 for a regex aggregate comparison
-        // before a chain is ever built; refusing here as well means this
-        // renderer never depends on that having happened.
-        ComparisonOp::Re | ComparisonOp::Nre => return None,
+        // Unreachable through the match above, which admits only the
+        // four ordering operators. Kept as an arm rather than an
+        // `unreachable!` so that widening the cell rule cannot render a
+        // comparison this function never named.
+        ComparisonOp::Eq | ComparisonOp::Neq | ComparisonOp::Re | ComparisonOp::Nre => return None,
     };
     // The threshold is read from the stage's LEXEME, not from the
     // evaluator's `f64`, and the read refuses whenever the integer
@@ -409,7 +477,125 @@ pub fn aggregate_having_sql(stage: &PipelineStage) -> Option<String> {
     // `UInt64` for `uniqExact(span_id)` — and the evaluator's `f64` one
     // could put a span on different sides of it.
     let threshold = super::search_plan::exact_aggregate_threshold(*op, field, value)?;
-    Some(format!("{agg} {cmp_sql} {threshold}"))
+    Some(match group_key {
+        None => format!("{scalar} {cmp_sql} {threshold}"),
+        Some(key) => {
+            format!("{wrapper}(mapValues({map_agg}(map({key}, {arg})))) {cmp_sql} {threshold}")
+        }
+    })
+}
+
+// ---------------------------------------------------------------------
+// The `by()` key's SQL
+// ---------------------------------------------------------------------
+
+/// The SQL expression a `by()` key groups on, or `None` when the key may
+/// not be pushed (issue #492 part 5). **The one place a `by()` key
+/// becomes SQL.**
+///
+/// A group key is not compared with an operator, it PARTITIONS, so the
+/// failure mode is a partition that is finer or coarser on one side, and
+/// the direction is not uniform across aggregates: a finer SQL partition
+/// LOSES a qualifying trace under `count() > t` and ADMITS an extra one
+/// under `min(d) > t`. No "wider is safe" argument covers the set, so
+/// the rule is: **the two partitions are identical, or the key does not
+/// push.**
+///
+/// # Keyed on the generator's SOURCE
+///
+/// Only a `trace_spans` generator accepts. The argument in
+/// [`aggregate_having_sql`] needs the map's key and the evaluator's key
+/// to come from the SAME row, which holds when the generator reads
+/// `trace_spans` — `search_eval::resolve_group_value` reads every
+/// pushable key off the hydrated span. It does not hold on
+/// `trace_attrs_idx`: there a `by(duration)` key would be
+/// `trace_attrs_idx.duration_ns` while the evaluator's comes from
+/// `trace_spans.duration_ns`, and those are two rows in two tables with
+/// different deduplication rules (`trace_attrs_idx` is a
+/// `ReplacingMergeTree` whose ordering key does not contain
+/// `duration_ns`, so a merge picks one value arbitrarily, while
+/// `trace_spans` is a plain `MergeTree` and keeps both). A span's
+/// evaluator key could then be absent from the map entirely, and even
+/// `count() > t` could lose a trace.
+///
+/// # Why every string key renders through [`super::search_sql::byte_cap_expr`]
+///
+/// The evaluator groups the byte-capped hydrated value
+/// (`hydration_sql` projects `if(length(name) <= 8192, name,
+/// substringUTF8(name, 1, 2048)) AS name`), so grouping the RAW column
+/// would be a different partition. `length(col) <= 8192` is inclusive,
+/// so 8192 bytes caps to itself and 8193 is the first that truncates.
+/// Measured on ClickHouse 26.3 with three spans, two distinct raw names
+/// of 8193 bytes sharing their first 2048 code points:
+///
+/// ```text
+///   arrayMax(mapValues(uniqExactMap(map(name,      span_id))))  -> 2  count() > 2 DROPS the trace
+///   arrayMax(mapValues(uniqExactMap(map(cap(name), span_id))))  -> 3  count() > 2 KEEPS it
+/// ```
+///
+/// There is no ingest length cap on `name`/`service`
+/// (`pulsus-write/src/protocols/otlp_traces.rs` binds them unbounded),
+/// so the case is reachable through our own write path.
+///
+/// # What refuses, and why each
+///
+/// ```text
+///   by(status)                 status_keyword(i8) has THREE outputs over 256 inputs —
+///                              status_code 0 and 3 both read "unset" and SQL splits them
+///   by(kind)                   kind_keyword(i8), the same shape with six outputs
+///   by(.attr)                  a val/val_num row under a DIFFERENT key than the
+///                              generator's: a second source read, and ADR 0008 names
+///                              no join clause
+///   by(nestedSet*)             computed per trace after the read
+///   by(traceDuration)          a trace-wide co-load, not a column of the generator
+///   by(rootName)               as above
+///   by(rootServiceName)        as above
+///   by(span:childCount)        as above
+/// ```
+///
+/// `by(duration)` and the three id keys DO push: the evaluator renders
+/// `go_duration_string(span.duration_ns)` and lowercase hex
+/// respectively, and both maps are injective, so distinct column values
+/// give distinct evaluator keys and the two partitions coincide.
+pub(crate) fn group_key_sql(field: &Field, source: SourceRef) -> Option<String> {
+    if source != TRACE_SPANS {
+        return None;
+    }
+    let cap = super::search_sql::byte_cap_expr;
+    Some(match field {
+        Field::Intrinsic(Intrinsic::Name) => cap("name"),
+        Field::Intrinsic(Intrinsic::StatusMessage) => cap("status_message"),
+        Field::Intrinsic(Intrinsic::InstrumentationName) => cap("scope_name"),
+        Field::Intrinsic(Intrinsic::InstrumentationVersion) => cap("scope_version"),
+        Field::Intrinsic(Intrinsic::Duration) => "duration_ns".to_string(),
+        Field::Intrinsic(Intrinsic::SpanId) => "span_id".to_string(),
+        Field::Intrinsic(Intrinsic::ParentId) => "parent_id".to_string(),
+        Field::Intrinsic(Intrinsic::TraceId) => "trace_id".to_string(),
+        Field::Attribute { scope, key }
+            if *scope == pulsus_traceql::AttrScope::Resource && key == "service.name" =>
+        {
+            cap("service")
+        }
+        // Every refusal, listed as its own arm so a new `Intrinsic`
+        // variant fails to compile here rather than silently joining the
+        // accept list.
+        Field::Intrinsic(
+            Intrinsic::Status
+            | Intrinsic::Kind
+            | Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount
+            | Intrinsic::TraceDuration
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName
+            | Intrinsic::EventName
+            | Intrinsic::EventTimeSinceStart
+            | Intrinsic::LinkSpanId
+            | Intrinsic::LinkTraceId,
+        )
+        | Field::Attribute { .. } => return None,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -587,6 +773,18 @@ impl Lang for Tql {
     }
 }
 
+/// The one grouping key a preceding `by()` recorded, as SQL — the
+/// argument [`aggregate_having_sql`] takes.
+///
+/// A single accessor rather than the expression written twice, because
+/// [`AggregateLower::capability`] and [`AggregateLower::apply`] must ask
+/// the renderer the SAME question; a `capability` that admitted the
+/// ungrouped form while `apply` rendered the grouped one would put a
+/// fragment in the statement that no precondition checked.
+fn grouped_key(rel: &Relation<Tql>) -> Option<&str> {
+    rel.grouping.as_ref()?.keys.first().map(String::as_str)
+}
+
 // ---------------------------------------------------------------------
 // Per-link rules
 // ---------------------------------------------------------------------
@@ -756,8 +954,9 @@ impl Lower<Tql> for BoolTruthLower {
 }
 
 impl Lower<Tql> for AggregateLower {
-    /// `exact` **and** `grouping.is_none()` **and** a fragment
-    /// [`aggregate_having_sql`] will render.
+    /// `exact`, **no fragment already in this statement's `HAVING`**, and
+    /// a fragment [`aggregate_having_sql`] will render for this
+    /// (aggregate, operator) pair and this grouping.
     ///
     /// An aggregate over a superset is not merely wide, it is wrong:
     /// `max()` can exceed the true maximum and admit a trace that should
@@ -765,11 +964,16 @@ impl Lower<Tql> for AggregateLower {
     /// Measured, the cost of getting this wrong is 333 qualifying traces
     /// becoming 1,000.
     ///
-    /// The fourth condition is issue #492 part 4's: the aggregate
-    /// families whose value a duplicated index row moves — `sum` and
-    /// `avg` — and an attribute source and a non-integral threshold get
-    /// `No(NotYetLowered)`, because a SQL form for them exists in
-    /// principle and none has been written that is safe over this index.
+    /// **`grouping.is_some()` is no longer a refusal** (issue #492 part
+    /// 5). A grouping reaches here only when [`ByLower`] found the key
+    /// renderable on this generator's source; a key that does not render
+    /// clears `exact` exactly as it did before, so the same shapes are
+    /// refused and one rule decides it.
+    ///
+    /// The renderer condition is part 4's, widened by part 5: `sum` and
+    /// `avg`, an attribute source, a non-integral threshold, and now the
+    /// twelve anti-monotone (aggregate, operator) cells all get
+    /// `No(NotYetLowered)`.
     fn capability(&self, s: &TqlLink, rel: &Relation<Tql>) -> Capability {
         if rel.shape != TqlShape::Spans {
             return Capability::No(BlockReason::ShapeMismatch);
@@ -777,13 +981,26 @@ impl Lower<Tql> for AggregateLower {
         if !rel.exact {
             return Capability::No(BlockReason::NotExact);
         }
-        if rel.grouping.is_some() {
-            return Capability::No(BlockReason::ShapeMismatch);
+        // A statement carries at most one pushed fragment: `plan_search`
+        // re-renders only when the fold recorded exactly one.
+        //
+        // **This line has no witness on its own**, and saying so is the
+        // point. [`Self::fidelity`] returns `Wider`, which clears
+        // `rel.exact` the moment the first aggregate applies, so the
+        // `!rel.exact` check above always refuses a second aggregate
+        // first. Measured over 9,425 planned queries: deleting this line
+        // alone moves no column of the enumeration freeze. The two
+        // conditions are individually redundant and jointly load-bearing
+        // — with BOTH removed, 477 of those queries change push status —
+        // so this must not be cited as the thing that enforces
+        // one-fragment-per-statement. `Fidelity::Wider` is.
+        if !rel.having.is_empty() {
+            return Capability::No(BlockReason::NotYetLowered);
         }
         let TqlLink::Pipe(stage) = s else {
             return Capability::No(BlockReason::NotYetLowered);
         };
-        if aggregate_having_sql(stage).is_none() {
+        if aggregate_having_sql(stage, grouped_key(rel)).is_none() {
             return Capability::No(BlockReason::NotYetLowered);
         }
         Capability::Yes
@@ -798,25 +1015,32 @@ impl Lower<Tql> for AggregateLower {
         _cx: &LowerCx<'_, Tql>,
     ) -> Result<Relation<Tql>, PlanError> {
         if let TqlLink::Pipe(stage) = s
-            && let Some(frag) = aggregate_having_sql(stage)
+            && let Some(frag) = aggregate_having_sql(stage, grouped_key(&rel))
         {
             rel.having.push(frag);
         }
         Ok(rel)
     }
-    /// [`Fidelity::Equivalent`]: `capability` admits the link only when
-    /// the accumulated relation is already `exact` — the generator's
-    /// rows are the selector's matched spans — and the fragment
-    /// aggregates the same column over the same set the evaluator does.
-    /// So `orig ⟺ sql` and not merely `orig ⟹ sql`.
+    /// [`Fidelity::Wider`], for every pushed aggregate, grouped or not
+    /// (issue #492 part 5).
     ///
-    /// The evaluator still recomputes the aggregate, because the
-    /// response's spanSet `attributes` carries its VALUE (issue #510);
-    /// what `Equivalent` says is that no trace the SQL returned will be
-    /// dropped by that recomputation, which is what keeps `exact` set
-    /// for the links after it.
+    /// The statement aggregates the generator's ROWS and the evaluator
+    /// its DEDUPLICATED, selector-matched spans. Those are not the same
+    /// set — `R ⊇ D`, [`aggregate_having_sql`] — so `orig ⟹ sql` and the
+    /// evaluator MUST re-apply the link. Part 4 returned
+    /// [`Fidelity::Equivalent`] here, which asserts `orig ⟺ sql`; the
+    /// counterexamples are measured and pasted in
+    /// [`aggregate_having_sql`]'s table, where four cells admit a trace
+    /// phase 2 then drops.
+    ///
+    /// **The consequence is real and small.** `Wider` clears `rel.exact`
+    /// at `fold.rs:957`, so a SECOND aggregate in the same pipeline can
+    /// no longer lower. That is the behaviour we want: `plan_search`
+    /// re-renders only when the fold recorded exactly one fragment, so
+    /// before this a two-aggregate pipeline recorded two `Lowered` links
+    /// and pushed neither.
     fn fidelity(&self, _s: &TqlLink, _rel: &Relation<Tql>) -> Fidelity {
-        Fidelity::Equivalent
+        Fidelity::Wider
     }
     /// **Shape unchanged** — whatever the fold has accumulated, not reset
     /// to `Spans`; **clears `exact`**, because the evaluator will drop
@@ -848,12 +1072,33 @@ impl Lower<Tql> for ByLower {
     ) -> Result<Relation<Tql>, PlanError> {
         Ok(rel)
     }
-    /// **Shape unchanged**; clears `exact`; records the key as an
-    /// evaluator-owned group consumer, so a later `Aggregate` refuses.
+    /// **Shape unchanged**; records the key as an evaluator-owned group
+    /// consumer in both branches; and then one of two things (issue #492
+    /// part 5):
+    ///
+    /// * the key RENDERS on this generator's source ([`group_key_sql`]),
+    ///   the grouping slot is free, and the relation is still exact —
+    ///   the grouping is recorded and `exact` is left alone, so a
+    ///   following `Aggregate` compiles a per-group fragment;
+    /// * otherwise `exact` is cleared, exactly as before part 5, so a
+    ///   following `Aggregate` refuses with `NotExact`.
+    ///
+    /// The link itself still does not lower ([`Self::capability`] is
+    /// unchanged): `Capability::Yes` would mean "the evaluator MUST NOT
+    /// re-apply this link", and the evaluator is what builds the span
+    /// sets.
     fn residual_effect(&self, s: &TqlLink, mut rel: Relation<Tql>) -> Relation<Tql> {
         if let TqlLink::Pipe(PipelineStage::By { key }) = s {
             rel.cols
                 .set_provenance(&Name::new(key.to_string()), Provenance::EvaluatorOnly);
+            if rel.exact
+                && rel.grouping.is_none()
+                && let FieldExpr::Field(field) = key
+                && let Some(sql) = group_key_sql(field, rel.source_ref())
+            {
+                rel.grouping = Some(Grouping { keys: vec![sql] });
+                return rel;
+            }
         }
         rel.exact = false;
         rel
@@ -862,22 +1107,34 @@ impl Lower<Tql> for ByLower {
 
 impl Lower<Tql> for CoalesceLower {
     /// Two rows in one dispatcher, and one rule rather than two special
-    /// cases: with a preceding `By` the grouping slot is occupied and
-    /// lowering means WRAPPING; with none it is the identity and costs
-    /// nothing.
+    /// cases.
+    ///
+    /// * No grouping — the identity. It contributes no SQL and cannot
+    ///   fail.
+    /// * A grouping and no `HAVING` yet — the slot is FREED (issue #492
+    ///   part 5), so a following `by()` may fill it again. This is the
+    ///   reference's own merge behaviour, read from the pinned build:
+    ///   the merge stage concatenates every span set's spans into one
+    ///   and carries no group attributes forward, so an unfiltered
+    ///   `by()` followed by `coalesce()` is the identity.
+    /// * A grouping WITH a `HAVING` — refuse. The aggregate selected
+    ///   groups; the spans it selected are not recoverable from a
+    ///   statement that has already reduced them.
     fn capability(&self, _s: &TqlLink, rel: &Relation<Tql>) -> Capability {
-        if rel.grouping.is_none() {
-            // The identity: it contributes no SQL and cannot fail.
+        if rel.grouping.is_none() || rel.having.is_empty() {
             return Capability::Yes;
         }
         Capability::No(BlockReason::NotYetLowered)
     }
+    /// Frees the grouping slot. In the no-grouping arm this is the
+    /// identity, so one assignment covers both `Yes` branches.
     fn apply(
         &self,
         _s: &TqlLink,
-        rel: Relation<Tql>,
+        mut rel: Relation<Tql>,
         _cx: &LowerCx<'_, Tql>,
     ) -> Result<Relation<Tql>, PlanError> {
+        rel.grouping = None;
         Ok(rel)
     }
     /// Grouped: shape unchanged, clears `exact`. Ungrouped: the identity,
@@ -1402,6 +1659,18 @@ mod tests {
         rel
     }
 
+    /// The SQL `by(name)` lowers to on a `trace_spans` generator —
+    /// written out rather than called, so the expectation is not
+    /// produced by the code under test.
+    const NAME_KEY_SQL: &str = "if(length(name) <= 8192, name, substringUTF8(name, 1, 2048))";
+
+    fn grouped_by(mut rel: Relation<Tql>, key: &str) -> Relation<Tql> {
+        rel.grouping = Some(Grouping {
+            keys: vec![key.to_string()],
+        });
+        rel
+    }
+
     fn ordered(mut rel: Relation<Tql>, key: &str) -> Relation<Tql> {
         rel.ordering = Some(Ordering {
             keys: vec![(key.to_string(), SortDir::Desc)],
@@ -1430,8 +1699,8 @@ mod tests {
     /// *none* assert that the effect IS the identity — so the exemption
     /// is itself a check rather than a silence.
     ///
-    /// **Nineteen rows**, one per link kind: ten with a stated effect
-    /// (`Aggregate`, `By`, grouped `Coalesce`, `Select`, `Order`,
+    /// **Twenty rows**: eleven with a stated effect (`Aggregate`, `By`
+    /// in each of its two branches, grouped `Coalesce`, `Select`, `Order`,
     /// `Limit`, `Emit`, and issue #492 part 3's `Structural`,
     /// `NestedSet` and `BoolTruth`, which each clear `exact` because the
     /// SQL means strictly more than the query once they are residual)
@@ -1444,6 +1713,7 @@ mod tests {
         let sel = parse_selector(r#"{ resource.service.name = "checkout" }"#);
         let agg = pipe(r#"{ .a = "1" } | max(duration) > 1s"#);
         let by = pipe(r#"{ .a = "1" } | by(name)"#);
+        let by_status = pipe(r#"{ .a = "1" } | by(status)"#);
         let coalesce = pipe(r#"{ .a = "1" } | coalesce()"#);
         let select = pipe(r#"{ .a = "1" } | select(span.http.method)"#);
 
@@ -1476,13 +1746,32 @@ mod tests {
                 effect_is_constant: false,
                 has_effect: true,
             },
+            // Issue #492 part 5: `By` has TWO branches and both are
+            // rows. With a key that renders on this generator's source
+            // the grouping is recorded and `exact` is left alone; with
+            // one that does not, `exact` is cleared exactly as before
+            // part 5. A table carrying only the first would let the
+            // renderable set widen with nothing naming it.
             EffectRow {
-                name: "By",
+                name: "By, with a key that renders",
                 link: TqlLink::Pipe(by),
                 s1: base(TqlShape::Spans),
                 s2: base(TqlShape::Traces),
-                e1: not_exact(evaluator_owned(base(TqlShape::Spans), "name")),
-                e2: not_exact(evaluator_owned(base(TqlShape::Traces), "name")),
+                e1: grouped_by(evaluator_owned(base(TqlShape::Spans), "name"), NAME_KEY_SQL),
+                e2: grouped_by(
+                    evaluator_owned(base(TqlShape::Traces), "name"),
+                    NAME_KEY_SQL,
+                ),
+                effect_is_constant: false,
+                has_effect: true,
+            },
+            EffectRow {
+                name: "By, with a key that does not render",
+                link: TqlLink::Pipe(by_status),
+                s1: base(TqlShape::Spans),
+                s2: base(TqlShape::Traces),
+                e1: not_exact(evaluator_owned(base(TqlShape::Spans), "status")),
+                e2: not_exact(evaluator_owned(base(TqlShape::Traces), "status")),
                 effect_is_constant: false,
                 has_effect: true,
             },
@@ -1587,7 +1876,55 @@ mod tests {
                 has_effect: true,
             });
         }
-        assert_every_residual_state_effect::<Tql>(&rows, 19);
+        assert_every_residual_state_effect::<Tql>(&rows, 20);
+    }
+
+    /// Issue #492 part 5 criterion 32, and its assertion names its own
+    /// fields.
+    ///
+    /// The whole-`Relation` row in
+    /// [`every_residual_state_effect_is_the_one_the_document_states`]
+    /// stays exactly as strong as it is; this is a projection beside it,
+    /// not instead of it. The projection exists because the whole-row
+    /// comparison reddens for any field — it reddened for a change to
+    /// the PROVENANCE NAME during review, which criterion 32's sentence
+    /// does not mention — so the row cannot say which channel moved.
+    ///
+    /// The field list is not written here. It is derived from
+    /// `CRITERION_32`'s own backticked tokens, intersected with the
+    /// relation's top-level field set, so the only way to change what is
+    /// asserted is to change the sentence.
+    #[test]
+    fn the_by_link_records_the_grouping_and_leaves_exactness_alone_when_the_key_renders() {
+        use crate::compile::criterion_fields::assert_named_debug_fields;
+
+        const CRITERION_32: &str = "Criterion 32: `ByLower`'s residual state effect is the one \
+            the table states — a `by()` key that renders on this generator's source records the \
+            `grouping` and leaves `exact` alone, and one that does not records no `grouping` and \
+            clears `exact`.";
+
+        let by_name = TqlLink::Pipe(pipe(r#"{ .a = "1" } | by(name)"#));
+        let by_status = TqlLink::Pipe(pipe(r#"{ .a = "1" } | by(status)"#));
+        for (link, expected, ctx) in [
+            (
+                &by_name,
+                grouped_by(evaluator_owned(base(TqlShape::Spans), "name"), NAME_KEY_SQL),
+                "by(name), which renders on trace_spans",
+            ),
+            (
+                &by_status,
+                not_exact(evaluator_owned(base(TqlShape::Spans), "status")),
+                "by(status), whose keyword map is not injective",
+            ),
+        ] {
+            let got = Tql::lower_of(link).residual_effect(link, base(TqlShape::Spans));
+            assert_named_debug_fields(
+                CRITERION_32,
+                &format!("{got:#?}"),
+                &format!("{expected:#?}"),
+                ctx,
+            );
+        }
     }
 
     /// `Emit` is `Never`, AND the plan builder gives it its own SQL part
@@ -1918,7 +2255,7 @@ mod tests {
         );
     }
 
-    /// Issue #492 part 4 criterion 7: **the pushdown refuses every unsafe
+    /// Issue #492 parts 4 and 5 — **the pushdown refuses every unsafe
     /// shape, and each refusal names the condition that refused it.**
     ///
     /// Three things can stop a spanset aggregate reaching the generator
@@ -1927,24 +2264,26 @@ mod tests {
     ///
     /// ```text
     ///   Refusal::Renderer   aggregate_having_sql said None — the aggregate
-    ///                       family, its source, or its threshold
+    ///                       family, its (aggregate, operator) cell, or its
+    ///                       threshold
     ///   Refusal::NotExact   the generator's rows are not the selector's
-    ///                       matched spans (which of the six conditions)
+    ///                       matched spans (which of the conditions)
     ///   Refusal::FoldState  both of the above are satisfied and the FOLD
-    ///                       still refuses: a `by()` before the aggregate
-    ///                       has cleared `exact`
+    ///                       still refuses: a `by()` whose key does not
+    ///                       render has cleared `exact`
     /// ```
     ///
-    /// The last row is the one a reader would not predict: `{ .k = "v" }
-    /// | by(name) | count() > 2` has an exact generator AND a renderable
-    /// fragment, and must still not push, because the aggregate then
-    /// filters GROUPS and `uniqExact(span_id)` over the whole trace is a
-    /// different question.
+    /// **The refusal is a property of a PAIR, so the table carries every
+    /// cell and not only the pushes.** A table listing what pushes cannot
+    /// see a missing refusal: drop the operator gate from
+    /// [`aggregate_having_sql`] and twelve rows per arm become `Push`
+    /// with no test naming them. Hence all eighteen (aggregate, operator)
+    /// cells on the attribute-index generator, all eighteen on the
+    /// `ServiceEq` one, and all eighteen grouped — six `Push` and twelve
+    /// `RefusedByRenderer` each — with the array length in the type.
     ///
-    /// The list is CLOSED at the other end too: over the golden corpus,
-    /// `traces_search_sql.rs`'s
-    /// `the_generator_having_is_the_fragment_the_plan_recorded` asserts
-    /// the set of pushing cases equals a frozen four-name list.
+    /// The `by()`-key table is the other half of the same shape: a key
+    /// that does not render must refuse, and a key that does must push.
     #[test]
     fn the_pushdown_precondition_refuses_every_unsafe_shape() {
         use super::super::search_plan::NotExact;
@@ -1984,12 +2323,16 @@ mod tests {
             if let Some(frag) = plan.pushed_having() {
                 return Verdict::Push(frag.to_string());
             }
-            // The renderer alone, read straight off the AST.
+            // The renderer alone, read straight off the AST. The
+            // ungrouped form is the right question to ask it: the
+            // six-cell rule is the SAME on both arms, so a cell the
+            // ungrouped renderer refuses is one the grouped renderer
+            // refuses too.
             let renders = query
                 .pipeline
                 .iter()
                 .filter(|s| matches!(s, PipelineStage::Aggregate { .. }))
-                .all(|s| aggregate_having_sql(s).is_some());
+                .all(|s| aggregate_having_sql(s, None).is_some());
             if !renders {
                 return Verdict::RefusedByRenderer;
             }
@@ -2000,22 +2343,12 @@ mod tests {
         }
 
         let push = |frag: &str| Verdict::Push(frag.to_string());
-        let rows: [(&str, Verdict); 18] = [
-            // --- pushed ------------------------------------------------
-            (
-                r#"{ span.http.method = "GET" } | max(duration) > 1s"#,
-                push("max(duration_ns) > 1000000000"),
-            ),
-            (
-                r#"{ span.http.method = "GET" } | min(duration) >= 1s"#,
-                push("min(duration_ns) >= 1000000000"),
-            ),
-            (
-                r#"{ span.http.method = "GET" } | count() > 2"#,
-                push("uniqExact(span_id) > 2"),
-            ),
+
+        // --- the two exact leaf families, and everything that is neither
+        let shapes: [(&str, Verdict); 15] = [
             // Unscoped: no `scope` term on either side, so the two
-            // predicates are byte-equal and condition (5) decides it.
+            // predicates are byte-equal and the predicate comparison
+            // decides it.
             (
                 r#"{ .k = "v" } | max(duration) > 1s"#,
                 push("max(duration_ns) > 1000000000"),
@@ -2026,37 +2359,55 @@ mod tests {
                 r#"{ span.a = true } | max(duration) > 1s"#,
                 push("max(duration_ns) > 1000000000"),
             ),
+            // Issue #492 part 5: the SECOND exact family. A bare
+            // `resource.service.name` equality is a `PREWHERE`-carrying
+            // `trace_spans` read, and until part 5 nothing pushed for it
+            // at all.
+            (
+                r#"{ resource.service.name = "checkout" } | max(duration) > 1s"#,
+                push("max(duration_ns) > 1000000000"),
+            ),
             // --- refused because the generator is not exact ------------
-            // An attribute regex compiles to `ValuePred::Regex`, so
-            // condition (3) refuses it BEFORE condition (6) is reached.
-            // Condition (6) is not thereby redundant — the second half of
-            // this test builds the input where it is the one that
-            // refuses.
+            // An attribute regex compiles to `ValuePred::Regex`, so the
+            // value-predicate condition refuses it before the selector
+            // fidelity one is reached. That condition is not thereby
+            // redundant — the second half of this test builds the input
+            // where it is the one that refuses.
             (
                 r#"{ span.http.method =~ "GE.*" } | max(duration) > 1s"#,
                 Verdict::RefusedNotExact(NotExact::ValuePredIsNotEquality),
             ),
             // A PHYSICAL regex leaf is refused one condition earlier
-            // still: it is not an attribute-membership leaf at all.
+            // still: it is in neither exact family.
             (
                 r#"{ name =~ "a.*" } | max(duration) > 1s"#,
-                Verdict::RefusedNotExact(NotExact::LeafIsNotAPositiveAttrMatch),
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAnExactLeafFamily),
             ),
             (
                 r#"{ span.http.method != "GET" } | max(duration) > 1s"#,
-                Verdict::RefusedNotExact(NotExact::LeafIsNotAPositiveAttrMatch),
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAnExactLeafFamily),
             ),
             (
                 "{ span.http.status_code >= 500 } | max(duration) > 1s",
                 Verdict::RefusedNotExact(NotExact::ValuePredIsNotEquality),
             ),
+            // A service INEQUALITY is not the `ServiceEq` family: absence
+            // is not indexable, so its generator is the time-range
+            // fallback.
             (
-                r#"{ resource.service.name = "checkout" } | max(duration) > 1s"#,
-                Verdict::RefusedNotExact(NotExact::LeafIsNotAPositiveAttrMatch),
+                r#"{ resource.service.name != "checkout" } | max(duration) > 1s"#,
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAnExactLeafFamily),
+            ),
+            // A service REGEX generates through the attribute index and
+            // evaluates on the physical column, so it is in neither
+            // family either.
+            (
+                r#"{ resource.service.name =~ "check.*" } | max(duration) > 1s"#,
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAnExactLeafFamily),
             ),
             (
                 "{ duration > 2s } | max(duration) > 1s",
-                Verdict::RefusedNotExact(NotExact::LeafIsNotAPositiveAttrMatch),
+                Verdict::RefusedNotExact(NotExact::LeafIsNotAnExactLeafFamily),
             ),
             (
                 r#"{ .a = "1" && .b = "2" } | max(duration) > 1s"#,
@@ -2079,32 +2430,425 @@ mod tests {
                 r#"{ span.http.method = "GET" } | max(span.retries) > 1"#,
                 Verdict::RefusedByRenderer,
             ),
+        ];
+
+        // --- all eighteen cells, ungrouped, on the attribute index -----
+        //
+        // Twelve of these eighteen pushed at `ddb48c96` and returned
+        // FEWER traces than the query matches. The `min`/`max` losses
+        // need a `(trace_id, span_id)` with two rows disagreeing on
+        // `duration_ns`; the four `count()` losses need a trace past the
+        // 10 000-span hydration cap, which `uniqExact(span_id)` counts
+        // past and the evaluator never sees.
+        let ungrouped_attrs: [(&str, Verdict); 18] = [
             (
-                r#"{ span.http.method = "GET" } | count() > 2.5"#,
+                r#"{ span.http.method = "GET" } | count() > 1"#,
+                push("uniqExact(span_id) > 1"),
+            ),
+            (
+                r#"{ span.http.method = "GET" } | count() >= 2"#,
+                push("uniqExact(span_id) >= 2"),
+            ),
+            (
+                r#"{ span.http.method = "GET" } | count() < 2"#,
                 Verdict::RefusedByRenderer,
             ),
-            // --- refused by the fold, with both other checks passing ---
+            (
+                r#"{ span.http.method = "GET" } | count() <= 1"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | count() = 1"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | count() != 2"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | min(duration) < 2s"#,
+                push("min(duration_ns) < 2000000000"),
+            ),
+            (
+                r#"{ span.http.method = "GET" } | min(duration) <= 1s"#,
+                push("min(duration_ns) <= 1000000000"),
+            ),
+            (
+                r#"{ span.http.method = "GET" } | min(duration) > 2s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | min(duration) >= 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | min(duration) = 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | min(duration) != 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | max(duration) > 2s"#,
+                push("max(duration_ns) > 2000000000"),
+            ),
+            (
+                r#"{ span.http.method = "GET" } | max(duration) >= 5s"#,
+                push("max(duration_ns) >= 5000000000"),
+            ),
+            (
+                r#"{ span.http.method = "GET" } | max(duration) < 2s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | max(duration) <= 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | max(duration) = 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ span.http.method = "GET" } | max(duration) != 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+        ];
+
+        // --- all eighteen cells, ungrouped, on the `ServiceEq` read ----
+        //
+        // `R ⊇ D` holds on this source for one more reason than on the
+        // index: the selector reads `service`, a column the evaluator
+        // DEDUPLICATES, so a span the generator counts can be one the
+        // evaluator has dropped.
+        let ungrouped_service: [(&str, Verdict); 18] = [
+            (
+                r#"{ resource.service.name = "grp" } | count() > 1"#,
+                push("uniqExact(span_id) > 1"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | count() >= 2"#,
+                push("uniqExact(span_id) >= 2"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | count() < 2"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | count() <= 1"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | count() = 1"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | count() != 2"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | min(duration) < 2s"#,
+                push("min(duration_ns) < 2000000000"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | min(duration) <= 1s"#,
+                push("min(duration_ns) <= 1000000000"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | min(duration) > 2s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | min(duration) >= 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | min(duration) = 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | min(duration) != 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | max(duration) > 2s"#,
+                push("max(duration_ns) > 2000000000"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | max(duration) >= 5s"#,
+                push("max(duration_ns) >= 5000000000"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | max(duration) < 2s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | max(duration) <= 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | max(duration) = 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | max(duration) != 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+        ];
+
+        // --- all eighteen cells, grouped by a renderable key ----------
+        let grouped_by_name: [(&str, Verdict); 18] = [
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | count() > 1"#,
+                push(
+                    "arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), span_id)))) > 1",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | count() >= 2"#,
+                push(
+                    "arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), span_id)))) >= 2",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | count() < 2"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | count() <= 1"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | count() = 1"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | count() != 2"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | min(duration) < 2s"#,
+                push(
+                    "arrayMin(mapValues(minMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), duration_ns)))) < 2000000000",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | min(duration) <= 1s"#,
+                push(
+                    "arrayMin(mapValues(minMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), duration_ns)))) <= 1000000000",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | min(duration) > 2s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | min(duration) >= 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | min(duration) = 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | min(duration) != 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | max(duration) > 2s"#,
+                push(
+                    "arrayMax(mapValues(maxMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), duration_ns)))) > 2000000000",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | max(duration) >= 5s"#,
+                push(
+                    "arrayMax(mapValues(maxMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), duration_ns)))) >= 5000000000",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | max(duration) < 2s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | max(duration) <= 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | max(duration) = 1s"#,
+                Verdict::RefusedByRenderer,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(name) | max(duration) != 5s"#,
+                Verdict::RefusedByRenderer,
+            ),
+        ];
+
+        // --- the `by()` key's own accept/refuse set --------------------
+        //
+        // A key that renders fills the grouping slot and leaves `exact`
+        // set, so the aggregate compiles a per-group fragment; a key that
+        // does not clears `exact`, so the aggregate refuses by fold
+        // state. Both directions are here, because a table of pushes
+        // alone cannot see a key that started rendering.
+        let keys: [(&str, Verdict); 15] = [
+            // `by(duration)` is exact because `go_duration_string` is
+            // injective over `i64` — a separate test measures that.
+            (
+                r#"{ resource.service.name = "grp" } | by(duration) | count() > 2"#,
+                push("arrayMax(mapValues(uniqExactMap(map(duration_ns, span_id)))) > 2"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(resource.service.name) | count() > 2"#,
+                push(
+                    "arrayMax(mapValues(uniqExactMap(map(if(length(service) <= 8192, service, \
+                     substringUTF8(service, 1, 2048)), span_id)))) > 2",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(statusMessage) | count() > 2"#,
+                push(
+                    "arrayMax(mapValues(uniqExactMap(map(if(length(status_message) <= 8192, \
+                     status_message, substringUTF8(status_message, 1, 2048)), span_id)))) > 2",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(instrumentation:name) | count() > 2"#,
+                push(
+                    "arrayMax(mapValues(uniqExactMap(map(if(length(scope_name) <= 8192, \
+                     scope_name, substringUTF8(scope_name, 1, 2048)), span_id)))) > 2",
+                ),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(instrumentation:version) | count() > 2"#,
+                push(
+                    "arrayMax(mapValues(uniqExactMap(map(if(length(scope_version) <= 8192, \
+                     scope_version, substringUTF8(scope_version, 1, 2048)), span_id)))) > 2",
+                ),
+            ),
+            // Hex is injective, so all three id keys induce the same
+            // partition as the evaluator's lowercase-hex rendering.
+            (
+                r#"{ resource.service.name = "grp" } | by(span:id) | count() > 2"#,
+                push("arrayMax(mapValues(uniqExactMap(map(span_id, span_id)))) > 2"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(span:parentID) | count() > 2"#,
+                push("arrayMax(mapValues(uniqExactMap(map(parent_id, span_id)))) > 2"),
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(trace:id) | count() > 2"#,
+                push("arrayMax(mapValues(uniqExactMap(map(trace_id, span_id)))) > 2"),
+            ),
+            // `status_keyword` has three outputs over 256 inputs —
+            // `status_code` 0 and 3 both read "unset" — so SQL splits a
+            // group the evaluator merges.
+            (
+                r#"{ resource.service.name = "grp" } | by(status) | count() > 2"#,
+                Verdict::RefusedByFoldState,
+            ),
+            // `kind_keyword`, six outputs over 256 inputs, same shape.
+            (
+                r#"{ resource.service.name = "grp" } | by(kind) | count() > 2"#,
+                Verdict::RefusedByFoldState,
+            ),
+            // An attribute key is a `val`/`val_num` row under a DIFFERENT
+            // key than the generator's: a second source read, and ADR
+            // 0008 names no join clause.
+            (
+                r#"{ resource.service.name = "grp" } | by(span.foo) | count() > 2"#,
+                Verdict::RefusedByFoldState,
+            ),
+            // The co-load keys are computed per trace after the read and
+            // are columns of neither generator source.
+            (
+                r#"{ resource.service.name = "grp" } | by(traceDuration) | count() > 2"#,
+                Verdict::RefusedByFoldState,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(nestedSetLeft) | count() > 2"#,
+                Verdict::RefusedByFoldState,
+            ),
+            (
+                r#"{ resource.service.name = "grp" } | by(span:childCount) | count() > 2"#,
+                Verdict::RefusedByFoldState,
+            ),
+            // `name` is not a column of `trace_attrs_idx`, so the SAME
+            // key that renders above does not render on this source.
+            // That is the source restriction, as a pair.
             (
                 r#"{ span.http.method = "GET" } | by(name) | count() > 2"#,
                 Verdict::RefusedByFoldState,
             ),
         ];
+
+        // Collected rather than asserted one at a time. Dropping the
+        // operator gate turns TWELVE cells per arm into pushes at once,
+        // and the whole set is the finding: a row-by-row assertion names
+        // the first and says nothing about how many others moved with
+        // it, which is exactly the question "did the rule move or did one
+        // row?" turns on.
+        let rows: Vec<(&str, Verdict)> = shapes
+            .into_iter()
+            .chain(ungrouped_attrs)
+            .chain(ungrouped_service)
+            .chain(grouped_by_name)
+            .chain(keys)
+            .collect();
+        let total = rows.len();
+        let mut wrong: Vec<String> = Vec::new();
         for (q, want) in rows {
             let got = verdict(q);
-            assert_eq!(got, want, "{q}: expected {want:?}, got {got:?}");
+            if got != want {
+                wrong.push(format!("{q}: expected {want:?}, got {got:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {total} rows disagree:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+
+        // --- the service literal's cap boundary, as a PAIR -------------
+        //
+        // The generator's `PREWHERE` compares the RAW `service` column
+        // and the evaluator the byte-capped one, so they disagree exactly
+        // when the literal is what a capped value can equal — a literal
+        // of 2048 code points. 2047 is the last that cannot be, and the
+        // two rows differ by one character.
+        {
+            let under = "a".repeat(2047);
+            let at = "a".repeat(2048);
+            assert_eq!(
+                verdict(&format!(
+                    r#"{{ resource.service.name = "{under}" }} | count() > 2"#
+                )),
+                push("uniqExact(span_id) > 2"),
+                "a service literal one code point below the cap must still push"
+            );
+            assert_eq!(
+                verdict(&format!(
+                    r#"{{ resource.service.name = "{at}" }} | count() > 2"#
+                )),
+                Verdict::RefusedNotExact(NotExact::ServiceLiteralAtTheCapBoundary),
+                "at the cap a capped stored value can equal the literal and a raw one cannot"
+            );
         }
 
         // --- condition (6) is live, and no parsed query reaches it -----
         //
         // Every regex the planner can build is refused earlier: an
-        // attribute regex by (3), a physical one by (2). So the only way
-        // to show (6) is not dead code is to hand it the input where
-        // (1)-(5) hold and the SELECTOR still carries a regex. That input
-        // is not one `plan_search` produces — it is the input `(3)` would
-        // hand it if `(3)` were ever widened to admit a regex probe, and
-        // the aggregate over that generator's rows would be wrong,
-        // because the SQL reading of a pattern is the NARROWER one and an
-        // aggregate over a subset can err in either direction.
+        // attribute regex by the value-predicate condition, a physical
+        // one by the leaf-family one. So the only way to show the
+        // selector-fidelity condition is not dead code is to hand it the
+        // input where every earlier condition holds and the SELECTOR
+        // still carries a regex. That input is not one `plan_search`
+        // produces — it is the input the value-predicate condition would
+        // hand it if that condition were ever widened to admit a regex
+        // probe, and the aggregate over that generator's rows would be
+        // wrong, because the SQL reading of a pattern is the NARROWER one
+        // and an aggregate over a subset can err in either direction.
         {
             use super::super::filter::{GenClass, GenTable, LeafGenerator, ValuePred};
             use super::super::search_plan::{PlannedFilter, PlannedLeafEval, generator_exactness};
@@ -2132,7 +2876,8 @@ mod tests {
                     prewhere: None,
                 },
             )];
-            // (1)-(5) hold and the selector is regex-free: exact.
+            // Every earlier condition holds and the selector is
+            // regex-free: exact.
             assert_eq!(
                 generator_exactness(
                     &filters,
@@ -2154,8 +2899,8 @@ mod tests {
                     &parse_selector(r#"{ span.http.method =~ "GE.*" }"#),
                 ),
                 Err(NotExact::SelectorIsWider),
-                "condition (6) must refuse a selector carrying a regex even when the two \
-                 predicates are byte-equal"
+                "the selector-fidelity condition must refuse a selector carrying a regex even \
+                 when the two predicates are byte-equal"
             );
         }
     }
@@ -2191,8 +2936,8 @@ mod tests {
     /// case in duration form. Measured by building it: 18 of these 84
     /// cases failed, six operators on each of those three literals.
     ///
-    /// Every row runs under all six comparison operators, and the rule
-    /// refuses for all six. Four of them can actually diverge, measured
+    /// Every row runs under all six comparison operators, and the
+    /// THRESHOLD rule refuses for all six. Four of them can actually diverge, measured
     /// on the pre-fix build (the bound inclusive, so `t = 2^53` pushes)
     /// against corpus B of `traces_search_pushdown_live.rs`, whose five
     /// traces have `max(duration)` 1s / 2^53-1 / 2^53 / 2^53+1 / 2^53+3
@@ -2218,6 +2963,15 @@ mod tests {
     /// extra candidate costs a transported span set and never reaches the
     /// client. One threshold rule rather than six operator rules, and the
     /// test runs all six so a per-operator carve-out would redden it.
+    ///
+    /// **Two rules compose here, and neither subsumes the other** (issue
+    /// #492 part 5). A `max(duration)` cell renders only under `>` and
+    /// `>=` — [`aggregate_having_sql`]'s containment rule — so the four
+    /// anti-monotone operators expect NO fragment for every literal,
+    /// in-range or not, and the two monotone ones carry this test's own
+    /// subject. The two halves are independently visible: dropping the
+    /// operator gate reddens 24 of these 84 cases (six literals x four
+    /// operators) and dropping the threshold bound reddens the other 18.
     ///
     /// The second half asserts the property the doc comment on
     /// `search_plan::aggregate_threshold` now claims: whenever this
@@ -2259,14 +3013,22 @@ mod tests {
             // so only the bound can refuse one.
             ("2600h", REFUSES),
         ];
-        let ops = ["=", "!=", ">", ">=", "<", "<="];
+        // `max(duration)` reads HIGH over the generator's rows, so only
+        // `>` and `>=` are safe; the other four LOSE a trace and refuse
+        // whatever the literal is.
+        let monotone = [">", ">="];
+        let anti_monotone = ["=", "!=", "<", "<="];
 
         // Collected rather than asserted one at a time: on a build with
         // the defect several rows are wrong at once, and the whole set is
         // what says where the boundary moved to.
         let mut wrong: Vec<String> = Vec::new();
-        for (literal, wants_push) in rows {
-            for op in ops {
+        for (literal, in_range) in rows {
+            for (op, wants_push) in monotone
+                .iter()
+                .map(|op| (*op, in_range))
+                .chain(anti_monotone.iter().map(|op| (*op, false)))
+            {
                 let q = format!(r#"{{ span.http.method = "GET" }} | max(duration) {op} {literal}"#);
                 let query = pulsus_traceql::parse(&q).unwrap_or_else(|e| panic!("{q}: {e}"));
                 let stage = query
@@ -2274,7 +3036,7 @@ mod tests {
                     .iter()
                     .find(|s| matches!(s, PipelineStage::Aggregate { .. }))
                     .unwrap_or_else(|| panic!("{q}: parsed without an aggregate stage"));
-                let frag = aggregate_having_sql(stage);
+                let frag = aggregate_having_sql(stage, None);
                 if frag.is_some() != wants_push {
                     wrong.push(format!(
                         "{q}: expected {}, got {frag:?}",
@@ -2316,7 +3078,7 @@ mod tests {
             wrong.is_empty(),
             "{} of {} cases disagree with the boundary:\n{}",
             wrong.len(),
-            rows.len() * ops.len(),
+            rows.len() * (monotone.len() + anti_monotone.len()),
             wrong.join("\n")
         );
     }

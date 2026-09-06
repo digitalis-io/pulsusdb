@@ -10,6 +10,14 @@
 //! diff (the byte-frozen-artifact rule).
 
 use pulsus_read::traces::search_plan::{SearchCtx, SearchParams, plan_search};
+
+// The criterion-field helper is `#[path]`-included rather than imported:
+// it is a `#[cfg(test)] pub mod` of the library, which an integration
+// test binary cannot reach. Only the JSON half is used here; the `Debug`
+// half is used by a unit test in the library and by the by-key freeze.
+#[allow(dead_code)]
+#[path = "../src/compile/criterion_fields.rs"]
+mod criterion_fields;
 use pulsus_read::{SearchPlan, SpanFilterCtx};
 
 /// Fixed request window: 2023-11-14T22:13:20Z .. +3h (the §4.2 "last 3h"
@@ -572,6 +580,85 @@ const CASES: &[Case] = &[
         q: r#"{ span.http.method = "GET" } | max(span.retries) > 1"#,
         distributed: false,
     },
+    // --- Issue #492 part 5: the `by()` key's own accept and refuse
+    // --- surface, in statement text. Which key is grouped is decided at
+    // --- one site, and each of these reaches a different arm of it.
+    Case {
+        // The grouping slot taken, FREED by `coalesce()`, and taken
+        // again — with an aggregate in the last level, which is what
+        // makes the difference observable. Renders exactly the statement
+        // `issue492_by_then_count` renders.
+        name: "issue492_by_coalesce_by_count",
+        q: r#"{ resource.service.name = "grp" } | by(name) | coalesce() | by(name) | count() > 2"#,
+        distributed: false,
+    },
+    Case {
+        // The one that LOOKS like it needs a second grouping level and
+        // does not. The reference's merge stage folds every span set
+        // into one and carries no group attributes forward, so this
+        // pipeline is `by(name)` alone: a grouping with nothing to
+        // filter. Emitting anything for it would cost a wider statement
+        // and change no answer, so it renders the bare generator.
+        name: "issue492_by_coalesce_by",
+        q: r#"{ resource.service.name = "grp" } | by(name) | coalesce() | by(name)"#,
+        distributed: false,
+    },
+    Case {
+        // A non-string key: `duration_ns` grouped raw, because
+        // `go_duration_string` is injective over `i64` and the two
+        // partitions therefore coincide.
+        name: "issue492_by_duration_then_count",
+        q: r#"{ resource.service.name = "grp" } | by(duration) | count() > 2"#,
+        distributed: false,
+    },
+    Case {
+        // `by(status)` must NOT push: `status_keyword` has three outputs
+        // over 256 inputs — `status_code` 0 and 3 both read "unset" — so
+        // grouping the column splits a group the evaluator merges.
+        // Byte-identical past the header to the same query without the
+        // `by()`.
+        name: "issue492_by_status_then_count",
+        q: r#"{ resource.service.name = "grp" } | by(status) | count() > 2"#,
+        distributed: false,
+    },
+    Case {
+        // An attribute key is a `val`/`val_num` row under a DIFFERENT
+        // key than the generator's rows carry: a second source read, and
+        // ADR 0008 names no join clause.
+        name: "issue492_by_attr_then_count",
+        q: r#"{ resource.service.name = "grp" } | by(span.foo) | count() > 2"#,
+        distributed: false,
+    },
+    Case {
+        // The SOURCE restriction, as a pair with
+        // `issue492_by_then_count`: the same key, the same aggregate,
+        // and no push, because `name` is not a column of
+        // `trace_attrs_idx`.
+        name: "issue492_index_by_name_then_count",
+        q: r#"{ span.http.method = "GET" } | by(name) | count() > 2"#,
+        distributed: false,
+    },
+    Case {
+        // `duration_ns` IS a column of `trace_attrs_idx`, and the key
+        // still refuses there: the index is a `ReplacingMergeTree` whose
+        // ordering key does not contain `duration_ns`, so one span's
+        // index reading and its `trace_spans` reading can disagree and
+        // the map would not contain the evaluator's key at all.
+        name: "issue492_index_by_duration_then_count",
+        q: r#"{ span.http.method = "GET" } | by(duration) | count() > 2"#,
+        distributed: false,
+    },
+    Case {
+        // The narrowest witness for part 5's operator rule on this
+        // surface: one operator apart from
+        // `issue492_attr_eq_with_min_duration`, and the only one of the
+        // two that still pushes. `min` reads LOW over the generator's
+        // rows, so `<` produces a superset phase 2 re-filters and `>=`
+        // would lose a trace.
+        name: "issue492_attr_eq_with_min_duration_lt",
+        q: r#"{ span.http.method = "GET" } | min(duration) < 2s"#,
+        distributed: false,
+    },
     Case {
         // Issue #476 Wave B: a cross-type `=` on `resource.service.name`
         // — the query a client builds from an UNQUOTED tag value. The
@@ -1092,13 +1179,48 @@ fn the_pushed_aggregate_pair_differs_and_the_three_control_pairs_do_not() {
             "avg over a ReplacingMergeTree read without FINAL moves when a row is replayed, so \
              the aggregate must NOT compile into the generator",
         ),
-        (
-            "issue492_by_then_count",
-            "issue492_count_then_by",
-            "the pipeline's written order is invisible to the SQL",
-        ),
     ] {
         assert_eq!(body(a), body(b), "{a} vs {b}: {why}");
+    }
+    // Issue #492 part 5: the pair that used to be a control is now the
+    // subject. `| by(name) | count() > 2` groups in SQL and
+    // `| count() > 2 | by(name)` does not, so the two written orders
+    // send different statements — and the difference is exactly the
+    // `HAVING` line, asserted rather than left to `assert_ne!`, which any
+    // byte would satisfy.
+    {
+        let a = body("issue492_by_then_count");
+        let b = body("issue492_count_then_by");
+        assert_ne!(
+            a, b,
+            "issue492_by_then_count vs issue492_count_then_by: the pipeline's written order must \
+             now reach the SQL"
+        );
+        let differing: Vec<(usize, &str, &str)> = a
+            .lines()
+            .zip(b.lines())
+            .enumerate()
+            .filter(|(_, (x, y))| x != y)
+            .map(|(i, (x, y))| (i, x, y))
+            .collect();
+        assert_eq!(
+            a.lines().count(),
+            b.lines().count(),
+            "the two composites must differ by a line's CONTENT, not by their length"
+        );
+        assert_eq!(
+            differing
+                .iter()
+                .map(|(_, x, y)| (*x, *y))
+                .collect::<Vec<_>>(),
+            vec![(
+                "HAVING arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, \
+                 substringUTF8(name, 1, 2048)), span_id)))) > 2",
+                "HAVING uniqExact(span_id) > 2",
+            )],
+            "the two written orders must differ on exactly one line, and it must be the HAVING: \
+             got {differing:?}"
+        );
     }
     // ...and the identity is not vacuous: a THIRD case with a different
     // filter renders different SQL, so "equal" here is a property of the
@@ -1110,37 +1232,82 @@ fn the_pushed_aggregate_pair_differs_and_the_three_control_pairs_do_not() {
     );
 }
 
-/// Issue #492 part 4 criterion 6: the aggregate link's DISPOSITION moves
-/// on the explain surface, and the part list does not.
+/// Issue #492 part 5 criterion 22: **the aggregate link's disposition on
+/// the explain surface.**
 ///
-/// `X-Pulsus-Explain: 1` on `{ span.http.method = "GET" } | max(duration)
-/// > 1s` renders the `Pipe(Aggregate)` link as
-/// `{"how":"lowered","fidelity":"equivalent"}` where it rendered
-/// `{"how":"residual","why":"not_yet_lowered"}`. Two controls, one per
-/// route a refusal can take: the regex query's generator is not exact,
-/// so the link never reaches the fragment renderer and reads
-/// `not_exact`; the `avg` query's generator IS exact and the renderer is
-/// what refuses, so it keeps `not_yet_lowered`.
+/// # The assertion names its own fields, and nothing else
+///
+/// Part 4's form of this test compared a hand-written 3-tuple
+/// `(how, fidelity, why)`, and whether that list matched the criterion
+/// was a matter of inspection. It did not: the tuple's `how` component
+/// was not in the criterion's sentence, and neither was the `stage`
+/// value the row is SELECTED by — selecting a row is as much a
+/// dependence as asserting on one. Measured on the base tree, a
+/// perturbation moving only the `how` wire word made this the ONLY
+/// failure among the criterion-named tests in six binaries, and a
+/// perturbation moving only the stage spelling made it panic at the
+/// `find`.
+///
+/// **Dropping `how` from the assertion was measured and rejected.** With
+/// the `how` words changed, every test in `query_lowering_doc_gate`,
+/// `traces_search_plan_parts`, `traces_search_explain`,
+/// `traces_metrics_explain`, `traces_graph_explain` and the rest of this
+/// binary passes. The gate that looks like it would catch it does not:
+/// `the_plan_shape_json_keys_match_the_api_document` compares the
+/// renderer's KEY SET against the documented example's, so a changed
+/// wire WORD is invisible to it. Drop `how` here and those two words
+/// have no hermetic gate at all.
+///
+/// So the criterion names four fields, and the assertion derives the
+/// list from the sentence rather than repeating it:
+///
+/// ```text
+///    CRITERION_22 ──backticked tokens──> intersect ──> {stage, how, fidelity, why}
+///                                            ^
+///    link_shape_keys() ──a STRUCT LITERAL────┘
+/// ```
+///
+/// `i` and `part` are in the universe, are not named, and are not
+/// asserted — a `LinkShape.part` perturbation leaves this green.
 #[test]
 fn the_pushed_aggregate_link_is_lowered_and_the_refused_one_is_residual() {
-    for (case, how, fidelity, why) in [
+    const CRITERION_22: &str = "Criterion 22: for each row, the link whose `stage` is \
+        `Pipe(Aggregate)` renders `how`, `fidelity` and `why` as the row states — a pushed \
+        aggregate reads `(\"lowered\", \"wider\", null)` and a refused one reads \
+        `(\"residual\", null, <reason>)`.";
+
+    let universe = link_shape_keys();
+    for (case, stage, how, fidelity, why) in [
         (
             "issue492_attr_eq_with_max_duration",
+            "Pipe(Aggregate)",
             "lowered",
-            Some("equivalent"),
-            None,
+            serde_json::Value::from("wider"),
+            serde_json::Value::Null,
         ),
         (
             "issue492_regex_with_max_duration",
+            "Pipe(Aggregate)",
             "residual",
-            None,
-            Some("not_exact"),
+            serde_json::Value::Null,
+            serde_json::Value::from("not_exact"),
         ),
         (
             "issue492_attr_eq_with_avg_duration",
+            "Pipe(Aggregate)",
             "residual",
-            None,
-            Some("not_yet_lowered"),
+            serde_json::Value::Null,
+            serde_json::Value::from("not_yet_lowered"),
+        ),
+        // Issue #492 part 5: the aggregate family renders and the
+        // generator is exact, and the CELL is what refuses — `min` reads
+        // LOW over the generator's rows, so `>=` would lose a trace.
+        (
+            "issue492_attr_eq_with_min_duration",
+            "Pipe(Aggregate)",
+            "residual",
+            serde_json::Value::Null,
+            serde_json::Value::from("not_yet_lowered"),
         ),
     ] {
         let plan = plan_for(
@@ -1150,18 +1317,47 @@ fn the_pushed_aggregate_link_is_lowered_and_the_refused_one_is_residual() {
                 .unwrap_or_else(|| panic!("case {case}")),
         );
         let shape = plan.plan_shape();
-        let link = shape
+        let actual = shape
             .links
             .iter()
-            .find(|l| l.stage == "Pipe(Aggregate)")
-            .unwrap_or_else(|| panic!("{case}: the chain must carry the aggregate link"));
-        assert_eq!(
-            (link.how, link.fidelity, link.why),
-            (how, fidelity, why),
-            "{case}: the aggregate link renders {:?}",
-            (link.how, link.fidelity, link.why)
-        );
+            .map(|l| serde_json::to_value(l).expect("a LinkShape serialises"))
+            .find(|l| l["stage"] == stage)
+            .unwrap_or_else(|| panic!("{case}: the chain must carry the {stage} link"));
+        let expected = serde_json::json!({
+            "stage": stage,
+            "how": how,
+            "fidelity": fidelity,
+            "why": why,
+        });
+        criterion_fields::assert_named_fields(CRITERION_22, &universe, &actual, &expected, case);
     }
+}
+
+/// The field universe criterion 22's sentence is intersected with,
+/// produced by the COMPILER rather than by a list: a `LinkShape` struct
+/// literal with every `Option` `Some`, so its serialised key set is
+/// complete.
+///
+/// Adding a field to `LinkShape` fails to build this binary with
+/// `error[E0063]: missing field ... in initializer of `LinkShape``, at
+/// this literal. A hand-written list would silently fall behind the
+/// type.
+fn link_shape_keys() -> std::collections::BTreeSet<String> {
+    let complete = pulsus_read::compile::LinkShape {
+        i: 0,
+        part: 0,
+        stage: String::new(),
+        how: "",
+        fidelity: Some(""),
+        why: Some(""),
+    };
+    serde_json::to_value(&complete)
+        .expect("a LinkShape serialises")
+        .as_object()
+        .expect("a LinkShape serialises to an object")
+        .keys()
+        .cloned()
+        .collect()
 }
 
 /// Issue #492 part 4 criterion 8: **the statement carries the fragment
@@ -1178,10 +1374,15 @@ fn the_pushed_aggregate_link_is_lowered_and_the_refused_one_is_residual() {
 /// widened accept surface cannot arrive unnoticed.
 #[test]
 fn the_generator_having_is_the_fragment_the_plan_recorded() {
-    const PUSHES: [&str; 4] = [
+    const PUSHES: [&str; 9] = [
+        "count_pipeline",
         "issue492_attr_eq_with_count",
         "issue492_attr_eq_with_max_duration",
-        "issue492_attr_eq_with_min_duration",
+        "issue492_attr_eq_with_min_duration_lt",
+        "issue492_by_coalesce_by_count",
+        "issue492_by_duration_then_count",
+        "issue492_by_then_count",
+        "issue492_count_then_by",
         "issue492_unscoped_attr_with_max_duration",
     ];
     let mut pushed: Vec<&str> = Vec::new();
@@ -1229,6 +1430,279 @@ fn the_generator_having_is_the_fragment_the_plan_recorded() {
     assert_eq!(
         pushed, PUSHES,
         "the set of cases whose aggregate compiles into the generator moved"
+    );
+}
+
+/// Issue #492 part 5 criterion 21(b): **the cell part 4 pushed and part 5
+/// refuses carries no `HAVING` at all.**
+///
+/// `| min(duration) >= 1s` is one operator away from
+/// `| min(duration) < 2s`, which still pushes. `min` reads LOW over the
+/// generator's rows — a repeated `span_id` whose two rows carry
+/// different durations makes the statement's minimum smaller than the
+/// evaluator's — so `>=` LOSES a trace and there is no second pass to
+/// put it back.
+///
+/// One line, and it says what the golden diff says by inspection.
+#[test]
+fn the_refused_min_cell_carries_no_having_line() {
+    let case = CASES
+        .iter()
+        .find(|c| c.name == "issue492_attr_eq_with_min_duration")
+        .expect("issue492_attr_eq_with_min_duration case");
+    let text = composite(case);
+    assert!(
+        !text.contains("\nHAVING "),
+        "{}: `min(duration) >= 1s` reads LOW over the generator's rows and must send no \
+         HAVING:\n{text}",
+        case.name
+    );
+}
+
+/// Issue #492 part 5 criterion 21(c): **the pushdown moves ONLY the
+/// `HAVING` line.**
+///
+/// For every case that pushes, `generator_sqls[0]` with its single
+/// `HAVING {frag}` line removed is byte-identical to
+/// `generator_fallback_sql()`. That is the projection the golden byte
+/// freeze was standing in for: the freeze reddens for the fragment text,
+/// for a phase-2 statement and for the generator's `ORDER BY` alike, so
+/// it cannot say that the pushdown touched nothing else.
+///
+/// It is also criterion 7. The fallback is the statement this query
+/// sends with nothing pushed, and the executor runs it when the pushed
+/// one breaches the generator memory ceiling — so a query that answers
+/// `200` at `ddb48c96` still answers `200`. That claim is only true if
+/// the fallback really is that statement, and the second half asserts it
+/// against the plan for the SELECTOR ALONE, planned separately.
+#[test]
+fn the_pushed_statement_is_the_fallback_plus_one_having_line() {
+    let mut checked = 0usize;
+    for case in CASES {
+        let plan = plan_for(case);
+        let Some(frag) = plan.pushed_having() else {
+            assert_eq!(
+                plan.generator_fallback_sql(),
+                None,
+                "{}: nothing was pushed, so there is nothing to fall back FROM",
+                case.name
+            );
+            continue;
+        };
+        checked += 1;
+        let fallback = plan
+            .generator_fallback_sql()
+            .unwrap_or_else(|| panic!("{}: a pushed plan carries a fallback", case.name));
+        let stripped: Vec<&str> = plan.generator_sqls[0]
+            .lines()
+            .filter(|l| *l != format!("HAVING {frag}"))
+            .collect();
+        assert_eq!(
+            stripped.join("\n"),
+            fallback,
+            "{}: the pushdown must move ONLY the HAVING line",
+            case.name
+        );
+        assert_eq!(
+            plan.generator_sqls[0].lines().count(),
+            fallback.lines().count() + 1,
+            "{}: exactly one line is added",
+            case.name
+        );
+
+        // ...and the fallback is the statement the SELECTOR ALONE
+        // sends, planned from scratch rather than derived from the
+        // string above.
+        let selector = case
+            .q
+            .split_once(" | ")
+            .map_or(case.q, |(sel, _)| sel)
+            .to_string();
+        let bare = plan_for(&Case {
+            name: "selector-alone control",
+            q: Box::leak(selector.into_boxed_str()),
+            distributed: case.distributed,
+        });
+        assert_eq!(
+            bare.pushed_having(),
+            None,
+            "{}: the selector alone must push nothing",
+            case.name
+        );
+        assert_eq!(
+            fallback, bare.generator_sqls[0],
+            "{}: the fallback must be the statement the selector alone sends",
+            case.name
+        );
+    }
+    assert_eq!(
+        checked, 9,
+        "the projection must run over every pushing case, not a sample"
+    );
+}
+
+/// Issue #492 part 5 criterion 31: **a second aggregate refuses, and the
+/// reachable reason is the one asserted.**
+///
+/// `Fidelity::Wider` clears `rel.exact` the moment the first aggregate
+/// applies, so the second one refuses at the exactness check with
+/// `not_exact`. Exactly one fragment therefore reaches the statement,
+/// and `pushed_having()` — which is `Some` only when the fold recorded
+/// EXACTLY one — is `Some`.
+///
+/// **This query pushed NOTHING at `ddb48c96`**, because both aggregates
+/// lowered and two fragments accumulated. It is one of 477 enumerated
+/// shapes whose push status the complete `Wider` rule moves.
+///
+/// # What is deliberately not asserted here
+///
+/// `AggregateLower::capability` also refuses when `rel.having` is
+/// non-empty. **Deleting that line alone reddens nothing** — measured
+/// over the 9,425 planned queries of the enumeration freeze, no column
+/// moves — because the exactness check above always refuses first. The
+/// two conditions are individually redundant and jointly load-bearing:
+/// with BOTH removed, 477 shapes change push status. So the reachable
+/// fact is asserted, and nobody should later cite the having guard as
+/// the thing that enforces one-fragment-per-statement.
+#[test]
+fn a_second_aggregate_refuses_and_the_first_ones_fragment_is_the_one_pushed() {
+    let plan = plan_for(&Case {
+        name: "two aggregates",
+        q: r#"{ span.http.method = "GET" } | count() > 2 | count() > 2"#,
+        distributed: false,
+    });
+    assert_eq!(
+        plan.pushed_having(),
+        Some("uniqExact(span_id) > 2"),
+        "exactly one fragment reaches the statement"
+    );
+    // The two links, compared on exactly the fields CRITERION_31's own
+    // sentence names — the same derived mechanism criterion 22 uses, so
+    // this assertion cannot read a field the criterion does not name
+    // either.
+    const CRITERION_31: &str = "Criterion 31: for `{ span.http.method = \"GET\" } | count() > 2 \
+        | count() > 2` the FIRST link whose `stage` is `Pipe(Aggregate)` renders `how` \
+        \"lowered\", `fidelity` \"wider\" and no `why`, and the SECOND renders `how` \
+        \"residual\", no `fidelity` and `why` \"not_exact\".";
+    let universe = link_shape_keys();
+    let shape = plan.plan_shape();
+    let aggregates: Vec<serde_json::Value> = shape
+        .links
+        .iter()
+        .map(|l| serde_json::to_value(l).expect("a LinkShape serialises"))
+        .filter(|l| l["stage"] == "Pipe(Aggregate)")
+        .collect();
+    assert_eq!(
+        aggregates.len(),
+        2,
+        "the chain carries both aggregate links"
+    );
+    for (i, (how, fidelity, why)) in [
+        (
+            "lowered",
+            serde_json::Value::from("wider"),
+            serde_json::Value::Null,
+        ),
+        (
+            "residual",
+            serde_json::Value::Null,
+            serde_json::Value::from("not_exact"),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        criterion_fields::assert_named_fields(
+            CRITERION_31,
+            &universe,
+            &aggregates[i],
+            &serde_json::json!({
+                "stage": "Pipe(Aggregate)",
+                "how": how,
+                "fidelity": fidelity,
+                "why": why,
+            }),
+            &format!("aggregate link {i}"),
+        );
+    }
+}
+
+/// Issue #492 part 5 criterion 13: **a `by()` whose key does not render
+/// leaves the generator statement exactly where it was.**
+///
+/// Four keys, four different reasons, and one claim each: the statement
+/// is byte-identical to the one the SELECTOR ALONE sends. Not "identical
+/// to the same query without the `by()`" — that query pushes
+/// `uniqExact(span_id) > 2` on a service selector, so the two are not
+/// the same control.
+///
+/// The pair with `issue492_by_then_count` is what makes this a property
+/// of the KEY: same selector, same aggregate, and a `HAVING` there.
+#[test]
+fn a_by_key_that_does_not_render_leaves_the_generator_where_it_was() {
+    for (case_name, selector, why) in [
+        (
+            "issue492_by_status_then_count",
+            r#"{ resource.service.name = "grp" }"#,
+            "status_keyword has three outputs over 256 inputs, so SQL splits a group the \
+             evaluator merges",
+        ),
+        (
+            "issue492_by_attr_then_count",
+            r#"{ resource.service.name = "grp" }"#,
+            "an attribute key is a row under a different key than the generator's: a second \
+             source read",
+        ),
+        (
+            "issue492_index_by_name_then_count",
+            r#"{ span.http.method = "GET" }"#,
+            "`name` is not a column of trace_attrs_idx",
+        ),
+        (
+            "issue492_index_by_duration_then_count",
+            r#"{ span.http.method = "GET" }"#,
+            "the index and the span table deduplicate by different rules, so one span's two \
+             duration readings can disagree",
+        ),
+        (
+            "issue492_by_coalesce_by",
+            r#"{ resource.service.name = "grp" }"#,
+            "two groupings and no aggregate in either: a grouping with nothing to filter",
+        ),
+    ] {
+        let case = CASES
+            .iter()
+            .find(|c| c.name == case_name)
+            .unwrap_or_else(|| panic!("case {case_name}"));
+        let plan = plan_for(case);
+        assert_eq!(plan.pushed_having(), None, "{case_name}: {why}");
+        let bare = plan_for(&Case {
+            name: "selector-alone control",
+            q: selector,
+            distributed: false,
+        });
+        assert_eq!(
+            plan.generator_sqls[0], bare.generator_sqls[0],
+            "{case_name}: the statement must be the selector's own, byte for byte — {why}"
+        );
+    }
+
+    // ...and the identity is not vacuous: the SAME selector and the SAME
+    // aggregate with a key that DOES render sends a different statement.
+    let grouped = plan_for(
+        CASES
+            .iter()
+            .find(|c| c.name == "issue492_by_then_count")
+            .expect("issue492_by_then_count case"),
+    );
+    let bare = plan_for(&Case {
+        name: "selector-alone control",
+        q: r#"{ resource.service.name = "grp" }"#,
+        distributed: false,
+    });
+    assert_ne!(
+        grouped.generator_sqls[0], bare.generator_sqls[0],
+        "by(name) renders on trace_spans, so its statement must NOT be the bare one"
     );
 }
 

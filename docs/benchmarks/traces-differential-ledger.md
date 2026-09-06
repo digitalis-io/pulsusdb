@@ -2723,6 +2723,142 @@ when we are asking it to slow down, so we keep `429`; recorded as
   results paragraph) and docs/schemas.md §4.2 (clause (a) of the partiality
   list).
 
+### `traceql-aggregate-pushdown-is-a-superset` (issue #492 part 5) — **part 4 shipped a pushdown that returns FEWER traces than the query matches for twelve of eighteen cells; part 5 refuses those twelve and the six that remain return a superset phase 2 re-filters**
+
+- **Route.** `GET /api/traces/v1/search` (and its `/api/search` alias). The
+  aggregate stage of a TraceQL pipeline, at its written position.
+
+- **What was wrong, plainly.** This is not a hardening and not a tightening.
+  At `ddb48c96` — part 4 as merged — a spanset aggregate compiled into the
+  phase-1 generator's `HAVING` for all six comparison operators of `count()`,
+  `min(duration)` and `max(duration)`. For twelve of those eighteen
+  (aggregate, operator) cells the statement returns fewer traces than the
+  query matches, and phase 2 cannot put a lost trace back: the aggregate
+  filters the span-set list in place, and an empty list ends the trace.
+
+- **The mechanism, in one containment.** Write `R` for the generator
+  statement's rows and `D` for the spans the evaluator aggregates. Every span
+  in `D` is the survivor of one or more rows of `R` carrying the same
+  `span_id` — the hydration read keeps the FIRST row per `span_id` in
+  `(trace_id, timestamp_ns, span_id)` order — and the selector is then applied
+  to that survivor.
+
+  ```text
+     generator rows R  ─────────────────────►  one row per delivery
+          │  first-row-per-span_id, then the selector
+          ▼
+     evaluator spans D ─────────────────────►  R ⊇ D,  ALWAYS
+  ```
+
+  `min` over a superset reads LOW; `max` and `uniqExact` read HIGH. A HIGH
+  reading under `>` or `>=` ADMITS a trace phase 2 then drops; under `<`,
+  `<=`, `=` or `!=` it LOSES one. A LOW reading is the mirror image.
+
+  ```text
+    aggregate      reads   safe operators   fragment (ungrouped)
+    count()        HIGH    >   >=           uniqExact(span_id) <op> <t>
+    max(duration)  HIGH    >   >=           max(duration_ns)   <op> <t>
+    min(duration)  LOW     <   <=           min(duration_ns)   <op> <t>
+  ```
+
+- **Corpus U, and both answers.** Seven traces on ClickHouse 26.3,
+  `service = 'svc'`, `name = 'op'`, every span row also carrying
+  `http.method = 'GET'`. A span id listed twice is TWO rows for one
+  `(trace_id, span_id)` at different `timestamp_ns` — a re-send whose second
+  delivery disagrees with the first.
+
+  ```text
+    trace  rows                                    what disagrees  deduped spans
+    …0001  S1 1s          S2 5s                    nothing         1s, 5s
+    …0002  S1 3s                                   nothing         3s
+    …0003  S1 3s          S2 3s      S3 3s         nothing         3s, 3s, 3s
+    …000a  S1 5s (first)  S1 1s                    duration        5s
+    …000b  S1 1s (first)  S1 5s                    duration        1s
+    …000d  S1 5s (first)  S1 1s      S2 3s         duration        5s, 3s
+    …000e  S1 3s svc=other (first)   S1 3s svc     the SELECTOR    3s (S1 dropped)
+                           S2 3s svc
+  ```
+
+  Two of the twelve, with the answer at `ddb48c96` and the answer part 5
+  gives — both are this engine's own numbers over the same rows, the second
+  being what the same query returns with nothing pushed:
+
+  ```text
+    { span.http.method = "GET" } | max(duration) < 2s
+      ddb48c96   200, traces: []
+      part 5     200, traces: [ …000b ]
+
+    { span.http.method = "GET" } | count() < 10001     (corpus U-cap: one trace, 10 002 matched spans)
+      ddb48c96   200, traces: []
+      part 5     200, traces: [ …0001 ]
+  ```
+
+  `count()` is not exempt, and the witness is the hydration cap rather than a
+  re-delivery: `hydration_sql` carries `LIMIT MAX_SPANS_PER_TRACE + 1 BY
+  trace_id` (10,000), so a trace with 10,002 matched spans is evaluated on
+  10,000 of them while `uniqExact(span_id)` counts all 10,002. On corpus U
+  alone all four anti-monotone `count()` cells agree, which is exactly the
+  shape an exemption hides in.
+
+- **What the six that survive do.** They return a SUPERSET, and phase 2
+  removes the extra traces — `exec::group_hydrated_rows` then the pipeline
+  fold. Measured on corpus U: `{ span.http.method = "GET" } | max(duration) >
+  2s` answers six traces and its statement returns SEVEN candidate rows,
+  `…000b` being admitted by the statement and removed by phase 2. A criterion
+  comparing only answers cannot see that, which is why the candidate rows are
+  asserted separately.
+
+  Consequently `AggregateLower::fidelity` is `Fidelity::Wider` for every
+  pushed aggregate, grouped or not, and `parts[*].yields` on the explain
+  surface reads `"candidates"` where it read `"exact"`. Part 4's
+  `Fidelity::Equivalent` asserted `orig ⟺ sql`, whose contract is *the
+  evaluator must not re-filter*; the seven-against-six count above is the
+  counterexample.
+
+- **The grouped arm is the same six cells**, with `V = mapValues(<agg>Map(map(<key>, <arg>)))`
+  and the trace-level question asked by `arrayMax(V)` / `arrayMin(V)`. The
+  grouped map assigns a repeated `span_id` to BOTH of its keys before
+  deduplication, so on a trace with two span ids, four rows and the names
+  swapped the map reads 2 for every group while the evaluator, which
+  deduplicates first, reads 1 for each — and `count() < 2` would lose the
+  trace. That witness is run in
+  `traces_search_pushdown_live.rs::the_grouped_cells_return_a_superset_and_a_replay_moves_neither_side`,
+  which renders the fragment `count() < 2` WOULD have produced and shows the
+  loss.
+
+- **What cannot produce the divergence.** A byte-identical at-least-once
+  redelivery moves neither side, in any of the eighteen cells: the aggregate
+  is over distinct span ids, and the duplicated rows carry the same key and
+  the same value. That is what licenses pushing at all, and it is measured
+  rather than argued — the same suite runs every cell against a corpus
+  written twice with merges stopped.
+
+- **What the twelve refused cells cost.** They send the bare generator,
+  byte-identical to what the same query planned before part 4 merged: same
+  table, same `PREWHERE`, same granules, no `HAVING`, no extra statement and
+  no extra round trip. What is given up is pruning that produced a wrong
+  answer. Measured on corpus U, `min(duration) > 2s` goes from 3 candidate
+  traces to 7 — all seven of which the selector matches. The magnitude is a
+  property of the data and routes to #25.
+
+  **No weaker implication is pushed in their place.** `by(name) |
+  max(duration) < 2s` does imply `min(duration_ns) < 2s`, and three other
+  cells have similar weaker forms; each is a different implication needing its
+  own proof and its own witness, and none of them is the query this work
+  exists for. A deliberate omission, not an oversight.
+
+- **The read side does not move.** `EXPLAIN indexes = 1` is byte-identical
+  across the bare statement, the ungrouped pushed one and the grouped one for
+  the same selector: a `HAVING` line neither adds nor removes a granule. Held
+  to a check by
+  `traces_search_explain.rs`'s `the_pushdown_keeps_the_generators_index_selection`,
+  with a narrowed time predicate as the positive control so the identity
+  cannot be vacuous.
+
+- **Disposition.** A defect, fixed. Documented in docs/schemas.md §4.2 (the
+  phase-1/phase-2 contract and the partiality rule) and docs/query-to-sql.md
+  §2.7 (the clause table).
+
 ### `traceql-pushed-aggregate-generator-memory` (issue #492 part 4) — **the pushdown enlarges the phase-1 grouping state, so the ceiling that already bounds it bites on smaller selectors**
 
 - **Route.** `GET /api/traces/v1/search` (and its `/api/search` alias), same
@@ -2784,13 +2920,72 @@ when we are asking it to slow down, so we keep `429`; recorded as
   dropping it: **on a breach, refuse — never truncate and never spill** stands
   unchanged; only the mechanism that refuses is the shipped one.
 
+- **Issue #492 part 5: the extra state no longer narrows what is answerable,
+  and one shipped expectation is WITHDRAWN.** Part 5 adds a fallback. When the
+  pushed statement raises code 241 the reader releases the failed attempt's
+  byte charge, records a `phase1_candidate_generator_fallback` explain entry,
+  and re-runs the SAME generator with no `HAVING` —
+  `SearchPlan::generator_fallback_sql()`, which is byte-identical to the
+  statement the same selector sends with nothing pushed. Measured over 9,425
+  planned queries at the base tree: `generator_sqls[0]` for
+  `{selector} | <any pipeline>` equals `generator_sqls[0]` for `{selector}`
+  alone in every case where nothing is pushed, with no exceptions, and differs
+  in every case where something is. So a query that answers `200` without the
+  pushdown answers `200` with it, and `422` is returned only where the bare
+  statement breaches too.
+
+  **The withdrawn expectation.**
+  `traces_search_pushdown_live.rs::the_pushed_aggregate_outgrows_the_generator_memory_ceiling_and_refuses`
+  asserted `422` for `{ span.http.method = "GET" } | count() > 0` on the
+  1,000,000-group corpus at the 320 MiB ceiling. Its own sibling proved the
+  bare statement answers under that ceiling, so the `422` was a query we could
+  answer correctly and chose not to — and close to the ceiling the outcome
+  moves with `max_threads`, so it was a refusal that shows up on one node and
+  not another. Part 5 replaces it with
+  `…::the_pushed_aggregate_outgrows_the_ceiling_and_the_fallback_answers`,
+  which asserts `200`, twenty traces and the fallback explain entry, and adds
+  `…::a_ceiling_below_the_bare_statements_own_peak_still_refuses` at 16 MiB,
+  where BOTH statements breach and the `422` is the only available answer.
+
+  Part 5 also multiplies the group count when a `by()` key precedes the
+  aggregate: the statement then holds one aggregation state per
+  (trace × distinct key value) rather than one per trace. Measured on a
+  2,000,000-row / 100,000-trace corpus with 25 distinct names, three
+  repetitions, `max_bytes_before_external_group_by = 0`: the bare generator
+  106,756,719–138,471,480 bytes; `+ HAVING uniqExact(span_id) > 2`
+  301,170,603–301,170,779; `+ HAVING max(duration_ns) > 1000000000`
+  134,892,350–141,108,639; the grouped `arrayMax(mapValues(uniqExactMap(…)))`
+  form 326,679,663–327,842,515; the grouped `maxMap` form
+  188,724,766–192,919,095. The fallback bounds the consequence, and the cost
+  of reaching it is one refused attempt: at a 300,000,000-byte ceiling the
+  refused attempt read 540,672 rows in 47–48 ms before raising 241, and the
+  fallback then cost the bare statement's 1,007,616 rows in 57–59 ms.
+
+  **A `by(duration)` key on a `trace_spans` generator is the one most likely
+  to reach the fallback**: its map holds one entry per distinct duration per
+  trace, where `by(name)` and `by(resource.service.name)` hold one per
+  distinct `LowCardinality` value. It is admitted because its two readings are
+  injective and therefore induce the same partition, not because it is cheap.
+
+  **`count()` instead of `uniqExact(span_id)`: considered and not taken.**
+  Under part 5's containment rule a plain `count()` would also be sound for
+  `>`/`>=` — phase 2 re-filters — and it is cheaper: 245,425,630–246,135,553
+  bytes against 522,962,961–529,777,420 on the grouped form. It is not
+  adopted, because `count()` makes the CANDIDATE set move under a
+  byte-identical replay, which
+  `duplicate_index_rows_do_not_move_a_pushed_min_max_or_count` exists to
+  prevent, and it would move the committed numbers in this row.
+
 - **What holds the "already bounded" claim to a check.** Prose has no failure
   mode, so two tests carry it.
-  `crates/pulsus-read/tests/traces_search_pushdown_live.rs::the_pushed_aggregate_outgrows_the_generator_memory_ceiling_and_refuses`
-  runs the refusal against a 1,000,000-group corpus at a 320 MiB ceiling, with
-  `…::the_same_corpus_without_the_pushed_aggregate_answers_two_hundred` as the
-  control that makes it a statement about the aggregate rather than about the
-  corpus. `traces::exec::tests::generator_settings_pin_the_memory_ceiling_and_throw_not_spill`
+  `crates/pulsus-read/tests/traces_search_pushdown_live.rs::a_ceiling_below_the_bare_statements_own_peak_still_refuses`
+  runs the refusal against a 1,000,000-group corpus at a 16 MiB ceiling and
+  asserts it for the bare selector as well as for the pushed one — which is
+  what makes the boundary honest rather than a repeat of the withdrawn
+  expectation. `…::the_pushed_aggregate_outgrows_the_ceiling_and_the_fallback_answers`
+  and `…::the_same_corpus_without_the_pushed_aggregate_answers_two_hundred`
+  are the pair above it, at the 320 MiB ceiling.
+  `traces::exec::tests::generator_settings_pin_the_memory_ceiling_and_throw_not_spill`
   asserts `max_bytes_before_external_group_by` is `"0"` and not merely
   present: with a non-zero value the same statement spills and answers a slow
   `200`, which is the silent widening the ruling existed to prevent, and the

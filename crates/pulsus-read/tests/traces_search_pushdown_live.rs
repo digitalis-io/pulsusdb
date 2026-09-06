@@ -359,13 +359,28 @@ fn qualifiers() -> Vec<Qualifier> {
             selects: |s| s.method_attr,
             admits: |spans| spans.iter().map(|s| s.duration_ns).max().unwrap_or(0) > 1_000_000_000,
         },
+        // Issue #492 part 5: `min` reads LOW over the generator's rows,
+        // so `<` and `<=` are the safe operators and `>=` refuses. This
+        // row was `min(duration) >= 1s` at `ddb48c96`, which pushed and
+        // could lose a trace.
         Qualifier {
-            q: r#"{ span.http.method = "GET" } | min(duration) >= 1s"#,
-            fragment: "min(duration_ns) >= 1000000000",
+            // The threshold is `1s` and not `2s` because corpus Q's
+            // per-trace minima are 0.4s, 0.5s and 1.1s: at `2s` every
+            // trace qualifies, the `HAVING` filters nothing, and the
+            // suite's own "the corpus cannot tell the two apart" guard
+            // reddens. Measured — 200 rows with the HAVING and 200
+            // without.
+            q: r#"{ span.http.method = "GET" } | min(duration) < 1s"#,
+            fragment: "min(duration_ns) < 1000000000",
             selects: |s| s.method_attr,
             admits: |spans| {
                 !spans.is_empty()
-                    && spans.iter().map(|s| s.duration_ns).min().unwrap_or(0) >= 1_000_000_000
+                    && spans
+                        .iter()
+                        .map(|s| s.duration_ns)
+                        .min()
+                        .unwrap_or(i64::MAX)
+                        < 1_000_000_000
             },
         },
         Qualifier {
@@ -903,26 +918,26 @@ async fn duplicate_index_rows_do_not_move_a_pushed_min_max_or_count() {
         ChClient::new(conn(replay_db)).await.expect("connect"),
         engine_config(100_000, 536_870_912),
     );
-    for q in [
-        r#"{ span.http.method = "GET" } | max(duration) > 1s"#,
-        r#"{ span.http.method = "GET" } | min(duration) >= 1s"#,
-        r#"{ span.http.method = "GET" } | count() > 2"#,
-        // **The `<` form is the one that can lose a trace, and it is why
-        // this list is not three `>` queries.** A duplicated index row
-        // can only INFLATE a count, so a pushed `count() > n` over the
-        // replay admits too many traces and the evaluator — which
-        // deduplicates by `span_id` — drops them again: the answer does
-        // not move, and a corpus of `>` queries alone cannot tell a
-        // correct pushdown from `count()`. With `<` the inflation drops
-        // traces the database never returns, and nothing downstream can
-        // put them back. Measured: with `count()` substituted for
-        // `uniqExact(span_id)` this row returns 50 traces where the
-        // clean corpus returns 100.
-        r#"{ span.http.method = "GET" } | count() < 3"#,
+    // Issue #492 part 5: `count() < 3` and `min(duration) >= 1s` no
+    // longer push — `count()` and `min` read the wrong way over the
+    // generator's rows under those operators, so the six-cell rule
+    // refuses them. They stay in the list as the UNPUSHED half: their
+    // answers must still not move over a replay, and a query that pushes
+    // nothing is the control for a query that pushes something.
+    for (q, must_push) in [
+        (r#"{ span.http.method = "GET" } | max(duration) > 1s"#, true),
+        (r#"{ span.http.method = "GET" } | min(duration) < 1s"#, true),
+        (r#"{ span.http.method = "GET" } | count() > 2"#, true),
+        (
+            r#"{ span.http.method = "GET" } | min(duration) >= 1s"#,
+            false,
+        ),
+        (r#"{ span.http.method = "GET" } | count() < 3"#, false),
     ] {
         let a = plan_for(&clean_engine, q, &p);
         let b = plan_for(&replay_engine, q, &p);
-        assert!(a.aggregate_pushed() && b.aggregate_pushed(), "{q}");
+        assert_eq!(a.aggregate_pushed(), must_push, "{q} (clean)");
+        assert_eq!(b.aggregate_pushed(), must_push, "{q} (replay)");
         let ids = |o: pulsus_read::SearchOutput| -> Vec<String> {
             o.traces.iter().map(|t| hex32(&t.trace_id)).collect()
         };
@@ -930,6 +945,29 @@ async fn duplicate_index_rows_do_not_move_a_pushed_min_max_or_count() {
         let got = ids(replay_engine.search(&b).await.expect("replay search"));
         assert!(!want.is_empty(), "{q}: the clean corpus returns nothing");
         assert_eq!(got, want, "{q}: the replay moved the answer");
+
+        // **What `uniqExact` buys, now that correctness no longer
+        // depends on it.** Under the containment rule a plain `count()`
+        // would also be sound for `>`/`>=` — phase 2 re-filters — so the
+        // ANSWER cannot tell the two apart on this corpus. The CANDIDATE
+        // set can: `count()` inflates over a replayed row and admits
+        // traces the clean corpus's statement does not. Measured here on
+        // the statements themselves rather than on the answers.
+        if !must_push {
+            continue;
+        }
+        let clean_candidates = generator_ids(&clean, &a.generator_sqls[0]).await;
+        let replay_candidates = generator_ids(&replay, &b.generator_sqls[0]).await;
+        assert!(
+            !clean_candidates.is_empty(),
+            "{q}: the clean statement returns no candidate"
+        );
+        assert_eq!(
+            replay_candidates.iter().map(hex32).collect::<Vec<_>>(),
+            clean_candidates.iter().map(hex32).collect::<Vec<_>>(),
+            "{q}: the replay moved the CANDIDATE set — which is what an aggregate over rows \
+             rather than over distinct span ids would do"
+        );
     }
 
     // What makes the three safe, and what makes the other two unsafe: on
@@ -986,6 +1024,12 @@ const M1_STEP_NS: i64 = 1_000;
 /// apart. It is a fixture value, not the shipped default.
 const M1_CEILING_BYTES: u64 = 335_544_320;
 const M1_MAX_CANDIDATES: u64 = 1_000;
+/// 16 MiB — below the BARE generator's own peak over corpus M1, whose
+/// `GROUP BY trace_id` holds one aggregation state per distinct trace id
+/// across 1,000,000 of them. At this ceiling there is no statement that
+/// answers, which is the only boundary a `422` is owed at (issue #492
+/// part 5).
+const M1_FLOOR_CEILING_BYTES: u64 = 16_777_216;
 
 async fn seed_m1(client: &ChClient, db: &str, base_ns: i64) {
     exec(
@@ -1030,23 +1074,48 @@ fn m1_params(base_ns: i64) -> SearchParams {
     }
 }
 
-/// **The grouping state a pushed aggregate adds is bounded, and the bound
-/// refuses.**
+/// **Issue #492 part 5 criterion 29: a query that answers `200` without
+/// the pushdown answers `200` with it.**
 ///
-/// Ruling `5556416192` chose the ceiling the generator statement already
-/// carries — `max_memory_usage` with `max_bytes_before_external_group_by
-/// = 0` — over adding `max_rows_to_group_by`, because the latter's
-/// refusal point moves with `max_threads` and the former's does not. That
-/// choice made "already bounded" the load-bearing sentence, and prose has
-/// no failure mode. This is the check.
+/// # What this replaces, and why
 ///
-/// Its break is one character in `exec.rs`: with
-/// `max_bytes_before_external_group_by` non-zero the identical statement
-/// spills and answers `200`, and this test then sees `Ok(SearchOutput)`.
-/// The hermetic half of that break is
-/// `traces::exec::tests::generator_settings_pin_the_memory_ceiling_and_throw_not_spill`.
+/// At `ddb48c96` this test was
+/// `the_pushed_aggregate_outgrows_the_generator_memory_ceiling_and_refuses`,
+/// and it asserted `422` for exactly this query, corpus and ceiling.
+/// **Part 5 withdraws that expectation.** Its sibling below proves the
+/// bare statement answers under the SAME ceiling, so the `422` was a
+/// query we could answer correctly and chose not to — a capability
+/// regression, and one whose refusal point moves with `max_threads`
+/// because it sits close to the ceiling.
+///
+/// The fallback is what removes it. When the pushed statement raises
+/// ClickHouse code 241 — the only thing `generator_settings`'
+/// `max_memory_usage` raises — the executor releases the failed
+/// attempt's byte charge, records an explain entry, and runs
+/// `SearchPlan::generator_fallback_sql()`: the same generator with no
+/// `HAVING`, which is byte-identical to the statement this query sends
+/// with nothing pushed.
+///
+/// ```text
+///    phase 1, generator 0
+///
+///      pushed statement ──► 200 ─────────────────────────► candidates (narrow)
+///             │
+///             └─ code 241 ─► release the charge ─► fallback ──► candidates (wide, = today)
+///                                                     │
+///                                                     └─ code 241 ─► 422, as before
+/// ```
+///
+/// # What each assertion is for
+///
+/// The answer alone would not say the fallback ran — a build that never
+/// pushed at all would also answer `200` here. So the plan's own
+/// `pushed_having()` is asserted first, and the explain list must carry
+/// a `phase1_candidate_generator_fallback` entry whose SQL is the
+/// fallback statement. The control at the same ceiling with no aggregate
+/// has no such entry.
 #[tokio::test]
-async fn the_pushed_aggregate_outgrows_the_generator_memory_ceiling_and_refuses() {
+async fn the_pushed_aggregate_outgrows_the_ceiling_and_the_fallback_answers() {
     skip_unless_live!();
     let db = &pulsus_testkit::test_db("pulsus_read_it_pushdown_ceiling");
     let client = fresh_db(db).await;
@@ -1064,14 +1133,109 @@ async fn the_pushed_aggregate_outgrows_the_generator_memory_ceiling_and_refuses(
         Some("uniqExact(span_id) > 0"),
         "the aggregate must have compiled into the generator, or this test measures nothing"
     );
-    match engine.search(&plan).await {
-        Err(ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory { budget_bytes })) => {
-            assert_eq!(budget_bytes, M1_CEILING_BYTES);
+    let fallback = plan
+        .generator_fallback_sql()
+        .expect("a pushed plan carries a fallback")
+        .to_string();
+    assert!(
+        !fallback.contains("HAVING"),
+        "the fallback is the generator with no HAVING:\n{fallback}"
+    );
+
+    let (out, explain) = engine
+        .search_explained(&plan)
+        .await
+        .expect("the fallback must answer where the pushed statement cannot");
+    assert_eq!(out.traces.len(), 20);
+    assert!(
+        out.partial,
+        "1,000,000 candidates against a cap of {M1_MAX_CANDIDATES}: the depth bound engaged"
+    );
+    let entry = explain
+        .stages
+        .iter()
+        .find(|st| st.name == "phase1_candidate_generator_fallback")
+        .unwrap_or_else(|| {
+            panic!(
+                "the explain list must record the fallback; it holds {:?}",
+                explain.stages.iter().map(|st| st.name).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        entry.sql, fallback,
+        "the entry carries the fallback statement"
+    );
+    assert_eq!(
+        entry.note.as_deref(),
+        Some("reasongenerator memory ceiling"),
+        "the entry says why it ran"
+    );
+
+    // The control: the same corpus and the same ceiling with no
+    // aggregate records NO fallback entry, so the entry above is a
+    // statement about this query and not about the suite.
+    let bare = plan_for(&engine, r#"{ span.http.method = "GET" }"#, &p);
+    assert_eq!(bare.pushed_having(), None);
+    let (_, bare_explain) = engine
+        .search_explained(&bare)
+        .await
+        .expect("the control must answer");
+    assert!(
+        !bare_explain
+            .stages
+            .iter()
+            .any(|st| st.name == "phase1_candidate_generator_fallback"),
+        "a request that did not fall back must carry no fallback entry"
+    );
+
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+/// **The refusal keeps a test, at the honest boundary.**
+///
+/// Below the BARE statement's own peak there is no way to answer: the
+/// pushed statement breaches, the fallback breaches, and the request is
+/// refused exactly as it was before part 5. That is the boundary we are
+/// entitled to refuse at — not "there is a way and we chose not to take
+/// it".
+///
+/// Its break is one character in `exec.rs`: with
+/// `max_bytes_before_external_group_by` non-zero the identical statement
+/// spills and answers `200`. The hermetic half of that break is
+/// `traces::exec::tests::generator_settings_pin_the_memory_ceiling_and_throw_not_spill`.
+#[tokio::test]
+async fn a_ceiling_below_the_bare_statements_own_peak_still_refuses() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_pushdown_floor");
+    let client = fresh_db(db).await;
+    let base = now_ns() - (M1_ROWS as i64) * M1_STEP_NS - 3_600_000_000_000;
+    seed_m1(&client, db, base).await;
+
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(M1_MAX_CANDIDATES, M1_FLOOR_CEILING_BYTES),
+    );
+    let p = m1_params(base);
+    // BOTH statements must breach, and the second half is what makes
+    // this the honest boundary rather than a repeat of the withdrawn
+    // expectation: the bare statement is refused here too.
+    for (q, pushes) in [
+        (r#"{ span.http.method = "GET" } | count() > 0"#, true),
+        (r#"{ span.http.method = "GET" }"#, false),
+    ] {
+        let plan = plan_for(&engine, q, &p);
+        assert_eq!(plan.aggregate_pushed(), pushes, "{q}");
+        match engine.search(&plan).await {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory {
+                budget_bytes,
+            })) => {
+                assert_eq!(budget_bytes, M1_FLOOR_CEILING_BYTES, "{q}");
+            }
+            other => panic!(
+                "{q}: expected the generator memory ceiling to refuse; got {:?}",
+                other.map(|o| (o.traces.len(), o.partial))
+            ),
         }
-        other => panic!(
-            "expected the generator memory ceiling to refuse; got {:?}",
-            other.map(|o| (o.traces.len(), o.partial))
-        ),
     }
     exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
 }
@@ -1259,8 +1423,14 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
         // Every threshold at or past 2^53 refuses to push; the one below
         // it still does. Asserted per threshold rather than described,
         // because "they agree" is also true when nothing pushes at all.
-        let pushes = threshold.parse::<i64>().expect("an integer literal") < (1i64 << 53);
+        let in_range = threshold.parse::<i64>().expect("an integer literal") < (1i64 << 53);
         for op in B_OPS {
+            // Issue #492 part 5: TWO rules compose here and neither
+            // subsumes the other. `max(duration)` reads HIGH over the
+            // generator's rows, so only `>` and `>=` are safe; the other
+            // four refuse whatever the literal is. The threshold rule is
+            // then what decides the remaining two.
+            let pushes = in_range && matches!(op, ">" | ">=");
             let pushed_q =
                 format!(r#"{{ span.http.method = "GET" }} | max(duration) {op} {threshold}"#);
             let plain_q =
@@ -1338,4 +1508,994 @@ async fn the_two_paths_agree_at_the_precision_boundary_under_every_operator() {
          and {between}"
     );
     exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #492 part 5 — corpus U: a repeated `span_id` whose rows disagree
+// ---------------------------------------------------------------------
+
+/// One seeded row of corpus U. A `span` listed twice inside one trace is
+/// **two rows for one `(trace_id, span_id)`** at different
+/// `timestamp_ns` — a re-send of one span whose second delivery
+/// disagrees with the first. The evaluator keeps the FIRST row per
+/// `span_id` in `(trace_id, timestamp_ns, span_id)` order
+/// (`exec::group_hydrated_rows` over `search_sql::hydration_sql`'s
+/// ordering) and applies the selector to that survivor; the generator
+/// statement aggregates every row.
+#[derive(Debug, Clone)]
+struct URow {
+    trace: u32,
+    span: u32,
+    duration_ns: i64,
+    name: String,
+    service: String,
+}
+
+fn u(trace: u32, span: u32, duration_s: i64, service: &str) -> URow {
+    URow {
+        trace,
+        span,
+        duration_ns: duration_s * 1_000_000_000,
+        name: "op".to_string(),
+        service: service.to_string(),
+    }
+}
+
+/// Corpus U, exactly as issue #492 part 5's plan defines it.
+///
+/// ```text
+///   trace  rows                                    what disagrees  the engine's deduped spans
+///   …0001  S1 1s          S2 5s                    nothing         1s, 5s
+///   …0002  S1 3s                                   nothing         3s
+///   …0003  S1 3s          S2 3s      S3 3s         nothing         3s, 3s, 3s
+///   …000a  S1 5s (first)  S1 1s                    duration        5s
+///   …000b  S1 1s (first)  S1 5s                    duration        1s
+///   …000d  S1 5s (first)  S1 1s      S2 3s         duration        5s, 3s
+///   …000e  S1 3s svc=other (first)   S1 3s svc     the SELECTOR    3s  (S1 is dropped;
+///                          S2 3s svc                                    only S2 survives)
+/// ```
+///
+/// `…000e` is the one whose surviving row does not satisfy the selector,
+/// so under `{ resource.service.name = "svc" }` the evaluator counts ONE
+/// span there and the generator's rows hold two. That is the shape in
+/// which `R ⊇ D` is a strict containment on the span table and not only
+/// on the index.
+fn corpus_u() -> Vec<URow> {
+    vec![
+        u(1, 1, 1, "svc"),
+        u(1, 2, 5, "svc"),
+        u(2, 1, 3, "svc"),
+        u(3, 1, 3, "svc"),
+        u(3, 2, 3, "svc"),
+        u(3, 3, 3, "svc"),
+        u(10, 1, 5, "svc"),
+        u(10, 1, 1, "svc"),
+        u(11, 1, 1, "svc"),
+        u(11, 1, 5, "svc"),
+        u(13, 1, 5, "svc"),
+        u(13, 1, 1, "svc"),
+        u(13, 2, 3, "svc"),
+        u(14, 1, 3, "other"),
+        u(14, 1, 3, "svc"),
+        u(14, 2, 3, "svc"),
+    ]
+}
+
+/// Writes rows into `trace_spans` and one `http.method = 'GET'`
+/// attribute-index row per span row.
+///
+/// `ts_ns` is assigned from each row's position: trace index first, then
+/// the row's position within its trace. So the list ORDER is the
+/// timestamp order, which is what makes "the first row of a repeated
+/// `span_id`" the row written first in [`corpus_u`].
+///
+/// `repeats` is how many times every row is written. `2` is the
+/// byte-identical at-least-once redelivery; merges are stopped on the
+/// attribute index first, because a `ReplacingMergeTree` merge collapses
+/// two identical rows on the ordering key and would delete the very
+/// thing the test is about.
+async fn seed_u(client: &ChClient, db: &str, base_ns: i64, rows: &[URow], repeats: usize) {
+    if repeats > 1 {
+        exec(client, &format!("SYSTEM STOP MERGES {db}.trace_attrs_idx")).await;
+        exec(client, &format!("SYSTEM STOP MERGES {db}.trace_spans")).await;
+    }
+    let mut seen: std::collections::BTreeMap<u32, i64> = Default::default();
+    let mut spans = Vec::new();
+    let mut attrs = Vec::new();
+    for r in rows {
+        let j = seen.entry(r.trace).or_insert(0);
+        let ts = base_ns + i64::from(r.trace) * Q_TRACE_STEP_NS + *j * 1_000;
+        *j += 1;
+        let tid = hex32(&trace_id(r.trace));
+        let sid: String = span_id(r.trace, r.span)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        spans.push(format!(
+            "(unhex('{tid}'), unhex('{sid}'), unhex('0000000000000000'), '{}', '{}', {ts}, {}, \
+             0, 1, 1, '')",
+            r.name, r.service, r.duration_ns
+        ));
+        attrs.push(format!(
+            "(toDate(fromUnixTimestamp64Nano({ts})), 'http.method', 'GET', 'span', NULL, {ts}, \
+             unhex('{tid}'), unhex('{sid}'), {})",
+            r.duration_ns
+        ));
+    }
+    for _ in 0..repeats {
+        for chunk in spans.chunks(200) {
+            exec(
+                client,
+                &format!(
+                    "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
+                     timestamp_ns, duration_ns, status_code, kind, payload_type, payload) VALUES \
+                     {}",
+                    chunk.join(", ")
+                ),
+            )
+            .await;
+        }
+        for chunk in attrs.chunks(200) {
+            exec(
+                client,
+                &format!(
+                    "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_num, \
+                     timestamp_ns, trace_id, span_id, duration_ns) VALUES {}",
+                    chunk.join(", ")
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+/// The eighteen (aggregate, operator) cells, and which six the six-cell
+/// rule admits.
+///
+/// `count()` and `max(duration)` read HIGH over the generator's rows and
+/// `min(duration)` reads LOW, so `>`/`>=` are safe for the first two and
+/// `<`/`<=` for the third. The other twelve LOSE a trace and must send
+/// no fragment at all.
+const U_CELLS: [(&str, bool); 18] = [
+    ("count() > 1", true),
+    ("count() >= 2", true),
+    ("count() < 2", false),
+    ("count() <= 1", false),
+    ("count() = 1", false),
+    ("count() != 2", false),
+    ("min(duration) < 2s", true),
+    ("min(duration) <= 1s", true),
+    ("min(duration) > 2s", false),
+    ("min(duration) >= 5s", false),
+    ("min(duration) = 5s", false),
+    ("min(duration) != 1s", false),
+    ("max(duration) > 2s", true),
+    ("max(duration) >= 5s", true),
+    ("max(duration) < 2s", false),
+    ("max(duration) <= 1s", false),
+    ("max(duration) = 1s", false),
+    ("max(duration) != 5s", false),
+];
+
+fn u_params(base_ns: i64) -> SearchParams {
+    params(base_ns, 20 * Q_TRACE_STEP_NS)
+}
+
+/// **Issue #492 part 5 criterion 24: every one of the eighteen cells
+/// gives the same answer pushed and unpushed, on both exact families,
+/// over a corpus where a repeated `span_id`'s rows disagree.**
+///
+/// At `ddb48c96` twelve of these thirty-six cells returned FEWER traces
+/// than the query matches, and phase 2 cannot put a lost trace back.
+/// This is the corpus those losses were measured on.
+///
+/// # The three producers
+///
+/// * the **pushed** plan — `{ selector } | <cell>`, whose generator
+///   statement carries the fragment;
+/// * the **unpushed** plan — `{ selector } && { selector } | <cell>`,
+///   which matches the same spans (`eval_spanset`'s `And` takes the
+///   union of two identical sets) and is refused by
+///   `generator_exactness`'s one-leaf condition, so its aggregate runs
+///   in the evaluator;
+/// * three **literal** answers, written from the seeded rows rather than
+///   read off either plan, so "the two agree" cannot be two wrong lists.
+///
+/// # The superset is asserted separately
+///
+/// A criterion comparing only answers cannot see the mechanism the six
+/// surviving cells rest on. `max(duration) > 2s` returns six traces and
+/// its statement returns SEVEN candidate rows — `…000b`, whose two rows
+/// for one span id read 1s and 5s, is admitted by the statement and
+/// dropped by phase 2. So the candidate rows are asserted to be a
+/// superset of the answer, per cell.
+#[tokio::test]
+async fn every_ungrouped_cell_agrees_with_the_unpushed_plan_on_a_conflicting_corpus() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_pushdown_conflict");
+    let client = fresh_db(db).await;
+    let base = now_ns() - 20 * Q_TRACE_STEP_NS - 3_600_000_000_000;
+    seed_u(&client, db, base, &corpus_u(), 1).await;
+
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = u_params(base);
+
+    let mut wrong: Vec<String> = Vec::new();
+    for selector in [
+        r#"{ span.http.method = "GET" }"#,
+        r#"{ resource.service.name = "svc" }"#,
+    ] {
+        for (cell, pushes) in U_CELLS {
+            let pushed_q = format!("{selector} | {cell}");
+            let unpushed_q = format!("{selector} && {selector} | {cell}");
+            let pushed = plan_for(&engine, &pushed_q, &p);
+            let unpushed = plan_for(&engine, &unpushed_q, &p);
+            if pushed.aggregate_pushed() != pushes {
+                wrong.push(format!(
+                    "{pushed_q}: expected the fragment to {}, and it {}",
+                    if pushes { "render" } else { "be refused" },
+                    match pushed.pushed_having() {
+                        Some(f) => format!("rendered {f:?}"),
+                        None => "was not".to_string(),
+                    }
+                ));
+            }
+            assert!(
+                !unpushed.aggregate_pushed(),
+                "{unpushed_q}: the control must evaluate the aggregate in the engine"
+            );
+
+            let ids = |o: &pulsus_read::SearchOutput| -> Vec<String> {
+                o.traces.iter().map(|t| hex32(&t.trace_id)).collect()
+            };
+            let got = ids(&engine
+                .search(&pushed)
+                .await
+                .unwrap_or_else(|e| panic!("{pushed_q}: {e:?}")));
+            let want = ids(&engine
+                .search(&unpushed)
+                .await
+                .unwrap_or_else(|e| panic!("{unpushed_q}: {e:?}")));
+            if got != want {
+                wrong.push(format!(
+                    "{pushed_q}: pushed returned {got:?} and unpushed returned {want:?}"
+                ));
+            }
+
+            // The candidate rows are a SUPERSET of the answer: the
+            // mechanism the six surviving cells rest on, per cell.
+            let candidates: BTreeSet<String> = generator_ids(&client, &pushed.generator_sqls[0])
+                .await
+                .iter()
+                .map(hex32)
+                .collect();
+            let missing: Vec<&String> = got.iter().filter(|id| !candidates.contains(*id)).collect();
+            if !missing.is_empty() {
+                wrong.push(format!(
+                    "{pushed_q}: the statement did not return {missing:?}, which the answer holds"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases failed:\n{}",
+        wrong.len(),
+        2 * U_CELLS.len(),
+        wrong.join("\n")
+    );
+
+    // The three literal answers, written from the seeded rows. Without
+    // them the agreement above could be an agreement about nothing.
+    async fn answer(engine: &TraceEngine, p: &SearchParams, q: &str) -> Vec<String> {
+        let plan = plan_for(engine, q, p);
+        engine
+            .search(&plan)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e:?}"))
+            .traces
+            .iter()
+            .map(|t| hex32(&t.trace_id))
+            .collect()
+    }
+    let id = |n: u32| hex32(&trace_id(n));
+    assert_eq!(
+        answer(
+            &engine,
+            &p,
+            r#"{ span.http.method = "GET" } | max(duration) < 2s"#
+        )
+        .await,
+        vec![id(11)],
+        "…000b's two rows read 1s then 5s; the evaluator keeps the first, so its max is 1s. At \
+         ddb48c96 this answered with no traces at all"
+    );
+    assert_eq!(
+        answer(
+            &engine,
+            &p,
+            r#"{ span.http.method = "GET" } | min(duration) > 2s"#
+        )
+        .await,
+        vec![id(14), id(13), id(10), id(3), id(2)],
+        "…000d and …000a each keep a 5s first row; at ddb48c96 this answered with three traces"
+    );
+    let six = answer(
+        &engine,
+        &p,
+        r#"{ span.http.method = "GET" } | max(duration) > 2s"#,
+    )
+    .await;
+    assert_eq!(
+        six,
+        vec![id(14), id(13), id(10), id(3), id(2), id(1)],
+        "the surviving cell's answer does not move"
+    );
+    let candidates: Vec<String> = generator_ids(
+        &client,
+        &plan_for(
+            &engine,
+            r#"{ span.http.method = "GET" } | max(duration) > 2s"#,
+            &p,
+        )
+        .generator_sqls[0],
+    )
+    .await
+    .iter()
+    .map(hex32)
+    .collect();
+    assert_eq!(
+        candidates.len(),
+        7,
+        "seven candidates against six answers: …000b is admitted by the statement and removed by \
+         phase 2 — {candidates:?}"
+    );
+    assert!(
+        candidates.contains(&id(11)),
+        "…000b is the admitted one: {candidates:?}"
+    );
+
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+/// **Issue #492 part 5 criterion 25: a trace past the hydration cap does
+/// not lose its `count()` cells.**
+///
+/// `search_sql::hydration_sql` carries `LIMIT MAX_SPANS_PER_TRACE + 1 BY
+/// trace_id` (10 000) and `exec::group_hydrated_rows` drops the overflow
+/// probe row, so a trace with 10 002 matched spans is evaluated on
+/// 10 000 of them while `uniqExact(span_id)` counts all 10 002. That is
+/// the witness that `count()` is not exempt from the containment rule —
+/// on corpus U all four of its anti-monotone cells happen to agree, and
+/// "the defect lives in the exemption" is exactly the shape that hides.
+///
+/// One trace, 10 002 spans, five cells, each asserted against the same
+/// query planned unpushed.
+#[tokio::test]
+async fn a_trace_past_the_hydration_cap_does_not_lose_its_count_cells() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_pushdown_cap");
+    let client = fresh_db(db).await;
+    /// Two more than `exec::MAX_SPANS_PER_TRACE`, which is the narrowest
+    /// separation this mechanism admits: one more would be inside the
+    /// `+ 1` overflow probe.
+    const CAP_SPANS: u64 = 10_002;
+    let base = now_ns() - (CAP_SPANS as i64) * 1_000 - 3_600_000_000_000;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.trace_spans (trace_id, span_id, parent_id, name, service, \
+             timestamp_ns, duration_ns, status_code, kind, payload_type, payload) SELECT \
+               toFixedString(unhex('{tid}'), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
+               toFixedString(unhex('0000000000000000'), 8), 'op', 'svc', \
+               {base} + toInt64(number) * 1000, 1000000000, 0, 1, 1, '' \
+             FROM numbers({CAP_SPANS})",
+            tid = hex32(&trace_id(1)),
+        ),
+    )
+    .await;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {db}.trace_attrs_idx (date, key, val, scope, val_num, timestamp_ns, \
+             trace_id, span_id, duration_ns) SELECT \
+               toDate(fromUnixTimestamp64Nano({base} + toInt64(number) * 1000)), \
+               'http.method', 'GET', 'span', NULL, {base} + toInt64(number) * 1000, \
+               toFixedString(unhex('{tid}'), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), 1000000000 \
+             FROM numbers({CAP_SPANS})",
+            tid = hex32(&trace_id(1)),
+        ),
+    )
+    .await;
+
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = params(base, (CAP_SPANS as i64) * 1_000 + 1_000_000_000);
+
+    let mut wrong: Vec<String> = Vec::new();
+    for (cell, pushes) in [
+        ("count() < 10001", false),
+        ("count() <= 10000", false),
+        ("count() = 10000", false),
+        ("count() != 10002", false),
+        ("count() > 10001", true),
+    ] {
+        let pushed_q = format!(r#"{{ span.http.method = "GET" }} | {cell}"#);
+        let unpushed_q =
+            format!(r#"{{ span.http.method = "GET" }} && {{ span.http.method = "GET" }} | {cell}"#);
+        let pushed = plan_for(&engine, &pushed_q, &p);
+        let unpushed = plan_for(&engine, &unpushed_q, &p);
+        // COLLECTED, not asserted: an `assert_eq!` here would fire
+        // before the answers were compared, so a build that admitted an
+        // anti-monotone cell would redden on the push STATUS and never
+        // reach the claim this criterion is about, which is that the
+        // ANSWER does not move.
+        if pushed.aggregate_pushed() != pushes {
+            wrong.push(format!(
+                "{pushed_q}: expected the fragment to {}, and it {}",
+                if pushes { "render" } else { "be refused" },
+                match pushed.pushed_having() {
+                    Some(f) => format!("rendered {f:?}"),
+                    None => "was not".to_string(),
+                }
+            ));
+        }
+        assert!(!unpushed.aggregate_pushed(), "{unpushed_q}");
+        let ids = |o: pulsus_read::SearchOutput| -> Vec<String> {
+            o.traces.iter().map(|t| hex32(&t.trace_id)).collect()
+        };
+        let got = ids(engine
+            .search(&pushed)
+            .await
+            .unwrap_or_else(|e| panic!("{pushed_q}: {e:?}")));
+        let want = ids(engine
+            .search(&unpushed)
+            .await
+            .unwrap_or_else(|e| panic!("{unpushed_q}: {e:?}")));
+        if got != want {
+            wrong.push(format!(
+                "{pushed_q}: pushed returned {got:?} and unpushed returned {want:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} cell(s) failed:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+
+    // The literal answer, and it is the one that moved: at `ddb48c96`
+    // this query returned no traces at all.
+    let plan = plan_for(
+        &engine,
+        r#"{ span.http.method = "GET" } | count() < 10001"#,
+        &p,
+    );
+    let out = engine.search(&plan).await.expect("search");
+    assert_eq!(
+        out.traces
+            .iter()
+            .map(|t| hex32(&t.trace_id))
+            .collect::<Vec<_>>(),
+        vec![hex32(&trace_id(1))],
+        "the trace the evaluator counts 10 000 spans in and the statement counts 10 002"
+    );
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+// ---------------------------------------------------------------------
+// Issue #492 part 5 — the grouped arm
+// ---------------------------------------------------------------------
+
+fn named(trace: u32, span: u32, duration_s: i64, name: &str) -> URow {
+    URow {
+        trace,
+        span,
+        duration_ns: duration_s * 1_000_000_000,
+        name: name.to_string(),
+        service: "svc".to_string(),
+    }
+}
+
+/// **Issue #492 part 5 criteria 6 and 7: the two written orders separate
+/// the narrowest pair, and the grouped answer is the unpushed answer.**
+///
+/// Corpus C3b is two traces that are identical in every respect the
+/// query can see except how their four spans divide between two names:
+///
+/// ```text
+///   …0001   a a a b     the biggest group holds THREE spans
+///   …0002   a a b b     the biggest group holds TWO
+/// ```
+///
+/// ```text
+///   { resource.service.name = "svc" } | count() > 2 | by(name)   -> 0001, 0002
+///   { resource.service.name = "svc" } | by(name) | count() > 2   -> 0001
+/// ```
+///
+/// Both spellings answer `200`. For `…0002` the first returns two span
+/// sets and four spans; the second returns **no trace at all**, because
+/// an aggregate that empties the span-set list ends the trace
+/// (`docs/api.md` §4.2).
+///
+/// The second half is criterion 6: the grouped spelling's answer is the
+/// answer the SAME query gives with nothing pushed, so the statement
+/// filtered and did not decide.
+#[tokio::test]
+async fn the_grouped_and_ungrouped_spellings_separate_the_narrowest_pair() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_pushdown_c3b");
+    let client = fresh_db(db).await;
+    let base = now_ns() - 20 * Q_TRACE_STEP_NS - 3_600_000_000_000;
+    let rows = vec![
+        named(1, 1, 1, "a"),
+        named(1, 2, 1, "a"),
+        named(1, 3, 1, "a"),
+        named(1, 4, 1, "b"),
+        named(2, 1, 1, "a"),
+        named(2, 2, 1, "a"),
+        named(2, 3, 1, "b"),
+        named(2, 4, 1, "b"),
+    ];
+    seed_u(&client, db, base, &rows, 1).await;
+
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = u_params(base);
+    let ids = |o: pulsus_read::SearchOutput| -> Vec<String> {
+        o.traces.iter().map(|t| hex32(&t.trace_id)).collect()
+    };
+
+    let ungrouped_q = r#"{ resource.service.name = "svc" } | count() > 2 | by(name)"#;
+    let grouped_q = r#"{ resource.service.name = "svc" } | by(name) | count() > 2"#;
+    let ungrouped = plan_for(&engine, ungrouped_q, &p);
+    let grouped = plan_for(&engine, grouped_q, &p);
+    assert_eq!(
+        ungrouped.pushed_having(),
+        Some("uniqExact(span_id) > 2"),
+        "the aggregate at its written position filters the whole matched set"
+    );
+    assert_eq!(
+        grouped.pushed_having(),
+        Some(
+            "arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, \
+             substringUTF8(name, 1, 2048)), span_id)))) > 2"
+        ),
+        "the aggregate after a by() filters GROUPS"
+    );
+
+    assert_eq!(
+        ids(engine.search(&ungrouped).await.expect("ungrouped search")),
+        vec![hex32(&trace_id(2)), hex32(&trace_id(1))],
+        "{ungrouped_q}: both traces have four matched spans"
+    );
+    assert_eq!(
+        ids(engine.search(&grouped).await.expect("grouped search")),
+        vec![hex32(&trace_id(1))],
+        "{grouped_q}: …0002's biggest group holds two spans, so its span-set list empties and \
+         the trace ends"
+    );
+
+    // Criterion 6: the grouped answer is the answer with nothing pushed.
+    // The unpushed spelling is the same pipeline behind a selector the
+    // one-leaf exactness condition refuses, so the ONLY difference is
+    // where the aggregate ran.
+    let unpushed = plan_for(
+        &engine,
+        r#"{ resource.service.name = "svc" } && { resource.service.name = "svc" } | by(name) | count() > 2"#,
+        &p,
+    );
+    assert!(!unpushed.aggregate_pushed());
+    assert_eq!(
+        ids(engine.search(&grouped).await.expect("grouped search")),
+        ids(engine.search(&unpushed).await.expect("unpushed search")),
+        "the grouped statement filtered; it did not decide"
+    );
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+/// **Issue #492 part 5 criterion 10: a string group key groups by the
+/// BYTE-CAPPED expression.**
+///
+/// The evaluator groups the capped hydrated `name`
+/// (`search_sql::hydration_sql` projects
+/// `if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS
+/// name`), so the statement must group the same expression. Grouping the
+/// raw column is a FINER partition and loses the trace.
+///
+/// The corpus is the narrowest pair that can show it: `length(col) <=
+/// 8192` is inclusive, so 8192 bytes caps to itself and **8193 is the
+/// first that truncates**. Two names of 8193 bytes sharing their first
+/// 2048 code points cap to the same value and differ raw:
+///
+/// ```text
+///   '𝄞' x 2048 + '0'   8193 bytes, 2049 code points
+///   '𝄞' x 2048 + '1'   8193 bytes, 2049 code points
+///
+///   GROUP BY the raw column     -> groups of 2 and 1, count() > 2 DROPS the trace
+///   GROUP BY the capped column  -> one group of 3,    count() > 2 KEEPS it
+/// ```
+///
+/// There is no ingest length cap on `name`
+/// (`pulsus-write/src/protocols/otlp_traces.rs` binds it unbounded), so
+/// this is reachable through our own write path.
+#[tokio::test]
+async fn a_string_group_key_groups_by_the_capped_expression() {
+    skip_unless_live!();
+    let db = &pulsus_testkit::test_db("pulsus_read_it_pushdown_capkey");
+    let client = fresh_db(db).await;
+    let base = now_ns() - 20 * Q_TRACE_STEP_NS - 3_600_000_000_000;
+    let long = "\u{1D11E}".repeat(2048);
+    let a = format!("{long}0");
+    let b = format!("{long}1");
+    assert_eq!(a.len(), 8193, "the first length that truncates");
+    assert_eq!(a.chars().count(), 2049);
+    let rows = vec![named(1, 1, 1, &a), named(1, 2, 1, &a), named(1, 3, 1, &b)];
+    seed_u(&client, db, base, &rows, 1).await;
+
+    // The corpus really does hold two distinct raw names that cap to
+    // one, or the assertion below would be about nothing.
+    assert_eq!(
+        scalar(
+            &client,
+            &format!("SELECT uniqExact(name) AS v FROM {db}.trace_spans"),
+        )
+        .await,
+        2,
+        "two distinct raw names"
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            &format!("SELECT uniqExact(substringUTF8(name, 1, 2048)) AS v FROM {db}.trace_spans"),
+        )
+        .await,
+        1,
+        "one capped name"
+    );
+
+    let engine = TraceEngine::new(
+        ChClient::new(conn(db)).await.expect("connect (engine)"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = u_params(base);
+    let plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "svc" } | by(name) | count() > 2"#,
+        &p,
+    );
+    let frag = plan.pushed_having().expect("the grouped fragment renders");
+    assert!(
+        frag.contains("substringUTF8(name, 1, 2048)"),
+        "the group key must be the capped expression: {frag}"
+    );
+    let out = engine.search(&plan).await.expect("search");
+    assert_eq!(
+        out.traces
+            .iter()
+            .map(|t| hex32(&t.trace_id))
+            .collect::<Vec<_>>(),
+        vec![hex32(&trace_id(1))],
+        "three spans capping to one name: the capped grouping keeps the trace"
+    );
+
+    // The break, run in the test rather than described: the same
+    // statement with the cap removed from the map key returns nothing,
+    // because three spans become groups of two and one.
+    let raw = plan.generator_sqls[0].replace(
+        "if(length(name) <= 8192, name, substringUTF8(name, 1, 2048))",
+        "name",
+    );
+    assert_ne!(raw, plan.generator_sqls[0], "the control must differ");
+    assert!(
+        generator_ids(&client, &raw).await.is_empty(),
+        "grouping the RAW column must lose the trace — which is what makes the cap load-bearing"
+    );
+    exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+}
+
+/// **Issue #492 part 5 criteria 6b and 6c: the six grouped cells return
+/// a superset the engine re-filters, and a byte-identical redelivery
+/// moves neither side.**
+///
+/// The corpus is C3b plus the three conflicting shapes — a trace whose
+/// repeated `span_id` carries two different NAMES (so the map assigns
+/// one span to two group keys where the evaluator assigns it to one),
+/// and two whose repeated `span_id` carries two different durations.
+///
+/// ```text
+///   …0001  a a a b                       four spans, biggest group three
+///   …0002  a a b b                       four spans, biggest group two
+///   …0009  S1 name a, S1 name b          one span id, two rows, names SWAPPED
+///          S2 name b, S2 name a
+///   …000a  S1 5s (first), S1 1s          one span id, two rows, durations disagree
+///   …000b  S1 1s (first), S1 5s
+/// ```
+///
+/// **Criterion 6c is what licenses pushing at all.** If a BYTE-IDENTICAL
+/// at-least-once redelivery could move either side, the map form could
+/// not be used on a plain `MergeTree` at all. It cannot: the same rows
+/// written twice give the same answer and the same candidate set for
+/// every cell, because the aggregate is over DISTINCT span ids and the
+/// duplicated rows carry the same key and the same value.
+#[tokio::test]
+async fn the_grouped_cells_return_a_superset_and_a_replay_moves_neither_side() {
+    skip_unless_live!();
+    let clean_db = &pulsus_testkit::test_db("pulsus_read_it_grouped_clean");
+    let replay_db = &pulsus_testkit::test_db("pulsus_read_it_grouped_replay");
+    let base = now_ns() - 20 * Q_TRACE_STEP_NS - 3_600_000_000_000;
+    let rows = vec![
+        named(1, 1, 1, "a"),
+        named(1, 2, 1, "a"),
+        named(1, 3, 1, "a"),
+        named(1, 4, 1, "b"),
+        named(2, 1, 1, "a"),
+        named(2, 2, 1, "a"),
+        named(2, 3, 1, "b"),
+        named(2, 4, 1, "b"),
+        named(9, 1, 1, "a"),
+        named(9, 1, 1, "b"),
+        named(9, 2, 1, "b"),
+        named(9, 2, 1, "a"),
+        named(10, 1, 5, "a"),
+        named(10, 1, 1, "a"),
+        named(11, 1, 1, "a"),
+        named(11, 1, 5, "a"),
+    ];
+    let clean = fresh_db(clean_db).await;
+    seed_u(&clean, clean_db, base, &rows, 1).await;
+    let replay = fresh_db(replay_db).await;
+    seed_u(&replay, replay_db, base, &rows, 2).await;
+
+    // The replay is visible, or the rest proves nothing.
+    let one = scalar(
+        &clean,
+        &format!("SELECT count() AS v FROM {clean_db}.trace_spans"),
+    )
+    .await;
+    let two = scalar(
+        &replay,
+        &format!("SELECT count() AS v FROM {replay_db}.trace_spans"),
+    )
+    .await;
+    assert_eq!(two, 2 * one, "the replayed corpus holds every row twice");
+
+    let clean_engine = TraceEngine::new(
+        ChClient::new(conn(clean_db)).await.expect("connect"),
+        engine_config(100_000, 536_870_912),
+    );
+    let replay_engine = TraceEngine::new(
+        ChClient::new(conn(replay_db)).await.expect("connect"),
+        engine_config(100_000, 536_870_912),
+    );
+    let p = u_params(base);
+
+    let mut wrong: Vec<String> = Vec::new();
+    for (cell, pushes) in U_CELLS {
+        let pushed_q = format!(r#"{{ resource.service.name = "svc" }} | by(name) | {cell}"#);
+        let unpushed_q = format!(
+            r#"{{ resource.service.name = "svc" }} && {{ resource.service.name = "svc" }} | by(name) | {cell}"#
+        );
+        let pushed = plan_for(&clean_engine, &pushed_q, &p);
+        let unpushed = plan_for(&clean_engine, &unpushed_q, &p);
+        if pushed.aggregate_pushed() != pushes {
+            wrong.push(format!(
+                "{pushed_q}: expected the grouped fragment to {}, and it {}",
+                if pushes { "render" } else { "be refused" },
+                match pushed.pushed_having() {
+                    Some(f) => format!("rendered {f:?}"),
+                    None => "was not".to_string(),
+                }
+            ));
+        }
+        assert!(!unpushed.aggregate_pushed(), "{unpushed_q}");
+
+        let ids = |o: &pulsus_read::SearchOutput| -> Vec<String> {
+            o.traces.iter().map(|t| hex32(&t.trace_id)).collect()
+        };
+        let got = ids(&clean_engine
+            .search(&pushed)
+            .await
+            .unwrap_or_else(|e| panic!("{pushed_q}: {e:?}")));
+        let want = ids(&clean_engine
+            .search(&unpushed)
+            .await
+            .unwrap_or_else(|e| panic!("{unpushed_q}: {e:?}")));
+        if got != want {
+            wrong.push(format!(
+                "{pushed_q}: pushed returned {got:?} and unpushed returned {want:?}"
+            ));
+        }
+
+        // (i) the candidate rows CONTAIN the engine's answer.
+        let candidates: BTreeSet<String> = generator_ids(&clean, &pushed.generator_sqls[0])
+            .await
+            .iter()
+            .map(hex32)
+            .collect();
+        let missing: Vec<&String> = want.iter().filter(|id| !candidates.contains(*id)).collect();
+        if !missing.is_empty() {
+            wrong.push(format!(
+                "{pushed_q}: the statement did not return {missing:?}, which the answer holds"
+            ));
+        }
+
+        // (ii) criterion 6c: the byte-identical replay moves neither the
+        // answer nor the candidate set.
+        let replayed = plan_for(&replay_engine, &pushed_q, &p);
+        let replayed_answer = ids(&replay_engine
+            .search(&replayed)
+            .await
+            .unwrap_or_else(|e| panic!("{pushed_q} (replay): {e:?}")));
+        if replayed_answer != got {
+            wrong.push(format!(
+                "{pushed_q}: the replay moved the answer, {got:?} -> {replayed_answer:?}"
+            ));
+        }
+        let replay_candidates: BTreeSet<String> =
+            generator_ids(&replay, &replayed.generator_sqls[0])
+                .await
+                .iter()
+                .map(hex32)
+                .collect();
+        if replay_candidates != candidates {
+            wrong.push(format!(
+                "{pushed_q}: the replay moved the CANDIDATE set, {candidates:?} -> \
+                 {replay_candidates:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases failed:\n{}",
+        wrong.len(),
+        U_CELLS.len(),
+        wrong.join("\n")
+    );
+
+    // --- the flagship query, at the threshold that discriminates -----
+    //
+    // The loop above runs `count()` at thresholds 1 and 2, and on this
+    // corpus every trace's biggest group holds at least two ROWS, so a
+    // map that counted rows rather than distinct span ids would give the
+    // same candidate set on both corpora and the loop could not see it.
+    // At `> 2` it can: with `uniqExactMap` the clean and replayed
+    // corpora both admit `…0001` alone, and with a row-counting map the
+    // replay admits all five traces, because every row is written twice.
+    //
+    // This is `| by(name) | count() > 2` — the query part 5 exists for.
+    {
+        let q = r#"{ resource.service.name = "svc" } | by(name) | count() > 2"#;
+        let clean_plan = plan_for(&clean_engine, q, &p);
+        let replay_plan = plan_for(&replay_engine, q, &p);
+        assert!(
+            clean_plan.aggregate_pushed() && replay_plan.aggregate_pushed(),
+            "{q}"
+        );
+        let clean_ids: Vec<String> = generator_ids(&clean, &clean_plan.generator_sqls[0])
+            .await
+            .iter()
+            .map(hex32)
+            .collect();
+        let replay_ids: Vec<String> = generator_ids(&replay, &replay_plan.generator_sqls[0])
+            .await
+            .iter()
+            .map(hex32)
+            .collect();
+        assert_eq!(
+            clean_ids,
+            vec![hex32(&trace_id(1))],
+            "{q}: only …0001's biggest group holds three DISTINCT span ids"
+        );
+        assert_eq!(
+            replay_ids, clean_ids,
+            "{q}: the byte-identical replay must not move the candidate set — a map counting \
+             ROWS rather than distinct span ids would admit all five traces here"
+        );
+    }
+
+    // --- the superset, with a witness -------------------------------
+    //
+    // `…000b`'s two rows for one span id read 1s then 5s. The evaluator
+    // keeps the FIRST, so its only group's maximum is 1s; the map
+    // aggregates ROWS, so its maximum is 5s. Under `max(duration) >= 5s`
+    // the statement admits the trace and phase 2 drops it — a superset,
+    // and one that is not empty on this corpus.
+    let eleven = hex32(&trace_id(11));
+    let surviving = plan_for(
+        &clean_engine,
+        r#"{ resource.service.name = "svc" } | by(name) | max(duration) >= 5s"#,
+        &p,
+    );
+    assert!(surviving.aggregate_pushed());
+    let candidates: Vec<String> = generator_ids(&clean, &surviving.generator_sqls[0])
+        .await
+        .iter()
+        .map(hex32)
+        .collect();
+    let answer: Vec<String> = clean_engine
+        .search(&surviving)
+        .await
+        .expect("search")
+        .traces
+        .iter()
+        .map(|t| hex32(&t.trace_id))
+        .collect();
+    assert!(
+        candidates.contains(&eleven),
+        "the map maximises over ROWS, so …000b's 5s second row admits it: {candidates:?}"
+    );
+    assert!(
+        !answer.contains(&eleven),
+        "the evaluator keeps the FIRST row per span id, so …000b's maximum is 1s: {answer:?}"
+    );
+
+    // --- and the loss the twelve refused cells are refused for -------
+    //
+    // `…0009` has two span ids and four rows with the NAMES SWAPPED. The
+    // map assigns each repeated span id to BOTH keys before
+    // deduplication, so every group reads 2; the evaluator deduplicates
+    // first and sees two groups of one.
+    //
+    //   the engine   a:{S1}     b:{S2}      -> min 1  -> `count() < 2` RETURNS it
+    //   the map      a:{S1,S2}  b:{S1,S2}   -> min 2  -> `count() < 2` LOSES it
+    //
+    // So `count() < 2` refuses. This runs the fragment it WOULD have
+    // rendered — by string surgery on the production statement, so the
+    // two differ in the `HAVING` and in nothing else — and shows the
+    // loss. Without it the refusal is a rule nothing measures.
+    let nine = hex32(&trace_id(9));
+    let refused = plan_for(
+        &clean_engine,
+        r#"{ resource.service.name = "svc" } | by(name) | count() < 2"#,
+        &p,
+    );
+    assert_eq!(
+        refused.pushed_having(),
+        None,
+        "an anti-monotone grouped cell must send no fragment"
+    );
+    let answer: Vec<String> = clean_engine
+        .search(&refused)
+        .await
+        .expect("search")
+        .traces
+        .iter()
+        .map(|t| hex32(&t.trace_id))
+        .collect();
+    assert!(
+        answer.contains(&nine),
+        "…0009's deduplicated groups hold one span each: {answer:?}"
+    );
+    let would_be = refused.generator_sqls[0].replace(
+        "\nGROUP BY trace_id\n",
+        "\nGROUP BY trace_id\nHAVING arrayMin(mapValues(uniqExactMap(map(if(length(name) <= \
+         8192, name, substringUTF8(name, 1, 2048)), span_id)))) < 2\n",
+    );
+    assert_ne!(
+        would_be, refused.generator_sqls[0],
+        "the control must differ"
+    );
+    let would_be_candidates: Vec<String> = generator_ids(&clean, &would_be)
+        .await
+        .iter()
+        .map(hex32)
+        .collect();
+    assert!(
+        !would_be_candidates.contains(&nine),
+        "if `count() < 2` pushed, the statement would lose …0009 and phase 2 could not put it \
+         back: {would_be_candidates:?}"
+    );
+    exec(&clean, &format!("DROP DATABASE IF EXISTS {clean_db}")).await;
+    exec(&replay, &format!("DROP DATABASE IF EXISTS {replay_db}")).await;
 }

@@ -509,10 +509,11 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `{ !a }` | `NOT sql_a`, only when `a` means exactly what it says; otherwise the constant `1` | *from the design*, `docs/query-lowering.md:304-305` |
 | `{ .a != nil }` | `key = 'a' AND 1` | *emitted today*, unchanged |
 | `{ nestedSetParent < 0 }` | `parent_id = toFixedString(unhex('0000000000000000'), 8)` | *from the design*, `docs/query-lowering.md:777`. The expression already exists on the metrics route (`metrics_sql.rs:414`); this work brings it to the search route |
-| `\| max(duration) > 1s` | `HAVING max(duration_ns) > 1000000000` | *from the design*, `docs/query-lowering.md:608`. Three conditions, all required: the predicate so far means exactly what the query means, no grouping is set, and the rows so far are spans |
-| `\| count() > 2` | `HAVING count() > 2` | *from the design*, the same three conditions |
-| `\| by(name)` | `GROUP BY name` | *from the design*, `docs/query-lowering.md:609`. The same three conditions. After it, the rows are groups rather than spans |
-| `\| coalesce()` after a `by()` | wraps the statement so far in a subquery and groups again | *from the design*, `docs/query-lowering.md:610` and ADR 0008 D1 |
+| `\| max(duration) > 1s` | `HAVING max(duration_ns) > 1000000000` | *emitted today* (issue #492 parts 4 and 5). Conditions: the predicate so far means exactly what the query means, the rows so far are spans, no fragment is already in this statement's `HAVING`, and the (aggregate, operator) pair is one of the six that read the SAME direction as the evaluator. `max` reads HIGH over the generator's rows, so `>` and `>=` push and `<`, `<=`, `=`, `!=` refuse |
+| `\| count() > 2` | `HAVING uniqExact(span_id) > 2` | *emitted today*, the same conditions. `uniqExact(span_id)` and not `count()`: a replayed row inflates a plain count. `count()` reads HIGH, so `>` and `>=` push |
+| `\| min(duration) < 2s` | `HAVING min(duration_ns) < 2000000000` | *emitted today*. `min` reads LOW over the generator's rows, so `<` and `<=` push and the other four refuse |
+| `\| by(name)` | the key becomes the KEY of a map aggregate inside the `HAVING`, not a `GROUP BY` column: `HAVING arrayMax(mapValues(uniqExactMap(map(<capped name>, span_id)))) > 2` when an aggregate lands in the same level, and nothing at all when none does | *emitted today* (issue #492 part 5), superseding `docs/query-lowering.md:609`'s `GROUP BY name`. The statement keeps one aggregation state per (trace × key value) where the ungrouped one keeps one per trace; the map form measured 334 MB against the wrapped `GROUP BY trace_id, name` form's 523 MB on the same corpus, with byte-identical `EXPLAIN indexes = 1` |
+| `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
 | `\| select(.foo)` | a left join whose right side is `trace_attrs_idx` restricted to `key = 'foo'`, one value per span, projected as an extra column | **decided here**, §2.7.3. The alternative — widening the selector's own `key` predicate and picking the values apart with `anyIf` — was rejected on a measurement: it loses the `val` prune, and `key = 'service.namespace' AND val = 'prod'` reads 14 of 74 granules against 51 of 74 for `key IN ('service.namespace', 'foo')`. Worked in §2.9's TraceQL30. **A join is a clause ADR 0008 does not name** — part 10's open question 4 |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:90`. Still `400` on the search route (`search_plan.rs:1228`); this work does not change that |
@@ -782,10 +783,11 @@ date (`catalog.rs:381-382`), and `trace_spans`, ordered by `(trace_id, timestamp
 | `{ traceDuration > 2s }`, `rootName`, `rootServiceName` | | — | **cannot become SQL.** Resolved from a read across the whole trace with no time bound, because the true root may start before the window |
 | `{ span:childCount > 2 }` | | — | **cannot become SQL**, the same reason |
 | `{ a } > { b }` and every other structural relation | | — | **cannot become SQL.** The relation holds between two spans of one trace and is decided over the spans read back, which are cut at 10,000 per trace (`exec.rs:119`) |
-| `\| max(duration) > 1s` | `HAVING max(duration_ns) > 1000000000` | `HAVING` | *from the design*, `docs/query-lowering.md:608`, on the three conditions §2.4 lists: the predicate so far means exactly what the query means, no grouping is set, and the rows so far are spans. Executed on the container over `trace_attrs_idx` alone: the index carries `duration_ns` on every attribute row (`catalog.rs:379`), so a single-condition selector with a duration aggregate needs no second table |
-| `\| count() > 2` | `HAVING count() > 2` | `HAVING` | *from the design*, the same three conditions. Worked in §2.9's TraceQL27 |
-| `\| by(name)` | `name` added to the `SELECT` list and the `GROUP BY` | `SELECT` and `GROUP BY` | *from the design*, `docs/query-lowering.md:609`. Removes **two** statements per batch of 32 candidates, not one — today the value is read twice, once as a number and once as text, because the key's type is not known until the values arrive (golden `spanset_by_attr.sql`) |
-| `\| coalesce()` after a `by()` | the statement so far becomes a subquery and the outer statement groups again | a new outer statement | *from the design*, `docs/query-lowering.md:610` and ADR 0008 D1 |
+| `\| max(duration) > 1s` | `HAVING max(duration_ns) > 1000000000` | `HAVING` | *emitted today* (issue #492 parts 4 and 5). Executed on the container over `trace_attrs_idx` alone: the index carries `duration_ns` on every attribute row (`catalog.rs:379`), so a single-condition selector with a duration aggregate needs no second table. **Only `>` and `>=`**: the statement aggregates the generator's ROWS and the evaluator its DEDUPLICATED, selector-matched spans, so `R ⊇ D` and `max` reads HIGH. Under `<`, `<=`, `=` or `!=` a HIGH reading LOSES a qualifying trace and phase 2 cannot put it back — measured on a seven-trace corpus where one `(trace_id, span_id)` carries two rows with different durations, `max(duration) < 2s` returned one trace unpushed and none pushed |
+| `\| count() > 2` | `HAVING uniqExact(span_id) > 2` | `HAVING` | *emitted today*. Worked in §2.9's TraceQL27. `count()` reads HIGH for the same reason, and it is not exempt: a trace with 10 002 matched spans is evaluated on 10 000 of them (`hydration_sql`'s `LIMIT 10001 BY trace_id`) while `uniqExact(span_id)` counts all 10 002, so `count() < 10001` returned one trace unpushed and none pushed. **Only `>` and `>=`** |
+| `\| min(duration) < 2s` | `HAVING min(duration_ns) < 2000000000` | `HAVING` | *emitted today*. `min` over a superset reads LOW, so `<` and `<=` produce a superset phase 2 re-filters and the other four LOSE a trace. **Only `<` and `<=`** |
+| `\| by(name)` | the key becomes the KEY of a map aggregate inside the `HAVING`: `arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), span_id)))) > 2` | `HAVING` | *emitted today* (issue #492 part 5). **Not the `SELECT` list and not the `GROUP BY`**: those would make the statement's rows one per (trace, group), which is not what the executor consumes, and would need an outer statement to collapse them back. The map form asks the trace-level question — "does any group satisfy it?" — on the statement part 4 already sends. The key renders through `search_sql::byte_cap_expr`, the same function `hydration_sql` projects the column through, so the SQL partition and the evaluator's are one function of one column. It renders only on a `trace_spans` generator and only when an aggregate lands in the same level |
+| `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING` | — | *emitted today* (issue #492 part 5). **No subquery, no outer statement and no wrap.** With a `HAVING` in the level it refuses: the aggregate selected groups and the spans it selected are not recoverable from a statement that has already reduced them |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | — | *from the design*, `docs/query-lowering.md:611`. It is the identity |
 | `\| select(.foo)` | a left join whose right side is the attribute index restricted to `key = 'foo'`, one value per span, projected as an extra column | `FROM … LEFT JOIN (…)` | **decided here.** The alternative is to widen the selector's own `key` predicate to `key IN ('a', 'foo')` and pick the two values apart with `anyIf`. That form was rejected on a measurement: widening the predicate loses the `val` prune, because `val` is the second column of the ordering key. `key = 'service.namespace' AND val = 'prod'` read **14 of 74** granules; `key IN ('service.namespace', 'foo')` read **51 of 74** — 3.6 times as many. The join keeps the selector's two-column prune and puts the value read on its own side. It replaces one statement **per batch** with one statement per query. **A join is a clause ADR 0008 does not name** — §10's open question 4 |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | — | `metrics_sql.rs:90`. Still refused with `400` on the search route (`search_plan.rs:1228`) |
@@ -1416,26 +1418,52 @@ requires before an aggregate may compile at all.
 { .service.namespace = "prod" } | by(name)
 ```
 
-**Marked: from the design** (`docs/query-lowering.md:609`), text decided here. `name` is a column of
-`trace_spans`, so the statement reads the span table and semi-joins the attribute index.
+**Superseded by issue #492 part 5.** The block below is what this record proposed and what part 5
+decided against; the SQL a `by(name)` produces today is stated after it.
+
+> **Marked: from the design** (`docs/query-lowering.md:609`), text decided here. `name` is a column of
+> `trace_spans`, so the statement reads the span table and semi-joins the attribute index.
+>
+> ```sql
+> -- proposed here; executed on 26.3.17.110; NOT what the compiler emits
+> SELECT trace_id, name, max(timestamp_ns) AS sort_key
+> FROM trace_spans
+> WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000
+>   AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000 AND key = 'service.namespace' AND val = 'prod' AND scope = 'resource')
+> GROUP BY trace_id, name
+> ORDER BY sort_key DESC, trace_id ASC, name ASC
+> LIMIT 20
+> ```
+>
+> Ran, returning 20 rows; read 314,688 rows and 11.01 MiB.
+
+**Part 5 emits no join and no semi-join, and it removes none, because the compiler has never emitted
+one on this path.** The proposal above acquires a `(trace_id, span_id) IN (SELECT …)` clause, and ADR
+0008 (`decisions/0008-sql-composition-for-lowered-pipelines.md:199-203`) says no emitted SQL may
+contain a join until the ADR is amended to name the clause. Part 5 refuses the push instead:
 
 ```sql
--- decided here; executed on 26.3.17.110
-SELECT trace_id, name, max(timestamp_ns) AS sort_key
-FROM trace_spans
-WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000
-  AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000 AND key = 'service.namespace' AND val = 'prod' AND scope = 'resource')
-GROUP BY trace_id, name
-ORDER BY sort_key DESC, trace_id ASC, name ASC
-LIMIT 20
+-- what `{ .service.namespace = "prod" } | by(name)` sends today, and after part 5,
+-- byte for byte the same
+SELECT trace_id, max(timestamp_ns) AS bound_ts
+FROM trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
+  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000
+  AND (key = 'service.namespace' AND val = 'prod')
+GROUP BY trace_id
+ORDER BY bound_ts DESC, trace_id ASC
+LIMIT 100001
 ```
 
-Ran, returning 20 rows; read 314,688 rows and 11.01 MiB.
+Two reasons, either of which alone is enough. `name` is not a column of `trace_attrs_idx`, so the key
+is not renderable on this generator's source; and the pipeline carries no aggregate, so a grouping
+would filter nothing and cost a wider statement. A `by(name)` DOES reach the statement when its
+generator reads `trace_spans` and an aggregate lands in the same level — see the clause table above
+and §2.9's TraceQL12.
 
-**What it avoids.** Two statements per batch, not one. Today a `by()` over an attribute adds a
-numeric value read **and** a text value read for every candidate span, because the group key's type
-is not known until the values arrive (golden `traces_search/spanset_by_attr.sql`). Grouping by an
-intrinsic such as `name` needs neither.
+Exactly one golden in the search corpus contains `IN (SELECT`, and it is pre-existing and untouched:
+`traces_search/spanset_by_service.sql`, in its `== by() cardinality probe ==` block (issue #185's
+pre-flight).
 
 #### TraceQL29 — a grouping, then a merge back into spans
 
@@ -1443,26 +1471,43 @@ intrinsic such as `name` needs neither.
 { .service.namespace = "prod" } | by(name) | coalesce()
 ```
 
-**Marked: from the design** (`docs/query-lowering.md:610`) and ADR 0008 D1: the grouping clause is
-already filled, so the statement so far becomes a subquery and the outer statement groups again.
+**Superseded by issue #492 part 5**, for the same reason as TraceQL28 plus one more: no wrap is
+emitted, and none ever was.
 
-```sql
--- decided here; executed on 26.3.17.110
-SELECT trace_id, max(sort_key) AS sort_key
-FROM (
-  SELECT trace_id, name, max(timestamp_ns) AS sort_key
-  FROM trace_spans
-  WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000
-    AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000 AND key = 'service.namespace' AND val = 'prod' AND scope = 'resource')
-  GROUP BY trace_id, name
-)
-GROUP BY trace_id
-ORDER BY sort_key DESC, trace_id ASC
-LIMIT 20
-```
+> **Marked: from the design** (`docs/query-lowering.md:610`) and ADR 0008 D1: the grouping clause is
+> already filled, so the statement so far becomes a subquery and the outer statement groups again.
+>
+> ```sql
+> -- proposed here; executed on 26.3.17.110; NOT what the compiler emits
+> SELECT trace_id, max(sort_key) AS sort_key
+> FROM (
+>   SELECT trace_id, name, max(timestamp_ns) AS sort_key
+>   FROM trace_spans
+>   WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000
+>     AND (trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15') AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700000200000000000 AND key = 'service.namespace' AND val = 'prod' AND scope = 'resource')
+>   GROUP BY trace_id, name
+> )
+> GROUP BY trace_id
+> ORDER BY sort_key DESC, trace_id ASC
+> LIMIT 20
+> ```
+>
+> Ran, returning 20 rows; read **314,688 rows and 11.01 MiB — the same figures as TraceQL28**, which is ADR 0008 D1's
+> claim reproduced here: ClickHouse flattens the nesting and the wrap costs nothing.
 
-Ran, returning 20 rows; read **314,688 rows and 11.01 MiB — the same figures as TraceQL28**, which is ADR 0008 D1's
-claim reproduced here: ClickHouse flattens the nesting and the wrap costs nothing.
+**What `coalesce()` does after a `by()` today.** It frees the grouping slot, and contributes no SQL.
+Read from the reference's own merge stage at the pinned build: it concatenates every span set's spans
+into one and carries no group attributes forward, so an UNFILTERED `by()` followed by `coalesce()` is
+the identity — the pipeline means what `by(name)` alone means, a grouping with nothing to filter.
+Emitting anything for it would cost a wider statement and change no answer.
+
+The slot being freed is observable one stage later, and that is the golden that pins it:
+`{ resource.service.name = "grp" } | by(name) | coalesce() | by(name) | count() > 2` renders the
+grouped `HAVING`, because the first `by()` fills the slot, the `coalesce()` frees it, the second
+fills it again, and the aggregate lands in that level
+(`tests/golden/traces_search/issue492_by_coalesce_by_count.sql`). Without the `count() > 2` the same
+pipeline renders the bare generator
+(`tests/golden/traces_search/issue492_by_coalesce_by.sql`).
 
 #### TraceQL30 — selecting an attribute for the response
 
@@ -3600,7 +3645,12 @@ LIMIT 20
 
 **SQL today** — as TraceQL9: the aggregate produces no SQL. The statements are TraceQL1's.
 
-**SQL after this work** — `HAVING max(duration_ns) > 1000000000`, on the same three conditions (`docs/query-lowering.md:608`). `trace_attrs_idx` carries `duration_ns` on every attribute row (`catalog.rs:379`), so the attribute index answers the whole query — no join, no subquery, no second table.
+**SQL today** (issue #492 parts 4 and 5) — `HAVING max(duration_ns) > 1000000000`. `trace_attrs_idx` carries `duration_ns` on every attribute row (`catalog.rs:379`), so the attribute index answers the whole query — no join, no subquery, no second table.
+
+`>` is one of the two operators `max` may push under. The statement aggregates the generator's ROWS
+and the evaluator its DEDUPLICATED, selector-matched spans, so the statement's maximum reads HIGH:
+under `>` and `>=` it returns a superset phase 2 re-filters, and under `<`, `<=`, `=` or `!=` it
+LOSES a qualifying trace. The same query with `< 2s` sends no `HAVING` at all.
 
 ```sql
 SELECT trace_id, max(timestamp_ns) AS sort_key
@@ -3667,12 +3717,34 @@ halves the saving and leaves the other.
 { .a = "1" } | by(span.foo) | count() > 2
 ```
 
-**A worked case of one step blocking the next.** `by()` compiles and produces groups; `count()`
-accepts spans, not groups, so it cannot compile there — and everything after it refuses too.
+**Superseded by issue #492 part 5.** This entry said `by()` compiles to a `GROUP BY` and `count()`
+then refuses because its input kind is groups rather than spans. Part 5 is the change that makes both
+halves false: the `by()` key becomes the KEY of a map aggregate rather than a `GROUP BY` column, and
+`count()` after it compiles a per-group fragment.
 
-**SQL today** — TraceQL11's statements. Neither stage produces SQL.
+**SQL today** — for THIS query, TraceQL11's statements, unchanged: an ATTRIBUTE key
+(`by(span.foo)`) is a `val`/`val_num` row under a different `key` than the generator's, which is a
+second source read, and ADR 0008 names no join clause. So the key does not render, the `by()` clears
+exactness, and `count() > 2` refuses with `not_exact`.
 
-**SQL after this work** — `GROUP BY foo` compiles. `count() > 2` does not: its input kind does not match, so it is evaluated after the read. The walk continues — the ordering is asked next and refuses, because the aggregate evaluated after the read made the predicate wider than the query (`docs/query-lowering.md:616`); the limit refuses after it because no ordering was set (`:617`). **Neither clause appears in the statement.**
+**The same shape with a renderable key does compile**, and it is the pair that shows the written
+order reaching the SQL:
+
+```sql
+-- { resource.service.name = "grp" } | by(name) | count() > 2
+SELECT trace_id, max(timestamp_ns) AS bound_ts
+FROM trace_spans
+PREWHERE service = 'grp'
+WHERE timestamp_ns > <start> AND timestamp_ns <= <end>
+GROUP BY trace_id
+HAVING arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), span_id)))) > 2
+ORDER BY bound_ts DESC, trace_id ASC
+LIMIT 100001
+```
+
+The grouping key is not a `GROUP BY` column: the statement's rows stay one per trace, which is what
+the executor consumes, and the trace-level question — "does any group satisfy the predicate?" — is
+asked with `arrayMax` over the map's values. There is no wrap and no subquery.
 
 ```sql
 SELECT trace_id, name, max(timestamp_ns) AS sort_key
@@ -3700,7 +3772,23 @@ exactly the case where the statement cannot carry its own limit, which is why pa
 
 **SQL today** — TraceQL11's statements. **We return the same result set as TraceQL12, and the reference does not** — it applies the stages in the order written. A defect the design corrects (issue #492).
 
-**SQL after this work** — `HAVING count() > 2` compiles; `by()` then refuses, because the aggregate produced traces and `by()` accepts spans (`docs/query-lowering.md:622-623`). **The mirror image of TraceQL12, and the two must give different answers.**
+**SQL today** (issue #492 parts 4 and 5) — `HAVING uniqExact(span_id) > 2` compiles at the
+aggregate's WRITTEN position, so it filters the whole matched set; `by()` after it contributes
+nothing, because the aggregate already cleared exactness. **The mirror image of TraceQL12, and the
+two now send different statements as well as giving different answers** — on a service selector the
+pair renders
+
+```text
+| by(name) | count() > 2   ->  HAVING arrayMax(mapValues(uniqExactMap(map(<capped name>, span_id)))) > 2
+| count() > 2 | by(name)   ->  HAVING uniqExact(span_id) > 2
+```
+
+and the two composites differ on exactly that one line
+(`tests/golden/traces_search/issue492_by_then_count.sql` against
+`issue492_count_then_by.sql`). At `ddb48c96` they were byte-identical.
+
+`uniqExact(span_id)` and not `count()`: the index is a `ReplacingMergeTree` read without `FINAL`, so
+a replayed row inflates a plain count.
 
 Included as a pair with TraceQL12 because an implementation that ignores stage order gives both
 queries one answer and passes each of them read alone. The assertion is that the two differ.

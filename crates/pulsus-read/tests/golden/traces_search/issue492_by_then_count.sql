@@ -7,6 +7,7 @@ FROM trace_spans
 PREWHERE service = 'grp'
 WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
 GROUP BY trace_id
+HAVING arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), span_id)))) > 2
 ORDER BY bound_ts DESC, trace_id ASC
 LIMIT 100001
 

@@ -5826,6 +5826,54 @@ mod tests {
         assert_eq!(go_duration_string(-1_500_000_000), "-1.5s");
     }
 
+    /// Issue #492 part 5 criterion 12: **`by(duration)`'s two readings
+    /// induce the SAME partition.**
+    ///
+    /// The evaluator groups the STRING `go_duration_string(duration_ns)`
+    /// and the pushed statement groups the `Int64` `duration_ns`. Those
+    /// are different values, and that is not the question — a group key
+    /// PARTITIONS, so the two agree exactly when the map from
+    /// nanoseconds to string is injective. If it were not, two distinct
+    /// nanosecond counts would print the same string, SQL would split a
+    /// group the evaluator merges, and the pushed answer would move.
+    ///
+    /// The values are the plan's boundary set: pairs adjacent across
+    /// each unit change, where two renderings that could collide differ
+    /// least, plus the two extremes of the type.
+    ///
+    /// Injectivity is asserted over the SET, not by naming pairs — a
+    /// pairwise list is the thing that gets one pair wrong.
+    #[test]
+    fn go_duration_string_is_injective_over_the_unit_boundaries() {
+        const BOUNDARIES: [i64; 9] = [
+            0,
+            999,
+            1_000,
+            1_001,
+            999_999_999,
+            1_000_000_000,
+            60_000_000_000,
+            i64::MIN,
+            i64::MAX,
+        ];
+        let mut seen: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+        for ns in BOUNDARIES {
+            let rendered = go_duration_string(ns);
+            if let Some(other) = seen.insert(rendered.clone(), ns) {
+                panic!(
+                    "go_duration_string is not injective: {ns} and {other} both render \
+                     {rendered:?}, so SQL's `GROUP BY duration_ns` would split a group the \
+                     evaluator merges and `| by(duration) | count() > t` would lose a trace"
+                );
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            BOUNDARIES.len(),
+            "every boundary value must have its own rendering"
+        );
+    }
+
     /// Finding (flag-5 answer): `by(status)`/`by(kind)`/`by(duration)`
     /// render by their TraceQL TYPE as `stringValue` keyword / duration
     /// forms — matching Tempo v3.0.2 (NOT numeric enums), under the
