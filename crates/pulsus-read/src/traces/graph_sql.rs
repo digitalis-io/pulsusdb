@@ -54,8 +54,14 @@ pub struct GraphWindow {
 /// which nanosecond is last. Changing the constructor here to
 /// [`WindowSql::start_open_end_closed`] — [`super::search_sql`]'s
 /// convention — changes the row bound too and moves
-/// `golden/traces_graph/*.sql`; see [`super::window_sql`] for why the
-/// day bound alone would have changed nothing observable.
+/// `golden/traces_graph/*.sql`.
+///
+/// Were the DAY bound alone to take the right-closed rule, it would
+/// widen by a day and read one extra partition while returning every
+/// answer unchanged — the quiet direction, and the reason this file's
+/// rule is worth stating rather than tidying. (The mismatch in the other
+/// direction, on [`super::search_sql`]'s inclusive window, loses rows
+/// instead.) [`super::window_sql`] has both, with measured figures.
 fn bounds(w: GraphWindow) -> WindowSql {
     WindowSql::start_closed_end_open(w.start_ns, w.end_ns)
 }

@@ -66,8 +66,14 @@ pub struct SnappedWindow {
 /// [`WindowSql::start_open_end_closed`] — [`super::search_sql`]'s
 /// convention, and the one `compare()`'s SELECTION window uses a few
 /// hundred lines below — changes the row bound too and moves every
-/// `golden/traces_metrics/*.sql`; see [`super::window_sql`] for why the
-/// day bound alone would have changed nothing observable.
+/// `golden/traces_metrics/*.sql`.
+///
+/// Were the DAY bound alone to take the right-closed rule, it would
+/// widen by a day and read one extra partition while returning every
+/// answer unchanged — the quiet direction, and the reason this file's
+/// rule is worth stating rather than tidying. (The mismatch in the other
+/// direction, on [`super::search_sql`]'s inclusive window, loses rows
+/// instead.) [`super::window_sql`] has both, with measured figures.
 ///
 /// **This module renders BOTH conventions, and that is not an
 /// inconsistency.** The evaluation window here is right-open; the

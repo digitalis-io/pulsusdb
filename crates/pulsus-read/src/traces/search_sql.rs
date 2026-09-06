@@ -101,9 +101,14 @@ pub(crate) fn date_literal(days: i64) -> String {
 /// [`WindowSql::start_closed_end_open`] — the convention
 /// [`super::graph_sql`] and [`super::metrics_sql`] use, and the obvious
 /// "fix" for three files that look inconsistent — changes the row bound
-/// too and moves every `golden/traces_search/*.sql`. That is deliberate:
-/// see [`super::window_sql`] for why the day bound alone would have
-/// changed nothing observable.
+/// too and moves every `golden/traces_search/*.sql`. That is deliberate.
+///
+/// Were the DAY bound alone to take the right-open rule, it would narrow
+/// to one day less than the row bound admits and DROP spans stored at
+/// exactly `end_ns` — measured, 499 999 rows returned where 500 001 were
+/// correct. That is the loud direction in consequence but the quiet one
+/// in appearance: no SQL a golden pins would move. See
+/// [`super::window_sql`] for both directions and their figures.
 fn bounds(w: TimeWindow) -> WindowSql {
     WindowSql::start_open_end_closed(w.start_ns, w.end_ns)
 }
@@ -594,9 +599,16 @@ mod tests {
     ///
     /// `date_clause_spans_the_windows_utc_days` above cannot see this:
     /// its window ends mid-day, where both conventions agree. A window
-    /// ending on a day boundary is the only input that discriminates,
-    /// and giving this module the right-open rule is silent without
-    /// one — the answers stay correct and one extra partition is read.
+    /// ending on a day boundary is the only input that discriminates.
+    ///
+    /// Giving THIS module the right-open rule narrows the day clause to
+    /// one day less than the row bound admits, so a span stored at
+    /// exactly `end_ns` sits in a partition the query never reads:
+    /// measured, 499 999 rows returned where 500 001 were correct. A
+    /// lost answer, not a slower query. The reverse mistake — an
+    /// exclusive window given this module's inclusive rule — is the one
+    /// that keeps every answer and merely reads an extra partition
+    /// ([`super::window_sql`] has both).
     #[test]
     fn date_clause_keeps_the_end_day_because_the_search_end_is_included() {
         let w = TimeWindow {

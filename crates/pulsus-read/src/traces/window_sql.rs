@@ -26,14 +26,44 @@
 //! The row bound (`timestamp_ns` operators) and the day bound (the
 //! `date` partition prune) are two renderings of ONE fact: which
 //! nanosecond is the last the window contains. Before this module they
-//! were written out separately in three files, which meant the day bound
-//! could be given the other convention's rule while the row bound kept
-//! its own — and nothing would have failed. The answers stay correct
-//! either way, because the day clause only ever prunes partitions that
-//! the row clause would have emptied anyway; the only symptom is an
-//! extra day's partition read on every window that ends on a UTC day
-//! boundary. There is no result to compare, so no result comparison can
-//! see it.
+//! were written out separately in three files, so the day bound could be
+//! given the other convention's rule while the row bound kept its own,
+//! and nothing would have failed.
+//!
+//! **The two possible mismatches are not the same defect.** Which one
+//! you get depends on which convention is handed the other's day rule:
+//!
+//! ```text
+//!   inclusive window (ts <= end) given the EXCLUSIVE day rule
+//!       day clause becomes `date <= D` — one day NARROWER than the row
+//!       bound admits. A span stored at exactly end_ns is inside the
+//!       window, but its partition is never read.
+//!       => THE ANSWER LOSES ROWS. Not a slower query, a wrong one.
+//!
+//!   exclusive window (ts < end) given the INCLUSIVE day rule
+//!       day clause becomes `date <= D+1` — one day WIDER. No row in
+//!       D+1 can satisfy `ts < end_ns` anyway.
+//!       => EVERY ANSWER IDENTICAL, one extra partition read.
+//!          This is the silent one: there is no result to compare, so
+//!          no result comparison can see it.
+//! ```
+//!
+//! Both were measured against ClickHouse on a two-partition corpus
+//! (issue #525, `trace_attrs_idx` DDL, 500 000 attribute rows per UTC
+//! day, one row on the boundary nanosecond). Narrowing the inclusive
+//! window returned 499 999 rows where the correct clause returned
+//! 500 001. Widening the exclusive window returned the same 500 000 rows
+//! either way, reading 2 partitions instead of 1.
+//!
+//! **The partition count is the figure that transfers: exactly one extra
+//! day's partition. The row and byte counts do not** — they are
+//! properties of the data. That same widening read 500 001 extra rows on
+//! a corpus of 200 attribute keys, where `timestamp_ns` sits behind an
+//! unconstrained prefix of the sorting key and cannot prune granules;
+//! but only 33 057 extra rows on a corpus with ONE key and five distinct
+//! values, where the leading columns were near-degenerate and the
+//! primary key pruned inside the extra partition. Quote the partition
+//! count; treat any row or byte figure as one corpus's illustration.
 //!
 //! That is why [`WindowSql`] has no public fields and no `new`: the only
 //! ways to build one are the two constructors named after their
@@ -250,8 +280,10 @@ mod tests {
             open.date_clause(),
             "a window ending exactly at midnight touches one more day when its end is \
              INCLUDED than when it is EXCLUDED; if these render alike, one convention has \
-             been given the other's day rule and every such query reads a whole extra \
-             partition without any answer changing (issue #525)"
+             been given the other's day rule — and the two directions differ: widening the \
+             EXCLUSIVE window reads a whole extra partition with every answer unchanged, \
+             while narrowing the INCLUSIVE one drops spans stored at exactly end_ns \
+             (issue #525)"
         );
         assert_ne!(closed.last_included_ns(), open.last_included_ns());
     }
