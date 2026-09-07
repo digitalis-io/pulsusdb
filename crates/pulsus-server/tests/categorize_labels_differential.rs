@@ -1568,7 +1568,8 @@ fn the_committed_capture_matches_the_live_reference() {
         capture::ids().len()
     );
     assert_eq!(
-        fresh_ids, second_ids,
+        fresh_ids,
+        second_ids,
         "the two captures carry different probes: {} against {}",
         fresh.len(),
         second.len()
