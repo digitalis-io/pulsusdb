@@ -1264,8 +1264,9 @@ of the pipeline."
 differ mainly in whether they *block* the collapse, not in how much each would save alone. §9.7
 measures what the collapse is worth for the four **measured on C6** rows, and it is not one number:
 the same
-query text saves about **1.2x** on the metered hop when 1 trace in 10 matches and about **440x**
-when 1 in 1,000 does. **The saving is a function of selectivity, not of the class.**
+query text saves about **1.2x** on the metered hop when 1 trace in 10 matches and **390x – 460x**
+when 1 in 1,000 does — a range because four takes of the same pair disagree on the metered column.
+**The saving is a function of selectivity, not of the class.**
 
 **A row left this table, and it is a correction rather than a re-ranking.** `{ name != "x" }` was
 listed here as widening the candidate generator to the whole window. It does not: the predicate is
@@ -2565,7 +2566,7 @@ precision, and the decision here does not turn on whether the saving is 390x or 
 
 **Two things fall out, and both matter more than the endpoints.** The saving is a function of
 **selectivity**, not of the class: the same query text at 1 trace in 10 saves 1.2x and at 1 in 1,000
-saves about 440x. And the memory cost below is a function of **window size**, not of selectivity —
+saves 390x – 460x. And the memory cost below is a function of **window size**, not of selectivity —
 it is the same 10.5 GiB for the 1-in-10 and the 1-in-1,000 form.
 
 #### Why none of it was lowered: the per-span pre-grouping does not fit
