@@ -2139,6 +2139,54 @@ jobs:
         if: always()
         run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
 
+  # MEASUREMENT BRANCH ONLY (ci-build-once-a): the container image built
+  # once per run instead of once per consuming job. Deliberately has NO
+  # `needs:` — it runs beside `ci`, so the e2e jobs start at
+  # `max(ci_end, image_end)` rather than `ci_end + image_duration`.
+  #
+  # The save/upload and download/load steps are instrumented because the
+  # analysis this branch exists to check had to estimate them (40 s and
+  # 15 s) with no measurement behind either figure.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build pulsusdb:e2e
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          tags: pulsusdb:e2e
+          load: true
+          cache-from: type=gha,scope=pulsusdb-e2e
+          cache-to: type=gha,mode=max,scope=pulsusdb-e2e
+
+      - name: Save the image (instrumented)
+        run: |
+          t0=$(date +%s.%N)
+          docker save pulsusdb:e2e -o image.tar
+          t1=$(date +%s.%N)
+          raw=$(stat -c %s image.tar)
+          gzip -1 image.tar
+          t2=$(date +%s.%N)
+          gz=$(stat -c %s image.tar.gz)
+          echo "MEASURE docker_save_secs=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")"
+          echo "MEASURE tar_bytes=$raw"
+          echo "MEASURE gzip1_secs=$(awk "BEGIN{printf \"%.3f\", $t2 - $t1}")"
+          echo "MEASURE targz_bytes=$gz"
+
+      # compression-level 0: the payload is already gzipped, so the whole
+      # duration of this step is transfer, not compression.
+      - name: Upload the image
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulsusdb-e2e-image
+          path: image.tar.gz
+          retention-days: 1
+          compression-level: 0
+
   # Issue #7: e2e harness skeleton. Both legs build the local `pulsusdb:e2e`
   # image once via buildx (GHA layer cache, so the image build itself is
   # fast on both legs) then hand the whole stack lifecycle — up, poll
@@ -2148,7 +2196,7 @@ jobs:
   # (`PULSUS_E2E_METRICS_SCALE` defaults to `ci` — `e2e/src/metrics.rs`);
   # the ~10k `full` tier is `e2e-metrics-full` below.
   e2e-single:
-    needs: ci
+    needs: [ci, image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -2162,16 +2210,21 @@ jobs:
           shared-key: "workspace"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Build pulsusdb:e2e
-        uses: docker/build-push-action@v7
+      - name: Download the image
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          tags: pulsusdb:e2e
-          load: true
-          cache-from: type=gha,scope=pulsusdb-e2e
-          cache-to: type=gha,mode=max,scope=pulsusdb-e2e
+          name: pulsusdb-e2e-image
+
+      - name: Load the image (instrumented)
+        run: |
+          t0=$(date +%s.%N)
+          gunzip image.tar.gz
+          t1=$(date +%s.%N)
+          docker load -i image.tar
+          t2=$(date +%s.%N)
+          echo "MEASURE gunzip_secs=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")"
+          echo "MEASURE docker_load_secs=$(awk "BEGIN{printf \"%.3f\", $t2 - $t1}")"
+          docker image ls pulsusdb:e2e
 
       - name: Run the single-node e2e harness
         run: cargo run -p pulsus-e2e -- --variant single --engine docker
@@ -2190,7 +2243,7 @@ jobs:
           if-no-files-found: ignore
 
   e2e-cluster:
-    needs: ci
+    needs: [ci, image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -2204,16 +2257,21 @@ jobs:
           shared-key: "workspace"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Build pulsusdb:e2e
-        uses: docker/build-push-action@v7
+      - name: Download the image
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          tags: pulsusdb:e2e
-          load: true
-          cache-from: type=gha,scope=pulsusdb-e2e
-          cache-to: type=gha,mode=max,scope=pulsusdb-e2e
+          name: pulsusdb-e2e-image
+
+      - name: Load the image (instrumented)
+        run: |
+          t0=$(date +%s.%N)
+          gunzip image.tar.gz
+          t1=$(date +%s.%N)
+          docker load -i image.tar
+          t2=$(date +%s.%N)
+          echo "MEASURE gunzip_secs=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")"
+          echo "MEASURE docker_load_secs=$(awk "BEGIN{printf \"%.3f\", $t2 - $t1}")"
+          docker image ls pulsusdb:e2e
 
       - name: Run the 2-shard cluster e2e harness
         run: cargo run -p pulsus-e2e -- --variant cluster --engine docker
@@ -2234,7 +2292,7 @@ jobs:
   # protection — same split as issue #16's `bench-cluster`).
   e2e-metrics-full:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    needs: ci
+    needs: [ci, image]
     strategy:
       matrix:
         variant: [single, cluster]
@@ -2250,16 +2308,21 @@ jobs:
         with:
           shared-key: "workspace"
 
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Build pulsusdb:e2e
-        uses: docker/build-push-action@v7
+      - name: Download the image
+        uses: actions/download-artifact@v4
         with:
-          context: .
-          tags: pulsusdb:e2e
-          load: true
-          cache-from: type=gha,scope=pulsusdb-e2e
-          cache-to: type=gha,mode=max,scope=pulsusdb-e2e
+          name: pulsusdb-e2e-image
+
+      - name: Load the image (instrumented)
+        run: |
+          t0=$(date +%s.%N)
+          gunzip image.tar.gz
+          t1=$(date +%s.%N)
+          docker load -i image.tar
+          t2=$(date +%s.%N)
+          echo "MEASURE gunzip_secs=$(awk "BEGIN{printf \"%.3f\", $t1 - $t0}")"
+          echo "MEASURE docker_load_secs=$(awk "BEGIN{printf \"%.3f\", $t2 - $t1}")"
+          docker image ls pulsusdb:e2e
 
       - name: Run the ${{ matrix.variant }} e2e harness (full 10k-series differential tier)
         env:
