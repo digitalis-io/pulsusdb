@@ -2993,14 +2993,31 @@ take 3, build 81e37dde-8239-405e-a5ab-fddd4c68a5de:
 Code: 241. DB::Exception: Query memory limit exceeded: would use 514.05 MiB (attempt to allocate chunk of 4.04 MiB), maximum: 512.00 MiB: (while reading column trace_id): (while reading from part /var/lib/clickhouse/store/3c6/3c6209c2-899e-4088-8041-c0bb02613ec1/20231117_9_12_2/ in table arch492p7.trace_attrs_idx (3c6209c2-899e-4088-8041-c0bb02613ec1) located on disk default of type local, from mark 24 with max_rows_to_read = 4096, offset = 0): While executing MergeTreeSelect(pool: ReadPool, algorithm: Thread). (MEMORY_LIMIT_EXCEEDED) (version 26.3.29.7 (official build))
 ```
 
+**The statement those three bodies come from.** The capture statement printed under "The
+instrument" below selects `exception_code` but not the body, so the bodies were read by a second
+`system.query_log` statement, run after the same flush loop against the same build:
+
+```sql
+SELECT ql.query_id, ql.exception
+FROM system.query_log AS ql
+WHERE ql.type = 'ExceptionWhileProcessing'
+  AND startsWith(ql.query_id, 'p7c_t4_join_ceiling_')
+ORDER BY ql.query_id
+```
+
+It returns three rows, one per take. They are the only rows the capture found with a non-zero
+`exception_code`: of the 42 takes that capture returned, the three ceiling takes of `t4_join` are
+the only ones that failed. `'p7c_t4_join_ceiling_'` is this section's `query_id` prefix followed by
+the statement name, so a re-taker changes the same string literal here as in the capture statement.
+
 **The same statement with only the join removed runs.** The control — `t4_control` below, which is
 `t4_join` with the `LEFT JOIN (…) AS sel ON …` block and the `sel.v AS sel_method` projection taken
 out and nothing else changed — answered 20 rows at 476 marks with `exception_code` 0, on all three
 takes at the same ceiling. **The breach is the join's, isolated by removing only the join.** A run
 where both fail, or both succeed, means the corpus is not the one this recipe builds.
 
-The corpus this happened on is a fifth the size of C1 on both tables: `trace_attrs_idx` 10,000,000
-rows against C1's 50,000,000 and `trace_spans` 2,000,000 against 10,000,000 (§9.1, lines 1834-1843).
+The corpus this happened on holds 10,000,000 `trace_attrs_idx` rows and 2,000,000 `trace_spans`
+rows, which is what the physical-layout statement printed under "The corpus" below returned.
 Code 241 on a generator read maps to `TooBroadReason::TraceGeneratorMemory`
 (`map_trace_generator_error`, `crates/pulsus-read/src/traces/exec.rs:701`) and the request answers
 **422**. Table 4 is the whole measurement.
@@ -3267,6 +3284,7 @@ statement            printed in                     what it produces a figure fo
 the id generator     "`<the 32>`" above             the batch every read is taken over
 the capture          "The instrument" above         every mark, rows-read, rows-out and
                                                     exception-code figure below
+the error-body read  the top of this section        the three `Code: 241` bodies
 the zero-row check   "The instrument" above         the instrument's own empty answer
 the recipe           "The corpus" above             the corpus
 physical layout      "The corpus" above             parts, rows, marks, part type
@@ -3586,6 +3604,7 @@ wrong**: say so rather than editing the figure. Three takes of each statement on
 above, unless the row says otherwise.
 
 ```text
+build 81e37dde-8239-405e-a5ab-fddd4c68a5de
 statement            marks   read_rows    rows out   takes
 a1                     226   1,851,392         260   3
 a1_nokey             1,225  10,000,000         320   3
@@ -3636,6 +3655,7 @@ build named above. They agreed on all three takes here; that is what was observe
 being claimed:
 
 ```text
+build 81e37dde-8239-405e-a5ab-fddd4c68a5de
 statement       take 1   take 2   take 3
 a1               6,289    6,289    6,289
 a1_nokey         7,729    7,729    7,729
@@ -3653,6 +3673,7 @@ t3_no_alias     31,028   31,028   31,028
 Table 4's `read_rows`, each take:
 
 ```text
+build 81e37dde-8239-405e-a5ab-fddd4c68a5de
 form                     take 1      take 2      take 3
 t4_join    at 8 GiB     3,973,120   4,026,368   4,009,984
 t4_control at ceiling   3,448,832   3,489,792   3,338,240
@@ -4605,7 +4626,7 @@ the count the same selector prints once wave 1 lands.
 A gate seeded from one example would assert that the example is correct. If the example is wrong,
 such a gate makes the error permanent and looks like coverage while doing it — so every row below
 states whether its seed is **independently established** or **assumed**, and the assumed ones say
-what they therefore cannot discover. **All 22 gates §11.0 counts have a row here**: of the three
+what they therefore cannot discover. **All 25 gates §11.0 counts have a row here**: of the three
 missing from an earlier revision, `logql::plan::tests::a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual`,
 **wave 1**, is the third row from the end and the live `query_log_gates` half, which exists and
 prints `Starting 14 tests` at exit 0, is the last, while
