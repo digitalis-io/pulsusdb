@@ -1255,15 +1255,24 @@ of the pipeline."
 | **spanset aggregate** (`count`/`sum`/`avg`/`min`/`max`) | the whole two-phase loop: 1,110 round trips, 76,616,608 metered bytes, 5,705,629,767 rows read (§9.2) | **measured on C1** |
 | **`by()` regrouping** | adds no query of its own; its saving is the same loop collapse when the selector is lowerable | argued — it adds no read |
 | **`select()` projection** | one extra read per batch; +4.6 KiB per request and one extra round trip | measured on C2 (issue #478) |
-| **field-vs-field comparison** `{ .a = .b }` | two `attr_values_sql` reads per batch | **not measured** |
-| **cross-field arithmetic** `{ .a * 2 > .b }` | two `attr_values_sql` reads per batch | **not measured** |
-| **event/link set comparison** `{ .a = event:name }` | one `event_set_sql` co-load per batch, one row per value | **not measured** |
-| **negated physical leaf** `{ name != "x" }` | widens the candidate generator to the whole window (`GenClass::TimeRange`, `filter.rs:89`); adds no read | **not measured** |
+| **field-vs-field comparison** `{ .a = .b }` | **four** `attr_values_sql` reads per batch, not two — each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1346-1347`), so a two-operand leaf reads both values twice. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
+| **cross-field arithmetic** `{ .a * 2 > .b }` | the same four reads per batch; 347 statements and 2,869,590,609 rows read for a request matching 9,000 traces (§9.7) | **measured on C6** |
+| **event/link set comparison** `{ .a = event:name }` | one `event_set_sql` co-load per batch **plus the scalar operand's two value reads**; 2,502 statements and 13,995,704,756 rows read (§9.7) | **measured on C6** |
+| **negated attribute leaf** `{ .a != "5" }` | drops the generator to the empty-predicate time-range superset (`GenClass::TimeRange`, `filter.rs:102`) and adds no read of its own, so the window's whole span scan is the cost: 4 statements, 12,097,152 rows read, 1,482 granules (§9.7) | **measured on C6** |
 
-Four of the seven are unranked because they were not measured, and they are not ranked from
-reasoning. What the measured row establishes is that **every group-2 class shares one saving
-mechanism** — collapsing the phase-2 loop — so the classes differ mainly in whether they *block*
-the collapse, not in how much each would save alone.
+**Every group-2 class shares one saving mechanism** — collapsing the phase-2 loop — so the classes
+differ mainly in whether they *block* the collapse, not in how much each would save alone. §9.7
+measures what the collapse is worth for the four **measured on C6** rows, and it is not one number:
+the same
+query text saves about **1.2x** on the metered hop when 1 trace in 10 matches and about **440x**
+when 1 in 1,000 does. **The saving is a function of selectivity, not of the class.**
+
+**A row left this table, and it is a correction rather than a re-ranking.** `{ name != "x" }` was
+listed here as widening the candidate generator to the whole window. It does not: the predicate is
+rendered into a bounded span scan. It is a group-3 class — lowered already, prunes nothing — and it
+is now in §3.4 with the measurement that says so. The construct that *does* produce the
+empty-predicate time-range superset is the negated **attribute** leaf, which is the fourth row
+above. The two are separate constructs and the record had them crossed.
 
 ### 3.4 Group 3 — lowered already, prunes nothing
 
@@ -1288,7 +1297,39 @@ Corpus C1, 5-day window, `trace_attrs_idx` at 6,110 granules:
 The last pair is the sharpest statement of the group: **identical one-row answer, 245x the rows
 read.** Being lowered and being cheap are separate claims.
 
-Two more entries in this group:
+Three more entries in this group:
+
+- **The negated physical leaf `{ name != "x" }`**, which this document listed under §3.3 until
+  issue #492 part 6 measured it. `compile_leaf` sends a physical predicate through
+  `spans_generator_for` (`filter.rs:2296`), which always returns `GenClass::SpanScan` with the
+  predicate rendered into the `WHERE`. There is no widening to the whole window and there is
+  nothing left to lower. On corpus C6 (§9.7) the negated form and the positive form select the
+  **same granules** and read the **same rows**:
+
+  | generator statement | result rows | rows read | granules | result bytes |
+  |---|---|---|---|---|
+  | `… AND (name != 'op-0') …` | 100,001 | 10,000,000 | **1,226/1,226** | 4,767,944 |
+  | `… AND (name = 'op-0') …` | 4,000 | 10,000,000 | **1,226/1,226** | 97,672 |
+
+  `EXPLAIN indexes = 1` prints the same three index blocks for both, and the `name` predicate
+  appears in none of them — only the time bound does:
+
+  ```
+  Condition: and((timestamp_ns in (-Inf, 1700432001000000000]),
+                 (timestamp_ns in [1699999999000000001, +Inf)))
+  Parts: 6/6
+  Granules: 1226/1226
+  Search Algorithm: generic exclusion search
+  ```
+
+  Same reads, 49x the result bytes. The cost is the candidate rows themselves, and they genuinely
+  match — a negation over 2,500 span names matches 2,499 of them. Lowering cannot help a predicate
+  that is already in the statement and already selects everything.
+  `a_negated_physical_leaf_keeps_its_predicate_a_negated_attribute_leaf_does_not`
+  (`crates/pulsus-read/tests/traceql_group2_selector_generators.rs`) goes red if the generator
+  stops being a `SpanScan` carrying its own predicate, and the same test asserts the negated
+  attribute leaf's `GenClass::TimeRange` beside it, because a true sentence about one of them is
+  what made the other one wrong.
 
 - **The phase-2 candidate restriction `trace_id IN (…)` on `trace_spans`** prunes badly, and the
   rule that predicts it is §9.4.
@@ -1387,9 +1428,14 @@ nobody later reads them as unfinished work.
 | **`Emit` on the traces search route** | the response's root summary is read trace-wide and unwindowed, the same reason as the trace-level intrinsics — and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:386`), so this is unconditional on that route, not a case that sometimes arises. **`Never` is the right classification and it does not mean the evaluator does the work**: the way the evaluator owns this link is to send a second statement, so `plan_of` gives it its own SQL part (`Cut::SourceHandoff`, §2.7.2). "Cannot be lowered into THIS statement" and "is not SQL" are different claims, and only the first is made here |
 
 **Cross-attribute comparison is deliberately not in this table.** `{ .a = .b }` compares two rows
-of the attribute index sharing a `(trace_id, span_id)`; the information is present and it is a
-self-join, so it is a group-2 class the core can reach later (§3.3). Calling it impossible would
-be wrong — what it is not is *cheap*, and that is a different claim.
+of the attribute index sharing a `(trace_id, span_id)`; the information is present, and the SQL
+that decides it is a **per-span pre-grouping** — `GROUP BY trace_id, span_id` with the comparison
+in a `HAVING`. **No join**: ADR 0008 authorises none ("A clause these rules do not name: the
+join"), and none is needed. So it is a group-2 class the core can reach later (§3.3). Calling it
+impossible would be wrong — what it is not is *cheap*, and §9.7 measures how far from cheap: on
+the attribute index as it is ordered today the pre-grouping needs about 10.5 GiB of aggregation
+state on a 10,000,000-span window, against a shipped 512 MiB generator ceiling, so issue #492
+part 6 measured it and refused it rather than shipping it.
 
 **LogQL's candidate `Never` class was settled by [#507](https://github.com/digitalis-io/pulsusdb/issues/507),
 and two of the three are not `Never`.** The class was "a link whose output depends on an in-engine
@@ -1877,6 +1923,11 @@ window-bounded hydration read and the membership read, which survive lowering be
 ratios are therefore upper bounds on the true saving, not the saving. **Part 8's §9.2
 re-measurement replaces every figure in the `lowered` and `ratio` rows.**
 
+**§9.7 is a second table of this kind and it is not this one.** It measures a *refused* push — the
+per-span pre-grouping four group-2 selector classes would need — on a different corpus, with the
+instrument settings stated beside every figure. Anyone re-taking this section should read §9.7
+first, so part 6's numbers are found rather than taken again.
+
 **The root read is why the lowered side is more than 1.** It is not an artefact of the measurement:
 `Emit` is `Never` (§3.1) because the root summary is trace-wide and unwindowed, so no chain removes
 it. **16,598× is not a figure this document reports**, here or anywhere: it is the lowered
@@ -1949,7 +2000,7 @@ matching.
 **An `EXPLAIN` showing an index selected is not evidence that it pruned.** Every claim in this
 section quotes granule counts, not index names.
 
-### 9.5 The instrument, and one trap
+### 9.5 The instrument, and the traps that decide a figure
 
 Every figure is one `system.query_log` row per `query_id`. The instrument was validated in states
 where it must fail: a `query_id` that does not exist returns no row rather than a plausible one,
@@ -1967,6 +2018,40 @@ wave asserts on.
 A second trap, also measured: a `LIMIT` with no `ORDER BY` is cancelled on early termination and
 writes **no `QueryFinish` row at all**. A measurement reading `query_log` must fail on a missing row,
 never treat it as zero cost.
+
+**A third trap, and it is the one that decided an architectural question.** Our reader sends
+`max_block_size = 4096` on every search statement — `TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096`
+(`crates/pulsus-read/src/traces/exec.rs:173`), set in `search_settings` (`:2836`) and inherited by
+`generator_settings` (`:2869`). ClickHouse 26.3.29.7's own default is **65,409**
+(`SELECT value, default FROM system.settings WHERE name = 'max_block_size'` prints `65409 65409`).
+A measurement taken at the server default is a measurement of a system we do not run, and the
+setting moves two different figures in opposite directions:
+
+```
+peak query memory, ONE statement (issue #492 part 6's pushed pre-grouping on a span-ordered
+attribute index, full 10,000,000-span window, optimize_aggregation_in_order = 1)
+
+  0                          512 MiB ceiling                            1200 MiB
+  |----------------------------------|----------------------------------------|
+              228.7 MiB                              1,068.3 MiB
+        max_block_size = 4096                   max_block_size = 65,409
+        (what our reader sends)                 (ClickHouse's default)
+             COMPLETES                            REFUSED, Code 241
+
+result_bytes, one generator statement, same rows read and same granules either way
+
+        100,001-row result:   4,767,944 at 4096      3,145,744 at 65,409   (default 34.0% lower)
+          4,096-row result:     196,616 at 4096        196,616 at 65,409   (identical)
+```
+
+So a re-take at the default **refuses a statement the shipped reader would run**, and it
+understates the metered column by about a third on any result larger than one block. Two competent
+measurements of §9.7's headline figure landed a factor of 4.7 apart for exactly this reason, and
+neither was wrong about what it measured. `search_settings_pin_the_layer_1_budget_contract`
+(`crates/pulsus-read/src/traces/exec.rs:5254`) is what keeps 4,096 shipped: it asserts that the
+rendered search settings contain the substring `max_block_size` and the substring `4096` — as two
+independent substring checks, not bound to each other, so it would not catch a different value
+arriving beside a stray `4096`.
 
 **No wall-clock figure in this document carries a claim.** The machine carried other work
 throughout and its load average moved from 3.42 to 34.24; two readings of the same query forty
@@ -2021,6 +2106,611 @@ that `decolorize` rewrites the line gave 171; restoring gave 0.
 **Attribution.** This finding is #507's, obtained by transcribing this document's §2 interface
 verbatim into a throwaway crate and writing the LogQL link set against it. It is the reason §10
 now records the two-language fit as **disproved** rather than unproven.
+
+### 9.7 The four group-2 selector classes, measured — and why none of them was lowered
+
+Issue #492 part 6 measured the four §3.3 rows that had never been measured: the two field-vs-field
+comparisons, the cross-field arithmetic form, and the event-set comparison. It built the SQL each
+one would need, ran it beside the path that ships today, and **lowered none of them**. This section
+is that record. Nothing in it is asserted by a test and nothing in it runs in CI — the corpus is
+71,000,000 rows on a developer instance and was dropped when the measurements were finished — so
+**the recipe below, not any single figure, is the deliverable**.
+
+The one thing that did move into code is a correction: `{ name != "x" }` was in §3.3 and is now in
+§3.4, because it is lowered already and prunes nothing.
+
+#### The instrument, before any figure
+
+Every number in this section is one `system.query_log` row per `query_id`, on **ClickHouse
+26.3.29.7**. Read §9.5's three traps first. The settings are part of each claim, so they are named
+beside the figures they govern rather than once here, and this list is the index:
+
+| setting | value used | why it decides a figure here |
+|---|---|---|
+| `max_block_size` | **4096** | the shipped value (`exec.rs:173`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and a large result's `result_bytes` reads 34% low. Every memory and metered figure below is at 4096 |
+| `use_query_condition_cache` | **0**, or the cache dropped before each request | otherwise a repeat read reports an order of magnitude fewer rows (§9.5's first trap). Two routes, below |
+| `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
+| `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:518`), applied by `generator_settings` (`exec.rs:2869`) |
+| `max_bytes_before_external_group_by` | **0** | shipped: the generator throws rather than spilling (`exec.rs:2869`) |
+| `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:515`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2830-2836`) |
+| `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
+
+`search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:5254`)
+is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
+rendered search settings contain the substring `max_block_size` and the substring `4096`, as two
+independent checks that are not bound to each other. It would not catch a different block size
+arriving beside a stray `4096` elsewhere in the settings.
+
+**Two routes to `use_query_condition_cache = 0`, and they are not interchangeable.** ClickHouse 26.3
+ships the setting **on** (`system.settings` prints `value 1, default 1, changed 0` — it is not a
+container configuration), and `ALTER USER default SETTINGS use_query_condition_cache = 0` is refused
+with `Code: 495 … in users_xml because this storage is readonly`. So either
+
+- issue every statement with `?use_query_condition_cache=0`, or, when the statements are issued by
+  our own reader rather than by hand, connect it as a SQL-defined user:
+
+      CREATE USER p6 IDENTIFIED WITH no_password
+        SETTINGS use_query_condition_cache = 0 CHANGEABLE_IN_READONLY;
+      GRANT CURRENT GRANTS ON *.* TO p6;   -- GRANT ALL is refused: `default` lacks GRANT OPTION
+
+  then point `clickhouse.auth` at it and check each statement's logged `Settings` carries the `0`;
+
+- or run `SYSTEM DROP QUERY CONDITION CACHE` before each request, which is what the last take used.
+  The two are not the same measurement: dropping the cache before a request against carrying it over
+  from the previous one moves the metered column by 0.75% on `{ .a * 2 < .c }` — **17,940,201**
+  dropped against **17,806,317** carried.
+
+**And one rule about instruments, learnt the expensive way here.** Two takes of the peak-memory
+figure disagreed by 4.7x and each was internally consistent. They became comparable only when the
+corpus was rebuilt **from the other side's own build scripts**, database name substituted and
+nothing else changed: with a shared corpus the statement counts, rows read and granule counts
+matched to the digit, the disagreement narrowed to one column and one setting, and the setting was
+`max_block_size`. **When two measurements of the same quantity disagree, rebuild the corpus from
+the other side's scripts and re-take both figures on one instrument before attributing the
+difference to anything else.**
+
+#### Corpus C6 — the recipe, which is the part that has to survive
+
+C6 is 10,000,000 spans / 1,000,000 traces / 10 spans each / 432,000 s from `1700000000000000000`
+across 6 dates / 50 services / 2,500 span names, with **7** attribute rows per span plus 1,000,000
+event-intrinsic rows = **71,000,000** `trace_attrs_idx` rows. Keys: `service.namespace` (resource),
+`http.method` (span), `a` (span, numeric), `b` (equal to `a` on 1 span in 100), `c` (equal to `a` on
+1 span in 10,000), `s1` (span, text), `s2` (equal to `s1` on 1 span in 10,000), and `name` under
+`scope = 'event:intrinsic'` on 1 span in 10, equal to `s1`'s value on 1 span in 50.
+
+**The schema is exactly these five statements, in this order, and no other migration.** Not the
+`_dist` twins (36/38/40), not `trace_tag_catalog` (18/41), not the `span_name_day` projection
+(42/43).
+
+| # | migration | what it is | `catalog.rs` |
+|---|---|---|---|
+| 1 | 16 | `CREATE TABLE … trace_spans` | `339-361` |
+| 2 | 35 | `ALTER … ADD COLUMN IF NOT EXISTS status_message` | `742-745` |
+| 3 | 37 | `ALTER … ADD COLUMN … scope_name, scope_version` | `779-783` |
+| 4 | 17 | `CREATE TABLE … trace_attrs_idx` | `369-385` |
+| 5 | 39 | `ALTER … ADD COLUMN IF NOT EXISTS val_type` | `816-819` |
+
+The additive-`ALTER` order is the shipped build order, not a convenience: `catalog.rs:1657` asserts
+`"status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"` and `:1708` the
+same for `scope_name`. A corpus with those columns written inline into the `CREATE` is **not the
+schema we run**, and that ambiguity is why the statements are printed rather than described.
+
+Each `CREATE` is transcribed with exactly three edits: `{{db}}` becomes the corpus database,
+`{{on_cluster}}` becomes empty, the `TTL …` line is **deleted** (C6's timestamps are in 2023), and
+the trailing `SETTINGS ttl_only_drop_parts = 1` becomes
+
+    SETTINGS ttl_only_drop_parts = 1, min_bytes_for_wide_part = 10485760, min_rows_for_wide_part = 0
+
+The two `ALTER`s are transcribed with no edit but `{{db}}` and `{{on_cluster}}`.
+
+Spans — 10,000,000 rows:
+
+```sql
+INSERT INTO trace_spans SELECT
+  reinterpretAsFixedString(toUInt64(intDiv(number,10))) || reinterpretAsFixedString(toUInt64(0)),
+  reinterpretAsFixedString(toUInt64(number)),
+  reinterpretAsFixedString(toUInt64(0)),
+  concat('op-', toString(number % 2500)),
+  concat('svc-', toString(intDiv(number,10) % 50)),
+  toInt64(1700000000000000000 + intDiv(number,10) * 432000000 + (number % 10) * 1000000),
+  toInt64(if(intDiv(number,10) % 1000 = 0 AND number % 10 = 0, 2001000000, 1000001 + (number % 1000000))),
+  toInt8(number % 3), toInt8(1 + number % 5), toInt8(0), '', '', '', ''
+FROM numbers_mt(10000000)
+```
+
+Attributes — one pass per key, each 10,000,000 rows, with `<KEY>`, `<VAL>`, `<SCOPE>` and `<TYPE>`
+from the table below:
+
+```sql
+INSERT INTO trace_attrs_idx SELECT
+  toDate(fromUnixTimestamp64Nano(toInt64(1700000000000000000 + intDiv(number,10) * 432000000 + (number % 10) * 1000000))),
+  <KEY>, <VAL>, <SCOPE>, toFloat64OrNull(<VAL>),
+  toInt64(1700000000000000000 + intDiv(number,10) * 432000000 + (number % 10) * 1000000),
+  reinterpretAsFixedString(toUInt64(intDiv(number,10))) || reinterpretAsFixedString(toUInt64(0)),
+  reinterpretAsFixedString(toUInt64(number)),
+  toInt64(if(intDiv(number,10) % 1000 = 0 AND number % 10 = 0, 2001000000, 1000001 + (number % 1000000))),
+  <TYPE>
+FROM numbers_mt(10000000)
+```
+
+| `<KEY>` | `<SCOPE>` | `<VAL>` | `<TYPE>` |
+|---|---|---|---|
+| `'service.namespace'` | `'resource'` | `if(intDiv(number,10) % 50 < 45, 'prod', 'staging')` | `'string'` |
+| `'http.method'` | `'span'` | `['GET','POST','PUT','DELETE','PATCH','HEAD'][1 + number % 6]` | `'string'` |
+| `'a'` | `'span'` | `toString(number % 1000)` | `'int'` |
+| `'b'` | `'span'` | `if(number % 100 = 0, toString(number % 1000), toString((number % 1000) + 1))` | `'int'` |
+| `'c'` | `'span'` | `if(number % 10000 = 0, toString(number % 1000), toString((number % 1000) + 1))` | `'int'` |
+| `'s1'` | `'span'` | `concat('t-', toString(number % 1000))` | `'string'` |
+| `'s2'` | `'span'` | `if(number % 10000 = 0, concat('t-', toString(number % 1000)), concat('z-', toString(number % 1000)))` | `'string'` |
+
+Event intrinsics — 1,000,000 rows, one per tenth span:
+
+```sql
+INSERT INTO trace_attrs_idx SELECT
+  toDate(fromUnixTimestamp64Nano(toInt64(1700000000000000000 + number * 432000000))),
+  'name',
+  concat('t-', toString(if((number*10) % 50 = 0, (number*10) % 1000, ((number*10) % 1000) + 3))),
+  'event:intrinsic', NULL,
+  toInt64(1700000000000000000 + number * 432000000),
+  reinterpretAsFixedString(toUInt64(number)) || reinterpretAsFixedString(toUInt64(0)),
+  reinterpretAsFixedString(toUInt64(number*10)),
+  toInt64(1000001), 'string'
+FROM numbers_mt(1000000)
+```
+
+Then `OPTIMIZE TABLE … FINAL` on both tables.
+
+**What a rebuild has to match: eight structural quantities and six selectivities.** These reproduced
+exactly on every build that took them — three independent full builds of the recipe above, by three
+different people, and the structural half again on the four span-only repeat builds below.
+
+```
+trace_spans      6 parts   1,232 marks   10,000,000 rows   Wide
+trace_attrs_idx  6 parts   8,676 marks   71,000,000 rows   Wide
+
+.a = .b            100,000 spans   100,000 traces
+.a = .c              1,000 spans     1,000 traces
+.s1 = .s2            1,000 spans     1,000 traces
+.a * 2 < .c          9,000 spans     9,000 traces
+.s2 = event:name     1,000 spans     1,000 traces
+name = 'op-0'        4,000 spans     4,000 traces
+```
+
+The awkward one is `.a * 2 < .c`, which is 9,000 and not 10,000: `a = n % 1000` and
+`c = (n % 1000) + 1` except on the 1,000 spans where `n % 10000 = 0`, and there `c = a = 0`, so
+`0 < 0` excludes them. A rebuild reporting 10,000 has transcribed the `c` generator wrongly. That is
+why the selectivities are the check.
+
+**The byte totals are recorded and are not a check.** Seven builds of the identical pinned recipe —
+same rows, same order, same granules, same part format, and an identical content hash over all 14
+columns (`4829404233030457425`) — gave seven different `trace_spans` byte totals:
+
+```
+trace_spans bytes on disk -- recorded, not a check
+build set               bytes on disk                                 spread within the set
+three by one person     211,538,791 / 211,564,845 / 211,376,088             188,757
+three by another        211,366,295 / 211,506,324 / 211,503,142             140,029
+one at implementation   211,335,774
+                            overall range 211,335,774 .. 211,564,845        229,071
+```
+
+Every column's compressed size moves between builds; the thread count is not pinned, and pinning it
+would make it a different recipe from the one that produced these figures. `trace_attrs_idx` came
+out at 1,128,726,045 on three builds, 1,128,725,599 on one and 1,128,726,121 on one — 522 bytes
+apart at the widest. **A rebuild that differs from these figures by tens of kilobytes has
+reproduced**; the eight structural quantities and the six selectivities are what a rebuild is
+checked against.
+
+One further note about running our own reader against a trace-only corpus: it logs a
+`metric_series` label-cache refresh warning about once a minute. That is expected and is not a
+symptom of anything.
+
+#### What the four classes cost today
+
+Whole requests, `GET /api/traces/v1/search?q=<query>&start=1699999999&end=1700432001&limit=20`,
+issued to the reader binary built at `fe0d98fe` in `mode: reader` against C6, with the request's
+statements attributed from `system.query_log`. Every one answered `200` with 20 traces. Metered
+bytes are `result_bytes + length(query)` summed over every statement of the request — both
+directions of the `pulsus-server` ↔ ClickHouse hop, which is the cost model §9.1 states.
+`max_block_size = 4096`, condition cache dropped before each request.
+
+| query | traces matching | statements | rows read | granules | metered bytes |
+|---|---|---|---|---|---|
+| `{ .a = .b }` | 100,000 | 37 | 300,984,841 | 36,744 | 6,186,101 |
+| `{ .a = .c }` | 1,000 | **3,127** | **25,904,824,756** | 3,162,449 | 123,448,989 |
+| `{ .s1 = .s2 }` | 1,000 | 3,127 | 25,945,817,524 | 3,167,453 | 103,993,640 |
+| `{ .a * 2 < .c }` | 9,000 | 347 | 2,869,590,609 | 350,316 | 17,940,201 |
+| `{ .s2 = event:name }` | 1,000 | 2,502 | 13,995,704,756 | 1,708,699 | 96,025,490 |
+
+**Where the cost is.** For `{ .a = .c }`, per stage:
+
+| stage | statements | rows read | granules | result bytes | query-text bytes |
+|---|---|---|---|---|---|
+| phase-1 generator | 1 | 10,043,392 | 1,226 | 3,145,744 | 323 |
+| phase-2 hydration | 625 | 785,300,131 | 96,108 | 69,698,611 | 1,333,750 |
+| phase-2 `val_num` value reads | 1,250 | 12,554,240,000 | 1,532,500 | 19,816,250 | 2,146,250 |
+| phase-2 `val` value reads | 1,250 | 12,554,240,000 | 1,532,500 | 21,469,100 | 2,177,500 |
+| winners' root read | 1 | 942,070 | 115 | 92,352 | 1,131 |
+
+**All 2,500 value reads read exactly 10,043,392 rows and exactly 1,226 granules** — measured as
+`min = max` with `uniqExact(read_rows) = 1`, not inferred from a total that happens to divide (the
+trap §9.2 records against itself). That is the whole `key = 'a'` (or `'c'`) partition, once per
+read, and it equals the phase-1 generator's own read. `trace_id` is the fifth column of `ORDER BY
+(key, val, scope, timestamp_ns, trace_id, span_id)` (`catalog.rs:382`), so a batch's
+`trace_id IN (32 ids)` prunes nothing inside it.
+
+**And §9.2's cheap fix does not apply.** §9.2 records that narrowing the *membership* read's
+`timestamp_ns` to the batch's own span range collapses it 221x. On the *value* read for the same
+batch, window narrowed from 432,002 s to the batch's own 13.401 s:
+
+    read_rows 10,043,392 -> 10,043,392, granules 1,226 -> 1,226, result 320 rows -> 320 rows
+
+A membership read fixes `(key, val, scope)`, so `timestamp_ns` is the next key column and the time
+bound has something to prune. A value read fixes only `key` and leaves `val` free, so there is
+nothing inside for the time bound to reach. These classes cannot be rescued cheaply.
+
+#### The SQL the push would be
+
+The generator's own predicate and its `GROUP BY trace_id` are unchanged — so `bound_ts`, the
+candidate sort key, is unchanged — and a `trace_id IN (…)` sub-statement pre-groups by
+`(trace_id, span_id)` and applies a range-and-type test. **No join**: ADR 0008 authorises none and
+none is needed. Written out for `{ .a = .c }`; the other four differ only in the keys and the
+`HAVING`:
+
+```sql
+SELECT trace_id, max(timestamp_ns) AS bound_ts
+FROM <trace_attrs_idx | the span-ordered copy>
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-19')
+  AND timestamp_ns > 1699999999000000000 AND timestamp_ns <= 1700432001000000000
+  AND (key = 'a')
+  AND trace_id IN (
+    SELECT trace_id FROM <same table>
+    WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-19')
+      AND timestamp_ns > 1699999999000000000 AND timestamp_ns <= 1700432001000000000
+      AND key IN ('a', 'c')
+    GROUP BY trace_id, span_id
+    HAVING countIf(key = 'a') > 0 AND countIf(key = 'c') > 0 AND (
+        (countIf(key = 'a' AND isNotNull(val_num)) > 0 AND countIf(key = 'c' AND isNotNull(val_num)) > 0
+         AND maxIf(val_num, key = 'a') >= minIf(val_num, key = 'c')
+         AND minIf(val_num, key = 'a') <= maxIf(val_num, key = 'c'))
+     OR (countIf(key = 'a' AND isNotNull(val_num)) = 0 AND countIf(key = 'c' AND isNotNull(val_num)) = 0
+         AND maxIf(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)), key = 'a')
+             >= minIf(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)), key = 'c')
+         AND minIf(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)), key = 'a')
+             <= maxIf(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)), key = 'c')))
+  )
+GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
+```
+
+**Three details of that `HAVING` are not decoration, and each was measured.** A future push that
+drops any of them answers differently from the evaluator.
+
+- **Compare `val_num`, not `val`, and gate on `isNotNull(val_num)`.** The `f64` rounding happens at
+  ingest — `numeric_val_num` (`crates/pulsus-write/src/protocols/otlp_traces.rs:712`) is
+  `val.parse::<f64>().filter(is_finite)` — so both sides of the comparison already read the rounded
+  number and there is no unrounded side to disagree with. But the `val` String still holds the
+  original text:
+
+      stored val            val_num           back to UInt64
+      9007199254740992      9007199254740992  9007199254740992
+      9007199254740993      9007199254740992  9007199254740992   <- rounds onto its neighbour
+      9007199254740994      9007199254740994  9007199254740994
+      9007199254740995      9007199254740996  9007199254740996
+
+  A span with `.a = "9007199254740993"` and `.b = "9007199254740992"` **matches `{ .a = .b }`
+  today**. A pushed form comparing `val` would answer `false` there — a lost row under `=` and an
+  admitted one under `!=` — and nothing downstream re-applies the leaf when the generator is the
+  only filter, so a lost row is a wrong answer. The control pair
+  `9007199254740994` / `9007199254740995` is unequal under both readings and so cannot mask it.
+- **Render the same byte cap on both operands.** `byte_cap_expr`
+  (`crates/pulsus-read/src/traces/search_sql.rs:64`) renders
+  `if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))`; `length` counts **bytes** and
+  `substringUTF8` counts **code points**. Measured: two 8,192-byte values differing in the last byte
+  compare unequal (`eq_at_8192 = 0`, both compared in full), and two 8,193-byte values agreeing on
+  the first 2,048 code points and differing at byte 8,193 compare **equal** (`eq_at_8193 = 1`, both
+  truncated). `repeat('<3-byte char>', 3000)` — 9,000 bytes, 3,000 characters — caps to 2,048
+  characters and 6,144 bytes. Comparing raw `val` disagrees at exactly 8,193 bytes; comparing a
+  character-counted cap disagrees on any multi-byte value above 2,048 characters.
+- **Use a range test, not `anyIf`.** One `(trace_id, span_id, key)` can carry two rows, and the
+  evaluator reads `any(val_num)` and `any(val)` (`attr_values_sql`, `search_sql.rs:325`), which is
+  an **arbitrary** choice among them. On a three-row fixture (`a` = 5, `a` = 7, `b` = 7 on one span)
+  `any(val_num)` for `key = 'a'` returned `5` on ten runs across `max_threads` 1–4 — arbitrary, and
+  here stable — so `{ .a = .b }` on that span is decided by which row `any` picked. A pushed `anyIf`
+  could pick the other row and **drop** a trace the evaluator keeps. The range test is a superset for
+  every choice `any` could make: on that fixture `min_a = 5`, `max_a = 7`, `min_b = max_b = 7`, and
+  `maxIf(val_num, key='a') >= minIf(val_num, key='b') AND minIf(val_num, key='a') <= maxIf(val_num, key='b')`
+  is `1`.
+
+**The push is exact.** On all five classes its candidate set equals the arithmetic ground truth —
+100,000 / 1,000 / 1,000 / 9,000 / 1,000 traces, no extra candidates and none missed — and the first
+20 trace ids are the same ids in the same order as today's path (`36420F00…`, `583E0F00…`,
+`583E0F00…`, `DC410F00…`, `583E0F00…`). **So the refusal below is about resources alone.**
+
+#### What the push would save on the metered hop, and why one number will not do
+
+Push side: the pushed phase-1 statement above, then the server's own phase-2 statement text taken
+from `system.query_log` for the same query with only the `trace_id` list substituted, at the
+server's own settings. The memory ceiling is lifted for this table, because under the shipped
+ceiling none of these statements runs at all on the current index order.
+
+| query | today: stmts / metered bytes | push: stmts / rows read / granules / metered bytes | saving |
+|---|---|---|---|
+| `{ .a = .b }` | 37 / 6,186,101 | 7 / 72,646,656 / 8,868 / 5,025,292 | **1.2x** |
+| `{ .a = .c }` | 3,127 / 123,448,989 | 7 / 72,704,000 / 8,875 / 277,773 | **440x – 460x** |
+| `{ .s1 = .s2 }` | 3,127 / 103,993,640 | 7 / 72,785,920 / 8,885 / 249,160 | **420x – 440x** |
+| `{ .a * 2 < .c }` | 347 / 17,940,201 | 7 / 72,720,384 / 8,877 / 668,425 | **27x – 28x** |
+| `{ .s2 = event:name }` | 2,502 / 96,025,490 | 6 / 44,638,208 / 5,449 / 231,450 | **410x – 450x** |
+
+**The ratios are printed to two significant figures as a range, deliberately, and the raw integers
+are printed beside them so a reader can recompute any take's own quotient.** Three careful takes of
+this table, on three instruments, disagree by up to 8.1% on the metered column while agreeing to the
+digit on statement counts, rows read and granules — so the entire disagreement is `result_bytes`.
+Printing four digits of a quotient that three takes cannot reproduce to two would be false
+precision, and the decision here does not turn on whether the saving is 440x or 460x.
+
+- The **push** column agrees between 0.00% and 1.14% across takes: `{ .a = .b }` gave 5,025,441 /
+  5,025,378 / 5,025,292, and `{ .a = .c }` gave **277,922** / **280,931** / **277,773**.
+- The **today** column differs by 0.5% to 8.1% of the smaller reading: narrowest `{ .a = .b }`
+  6,218,236 against 6,186,101, widest `{ .s2 = event:name }` 103,776,196 against 96,025,490. For
+  `{ .a = .c }` the three takes are **128,810,945**, 128,819,521 and **123,448,989**.
+- **What is attributed:** whether the query condition cache was dropped before the request moves
+  the metered column, 17,940,201 dropped against 17,806,317 carried — 0.75%, measured on
+  `{ .a * 2 < .c }` only. Applying that figure to the other four classes would be an argument, not
+  a measurement.
+- **What is not attributed:** about 3% on `{ .a = .c }` and up to about 7% on the event class. That
+  is unexplained, not noise, and a fourth take could land outside the ranges printed above — in
+  which case the range widens and the conclusion does not change.
+
+**Two things fall out, and both matter more than the endpoints.** The saving is a function of
+**selectivity**, not of the class: the same query text at 1 trace in 10 saves 1.2x and at 1 in 1,000
+saves about 440x. And the memory cost below is a function of **window size**, not of selectivity —
+it is the same 10.5 GiB for the 1-in-10 and the 1-in-1,000 form.
+
+#### Why none of it was lowered: the per-span pre-grouping does not fit
+
+Relating two attribute values of one span needs a per-span grouping, and its aggregation state is
+`O(spans in the search window)`. On the attribute index as it is ordered today, peak query memory
+for the pushed phase-1 statement, from `system.query_log`, no memory ceiling applied, three
+repetitions per point, `use_query_condition_cache = 0`. MiB, min–max over the reps:
+
+| spans in window | `{ .a = .b }` | `{ .a = .c }` | `{ .s1 = .s2 }` | `{ .a * 2 < .c }` | `{ .s2 = event:name }` |
+|---|---|---|---|---|---|
+| 625,000 | 800.7–801.6 | 800.7–801.8 | 800.7–801.7 | 276.1–276.4 | 318.8–392.3 |
+| 10,000,000 | 10,526.6–10,777.5 | 10,539.2–10,649.5 | 10,532.1–10,642.1 | 4,314.1–4,372.0 | 5,436.2–6,666.8 |
+
+The 625,000-span row is 30 runs — five forms, two block sizes, three repetitions — and the maximum
+over all 30 is **801.8 MiB**. At 312,500 spans the same design spans **167.4–469.5 MiB** across the
+five forms; the per-form split at that point was not printed. On this index order the block size
+does not move the figure: 10,651.8 against 10,650.2 MiB for the same statement at 4,096 and at
+65,409. The hash table over roughly 10,000,000 groups dominates, and the per-thread block buffers
+do not.
+
+**Peak memory is not one number, and treating it as one is what produced two irreconcilable
+readings of it.** At 625,000 spans the answer is anywhere between 276 MiB and 802 MiB depending on
+which of the five forms is running — a factor of 2.9 — because the number of aggregate states per
+span-group differs: 12 states, four of them `String`, for a field-vs-field equality; 4 states, none
+of them `String`, for the arithmetic form. Per span-group at the full window the five forms cost
+1,129 / 1,116 / 1,104 / 454 / 571 bytes.
+
+Against that, `generator_settings` (`exec.rs:2869`) applies `max_memory_usage = 536870912` — the
+shipped `reader.traceql_generator_max_memory_bytes` (`model.rs:518`) — with
+`max_bytes_before_external_group_by = 0`, so the statement throws rather than spilling:
+
+```
+Code: 241. DB::Exception: Query memory limit exceeded: would use 515.11 MiB
+(attempt to allocate chunk of 4.10 MiB), maximum: 512.00 MiB:
+While executing AggregatingTransform. (MEMORY_LIMIT_EXCEEDED) (version 26.3.29.7 (official build))
+```
+
+`map_trace_generator_error` (`exec.rs:701`) classifies code 241 first, and `read_error_parts`
+(`crates/pulsus-server/src/traces_api/error.rs:366`) answers `422`. Executed rather than reasoned —
+same binary, same corpus, same query, the only change being
+`reader.traceql_generator_max_memory_bytes`:
+
+```
+default (536870912):
+  HTTP/1.1 200 OK
+  content-type: application/json
+  -> 20 traces, first 583e0f00000000000000000000000000
+
+16777216:
+  HTTP/1.1 422 Unprocessable Entity
+  content-type: text/plain; charset=utf-8
+  content-length: 80
+
+  query too broad: trace search generator memory budget of 16777216 bytes exceeded
+```
+
+(no trailing newline; at the shipped default the number in the body reads `536870912`). **A query
+that answers 200 today would answer 422.**
+
+**Where the boundary falls, measured by bisection rather than interpolated.** Same statements under
+the shipped `max_memory_usage = 536870912` and `max_bytes_before_external_group_by = 0`, at
+`max_block_size = 4096`, window narrowed by `timestamp_ns` until it holds exactly the stated number
+of spans (counted, not assumed):
+
+    390,000 spans  10 of 10 complete at 4,096, and 10 of 10 at 65,409
+    395,000 spans  the peaks straddle the ceiling -- see below
+
+**At 395,000 spans the peaks fall into two clusters 24 MiB apart with the ceiling between them, and
+which cluster a run lands in was not explained.** Completions peak at 482.1–486.3 MiB and refusals
+at 508.0–512.0 MiB. Four blocks of runs at that window:
+
+    25 runs, first block                                          15 completed / 10 refused
+    40 runs (mark, uncompressed, primary-index and condition
+            caches dropped before three of the five blocks)       40 completed /  0 refused
+    25 runs replaying the earlier block order                     25 completed /  0 refused
+    25 runs at max_block_size = 65,409                            25 completed /  0 refused
+    23 runs on a second instrument                                 0 completed / 23 refused
+
+So a run-to-run flip was observed once and did not reproduce, and a second instrument sat in the
+high cluster for 23 consecutive runs. **It is recorded as two clusters, not as a rate**: the
+mechanism that selects one is not established, and neither instrument could force the other's
+result. Nothing in the recommendation rests on it.
+
+**Two rescues on the current index order, both measured, both refused.** `{ .a = .c }` pushed, full
+window, three reps:
+
+```
+current index order, plain                             10,647–10,760 MiB   read 30,130,176  marks 3,678
+current index order + optimize_aggregation_in_order=1  10,634–10,780 MiB   -- no improvement
+   (its own paired plain run, same three reps:         10,506–10,629 MiB)
+current index order + in_order at max_block_size=4096   0 of 3 complete, peak 511.6 MiB
+```
+
+In-order aggregation buys nothing here because the grouping key `(trace_id, span_id)` is not a
+prefix of `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)`, so the aggregation cannot
+stream. A numeric-only `HAVING` — the cheapest per-span comparison that could be written — costs
+5,894–6,027 MiB on this order. **Six statements were tried at the shipped ceiling and block size on
+the current index order — the five classes and the numeric-only `HAVING` — and all six refuse. That
+is six, not all.**
+
+#### The one thing that does fit, and the two changes it needs
+
+The same statement against an attribute table ordered `(trace_id, span_id, key)` streams the
+aggregation, and then it fits. The attribution took two rounds and one setting:
+
+```
+span-ordered index, optimize_aggregation_in_order = 1, full 10,000,000-span window, { .a = .c }
+
+max_block_size    uncapped peak (3 reps)         under max_memory_usage = 536870912
+65,409 (server)   1130.6 / 1107.0 / 1068.3 MiB   0 of 3 -- Code 241 at 520.60 / 514.65 / 516.05 MiB
+ 4,096 (ours)      248.1 /  232.9 /  228.7 MiB   3 of 3 COMPLETE at 230.2 / 222.0 / 225.1 MiB
+```
+
+**Our reader sends 4,096, so the shipped answer is the second row.** All five classes, span-ordered
+table, `optimize_aggregation_in_order = 1`, `max_block_size = 4096`, shipped memory ceiling, full
+window, three reps:
+
+| class | capped peaks (MiB) | rows read | marks | current index order, same window |
+|---|---|---|---|---|
+| `{ .a = .b }` | 242.6 / 238.4 / 231.7 | 112,197,568 | 13,699 | 0 of 3, `Code: 241` |
+| `{ .a = .c }` | 249.6 / 222.6 / 240.9 | 80,658,368 | 9,849 | 0 of 3, `Code: 241` |
+| `{ .s1 = .s2 }` | 248.4 / 231.0 / 243.9 | 80,658,368 | 9,849 | 0 of 3, `Code: 241` |
+| `{ .a * 2 < .c }` | 76.3 / 77.8 / 79.3 | 91,520,960 | 11,175 | 0 of 3, `Code: 241` |
+| `{ .s2 = event:name }` | 274.8 / 250.1 / 247.6 | 80,658,368 | 9,849 | 0 of 3, `Code: 241` |
+
+Exact on all five: the candidate set equals the arithmetic ground truth — 100,000 / 1,000 / 1,000 /
+9,000 / 1,000 traces, none extra and none missed — and the first 20 ids are the same ids in the same
+order as on the current index order. The same numeric-only `HAVING` control that costs 5,894–6,027
+MiB on the current order costs 77.7–85.6 MiB here, which is what establishes that the index order,
+not the statement, is what changed.
+
+**And then a second shipped budget refuses it, which nobody had looked at.** `generator_settings`
+inherits `search_settings`, so the pushed statement carries **four** throw budgets and not one:
+rows read, bytes read, result bytes and memory. On the span-ordered table at the full window with
+everything shipped:
+
+```
+Code: 158. DB::Exception: Limit for rows or bytes to read exceeded,
+max rows: 50.00 million, current rows: 51.31 million: While executing MergeTreeSelect…
+```
+
+`map_trace_read_error` turns 158 into `TooBroadReason::TraceScanBudgetRows` (`exec.rs:666`) and
+`ReadError::QueryTooBroad(_)` is `422` (`traces_api/error.rs:366`), so **"it fits" is false at the
+level a user experiences** until `reader.traceql_scan_budget_rows` is raised as well. All five
+classes trip it, at 51.31 / 51.31 / 55.75 / 53.30 / 52.88 million rows in the order of the table
+above. With that one budget at 200,000,000 and every other setting shipped, three reps each:
+
+| class | peaks (MiB) | rows read | result rows (the right answer) |
+|---|---|---|---|
+| `{ .a = .b }` | 229.9 / 229.9 / 231.0 | 112,197,568 | 100,000 |
+| `{ .a = .c }` | 225.8 / 216.1 / 227.8 | 80,658,368 | 1,000 |
+| `{ .s1 = .s2 }` | 234.7 / 237.1 / 239.8 | 80,658,368 | 1,000 |
+| `{ .a * 2 < .c }` | 69.7 / 74.0 / 76.1 | 91,520,960 | 9,000 |
+| `{ .s2 = event:name }` | 254.7 / 255.9 / 231.7 | 80,658,368 | 1,000 |
+
+**Note what that budget is bounding.** Today's `{ .a = .c }` request reads 25,904,824,756 rows
+across 3,127 statements and passes, because the budget is **per statement**. The push reads
+80,658,368 rows in **one** statement and is refused. The budget bounds a statement, and the class it
+refuses is the one that replaced three thousand statements with one.
+
+#### Where this leaves the read path
+
+Today the generator prunes on `key` — a group-3 leaf reaches 6 to 12 marks of 8,676 — and the cost
+is not the generator, it is the phase-2 loop: 3,127 statements and 25.9 billion rows read for one
+`{ .a = .c }` request. The push replaces that loop with one statement. On the current index order it
+keeps the `key` prune (30,130,176 rows) but cannot hold the per-span state (about 10.5 GiB). On the
+span-ordered order it holds the state (216–275 MiB) and loses the `key` prune, so it reads every
+attribute row in the window — 80,658,368 in that one statement, about 123 million across the whole
+seven-statement request, against today's 25,904,824,756. Nothing moves client-side either way: the
+comparison is a `HAVING` on ClickHouse in both.
+
+**So the four classes are not blocked by the compiler. They are blocked by the attribute index order
+and by one budget** — a schema change and a configuration change, neither of which is part 6's to
+make.
+
+Two claims here are scale-dependent and are not asserted: where the row budget binds relative to
+memory at production volume, and whether 80,658,368 rows per generator statement is acceptable at
+1 TB. Those belong to [#25](https://github.com/digitalis-io/pulsusdb/issues/25).
+
+#### Where this measurement stops
+
+- **Nothing here is checkable in CI, and the corpus is gone.** C6 was 71,000,000 rows on a developer
+  instance and was dropped. No fixture reproduces it, no xtask scenario generates it, and no cargo
+  test reads this section. That is why the recipe above, not any figure, is the deliverable.
+- **The two tests this part shipped prove only what the compiler emits.**
+  `crates/pulsus-read/tests/traceql_group2_selector_generators.rs` asserts that a negated `name`
+  leaf keeps its predicate in a bounded span scan while a negated attribute leaf does not, and that
+  no generator predicate contains a nested statement. Neither can observe a memory ceiling, and
+  neither would notice if any figure above were wrong.
+- **One corpus, one attribute density.** Seven attribute rows per span and one window shape. A
+  denser corpus crosses the memory ceiling at fewer spans and trips the row budget sooner.
+- **The span-ordered index was measured at one window** — the full 10,000,000 spans — so its
+  memory-versus-window curve is argued, not measured: in-order aggregation streams, so the state is
+  bounded by the per-thread block buffers rather than by the number of groups, while rows read grow
+  linearly with the window. That is why the row budget, not memory, is expected to bind first at
+  production volume, and establishing that ordering belongs to #25.
+- **The 395,000-span flip's mechanism is not established**, and about 3% of the metered-bytes
+  disagreement between takes is not attributed.
+- **The push side of the saving table is our statement at our settings, but it was not issued by our
+  binary**, because the push does not exist in our binary. The phase-2 text was taken from
+  `system.query_log` with only the id list substituted.
+- **The argument that no lower-memory form exists on the current index order is an argument.**
+  Relating two rows of one span needs a join (ADR 0008 authorises none, and a hash join materialises
+  the same per-span state), a correlated subquery (ClickHouse has none in this position), or a
+  per-span grouping. It is falsified by any statement that decides `{ .a = .b }` per span under
+  512 MiB on a 10,000,000-span window at `max_block_size = 4096`. Three rescues were tried —
+  in-order aggregation, the span-ordered index, and the two combined — and the storage figures
+  below. That is three, not all.
+
+#### The span-ordered attribute index — a proposal for scheduling, not part of this work
+
+**What it is.** An **additional** `trace_attrs_idx`-shaped table ordered `(trace_id, span_id, key)`,
+alongside the existing `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)`
+(`crates/pulsus-schema/src/catalog.rs:382`) — **not instead of it**.
+
+**What it costs to store.** **451,383,963** bytes for the same **71,000,000** rows, on top of the
+existing **1,128,726,045** — **+40%** — plus a second write of every attribute row on ingest. The
+copy's byte total repeated exactly on three independent builds, and the quotient agrees to four
+digits against both recorded denominators (39.990569% and 39.990584%), which is why this one byte
+figure is quoted where the corpus's own totals are not.
+
+**Why it cannot replace the key-ordered index.** Group 3's leaves prune on `key`, which is not the
+leading column of the span-ordered table:
+
+| leaf | key-ordered | span-ordered | |
+|---|---|---|---|
+| `key='http.method' AND val='GET' AND scope='span'` | 98,305 rows / 12 marks | 71,000,000 rows / 8,670 marks | 722x |
+| `key='a' AND val='42' AND scope='span'` | 49,152 rows / 6 marks | 71,000,000 rows / 8,670 marks | **1,444x** |
+
+Same answers on both tables — 1,666,667 and 10,000 matching rows — at 722x and 1,444x the rows read.
+So this is a second copy of the attribute rows, not a re-ordering of the existing one.
+
+**The budget it needs alongside.** `reader.traceql_scan_budget_rows`, raised from 50,000,000
+(`crates/pulsus-config/src/model.rs:515`) to cover the window's attribute rows; **200,000,000** was
+measured. Without it every one of the five classes returns
+`Code: 158. DB::Exception: Limit for rows or bytes to read exceeded, max rows: 50.00 million,
+current rows: …` at 51.31 / 51.31 / 55.75 / 53.30 / 52.88 million, and the user sees `422`.
+
+**What it buys.** For the four selector classes: 7 statements and 80,658,368 rows read in place of
+3,127 statements and 25,904,824,756 rows, and a metered hop between 1.2x and about 440x smaller
+depending on selectivity.
+
+**This is a proposal for the owner to schedule, and nothing more.** Part 6 does not build the table,
+does not change a configuration default, and **files nothing**.
+
+---
 
 ## 10. Status: what is demonstrated, what is not
 
