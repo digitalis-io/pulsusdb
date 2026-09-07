@@ -599,8 +599,13 @@ fn differential_categories_are_pinned() {
     // — the reference's other two `compare()` productions
     // (`expr.y:325-326`), both `supported` with corpus evidence and both
     // measured `accept` against the pinned oracle: 119 + 2 = 121.
+    // Issue #492 item 9 adds `pipeline.spanset_filter` — a `{...}` spanset
+    // expression as a LATER pipeline element, the reference's own
+    // `spansetPipeline PIPE spansetExpression` production
+    // (`expr.y:170` @ Tempo v3.0.2) — `supported` with corpus evidence and
+    // measured `accept` against the pinned oracle: 121 + 1 = 122.
     assert_eq!(
-        supported, 121,
+        supported, 122,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(

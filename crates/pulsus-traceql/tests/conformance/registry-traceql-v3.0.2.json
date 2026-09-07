@@ -106,6 +106,7 @@
     { "id": "pipeline.select", "category": "pipeline-stages", "syntax": "select(...)", "doc": "https://grafana.com/docs/tempo/latest/traceql/#aggregators", "probe": "{ .a = 1 } | select(.b, .c)" },
     { "id": "pipeline.by", "category": "pipeline-stages", "syntax": "by(f)", "doc": "https://grafana.com/docs/tempo/latest/traceql/#aggregators", "probe": "{ .a = 1 } | by(resource.service.name)" },
     { "id": "pipeline.coalesce", "category": "pipeline-stages", "syntax": "coalesce()", "doc": "https://grafana.com/docs/tempo/latest/traceql/#aggregators", "probe": "{ .a = 1 } | coalesce()" },
+    { "id": "pipeline.spanset_filter", "category": "pipeline-stages", "syntax": "{ ... } as a later pipeline element", "doc": "https://grafana.com/docs/tempo/latest/traceql/#combine-spansets", "probe": "{ .a = 1 } | by(name) | { name = \"b\" }" },
     { "id": "pipeline.scalar_expr", "category": "pipeline-stages", "syntax": "scalar pipeline expression", "doc": "https://grafana.com/docs/tempo/latest/traceql/#aggregators", "probe": "{ .a = 1 } | avg(duration) * 2 > 1s" },
     { "id": "metrics.rate", "category": "metrics-first-stage", "syntax": "rate()", "doc": "https://grafana.com/docs/tempo/latest/traceql/metrics-queries/functions/", "probe": "{ .a = 1 } | rate()" },
     { "id": "metrics.count_over_time", "category": "metrics-first-stage", "syntax": "count_over_time()", "doc": "https://grafana.com/docs/tempo/latest/traceql/metrics-queries/functions/", "probe": "{ .a = 1 } | count_over_time()" },

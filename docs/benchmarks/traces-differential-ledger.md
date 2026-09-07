@@ -2430,15 +2430,15 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Disposition.** Not copied, no code change: our answer was already the
   documented one. Recorded so the difference is not read as our bug.
 
-### `traceql-midpipeline-spanset-filter-unsupported` (issue #492) — **a GAP record, not a divergence**
+### `traceql-midpipeline-spanset-filter-unsupported` (issue #492) — **WITHDRAWN: item 9 closed the gap, and the row's own account of it was wrong**
 
 - **Route.** `GET /api/traces/v1/search` and its `/api/search` alias — the
-  refusal is the same handler on both paths.
+  refusal was the same handler on both paths.
 
-- **What.** The reference's pipeline grammar admits a `{...}` spanset
-  expression as an element in ANY position; ours admits only an
-  identifier-led stage. So a filter written after another stage is a
-  `400` here and a `200` there:
+- **What it recorded (original text, kept).** The reference's pipeline
+  grammar admits a `{...}` spanset expression as an element in ANY
+  position; ours admitted only an identifier-led stage. So a filter
+  written after another stage was a `400` here and a `200` there:
 
   ```
   { resource.service.name = "grp492" } | by(name) | { name = "b" }
@@ -2451,35 +2451,182 @@ when we are asking it to slow down, so we keep `429`; recorded as
   unexpected '{' at byte 50: expected a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)
   ```
 
-  The reference answers `200` with one spanSet, `by(name)=b` over the
-  single `b` span — measured 2026-09-04 against a reference instance
-  started for that run. Written the other way round
-  (`| { name = "b" } | by(name)`) both systems answer that same result,
-  because our parser folds a leading second filter into the spanset
-  expression.
+  Our `Query` carried ONE `spanset: SpansetExpr` plus a
+  `Vec<PipelineStage>` and `parse_pipeline_stage` accepted only an
+  identifier-led stage, so the shape could not be represented at all.
 
-- **Why it is a gap and not a judgement.** Our `Query` carries ONE
-  `spanset: SpansetExpr` plus a `Vec<PipelineStage>`
-  (`crates/pulsus-traceql/src/ast.rs:62-70`) and `parse_pipeline_stage`
-  accepts only an identifier-led stage
-  (`crates/pulsus-traceql/src/parser.rs:843-897`), so the shape cannot be
-  represented at all. Closing it needs a new `PipelineStage` variant
-  carrying a `SpansetExpr`, a planner that can plan more than one filter,
-  and an evaluator stage that filters each spanSet's members — an AST,
-  planner and evaluator change.
+- **One sentence of the original was WRONG, and it contradicted a later
+  sentence of the same row.** The row said that written the other way
+  round (`| { name = "b" } | by(name)`) both systems answer the same
+  result, "because our parser folds a leading second filter into the
+  spanset expression". **There is no fold, and there never was.** Both
+  spellings were the same `400`, which is what the row's own later
+  sentence said (`{a} | {b}` is still the same `400`). Measured on this
+  tree at `3081019b` by calling `pulsus_traceql::parse` directly — the
+  filter-first spelling failed at **byte 39** and the grouping-first one at
+  **byte 50**, which is the same error at the two different offsets, not a
+  fold and a refusal:
 
-- **Tracked as** item 9 of the issue #492 enumeration (comment
-  5536956647), which records the same measurement and points back at this
-  row. Issue #492 item 2 changed the evaluator only and deliberately
-  neither widened nor narrowed this accept surface: `{a} | {b}` is still
-  the same `400`, with the stage list in the message now naming `by` and
-  `coalesce`.
+  ```
+  { resource.service.name = "grp492" } | { name = "b" } | by(name)
+    unexpected '{' at byte 39: expected a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)
+  { resource.service.name = "grp492" } | by(name) | { name = "b" }
+    unexpected '{' at byte 50: expected a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)
+  ```
 
-- **Disposition.** Recorded, not fixed here. Whether to close the gap or
-  keep the refusal is item 9's own decision — it widens the accept
-  surface, the direction this project has previously withdrawn from
-  (`traceql-spanset-by-multi-key-withdrawn`), while "works there, not
-  here" is the case it has previously treated as the worse defect.
+  `parse` calls `parse_spanset_expr`, then loops on `Pipe` into
+  `parse_pipeline_stage`; `|` is `TokenKind::Pipe` and never enters the
+  `&&`/`||` climb. The same held at `d0a410d0`, the last commit before
+  issue #492 item 2 merged, so the sentence was wrong when written rather
+  than having aged.
+
+- **What closed it.** Issue #492 item 9 added `PipelineStage::Filter`, a
+  parser path for a `{`-led (or `(`-led) element, a planner that plans
+  more than one filter, and an ordered evaluator stage. Both spellings now
+  answer `200` with one spanSet, `by(name) = "b"`, `matched 2`, spans
+  `02 04` — measured **2026-09-07** against an instance of the pinned
+  reference build started for this work, on one trace
+  `4929…a1`, service `grp492`, four spans `01 a`, `02 b`, `03 a`,
+  `04 b`:
+
+  ```
+  { resource.service.name = "grp492" } | { name = "b" } | by(name)
+    200  [by(name) = "b"]  matched 2  spans 02 04
+  { resource.service.name = "grp492" } | by(name) | { name = "b" }
+    200  [by(name) = "b"]  matched 2  spans 02 04
+  ```
+
+  Our own answers are the same, and both spellings are live parity
+  fixtures (`midpipe_filter_then_by`, `midpipe_by_then_filter` in
+  `crates/pulsus-read/tests/traces_search_grouping_differential.rs`).
+
+- **Disposition.** **Withdrawn, not deleted**, so the next reader does not
+  re-derive the reasoning — and so the wrong sentence stays visible as a
+  correction rather than disappearing. Three narrower rows survive it, all
+  below: the mid-pipeline spanset OPERATION, the `{...}` stage on the
+  metrics routes, and the reference's empty answer for `select()` before a
+  mid-pipeline filter.
+
+### `traceql-midpipeline-spanset-operation-unsupported` (issue #492 item 9) — **we refuse a shape the reference answers**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** The reference's pipeline element is a full spanset
+  EXPRESSION, not a single filter, so an operation between spansets is
+  legal after a `|`. We parse it — the parser must not answer a semantic
+  question — and refuse it at plan time.
+
+  ```
+  { resource.service.name = "grp492" } | { name = "b" } && { name = "a" }
+  ```
+
+- **Reference.** `200`, one spanSet with no attributes, `matched 4`,
+  spans `01 03 02 04` — the union of both operands. Measured
+  **2026-09-07** against an instance of the pinned reference build
+  started for this work, on the four-span `a b a b` fixture above.
+
+- **Ours.** `400`, `text/plain; charset=utf-8`, no trailing newline, no
+  `invalid TraceQL query: ` prefix on this route. Body verbatim:
+
+  ```
+  type mismatch: ({ name = "b" } && { name = "a" }) is not executable as a pipeline stage: a `|` stage must be a single { ... } filter, not a cross-spanset or structural operation
+  ```
+
+  The parenthesised rendering with double-quoted string values is
+  `SpansetExpr`'s own `Display`.
+
+- **Triage.** Recorded gap, not a judgement. Executing it means evaluating
+  a cross-spanset algebra per surviving spanSet at each pipeline
+  position, which is a second evaluator, not a wider filter. Pinned by
+  `traces::search_plan::tests::a_mid_pipeline_spanset_operation_is_a_clean_400`,
+  which asserts this body byte for byte.
+
+- **Disposition.** Refused cleanly, never silently answered from the left
+  operand alone. Closing it is separate work.
+
+### `traceql-midpipeline-filter-before-metrics-stage-unsupported` (issue #492 item 9) — **the `{...}` stage is search-only**
+
+- **Routes.** `GET /api/traces/v1/metrics/query_range` and
+  `GET /api/traces/v1/metrics/query`.
+
+- **What.** A `{...}` pipeline element before a metrics function. The
+  reference applies it and computes the metric over what survives.
+
+  ```
+  { resource.service.name = "grp492" } | { name = "b" } | rate()
+  ```
+
+- **Reference.** `200`. On the four-span `a b a b` fixture, one non-zero
+  sample: `rate = 0.03333333333333333`. The same query WITHOUT the filter
+  gives `0.06666666666666667` — which is how this row shows the filter is
+  applied rather than ignored. Measured **2026-09-07**,
+  `step=60s`, against an instance of the pinned reference build started
+  for this work.
+
+- **Ours.** `400`, `text/plain; charset=utf-8`. Body verbatim:
+
+  ```
+  type mismatch: a metrics query takes one metrics function stage and at most one topk()/bottomk() second stage; aggregate filters, select(), and { ... } spanset filters are search-only
+  ```
+
+  Before item 9 this query was a PARSER `400`; it is now a planner `400`.
+  The status did not move — the body did, and this row is what records
+  that. Pinned by
+  `traces::metrics_plan::tests::the_metrics_refusal_names_the_mid_pipeline_spanset_filter`.
+
+- **Disposition.** Refused cleanly. The search route serves the stage; the
+  metrics routes do not.
+
+### `traceql-select-before-midpipeline-filter-empty` (issue #492 item 9) — **the reference returns nothing; we return the filtered result**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** With a `select()` immediately after the leading filter and a
+  `{...}` stage after it, the reference returns no traces for a filter
+  that compares a field. We return the filtered result.
+
+- **The six measured spellings, and the row claims nothing beyond them.**
+  All six against an instance of the pinned reference build started for
+  this work, on the four-span `a b a b` fixture, **2026-09-07**, with
+  `spss=100` on every request (without it the per-spanSet summary cap
+  returns three of four spans and the numbers are not comparable). `{svc}`
+  is `{ resource.service.name = "grp492" }`.
+
+  | spelling | reference |
+  |---|---|
+  | `{svc} \| select(.tag) \| { name = "b" }` | `200`, no traces |
+  | `{svc} \| select(name) \| { name = "b" }` | `200`, no traces |
+  | `{svc} \| select(.tag) \| { .tag = "x" }` | `200`, no traces |
+  | `{svc} \| select(.tag) \| { true }` | `200`, spans `01 02 03 04` |
+  | `{svc} \| { name = "b" } \| select(.tag) \| { name = "b" }` | `200`, spans `02 04` |
+  | `{svc} \| by(name) \| select(.tag) \| { name = "b" }` | `200`, `[by(name) = "b"]`, spans `02 04` |
+
+- **Ours**, for the first spelling: `200`, one spanSet, spans `02 04`.
+  Pinned hermetically in
+  `traces::search_eval::tests::the_mid_pipeline_filter_composes_with_every_neighbouring_stage`.
+
+- **What the six rule out.** That `select()` always empties (row 4
+  answers); that it depends on which field is selected (rows 1 and 2 both
+  empty, one an attribute and one an intrinsic); and that it persists
+  across an intervening filter (row 5) or an intervening grouping
+  (row 6).
+
+- **What the six do NOT cover, and this row claims none of it.** Other
+  comparison operators, other field types, other selector shapes, other
+  intervening stages, more than one selected field, more than one trace,
+  and the mechanism. None of these was measured. **This row is a record of
+  six observations, not a rule.**
+
+- **Triage.** Not copied. Our `select()` is a projection registered once,
+  so the filter that follows it sees the same spans it would have seen
+  without it. This is **not** an entry in
+  `docs/reference-defects-we-do-not-copy.md`: that file admits a
+  behaviour only on its four stated tests, and none of them was
+  established here, because no mechanism was diagnosed.
+
+- **Disposition.** Recorded. Reproducing the empty answer would mean
+  making `select()` change which spans a later stage sees, which nothing
+  in the reference's stated intent asks for.
 
 ### `traceql-spanset-aggregate-precedes-grouping` — **WITHDRAWN: the ordered pipeline fold retired it (issues #510, #492 item 2)**
 

@@ -957,7 +957,8 @@ fn analyze_pipeline(query: &Query) -> Result<PipelineAnalysis, PlanError> {
         _ => {
             return Err(PlanError::TypeMismatch(
                 "a metrics query takes one metrics function stage and at most one topk()/bottomk() \
-                 second stage; aggregate filters and select() are search-only"
+                 second stage; aggregate filters, select(), and { ... } spanset filters are \
+                 search-only"
                     .to_string(),
             ));
         }
@@ -1201,6 +1202,35 @@ mod tests {
 
     fn plan(q: &str) -> TraceMetricsPlan {
         plan_trace_metrics(&parse(q).expect("parse"), &PARAMS, &ctx()).expect("plan")
+    }
+
+    /// Issue #492 item 9 criterion 15: the metrics-route refusal names the
+    /// `{ ... }` spanset filter.
+    ///
+    /// A `{...}` pipeline stage is search-only. Before item 9 the query
+    /// below was a parser `400`; now it parses, reaches this catch-all,
+    /// and must be a planner `400` whose message says WHICH stages the
+    /// metrics routes take — otherwise a user sent a stage the message
+    /// does not mention. The text is asserted in full because the ledger
+    /// row `traceql-midpipeline-filter-before-metrics-stage-unsupported`
+    /// quotes it verbatim.
+    ///
+    /// *RED when:* the catch-all keeps its old message, which named only
+    /// aggregate filters and `select()`.
+    #[test]
+    fn the_metrics_refusal_names_the_mid_pipeline_spanset_filter() {
+        let q = parse(r#"{ .a = 1 } | { .b = 2 } | rate()"#).expect("it must PARSE");
+        // `PipelineAnalysis` carries no `Debug`, so the refusal is
+        // destructured rather than unwrapped.
+        let Err(err) = analyze_pipeline(&q) else {
+            panic!("a `{{...}}` stage must be refused on the metrics routes");
+        };
+        assert_eq!(
+            err.to_string(),
+            "type mismatch: a metrics query takes one metrics function stage and at most one \
+             topk()/bottomk() second stage; aggregate filters, select(), and { ... } spanset \
+             filters are search-only"
+        );
     }
 
     /// AC1 (issue #477 (a)/(b)): the emitted bucket grid, one case per

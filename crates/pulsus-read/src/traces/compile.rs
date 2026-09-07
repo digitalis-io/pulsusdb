@@ -622,6 +622,7 @@ dispatchers!(
     SelectLower,
     ByLower,
     CoalesceLower,
+    PipeFilterLower,
     NotASearchLinkLower,
     OrderLower,
     LimitLower,
@@ -638,6 +639,7 @@ static AGGREGATE: AggregateLower = AggregateLower;
 static SELECT: SelectLower = SelectLower;
 static BY: ByLower = ByLower;
 static COALESCE: CoalesceLower = CoalesceLower;
+static PIPE_FILTER: PipeFilterLower = PipeFilterLower;
 static NOT_A_SEARCH_LINK: NotASearchLinkLower = NotASearchLinkLower;
 static ORDER: OrderLower = OrderLower;
 static LIMIT: LimitLower = LimitLower;
@@ -670,6 +672,7 @@ impl Lang for Tql {
                 PipelineStage::Select { .. } => &SELECT,
                 PipelineStage::By { .. } => &BY,
                 PipelineStage::Coalesce => &COALESCE,
+                PipelineStage::Filter(_) => &PIPE_FILTER,
                 // Not chain links on the search route: the planner
                 // answers 400 for all three, so the chain builder never
                 // constructs one. They are dispatched rather than
@@ -1151,6 +1154,61 @@ impl Lower<Tql> for CoalesceLower {
     }
 }
 
+impl Lower<Tql> for PipeFilterLower {
+    /// **Never lowers**, and the reason is soundness rather than
+    /// unfinished work — so `NotYetLowered` here means "not lowered by
+    /// this dispatcher", and the three reasons below say why adding one
+    /// would be wrong rather than merely absent.
+    ///
+    /// 1. **A `WHERE` conjunct is unsound whenever the leading spanset is
+    ///    not a single filter.** For
+    ///    `{ .tag = "x" } && { name = "a" } | { .tag = "y" }` the
+    ///    reference answers one span — the one carrying `tag = "y"` — and
+    ///    that span is supplied by the RIGHT operand of the `&&`. A
+    ///    generator built from the `.tag = "x"` leaf with `val = 'y'`
+    ///    ANDed onto the same `trace_attrs_idx` row matches nothing, so
+    ///    the trace is dropped. That is a WRONG answer, not a wider one.
+    /// 2. **Even where it is sound it would favour one spelling.** This
+    ///    engine does not push a conjunction's second leaf: the committed
+    ///    golden for
+    ///    `{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s }`
+    ///    sends `PREWHERE service = 'checkout'` and nothing else. If `{A} | {B}` pushed `B` and `{A && B}` did
+    ///    not, the two spellings would return different traces under
+    ///    `reader.traceql_max_candidates` — the defect class issue #492
+    ///    item 9 exists to remove.
+    /// 3. **Nothing reads `rel.predicate` back into emitted text.** Part
+    ///    4's mechanism reads `rel.having` back in `plan_search`; a
+    ///    `WHERE` read-back is a new mechanism, and reasons 1 and 2 say it
+    ///    should not be added for this stage.
+    ///
+    /// No join is needed and none is proposed: where the two sides cannot
+    /// meet on one row the answer is to refuse. ADR 0008 forbids a join
+    /// until the ADR names the clause
+    /// (`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`).
+    ///
+    /// What the stage DOES influence is which generator statement phase 1
+    /// sends — `search_plan::plan_search`'s fold over
+    /// `PlannedPipeline::filter_generators`. That is a choice among
+    /// statements the query already implies, not a fragment added to one.
+    fn capability(&self, _s: &TqlLink, _rel: &Relation<Tql>) -> Capability {
+        Capability::No(BlockReason::NotYetLowered)
+    }
+    fn apply(
+        &self,
+        _s: &TqlLink,
+        rel: Relation<Tql>,
+        _cx: &LowerCx<'_, Tql>,
+    ) -> Result<Relation<Tql>, PlanError> {
+        Ok(rel)
+    }
+    /// The accumulated predicate no longer means the chain: the evaluator
+    /// will drop spans, and traces, that the SQL returned.
+    fn residual_effect(&self, _s: &TqlLink, mut rel: Relation<Tql>) -> Relation<Tql> {
+        rel.exact = false;
+        rel
+    }
+}
+
 impl Lower<Tql> for SelectLower {
     /// **No exactness precondition** — projecting a column onto rows the
     /// evaluator will drop is harmless.
@@ -1505,6 +1563,7 @@ fn pipe_name(stage: &PipelineStage) -> &'static str {
         PipelineStage::Select { .. } => "Select",
         PipelineStage::By { .. } => "By",
         PipelineStage::Coalesce => "Coalesce",
+        PipelineStage::Filter(_) => "Filter",
         PipelineStage::Metric(_) => "Metric",
         PipelineStage::MetricSecondStage(_) => "MetricSecondStage",
         PipelineStage::Compare { .. } => "Compare",
@@ -1699,12 +1758,13 @@ mod tests {
     /// *none* assert that the effect IS the identity — so the exemption
     /// is itself a check rather than a silence.
     ///
-    /// **Twenty rows**: eleven with a stated effect (`Aggregate`, `By`
+    /// **Twenty-one rows**: twelve with a stated effect (`Aggregate`, `By`
     /// in each of its two branches, grouped `Coalesce`, `Select`, `Order`,
-    /// `Limit`, `Emit`, and issue #492 part 3's `Structural`,
-    /// `NestedSet` and `BoolTruth`, which each clear `exact` because the
-    /// SQL means strictly more than the query once they are residual)
-    /// and nine whose effect is none (`Source`, `Coalesce` with no
+    /// `Limit`, `Emit`, issue #492 part 3's `Structural`, `NestedSet` and
+    /// `BoolTruth`, which each clear `exact` because the SQL means
+    /// strictly more than the query once they are residual, and issue
+    /// #492 item 9's mid-pipeline `{...}` filter, which clears it for the
+    /// same reason) and nine whose effect is none (`Source`, `Coalesce` with no
     /// preceding `By`, and the seven per-batch reads — five phase-2
     /// statements plus the two trace-wide co-loads — which add rows the
     /// evaluator consults and rewrite no column).
@@ -1716,6 +1776,7 @@ mod tests {
         let by_status = pipe(r#"{ .a = "1" } | by(status)"#);
         let coalesce = pipe(r#"{ .a = "1" } | coalesce()"#);
         let select = pipe(r#"{ .a = "1" } | select(span.http.method)"#);
+        let pipe_filter = pipe(r#"{ .a = "1" } | { .b = "2" }"#);
 
         // Two seeds per row. They differ in `shape` and in every field
         // the row's effect column names as unchanged or retained; where
@@ -1805,6 +1866,20 @@ mod tests {
                 effect_is_constant: false,
                 has_effect: true,
             },
+            // Issue #492 item 9: the mid-pipeline `{...}` filter never
+            // lowers, and once it is residual the accumulated predicate
+            // no longer means the chain — the evaluator will drop spans,
+            // and traces, that the SQL returned.
+            EffectRow {
+                name: "Pipe filter",
+                link: TqlLink::Pipe(pipe_filter),
+                s1: base(TqlShape::Spans),
+                s2: base(TqlShape::Traces),
+                e1: not_exact(base(TqlShape::Spans)),
+                e2: not_exact(base(TqlShape::Traces)),
+                effect_is_constant: false,
+                has_effect: true,
+            },
             EffectRow {
                 name: "Order",
                 link: TqlLink::Order,
@@ -1876,7 +1951,7 @@ mod tests {
                 has_effect: true,
             });
         }
-        assert_every_residual_state_effect::<Tql>(&rows, 20);
+        assert_every_residual_state_effect::<Tql>(&rows, 21);
     }
 
     /// Issue #492 part 5 criterion 32, and its assertion names its own
@@ -1925,6 +2000,52 @@ mod tests {
                 ctx,
             );
         }
+    }
+
+    /// Issue #492 item 9 criterion 10: the mid-pipeline `{...}` link
+    /// refuses into SQL and clears exactness.
+    ///
+    /// Both halves are asserted because they are separate claims: a link
+    /// that lowered `Wider` would ALSO clear `exact`, so the exactness
+    /// assertion alone cannot tell a refusal from a widening. The
+    /// disposition is what says it never became SQL.
+    ///
+    /// *RED when:* `PipeFilterLower::capability` returns anything but
+    /// `No(NotYetLowered)`, or `residual_effect` stops clearing `exact`.
+    #[test]
+    fn the_mid_pipeline_filter_link_refuses_and_clears_exactness() {
+        let bounds = crate::compile::fold::RequestBounds {
+            start_ns: 0,
+            end_ns: 1,
+            step_ns: None,
+            limit: Some(20),
+        };
+        let query = pulsus_traceql::parse(r#"{ .a = "1" } | { .b = "2" }"#).expect("parse");
+        let chain = vec![
+            TqlLink::Source {
+                expr: Box::new(query.spanset.clone()),
+                generator_is_exact: true,
+            },
+            TqlLink::Pipe(query.pipeline[0].clone()),
+        ];
+        let cx = LowerCx::<Tql>::new(&bounds);
+        let lowering = crate::compile::fold::lower_chain::<Tql>(
+            &chain,
+            seed_relation(TRACE_SPANS, Pred::True),
+            &cx,
+        )
+        .expect("fold");
+        assert_eq!(
+            lowering.how[1],
+            crate::compile::fold::Disposition::Residual(
+                crate::compile::fold::ResidualReason::Blocked(BlockReason::NotYetLowered)
+            ),
+            "the `{{...}}` pipeline link must refuse into SQL, not lower"
+        );
+        assert!(
+            !lowering.rel.exact,
+            "a residual `{{...}}` filter means the SQL is now a superset: exact must be cleared"
+        );
     }
 
     /// `Emit` is `Never`, AND the plan builder gives it its own SQL part

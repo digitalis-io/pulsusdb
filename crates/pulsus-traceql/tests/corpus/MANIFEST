@@ -97,6 +97,11 @@ accept/pipeline_coalesce
 accept/pipeline_count
 accept/pipeline_max_duration
 accept/pipeline_min_attr
+accept/pipeline_spanset_filter
+accept/pipeline_spanset_filter_first
+accept/pipeline_spanset_filter_match_all
+accept/pipeline_spanset_filter_parens
+accept/pipeline_spanset_operation
 accept/pipeline_sum_attr
 accept/rhs_attr_eq
 accept/scope_event

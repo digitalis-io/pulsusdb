@@ -997,6 +997,28 @@ pub enum PipelineStage {
         cmp: ComparisonOp,
         value: Value,
     },
+    /// A `{...}` spanset expression written as a LATER pipeline element
+    /// (issue #492 item 9): `{A} | by(name) | { name = "b" }` keeps, in
+    /// each surviving spanset, the spans that satisfy the filter, and
+    /// drops the spansets it empties.
+    ///
+    /// The reference's pipeline production carries an element
+    /// alternative for a spanset expression after a pipe —
+    /// `spansetPipeline PIPE spansetExpression`
+    /// (`pkg/traceql/expr.y:170` @ Tempo v3.0.2), one of five element
+    /// alternatives at `:170-174` beside the aggregate filter, the
+    /// grouping stage, the coalesce stage and the select stage. So the
+    /// position is ANY pipeline position, not only the second, and the
+    /// element is a full `spansetExpression` rather than a single
+    /// filter: `| { a } && { b }` parses there and parses here.
+    ///
+    /// The planner executes the single-filter form and refuses a
+    /// cross-spanset or structural operation with a `400`
+    /// (`traceql-midpipeline-spanset-operation-unsupported` in
+    /// `docs/benchmarks/traces-differential-ledger.md`); the parser must
+    /// not answer that semantic question, which is the same rule the
+    /// aggregate argument and the `by()` key follow.
+    Filter(SpansetExpr),
     /// `select(field, ...)` — one or more fields; `select()` is a
     /// positioned parse error.
     Select { fields: Vec<Field> },
@@ -1087,6 +1109,7 @@ impl fmt::Display for PipelineStage {
                 }
                 write!(f, ")")
             }
+            PipelineStage::Filter(expr) => write!(f, "{expr}"),
             PipelineStage::By { key } => write!(f, "by({key})"),
             PipelineStage::Coalesce => write!(f, "coalesce()"),
             PipelineStage::Metric(stage) => write!(f, "{stage}"),

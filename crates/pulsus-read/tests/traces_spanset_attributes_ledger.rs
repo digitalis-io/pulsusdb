@@ -38,14 +38,29 @@ use std::path::PathBuf;
 /// here. It was a live row on the issue #510 branch and the ordered fold
 /// retired it; it now appears in [`WITHDRAWN`] instead, and moving it
 /// between the two arrays is the edit that records the retirement.
-const LEDGER_IDS: [&str; 7] = [
+///
+/// `traceql-midpipeline-spanset-filter-unsupported` left this array in
+/// issue #492 item 9 and is in [`WITHDRAWN`] instead — the same edit that
+/// records a retirement.
+///
+/// **One row of item 9's three is deliberately NOT here.**
+/// `traceql-midpipeline-filter-before-metrics-stage-unsupported` is a
+/// METRICS-route row (`/api/traces/v1/metrics/query_range` and
+/// `/query`), and every id in this array is asserted to name the two
+/// SEARCH routes in its Route bullet. Listing it would make that
+/// assertion demand routes the row is not about. It is a live ledger row
+/// and it is pinned separately, by
+/// `traces::metrics_plan::tests::the_metrics_refusal_names_the_mid_pipeline_spanset_filter`,
+/// which asserts its body byte for byte.
+const LEDGER_IDS: [&str; 8] = [
     "traceql-spanset-aggregate-double-lexical-form",
     "traceql-spanset-aggregate-mixed-type-attribute",
     "traceql-spanset-aggregate-string-attribute-contributes",
     "traceql-attribute-aggregate-float64-precision",
     "traceql-nested-by-composite-series-cap",
     "traceql-select-before-by-nil-group-key",
-    "traceql-midpipeline-spanset-filter-unsupported",
+    "traceql-midpipeline-spanset-operation-unsupported",
+    "traceql-select-before-midpipeline-filter-empty",
 ];
 
 /// The rows WITHDRAWN, each paired with phrases from the measurement that
@@ -60,7 +75,7 @@ const LEDGER_IDS: [&str; 7] = [
 ///
 /// At least one phrase per row is a NUMBER the measurement moved, so a
 /// withdrawal written from memory rather than from the run fails.
-const WITHDRAWN: [(&str, &[&str]); 2] = [
+const WITHDRAWN: [(&str, &[&str]); 3] = [
     (
         "traceql-spanset-stacked-by-last-key-wins",
         &[
@@ -75,6 +90,17 @@ const WITHDRAWN: [(&str, &[&str]); 2] = [
             "by(name)=stringValue=alpha,count()=intValue=2",
             "`4`/`4`/`4` here and are now `3`/`3`/`1`",
             "by(name) | count() > 0 | by(status)",
+        ],
+    ),
+    // Issue #492 item 9. The phrases carry the two byte offsets that
+    // showed BOTH spellings were the same `400` — the sentence the row
+    // itself had wrong — and the answer both now give.
+    (
+        "traceql-midpipeline-spanset-filter-unsupported",
+        &[
+            "failed at **byte 39**",
+            "the grouping-first one at **byte 50**",
+            "`matched 2`, spans `02 04`",
         ],
     ),
 ];
@@ -465,7 +491,7 @@ fn the_api_section_states_the_measured_rules_and_not_the_retired_ones() {
 /// would pass on every row.
 #[test]
 fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
-    const OWNERS: [(&str, &str); 7] = [
+    const OWNERS: [(&str, &str); 8] = [
         (
             "traceql-spanset-aggregate-double-lexical-form",
             "crates/pulsus-read/src/traces/search_eval.rs",
@@ -491,8 +517,12 @@ fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
             "docs/reference-defects-we-do-not-copy.md",
         ),
         (
-            "traceql-midpipeline-spanset-filter-unsupported",
-            "crates/pulsus-traceql/src/parser.rs",
+            "traceql-midpipeline-spanset-operation-unsupported",
+            "crates/pulsus-read/src/traces/search_plan.rs",
+        ),
+        (
+            "traceql-select-before-midpipeline-filter-empty",
+            "crates/pulsus-read/src/traces/search_eval.rs",
         ),
     ];
     assert_eq!(

@@ -598,6 +598,18 @@ pub(crate) enum GroupKeyResolver {
 /// planning and has no other producer, so the two carriers cannot drift.
 #[derive(Debug, Clone)]
 pub(crate) enum SpansetStage {
+    /// A `{...}` stage written as a later pipeline element (issue #492
+    /// item 9): keeps each spanset's spans that satisfy `body` and drops
+    /// the spansets it empties. `filter_idx` indexes
+    /// [`SearchPlan::filters`], whose pipeline entries are appended AFTER
+    /// every selector entry, so `eval_spanset`'s pre-order walk over the
+    /// selector never reaches one.
+    ///
+    /// `body` is `None` for the match-all `{ }`, which keeps every span.
+    Filter {
+        filter_idx: usize,
+        body: Option<FieldExpr>,
+    },
     By(Vec<PlannedGroupKey>),
     Coalesce,
     /// An aggregate filter at its WRITTEN position (issue #492 item 2):
@@ -1590,26 +1602,110 @@ struct PlannedPipeline {
     group_by: Vec<Field>,
     /// Whether a `| coalesce()` stage is present (issue #185).
     coalesce: bool,
-    /// The ordered `by()` / `coalesce()` / aggregate stages with resolved
-    /// group keys (issue #193, widened by #492 item 2) — the pipeline's
-    /// source of truth.
+    /// The ordered `by()` / `coalesce()` / aggregate / `{...}` filter
+    /// stages with resolved group keys (issue #193, widened by #492
+    /// items 2 and 9) — the pipeline's source of truth.
     post_stages: Vec<SpansetStage>,
+    /// One compiled generator set per mid-pipeline `{...}` stage, in
+    /// written order (issue #492 item 9). Never lowered into SQL: the
+    /// sets feed only the phase-1 generator CHOICE in [`plan_search`],
+    /// which continues `filter::collect`'s `&&` fold across the pipe so
+    /// that `{A} | {B}` sends the statement `{A && B}` sends.
+    filter_generators: Vec<Vec<filter::LeafGenerator>>,
+}
+
+/// Every sink [`plan_pipeline`] writes into. The first eight are
+/// [`LeafPlanSink`]'s own fields, borrowed through because a mid-pipeline
+/// `{...}` filter plans its leaves through exactly the same
+/// [`plan_leaf_eval`] the selector's do — so a leaf it shares with the
+/// selector interns onto the same index and adds no phase-2 read. The
+/// last two are what a `{...}` stage additionally appends to.
+struct PipelineSinks<'a> {
+    probes: &'a mut Vec<AttrProbe>,
+    probe_predicates: &'a mut Vec<String>,
+    agg_fields: &'a mut Vec<AttrFieldRef>,
+    select_attrs: &'a mut Vec<AttrFieldRef>,
+    event_sets: &'a mut Vec<EventSetField>,
+    nested_set: &'a mut bool,
+    trace_ctx: &'a mut bool,
+    child_count: &'a mut bool,
+    filters: &'a mut Vec<PlannedFilter>,
+    projection_leaves: &'a mut Vec<Vec<Option<(Field, bool)>>>,
+}
+
+impl PipelineSinks<'_> {
+    /// The leaf sink, reborrowed for one `plan_leaf_eval` call.
+    fn leaf_sink(&mut self) -> LeafPlanSink<'_> {
+        LeafPlanSink {
+            probes: self.probes,
+            probe_predicates: self.probe_predicates,
+            agg_fields: self.agg_fields,
+            select_attrs: self.select_attrs,
+            event_sets: self.event_sets,
+            nested_set: self.nested_set,
+            trace_ctx: self.trace_ctx,
+            child_count: self.child_count,
+        }
+    }
 }
 
 fn plan_pipeline(
     query: &Query,
-    agg_fields: &mut Vec<AttrFieldRef>,
-    select_attrs: &mut Vec<AttrFieldRef>,
-    nested_set: &mut bool,
-    trace_ctx: &mut bool,
-    child_count: &mut bool,
+    sinks: &mut PipelineSinks<'_>,
 ) -> Result<PlannedPipeline, PlanError> {
     let mut select_fields = Vec::new();
     let mut group_by = Vec::new();
     let mut coalesce = false;
     let mut post_stages: Vec<SpansetStage> = Vec::new();
+    let mut filter_generators: Vec<Vec<filter::LeafGenerator>> = Vec::new();
     for stage in &query.pipeline {
         match stage {
+            // Issue #492 item 9: a `{...}` written as a later pipeline
+            // element. It is planned by the SAME `compile_span_filter` +
+            // `plan_leaf_eval` the selector's filters go through, into the
+            // SAME sinks, so it introduces no new read shape and no new
+            // renderer; it is never lowered into SQL.
+            //
+            // Only a single filter is executable. The reference's element
+            // is a full `spansetExpression`, so `| {a} && {b}` PARSES here
+            // (the parser must not answer a semantic question) and is a
+            // clean `400` naming the rendered expression — ledger row
+            // `traceql-midpipeline-spanset-operation-unsupported`.
+            PipelineStage::Filter(expr) => {
+                let SpansetExpr::Filter(spanset_filter) = expr else {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "{expr} is not executable as a pipeline stage: a `|` stage must be a \
+                         single {{ ... }} filter, not a cross-spanset or structural operation"
+                    )));
+                };
+                let compiled = filter::compile_span_filter(spanset_filter)?;
+                let mut leaves = Vec::with_capacity(compiled.leaves.len());
+                for leaf in &compiled.leaves {
+                    let mut sink = sinks.leaf_sink();
+                    leaves.push(plan_leaf_eval(&leaf.eval, &mut sink)?);
+                }
+                // Issue #479's projection inputs, collected in the same
+                // pre-order the leaves are — the reference projects a
+                // mid-pipeline condition's matched value on the spans it
+                // matched, exactly as a selector condition does.
+                let mut leaf_fields = Vec::with_capacity(leaves.len());
+                if let Some(body) = &spanset_filter.body {
+                    collect_projection_leaves(body, false, &mut leaf_fields);
+                }
+                debug_assert_eq!(
+                    leaf_fields.len(),
+                    leaves.len(),
+                    "the projection walk and filter::collect must push leaves in lockstep"
+                );
+                let filter_idx = sinks.filters.len();
+                sinks.projection_leaves.push(leaf_fields);
+                sinks.filters.push(PlannedFilter { leaves });
+                filter_generators.push(compiled.generators.clone());
+                post_stages.push(SpansetStage::Filter {
+                    filter_idx,
+                    body: spanset_filter.body.clone(),
+                });
+            }
             // Spanset-level grouping / coalesce (issue #185 parse, #193
             // response reshaping): `by(...)` grouping keys feed the #185
             // pre-flight cardinality probe (`group_by`) AND the #193
@@ -1646,11 +1742,11 @@ fn plan_pipeline(
                 group_by.push(field.clone());
                 let planned = plan_group_key(
                     field,
-                    agg_fields,
-                    select_attrs,
-                    nested_set,
-                    trace_ctx,
-                    child_count,
+                    sinks.agg_fields,
+                    sinks.select_attrs,
+                    sinks.nested_set,
+                    sinks.trace_ctx,
+                    sinks.child_count,
                 )?;
                 post_stages.push(SpansetStage::By(vec![planned]));
             }
@@ -1720,7 +1816,7 @@ fn plan_pipeline(
                         let field_ref = attr_field_ref(attr)
                             .expect("Field::Attribute always yields a field ref");
                         AggSource::Attr {
-                            field_idx: intern(agg_fields, &field_ref),
+                            field_idx: intern(sinks.agg_fields, &field_ref),
                         }
                     }
                     (_, Some(expr)) => {
@@ -1869,7 +1965,7 @@ fn plan_pipeline(
                             SelectField {
                                 field: field.clone(),
                                 value: ProjectionValue::SelectValue {
-                                    field_idx: intern(select_attrs, &field_ref),
+                                    field_idx: intern(sinks.select_attrs, &field_ref),
                                 },
                             }
                         }
@@ -1886,7 +1982,7 @@ fn plan_pipeline(
         .iter()
         .filter_map(|s| match s {
             SpansetStage::Aggregate(a) => Some(a.clone()),
-            SpansetStage::By(_) | SpansetStage::Coalesce => None,
+            SpansetStage::By(_) | SpansetStage::Coalesce | SpansetStage::Filter { .. } => None,
         })
         .collect();
     Ok(PlannedPipeline {
@@ -1895,6 +1991,7 @@ fn plan_pipeline(
         group_by,
         coalesce,
         post_stages,
+        filter_generators,
     })
 }
 
@@ -2644,6 +2741,44 @@ fn service_generator_exactness(
     Ok(())
 }
 
+/// Renders a chosen generator set into the deduped phase-1 statement
+/// list plus the index-aligned `(source, generator)` pairs the compile
+/// core keys the seed predicate on (issue #492 part 3).
+///
+/// The dedup rule is **by rendered SQL, first appearance kept** — the
+/// rule this list has always carried, moved into a function by issue
+/// #492 item 9 so that it is applied ONCE, after the generator choice,
+/// rather than while the selector's filters are still being walked.
+/// `having` is always `None` here: the pipeline has not been folded yet,
+/// so no aggregate can have compiled into a statement. When one does,
+/// [`plan_search`] re-renders the single generator below.
+fn render_generators(
+    gens: &[filter::LeafGenerator],
+    window: TimeWindow,
+    ctx: &SearchCtx<'_>,
+) -> (Vec<String>, Vec<(SourceRef, filter::LeafGenerator)>) {
+    let mut sqls: Vec<String> = Vec::new();
+    let mut generators: Vec<(SourceRef, filter::LeafGenerator)> = Vec::new();
+    for generator in gens {
+        let sql = search_sql::generator_sql(
+            generator,
+            window,
+            ctx.filter.spans_table,
+            ctx.filter.attrs_table,
+            ctx.max_candidates,
+            None,
+        );
+        if !sqls.contains(&sql) {
+            sqls.push(sql);
+            generators.push((
+                super::compile::generator_source(generator.table),
+                generator.clone(),
+            ));
+        }
+    }
+    (sqls, generators)
+}
+
 pub fn plan_search(
     query: &Query,
     params: &SearchParams,
@@ -2660,11 +2795,11 @@ pub fn plan_search(
     let mut probes: Vec<AttrProbe> = Vec::new();
     let mut probe_predicates: Vec<String> = Vec::new();
     let mut filters = Vec::new();
-    let mut generator_sqls: Vec<String> = Vec::new();
-    // Issue #492 part 3: the generators themselves, index-aligned with
-    // the deduped `generator_sqls`, so the compile core can key the seed
-    // predicate's branches on the table each statement reads.
-    let mut generators: Vec<(SourceRef, filter::LeafGenerator)> = Vec::new();
+    // Issue #492 item 9: the SELECTOR's generator sets, accumulated
+    // unrendered. Rendering moved below the pipeline, because a
+    // mid-pipeline `{...}` stage gets a say in WHICH generator statement
+    // phase 1 sends (it never becomes SQL itself).
+    let mut selector_gens: Vec<filter::LeafGenerator> = Vec::new();
     let mut nested_set = false;
     let mut trace_ctx = false;
     let mut child_count = false;
@@ -2711,39 +2846,60 @@ pub fn plan_search(
         // Cross-spanset `{A} op {B}` candidates are the superset union of
         // both operands' generators for BOTH `&&` and `||` (plan v3 —
         // exactness lives in Phase 2, never a lossy trace-id reduction).
-        for generator in &compiled.generators {
-            let sql = search_sql::generator_sql(
-                generator,
-                window,
-                ctx.filter.spans_table,
-                ctx.filter.attrs_table,
-                ctx.max_candidates,
-                // The pipeline has not been folded yet, so no aggregate
-                // can have compiled into this statement. When one does,
-                // the single generator is re-rendered below.
-                None,
-            );
-            if !generator_sqls.contains(&sql) {
-                generator_sqls.push(sql);
-                generators.push((
-                    super::compile::generator_source(generator.table),
-                    generator.clone(),
-                ));
-            }
-        }
+        selector_gens.extend(compiled.generators.iter().cloned());
     }
 
     // `plan_pipeline` may force additional co-loads (issue #193): a `by()`
     // key over a nested-set / trace-level / child-count intrinsic needs the
     // same co-load its filter form does, even with no such filter leaf.
-    let pipeline = plan_pipeline(
-        query,
-        &mut agg_fields,
-        &mut select_attrs,
-        &mut nested_set,
-        &mut trace_ctx,
-        &mut child_count,
-    )?;
+    let pipeline = {
+        let mut sinks = PipelineSinks {
+            probes: &mut probes,
+            probe_predicates: &mut probe_predicates,
+            agg_fields: &mut agg_fields,
+            select_attrs: &mut select_attrs,
+            event_sets: &mut event_sets,
+            nested_set: &mut nested_set,
+            trace_ctx: &mut trace_ctx,
+            child_count: &mut child_count,
+            filters: &mut filters,
+            projection_leaves: &mut projection_leaves,
+        };
+        plan_pipeline(query, &mut sinks)?
+    };
+
+    // Issue #492 item 9: WHICH generator statement phase 1 sends.
+    //
+    // The rule is `filter::collect`'s own `&&` fold (`filter.rs`, the
+    // `FieldOp::Bool(BoolOp::And)` arm) continued across the pipe, in
+    // written order, with ties kept on the selector — one function scores
+    // both, so the two spellings cannot drift apart. Without it,
+    // `{svc} | { .tag = "x" }` would send the SERVICE statement while
+    // `{svc && .tag = "x"}` sends the attribute-index one; two spellings
+    // the reference answers identically would then return different
+    // traces under `reader.traceql_max_candidates`.
+    //
+    // Both sets are independently COMPLETE candidate sources: no pipeline
+    // stage adds a span (`By` sub-divides, `Coalesce` merges, an
+    // aggregate drops whole spansets, `Select` is the identity, and a
+    // `{...}` stage only removes), so every span in the answer satisfies
+    // every `{...}` stage, and `compile_span_filter` guarantees each set
+    // is a superset of its own filter's matches. Choosing the
+    // better-scoring one is therefore sound. **A fifth `SpansetStage`
+    // that ADDED spans would falsify this; nothing in the type system
+    // prevents one, so re-read this comment before adding a stage.**
+    //
+    // The choice REPLACES the selector's set; it never unions with it, so
+    // exactly one statement is sent, as before. With no `{...}` stage the
+    // fold is empty and `chosen == selector_gens`, which is why no query
+    // without one moves a byte.
+    let mut chosen = selector_gens;
+    for gens in &pipeline.filter_generators {
+        if filter::gen_set_score(gens) < filter::gen_set_score(&chosen) {
+            chosen = gens.clone();
+        }
+    }
+    let (mut generator_sqls, generators) = render_generators(&chosen, window, ctx);
     // Issue #479 — the matched-span projection groups. Built AFTER the
     // filters (whose leaves supply the gates) and AFTER `plan_pipeline`
     // (whose `select()` fields fold into the same groups), in
@@ -2810,7 +2966,22 @@ pub fn plan_search(
     // other by-key / composite-spanset forms still return 200 (parse-
     // supported, bounded by the search limit / scan budget — the full
     // value/response reshaping is #193).
+    //
+    // Issue #492 item 9: the probe counts distinct groups over the
+    // SELECTOR's spans. A `{...}` stage removes spans before the `by()`
+    // sees them, so with one in the pipeline the probe would count groups
+    // the query never produces and could answer `422 query_too_broad` for
+    // a query that is under the cap. It is suppressed for that shape; the
+    // in-engine distinct-group backstop in `by_stage` still enforces
+    // `reader.traceql_max_series`, so the cap is not weakened — only the
+    // false rejection is removed.
     let by_probe_sql = by_probe_column(&pipeline.group_by)
+        .filter(|_| {
+            !query
+                .pipeline
+                .iter()
+                .any(|s| matches!(s, PipelineStage::Filter(_)))
+        })
         .and_then(|col| single_filter_body(&query.spanset).map(|body| (col, body)))
         .map(|(col, body)| {
             super::metrics_sql::search_by_probe_sql(
@@ -3047,6 +3218,169 @@ mod tests {
 
     fn plan(q: &str) -> SearchPlan {
         plan_search(&parse(q).expect("parse"), &PARAMS, &ctx()).expect("plan")
+    }
+
+    // ---- issue #492 item 9: the mid-pipeline `{...}` stage ------------
+
+    /// Criterion 3: `{A} | {B}` sends the statement `{A && B}` sends, for
+    /// three pairs chosen so the winner is a different operand each time.
+    ///
+    /// The assertion is on the STATEMENT, not on an answer, because that
+    /// is the property that makes the two spellings agree at EVERY
+    /// candidate cap rather than at the one a fixture happens to use.
+    /// Phase 1 is `ORDER BY bound_ts DESC LIMIT gen_cap + 1`, so two
+    /// spellings can only diverge once the chosen generator returns more
+    /// than `reader.traceql_max_candidates` traces.
+    ///
+    /// Pair 3's `&&` side is the bare `{ .tag = "x" }`: `{}` matches every
+    /// span, so `{} | { .tag = "x" }` is the same query, and there is no
+    /// `{ && ... }` spelling to write.
+    ///
+    /// *RED when:* the fold over `PlannedPipeline::filter_generators` is
+    /// dropped and the selector's set is always kept — pairs 2 and 3 then
+    /// render the service / time-range statement against the attribute
+    /// one.
+    #[test]
+    fn a_pipeline_filter_sends_the_statement_its_conjunction_spelling_sends() {
+        for (piped, conjoined, winner) in [
+            (
+                r#"{ resource.service.name = "x" } | { name = "b" }"#,
+                r#"{ resource.service.name = "x" && name = "b" }"#,
+                "the selector wins (ServiceEq beats SpanScan)",
+            ),
+            (
+                r#"{ resource.service.name = "x" } | { .tag = "x" }"#,
+                r#"{ resource.service.name = "x" && .tag = "x" }"#,
+                "the pipeline filter wins (AttrEq beats ServiceEq)",
+            ),
+            (
+                r#"{} | { .tag = "x" }"#,
+                r#"{ .tag = "x" }"#,
+                "the pipeline filter wins (AttrEq beats TimeRange)",
+            ),
+        ] {
+            let a = plan(piped);
+            let b = plan(conjoined);
+            assert_eq!(
+                a.generator_sqls, b.generator_sqls,
+                "{piped} and {conjoined} must send the same phase-1 statement — {winner}"
+            );
+        }
+    }
+
+    /// Criterion 3, the other half: the fold is over the PIPELINE's
+    /// filters, so the three pairs above cannot all pass by the selector
+    /// always winning. Named separately because the equality above is
+    /// symmetric and would hold if BOTH sides were wrong the same way.
+    ///
+    /// *RED when:* the choice stops selecting the pipeline filter's set —
+    /// the piped statement then reads `trace_spans`, not
+    /// `trace_attrs_idx`.
+    #[test]
+    fn the_pipeline_filter_can_win_the_generator_choice() {
+        let selector_wins = plan(r#"{ resource.service.name = "x" } | { name = "b" }"#);
+        assert_eq!(selector_wins.generator_sqls.len(), 1);
+        assert!(
+            selector_wins.generator_sqls[0].contains("service = 'x'"),
+            "the selector's service generator must win: {:?}",
+            selector_wins.generator_sqls
+        );
+        let filter_wins = plan(r#"{ resource.service.name = "x" } | { .tag = "x" }"#);
+        assert_eq!(filter_wins.generator_sqls.len(), 1);
+        assert!(
+            filter_wins.generator_sqls[0].contains("key = 'tag'"),
+            "the pipeline filter's attribute generator must win: {:?}",
+            filter_wins.generator_sqls
+        );
+    }
+
+    /// Criterion 12: no false `422`. The `by()` cardinality pre-flight
+    /// probe counts distinct groups over the SELECTOR's spans, so a
+    /// `{...}` stage that removes spans before the `by()` would make it
+    /// count groups the query never produces. It is suppressed for that
+    /// shape; the control shows the probe is otherwise built, so the
+    /// assertion is about the stage and not about the probe never
+    /// existing.
+    ///
+    /// The cap itself is untouched: `by_stage`'s in-engine distinct-group
+    /// backstop still enforces `reader.traceql_max_series`.
+    ///
+    /// *RED when:* the suppression condition is dropped — the first
+    /// assertion then sees `Some`.
+    #[test]
+    fn a_pipeline_filter_suppresses_the_by_cardinality_preflight_probe() {
+        let with_filter =
+            plan(r#"{ resource.service.name = "x" } | { name = "b" } | by(resource.service.name)"#);
+        assert!(
+            with_filter.by_probe_sql().is_none(),
+            "a `{{...}}` stage before the by() must suppress the pre-flight probe, got {:?}",
+            with_filter.by_probe_sql()
+        );
+        let control = plan(r#"{ resource.service.name = "x" } | by(resource.service.name)"#);
+        assert!(
+            control.by_probe_sql().is_some(),
+            "the same query without the `{{...}}` stage must still build the probe"
+        );
+    }
+
+    /// Criterion 13: the aggregate `HAVING` pushdown stands down when a
+    /// `{...}` stage is present.
+    ///
+    /// `generator_exactness` requires `filters` to be exactly one filter
+    /// with one leaf; a mid-pipeline filter appends a second
+    /// `PlannedFilter`, so the query returns `NotOneLeaf` and nothing is
+    /// pushed. Conservative on purpose: a pushed `HAVING` counts generator
+    /// rows, and with the filter unapplied in SQL those rows are not the
+    /// spanset the aggregate is over.
+    ///
+    /// *RED when:* pipeline filters are excluded from `filters` — the
+    /// first assertion then sees `Ok`.
+    #[test]
+    fn a_pipeline_filter_stands_the_aggregate_pushdown_down() {
+        let with_filter = plan(r#"{ resource.service.name = "x" } | { name = "b" } | count() > 2"#);
+        assert_eq!(
+            with_filter.generator_exact(),
+            Err(NotExact::NotOneLeaf),
+            "a `{{...}}` stage adds a second planned filter, so the plan is not exact"
+        );
+        assert!(
+            with_filter.pushed_having().is_none(),
+            "nothing may be pushed for a query the evaluator will filter again, got {:?}",
+            with_filter.pushed_having()
+        );
+        let control = plan(r#"{ resource.service.name = "x" } | count() > 2"#);
+        assert!(
+            control.generator_exact().is_ok(),
+            "the same query without the `{{...}}` stage must still be exact"
+        );
+        assert!(
+            control.pushed_having().is_some(),
+            "…and must still push its HAVING"
+        );
+    }
+
+    /// Criterion 14: a mid-pipeline spanset OPERATION parses and is a
+    /// clean `400` naming the rendered expression.
+    ///
+    /// The parser must not answer this semantic question — the
+    /// reference's pipeline element is a full spanset expression, so
+    /// `| {a} && {b}` parses there and parses here — and the planner must
+    /// not answer it silently either. The body is asserted in full because
+    /// it is what the ledger row
+    /// `traceql-midpipeline-spanset-operation-unsupported` quotes.
+    ///
+    /// *RED when:* the arm accepts the operation and plans only its left
+    /// operand.
+    #[test]
+    fn a_mid_pipeline_spanset_operation_is_a_clean_400() {
+        let q = parse(r#"{ .a = 1 } | { .b = 2 } && { .c = 3 }"#).expect("it must PARSE");
+        let err = plan_search(&q, &PARAMS, &ctx()).expect_err("…and be refused at plan time");
+        assert_eq!(
+            err.to_string(),
+            "type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: \
+             a `|` stage must be a single { ... } filter, not a cross-spanset or structural \
+             operation"
+        );
     }
 
     /// Issue #492 part 3: **the PLANNER supplies the phase-2 batch as the
@@ -3959,7 +4293,7 @@ mod tests {
             .iter()
             .filter_map(|s| match s {
                 SpansetStage::Aggregate(a) => Some(format!("{a:?}")),
-                SpansetStage::By(_) | SpansetStage::Coalesce => None,
+                SpansetStage::By(_) | SpansetStage::Coalesce | SpansetStage::Filter { .. } => None,
             })
             .collect();
         let derived: Vec<String> = p.aggregates.iter().map(|a| format!("{a:?}")).collect();

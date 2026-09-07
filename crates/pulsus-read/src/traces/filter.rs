@@ -2508,7 +2508,15 @@ fn compile_comparison(
 
 /// Static score for a generator set: (worst class present, set size).
 /// Lower is better; ties keep the lhs.
-fn gen_set_score(set: &[LeafGenerator]) -> (GenClass, usize) {
+///
+/// **One function, two callers, and that is the contract.** The `&&` arm
+/// of [`collect`] uses it to pick a conjunction's generator, and issue
+/// #492 item 9's pipeline fold in
+/// [`crate::traces::search_plan::plan_search`] continues that same fold
+/// across a `|`. Splitting it would let `{A} | {B}` and `{A && B}` choose
+/// different statements, which is exactly the divergence item 9 exists to
+/// remove.
+pub(crate) fn gen_set_score(set: &[LeafGenerator]) -> (GenClass, usize) {
     let worst = set
         .iter()
         .map(|g| g.class)

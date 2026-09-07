@@ -2991,6 +2991,66 @@ fn coalesce_stage<'a>(
     ))
 }
 
+/// One `| { ... }` stage (issue #492 item 9): keeps, in EACH spanset, the
+/// spans that satisfy `body`, and drops the spansets it empties.
+///
+/// **In place, and it allocates nothing.** The retain is a
+/// `swap`/`truncate` compaction — the same shape the `Aggregate` arm uses
+/// — so no per-spanset `Vec` is built and no byte is charged. Dropped
+/// spans and dropped spansets stay charged until the caller releases the
+/// list wholesale, which is that arm's stated convention: charged once,
+/// released once.
+///
+/// `attributes` and `key` carry forward untouched. A `count()` attribute
+/// written before this stage survives it, and a `by()` key written before
+/// it still partitions what follows — measured against the reference,
+/// whose own merge of a filter element clones the span set and preserves
+/// both.
+///
+/// `body: None` is the match-all `{ }`, which keeps every span; the
+/// `debug_assert_eq!` is [`eval_filter`]'s, for the same reason — the
+/// planner's leaf walk and `eval_expr`'s pair by pre-order POSITION and a
+/// mismatch is otherwise silent.
+fn filter_stage<'a>(
+    body: Option<&FieldExpr>,
+    filter: &PlannedFilter,
+    sets: &mut Vec<PipelineSpanset<'a>>,
+    env: &EvalEnv<'_>,
+) -> Result<(), ReadError> {
+    let mut write = 0usize;
+    for read in 0..sets.len() {
+        let mut keep = 0usize;
+        for member in 0..sets[read].spans.len() {
+            let span = sets[read].spans[member];
+            let is_match = match body {
+                None => true,
+                Some(expr) => {
+                    let mut leaf_idx = 0;
+                    let matched = eval_expr(expr, filter, &mut leaf_idx, span, env)?;
+                    debug_assert_eq!(
+                        leaf_idx,
+                        filter.leaves.len(),
+                        "leaf/eval walk desynchronised for {expr}"
+                    );
+                    matched
+                }
+            };
+            if is_match {
+                sets[read].spans.swap(keep, member);
+                keep += 1;
+            }
+        }
+        sets[read].spans.truncate(keep);
+        if keep == 0 {
+            continue;
+        }
+        sets.swap(write, read);
+        write += 1;
+    }
+    sets.truncate(write);
+    Ok(())
+}
+
 /// Folds one trace's matched spans through the query's ordered pipeline
 /// (issue #492 item 2) and returns the surviving spansets; an EMPTY vector
 /// means the trace does not match and is dropped, which is how
@@ -3035,6 +3095,15 @@ fn run_pipeline<'a>(
                 sets = out;
                 budget.release(live);
                 live = out_live;
+            }
+            // Issue #492 item 9: filters IN PLACE and allocates nothing.
+            // A spanset it empties is dropped, and an empty list ends the
+            // trace at the bottom of this loop — which is how
+            // `{A} | {B} | {C}` returns no trace when nothing satisfies
+            // all three. `live` is unchanged: the dropped bytes stay
+            // charged until the caller releases the fold's total.
+            SpansetStage::Filter { filter_idx, body } => {
+                filter_stage(body.as_ref(), &plan.filters[*filter_idx], &mut sets, env)?;
             }
             SpansetStage::Aggregate(agg) => {
                 // Filters the list IN PLACE: the survivors keep the charge
@@ -5949,6 +6018,198 @@ mod tests {
                 GroupValue::Str("1.5s".to_string())
             )
         );
+    }
+
+    // ---- issue #492 item 9: the mid-pipeline `{...}` stage ------------
+
+    /// The item-9 corpus, hermetic: one trace, four spans under service
+    /// `grp492`, named `a b a b` — the same shape the live differential
+    /// pushes into both systems, so the two halves of criteria 1 and 2
+    /// are about the same data.
+    fn item9_trace() -> TraceSpans {
+        TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "grp492", "a", 10, 10_000_000),
+                span(2, "grp492", "b", 20, 20_000_000),
+                span(3, "grp492", "a", 30, 30_000_000),
+                span(4, "grp492", "b", 40, 40_000_000),
+            ],
+        }
+    }
+
+    /// One surviving spanset, reduced to what these tests compare:
+    /// its `attributes` rendered `key=value` in the pipeline's own
+    /// written order, its `matched` total, and its member span ids.
+    type Item9Shape = (Vec<String>, u32, Vec<u8>);
+
+    /// Every surviving spanset of a one-trace answer, or `None` when the
+    /// trace was dropped.
+    fn item9_shapes(matches: &[TraceMatch]) -> Option<Vec<Item9Shape>> {
+        let m = matches.first()?;
+        let ids = |spans: &[SpanSummary]| spans.iter().map(|s| s.span_id[7]).collect::<Vec<u8>>();
+        Some(match &m.groups {
+            Some(groups) => groups
+                .iter()
+                .map(|g| {
+                    (
+                        g.attributes
+                            .iter()
+                            .map(|(k, v)| format!("{k}={}", typed_token(v)))
+                            .collect(),
+                        g.matched,
+                        ids(&g.spans),
+                    )
+                })
+                .collect(),
+            None => vec![(Vec::new(), m.matched, ids(&m.spans))],
+        })
+    }
+
+    /// Criterion 1, the hermetic half: both spellings of the item-9 query
+    /// answer one spanset keyed `by(name) = "b"` over the two `b` spans.
+    ///
+    /// This runs with no environment variable set, and it drives the
+    /// evaluator itself. Its live twin —
+    /// `tests/traces_search_grouping_differential.rs`, fixtures
+    /// `midpipe_filter_then_by` and `midpipe_by_then_filter` — compares
+    /// the same two queries against the reference. Neither replaces the
+    /// other: this one says the evaluator computes the answer, that one
+    /// says the answer is the reference's.
+    ///
+    /// *RED when:* `filter_stage` keeps every span — both spellings then
+    /// answer TWO spansets, `by(name)="a"` over `01,03` as well.
+    #[test]
+    fn both_spellings_of_a_mid_pipeline_filter_answer_the_same_one_spanset() {
+        for q in [
+            r#"{ resource.service.name = "grp492" } | { name = "b" } | by(name)"#,
+            r#"{ resource.service.name = "grp492" } | by(name) | { name = "b" }"#,
+        ] {
+            let p = plan(q);
+            let matches = eval(&p, &[item9_trace()], &membership(&p, &[]));
+            assert_eq!(
+                item9_shapes(&matches),
+                Some(vec![(
+                    vec!["by(name)=stringValue=b".to_string()],
+                    2,
+                    vec![2, 4]
+                )]),
+                "{q}"
+            );
+        }
+    }
+
+    /// Criterion 2: the stage acts at its WRITTEN position, and the pair
+    /// below is what discriminates. `| {name="b"} | count() > 1` counts
+    /// the TWO spans the filter left; `| count() > 1 | {name="b"}` counts
+    /// all FOUR and then filters. The `> 3` pair is the sharper half: one
+    /// spelling drops the trace entirely and the other answers.
+    ///
+    /// *RED when:* `SpansetStage::Filter` is pushed at the end of
+    /// `post_stages` instead of at its written position — rows 1 and 3
+    /// then answer what rows 2 and 4 answer.
+    #[test]
+    fn a_mid_pipeline_filter_acts_at_its_written_position() {
+        for (q, want) in [
+            (
+                r#"{ resource.service.name = "grp492" } | { name = "b" } | count() > 1"#,
+                Some(vec![(
+                    vec!["count()=intValue=2".to_string()],
+                    2,
+                    vec![2, 4],
+                )]),
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | count() > 1 | { name = "b" }"#,
+                Some(vec![(
+                    vec!["count()=intValue=4".to_string()],
+                    2,
+                    vec![2, 4],
+                )]),
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | { name = "b" } | count() > 3"#,
+                None,
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | count() > 3 | { name = "b" }"#,
+                Some(vec![(
+                    vec!["count()=intValue=4".to_string()],
+                    2,
+                    vec![2, 4],
+                )]),
+            ),
+        ] {
+            let p = plan(q);
+            let matches = eval(&p, &[item9_trace()], &membership(&p, &[]));
+            assert_eq!(item9_shapes(&matches), want, "{q}");
+        }
+    }
+
+    /// The awkward shapes of item 9, each answered by the evaluator: the
+    /// match-all `{ }` keeps everything, a parenthesised element is the
+    /// same as the bare one, two filters compose, one that matches
+    /// nothing drops the trace, and `coalesce()` still merges what
+    /// survives.
+    ///
+    /// *RED when:* `filter_stage` stops filtering (rows 4 and 5 then
+    /// answer), or stops carrying `attributes`/`key` forward (row 7 loses
+    /// its `by(name)` attribute).
+    #[test]
+    fn the_mid_pipeline_filter_composes_with_every_neighbouring_stage() {
+        for (q, want) in [
+            (
+                r#"{ resource.service.name = "grp492" } | { }"#,
+                Some(vec![(Vec::new(), 4, vec![1, 2, 3])]),
+            ),
+            (
+                r#"{} | { name = "b" }"#,
+                Some(vec![(Vec::new(), 2, vec![2, 4])]),
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | ({ name = "b" })"#,
+                Some(vec![(Vec::new(), 2, vec![2, 4])]),
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | { name = "b" } | { name = "a" }"#,
+                None,
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | { name = "zzz" }"#,
+                None,
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | { name != "b" }"#,
+                Some(vec![(Vec::new(), 2, vec![1, 3])]),
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | by(name) | { name = "b" } | coalesce()"#,
+                Some(vec![(Vec::new(), 2, vec![2, 4])]),
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | coalesce() | { name = "b" }"#,
+                Some(vec![(Vec::new(), 2, vec![2, 4])]),
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | { duration > 15ms }"#,
+                Some(vec![(Vec::new(), 3, vec![2, 3, 4])]),
+            ),
+            (
+                r#"{ resource.service.name = "grp492" } | { name = "b" } | by(name) | { name = "a" }"#,
+                None,
+            ),
+            // The reference answers this one with NO TRACES — ledger row
+            // `traceql-select-before-midpipeline-filter-empty`. We answer
+            // the filtered result, and this pins that we do.
+            (
+                r#"{ resource.service.name = "grp492" } | select(.tag) | { name = "b" }"#,
+                Some(vec![(Vec::new(), 2, vec![2, 4])]),
+            ),
+        ] {
+            let p = plan(q);
+            let matches = eval(&p, &[item9_trace()], &membership(&p, &[]));
+            assert_eq!(item9_shapes(&matches), want, "{q}");
+        }
     }
 
     /// Issue #193 (no silent subset): the nested-set intrinsics are

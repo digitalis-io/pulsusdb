@@ -1144,7 +1144,7 @@ on every run.
 
 **Enumerated from the AST, not from this design's needs.** `PipelineStage`
 ([`crates/pulsus-traceql/src/ast.rs`](../crates/pulsus-traceql/src/ast.rs), line 981) has exactly
-**seven** variants; all seven are below, together with `Source` and the three synthesised links of
+**eight** variants; all eight are below, together with `Source` and the three synthesised links of
 §2.1. Every row states the **residual state effect** — what the link applies to the accumulated
 `Relation` when it does *not* lower (§2.5) — because a link with no stated effect is a link whose
 blocking behaviour the reader has to infer.
@@ -1183,6 +1183,7 @@ cannot be reached by any request:
 | `By` | a span-event / span-link intrinsic key (`:1435`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
 | `Select` | a nested-set intrinsic (`:1277`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
 | `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:1322`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
+| `Filter` | a mid-pipeline spanset OPERATION rather than a single filter | `type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a ``|`` stage must be a single { ... } filter, not a cross-spanset or structural operation` | **yes** — `{ .a = 1 } \| { .b = 2 } && { .c = 3 }`. The reference's pipeline element is a full spanset expression, so the parser accepts it and the planner decides |
 
 `Coalesce` is zero-arity and has no payload to reject. `Metric`, `MetricSecondStage` and `Compare`
 are rejected whole rather than by payload and are already "not in the chain" below.
@@ -1209,6 +1210,7 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | `Coalesce` (`ast.rs:1026`), after a `By` | `Groups` → `Spans` | the level carries no `HAVING` — then the grouping slot is FREED. With a `HAVING` it refuses: the aggregate selected groups, and the spans it selected are not recoverable | **shape unchanged** — `Groups` in the ordinary case, but `Spans` if the preceding `By` was itself residual; clears `exact` when it refuses | conditional | *none* |
 | `Coalesce`, with no preceding `By` | `Spans` → `Spans` | none — the identity | none | **always lowers**, contributing no SQL | *none* |
 | `Select { fields }` (`ast.rs:1002`) | any → same shape, wider `cols` | every field resolves in `cols`. **No exactness precondition** — projecting a column onto rows the evaluator will drop is harmless | `cols` unchanged; the fields become an evaluator-owned projection | conditional on resolution, **over the accepted payload set only** | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4 |
+| `Filter(SpansetExpr)` (issue #492 item 9) | `Spans` → `Spans` | **never lowers** (`No(NotYetLowered)`) — and the reason is soundness, not unfinished work. Pushing the filter as a `WHERE` conjunct is WRONG whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span is supplied by the RIGHT operand, so `val = 'y'` ANDed onto the left leaf's `trace_attrs_idx` generator matches nothing and the trace is dropped. It would also favour one spelling over the identical `{A && B}`, which does not push its second leaf | **shape unchanged**; **clears `exact`** — the evaluator will drop spans, and traces, that the SQL returned | never lowers | *none*. It does decide WHICH generator statement phase 1 sends — `filter::collect`'s `&&` fold continued across the pipe, so `{A} \| {B}` sends the statement `{A && B}` sends — but that is a choice among statements the query already implies, not a fragment added to one |
 | `Metric(MetricStage)` (`ast.rs:1033`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:1228`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:90`) | n/a |
 | `MetricSecondStage(SecondStage)` (`ast.rs:1037`) | — | `400` on search (`search_plan.rs:1235`) | n/a | not in the chain | n/a |
 | `Compare { .. }` (`ast.rs:1049`) | — | `400` on search (`search_plan.rs:1241`) | n/a | not in the chain | n/a |
@@ -3801,15 +3803,23 @@ can be checked against an artefact either — including "under-checked" just abo
 about the earlier `Drop`/`Keep` revision below.
 
 **Every link with a stated residual state effect gets a row.** Counted off the document's own
-tables: **7** in §3.1 (`Aggregate`, `By`, grouped `Coalesce`, `Select`, `Order`, `Limit`, `Emit`)
-and **20** in §7.1 — 13 `Pipe` rows (`LineFilter`, the four `Parser` forms, `LabelFilter`,
+tables: **8** in §3.1 (`Aggregate`, `By`, grouped `Coalesce`, `Select`, `Filter`, `Order`, `Limit`,
+`Emit`) and **20** in §7.1 — 13 `Pipe` rows (`LineFilter`, the four `Parser` forms, `LabelFilter`,
 `LineFormat`, `LabelFormat`, `Unwrap`, `Unpack`, `Decolorize`, `Drop`, `Keep`) and 7 synthesised
-(`Window`, `RangeAgg`, `VectorAgg`, `LabelReplace`, `Order`, `Limit`, `Emit`) — **27 effects in
+(`Window`, `RangeAgg`, `VectorAgg`, `LabelReplace`, `Order`, `Limit`, `Emit`) — **28 effects in
 all**. The two chain links whose stated effect is *none* — `Source`, and `Coalesce` with no
 preceding `By`, both §3.1 — are to get a row too, asserting the effect **is** the identity, so the
 exemption is itself a check rather than a silence. So `logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states` is specified to
-carry **20** rows and `traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states` **9**
+carry **20** rows and `traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states` **10**
 — in **wave 1**, which writes both; neither exists at base.
+
+The TraceQL count above is this section's own derivation from §3.1 and is **not** the shipped
+test's row count. That test exists and carries **21** rows: the ten derived here plus the eleven
+per-batch read and engine links issue #492 part 3 added (`Hydrate`, the four indexed phase-2 reads,
+the two trace-wide co-loads, `Structural`, `NestedSet`, `BoolTruth`), which §3.1's table does not
+enumerate. The shipped row count is gated —
+`assert_every_residual_state_effect::<Tql>(&rows, 21)` in
+`crates/pulsus-read/src/traces/compile.rs` — while the derivation above is prose and is not.
 
 The five other cells reading `n/a` or `none` belong to rows the tables mark **not in the chain** —
 §3.1's `Metric`, `MetricSecondStage` and `Compare`, and §7.1's `MetricExpr::Literal`/`VectorFn` and

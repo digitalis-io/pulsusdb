@@ -616,6 +616,13 @@ fn validate_stage(stage: &PipelineStage) -> Result<(), ValidateError> {
                 &format!("{stage}"),
             )
         }
+        // Issue #492 item 9: a `{...}` pipeline element gets the ORDINARY
+        // field-expression rules, the same ones the leading spanset gets.
+        // Measured against the pinned reference: `| { 1 }`, `| { !1 }`,
+        // `| { name = 1 }` and `| { .a = nil && 1 }` produce the same four
+        // messages there that `validate_filter` / `validate_field_expr`
+        // already produce here.
+        PipelineStage::Filter(expr) => validate_spanset(expr),
         PipelineStage::Select { .. } | PipelineStage::By { .. } | PipelineStage::Coalesce => Ok(()),
         PipelineStage::Metric(metric) => validate_metric_stage(metric),
         PipelineStage::MetricSecondStage(second) => match second {
