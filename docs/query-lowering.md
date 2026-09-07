@@ -2074,6 +2074,45 @@ rendered search settings contain the substring `max_block_size` and the substrin
 independent substring checks, not bound to each other, so it would not catch a different value
 arriving beside a stray `4096`.
 
+**A fourth trap, and it is inside the method the third one invites.** The obvious way to establish
+the block size a figure was taken at is to read it back out of the query log. That method is blind
+in exactly one direction. `system.query_log` records only the settings a statement **changed**, so
+`Settings['max_block_size']` is **empty** for a statement submitted at 65,409 — and equally empty
+for a statement that sent no block size at all. Reading the log therefore cannot tell *"65,409 was
+sent"* from *"nothing was sent"*, which is the very pair the third trap turns on. Measured on
+ClickHouse 26.3.29.7, one statement per case:
+
+```
+$ curl -sS "$B?query_id=blk_4096&max_block_size=4096"   --data-binary "SELECT count() FROM numbers(100000)"
+$ curl -sS "$B?query_id=blk_65409&max_block_size=65409" --data-binary "SELECT count() FROM numbers(100000)"
+$ curl -sS "$B?query_id=blk_absent"                     --data-binary "SELECT count() FROM numbers(100000)"
+$ curl -sS "$B" --data-binary "SYSTEM FLUSH LOGS"
+$ curl -sS "$B" --data-binary "SELECT query_id, Settings['max_block_size'] AS logged,
+    has(mapKeys(Settings),'max_block_size') AS present FROM system.query_log
+    WHERE query_id LIKE 'blk_%' AND type = 'QueryFinish' ORDER BY query_id FORMAT TSVWithNames"
+
+query_id      logged  present
+blk_4096      4096    1
+blk_65409             0
+blk_absent            0
+```
+
+The submitted value is not hiding in another column either: `SELECT * FROM system.query_log WHERE
+query_id = 'blk_65409' AND type = 'QueryFinish' FORMAT Vertical` matches `65409` on `query_id` and
+`initial_query_id` and on nothing else, and those two carry it only because the id was named after
+the setting.
+
+**So the instrument is established from what was submitted, and the query log confirms only the
+non-default case.** Pair each `query_id` with the `max_block_size` the statement was sent with —
+the URL parameter, or the constant the reader binary sends — and use `Settings['max_block_size']`
+as a *confirmation* where the value is non-default. Every 4,096 figure in §9.7 is confirmed that
+way, and it is a real confirmation: 4,096 is not the default, so an empty cell there would mean the
+setting never arrived. Nothing at 65,409 can be confirmed that way; the curve above is established
+from the parameter each statement was sent with, alongside `SELECT value, default FROM
+system.settings WHERE name = 'max_block_size'`, which prints `65409 65409`. **An empty
+`Settings['max_block_size']` is not evidence that the default was used** — it is the absence of
+evidence either way.
+
 **No wall-clock figure in this document carries a claim.** The machine carried other work
 throughout and its load average moved from 3.42 to 34.24; two readings of the same query forty
 minutes apart differed 5.6x with identical counters. Timing for the worked query, taken on C2 at
@@ -2143,7 +2182,8 @@ The one thing that did move into code is a correction: `{ name != "x" }` was in 
 #### The instrument, before any figure
 
 Every number in this section is one `system.query_log` row per `query_id`, on **ClickHouse
-26.3.29.7**. Read §9.5's three traps first. The settings are part of each claim, so they are named
+26.3.29.7**. Read §9.5's four traps first — the fourth is about how the block size on each
+caption below was established, and it is why those captions say what was **submitted**. The settings are part of each claim, so they are named
 beside the figures they govern rather than once here, and this list is the index:
 
 | setting | value used | why it decides a figure here |
@@ -2165,13 +2205,25 @@ the phase-1 generator's `3,145,744` (**4,767,944** at 4,096) and the winners' ro
 so each table below states, in its own caption: the block size, the condition-cache state, whether a
 memory ceiling was applied, and **who issued the statements** — our reader binary, or a hand-issued
 statement. Where a figure was re-taken while writing this section, the re-take and its instrument
-are printed beside the original rather than replacing it.
+are printed beside the original rather than replacing it. **A caption's block size is what the
+statement was sent with**, paired to its `query_id`; §9.5's fourth trap is why it cannot be
+established the other way round.
 
 **And one arithmetic check that catches this class without knowing anything about ClickHouse.** A
-stage table decomposes a request, so its rows must sum to that request's own metered total. The
-4,096 stage table below sums to **123,448,989**, which is the `{ .a = .c }` row of the request
-table. The 65,409 table it replaces summed to 119,881,011 against the same request row — a
-3,567,978-byte disagreement between two tables on the same page, which nobody had added up.
+stage table decomposes a request, so its rows must sum to that request's own totals. The 4,096
+stage table below sums to **123,448,989** metered bytes, to **3,127** statements and to
+**3,162,449** granules, and all three are the `{ .a = .c }` row of the request table. The 65,409
+table it replaces summed to 119,881,011 bytes against the same request row — a 3,567,978-byte
+disagreement between two tables on the same page, which nobody had added up.
+
+**The same addition then caught a second thing, and it is not an instrument error.** The stage
+table's rows-read column sums to 25,904,811,940 against a request row of 25,904,824,756 printed a
+few lines above it, while statements, granules and metered bytes agree to the digit. Rows read
+**does not reproduce between takes of this request**; a third take gave a third value again. It is
+recorded below with all three measured values, as a note and not as a check, the same way the
+corpus byte totals are. **The equality claimed under the stage table is therefore over statements,
+granules and metered bytes only, and rows read is outside it because it was measured to be, not
+because excluding it was convenient.**
 
 `search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:5254`)
 is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
@@ -2373,10 +2425,12 @@ issued to the reader binary built at `fe0d98fe` in `mode: reader` against C6, wi
 statements attributed from `system.query_log`. Every one answered `200` with 20 traces. Metered
 bytes are `result_bytes + length(query)` summed over every statement of the request — both
 directions of the `pulsus-server` ↔ ClickHouse hop, which is the cost model §9.1 states.
-**Instrument:** every statement issued by our reader binary, so `max_block_size = 4096` on all of
-them — read back out of `Settings['max_block_size']` in `system.query_log` per statement, not
-assumed; condition cache dropped before each request; no `optimize_aggregation_in_order`; the
-shipped memory and row budgets in force.
+**Instrument:** every statement issued by our reader binary, which sends `max_block_size = 4096`,
+and each statement's `Settings['max_block_size']` in `system.query_log` carries the `4096` back —
+a confirmation, because 4,096 is not the server default (§9.5's fourth trap: at the default the
+log would be empty and would prove nothing); condition cache dropped before each request; no
+`optimize_aggregation_in_order`; the shipped memory and row budgets in force. **This is the first
+of three takes of these requests; see the rows-read note below.**
 
 | query | traces matching | statements | rows read | granules | metered bytes |
 |---|---|---|---|---|---|
@@ -2387,16 +2441,42 @@ shipped memory and row budgets in force.
 | `{ .s2 = event:name }` | 1,000 | 2,502 | 13,995,704,756 | 1,708,699 | 96,025,490 |
 
 **The request table above was re-taken while this section was being corrected**, one run per class
-on a fresh build of C6, with the block size read out of `system.query_log` for every statement
-rather than assumed. Four of the five metered figures came back **to the byte**; `{ .a = .b }` came
-back 219 bytes higher, 6,186,320 against 6,186,101 (0.0035%). Statement counts and granule counts
-came back exactly on all five. Rows read came back to five significant figures and not to the
-digit — 25,904,811,940 against 25,904,824,756 for `{ .a = .c }`, 12,816 rows lower, and the same
-12,816 on two other classes — and that difference is **not attributed**.
+on a fresh build of C6, with each statement's submitted block size paired to its `query_id` and the
+`4096` confirmed in `system.query_log`. Four of the five metered figures came back **to the byte**;
+`{ .a = .b }` came back 219 bytes higher, 6,186,320 against 6,186,101 (0.0035%). Statement counts
+and granule counts came back exactly on all five. Rows read came back to five significant figures
+and not to the digit — 25,904,811,940 against 25,904,824,756 for `{ .a = .c }`, 12,816 rows lower,
+and the same 12,816 on two other classes.
 
-**Where the cost is.** For `{ .a = .c }`, per stage. **Instrument: one request, issued by the reader
-binary, `max_block_size = 4096` on every one of its 3,127 statements (read from
-`system.query_log`), condition cache dropped before the request.**
+**`{ .a = .c }` rows read is recorded, not a check.** Three takes of that request — three separate
+builds of C6 from the identical pinned recipe, each issued by the reader binary at
+`max_block_size = 4096` with the condition cache dropped — gave three different rows-read totals
+while agreeing **to the digit** on statements, granules and metered bytes:
+
+```
+{ .a = .c }, whole request -- rows read recorded, not a check
+
+take                                            statements  rows read       granules  metered bytes
+first take (the request table above)                 3,127   25,904,824,756  3,162,449   123,448,989
+correction re-take (the stage table below)           3,127   25,904,811,940  3,162,449   123,448,989
+a third take, independent, on its own build          3,127   25,904,806,780  3,162,449   123,448,989
+
+spread on rows read: 17,976 rows out of 25.9 billion, under one part in a million
+spread on the other three columns: zero
+```
+
+**The difference is not attributed.** The three takes are three builds, and the recipe's byte totals
+above record that a rebuild moves every column's compressed size — but the granule *counts* are
+identical across all three takes, so nothing here establishes the mechanism, and none of the three
+figures is preferred over the others. Rows read is treated the way the byte totals are: **a rebuild
+landing within a few tens of thousands of rows has reproduced**, and the eight structural quantities
+and the six selectivities stay what a rebuild is checked against.
+
+**Where the cost is.** For `{ .a = .c }`, per stage. **Instrument: the correction re-take — one
+request issued by the reader binary, sent at `max_block_size = 4096` on every one of its 3,127
+statements and confirmed per statement in `Settings['max_block_size']`, condition cache dropped
+before the request. This is its own take, not a decomposition of the request-table run above**, and
+the rows-read column is the second line of the note above.
 
 | stage | statements | rows read | granules | result bytes | query-text bytes |
 |---|---|---|---|---|---|
@@ -2407,9 +2487,12 @@ binary, `max_block_size = 4096` on every one of its 3,127 statements (read from
 | winners' root read | 1 | 942,080 | 115 | 97,016 | 1,110 |
 | **request** | **3,127** | **25,904,811,940** | **3,162,449** | **117,855,702** | **5,593,287** |
 
-The last row is the sum of the five above it and is the same request as the `{ .a = .c }` row of the
-table above: `117,855,702 + 5,593,287 = 123,448,989`. **That equality is the check that catches an
-instrument mixed into a stage table**, and it is why the row is printed.
+The last row is the sum of the five above it. On **statements**, **granules** and **metered bytes**
+it also equals the `{ .a = .c }` row of the request table above — 3,127, 3,162,449, and
+`117,855,702 + 5,593,287 = 123,448,989`. **That equality is the check that catches an instrument
+mixed into a stage table**, and it is why the row is printed. On **rows read** it does not equal
+that row and is not claimed to: the two takes differ there by 12,816 rows and a third take differs
+again, which is the recorded note above.
 
 **This table replaces a 65,409 one.** The version of it that first appeared here carried
 `3,145,744 / 323` for the generator and `92,352 / 1,131` for the root read; the same two statements
@@ -2744,7 +2827,9 @@ With that one budget at 200,000,000 and every other setting shipped, three reps 
 | `{ .s2 = event:name }` | 254.7 / 255.9 / 231.7 | 80,658,368 | 1,000 |
 
 **Note what that budget is bounding.** Today's `{ .a = .c }` request reads 25,904,824,756 rows
-across 3,127 statements and passes, because the budget is **per statement**. The push reads
+across 3,127 statements and passes, because the budget is **per statement**. (That rows figure, and
+every repetition of it below, is the first of the three takes recorded above; the three span 17,976
+rows and nothing in the argument turns on which one is used.) The push reads
 80,658,368 rows in **one** statement and is refused. The budget bounds a statement, and the class it
 refuses is the one that replaced three thousand statements with one.
 
@@ -2804,10 +2889,13 @@ alongside the existing `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_
 (`crates/pulsus-schema/src/catalog.rs:382`) — **not instead of it**.
 
 **What it costs to store.** **451,383,963** bytes for the same **71,000,000** rows, on top of the
-existing **1,128,726,045** — **+40%** — plus a second write of every attribute row on ingest. The
-copy's byte total repeated exactly on **four** independent builds, and the quotient agrees to four
-digits against both recorded denominators (39.990569% and 39.990584%), which is why this one byte
-figure is quoted where the corpus's own totals are not. **Instrument: `sum(bytes_on_disk)` over
+existing key-ordered `trace_attrs_idx` — which is **1,128,726,045** bytes on four builds of the
+recipe and **1,128,725,599** on another — so **+40%** against either denominator, plus a second
+write of every attribute row on ingest. The copy's byte total repeated exactly on **four**
+independent builds, and the quotient agrees to four digits against both recorded denominators:
+**39.990569%** against 1,128,726,045 and **39.990584%** against 1,128,725,599, a disagreement in
+the seventh digit. That is why this one byte figure is quoted where the corpus's own totals are
+not; the recipe above records every build of that table and its spread. **Instrument: `sum(bytes_on_disk)` over
 `system.parts` for active parts after `OPTIMIZE … FINAL`, the same statement that produced the
 corpus totals.**
 
