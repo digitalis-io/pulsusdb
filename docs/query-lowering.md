@@ -1188,7 +1188,7 @@ cannot be reached by any request:
 `Coalesce` is zero-arity and has no payload to reject. `Metric`, `MetricSecondStage` and `Compare`
 are rejected whole rather than by payload and are already "not in the chain" below.
 
-**Three of the eleven rows are unreachable, and the fourth was not.** An earlier revision of this
+**Three of the twelve rows are unreachable, and the fourth was not.** An earlier revision of this
 table marked the non-finite numeric threshold parser-shadowed on the strength of `nan`, `inf` and
 `1e400` all being refused by the lexer. They are — but a long decimal literal is not, and
 `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and returns
@@ -1692,7 +1692,9 @@ lists and none in neither.
 
 §3.1's TraceQL table was enumerated the same way in the previous round, in the source direction over
 `crates/pulsus-read/src/traces/search_plan.rs`, and came back complete at eleven rows; it is not
-re-derived here.
+re-derived here. Issue #492 item 9 added the twelfth row with the arm it describes — the
+mid-pipeline spanset OPERATION — so the table is twelve rows and the enumeration above covers
+eleven of them.
 
 **The five parameter rejections stay the planner's, and the link must not re-implement them.**
 `parse_vector_agg_params` (`plan.rs:1480`) is the sole producer of parsed aggregation parameters and
@@ -3006,7 +3008,7 @@ at `2f78c53` and printing the error — not transcribed from the `format!` strin
 on the wire: the status code, the content type and the two headers are **read** from
 `crates/pulsus-server/src/traces_api/error.rs:270-304` and
 `crates/pulsus-server/src/logs_api/error.rs:147-212`. The same run established which arms are
-reachable at all: **three** of the eleven TraceQL arms and **four** of the fourteen LogQL arms are
+reachable at all: **three** of the twelve TraceQL arms and **four** of the fourteen LogQL arms are
 shadowed by the parser or by `pulsus_traceql::validate`, which no reading of the planner would have
 shown. The TraceQL count was four until this revision, when the input that defeats the fourth was
 constructed (§3.1); the LogQL count was written as "three of ten" against a table that had already
@@ -3062,7 +3064,7 @@ which its own table already carried; its builder derivation was replaced, becaus
 at all; and its `LabelReplace` row's "removes no series" was replaced by the measured 4-series-to-1
 range collision. The boundary diagram's pipeline D was drawn to the end of its chain and its
 enumeration caption stopped calling a transcription "the shipped function". §11.2b now nominates
-two gates covering all 27 effects, replacing what an earlier revision of that section nominated;
+two gates covering all 28 effects, replacing what an earlier revision of that section nominated;
 this section states no count for that revision and defers to §11.2b, which records that no retained
 artefact contains it —
 `logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states` and
@@ -3125,8 +3127,9 @@ was smaller than the claim it was asked to support.**
    in this document was re-checked by constructing the input that would defeat it** rather than by
    reading the lexer — four TraceQL rows with three to ten spellings each and four LogQL rows with
    three to eight. The other seven held. Two stale counts fell out of it: §10 said "four of the
-   eleven TraceQL arms and three of the ten LogQL arms" where the truth is three of eleven and four
-   of fourteen.
+   eleven TraceQL arms and three of the ten LogQL arms" where the truth was three of eleven and four
+   of fourteen. (The TraceQL table has since gained a twelfth arm — §3.1's `Filter` row, issue #492
+   item 9 — and it is reachable, so §10 now reads three of twelve.)
 3. **Three of the 22 gates then in the inventory had no seed-provenance row, and the diagram row
    said "two" where there are three.** §11.0b now has a row for every gate, each cell parenthesises
    how many gates it covers, the counts sum to the inventory total, and every row repeats §11.0's
@@ -3814,10 +3817,12 @@ carry **20** rows and `traces::compile::tests::every_residual_state_effect_is_th
 — in **wave 1**, which writes both; neither exists at base.
 
 The TraceQL count above is this section's own derivation from §3.1 and is **not** the shipped
-test's row count. That test exists and carries **21** rows: the ten derived here plus the eleven
+test's row count. That test exists and carries **21** rows: the ten derived here, plus the ten
 per-batch read and engine links issue #492 part 3 added (`Hydrate`, the four indexed phase-2 reads,
 the two trace-wide co-loads, `Structural`, `NestedSet`, `BoolTruth`), which §3.1's table does not
-enumerate. The shipped row count is gated —
+enumerate, plus **one more row for `By`** — the shipped test gives `By` a row per key branch, one
+key that renders and one that does not, where §3.1 gives it a single row. Ten plus ten plus one.
+The shipped row count is gated —
 `assert_every_residual_state_effect::<Tql>(&rows, 21)` in
 `crates/pulsus-read/src/traces/compile.rs` — while the derivation above is prose and is not.
 
@@ -3901,7 +3906,7 @@ Each row therefore carries seeds `S₁` and `S₂` and literals `E₁` and `E₂
    differ in, and `true` only where the effect genuinely resets a field to a constant. This is the
    assertion a single seed cannot make, and it is what would turn "shape unchanged" from a phrase
    into a property — in **wave 1**, which writes it; at base the selector exits 4.
-4. for the **27** rows with a stated effect, on **both** seeds,
+4. for the **28** rows with a stated effect, on **both** seeds,
    `assert_ne!(real.residual_effect(link, Sᵢ.clone()), Neutered(real).residual_effect(link, Sᵢ.clone()))`
    — this is to catch a *missing* effect, and it is the neutering. Like assertion 2 it catches
    nothing until **wave 1** writes it.
@@ -3914,9 +3919,9 @@ retained.** A row saying `cols` is unchanged needs seeds differing in `cols`; on
 untouched needs seeds differing in `exact`; `ordering`, `limit`, `source`, `predicate` and `depth`
 likewise. A row that names nothing as unchanged still gets two seeds differing in `shape`.
 
-29 rows across the two gates **wave 1** writes, 58 seed evaluations, 27 rows carrying assertion 4 on
+30 rows across the two gates **wave 1** writes, 60 seed evaluations, 28 rows carrying assertion 4 on
 both seeds. The
-wrapper cannot silently pass: if `Neutered::residual_effect` were ever made to delegate, all 27
+wrapper cannot silently pass: if `Neutered::residual_effect` were ever made to delegate, all 28
 would fail assertion 4 at once, which is the loudest possible failure.
 
 **`Drop`/`Keep` is fixed by giving each side its own literal.** `Drop` and `Keep` are each given a
@@ -3939,7 +3944,7 @@ satisfy.
 list is to be enumerated by an exhaustive `match` over the link type with no `_` arm, so that once
 the gate exists, adding a variant will fail to build it. That forces a *name* for the new link; it
 does not by itself force a *row*. The closure is to be the count, all of it in **wave 1**: the LogQL gate is to assert it
-has **20** rows and the TraceQL gate **9**, and §11.3's
+has **20** rows and the TraceQL gate **10**, and §11.3's
 `the_document_states_the_residual_effect_counts_the_gates_assert` is to assert the same numbers read
 from this document's own tables. §11.3's four variant gates —
 `every_logql_stage_variant_has_a_row_in_the_lowering_document`,
@@ -3964,7 +3969,7 @@ the *effect* cell. The first parse written for this section did exactly that and
 §7.1's synthesised-link tables each gained a **continuation** column, appended after `disposition`
 so that no existing column index moved. Every parse in §11.2b and §11.3 — including
 `the_document_states_the_residual_effect_counts_the_gates_assert`, **wave 1**, which reads the
-residual-effect counts **7**/**5** and **20**/**2** out of these same tables — must be written
+residual-effect counts **8**/**5** and **20**/**2** out of these same tables — must be written
 against the widened tables and must index the effect column from the left, never from the right. The
 counts themselves did not move: a column was added, no row was.
 
@@ -3994,8 +3999,8 @@ set against [api.md](api.md).
 | every `pulsus_logql::Stage` variant has a row in §7.1 — to be enumerated by an exhaustive `match` with no `_` arm, so that adding a variant will fail to build here | `test(=every_logql_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
 | every `pulsus_traceql::PipelineStage` variant has a row in §3.1, same construction | `test(=every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
 | every `LqlLink` variant has a row in §7.1, same construction — this is where adding a link variant will redden, once wave 1 has written it | `test(=every_lql_link_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every TraceQL chain link — the seven `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit` — has a row in §3.1 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| §3.1 carries exactly **7** rows with a residual state effect and **5** without; §7.1 carries exactly **20** and **2** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** |
+| every TraceQL chain link — the eight `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit` — has a row in §3.1 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
+| §3.1 carries exactly **8** rows with a residual state effect and **5** without; §7.1 carries exactly **20** and **2** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** |
 | the hops diagram's lowered round-trip count and result-byte total equal §9.2's | `test(=the_hops_diagram_and_the_document_agree_on_the_lowered_request)` | exit **101**, no such target — **wave 1** |
 | every link label in the boundary diagram's pipelines is a link this document defines | `test(=the_boundary_diagram_names_only_links_the_document_defines)` | exit **101**, no such target — **wave 1** |
 | every pipeline drawn in the boundary diagram ends in `Order`, `Limit` and `Emit`, because every chain does | `test(=every_boundary_diagram_pipeline_carries_the_three_synthesised_links)` | exit **101**, no such target — **wave 1** |

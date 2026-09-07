@@ -269,9 +269,9 @@ LIMIT 100001
 bound on the trace's final sort key, which is what lets the engine stop early. The `+ 1` on the
 limit is how the engine tells "exactly 100,000" from "more than 100,000".
 
-### 1.5 TraceQL — the seven stage kinds, and the selector
+### 1.5 TraceQL — the eight stage kinds, and the selector
 
-`PipelineStage` has exactly seven variants (`crates/pulsus-traceql/src/ast.rs:981`). The selector
+`PipelineStage` has exactly eight variants (`crates/pulsus-traceql/src/ast.rs:981`). The selector
 is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 
 | written as | SQL emitted today | marking and source |
@@ -294,6 +294,7 @@ is not a stage; it is `SpansetExpr` (`ast.rs:99`).
 | `\| by(span.foo)` | none — but it adds a per-batch statement reading `foo`'s value for every candidate span | *evaluated after the read*, golden `spanset_by_attr.sql` shows the value read and **no** `GROUP BY` |
 | `\| coalesce()` | none | *evaluated after the read*, golden `spanset_coalesce.sql` is byte-identical to the plain selector case |
 | `\| select(.foo)` | none — adds a per-batch value read | *evaluated after the read*, golden `spanset_by_attr.sql` second value statement |
+| `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read* (issue #492 item 9). It does decide WHICH generator statement is sent: `filter::collect`'s `&&` fold continues across the `\|`, so `{A} \| {B}` sends the statement `{A && B}` sends |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:90`. On the **search** route they are refused with `400` (`search_plan.rs:1228`, `:1235`, `:1241`) |
 | ordering | `ORDER BY bound_ts DESC, trace_id ASC` on each first statement only | *emitted today*, `search_sql.rs:182`. The final ordering across statements is done in `pulsus-server` |
 | `limit=20` | `LIMIT 100001` on each first statement — the candidate ceiling, not the request limit | *emitted today*, `search_sql.rs:183`. The request limit is applied after the read |
@@ -498,7 +499,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `limit=100` | `LIMIT 100` | *emitted today*. Conditional on an ordering being set **and** on the predicate meaning exactly what the query means. Over a wider-than-needed set the engine keeps today's behaviour and over-fetches instead |
 | the response | none | *evaluated after the read*. Assembling streams and statistics is not a database operation |
 
-### 2.4 TraceQL — the seven stage kinds, and the selector
+### 2.4 TraceQL — the eight stage kinds, and the selector
 
 | written as | SQL after this work | marking and source |
 |---|---|---|
@@ -515,6 +516,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| by(name)` | the key becomes the KEY of a map aggregate inside the `HAVING`, not a `GROUP BY` column: `HAVING arrayMax(mapValues(uniqExactMap(map(<capped name>, span_id)))) > 2` when an aggregate lands in the same level, and nothing at all when none does | *emitted today* (issue #492 part 5), superseding `docs/query-lowering.md:609`'s `GROUP BY name`. The statement keeps one aggregation state per (trace × key value) where the ungrouped one keeps one per trace; the map form measured 334 MB against the wrapped `GROUP BY trace_id, name` form's 523 MB on the same corpus, with byte-identical `EXPLAIN indexes = 1` |
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
+| `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *never becomes SQL*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
 | `\| select(.foo)` | a left join whose right side is `trace_attrs_idx` restricted to `key = 'foo'`, one value per span, projected as an extra column | **decided here**, §2.7.3. The alternative — widening the selector's own `key` predicate and picking the values apart with `anyIf` — was rejected on a measurement: it loses the `val` prune, and `key = 'service.namespace' AND val = 'prod'` reads 14 of 74 granules against 51 of 74 for `key IN ('service.namespace', 'foo')`. Worked in §2.9's TraceQL30. **A join is a clause ADR 0008 does not name** — part 10's open question 4 |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:90`. Still `400` on the search route (`search_plan.rs:1228`); this work does not change that |
 | structural relations `>` `>>` `<` `<<` `~` | none | *never becomes SQL*, `docs/query-lowering.md:776`. Part 5 |
