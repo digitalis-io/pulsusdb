@@ -2210,20 +2210,22 @@ statement was sent with**, paired to its `query_id`; §9.5's fourth trap is why 
 established the other way round.
 
 **And one arithmetic check that catches this class without knowing anything about ClickHouse.** A
-stage table decomposes a request, so its rows must sum to that request's own totals. The 4,096
-stage table below sums to **123,448,989** metered bytes, to **3,127** statements and to
-**3,162,449** granules, and all three are the `{ .a = .c }` row of the request table. The 65,409
-table it replaces summed to 119,881,011 bytes against the same request row — a 3,567,978-byte
-disagreement between two tables on the same page, which nobody had added up.
+stage table decomposes a request, so **within one take** its rows must sum to that request's own
+totals, in every column. The 4,096 stage table below sums to **123,448,989** metered bytes, to
+**3,127** statements and to **3,162,449** granules, and all three are the `{ .a = .c }` row of the
+request table. The 65,409 table it replaces summed to 119,881,011 bytes against the same request
+row — a 3,567,978-byte disagreement between two tables on the same page, which nobody had added up.
 
-**The same addition then caught a second thing, and it is not an instrument error.** The stage
-table's rows-read column sums to 25,904,811,940 against a request row of 25,904,824,756 printed a
-few lines above it, while statements, granules and metered bytes agree to the digit. Rows read
-**does not reproduce between takes of this request**; a third take gave a third value again. It is
-recorded below with all three measured values, as a note and not as a check, the same way the
-corpus byte totals are. **The equality claimed under the stage table is therefore over statements,
-granules and metered bytes only, and rows read is outside it because it was measured to be, not
-because excluding it was convenient.**
+**The same addition then caught a second thing, and it is not an instrument error.** The stage table
+and the request table are takes on two *different builds* of C6, so setting them side by side is
+also a reproduction test. Between those two takes, one column fails it: the stage table's rows-read
+column sums to 25,904,811,940 against a request row of 25,904,824,756 printed a few lines above it.
+Two further builds have been measured since, and all five takes are printed below. **Rows read and
+metered bytes both move between builds** — rows read across a span of 122,674, metered bytes across
+5,362,175 — while statements and granules are identical on all five. **So the equality claimed under the stage table, which is an equality
+between two takes, is over statements and granules. Rows read and metered bytes are recorded there
+rather than checked, and they are outside it because they were measured to be, not because
+excluding them was convenient.**
 
 `search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:5254`)
 is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
@@ -2238,7 +2240,7 @@ instrument, all at `max_block_size = 4096` with the condition cache dropped:
 | re-measured | outcome |
 |---|---|
 | the eight structural quantities and the six selectivities | exact |
-| the five whole requests of the table below | metered bytes exact on four of five; `{ .a = .b }` 219 bytes high; statement and granule counts exact on all five |
+| the five whole requests of the table below | metered bytes exact on four of five; `{ .a = .b }` 219 bytes high; statement and granule counts exact on all five. That was one re-take against one earlier build; a later build moved `{ .a = .c }`'s metered total by 5,362,175 bytes, so metered bytes is recorded and not checked (see the five-take note below the request table) |
 | the `{ .a = .c }` stage decomposition | **two rows were 65,409 readings**; the table is replaced and now sums to its own request total |
 | the `{ .a = .c }` push side | statements, rows read and granules exact; metered bytes a fourth take, outside the earlier three |
 | the span-ordered copy's size and the group-3 pruning pair | exact — 451,383,963 bytes, 98,305 / 12 and 49,152 / 6 against 71,000,000 / 8,670 |
@@ -2430,7 +2432,8 @@ and each statement's `Settings['max_block_size']` in `system.query_log` carries 
 a confirmation, because 4,096 is not the server default (§9.5's fourth trap: at the default the
 log would be empty and would prove nothing); condition cache dropped before each request; no
 `optimize_aggregation_in_order`; the shipped memory and row budgets in force. **This is the first
-of three takes of these requests; see the rows-read note below.**
+take of these requests. The `{ .a = .c }` row has since been taken four more times, on three
+further builds; see the note below for what did and did not come back.**
 
 | query | traces matching | statements | rows read | granules | metered bytes |
 |---|---|---|---|---|---|
@@ -2446,31 +2449,54 @@ on a fresh build of C6, with each statement's submitted block size paired to its
 `{ .a = .b }` came back 219 bytes higher, 6,186,320 against 6,186,101 (0.0035%). Statement counts
 and granule counts came back exactly on all five. Rows read came back to five significant figures
 and not to the digit — 25,904,811,940 against 25,904,824,756 for `{ .a = .c }`, 12,816 rows lower,
-and the same 12,816 on two other classes.
+and the same 12,816 on two other classes. **Do not read that metered agreement as a general
+property.** It is an agreement between two builds; a fourth build, in the note below, moved
+`{ .a = .c }`'s metered total by 5,362,175 bytes.
 
-**`{ .a = .c }` rows read is recorded, not a check.** Three takes of that request — three separate
-builds of C6 from the identical pinned recipe, each issued by the reader binary at
-`max_block_size = 4096` with the condition cache dropped — gave three different rows-read totals
-while agreeing **to the digit** on statements, granules and metered bytes:
+**For `{ .a = .c }`, rows read and metered bytes are recorded, not checks.** That request has been
+taken five times: once on each of four separate builds of C6 from the identical pinned recipe, and a
+second time on the fourth build against the same corpus with no rebuild in between. Builds one and
+two were made while writing this section; builds three and four were made independently, each in a
+run of its own. Every take was issued by the reader binary at `max_block_size = 4096` with the
+condition cache dropped before the request.
 
 ```
-{ .a = .c }, whole request -- rows read recorded, not a check
+{ .a = .c }, whole request -- five takes on four builds
+statements and granules are the checks; rows read and metered bytes are recorded
 
-take                                            statements  rows read       granules  metered bytes
-first take (the request table above)                 3,127   25,904,824,756  3,162,449   123,448,989
-correction re-take (the stage table below)           3,127   25,904,811,940  3,162,449   123,448,989
-a third take, independent, on its own build          3,127   25,904,806,780  3,162,449   123,448,989
-
-spread on rows read: 17,976 rows out of 25.9 billion, under one part in a million
-spread on the other three columns: zero
+take                          build                   statements  rows read       granules   metered bytes
+first (the request table)     implementation build        3,127   25,904,824,756  3,162,449     123,448,989
+correction re-take            the correction build        3,127   25,904,811,940  3,162,449     123,448,989
+  (the stage table below)
+third, by another party       a third build               3,127   25,904,806,780  3,162,449     123,448,989
+fourth, by another party      a fourth build              3,127   25,904,929,454  3,162,449     128,811,164
+fourth repeated, no rebuild   the same fourth build       3,127   25,904,929,454  3,162,449     128,810,945
 ```
 
-**The difference is not attributed.** The three takes are three builds, and the recipe's byte totals
-above record that a rebuild moves every column's compressed size — but the granule *counts* are
-identical across all three takes, so nothing here establishes the mechanism, and none of the three
-figures is preferred over the others. Rows read is treated the way the byte totals are: **a rebuild
-landing within a few tens of thousands of rows has reproduced**, and the eight structural quantities
-and the six selectivities stay what a rebuild is checked against.
+**What reproduces, and what does not.**
+
+- **Statements and granules reproduce to the digit** — 3,127 and 3,162,449 on all five takes across
+  four builds. **These two are the checks.**
+- **Rows read varies between builds, and within the one build that was run twice it did not vary at
+  all.** The first three builds fall in a 17,976-row band out of 25.9 billion; the fourth is 104,698
+  above the top of that band, 5.8 times the band's own width, so the four span 122,674. The fourth
+  build is the only one taken twice, and both of its runs returned 25,904,929,454 — the same digits.
+- **Metered bytes varies between builds as well, and within a build it is close but not identical.**
+  Three builds gave 123,448,989 and the fourth gave 128,811,164, a difference of 5,362,175. The
+  fourth build's two runs differ from each other by 219 bytes, so unlike rows read this quantity
+  does not settle even on one unchanged corpus. All of that movement is in `result_bytes`.
+  The query-text half is **5,593,287** on every take that recorded the split, so the metered totals
+  decompose as 117,855,702 + 5,593,287, 123,217,877 + 5,593,287 and 123,217,658 + 5,593,287.
+  128,810,945 also appears in the push-comparison table further down, as one of three earlier takes
+  of this same total; those were separate runs and nothing here attributes the match.
+
+**The difference between builds is not attributed.** The recipe's byte totals above record that a
+rebuild moves every column's compressed size — but the granule *counts* are identical across all
+five takes, so nothing here establishes the mechanism, and no take's figures are preferred over
+another's. **A rebuild is checked against the eight structural quantities, the six selectivities,
+and the statement and granule counts here. It is not checked against rows read or metered bytes: a
+sixth take is expected to produce a value for each that is not in this table, and that would confirm
+this paragraph rather than contradict it.**
 
 **Where the cost is.** For `{ .a = .c }`, per stage. **Instrument: the correction re-take — one
 request issued by the reader binary, sent at `max_block_size = 4096` on every one of its 3,127
@@ -2487,12 +2513,13 @@ the rows-read column is the second line of the note above.
 | winners' root read | 1 | 942,080 | 115 | 97,016 | 1,110 |
 | **request** | **3,127** | **25,904,811,940** | **3,162,449** | **117,855,702** | **5,593,287** |
 
-The last row is the sum of the five above it. On **statements**, **granules** and **metered bytes**
-it also equals the `{ .a = .c }` row of the request table above — 3,127, 3,162,449, and
-`117,855,702 + 5,593,287 = 123,448,989`. **That equality is the check that catches an instrument
-mixed into a stage table**, and it is why the row is printed. On **rows read** it does not equal
-that row and is not claimed to: the two takes differ there by 12,816 rows and a third take differs
-again, which is the recorded note above.
+The last row is the sum of the five above it. On **statements** and **granules** it also equals the
+`{ .a = .c }` row of the request table above — 3,127 and 3,162,449. **That equality is the check
+that catches an instrument mixed into a stage table**, and it is why the row is printed. It matched
+on metered bytes as well, `117,855,702 + 5,593,287 = 123,448,989`, but the note above records a
+fourth build on which metered bytes is 5,362,175 higher, so that column is recorded here and is not
+part of the check. On **rows read** it does not equal the request row and is not claimed to: these
+two takes differ there by 12,816 rows, and two later takes differ again.
 
 **This table replaces a 65,409 one.** The version of it that first appeared here carried
 `3,145,744 / 323` for the generator and `92,352 / 1,131` for the root read; the same two statements
@@ -2637,7 +2664,10 @@ precision, and the decision here does not turn on whether the saving is 390x or 
   **390x – 460x** rather than 440x – 460x.
 - The **today** column differs by 0.5% to 8.1% of the smaller reading: narrowest `{ .a = .b }`
   6,218,236 against 6,186,101, widest `{ .s2 = event:name }` 103,776,196 against 96,025,490. For
-  `{ .a = .c }` the three takes are **128,810,945**, 128,819,521 and **123,448,989**.
+  `{ .a = .c }` the three takes that built this table are **128,810,945**, 128,819,521 and
+  **123,448,989**. The five-take note under the request table above measures the same quantity on
+  one pinned instrument and finds it moving there too, so this column's spread is not only an
+  instrument effect.
 - **What is attributed:** whether the query condition cache was dropped before the request moves
   the metered column, 17,940,201 dropped against 17,806,317 carried — 0.75%, measured on
   `{ .a * 2 < .c }` only. Applying that figure to the other four classes would be an argument, not
@@ -2828,7 +2858,7 @@ With that one budget at 200,000,000 and every other setting shipped, three reps 
 
 **Note what that budget is bounding.** Today's `{ .a = .c }` request reads 25,904,824,756 rows
 across 3,127 statements and passes, because the budget is **per statement**. (That rows figure, and
-every repetition of it below, is the first of the three takes recorded above; the three span 17,976
+every repetition of it below, is the first of the five takes recorded above; the five span 122,674
 rows and nothing in the argument turns on which one is used.) The push reads
 80,658,368 rows in **one** statement and is refused. The budget bounds a statement, and the class it
 refuses is the one that replaced three thousand statements with one.
