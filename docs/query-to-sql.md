@@ -4200,8 +4200,13 @@ is a permanent boundary, and part 4 gives a worked entry for most of them.
   against the rewritten expression. That was settled by running each expression against a container,
   not by reading (`docs/query-lowering.md:792-796`).
 - TraceQL's `{ .a = .b }` compares two rows of the attribute index sharing a `(trace_id, span_id)`.
-  The information is present and it is a self-join: expensive, not impossible. Calling it impossible
-  would be wrong; what it is not is cheap, and that is a different claim.
+  The information is present, and the SQL that decides it is a **per-span pre-grouping** —
+  `GROUP BY trace_id, span_id` with the comparison in a `HAVING`, and no join. Calling it impossible
+  would be wrong; what it is not is cheap. It is **refused rather than merely expensive**: on the
+  attribute index as it is ordered today the pre-grouping needs about 10.5 GiB of aggregation state
+  on a 10,000,000-span window, against a shipped 512 MiB generator ceiling, so the statement throws
+  `Code: 241` and the request that answers `200` today would answer `422`. Measured in
+  `docs/query-lowering.md` §9.7, which also records the schema change that would make it fit.
 - `| drop level="info"` and `| keep` with a value matcher contribute no SQL, and that is a choice
   rather than a boundary. The matcher tests the label's value at that point in the query
   (`crates/pulsus-logql/src/ast.rs:157-160`); §2.7.1 decides that the name simply stops resolving
