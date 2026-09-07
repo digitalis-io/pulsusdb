@@ -3010,6 +3010,28 @@ It returns three rows, one per take. They are the only rows the capture found wi
 the only ones that failed. `'p7c_t4_join_ceiling_'` is this section's `query_id` prefix followed by
 the statement name, so a re-taker changes the same string literal here as in the capture statement.
 
+**These three bodies are this build's own output, read from the container that produced the
+figures below.** They are not an illustration of the shape such a body has: the statement above was
+run against the measurement container while it was still up, and its three rows were copied from
+the terminal into this section. The third body's part path names this measurement's own
+`arch492p7.trace_attrs_idx` and that table's UUID, and all three `query_id`s appear in the capture
+with `exception_code` 241, 721 marks and no rows out — the same three takes.
+
+**That run's stdout was not kept.** The capture statement's output was written to a file at capture
+time — measurement scratch, not in this repository — and the `marks`, `read_rows`, `rows out` and
+`exception_code` columns of the take tables below were read out of that file. The body statement's
+output was not written anywhere: it was read off the terminal, and the block at the top of this
+section is the only copy of it that survives. The container has been removed, so it cannot be read
+again; a re-taker builds the corpus afresh and gets three new bodies, differing in the ways listed
+under "Varies" below.
+
+What was checked instead is the statement. The SQL printed above is byte-for-byte the file the
+measurement submitted, and it was run once more against a different server, on three throwaway
+queries made to fail on purpose under the same `query_id` spelling, to show it returns one row per
+take with a body in it rather than merely parsing. **Those throwaway bodies are not the
+measurement's, are not printed in this document, and are not the source of any figure here.** The
+three above were already in this file at commit `b97d6853`, which predates that run.
+
 **The same statement with only the join removed runs.** The control — `t4_control` below, which is
 `t4_join` with the `LEFT JOIN (…) AS sel ON …` block and the `sel.v AS sel_method` projection taken
 out and nothing else changed — answered 20 rows at 476 marks with `exception_code` 0, on all three
@@ -3689,7 +3711,9 @@ The error body is a record beyond `Code: 241` and `512.00 MiB`. The three bodies
 section are one build's three takes of one statement: the "would use" figure takes two values across
 them, the chunk figure takes two, and the execution site takes two — two takes failed in the
 aggregate and one in a storage read, and only the storage-read take carries a part path. That part
-path carries a container-local table UUID, so it cannot repeat across builds at all.
+path carries a container-local table UUID, so it cannot repeat across builds at all. That run's
+stdout was not kept, so the block at the top of this section is the only copy of those three
+bodies; the note beside them says so, and gives the statement they came from.
 
 #### The answers agree
 
