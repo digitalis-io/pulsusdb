@@ -1426,8 +1426,35 @@ fn capture_reference(base_url: &str, host: &str, port: u16, nonce: &str) -> Vec<
             projection: project_probe(&p, status, &body, nonce, base_ns),
         });
     }
-    for p in tail_probes() {
-        let frames = run_tail_probe(host, port, &p, nonce);
+    // plans/ci-build-time.md §7 R2: the 18 tail probes run concurrently
+    // instead of one after another. Each keeps its own drain and its own
+    // budget verbatim — nothing inside `run_tail_probe` changes — so the
+    // capture costs one probe's ~13 s rather than the sum of eighteen,
+    // and `schema-it`'s capture leg drops from ~370 s.
+    //
+    // What makes them independent: each probe derives its own `app` label
+    // from the shared nonce and its own id (`t{nonce}{id}`), and the
+    // reference's entry-level deduplication keys on the stream. Probes
+    // therefore neither read each other's pushes nor share a tail. What
+    // they DO share is one reference process and one nonce, so eighteen
+    // simultaneous pushes and eighteen open tails is a load the serial
+    // form never applied; that is measured by the drift test's own
+    // second capture, which must project identically.
+    //
+    // Declaration order is restored below before anything positional
+    // looks at the result.
+    let tails = tail_probes();
+    let frames_by_probe: Vec<Vec<String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = tails
+            .iter()
+            .map(|p| scope.spawn(move || run_tail_probe(host, port, p, nonce)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a tail probe thread panicked"))
+            .collect()
+    });
+    for (p, frames) in tails.iter().zip(frames_by_probe) {
         out.push(ArtifactProbe {
             id: p.id.to_string(),
             class: class_name(Class::Tail).to_string(),
@@ -1522,6 +1549,31 @@ fn the_committed_capture_matches_the_live_reference() {
     std::thread::sleep(Duration::from_secs(2));
     let nonce_b = format!("{}b", now_ns() / 1_000_000_000);
     let second = capture_reference(&base_url, &host, port, &nonce_b);
+
+    // Cardinality and identity first, then the comparison — required by
+    // plans/ci-build-time.md §7 R2 before the tail probes were allowed to
+    // run concurrently. `zip` truncates to the shorter vector and the
+    // committed-artifact loop below looks probes up BY ID, so without
+    // these three lines a probe that a concurrent capture dropped from
+    // both runs — the natural outcome of a task whose result is
+    // discarded — passes the whole test silently.
+    let fresh_ids: Vec<&str> = fresh.iter().map(|p| p.id.as_str()).collect();
+    let second_ids: Vec<&str> = second.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(
+        fresh_ids,
+        capture::ids(),
+        "the live capture does not carry the committed artifact's probes, in its order — \
+         {} captured against {} committed",
+        fresh.len(),
+        capture::ids().len()
+    );
+    assert_eq!(
+        fresh_ids, second_ids,
+        "the two captures carry different probes: {} against {}",
+        fresh.len(),
+        second.len()
+    );
+
     for (a, b) in fresh.iter().zip(&second) {
         assert_eq!(
             (&a.id, &a.projection),
