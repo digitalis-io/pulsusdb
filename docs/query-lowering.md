@@ -2038,14 +2038,34 @@ attribute index, full 10,000,000-span window, optimize_aggregation_in_order = 1)
         (what our reader sends)                 (ClickHouse's default)
              COMPLETES                            REFUSED, Code 241
 
-result_bytes, one generator statement, same rows read and same granules either way
+result_bytes, ONE generator statement -- same SQL, same rows read, same granules, only the
+LIMIT moved. Condition cache dropped before every run; TSV output; ClickHouse 26.3.29.7.
 
-        100,001-row result:   4,767,944 at 4096      3,145,744 at 65,409   (default 34.0% lower)
-          4,096-row result:     196,616 at 4096        196,616 at 65,409   (identical)
+  rows returned      at 4,096     at 65,409     4,096 higher by
+        4,096         196,616       196,616             0     0%
+        4,097         197,136       196,616           520     0.26%
+        8,192         393,232       393,224             8     0.002%
+       12,288         589,848       393,224       196,624    33.3%
+       16,384         786,464       786,440            24     0.003%
+       20,000         884,776       786,440        98,336    11.1%
+       32,768       1,572,928     1,572,872            56     0.004%
+       50,000       2,383,976     1,572,872       811,104    34.0%
+       65,409       3,047,552     1,572,872     1,474,680    48.4%
+       65,410       3,047,552     1,573,392     1,474,160    48.4%
+      100,001       4,767,944     3,145,744     1,622,200    34.0%
 ```
 
-So a re-take at the default **refuses a statement the shipped reader would run**, and it
-understates the metered column by about a third on any result larger than one block. Two competent
+**The gap is a function of the result size, and it is not monotonic.** At 65,409 the figure only
+moves at the doublings -- 196,616, 393,224, 786,440, 1,572,872, 3,145,744 -- while at 4,096 it
+climbs roughly 48 bytes per row, so the distance between the two settings depends on where the
+result size sits between two doublings: **0.002% just above one (8,192 rows), 48.4% just below the
+next (65,409 rows)**. The phase-1 generator returns 100,001 rows, where the gap is **34.0%**; at
+4,097 rows, the first result above one block, it is **520 bytes, 0.26%**. So "the default reads
+about a third low" is a statement about the 100,001-row result and about no other result size, and
+this table, not that sentence, is what a re-take should be compared against.
+
+So a re-take at the default **refuses a statement the shipped reader would run**, and it moves the
+metered column by anywhere between 0% and 48% on the same statement. Two competent
 measurements of §9.7's headline figure landed a factor of 4.7 apart for exactly this reason, and
 neither was wrong about what it measured. `search_settings_pin_the_layer_1_budget_contract`
 (`crates/pulsus-read/src/traces/exec.rs:5254`) is what keeps 4,096 shipped: it asserts that the
@@ -2127,7 +2147,7 @@ beside the figures they govern rather than once here, and this list is the index
 
 | setting | value used | why it decides a figure here |
 |---|---|---|
-| `max_block_size` | **4096** | the shipped value (`exec.rs:173`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and a large result's `result_bytes` reads 34% low. Every memory and metered figure below is at 4096 |
+| `max_block_size` | **4096** | the shipped value (`exec.rs:173`). At ClickHouse's own default, 65,409, the same statement peaks at **1,068.3 MiB** instead of **228.7 MiB** — across the 512 MiB ceiling — and the same statement's `result_bytes` moves by between 0% and 48% depending on the result size (§9.5's curve). Every figure below names the block size it was taken at |
 | `use_query_condition_cache` | **0**, or the cache dropped before each request | otherwise a repeat read reports an order of magnitude fewer rows (§9.5's first trap). Two routes, below |
 | `optimize_aggregation_in_order` | **1**, named on the rows that need it | it is what lets the span-ordered index stream the aggregation instead of holding a hash table over every span-group. On the current index order it buys nothing, because `(trace_id, span_id)` is not a prefix of that sorting key |
 | `max_memory_usage` | **536870912** | the shipped `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:518`), applied by `generator_settings` (`exec.rs:2869`) |
@@ -2135,11 +2155,46 @@ beside the figures they govern rather than once here, and this list is the index
 | `max_rows_to_read` | **50000000** shipped, **200000000** in the raised-budget rows | `reader.traceql_scan_budget_rows` (`model.rs:515`), carried with `read_overflow_mode = throw` by `search_settings` (`exec.rs:2830-2836`) |
 | `min_bytes_for_wide_part` | **10485760** | pinned in the corpus recipe so the part format is reproducible; ClickHouse's own 26.3 default happens to be the same value, and neither trace `CREATE TABLE` pins it |
 
+**The rule this section follows: every metered figure carries its instrument beside the number.**
+Not a preamble saying "everything below is at 4,096" — this section had exactly that sentence and it
+did not hold. Its first `{ .a = .c }` stage table was a **65,409** take sitting under a 4,096
+heading, and two of its five rows are values that statement set produces only at the server default:
+the phase-1 generator's `3,145,744` (**4,767,944** at 4,096) and the winners' root read's `92,352`
+(**97,016** at 4,096). The wrong instrument is invisible in a number; it is visible only in a label,
+so each table below states, in its own caption: the block size, the condition-cache state, whether a
+memory ceiling was applied, and **who issued the statements** — our reader binary, or a hand-issued
+statement. Where a figure was re-taken while writing this section, the re-take and its instrument
+are printed beside the original rather than replacing it.
+
+**And one arithmetic check that catches this class without knowing anything about ClickHouse.** A
+stage table decomposes a request, so its rows must sum to that request's own metered total. The
+4,096 stage table below sums to **123,448,989**, which is the `{ .a = .c }` row of the request
+table. The 65,409 table it replaces summed to 119,881,011 against the same request row — a
+3,567,978-byte disagreement between two tables on the same page, which nobody had added up.
+
 `search_settings_pin_the_layer_1_budget_contract` (`crates/pulsus-read/src/traces/exec.rs:5254`)
 is what keeps 4,096 shipped, and it is worth knowing exactly how much it keeps: it asserts that the
 rendered search settings contain the substring `max_block_size` and the substring `4096`, as two
 independent checks that are not bound to each other. It would not catch a different block size
 arriving beside a stray `4096` elsewhere in the settings.
+
+**What the instrument rule was applied to, and what it did not reach.** After the mixed stage table
+was found, C6 was rebuilt from the five statements below and these were re-measured on one
+instrument, all at `max_block_size = 4096` with the condition cache dropped:
+
+| re-measured | outcome |
+|---|---|
+| the eight structural quantities and the six selectivities | exact |
+| the five whole requests of the table below | metered bytes exact on four of five; `{ .a = .b }` 219 bytes high; statement and granule counts exact on all five |
+| the `{ .a = .c }` stage decomposition | **two rows were 65,409 readings**; the table is replaced and now sums to its own request total |
+| the `{ .a = .c }` push side | statements, rows read and granules exact; metered bytes a fourth take, outside the earlier three |
+| the span-ordered copy's size and the group-3 pruning pair | exact — 451,383,963 bytes, 98,305 / 12 and 49,152 / 6 against 71,000,000 / 8,670 |
+| the row-budget refusal | reproduces; its `current rows` figure does not, and is now labelled |
+
+**Not re-measured, and still carrying the instrument recorded when they were taken:** the 30-run
+peak-memory table, the 390,000 / 395,000 crossover bracket, the push side of the other four classes,
+and the numeric-only `HAVING` control. An instrument label on those rows says what the take
+recorded, not what a re-take confirmed, and the rows say which.
 
 **Two routes to `use_query_condition_cache = 0`, and they are not interchangeable.** ClickHouse 26.3
 ships the setting **on** (`system.settings` prints `value 1, default 1, changed 0` — it is not a
@@ -2261,8 +2316,9 @@ FROM numbers_mt(1000000)
 Then `OPTIMIZE TABLE … FINAL` on both tables.
 
 **What a rebuild has to match: eight structural quantities and six selectivities.** These reproduced
-exactly on every build that took them — three independent full builds of the recipe above, by three
-different people, and the structural half again on the four span-only repeat builds below.
+exactly on every build that took them — **five** independent full builds of the recipe above, by
+four different hands (two of the five are the same one), and the structural half again on the four
+span-only repeat builds below.
 
 ```
 trace_spans      6 parts   1,232 marks   10,000,000 rows   Wide
@@ -2281,22 +2337,26 @@ The awkward one is `.a * 2 < .c`, which is 9,000 and not 10,000: `a = n % 1000` 
 `0 < 0` excludes them. A rebuild reporting 10,000 has transcribed the `c` generator wrongly. That is
 why the selectivities are the check.
 
-**The byte totals are recorded and are not a check.** Seven builds of the identical pinned recipe —
-same rows, same order, same granules, same part format, and an identical content hash over all 14
-columns (`4829404233030457425`) — gave seven different `trace_spans` byte totals:
+**The byte totals are recorded and are not a check.** Three builds of the identical pinned recipe,
+compared column by column — same rows, same order, same granules, same part format, and an identical
+content hash over all 14 columns (`4829404233030457425`) — gave three different `trace_spans` byte
+totals, and six further builds gave six more, nine distinct values in all:
 
 ```
 trace_spans bytes on disk -- recorded, not a check
 build set               bytes on disk                                 spread within the set
 three by one person     211,538,791 / 211,564,845 / 211,376,088             188,757
+  (the content hash was measured on these three)
 three by another        211,366,295 / 211,506,324 / 211,503,142             140,029
 one at implementation   211,335,774
+one at review           211,446,731
+one at the correction   211,506,914
                             overall range 211,335,774 .. 211,564,845        229,071
 ```
 
 Every column's compressed size moves between builds; the thread count is not pinned, and pinning it
 would make it a different recipe from the one that produced these figures. `trace_attrs_idx` came
-out at 1,128,726,045 on three builds, 1,128,725,599 on one and 1,128,726,121 on one — 522 bytes
+out at 1,128,726,045 on four builds, 1,128,725,599 on one and 1,128,726,121 on one — 522 bytes
 apart at the widest. **A rebuild that differs from these figures by tens of kilobytes has
 reproduced**; the eight structural quantities and the six selectivities are what a rebuild is
 checked against.
@@ -2312,7 +2372,10 @@ issued to the reader binary built at `fe0d98fe` in `mode: reader` against C6, wi
 statements attributed from `system.query_log`. Every one answered `200` with 20 traces. Metered
 bytes are `result_bytes + length(query)` summed over every statement of the request — both
 directions of the `pulsus-server` ↔ ClickHouse hop, which is the cost model §9.1 states.
-`max_block_size = 4096`, condition cache dropped before each request.
+**Instrument:** every statement issued by our reader binary, so `max_block_size = 4096` on all of
+them — read back out of `Settings['max_block_size']` in `system.query_log` per statement, not
+assumed; condition cache dropped before each request; no `optimize_aggregation_in_order`; the
+shipped memory and row budgets in force.
 
 | query | traces matching | statements | rows read | granules | metered bytes |
 |---|---|---|---|---|---|
@@ -2322,15 +2385,36 @@ directions of the `pulsus-server` ↔ ClickHouse hop, which is the cost model §
 | `{ .a * 2 < .c }` | 9,000 | 347 | 2,869,590,609 | 350,316 | 17,940,201 |
 | `{ .s2 = event:name }` | 1,000 | 2,502 | 13,995,704,756 | 1,708,699 | 96,025,490 |
 
-**Where the cost is.** For `{ .a = .c }`, per stage:
+**The request table above was re-taken while this section was being corrected**, one run per class
+on a fresh build of C6, with the block size read out of `system.query_log` for every statement
+rather than assumed. Four of the five metered figures came back **to the byte**; `{ .a = .b }` came
+back 219 bytes higher, 6,186,320 against 6,186,101 (0.0035%). Statement counts and granule counts
+came back exactly on all five. Rows read came back to five significant figures and not to the
+digit — 25,904,811,940 against 25,904,824,756 for `{ .a = .c }`, 12,816 rows lower, and the same
+12,816 on two other classes — and that difference is **not attributed**.
+
+**Where the cost is.** For `{ .a = .c }`, per stage. **Instrument: one request, issued by the reader
+binary, `max_block_size = 4096` on every one of its 3,127 statements (read from
+`system.query_log`), condition cache dropped before the request.**
 
 | stage | statements | rows read | granules | result bytes | query-text bytes |
 |---|---|---|---|---|---|
-| phase-1 generator | 1 | 10,043,392 | 1,226 | 3,145,744 | 323 |
-| phase-2 hydration | 625 | 785,300,131 | 96,108 | 69,698,611 | 1,333,750 |
-| phase-2 `val_num` value reads | 1,250 | 12,554,240,000 | 1,532,500 | 19,816,250 | 2,146,250 |
-| phase-2 `val` value reads | 1,250 | 12,554,240,000 | 1,532,500 | 21,469,100 | 2,177,500 |
-| winners' root read | 1 | 942,070 | 115 | 92,352 | 1,131 |
+| phase-1 generator | 1 | 10,043,392 | 1,226 | 4,767,944 | 302 |
+| phase-2 hydration | 625 | 785,346,468 | 96,108 | 71,705,392 | 1,320,625 |
+| phase-2 `val_num` value reads | 1,250 | 12,554,240,000 | 1,532,500 | 19,816,250 | 2,120,000 |
+| phase-2 `val` value reads | 1,250 | 12,554,240,000 | 1,532,500 | 21,469,100 | 2,151,250 |
+| winners' root read | 1 | 942,080 | 115 | 97,016 | 1,110 |
+| **request** | **3,127** | **25,904,811,940** | **3,162,449** | **117,855,702** | **5,593,287** |
+
+The last row is the sum of the five above it and is the same request as the `{ .a = .c }` row of the
+table above: `117,855,702 + 5,593,287 = 123,448,989`. **That equality is the check that catches an
+instrument mixed into a stage table**, and it is why the row is printed.
+
+**This table replaces a 65,409 one.** The version of it that first appeared here carried
+`3,145,744 / 323` for the generator and `92,352 / 1,131` for the root read; the same two statements
+at 4,096 give `4,767,944` and `97,016` (§9.5's curve is the same effect, measured across eleven
+result sizes). Those rows summed to 119,881,011 against a request total of 123,448,989 printed four
+lines above them, and neither number was wrong about what it measured.
 
 **All 2,500 value reads read exactly 10,043,392 rows and exactly 1,226 granules** — measured as
 `min = max` with `uniqExact(read_rows) = 1`, not inferred from a total that happens to divide (the
@@ -2429,14 +2513,21 @@ drops any of them answers differently from the evaluator.
 #### What the push would save on the metered hop, and why one number will not do
 
 Push side: the pushed phase-1 statement above, then the server's own phase-2 statement text taken
-from `system.query_log` for the same query with only the `trace_id` list substituted, at the
-server's own settings. The memory ceiling is lifted for this table, because under the shipped
-ceiling none of these statements runs at all on the current index order.
+from `system.query_log` for the same query with only the `trace_id` list substituted. The memory
+ceiling is lifted for this table, because under the shipped ceiling none of these statements runs at
+all on the current index order.
+
+**Instrument, and it is not the same on both columns.** The **today** column is a whole request
+issued by the reader binary, every statement at `max_block_size = 4096`. The **push** column is
+seven statements issued **by hand** — the push does not exist in our binary — on the **current**
+index order, with `max_memory_usage = 0` and `max_bytes_before_external_group_by = 0`, condition
+cache dropped. The three takes that built this table did not record the push side's block size.
+The fourth take, below, does.
 
 | query | today: stmts / metered bytes | push: stmts / rows read / granules / metered bytes | saving |
 |---|---|---|---|
 | `{ .a = .b }` | 37 / 6,186,101 | 7 / 72,646,656 / 8,868 / 5,025,292 | **1.2x** |
-| `{ .a = .c }` | 3,127 / 123,448,989 | 7 / 72,704,000 / 8,875 / 277,773 | **440x – 460x** |
+| `{ .a = .c }` | 3,127 / 123,448,989 | 7 / 72,704,000 / 8,875 / 277,773 | **390x – 460x** |
 | `{ .s1 = .s2 }` | 3,127 / 103,993,640 | 7 / 72,785,920 / 8,885 / 249,160 | **420x – 440x** |
 | `{ .a * 2 < .c }` | 347 / 17,940,201 | 7 / 72,720,384 / 8,877 / 668,425 | **27x – 28x** |
 | `{ .s2 = event:name }` | 2,502 / 96,025,490 | 6 / 44,638,208 / 5,449 / 231,450 | **410x – 450x** |
@@ -2444,12 +2535,22 @@ ceiling none of these statements runs at all on the current index order.
 **The ratios are printed to two significant figures as a range, deliberately, and the raw integers
 are printed beside them so a reader can recompute any take's own quotient.** Three careful takes of
 this table, on three instruments, disagree by up to 8.1% on the metered column while agreeing to the
-digit on statement counts, rows read and granules — so the entire disagreement is `result_bytes`.
-Printing four digits of a quotient that three takes cannot reproduce to two would be false
-precision, and the decision here does not turn on whether the saving is 440x or 460x.
+digit on statement counts and granules — so the entire disagreement is `result_bytes`. (A fourth
+take, described below, agrees on statement counts and granules and comes within five significant
+figures on rows read.)
+Printing four digits of a quotient that four takes cannot reproduce to two would be false
+precision, and the decision here does not turn on whether the saving is 390x or 460x.
 
-- The **push** column agrees between 0.00% and 1.14% across takes: `{ .a = .b }` gave 5,025,441 /
-  5,025,378 / 5,025,292, and `{ .a = .c }` gave **277,922** / **280,931** / **277,773**.
+- The **push** column agreed between 0.00% and 1.14% across the first three takes: `{ .a = .b }`
+  gave 5,025,441 / 5,025,378 / 5,025,292, and `{ .a = .c }` gave **277,922** / **280,931** /
+  **277,773**. A **fourth** take of the `{ .a = .c }` push side, this time with its instrument
+  recorded — seven hand-issued statements, current index order, `max_block_size = 4096`, ceiling
+  lifted, cache dropped — gave **318,640**, which is 13.4% above the highest of those three and
+  outside their spread. Its statement count (7), rows read (**72,704,000**) and granules (**8,875**)
+  reproduced the table's own figures **to the digit**, so once again the whole disagreement is
+  `result_bytes`. The same seven statements re-issued at 65,409 gave 311,129, so the push column is
+  block-size sensitive too, by 2.4% here. That is why the `{ .a = .c }` saving now reads
+  **390x – 460x** rather than 440x – 460x.
 - The **today** column differs by 0.5% to 8.1% of the smaller reading: narrowest `{ .a = .b }`
   6,218,236 against 6,186,101, widest `{ .s2 = event:name }` 103,776,196 against 96,025,490. For
   `{ .a = .c }` the three takes are **128,810,945**, 128,819,521 and **123,448,989**.
@@ -2457,9 +2558,10 @@ precision, and the decision here does not turn on whether the saving is 440x or 
   the metered column, 17,940,201 dropped against 17,806,317 carried — 0.75%, measured on
   `{ .a * 2 < .c }` only. Applying that figure to the other four classes would be an argument, not
   a measurement.
-- **What is not attributed:** about 3% on `{ .a = .c }` and up to about 7% on the event class. That
-  is unexplained, not noise, and a fourth take could land outside the ranges printed above — in
-  which case the range widens and the conclusion does not change.
+- **What is not attributed:** about 3% on `{ .a = .c }` and up to about 7% on the event class, and
+  now the fourth take's 13.4% on the push side of `{ .a = .c }`. That is unexplained, not noise. The
+  fourth take did land outside the range printed above, the range widened from 440x to 390x, and the
+  conclusion did not change.
 
 **Two things fall out, and both matter more than the endpoints.** The saving is a function of
 **selectivity**, not of the class: the same query text at 1 trace in 10 saves 1.2x and at 1 in 1,000
@@ -2470,8 +2572,15 @@ it is the same 10.5 GiB for the 1-in-10 and the 1-in-1,000 form.
 
 Relating two attribute values of one span needs a per-span grouping, and its aggregation state is
 `O(spans in the search window)`. On the attribute index as it is ordered today, peak query memory
-for the pushed phase-1 statement, from `system.query_log`, no memory ceiling applied, three
-repetitions per point, `use_query_condition_cache = 0`. MiB, min–max over the reps:
+for the pushed phase-1 statement, from `system.query_log`, MiB, min–max over the reps.
+
+**Instrument:** hand-issued statements on the current index order, no memory ceiling applied
+(`max_memory_usage = 0`, `max_bytes_before_external_group_by = 0`), `use_query_condition_cache = 0`,
+three repetitions per point. **The 625,000-span row deliberately spans both block sizes** — its 30
+runs are five forms × two block sizes × three reps — and the 10,000,000-span row is at
+**`max_block_size = 4096`**. Block size is the one instrument that does not move this figure, which
+is why the two are pooled and why the pooling is stated rather than assumed; the sentence under the
+table is the measurement that licenses it.
 
 | spans in window | `{ .a = .b }` | `{ .a = .c }` | `{ .s1 = .s2 }` | `{ .a * 2 < .c }` | `{ .s2 = event:name }` |
 |---|---|---|---|---|---|
@@ -2482,8 +2591,10 @@ The 625,000-span row is 30 runs — five forms, two block sizes, three repetitio
 over all 30 is **801.8 MiB**. At 312,500 spans the same design spans **167.4–469.5 MiB** across the
 five forms; the per-form split at that point was not printed. On this index order the block size
 does not move the figure: 10,651.8 against 10,650.2 MiB for the same statement at 4,096 and at
-65,409. The hash table over roughly 10,000,000 groups dominates, and the per-thread block buffers
-do not.
+65,409, and a later re-take of `{ .a = .c }` gave 10,650.2 MiB twice at 4,096 and 10,661.9 MiB at
+65,409 — a 0.1% spread across four readings and two block sizes, against the 2.9x spread the *form*
+of the statement produces. The hash table over roughly 10,000,000 groups dominates, and the
+per-thread block buffers do not.
 
 **Peak memory is not one number, and treating it as one is what produced two irreconcilable
 readings of it.** At 625,000 spans the answer is anywhere between 276 MiB and 802 MiB depending on
@@ -2549,7 +2660,8 @@ mechanism that selects one is not established, and neither instrument could forc
 result. Nothing in the recommendation rests on it.
 
 **Two rescues on the current index order, both measured, both refused.** `{ .a = .c }` pushed, full
-window, three reps:
+window, three reps. **Instrument: hand-issued, `max_block_size = 4096` except where the row says
+otherwise, no memory ceiling on the first three rows, `use_query_condition_cache = 0`.**
 
 ```
 current index order, plain                             10,647–10,760 MiB   read 30,130,176  marks 3,678
@@ -2610,7 +2722,17 @@ max rows: 50.00 million, current rows: 51.31 million: While executing MergeTreeS
 `ReadError::QueryTooBroad(_)` is `422` (`traces_api/error.rs:366`), so **"it fits" is false at the
 level a user experiences** until `reader.traceql_scan_budget_rows` is raised as well. All five
 classes trip it, at 51.31 / 51.31 / 55.75 / 53.30 / 52.88 million rows in the order of the table
-above. With that one budget at 200,000,000 and every other setting shipped, three reps each:
+above.
+
+**`current rows` is a property of the run, not of the class.** It is how far the read had got when
+the limit tripped, so it is not reproducible: three consecutive runs of the identical `{ .a = .c }`
+statement — same instrument, condition cache dropped before each — printed **51.31, 51.31 and
+53.30** million. The five numbers above are one reading each and should be read as "somewhere just
+above 50 million", never compared class against class. What *is* reproducible is the refusal itself
+and the rows the statement would read if allowed: 80,658,368 for `{ .a = .c }`, re-measured to the
+digit on a later build.
+
+With that one budget at 200,000,000 and every other setting shipped, three reps each:
 
 | class | peaks (MiB) | rows read | result rows (the right answer) |
 |---|---|---|---|
@@ -2682,12 +2804,17 @@ alongside the existing `ORDER BY (key, val, scope, timestamp_ns, trace_id, span_
 
 **What it costs to store.** **451,383,963** bytes for the same **71,000,000** rows, on top of the
 existing **1,128,726,045** — **+40%** — plus a second write of every attribute row on ingest. The
-copy's byte total repeated exactly on three independent builds, and the quotient agrees to four
+copy's byte total repeated exactly on **four** independent builds, and the quotient agrees to four
 digits against both recorded denominators (39.990569% and 39.990584%), which is why this one byte
-figure is quoted where the corpus's own totals are not.
+figure is quoted where the corpus's own totals are not. **Instrument: `sum(bytes_on_disk)` over
+`system.parts` for active parts after `OPTIMIZE … FINAL`, the same statement that produced the
+corpus totals.**
 
 **Why it cannot replace the key-ordered index.** Group 3's leaves prune on `key`, which is not the
-leading column of the span-ordered table:
+leading column of the span-ordered table. **Instrument: hand-issued `SELECT count()`, condition
+cache dropped before each statement (without that, granule counts are meaningless — §9.5's first
+trap), `max_block_size = 4096`; all four rows re-measured to the digit on a later independent
+build.**
 
 | leaf | key-ordered | span-ordered | |
 |---|---|---|---|
@@ -2701,11 +2828,14 @@ So this is a second copy of the attribute rows, not a re-ordering of the existin
 (`crates/pulsus-config/src/model.rs:515`) to cover the window's attribute rows; **200,000,000** was
 measured. Without it every one of the five classes returns
 `Code: 158. DB::Exception: Limit for rows or bytes to read exceeded, max rows: 50.00 million,
-current rows: …` at 51.31 / 51.31 / 55.75 / 53.30 / 52.88 million, and the user sees `422`.
+current rows: …` — the trailing figure is where the read had got when the limit tripped and varies
+run to run on one class (51.31, 51.31, 53.30 million on three runs of `{ .a = .c }`) — and the user
+sees `422`.
 
 **What it buys.** For the four selector classes: 7 statements and 80,658,368 rows read in place of
-3,127 statements and 25,904,824,756 rows, and a metered hop between 1.2x and about 440x smaller
-depending on selectivity.
+3,127 statements and 25,904,824,756 rows, and a metered hop between 1.2x at 1 matching trace in 10
+and 390x – 460x at 1 in 1,000 — a function of selectivity, and the endpoints are the take-to-take
+range, not a precision claim.
 
 **This is a proposal for the owner to schedule, and nothing more.** Part 6 does not build the table,
 does not change a configuration default, and **files nothing**.
