@@ -2494,9 +2494,12 @@ fourth repeated, no rebuild   the same fourth build       3,127   25,904,929,454
 rebuild moves every column's compressed size — but the granule *counts* are identical across all
 five takes, so nothing here establishes the mechanism, and no take's figures are preferred over
 another's. **A rebuild is checked against the eight structural quantities, the six selectivities,
-and the statement and granule counts here. It is not checked against rows read or metered bytes: a
-sixth take is expected to produce a value for each that is not in this table, and that would confirm
-this paragraph rather than contradict it.**
+and the statement and granule counts here. It is not checked against rows read or metered bytes.**
+Each of those two has already been seen both to repeat a printed value and to change: rows read
+came back to the digit on the fourth build's two runs and gave a different value on each of the four
+builds; metered bytes gave the same 123,448,989 on three builds and differed by 219 between the
+fourth build's two runs. **Neither outcome is compared against anything here, so a further take of
+either settles nothing in this paragraph.**
 
 **Where the cost is.** For `{ .a = .c }`, per stage. **Instrument: the correction re-take — one
 request issued by the reader binary, sent at `max_block_size = 4096` on every one of its 3,127
@@ -2897,7 +2900,7 @@ memory at production volume, and whether 80,658,368 rows per generator statement
 - **The span-ordered index was measured at one window** — the full 10,000,000 spans — so its
   memory-versus-window curve is argued, not measured: in-order aggregation streams, so the state is
   bounded by the per-thread block buffers rather than by the number of groups, while rows read grow
-  linearly with the window. That is why the row budget, not memory, is expected to bind first at
+  linearly with the window. That is the argument for the row budget, not memory, binding first at
   production volume, and establishing that ordering belongs to #25.
 - **The 395,000-span flip's mechanism is not established**, and about 3% of the metered-bytes
   disagreement between takes is not attributed.
