@@ -1208,7 +1208,7 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | `By { key }` (`ast.rs:1024`) | `Spans` → `Groups{key}` | never lowers (`No(NotYetLowered)`) — the evaluator builds the span sets | **shape unchanged**; records the key as an evaluator-owned group consumer; and then EITHER records `grouping` and leaves `exact` alone, when the key renders on this generator's source and the slot is free and the relation is still exact, OR clears `exact` | never lowers | *none* |
 | `Coalesce` (`ast.rs:1026`), after a `By` | `Groups` → `Spans` | the level carries no `HAVING` — then the grouping slot is FREED. With a `HAVING` it refuses: the aggregate selected groups, and the spans it selected are not recoverable | **shape unchanged** — `Groups` in the ordinary case, but `Spans` if the preceding `By` was itself residual; clears `exact` when it refuses | conditional | *none* |
 | `Coalesce`, with no preceding `By` | `Spans` → `Spans` | none — the identity | none | **always lowers**, contributing no SQL | *none* |
-| `Select { fields }` (`ast.rs:1002`) | any → same shape, wider `cols` | every field resolves in `cols`. **No exactness precondition** — projecting a column onto rows the evaluator will drop is harmless | `cols` unchanged; the fields become an evaluator-owned projection | conditional on resolution, **over the accepted payload set only** | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4 |
+| `Select { fields }` (`ast.rs:1002`) | any → same shape | **never lowers.** `apply` returns the relation unchanged and `capability` has no `Yes` arm, so field resolution decides only which `BlockReason` is reported: `select(name)` reports `NotYetLowered` and every attribute spelling reports `NameNotResolvable`, because a TraceQL seed's `ColSet` is `Closed([trace_id, name])`. Measured on both seed sources by `traces::compile::tests::select_refuses_and_names_its_reason_per_field`. **No exactness precondition** — projecting a column onto rows the evaluator will drop would be harmless | **wider `cols`**: no existing column moves, and `set_provenance` ADDS the selected field as `EvaluatorOnly` (`compile/fold.rs:242`), which the effect table already expects (`traces/compile.rs:1686`) | **never lowers** — the two refusal reasons are the only outcomes, and `NameNotResolvable` is what the explain surface renders (`compile/plan.rs:879`) for every spelling a client writes | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4, and §9.8 measured the join and refused it |
 | `Metric(MetricStage)` (`ast.rs:1033`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:1228`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:90`) | n/a |
 | `MetricSecondStage(SecondStage)` (`ast.rs:1037`) | — | `400` on search (`search_plan.rs:1235`) | n/a | not in the chain | n/a |
 | `Compare { .. }` (`ast.rs:1049`) | — | `400` on search (`search_plan.rs:1241`) | n/a | not in the chain | n/a |
@@ -1254,7 +1254,7 @@ of the pipeline."
 |---|---|---|
 | **spanset aggregate** (`count`/`sum`/`avg`/`min`/`max`) | the whole two-phase loop: 1,110 round trips, 76,616,608 metered bytes, 5,705,629,767 rows read (§9.2) | **measured on C1** |
 | **`by()` regrouping** | adds no query of its own; its saving is the same loop collapse when the selector is lowerable | argued — it adds no read |
-| **`select()` projection** | one extra read per batch; +4.6 KiB per request and one extra round trip | measured on C2 (issue #478) |
+| **`select()` projection** | one extra read per batch; +4.6 KiB per request and one extra round trip. **Measured and refused** in §9.8: for the query whose only attribute-index read is the `select()` value read there is nothing to merge it with, and putting an attribute value into a `trace_spans` statement is a join | measured on C2 (issue #478); the refusal measured on §9.8's corpus |
 | **field-vs-field comparison** `{ .a = .b }` | **four** `attr_values_sql` reads per batch, not two — each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1346-1347`), so a two-operand leaf reads both values twice. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
 | **cross-field arithmetic** `{ .a * 2 > .b }` | the same four reads per batch; 347 statements and 2,869,590,609 rows read for a request matching 9,000 traces (§9.7) | **measured on C6** |
 | **event/link set comparison** `{ .a = event:name }` | one `event_set_sql` co-load per batch **plus the scalar operand's two value reads**; 2,502 statements and 13,995,704,756 rows read (§9.7) | **measured on C6** |
@@ -2964,6 +2964,1009 @@ does not change a configuration default, and **files nothing**.
 
 ---
 
+### 9.8 `select()` is refused, and the measurement that refuses it
+
+Issue #492 part 7 asked whether a `select()` projection can be compiled into the statements a
+TraceQL search already sends. It cannot, for the query the scope enumeration names, and part 7
+changes no production line. This section is the measurement, so that the round which amends
+[ADR 0008](decisions/0008-sql-composition-for-lowered-pipelines.md) starts from figures rather than
+from an argument.
+
+**The finding first, because it is the one an amendment has to meet.** The per-query join form — the
+shape that justifies "replaces one statement per batch with one statement per query" — does not
+survive the shipped generator memory ceiling. At `max_memory_usage = 536870912`, the shipped
+`reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:518`, applied by
+`generator_settings`, `crates/pulsus-read/src/traces/exec.rs:2869`), it refused on all three takes,
+`exception_code` 241, 721 marks selected, no rows out. **The refusal is asserted on `Code: 241` and
+`512.00 MiB`, and on nothing else.** Everything else in the message is a record, and the three
+bodies below differ from each other in all four of the ways it can: the "would use" figure takes two
+values across these three takes, the chunk figure takes two, the execution site takes two — the
+aggregate on two takes and a storage read on the third — and a part path appears on one take of the
+three. All three takes are the same statement at the same ceiling on the same build.
+
+```text
+take 1, build 81e37dde-8239-405e-a5ab-fddd4c68a5de:
+Code: 241. DB::Exception: Query memory limit exceeded: would use 514.04 MiB (attempt to allocate chunk of 4.00 MiB), maximum: 512.00 MiB: While executing AggregatingTransform. (MEMORY_LIMIT_EXCEEDED) (version 26.3.29.7 (official build))
+take 2, build 81e37dde-8239-405e-a5ab-fddd4c68a5de:
+Code: 241. DB::Exception: Query memory limit exceeded: would use 514.04 MiB (attempt to allocate chunk of 4.00 MiB), maximum: 512.00 MiB: While executing AggregatingTransform. (MEMORY_LIMIT_EXCEEDED) (version 26.3.29.7 (official build))
+take 3, build 81e37dde-8239-405e-a5ab-fddd4c68a5de:
+Code: 241. DB::Exception: Query memory limit exceeded: would use 514.05 MiB (attempt to allocate chunk of 4.04 MiB), maximum: 512.00 MiB: (while reading column trace_id): (while reading from part /var/lib/clickhouse/store/3c6/3c6209c2-899e-4088-8041-c0bb02613ec1/20231117_9_12_2/ in table arch492p7.trace_attrs_idx (3c6209c2-899e-4088-8041-c0bb02613ec1) located on disk default of type local, from mark 24 with max_rows_to_read = 4096, offset = 0): While executing MergeTreeSelect(pool: ReadPool, algorithm: Thread). (MEMORY_LIMIT_EXCEEDED) (version 26.3.29.7 (official build))
+```
+
+**The statement those three bodies come from.** The capture statement printed under "The
+instrument" below selects `exception_code` but not the body, so the bodies were read by a second
+`system.query_log` statement, run after the same flush loop against the same build:
+
+```sql
+SELECT ql.query_id, ql.exception
+FROM system.query_log AS ql
+WHERE ql.type = 'ExceptionWhileProcessing'
+  AND startsWith(ql.query_id, 'p7c_t4_join_ceiling_')
+ORDER BY ql.query_id
+```
+
+It returns three rows, one per take. They are the only rows the capture found with a non-zero
+`exception_code`: of the 42 takes that capture returned, the three ceiling takes of `t4_join` are
+the only ones that failed. `'p7c_t4_join_ceiling_'` is this section's `query_id` prefix followed by
+the statement name, so a re-taker changes the same string literal here as in the capture statement.
+
+**These three bodies are this build's own output, read from the container that produced the
+figures below.** They are not an illustration of the shape such a body has: the statement above was
+run against the measurement container while it was still up, and its three rows were copied from
+the terminal into this section. The copying step itself is checked by nothing: the container is
+gone and its terminal was not saved. What can be shown is that the three takes the statement above
+matches are in the capture, and failed there. These are three rows of the capture output file — the
+scratch file the next paragraph describes — with its header, read out of that file by
+`(head -1 <capture file>; grep '^p7c_t4_join_ceiling_' <capture file>) | cut -f1-5,8 | column -t` —
+the `memory_usage` and `result_bytes` columns are cut, because they are records and this section
+does not publish them:
+
+```text
+query_id               exception_code  marks  read_rows  result_rows  build_uuid
+p7c_t4_join_ceiling_1  241             721    2551808    0            81e37dde-8239-405e-a5ab-fddd4c68a5de
+p7c_t4_join_ceiling_2  241             721    2592768    0            81e37dde-8239-405e-a5ab-fddd4c68a5de
+p7c_t4_join_ceiling_3  241             721    2699264    0            81e37dde-8239-405e-a5ab-fddd4c68a5de
+```
+
+Those are the three `query_id`s in full, and they are the row the tables below summarise as
+`t4_join at ceiling`: 721 marks, `exception_code` 241, no rows out, three takes, on build
+`81e37dde-8239-405e-a5ab-fddd4c68a5de`. `read_rows` is a record and differs across the three. This
+does not show that the bodies above were copied from that container — nothing here shows that — only
+that the three takes they are attributed to exist in the capture and failed the way the bodies say.
+
+**The body statement's stdout was not kept.** The capture statement's output was written to a file
+at capture time — measurement scratch, not in this repository — and the `marks`, `read_rows`,
+`rows out` and `exception_code` columns of the take tables below were read out of that file. The
+body statement's output was not written anywhere: it was read off the terminal, and the block at the
+top of this section is the only copy of it that survives. The container has been removed, so it
+cannot be read again; a re-taker builds the corpus afresh and gets three new bodies, differing in
+the ways listed under "Varies" below.
+
+What was checked instead is the statement. The SQL printed above is byte-for-byte the file the
+measurement submitted, and it was run once more against a different server, on three throwaway
+queries made to fail on purpose under the same `query_id` spelling, to show it returns one row per
+take with a body in it rather than merely parsing. **Those throwaway bodies are not the
+measurement's, are not printed in this document, and are not the source of any figure here.** The
+three above were already in this file at commit `b97d6853`, which predates that run.
+
+**The same statement with only the join removed runs.** The control — `t4_control` below, which is
+`t4_join` with the `LEFT JOIN (…) AS sel ON …` block and the `sel.v AS sel_method` projection taken
+out and nothing else changed — answered 20 rows at 476 marks with `exception_code` 0, on all three
+takes at the same ceiling. **The breach is the join's, isolated by removing only the join.** A run
+where both fail, or both succeed, means the corpus is not the one this recipe builds.
+
+The corpus this happened on holds 10,000,000 `trace_attrs_idx` rows and 2,000,000 `trace_spans`
+rows, which is what the physical-layout statement printed under "The corpus" below returned.
+Code 241 on a generator read maps to `TooBroadReason::TraceGeneratorMemory`
+(`map_trace_generator_error`, `crates/pulsus-read/src/traces/exec.rs:701`) and the request answers
+**422**. Table 4 is the whole measurement.
+
+#### The build these figures come from
+
+- build `81e37dde-8239-405e-a5ab-fddd4c68a5de`
+
+That is the `system.tables.uuid` of `arch492p7.trace_spans` on the container the figures below were
+taken on, and it is not typed by hand: the capture statement returns it in the same row as the
+figures, so a take carries the identity of the build it ran on. `CREATE TABLE` generates it, so a
+rebuild of the same recipe gets a different one. The container ran ClickHouse **26.3.29.7**
+(`SELECT version()`), held one build of the recipe printed below, and was removed when the
+measurement finished.
+
+The third error body above carries `3c6209c2-899e-4088-8041-c0bb02613ec1`. A `Code: 241` that fails
+inside a storage read prints the part path, and the part path carries the UUID of the table being
+read; a failure in the aggregate has no part path, which is why two of the three bodies do not carry
+one. **That UUID corroborates nothing.** The capture statement returns `trace_spans`'s UUID, not
+`trace_attrs_idx`'s, so no saved output outside the body carries that value, and the container that
+could have been asked for the mapping has been removed. It is repeated here because it is part of
+the body; the build label above rests on the capture statement alone.
+
+**Nothing here checks that a take table carries the right UUID.** No check covers a mistyped or
+swapped label. What makes it unlikely rather than impossible is that the UUID is copied out of the
+capture statement's own output rather than written down from memory.
+
+#### The instrument
+
+Every batch statement was submitted over HTTP, by hand rather than by the reader, with exactly these
+settings, and the wire figure is that response piped to `wc -c`:
+
+```text
+default_format=RowBinaryWithNamesAndTypes&max_block_size=4096&use_query_condition_cache=0
+&max_rows_to_read=200000000&max_bytes_to_read=8589934592&read_overflow_mode=throw
+&max_result_bytes=1073741824&result_overflow_mode=throw&max_memory_usage=8589934592
+&max_bytes_before_external_group_by=0
+```
+
+`max_block_size=4096` is the shipped `TRACE_SEARCH_MAX_BLOCK_ROWS`
+(`crates/pulsus-read/src/traces/exec.rs:173`). `use_query_condition_cache=0` is in the instrument so
+that a second take of a statement cannot be served in part from work an earlier take left behind;
+this section does not measure what that setting is worth, it holds it fixed. Table 4's ceiling takes
+are the same string with `max_memory_usage=536870912`.
+
+**Wire bytes are measured outside the query log and are not `result_bytes`.** `result_bytes` is the
+in-memory block size of the result, not what crosses the metered hop, and on the hydration-against-
+join pair of table 3 the two moved in opposite directions on this build. This section publishes no
+`result_bytes` figure; the capture statement above returns the column for anyone who wants to look.
+Every byte figure below is `wc -c` over
+`default_format=RowBinaryWithNamesAndTypes` — the format the reader decodes
+(`crates/pulsus-clickhouse/src/lib.rs:3`) — with no query log involved.
+
+The granule figures come from this capture statement. It selects the build's `trace_spans` UUID in
+the same row as the figures:
+
+```sql
+SELECT ql.query_id,
+       ql.exception_code,
+       ql.ProfileEvents['SelectedMarks'] AS marks,
+       ql.read_rows, ql.result_rows, ql.memory_usage, ql.result_bytes,
+       (SELECT uuid FROM system.tables
+        WHERE database='arch492p7' AND name='trace_spans') AS build_uuid
+FROM system.query_log AS ql
+WHERE ql.type IN ('QueryFinish','ExceptionWhileProcessing')
+  AND startsWith(ql.query_id, 'p7c_')
+ORDER BY ql.query_id
+```
+
+`'p7c_'` is the prefix on the takes this section publishes: each `query_id` is that prefix, the
+statement name and the take number. Anyone re-taking these figures changes that one string literal
+to their own prefix.
+
+**`SYSTEM FLUSH LOGS` is not a barrier, and one capture can come back short.** Run the flush, wait,
+capture, and repeat until the row count stops growing; read the figures off the last run. A take
+table built from a single capture can be missing takes with nothing on the screen to say so, which
+is the same hazard as a query that matched nothing looking like a query that found nothing. The
+takes below were read off a capture whose row count had stopped growing, at 42 rows.
+
+**The instrument, validated where it must fail.** This returns `0`, and a harness that reads a
+figure out of an empty result must abort rather than print a plausible number:
+
+```sql
+SELECT count() AS rows_for_a_query_id_that_does_not_exist
+FROM system.query_log
+WHERE type='QueryFinish' AND query_id='v5_no_such_take_0000'
+```
+
+**And validated where it must discriminate.** `a1` with its key predicate deleted — `a1_nokey`,
+printed in table 1 — reads every granule in the table: 1,225 marks against `a1`'s 226. The mark
+figure is decided by the key predicate, not by the batch of trace ids.
+
+#### `<the 32>`, the batch every read below is taken over
+
+Every read below is one batch of 32 trace ids over the whole five-day window, which is what the
+shipped `BATCH_TRACES = 32` loop sends (`crates/pulsus-read/src/traces/exec.rs:117`). **`<the 32>`
+means exactly this list, in this order, wherever it appears in a statement below**, and it is the
+only substitution any statement in this section carries:
+
+```text
+'T000000000000099','T000000000006299','T000000000012599','T000000000018799','T000000000025099','T000000000031299','T000000000037501','T000000000043751','T000000000050001','T000000000056251','T000000000062501','T000000000068751','T000000000075001','T000000000081251','T000000000087501','T000000000093751','T000000000100001','T000000000106251','T000000000112501','T000000000118751','T000000000125001','T000000000131251','T000000000137501','T000000000143751','T000000000150001','T000000000156251','T000000000162501','T000000000168751','T000000000175001','T000000000181251','T000000000187501','T000000000193751'
+```
+
+which is what this generator prints, one id per row:
+
+```sql
+WITH number*6250 + if(number<6,if(number%2=0,99,49),1) AS n
+SELECT toFixedString(concat('T',leftPad(toString(n),15,'0')),16) FROM numbers(32)
+```
+
+#### The corpus, as the text that builds it
+
+Run this through `clickhouse-client --multiquery --queries-file`. It is not runnable over HTTP: a
+multi-statement body answers `SYNTAX_ERROR`.
+
+```sql
+DROP DATABASE IF EXISTS arch492p7;
+CREATE DATABASE arch492p7;
+
+CREATE TABLE arch492p7.trace_spans (
+  trace_id FixedString(16), span_id FixedString(8), parent_id FixedString(8),
+  name LowCardinality(String), service LowCardinality(String),
+  timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)),
+  duration_ns Int64 CODEC(T64, ZSTD(1)), status_code Int8, kind Int8,
+  payload_type Int8, payload String CODEC(ZSTD(3)),
+  shared UInt8 DEFAULT 0,
+  status_message String DEFAULT '',
+  scope_name LowCardinality(String) DEFAULT '',
+  scope_version LowCardinality(String) DEFAULT '',
+  INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4,
+  PROJECTION service_time (SELECT * ORDER BY (service, timestamp_ns)),
+  PROJECTION span_name_day (SELECT toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS d, name, count() GROUP BY d, name)
+) ENGINE=MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+ORDER BY (trace_id,timestamp_ns)
+TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 10000 DAY DELETE
+SETTINGS ttl_only_drop_parts=1;
+
+CREATE TABLE arch492p7.trace_attrs_idx (
+  date Date, key LowCardinality(String), val String,
+  scope LowCardinality(String), val_num Nullable(Float64), timestamp_ns Int64,
+  trace_id FixedString(16), span_id FixedString(8), duration_ns Int64,
+  val_type LowCardinality(String) DEFAULT ''
+) ENGINE=ReplacingMergeTree
+PARTITION BY date
+ORDER BY (key,val,scope,timestamp_ns,trace_id,span_id)
+TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 10000 DAY DELETE
+SETTINGS ttl_only_drop_parts=1;
+
+CREATE VIEW arch492p7.p7_span_seed AS
+SELECT number AS span_n,
+  toFixedString(concat('T',leftPad(toString(intDiv(number,10)),15,'0')),16) AS trace_id,
+  toFixedString(leftPad(toString(number),8,'0'),8) AS span_id,
+  if(number%10=0,toFixedString('',8),
+     toFixedString(leftPad(toString(number-1),8,'0'),8)) AS parent_id,
+  concat('span-',toString(number%10)) AS name, 'checkout' AS service,
+  toInt64(1699920000000000000 + intDiv(number,400000)*86400000000000
+          + (number%400000)*100000000) AS timestamp_ns,
+  toInt64(1000000+(number%10000)) AS duration_ns,
+  toInt8(arrayElement([0,1,2,2,0],toUInt32(number%5+1))) AS status_code,
+  toInt8(number%6) AS kind, toInt8(0) AS payload_type, '' AS payload,
+  toUInt8(0) AS shared, '' AS status_message,
+  'review-scope' AS scope_name, '1.0' AS scope_version
+FROM numbers_mt(2000000);
+
+-- PIN (a): TWO inserts, split exactly here. The one-insert form's mark count is
+-- not stable across rebuilds; the pinned split gives 255.
+INSERT INTO arch492p7.trace_spans
+SELECT * EXCEPT span_n FROM arch492p7.p7_span_seed
+WHERE span_n%400000<200000;
+INSERT INTO arch492p7.trace_spans
+SELECT * EXCEPT span_n FROM arch492p7.p7_span_seed
+WHERE span_n%400000>=200000;
+DROP VIEW arch492p7.p7_span_seed;
+
+INSERT INTO arch492p7.trace_attrs_idx
+WITH intDiv(number,5) AS span_n, intDiv(span_n,10) AS trace_n,
+ number%5 AS attr_n,
+ toInt64(1699920000000000000 + intDiv(span_n,400000)*86400000000000
+         + (span_n%400000)*100000000) AS ts,
+ arrayElement(['service.namespace','tenant','http.method','http.status_code','k4'],
+              toUInt32(attr_n+1)) AS attr_key,
+ multiIf(
+   -- PIN (b): 91/89/90/90/90 by date, 90% overall. Uniform 90 gives 225 / 470.
+   attr_n=0,if((intDiv(trace_n,40000)=0 AND trace_n%100<91)
+              OR (intDiv(trace_n,40000)=1 AND trace_n%100<89)
+              OR (intDiv(trace_n,40000)>=2 AND trace_n%100<90),'prod','dev'),
+   attr_n=1,concat('tenant-',toString(trace_n%50)),
+   -- PIN (c): this assignment decides the attribute statements' wire bytes.
+   attr_n=2,arrayElement(['GET','POST','PUT','DELETE','PATCH'],toUInt32(span_n%5+1)),
+   attr_n=3,toString(arrayElement([200,400,404,500,503],toUInt32(span_n%5+1))),
+   concat('v',toString(span_n%100))) AS attr_val
+SELECT toDate(fromUnixTimestamp64Nano(ts)), attr_key, attr_val,
+ if(attr_n IN (0,1),'resource','span'),
+ if(attr_n=3,toNullable(toFloat64(attr_val)),NULL), ts,
+ toFixedString(concat('T',leftPad(toString(trace_n),15,'0')),16),
+ toFixedString(leftPad(toString(span_n),8,'0'),8),
+ toInt64(1000000+(span_n%10000)), if(attr_n=3,'int','string')
+FROM numbers_mt(10000000);
+OPTIMIZE TABLE arch492p7.trace_spans FINAL;
+OPTIMIZE TABLE arch492p7.trace_attrs_idx FINAL;
+```
+
+Three pins in that text decide figures below. **(a)** the span insert is split into two, exactly
+where the recipe splits it; a single insert lands its part boundaries wherever the threads finish
+and its mark count is not stable across rebuilds. **(b)** the `service.namespace` split is
+91/89/90/90/90 by date rather than a uniform 90%, which is what makes `a1` 226 marks rather than
+225. **(c)** which HTTP method lands on which span decides the attribute statements' wire bytes and
+nothing else — marks and rows do not move with it.
+
+**Pin (b)'s comment names a figure this build did not produce.** `225 / 470` comes from the
+uniform-90 counterfactual corpus, built and measured while the recipe was being pinned and published
+at [`5572477064`](https://github.com/digitalis-io/pulsusdb/issues/492#issuecomment-5572477064),
+[`5573379164`](https://github.com/digitalis-io/pulsusdb/issues/492#issuecomment-5573379164) and
+[`5574039261`](https://github.com/digitalis-io/pulsusdb/issues/492#issuecomment-5574039261). It is
+kept in the recipe because it is what tells a re-taker which corpus they built. No figure this
+section publishes comes from it.
+
+**A `trace_spans` without `status_message` cannot run table 3 at all.** The shipped hydration
+statement projects that column (`hydration_sql`,
+`crates/pulsus-read/src/traces/search_sql.rs:230`, and any `== phase2 hydration ==` section in the
+committed goldens), so a reduced span shape fails with `UNKNOWN_IDENTIFIER` before the query starts
+rather than returning a wrong number. That is the good failure, but only if the recipe carries the
+column — which is why it carries the full shipped span shape: migration 16 plus `shared`,
+`status_message`, `scope_name`/`scope_version` and the `span_name_day` projection.
+
+**What that recipe produced here.** The physical layout:
+
+```sql
+SELECT table, sum(rows), count(), sum(marks), groupArrayDistinct(part_type)
+FROM system.parts WHERE active AND database='arch492p7'
+GROUP BY table ORDER BY table
+```
+
+```text
+trace_attrs_idx  10000000  5  1230  ['Wide']
+trace_spans       2000000  5   255  ['Wide']
+```
+
+Read that statement once the `OPTIMIZE … FINAL`s have settled. Taken immediately after the recipe
+returned it answered `trace_attrs_idx 10000000 8 1234`, because a merge's source parts were still
+marked active; the three reads taken afterwards all gave the five parts above.
+
+And the per-date split that shows pin (b) landed:
+
+```sql
+SELECT date, countIf(val='prod') FROM arch492p7.trace_attrs_idx
+WHERE key='service.namespace' GROUP BY date ORDER BY date
+```
+
+```text
+2023-11-14  364000      2023-11-16  360000
+2023-11-15  356000      2023-11-17  360000
+                        2023-11-18  360000
+```
+
+A corpus answering `360000` five times is the uniform-90 one, and that is how to tell the two apart
+before running anything else.
+
+#### The statement register
+
+Every statement any figure in this section comes from, and where it is printed in full.
+
+```text
+statement            printed in                     what it produces a figure for
+the id generator     "`<the 32>`" above             the batch every read is taken over
+the capture          "The instrument" above         every mark, rows-read, rows-out and
+                                                    exception-code figure below
+the error-body read  the top of this section        the three `Code: 241` bodies
+the zero-row check   "The instrument" above         the instrument's own empty answer
+the recipe           "The corpus" above             the corpus
+physical layout      "The corpus" above             parts, rows, marks, part type
+per-date prod        "The corpus" above             the per-date `prod` counts
+a1                   table 1                        226 / 1,851,392 / 260 / 6,289
+a1_nokey             table 1                        1,225 / 10,000,000 / 320 / 7,729
+a2                   table 1                        245 / 2,007,040 / 320 / 11,651
+a3                   table 1                        471 / 3,858,432 / 320 / 11,985
+a4_widened           table 1                        495 / 4,055,040 / 320 / 11,985
+t2_agg               table 2                        250 / 2,048,000 / 320 / 11,918
+t2_select            table 2                        250 / 2,048,000 / 320 / 10,307
+t2_merged            table 2                        250 / 2,048,000 / 320 / 13,207
+t3_hyd               table 3                        32 / 262,144 / 320 / 27,106
+t3_join              table 3                        277 / 2,269,184 / 320 / 31,036
+t3_no_alias          table 3                        277 / 2,269,184 / 320 / 31,028
+t4_join              table 4                        721 marks, at both ceilings
+t4_control           table 4                        476 marks, 20 rows out
+answer agreement     "The answers agree" below      260 / 320 / 320 and four zeros
+the witness          "The join-free merge" below    two rows against three
+```
+
+A figure whose statement is not in that list is not published in this section. In particular this
+section publishes no `result_bytes` figure and no peak-memory figure, and it compares nothing
+against C1's corpus.
+
+#### Table 1 — two attribute-index reads over DIFFERENT keys
+
+`{ .service.namespace = "prod" } | select(span.http.method)` sends a membership read and a value
+read over one batch. **a1**, the membership read:
+
+```sql
+SELECT DISTINCT trace_id, span_id
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND (key = 'service.namespace' AND val = 'prod')
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+```
+
+**a1_nokey** — the same statement with its key predicate deleted. It is here as the instrument's
+discrimination check, not as a form anything would send:
+
+```sql
+SELECT DISTINCT trace_id, span_id
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+```
+
+**a2**, the `select()` value read:
+
+```sql
+SELECT trace_id, span_id,
+       any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v,
+       any(val_type) AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND key = 'http.method' AND scope = 'span'
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+```
+
+**a3**, the join-free merge: one statement carrying both predicates as a disjunction, with a
+presence count for the membership side and an `anyIf` for the value side:
+
+```sql
+SELECT trace_id, span_id,
+       countIf(key = 'service.namespace' AND val = 'prod') > 0 AS matched,
+       anyIf(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)),
+             key = 'http.method' AND scope = 'span') AS v,
+       anyIf(val_type, key = 'http.method' AND scope = 'span') AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND ((key = 'service.namespace' AND val = 'prod')
+       OR (key = 'http.method' AND scope = 'span'))
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+```
+
+**a4_widened**, the form the design record rejected: the same merge with the two predicates widened
+into `key IN (…)`, which throws the `val` prune away:
+
+```sql
+SELECT trace_id, span_id,
+       countIf(key = 'service.namespace' AND val = 'prod') > 0 AS matched,
+       anyIf(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)),
+             key = 'http.method' AND scope = 'span') AS v,
+       anyIf(val_type, key = 'http.method' AND scope = 'span') AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND (key IN ('service.namespace','http.method'))
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+```
+
+```text
+                                                marks   rows read   rows out   wire bytes   stmts
+a1    membership                                  226   1,851,392        260        6,289
+a2    select values                               245   2,007,040        320       11,651
+        today, the pair                           471   3,858,432        320       17,940       2
+a3    merged as one disjunction                   471   3,858,432        320       11,985       1
+a4_widened  merged, key IN (…)                    495   4,055,040        320       11,985       1
+a1_nokey    a1 with no key predicate            1,225  10,000,000        320        7,729
+```
+
+`471 = 226 + 245` and `3,858,432 = 1,851,392 + 2,007,040`, exactly. **The disjunctive form keeps the
+`val` prune** — the branch that has it is written out in full instead of being widened away — so it
+reads exactly what the two statements it replaces read, in one statement, and costs 33.2% fewer
+bytes on the metered hop. Widening to `key IN (…)` selects 495 marks instead: **that** is the form
+the design record rejected, and it is not the only join-free one. This is the same phenomenon part 4
+measured on the phase-1 generators (`148 = 25 + 123`, `traces_search_plan_parts.rs:48-54`),
+reproduced one layer down.
+
+#### Table 2 — two attribute-index reads over the SAME key
+
+`| by(span.foo)` and a right-hand-side attribute operand send an aggregate `val_num` read and a
+`select()` `val` read over one `(key, scope)` prefix. **t2_agg**:
+
+```sql
+SELECT trace_id, span_id, any(val_num) AS v, any(val_type) AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND key = 'http.status_code'
+  AND scope = 'span'
+  AND isNotNull(val_num)
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+```
+
+**t2_select**:
+
+```sql
+SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v, any(val_type) AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND key = 'http.status_code'
+  AND scope = 'span'
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+```
+
+**t2_merged**, the two in one statement:
+
+```sql
+SELECT trace_id, span_id,
+       anyIf(val_num, isNotNull(val_num)) AS n,
+       any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v,
+       any(val_type) AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND key = 'http.status_code'
+  AND scope = 'span'
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+```
+
+```text
+                                                marks   rows read   rows out   wire bytes   stmts
+t2_agg      aggregate values                      250   2,048,000        320       11,918
+t2_select   select values                         250   2,048,000        320       10,307
+              today, the pair                     500   4,096,000        320       22,225       2
+t2_merged   merged into one statement             250   2,048,000        320       13,207       1
+```
+
+**Half the marks, half the rows, 40.6% fewer bytes, one round trip instead of two.**
+
+#### Table 3 — the join, per batch
+
+**t3_hyd**, the shipped hydration render over the same batch:
+
+```sql
+SELECT trace_id, span_id, parent_id,
+       if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service,
+       if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name,
+       timestamp_ns, duration_ns, status_code,
+       if(length(status_message) <= 8192, status_message, substringUTF8(status_message, 1, 2048)) AS status_message,
+       kind,
+       if(length(scope_name) <= 8192, scope_name, substringUTF8(scope_name, 1, 2048)) AS scope_name,
+       if(length(scope_version) <= 8192, scope_version, substringUTF8(scope_version, 1, 2048)) AS scope_version
+FROM arch492p7.trace_spans
+WHERE trace_id IN (<the 32>)
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
+LIMIT 10001 BY trace_id
+```
+
+**t3_join**, that statement as the left side and a2 as the right side:
+
+```sql
+SELECT h.trace_id, h.span_id, h.parent_id, h.service, h.name, h.timestamp_ns, h.duration_ns, h.status_code, h.status_message, h.kind, h.scope_name, h.scope_version, sel.v AS sel_v, sel.t AS sel_t
+FROM (
+SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns, status_code, if(length(status_message) <= 8192, status_message, substringUTF8(status_message, 1, 2048)) AS status_message, kind, if(length(scope_name) <= 8192, scope_name, substringUTF8(scope_name, 1, 2048)) AS scope_name, if(length(scope_version) <= 8192, scope_version, substringUTF8(scope_version, 1, 2048)) AS scope_version
+FROM arch492p7.trace_spans
+WHERE trace_id IN (<the 32>)
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
+LIMIT 10001 BY trace_id
+) AS h
+LEFT JOIN (
+SELECT trace_id, span_id,
+       any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v,
+       any(val_type) AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND key = 'http.method' AND scope = 'span'
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+) AS sel ON sel.trace_id = h.trace_id AND sel.span_id = h.span_id
+```
+
+**t3_no_alias** — the same statement with the two output aliases gone. It is here because the marks
+and the rows do not move with the projection text while the byte figure does, by the eight
+characters the header loses:
+
+```sql
+SELECT h.trace_id, h.span_id, h.parent_id, h.service, h.name, h.timestamp_ns, h.duration_ns, h.status_code, h.status_message, h.kind, h.scope_name, h.scope_version, sel.v, sel.t
+FROM (
+SELECT trace_id, span_id, parent_id, if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service, if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name, timestamp_ns, duration_ns, status_code, if(length(status_message) <= 8192, status_message, substringUTF8(status_message, 1, 2048)) AS status_message, kind, if(length(scope_name) <= 8192, scope_name, substringUTF8(scope_name, 1, 2048)) AS scope_name, if(length(scope_version) <= 8192, scope_version, substringUTF8(scope_version, 1, 2048)) AS scope_version
+FROM arch492p7.trace_spans
+WHERE trace_id IN (<the 32>)
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
+LIMIT 10001 BY trace_id
+) AS h
+LEFT JOIN (
+SELECT trace_id, span_id,
+       any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v,
+       any(val_type) AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND key = 'http.method' AND scope = 'span'
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+) AS sel ON sel.trace_id = h.trace_id AND sel.span_id = h.span_id
+```
+
+```text
+                                                marks   rows read   rows out   wire bytes   stmts
+t3_hyd      hydration, the same 32 ids            32     262,144        320       27,106
+a2          select values                        245   2,007,040        320       11,651
+              today, the pair                    277   2,269,184        320       38,757       2
+t3_join     hydration LEFT JOIN a2               277   2,269,184        320       31,036       1
+t3_no_alias the same, output aliases dropped     277   2,269,184        320       31,028       1
+```
+
+`277 = 32 + 245` and `2,269,184 = 262,144 + 2,007,040`, exactly. Same marks, same rows, 19.9% fewer
+bytes, one statement instead of two — **per batch**. That is the join the design record's saving
+would actually buy, and it is not the one the record documents.
+
+#### Table 4 — the join per QUERY, which is the form the record documents
+
+The design record's worked example puts the selector inline as a subquery so the whole request is
+one statement. **t4_join**:
+
+```sql
+SELECT s.trace_id, s.span_id, sel.v AS sel_method
+FROM arch492p7.trace_spans AS s
+LEFT JOIN (
+  SELECT trace_id, span_id, any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v
+  FROM arch492p7.trace_attrs_idx
+  WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+    AND key = 'http.method' AND scope = 'span'
+    AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  GROUP BY trace_id, span_id
+) AS sel ON sel.trace_id = s.trace_id AND sel.span_id = s.span_id
+WHERE s.timestamp_ns > 1699919999999999999 AND s.timestamp_ns <= 1700345598900000000
+  AND (s.trace_id, s.span_id) IN (
+    SELECT trace_id, span_id FROM arch492p7.trace_attrs_idx
+    WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+      AND key = 'service.namespace' AND val = 'prod' AND scope = 'resource'
+      AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000)
+ORDER BY s.trace_id ASC, s.span_id ASC
+LIMIT 20
+```
+
+**t4_control** — the same statement with the join block and the `sel.v AS sel_method` projection
+removed, and nothing else changed:
+
+```sql
+SELECT s.trace_id, s.span_id
+FROM arch492p7.trace_spans AS s
+WHERE s.timestamp_ns > 1699919999999999999 AND s.timestamp_ns <= 1700345598900000000
+  AND (s.trace_id, s.span_id) IN (
+    SELECT trace_id, span_id FROM arch492p7.trace_attrs_idx
+    WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+      AND key = 'service.namespace' AND val = 'prod' AND scope = 'resource'
+      AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000)
+ORDER BY s.trace_id ASC, s.span_id ASC
+LIMIT 20
+```
+
+```text
+                                    marks   exception_code   rows out   takes
+t4_join    at 8589934592              721                0         20   3 of 3
+t4_control at 536870912               476                0         20   3 of 3
+t4_join    at 536870912               721              241          0   3 of 3
+```
+
+The extra 245 marks the joined form selects are exactly the whole `key='http.method' AND
+scope='span'` prefix over the window, measured alone as a2's 245: the per-query form's right side
+carries no candidate restriction at all. Bounding it is what makes the join per batch, which is
+table 3.
+
+#### Reproduces — the checks, with their takes
+
+Every quantity here took the same value on every take. **A re-take that differs means the recipe is
+wrong**: say so rather than editing the figure. Three takes of each statement on the one build named
+above, unless the row says otherwise.
+
+```text
+build 81e37dde-8239-405e-a5ab-fddd4c68a5de
+statement            marks   read_rows    rows out   takes
+a1                     226   1,851,392         260   3
+a1_nokey             1,225  10,000,000         320   3
+a2                     245   2,007,040         320   3
+a3                     471   3,858,432         320   3
+a4_widened             495   4,055,040         320   3
+t2_agg                 250   2,048,000         320   3
+t2_select              250   2,048,000         320   3
+t2_merged              250   2,048,000         320   3
+t3_hyd                  32     262,144         320   3
+t3_join                277   2,269,184         320   3
+t3_no_alias            277   2,269,184         320   3
+t4_join    at 8 GiB    721   (a record)         20   3, exception_code 0
+t4_control at ceiling  476   (a record)         20   3, exception_code 0
+t4_join    at ceiling  721   (a record)          0   3, exception_code 241
+
+physical layout   trace_spans      2,000,000 rows / 5 parts / 255 marks / Wide
+                  trace_attrs_idx 10,000,000 rows / 5 parts / 1,230 marks / Wide
+per-date prod     364,000  356,000  360,000  360,000  360,000
+identities        471 = 226 + 245          3,858,432 = 1,851,392 + 2,007,040
+                  277 =  32 + 245          2,269,184 =   262,144 + 2,007,040
+                  721 = 476 + 245
+answer agreement  260 / 320 / 320 rows, all four symmetric differences 0
+the witness       2 rows from a2's shape, 3 from a3's
+the instrument    a `query_id` that does not exist returns 0 rows
+```
+
+**The identity alone is not the check**, which is why both sides of every row above are asserted.
+On the uniform-90 corpus — pin (b) undone — the marks are different and the identity still holds;
+that corpus was built and measured while the recipe was being pinned, and its figures are at the
+three comment ids cited under the recipe. It was not rebuilt here.
+
+`read_rows` on the three table-4 forms is in the record below rather than here. **Measured:** those
+three differ take to take, while the eleven batch statements above repeated exactly. **Argued:**
+the difference is `LIMIT 20` stopping the read at a thread boundary, which the batch statements have
+no equivalent of, so they read every granule they select. What would falsify the argument is a
+table-4 form whose `read_rows` repeats exactly over many takes, or a batch statement whose
+`read_rows` moves.
+
+#### Varies — the records, every take
+
+These are published as their takes and are checked by nothing. **A take that differs is added to the
+record; it is not a failure.** No bound, no range, no tolerance and no invariant is stated on any of
+them.
+
+Wire bytes, `wc -c` over `default_format=RowBinaryWithNamesAndTypes`, three takes each on the one
+build named above. They agreed on all three takes here; that is what was observed, not a property
+being claimed:
+
+```text
+build 81e37dde-8239-405e-a5ab-fddd4c68a5de
+statement       take 1   take 2   take 3
+a1               6,289    6,289    6,289
+a1_nokey         7,729    7,729    7,729
+a2              11,651   11,651   11,651
+a3              11,985   11,985   11,985
+a4_widened      11,985   11,985   11,985
+t2_agg          11,918   11,918   11,918
+t2_select       10,307   10,307   10,307
+t2_merged       13,207   13,207   13,207
+t3_hyd          27,106   27,106   27,106
+t3_join         31,036   31,036   31,036
+t3_no_alias     31,028   31,028   31,028
+```
+
+Table 4's `read_rows`, each take:
+
+```text
+build 81e37dde-8239-405e-a5ab-fddd4c68a5de
+form                     take 1      take 2      take 3
+t4_join    at 8 GiB     3,973,120   4,026,368   4,009,984
+t4_control at ceiling   3,448,832   3,489,792   3,338,240
+t4_join    at ceiling   2,551,808   2,592,768   2,699,264
+```
+
+`memory_usage` and `result_bytes` are records too, and this section publishes neither. The capture
+statement returns both, in the columns of those names, for anyone who wants them; on this build
+`t3_join` reported a different `memory_usage` and a different `result_bytes` on its first take from
+the two after it, which is why a bound on either would be worthless.
+
+The error body is a record beyond `Code: 241` and `512.00 MiB`. The three bodies at the top of this
+section are one build's three takes of one statement: the "would use" figure takes two values across
+them, the chunk figure takes two, and the execution site takes two — two takes failed in the
+aggregate and one in a storage read, and only the storage-read take carries a part path. That part
+path carries a container-local table UUID, so it cannot repeat across builds at all. That run's
+stdout was not kept, so the block at the top of this section is the only copy of those three
+bodies; the note beside them says so, and gives the statement they came from.
+
+#### The answers agree
+
+The merged form of table 1 must return the same answers as the two statements it replaces. This
+statement inlines a1, a2 and a3 verbatim and counts the symmetric differences in both directions,
+on the membership set and on the projection:
+
+```sql
+WITH
+  a1 AS (
+SELECT DISTINCT trace_id, span_id
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND (key = 'service.namespace' AND val = 'prod')
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+  ),
+  a2 AS (
+SELECT trace_id, span_id,
+       any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v,
+       any(val_type) AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND key = 'http.method' AND scope = 'span'
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+  ),
+  a3 AS (
+SELECT trace_id, span_id,
+       countIf(key = 'service.namespace' AND val = 'prod') > 0 AS matched,
+       anyIf(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)),
+             key = 'http.method' AND scope = 'span') AS v,
+       anyIf(val_type, key = 'http.method' AND scope = 'span') AS t
+FROM arch492p7.trace_attrs_idx
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-18')
+  AND ((key = 'service.namespace' AND val = 'prod')
+       OR (key = 'http.method' AND scope = 'span'))
+  AND timestamp_ns > 1699919999999999999 AND timestamp_ns <= 1700345598900000000
+  AND trace_id IN (<the 32>)
+GROUP BY trace_id, span_id
+  )
+SELECT (SELECT count() FROM a1)                                        AS a1_rows,
+       (SELECT count() FROM a2)                                        AS a2_rows,
+       (SELECT count() FROM a3)                                        AS a3_rows,
+       (SELECT count() FROM (SELECT trace_id, span_id FROM a1
+                             EXCEPT SELECT trace_id, span_id FROM a3 WHERE matched)) AS a1_minus_a3,
+       (SELECT count() FROM (SELECT trace_id, span_id FROM a3 WHERE matched
+                             EXCEPT SELECT trace_id, span_id FROM a1))              AS a3_minus_a1,
+       (SELECT count() FROM (SELECT trace_id, span_id, v, t FROM a2
+                             EXCEPT SELECT trace_id, span_id, v, t FROM a3))        AS a2_minus_a3,
+       (SELECT count() FROM (SELECT trace_id, span_id, v, t FROM a3
+                             EXCEPT SELECT trace_id, span_id, v, t FROM a2))        AS a3_minus_a2
+```
+
+It answered, `TSVWithNames`:
+
+```text
+a1_rows	a2_rows	a3_rows	a1_minus_a3	a3_minus_a1	a2_minus_a3	a3_minus_a2
+260	320	320	0	0	0	0
+```
+
+The merged form's `matched` set is the membership statement's row set and its
+`(trace_id, span_id, v, t)` projection is the value statement's, in both directions.
+
+#### The ADR's rule sentence is wider than the decision it records, and this part does not change it
+
+ADR 0008 is titled "SQL composition for lowered query pipelines" and its three rules govern how a
+lowered pipeline composes. The rule added on 2026-09-02 is written without that qualifier — "no
+emitted SQL may contain a join until this ADR is amended to name the clause"
+(`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`, the same claim in the summary
+at line 11). Six committed goldens carry a join today and **none is planned by the compile core**:
+
+- `traces_graph/clustered_local_join.sql` and `traces_graph/single_node.sql`, one join line each,
+  from `service_graph_sql` (`crates/pulsus-read/src/traces/graph_sql.rs:92`, `INNER JOIN` at 109),
+  called from `crates/pulsus-read/src/traces/exec.rs:1693` and nowhere else.
+- `traces_metrics/compare_status.sql` and `traces_metrics/compare_status_window.sql`, seven join
+  lines each. Six of the seven come from `metrics_compare_sql`
+  (`crates/pulsus-read/src/traces/metrics_sql.rs:1189`, `LEFT JOIN` at 1253 and `INNER JOIN` at
+  1257), which builds one string holding both joins and feeds it to the cross-tab and the probe,
+  and which `metrics_plan.rs` calls three times (`:607`, `:619`, `:631`). The seventh comes from
+  `metrics_compare_exemplar_range_sql` (`metrics_sql.rs:1380`, `INNER JOIN` at 1425, called at
+  `metrics_plan.rs:646`).
+- `traces_metrics_base/compare_status.sql` and `traces_metrics_base/compare_status_window.sql`,
+  four join lines each. These are **historic**: each is byte-identical to
+  `git show 2f78c53:crates/pulsus-read/tests/golden/traces_metrics/` at the same file name, they carry no
+  exemplars section, and no test regenerates them. They are not unmoored from today's builder —
+  `every_instant_side_section_is_byte_identical_to_base` ties two of their four join lines to the
+  current file's bytes, and `the_declared_inverse_restores_every_moved_section_to_its_base_bytes`
+  inverts the cross-tab section under three timestamp substitutions, none of which touches a `JOIN`
+  line.
+
+All six come from hand-written builders on routes the compile core classifies `Never` —
+`NotASearchLinkLower::capability`, `crates/pulsus-read/src/traces/compile.rs:1188-1196` — so they
+are not lowered pipelines and the decision never reached them. The sentence reaches further than the
+decision it records: a drafting fault in the record, not shipped code breaking a rule. **The wording
+belongs to the amendment round ADR 0008 already reserves.** This part records the fact, scopes its
+gate to the compiled route's corpus, and pins the six by name so a seventh anywhere in the tree
+fails — `no_planned_search_statement_contains_a_join`,
+`crates/pulsus-read/tests/golden_sql_freeze.rs`, whose doc comment carries this same record beside
+the list.
+
+#### What this measures, and what it decides
+
+**The projection cannot compile without a join for a query whose only attribute-index read is its
+own; it can, join-free, for a query that already sends a second one — and that second thing is a
+different mechanism, not `select()` lowering.**
+
+`{ resource.service.name = "checkout" } | select(span.http.method)` sends four statements:
+`trace_spans` (the generator), `trace_spans:hydration`, `trace_attrs_idx:values` and
+`trace_spans:root`. Exactly one of them reads the attribute index, and it is the `select()` value
+read itself. There is nothing to merge it with. The other three read `trace_spans`, and putting an
+attribute value into a `trace_spans` statement means reading a second table inside one statement,
+which is a join. `Relation` has no join slot (`crates/pulsus-read/src/compile/fold.rs:623`), so a
+stage cannot contribute one without a type change, and ADR 0008 names no join clause. So part 7
+records the refusal and lowers nothing.
+
+That is a statement about the query, not about `select()` in general — which is why the refusal is
+pinned by three tests rather than asserted here.
+[`the_named_select_query_reads_the_attribute_index_exactly_once`](../crates/pulsus-read/tests/traceql_select_projection_refusal.rs)
+fails if the named query ever grows a second attribute-index read, or loses one of the other three
+statements. `exactly_one_committed_select_case_has_no_merge_partner`, in the same file, asserts both
+name lists, so it fails in either direction: if the named case gains a merge partner, or if any of
+the other six committed `select()` cases loses its. `select_refuses_and_names_its_reason_per_field`
+(`crates/pulsus-read/src/traces/compile.rs`, in `mod tests`) pins the dispatcher itself, on both
+seed sources and all six field spellings.
+
+**And the join the design record documents does not survive the shipped ceiling**, which is the top
+of this section. The form that does survive is the per-batch one, table 3, and that is one statement
+per batch — not one per query.
+
+#### The join-free merge is a different mechanism, and it is proposed later work on #492
+
+Tables 1 and 2 measure a real saving — a third of the metered bytes on one shape, half the marks on
+another — and it is **not `select()` lowering**. It is two phase-2 attribute-index reads sharing one
+SQL part, and it applies to a query with no `select()` in it at all. It is proposed as its own part
+on issue #492, after part 8, and it is not scheduled work until the owner schedules it.
+
+Its three prerequisites, each with what a taker must read first:
+
+1. **`plan_of`'s rule 2 must change.** Today every residual link with a handoff gets its own SQL
+   part, unconditionally (`crates/pulsus-read/src/compile/plan.rs:543`, the
+   `Disposition::Residual(_)` arm: "The evaluator's way of owning this link is to send a second
+   statement: it gets its own SQL part, not an engine part"). Merging two of them means a rule
+   saying when two handoffs over the same source and window share one part.
+2. **The presence-count discriminator.** A bare `anyIf` maps "the span carries the key with an empty
+   value" and "the span carries no such row" onto the same output row. `val_type` cannot tell them
+   apart: migration 39 added it with `DEFAULT ''` and pre-existing rows read back `''`
+   (`crates/pulsus-schema/src/catalog.rs:813`), and `StoredType::from_stored` maps `''` to `Unknown`
+   (`crates/pulsus-read/src/traces/search_eval.rs:166`). The merged statement must carry
+   `countIf(key = … AND scope = …) > 0` as its own column, which is what a3 does.
+
+   Measured, on a five-row witness. Span `0000000A` carries `service.namespace='prod'` and
+   `http.method='GET'`; `0000000B` carries only `service.namespace='prod'`; `0000000C` carries
+   `service.namespace='prod'` and `http.method` stored as the empty string with `val_type='string'`:
+
+   ```sql
+   DROP DATABASE IF EXISTS arch492p7w;
+   CREATE DATABASE arch492p7w;
+   CREATE TABLE arch492p7w.trace_attrs_idx (
+     date Date, key LowCardinality(String), val String,
+     scope LowCardinality(String), val_num Nullable(Float64), timestamp_ns Int64,
+     trace_id FixedString(16), span_id FixedString(8), duration_ns Int64,
+     val_type LowCardinality(String) DEFAULT ''
+   ) ENGINE=ReplacingMergeTree
+   PARTITION BY date
+   ORDER BY (key,val,scope,timestamp_ns,trace_id,span_id);
+
+   INSERT INTO arch492p7w.trace_attrs_idx
+     (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns, val_type) VALUES
+     ('2023-11-14','service.namespace','prod','resource',NULL,1700000000000000000,'T000000000000001','0000000A',1000000,'string'),
+     ('2023-11-14','http.method','GET','span',NULL,1700000000000000000,'T000000000000001','0000000A',1000000,'string'),
+     ('2023-11-14','service.namespace','prod','resource',NULL,1700000000000000000,'T000000000000001','0000000B',1000000,'string'),
+     ('2023-11-14','service.namespace','prod','resource',NULL,1700000000000000000,'T000000000000001','0000000C',1000000,'string'),
+     ('2023-11-14','http.method','','span',NULL,1700000000000000000,'T000000000000001','0000000C',1000000,'string');
+
+   -- C1: a2's shape over the witness
+   SELECT span_id,
+          any(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048))) AS v,
+          any(val_type) AS t
+   FROM arch492p7w.trace_attrs_idx
+   WHERE key = 'http.method' AND scope = 'span'
+   GROUP BY trace_id, span_id
+   ORDER BY span_id;
+
+   -- C2: a3's shape over the witness
+   SELECT span_id,
+          countIf(key = 'service.namespace' AND val = 'prod') > 0 AS matched,
+          anyIf(if(length(val) <= 8192, val, substringUTF8(val, 1, 2048)),
+                key = 'http.method' AND scope = 'span') AS v,
+          anyIf(val_type, key = 'http.method' AND scope = 'span') AS t
+   FROM arch492p7w.trace_attrs_idx
+   WHERE (key = 'service.namespace' AND val = 'prod')
+      OR (key = 'http.method' AND scope = 'span')
+   GROUP BY trace_id, span_id
+   ORDER BY span_id;
+   ```
+
+   The answer, `TSVRaw`, C1 then C2 — two rows against three:
+
+   ```text
+   0000000A	GET	string
+   0000000C		string
+   0000000A	1	GET	string
+   0000000B	1		
+   0000000C	1		string
+   ```
+
+   Under a2's shape span `0000000B` is absent. Under a bare `anyIf` merge it gains an `http.method`
+   whose value is the empty string, which is a **different** answer and not a wider one: nothing
+   downstream re-applies a presence test, because `ProjectionValue::SelectValue`'s only guard is the
+   map lookup itself (`crates/pulsus-read/src/traces/search_eval.rs:2417`) and the merged form makes
+   that lookup succeed. `0000000C` is the case that makes this a boundary rather than a rule about
+   null: an attribute that IS present with an empty value must stay present. A test built on
+   `val = 'GET'` against absent passes on a build that gets this wrong; the two values a test must
+   use are the pair that differ by the least — `val = ''` with `val_type = 'string'`, against no row
+   at all.
+3. **The with-value membership arm's row-count decision.** `membership_sql`'s `with_value` arm
+   projects `SELECT DISTINCT trace_id, span_id, v, t`, and its own documentation records that a span
+   carrying one key at one text under two stored types yields **two** rows where the non-value arm
+   yields one — "stated rather than guarded", because our ingest cannot produce it
+   (`crates/pulsus-read/src/traces/search_sql.rs:275-285`). A merged form is
+   `GROUP BY trace_id, span_id`, which collapses that to one row. Whether the collapse is accepted
+   is a decision the later part must take itself: the arm came from #479 and its `val_type` column
+   from #510, and both issues are closed, so nothing open owns it.
+
+#### What this measurement cannot see
+
+One node, one container, one build of one recipe, a warm page cache, and uniform-random trace ids.
+Nothing here is a scale claim; the 1 TB behaviour is [#25](https://github.com/digitalis-io/pulsusdb/issues/25).
+It cannot see the containers of earlier rounds, which are gone, so a quantity published there is
+cited by comment id rather than re-measured. And nothing in this section observes a TraceQL request
+end to end: what it measures is the SQL, and what pins the plan is the three tests named above.
+
 ## 10. Status: what is demonstrated, what is not
 
 This document describes a design. Its evidence is uneven and the unevenness is the point of this
@@ -2992,6 +3995,15 @@ carry the corrections.
 333-against-1,000 correctness consequence, the granule tables for groups 2 and 3, the pruning
 rule, and ADR 0008's three composition measurements. These are counters from
 `system.query_log`, load-independent, and re-runnable.
+
+**Measured, refused, and no SQL moved (issue #492 part 7).** §9.8 measured whether a `select()`
+projection can be compiled into the statements a TraceQL search already sends. It cannot, for the
+query the scope enumeration names, whose only attribute-index read is the `select()` value read
+itself; and the per-query join form the design record documents refuses at the shipped generator
+memory ceiling, where the same statement with only the join removed succeeds. Part 7 lowers nothing,
+changes no production line and moves no golden — what it ships is the record, plus three tests that
+fail if the record's checkable sentences stop being true. Its figures come from one build of the
+recipe §9.8 prints, on a container that no longer exists, and none of them is checkable in CI.
 
 **Read from source and labelled as read.** The four hand-written boundary computations of §1 and
 their call sites; the shape and residual-effect columns of §3.1 and §7.1; the `Never` reasons of §5;
@@ -3379,7 +4391,7 @@ new spelling and a new patch to the list.
 
 **So the audit keys on the gate's own identifier, because the identifiers are enumerable and the
 ways English can qualify a noun are not.** The inventory holds exactly **25** rows — four that
-exist and twenty-one that are **wave 1** — and the six tables in §§11.1–11.4 derive them. **It held
+exist and twenty-one that are **wave 1** — and the six tables in §§11.1–11.4 derive them. **§11.4 carries one further row that is not one of the 25**: `no_planned_search_statement_contains_a_join`, added by issue #492 part 7, which exists and prints `Starting 1 test` on this tree. It is marked as such where it stands, and every count in this section and in §11.0b is of the 25. **It held
 22 when the checker below was last run**, and the three added since are §11.3's
 `every_cut_variant_has_a_row_in_the_design_record`, `every_chain_link_row_states_a_continuation`
 and `the_plan_shape_json_keys_match_the_api_document`, all **wave 1** and none of them at base.
@@ -3657,7 +4669,7 @@ the count the same selector prints once wave 1 lands.
 A gate seeded from one example would assert that the example is correct. If the example is wrong,
 such a gate makes the error permanent and looks like coverage while doing it — so every row below
 states whether its seed is **independently established** or **assumed**, and the assumed ones say
-what they therefore cannot discover. **All 22 gates §11.0 counts have a row here**: of the three
+what they therefore cannot discover. **All 25 gates §11.0 counts have a row here**: of the three
 missing from an earlier revision, `logql::plan::tests::a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual`,
 **wave 1**, is the third row from the end and the live `query_log_gates` half, which exists and
 prints `Starting 14 tests` at exit 0, is the last, while
@@ -4041,12 +5053,13 @@ them — which are specified to
 compare the lowered round-trip count, the result-byte total, the link labels and the three
 synthesised links, and none of the six is any of those.
 
-### 11.4 The gates ADR 0008 nominates — one **wave 1**, one that exists and prints `Starting 14 tests` at exit 0
+### 11.4 The gates ADR 0008 nominates — one **wave 1**, one that exists and prints `Starting 14 tests` at exit 0, and one added by part 7 that is not one of §11.0's 25
 
 | gate | selector (`-E`) | binary | at base |
 |---|---|---|---|
 | no emitted SQL contains a `WITH` clause (ADR 0008 D2) | `test(=the_golden_sql_corpus_contains_no_with_clause)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 0 tests`, exit 4 — **wave 1** |
 | the `query_log` half of the same rule, and the round-trip and metered-byte ratios | — | `crates/pulsus-read/tests/query_log_gates.rs` | `Starting 14 tests`, 14 passed, exit 0 — **exists**, but see below |
+| no statement the compile core plans contains a join (ADR 0008's added rule, scoped to the compiled route's corpus) — **added by issue #492 part 7, not one of §11.0's 25** | `test(=no_planned_search_statement_contains_a_join)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | **exists**, `Starting 1 test across 1 binary (3 tests skipped)`, 1 passed, exit 0 |
 
 The second binary exists and is **env-gated**, which is exactly the trap: run here at `acf44c49`
 with `PULSUS_TEST_CLICKHOUSE` unset it printed `Starting 14 tests across 1 binary` and
@@ -4060,6 +5073,17 @@ does not count it.
 contains no lowered SQL at all, so a no-`WITH` assertion over it would be green over a population
 holding none of the case it exists for. It becomes a real check only when a wave emits wrapped
 statements into the corpus (ADR 0008 D1), and this document does not count it before that.
+
+**The third is vacuous in the same direction, and says so on its own face.** No statement the
+compile core plans contains a join today, and none can: `Relation` has no join slot
+(`compile/fold.rs:623`), so a stage cannot contribute one without a type change. Over the
+`traces_search/` corpus the assertion is therefore green over a population holding none of the case
+it exists for, exactly as the `WITH` row says of itself, and it becomes a real check only if
+something writes a join. What it is **not** vacuous about is the other half of its body: the six
+committed goldens outside that corpus which carry a join today are pinned as an EQUALITY, so a
+seventh anywhere in the golden tree fails it. That half is why the gate walks the golden root rather
+than `CORPORA` — two of the six sit in `traces_metrics_base/`, which `CORPORA` does not contain, so
+the digest gate above cannot see them either. §9.8 carries the record of all six.
 
 ### 11.5 Adding a link variant is to be a build failure — wave 1 makes it one
 

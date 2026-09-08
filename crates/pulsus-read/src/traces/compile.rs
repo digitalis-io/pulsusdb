@@ -3142,4 +3142,63 @@ mod tests {
         assert_eq!(f.to_string(), "span.http.method");
         let _ = SqlExpr::new("unused-in-production");
     }
+    /// Issue #492 part 7, criterion 1: **`select()` never lowers, and the
+    /// reason it names is decided by the field, not by the source.**
+    ///
+    /// `SelectLower::capability` has two refusal arms and they are not
+    /// interchangeable on the explain surface: `NameNotResolvable`
+    /// renders as `name_not_resolvable` (`compile/plan.rs:879`) and is
+    /// what a client sees for every attribute spelling, because a
+    /// TraceQL seed's `ColSet` is `Closed([trace_id, name])` and no
+    /// attribute resolves in it. Only `select(name)` reaches the
+    /// `NotYetLowered` arm.
+    ///
+    /// Both seed sources are asserted because the refusal is a property
+    /// of the link, not of the table it is folded against — a capability
+    /// that answered `Yes` on one source and `No` on the other would be
+    /// a lowering nobody decided.
+    ///
+    /// `docs/query-lowering.md` §3.1's `Select` row and §9.8 record this
+    /// split; this test is what makes those two sentences fail if the
+    /// dispatcher stops agreeing with them.
+    #[test]
+    fn select_refuses_and_names_its_reason_per_field() {
+        let want: [(&str, Capability); 6] = [
+            (
+                r#"{ .a = "1" } | select(name)"#,
+                Capability::No(BlockReason::NotYetLowered),
+            ),
+            (
+                r#"{ .a = "1" } | select(span.http.method)"#,
+                Capability::No(BlockReason::NameNotResolvable),
+            ),
+            (
+                r#"{ .a = "1" } | select(.foo)"#,
+                Capability::No(BlockReason::NameNotResolvable),
+            ),
+            (
+                r#"{ .a = "1" } | select(resource.service.name)"#,
+                Capability::No(BlockReason::NameNotResolvable),
+            ),
+            (
+                r#"{ .a = "1" } | select(status)"#,
+                Capability::No(BlockReason::NameNotResolvable),
+            ),
+            (
+                r#"{ .a = "1" } | select(name, span.http.method)"#,
+                Capability::No(BlockReason::NameNotResolvable),
+            ),
+        ];
+        for (q, expect) in want {
+            let link = TqlLink::Pipe(pipe(q));
+            for src in [TRACE_SPANS, TRACE_ATTRS_IDX] {
+                let rel = seed_relation(src, Pred::True);
+                let got = <Tql as Lang>::lower_of(&link).capability(&link, &rel);
+                assert_eq!(
+                    got, expect,
+                    "{q} on {src}: select() must refuse with {expect:?}, got {got:?}"
+                );
+            }
+        }
+    }
 }
