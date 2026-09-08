@@ -542,3 +542,559 @@ fn regenerate_the_count_site_lines() {
     }
     std::fs::write(repo_root().join(COUNTS_TSV), out).expect("write the dataset");
 }
+
+// ---------------------------------------------------------------------
+// Issue #492 part 8, landing 3 — the citations
+//
+// The design record cites source files by line number 582 times. Nothing
+// derived them: moving `search_plan.rs:1854` to `:2854` in
+// `docs/query-to-sql.md` and running `cargo nextest run --workspace`
+// exited 0 with no failing test.
+//
+// **The covered set is what resolves, and the rest is enumerated rather
+// than guessed.** 467 of the 582 occurrences cite a bare basename, and
+// six of those basenames match more than one tracked file — `plan.rs`
+// matches four. A resolver that picks the candidate whose cited line
+// contains an identifier the citing prose already prints answers 400 of
+// the 582. The obvious fallback for the remaining 185 — resolve by the
+// enclosing section's language — was tested against the 122 the anchor
+// rule already answers and **disagrees on 22 of them, 18%**, which over
+// 185 would manufacture roughly 33 citations that resolve and are wrong.
+// A citation that resolves wrongly is worse than one that does not
+// resolve, so the 185 are frozen as a named set instead
+// ([`UNRESOLVABLE_TSV`]) and the check below asserts that set does not
+// grow.
+//
+// **What would close the gap** is making those 185 citing lines print an
+// identifier the cited line carries — the same rule the 400 already
+// satisfy. That is a per-site reading of each cited line against the
+// claim beside it, and it is recorded here as work rather than promised.
+// ---------------------------------------------------------------------
+
+const CITATIONS_TSV: &str = "crates/pulsus-read/tests/design_record_citations.tsv";
+const UNRESOLVABLE_TSV: &str = "crates/pulsus-read/tests/design_record_unresolvable_citations.tsv";
+
+/// The five design artefacts every citation is read out of.
+const DESIGN_ARTEFACTS: [&str; 5] = [
+    "docs/query-lowering.md",
+    "docs/query-to-sql.md",
+    "docs/decisions/0008-sql-composition-for-lowered-pipelines.md",
+    "docs/diagrams/query-lowering-hops.svg",
+    "docs/diagrams/query-lowering-boundary.svg",
+];
+
+/// What a row's anchor is, and therefore what a reader can check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorKind {
+    /// A token the CITING prose already prints, which the cited line
+    /// carries. The claim and its evidence are reviewable side by side.
+    Prose,
+    /// A snapshot of the cited line itself, because the citing prose
+    /// prints no identifier the line carries. It detects drift — the
+    /// line moving or changing reddens — but it cannot show the citation
+    /// means the right thing, and this row records which kind it is so
+    /// that difference is visible.
+    Line,
+}
+
+/// One citation target: a tracked file, a line range, and the text that
+/// range must contain.
+#[derive(Debug, Clone)]
+struct CitationRow {
+    doc: String,
+    token: String,
+    path: String,
+    line: u32,
+    end_line: Option<u32>,
+    kind: AnchorKind,
+    anchor: String,
+}
+
+fn citation_rows() -> Vec<CitationRow> {
+    let text = read(CITATIONS_TSV);
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if n == 0 {
+            assert_eq!(
+                line, "doc\ttoken\tpath\tline\tend_line\tanchor_kind\tanchor",
+                "{CITATIONS_TSV} header"
+            );
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.splitn(7, '\t').collect();
+        assert_eq!(f.len(), 7, "{CITATIONS_TSV}:{}: seven columns", n + 1);
+        out.push(CitationRow {
+            doc: f[0].to_string(),
+            token: f[1].to_string(),
+            path: f[2].to_string(),
+            line: f[3]
+                .parse()
+                .unwrap_or_else(|_| panic!("{CITATIONS_TSV}:{}: line", n + 1)),
+            end_line: (!f[4].is_empty()).then(|| {
+                f[4].parse()
+                    .unwrap_or_else(|_| panic!("{CITATIONS_TSV}:{}: end_line", n + 1))
+            }),
+            kind: match f[5] {
+                "prose" => AnchorKind::Prose,
+                "line" => AnchorKind::Line,
+                other => panic!("{CITATIONS_TSV}:{}: unknown anchor_kind {other:?}", n + 1),
+            },
+            anchor: f[6].to_string(),
+        });
+    }
+    out
+}
+
+/// The frozen set of citations that cannot be resolved to one tracked
+/// file, keyed `(document, token)`, with the reason.
+fn unresolvable() -> BTreeSet<(String, String, String)> {
+    let text = read(UNRESOLVABLE_TSV);
+    let mut out = BTreeSet::new();
+    for (n, line) in text.lines().enumerate() {
+        if n == 0 {
+            assert_eq!(line, "doc\ttoken\treason", "{UNRESOLVABLE_TSV} header");
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 3, "{UNRESOLVABLE_TSV}:{}: three columns", n + 1);
+        assert!(
+            [
+                "ambiguous_basename",
+                "not_a_tracked_file",
+                "blank_target_line",
+                "line_beyond_end_of_file"
+            ]
+            .contains(&f[2]),
+            "{UNRESOLVABLE_TSV}:{}: unknown reason {:?}",
+            n + 1,
+            f[2]
+        );
+        out.insert((f[0].to_string(), f[1].to_string(), f[2].to_string()));
+    }
+    out
+}
+
+fn ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts, as
+/// `(document, token, first line, last line)`.
+fn citation_occurrences() -> Vec<(String, String, u32, u32)> {
+    let mut out = Vec::new();
+    for doc in DESIGN_ARTEFACTS {
+        let text = read(doc);
+        for line in text.lines() {
+            let bytes = line.as_bytes();
+            let mut i = 0usize;
+            while let Some(at) = line[i..].find(".rs:") {
+                let dot = i + at;
+                // The path: back to the first character that cannot be
+                // part of one.
+                let mut start = dot;
+                while start > 0 {
+                    let c = bytes[start - 1] as char;
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-' {
+                        start -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut j = dot + 4;
+                let first: String = line[j..].chars().take_while(char::is_ascii_digit).collect();
+                j += first.len();
+                let mut last = first.clone();
+                if line[j..].starts_with('-') {
+                    let second: String = line[j + 1..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    if !second.is_empty() {
+                        last = second.clone();
+                        j += 1 + second.len();
+                    }
+                }
+                if !first.is_empty() && start < dot {
+                    out.push((
+                        doc.to_string(),
+                        line[start..j].to_string(),
+                        first.parse().expect("digits"),
+                        last.parse().expect("digits"),
+                    ));
+                }
+                i = (dot + 4).max(j);
+            }
+        }
+    }
+    out
+}
+
+/// **Every citation the record makes still points at what it names.**
+///
+/// Each row's anchor must occur inside the cited line range of the file
+/// it names. A citation whose target moves stops containing its anchor
+/// and the check names the row.
+///
+/// **What it cannot see** is a citation whose anchor is right and whose
+/// CLAIM is wrong: the anchor says the line carries this text, not that
+/// the text means what the prose beside it says. For the 141 `prose`
+/// rows the anchor is a token the citing prose already prints, so the
+/// claim and its evidence are reviewable side by side; for the 128
+/// `line` rows it is a snapshot and it is not. The `anchor_kind` column
+/// exists so that difference is visible rather than assumed away.
+#[test]
+fn every_design_record_citation_still_points_at_what_it_names() {
+    let rows = citation_rows();
+    assert!(!rows.is_empty(), "{CITATIONS_TSV} is empty");
+    let (mut prose, mut line) = (0usize, 0usize);
+    for row in &rows {
+        let src = read(&row.path);
+        let lines: Vec<&str> = src.lines().collect();
+        let last = row.end_line.unwrap_or(row.line) as usize;
+        assert!(
+            last <= lines.len(),
+            "{} cites {}:{} but that file has {} lines",
+            CITATIONS_TSV,
+            row.path,
+            last,
+            lines.len()
+        );
+        let body = ws(&lines[row.line as usize - 1..last].join(" "));
+        assert!(
+            body.contains(&row.anchor),
+            "{}:{} does not contain its anchor {:?}",
+            row.path,
+            row.line,
+            row.anchor
+        );
+        match row.kind {
+            AnchorKind::Prose => prose += 1,
+            AnchorKind::Line => line += 1,
+        }
+    }
+    assert!(
+        prose > 0 && line > 0,
+        "the dataset must carry both anchor kinds; it carries {prose} prose and {line} line"
+    );
+}
+
+/// **Every citation in the record has a row, or is named as one that
+/// cannot be resolved.**
+///
+/// The two datasets partition the record's citations, and the partition
+/// is asserted in both directions: an occurrence that resolves to no row
+/// and is not in the frozen set is a hole, and a frozen entry that has
+/// started resolving must be removed rather than left as a standing
+/// exemption. **That is what stops the uncovered set widening quietly**,
+/// which is the failure mode a narrowed check invites.
+#[test]
+fn every_citation_in_the_design_record_has_a_row() {
+    let rows = citation_rows();
+    let frozen = unresolvable();
+    let frozen_keys: BTreeSet<(String, String)> = frozen
+        .iter()
+        .map(|(d, t, _)| (d.clone(), t.clone()))
+        .collect();
+    // Keyed on `(document, citation token)`: the same basename and line
+    // can resolve in one document and be ambiguous in another, so the
+    // document is part of the key. A token that resolves anywhere in a
+    // document is resolved for every occurrence of it in that document —
+    // they all name the same file and the same line.
+    let targets: BTreeSet<(String, String)> = rows
+        .iter()
+        .map(|r| (r.doc.clone(), r.token.clone()))
+        .collect();
+    let both: Vec<&(String, String)> = targets.intersection(&frozen_keys).collect();
+    assert!(
+        both.is_empty(),
+        "{both:?} appear in BOTH datasets. The two must PARTITION the record's citations: a \
+         citation covered by both rules is covered by neither"
+    );
+
+    let occurrences = citation_occurrences();
+    assert!(
+        occurrences.len() > 500,
+        "only {} citations were found in the five artefacts; the reader is broken, not the record",
+        occurrences.len()
+    );
+    let mut holes: Vec<String> = Vec::new();
+    let mut covered: BTreeSet<(String, String)> = BTreeSet::new();
+    for (doc, token, _, _) in &occurrences {
+        let key = (doc.clone(), token.clone());
+        if targets.contains(&key) {
+            continue;
+        }
+        if frozen_keys.contains(&key) {
+            covered.insert(key);
+            continue;
+        }
+        holes.push(format!(
+            "{doc} cites {token}, which has no row in {CITATIONS_TSV}"
+        ));
+    }
+    assert!(
+        holes.is_empty(),
+        "{} citation(s) are covered by neither dataset:\n  {}",
+        holes.len(),
+        holes.join("\n  ")
+    );
+    let stale: Vec<&(String, String)> = frozen_keys.difference(&covered).collect();
+    assert!(
+        stale.is_empty(),
+        "{UNRESOLVABLE_TSV} names {stale:?}, which now resolves. The frozen set is the enumerated \
+         hole, not a standing exemption: remove the row"
+    );
+}
+
+/// **No citation row is unused.**
+///
+/// A row nothing cites is a claim about a line that the record no longer
+/// makes, and it would otherwise sit in the dataset looking like
+/// coverage.
+#[test]
+fn no_citation_row_is_unused() {
+    let rows = citation_rows();
+    let cited: BTreeSet<(String, String)> = citation_occurrences()
+        .into_iter()
+        .map(|(doc, token, _, _)| (doc, token))
+        .collect();
+    let unused: Vec<String> = rows
+        .iter()
+        .filter(|r| !cited.contains(&(r.doc.clone(), r.token.clone())))
+        .map(|r| {
+            format!(
+                "{CITATIONS_TSV} row {}:{} is cited nowhere in {}",
+                r.path, r.line, r.doc
+            )
+        })
+        .collect();
+    assert!(unused.is_empty(), "{}", unused.join("\n"));
+    let stale: Vec<String> = unresolvable()
+        .into_iter()
+        .filter(|(d, t, _)| !cited.contains(&(d.clone(), t.clone())))
+        .map(|(d, t, _)| format!("{UNRESOLVABLE_TSV} names {d} / {t}, which {d} no longer cites"))
+        .collect();
+    assert!(stale.is_empty(), "{}", stale.join("\n"));
+}
+
+// ---------------------------------------------------------------------
+// Issue #492 part 8, landing 3 — the gate inventory
+//
+// The record names 28 `test(=…)` selectors and states, per gate, whether
+// it exists. **That state was wrong for almost all of them.** 27 of the
+// 28 resolve to a definition in the tree; the one that does not is
+// `no_such_test_name_at_all_zzz`, the record's own negative control, so
+// the finder discriminates rather than answering "present" to
+// everything. The record's `at base` column was a measurement at a named
+// commit and stays as one; part 8 added a `today` column beside it,
+// which is what this check reads.
+//
+// **Resolution is by FILE, not by last path segment.** Two of the
+// selectors share a final segment —
+// `every_residual_state_effect_is_the_one_the_document_states` is
+// defined in `logql/compile.rs` and in `traces/compile.rs` — and 308
+// integration-test function names in this workspace are defined in more
+// than one binary. A check resolving on the last segment would answer
+// "present" for a gate that exists somewhere else entirely.
+// ---------------------------------------------------------------------
+
+const GATES_TSV: &str = "crates/pulsus-read/tests/design_record_gates.tsv";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    Exists,
+    /// Absent from the tree on purpose. The record carries exactly one:
+    /// its own negative control, which is what makes a finder that
+    /// reports everything present detectable.
+    Absent,
+}
+
+#[derive(Debug, Clone)]
+struct GateRow {
+    selector: String,
+    krate: String,
+    file: String,
+    state: GateState,
+}
+
+fn gate_rows() -> Vec<GateRow> {
+    let text = read(GATES_TSV);
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if n == 0 {
+            assert_eq!(line, "selector\tkrate\tfile\tstate", "{GATES_TSV} header");
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 4, "{GATES_TSV}:{}: four columns", n + 1);
+        out.push(GateRow {
+            selector: f[0].to_string(),
+            krate: f[1].to_string(),
+            file: f[2].to_string(),
+            state: match f[3] {
+                "exists" => GateState::Exists,
+                "absent" => GateState::Absent,
+                other => panic!("{GATES_TSV}:{}: unknown state {other:?}", n + 1),
+            },
+        });
+    }
+    out
+}
+
+/// Every `test(=…)` selector the five artefacts name, with the line it
+/// sits on.
+fn record_selectors() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for doc in DESIGN_ARTEFACTS {
+        for line in read(doc).lines() {
+            let mut i = 0usize;
+            while let Some(at) = line[i..].find("test(=") {
+                let start = i + at + "test(=".len();
+                if let Some(end) = line[start..].find(')') {
+                    let sel = &line[start..start + end];
+                    if !sel.contains('…') && !sel.is_empty() {
+                        out.push((sel.to_string(), line.to_string()));
+                    }
+                    i = start + end;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// **The gate inventory cannot go stale.**
+///
+/// Three claims, each with two sides:
+///
+/// 1. every selector the record names has a row in [`GATES_TSV`], and
+///    every row is named by the record — so the dataset cannot carry a
+///    gate the record has stopped naming, or miss one it has started to;
+/// 2. a row marked `exists` names a file that defines the function
+///    **exactly once**, and a row marked `absent` names a function no
+///    tracked file defines anywhere;
+/// 3. where the record states the gate's state in a table of its own —
+///    the `today` column of §11.1 to §11.4 — that word agrees with the
+///    tree.
+///
+/// Claim 3 is the one that caught the record: before part 8 it called 24
+/// of its own gates `wave 1` while they existed.
+#[test]
+fn every_gate_the_record_names_exists_or_is_marked_absent() {
+    let rows = gate_rows();
+    let named = record_selectors();
+    assert!(
+        named.len() >= 28,
+        "only {} selectors were read out of the five artefacts",
+        named.len()
+    );
+    let dataset: BTreeSet<&str> = rows.iter().map(|r| r.selector.as_str()).collect();
+    let recorded: BTreeSet<&str> = named.iter().map(|(s, _)| s.as_str()).collect();
+    let missing: Vec<&&str> = recorded.difference(&dataset).collect();
+    assert!(
+        missing.is_empty(),
+        "the record names {missing:?}, which has no row in {GATES_TSV}"
+    );
+    let unused: Vec<&&str> = dataset.difference(&recorded).collect();
+    assert!(
+        unused.is_empty(),
+        "{GATES_TSV} carries {unused:?}, which the record names nowhere"
+    );
+
+    let tracked = tracked_rust_files();
+    let mut absent_rows = 0usize;
+    for row in &rows {
+        let segment = row.selector.rsplit("::").next().expect("a selector");
+        let needle = format!("fn {segment}(");
+        match row.state {
+            GateState::Exists => {
+                assert!(
+                    row.file.starts_with(&format!("crates/{}/", row.krate)),
+                    "{}: the file {:?} is not in the crate {:?} the row names",
+                    row.selector,
+                    row.file,
+                    row.krate
+                );
+                let hits = read(&row.file).matches(&needle).count();
+                assert_eq!(
+                    hits, 1,
+                    "{GATES_TSV} says {} exists in {}, where `{needle}` occurs {hits} times",
+                    row.selector, row.file
+                );
+            }
+            GateState::Absent => {
+                absent_rows += 1;
+                let defining: Vec<&String> = tracked
+                    .iter()
+                    .filter(|f| read(f).contains(&needle))
+                    .collect();
+                assert!(
+                    defining.is_empty(),
+                    "{GATES_TSV} calls {} absent, but {defining:?} define it",
+                    row.selector
+                );
+            }
+        }
+    }
+    assert_eq!(
+        absent_rows, 1,
+        "the record carries exactly one deliberately absent gate — its own negative control. \
+         Without it, a finder that answered \"present\" to everything would look correct"
+    );
+
+    // Claim 3: the document's own state word, where it states one.
+    let mut checked = 0usize;
+    for (selector, line) in &named {
+        if !line.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = line.trim_matches('|').split(" | ").map(str::trim).collect();
+        let Some(today) = cells.last() else { continue };
+        if !today.contains("exists") && !today.contains("absent") {
+            continue;
+        }
+        let row = rows
+            .iter()
+            .find(|r| r.selector == *selector)
+            .expect("every named selector has a row, asserted above");
+        let says_exists = today.contains("exists");
+        assert_eq!(
+            says_exists,
+            row.state == GateState::Exists,
+            "docs/query-lowering.md calls {selector} {today:?}, and the tree says {:?}",
+            row.state
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 25,
+        "only {checked} of the record's own state cells were checked; §11.1 to §11.4 carry 25 \
+         rows with a selector"
+    );
+}
+
+/// Every tracked `.rs` file, from `git ls-files`.
+fn tracked_rust_files() -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "*.rs"])
+        .current_dir(repo_root())
+        .output()
+        .expect("git ls-files");
+    assert!(out.status.success(), "git ls-files failed");
+    String::from_utf8(out.stdout)
+        .expect("utf-8")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}

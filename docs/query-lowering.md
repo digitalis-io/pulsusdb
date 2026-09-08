@@ -4398,11 +4398,19 @@ ruling and is neither measured nor estimated. Behaviour at 1 TB is
 ## 11. The tests this design nominates
 
 A design that names behaviours and no test selectors cannot be checked before the code exists. Each
-gate below is named with the **`cargo nextest` selector that selects it**, its binary, and its count
-at base: **four of the 25 gates exist and run today, and the other twenty-one do not exist and are
-wave 1**. For those twenty-one the selector is the one that **would** run the gate once wave 1 has written
-it: today it prints `Starting 0 tests` and exits 4, or fails target selection and exits 101. The
-wave that lands each one must make that same selector print `Starting 1 test`.
+gate below is named with the **`cargo nextest` selector that selects it**, its binary, and two
+states: what it printed **at base** — commit `acf44c49`, a measurement that stays as one — and what
+the tree says **today**.
+
+> **Part 8 re-derived the `today` column, and it is why that column exists.** At base four of the 25
+> gates ran and twenty-one were wave 1, and this section stated that in a dozen places. It went on
+> stating it: **27 of the 28 selectors the record names now resolve to a definition in the tree**,
+> and the one that does not is `no_such_test_name_at_all_zzz`, this record's own negative control.
+> `every_gate_the_record_names_exists_or_is_marked_absent` reads the `today` column and the tree and
+> fails when they disagree, so the state cannot go stale again without something saying so. The
+> `at base` column is untouched: it was a measurement at a named commit and it is still true of that
+> commit. **The prose below is written in the tense of that measurement**; where it says "wave 1
+> writes this", read it as what was owed at base, and read the `today` column for what happened.
 
 **Two things about the selector form, both measured on this tree at `acf44c49` with
 `cargo-nextest 0.9.143`.** An integration test's function name carries **no module prefix** and is
@@ -4761,7 +4769,7 @@ any of these can be written at all. **The coder owes their red output**: each mu
 shown failing before it is made to pass, and this document's `at base` column must be replaced by
 the count the same selector prints once wave 1 lands.
 
-### 11.0b Where each of §11's 25 gates gets its expected answer — four exist, twenty-one are **wave 1**
+### 11.0b Where each of §11's 25 gates gets its expected answer — four existed at base, twenty-one were **wave 1** then, and twenty-four exist today
 
 A gate seeded from one example would assert that the example is correct. If the example is wrong,
 such a gate makes the error permanent and looks like coverage while doing it — so every row below
@@ -4794,20 +4802,20 @@ the two tables are a cross-check on each other rather than one table quoted twic
 | §11.4 no-`WITH` (1) | **wave 1**, `Starting 0 tests`, exit 4 | the golden corpus | **yes, and vacuous until wave 2** — at base the corpus contains no lowered SQL at all, so the gate would be green over a population containing none of the case it exists for |
 | §11.4 the live `query_log` half (1) | **exists**, `Starting 14 tests`, exit 0 — and see §11.4: worthless locally | the round-trip and metered-byte counters ClickHouse writes for our own queries | **yes for the counters, and nothing at base** — `system.query_log` is written by the database, not by us, so the numbers are not ours to get wrong; but the ratios it checks are this document's, and locally the binary self-skips green without `PULSUS_TEST_CLICKHOUSE`, so its only real evidence is the `schema-it` CI job (§11.4) |
 
-### 11.1 The three gates that exist at base and must not move — three of the four; each prints `Starting 1 test` and exits 0
+### 11.1 The three gates that existed at base and must not move — three of the four; each prints `Starting 1 test` and exits 0, then and today
 
-| gate | selector | binary | at base |
-|---|---|---|---|
-| the SQL golden corpus keeps its membership | `-E 'test(=the_sql_golden_corpus_has_exactly_its_committed_membership)'` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 1 test`, passes |
-| the SQL golden corpus keeps its digest | `-E 'test(=the_sql_golden_corpus_matches_its_committed_digest)'` | same | `Starting 1 test`, passes |
-| the `EXPLAIN` skip-block reader still discriminates | `-E 'test(=skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other)'` | `crates/pulsus-read/tests/explain_indexes.rs` | `Starting 1 test`, passes |
+| gate | selector | binary | at base | today |
+|---|---|---|---|---|
+| the SQL golden corpus keeps its membership | `-E 'test(=the_sql_golden_corpus_has_exactly_its_committed_membership)'` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 1 test`, passes | **exists** |
+| the SQL golden corpus keeps its digest | `-E 'test(=the_sql_golden_corpus_matches_its_committed_digest)'` | same | `Starting 1 test`, passes | **exists** |
+| the `EXPLAIN` skip-block reader still discriminates | `-E 'test(=skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other)'` | `crates/pulsus-read/tests/explain_indexes.rs` | `Starting 1 test`, passes | **exists** |
 
 Wave 1 emits no SQL, so the first two must stay green **unchanged** — measured green today,
 `Starting 1 test` each, exit 0 (§11.0). When the fold is wired, the
 goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:168`) move in the
 same commit.
 
-### 11.2 The gates that reproduce each hand-written walk — all **wave 1**, none at base
+### 11.2 The gates that reproduce each hand-written walk — all **wave 1** at base, none of them there then; all six exist today
 
 §1's argument is that the boundary is computed four times by hand. The gates **wave 1** writes are
 to be that argument as tests: the model must reproduce **each** walk, not just the one §9.6
@@ -4823,13 +4831,13 @@ offered a second option — **wave 1** writes them wherever they go — moving t
 `logql::compile`'s test module with the two functions raised to `pub(super)`. That option is **withdrawn**: the widening was never needed, and a design
 that offers two placements has not decided.
 
-| gate | selector (`-E`) | at base |
-|---|---|---|
-| walk 1: the model's ordered pushed-filter list equals `compile_line_filters`' own — the real function, not a transcription — over the 3,375 chains of §9.6 | `test(=logql::plan::tests::the_model_reproduces_compile_line_filters_ordered_predicate_list)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| the same suite recomputes the first-refusal fold's mismatch count and asserts it is **not** 0, so the regression cannot silently return | `test(=logql::plan::tests::a_first_refusal_fold_still_mismatches_the_shipped_walk)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| walk 2: `!exact` on a `Lines` shape after the fold equals `has_unpushed_dropping_stage` on the same pipeline, over the same corpus | `test(=logql::plan::tests::exact_after_the_fold_agrees_with_has_unpushed_dropping_stage)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| walk 3: the first `Pipe` link the fold marks residual is the stage `metric_pipeline_construct` names, and the reason maps to its `&'static str` | `test(=logql::plan::tests::the_first_residual_pipe_link_agrees_with_metric_pipeline_construct)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| the residual rule as behaviour: a refused `line_format` marks `body` `Computed`, and the next line filter is residual because of it | `test(=logql::plan::tests::a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual)` | `Starting 0 tests`, exit 4 — **wave 1** |
+| gate | selector (`-E`) | at base | today |
+|---|---|---|---|
+| walk 1: the model's ordered pushed-filter list equals `compile_line_filters`' own — the real function, not a transcription — over the 3,375 chains of §9.6 | `test(=logql::plan::tests::the_model_reproduces_compile_line_filters_ordered_predicate_list)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| the same suite recomputes the first-refusal fold's mismatch count and asserts it is **not** 0, so the regression cannot silently return | `test(=logql::plan::tests::a_first_refusal_fold_still_mismatches_the_shipped_walk)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| walk 2: `!exact` on a `Lines` shape after the fold equals `has_unpushed_dropping_stage` on the same pipeline, over the same corpus | `test(=logql::plan::tests::exact_after_the_fold_agrees_with_has_unpushed_dropping_stage)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| walk 3: the first `Pipe` link the fold marks residual is the stage `metric_pipeline_construct` names, and the reason maps to its `&'static str` | `test(=logql::plan::tests::the_first_residual_pipe_link_agrees_with_metric_pipeline_construct)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| the residual rule as behaviour: a refused `line_format` marks `body` `Computed`, and the next line filter is residual because of it | `test(=logql::plan::tests::a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
 
 The gate this table used to carry — `logql::compile::tests::drop_and_keep_dispatch_differently_on_the_same_payload_type`,
 **wave 1** — has **moved to §11.2b**, where each side gets its own literal expectation. It is listed there and not here, so there is one gate of that name and not two.
@@ -4859,9 +4867,9 @@ So pushability is to get its own gate — also **wave 1**, `Starting 0 tests`, e
 it is to reach its answer without the helper: the expected answers are to be literals written in the
 test, one per parsed query, never values the helper produced.
 
-| gate | selector (`-E`) | at base |
-|---|---|---|
-| the pushability rule matches a hand-written table of parsed line filters | `test(=logql::plan::tests::the_pushability_rule_matches_a_hand_written_table)` | `Starting 0 tests`, exit 4 — **wave 1** |
+| gate | selector (`-E`) | at base | today |
+|---|---|---|---|
+| the pushability rule matches a hand-written table of parsed line filters | `test(=logql::plan::tests::the_pushability_rule_matches_a_hand_written_table)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
 
 The table, with every row's AST flags captured from the real parser on this tree at `2f78c53`. It
 is chosen adversarially: two rows spell an IP address without being an `ip()` filter, and two put
@@ -4896,7 +4904,7 @@ this document does not claim otherwise. All four are **wave 1**: each selector p
 `Starting 0 tests` and exits 4 at base, so the composition is a specification and covers nothing
 yet.
 
-### 11.2b Every residual state effect, gated in wave 1
+### 11.2b Every residual state effect — gated in wave 1, and all three gates exist today
 
 §2.5's whole repair is that a residual link **still applies its state effect**. §3.1 and §7.1 state
 that effect for every link. An earlier version of this section nominated other gates that did not
@@ -4941,11 +4949,11 @@ The five other cells reading `n/a` or `none` belong to rows the tables mark **no
 §3.1's `Metric`, `MetricSecondStage` and `Compare`, and §7.1's `MetricExpr::Literal`/`VectorFn` and
 `Binary`/`Variants` — and are excluded by that marking, not by silence.
 
-| gate | selector (`-E`) | at base |
-|---|---|---|
-| every LogQL link's residual state effect is the one §7.1 states, and none of them is the identity | `test(=logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| the same for TraceQL against §3.1 | `test(=traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| `Drop` and `Keep` reach different dispatchers and different effects on the same `Vec<DropKeepElem>` | `test(=logql::compile::tests::drop_and_keep_dispatch_differently_on_the_same_payload_type)` | `Starting 0 tests`, exit 4 — **wave 1** |
+| gate | selector (`-E`) | at base | today |
+|---|---|---|---|
+| every LogQL link's residual state effect is the one §7.1 states, and none of them is the identity | `test(=logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| the same for TraceQL against §3.1 | `test(=traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| `Drop` and `Keep` reach different dispatchers and different effects on the same `Vec<DropKeepElem>` | `test(=logql::compile::tests::drop_and_keep_dispatch_differently_on_the_same_payload_type)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
 
 All three gates above — **wave 1** writes them — are to be lib unit tests in the modules that will
 define the impls
@@ -5092,7 +5100,7 @@ disagreement between `E₁` and `E₂`, but a row whose stated effect is simply 
 written into both literals and agree with itself. That is the document's claim about the language,
 and it is settled by review, not by the gate **wave 1** writes.
 
-### 11.3 The document and its diagrams, gated in wave 1
+### 11.3 The document and its diagrams — gated in wave 1, and all eleven gates exist today
 
 A diagram asserts a design without being read as a claim, and this one has now carried four
 contradictions across three rounds: a lowered request drawn as one round trip while the text made
@@ -5106,19 +5114,19 @@ The last three are new in the plan-object revision and gate the three things tha
 closure of `Cut`, the continuation column on the three link tables, and the `data.explain.plan` key
 set against [api.md](api.md).
 
-| gate | selector (`-E`) | at base |
-|---|---|---|
-| every `pulsus_logql::Stage` variant has a row in §7.1 — to be enumerated by an exhaustive `match` with no `_` arm, so that adding a variant will fail to build here | `test(=every_logql_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every `pulsus_traceql::PipelineStage` variant has a row in §3.1, same construction | `test(=every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every `LqlLink` variant has a row in §7.1, same construction — this is where adding a link variant will redden, once wave 1 has written it | `test(=every_lql_link_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every `TqlLink` variant — all **15** of them, by an exhaustive `match` with no `_` arm, so adding a sixteenth fails to build here — has a row in §3.1. The LogQL sibling is the same shape: `LqlLink` has exactly **9** variants and §7.1 carries a row for each. An earlier revision specified this gate as a hand list of twelve (the eight `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit`), which would have passed over a §3.1 carrying 5 of the 15 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| §3.1 carries exactly **11** rows with a residual state effect and **12** without; §7.1 carries exactly **20** and **3** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** |
-| the hops diagram's lowered round-trip count and result-byte total equal §9.2's | `test(=the_hops_diagram_and_the_document_agree_on_the_lowered_request)` | exit **101**, no such target — **wave 1** |
-| every link label in the boundary diagram's pipelines is a link this document defines | `test(=the_boundary_diagram_names_only_links_the_document_defines)` | exit **101**, no such target — **wave 1** |
-| every pipeline drawn in the boundary diagram ends in `Order`, `Limit` and `Emit`, because every chain does | `test(=every_boundary_diagram_pipeline_carries_the_three_synthesised_links)` | exit **101**, no such target — **wave 1** |
-| every `Cut` variant has a row in §2.7 — an exhaustive `match` over `Cut` with no `_` arm on one side, a parse of §2.7's headings on the other, so a fifth cut is a build failure rather than a silent addition | `test(=every_cut_variant_has_a_row_in_the_design_record)` | exit **101**, no such target — **wave 1** |
-| every row of §3.1's and §7.1's three link tables states a continuation, and every continuation naming a cut names one of the four | `test(=every_chain_link_row_states_a_continuation)` | exit **101**, no such target — **wave 1** |
-| every key `QueryPlan::shape()` renders is a key [api.md](api.md) documents for `data.explain.plan`, and no other | `test(=the_plan_shape_json_keys_match_the_api_document)` | exit **101**, no such target — **wave 1** |
+| gate | selector (`-E`) | at base | today |
+|---|---|---|---|
+| every `pulsus_logql::Stage` variant has a row in §7.1 — to be enumerated by an exhaustive `match` with no `_` arm, so that adding a variant will fail to build here | `test(=every_logql_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** | **exists** |
+| every `pulsus_traceql::PipelineStage` variant has a row in §3.1, same construction | `test(=every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** | **exists** |
+| every `LqlLink` variant has a row in §7.1, same construction — this is where adding a link variant will redden, once wave 1 has written it | `test(=every_lql_link_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** | **exists** |
+| every `TqlLink` variant — all **15** of them, by an exhaustive `match` with no `_` arm, so adding a sixteenth fails to build here — has a row in §3.1. The LogQL sibling is the same shape: `LqlLink` has exactly **9** variants and §7.1 carries a row for each. An earlier revision specified this gate as a hand list of twelve (the eight `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit`), which would have passed over a §3.1 carrying 5 of the 15 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** | **exists** |
+| §3.1 carries exactly **11** rows with a residual state effect and **12** without; §7.1 carries exactly **20** and **3** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** | **exists** |
+| the hops diagram's lowered round-trip count and result-byte total equal §9.2's | `test(=the_hops_diagram_and_the_document_agree_on_the_lowered_request)` | exit **101**, no such target — **wave 1** | **exists** |
+| every link label in the boundary diagram's pipelines is a link this document defines | `test(=the_boundary_diagram_names_only_links_the_document_defines)` | exit **101**, no such target — **wave 1** | **exists** |
+| every pipeline drawn in the boundary diagram ends in `Order`, `Limit` and `Emit`, because every chain does | `test(=every_boundary_diagram_pipeline_carries_the_three_synthesised_links)` | exit **101**, no such target — **wave 1** | **exists** |
+| every `Cut` variant has a row in §2.7 — an exhaustive `match` over `Cut` with no `_` arm on one side, a parse of §2.7's headings on the other, so a fifth cut is a build failure rather than a silent addition | `test(=every_cut_variant_has_a_row_in_the_design_record)` | exit **101**, no such target — **wave 1** | **exists** |
+| every row of §3.1's and §7.1's three link tables states a continuation, and every continuation naming a cut names one of the four | `test(=every_chain_link_row_states_a_continuation)` | exit **101**, no such target — **wave 1** | **exists** |
+| every key `QueryPlan::shape()` renders is a key [api.md](api.md) documents for `data.explain.plan`, and no other | `test(=the_plan_shape_json_keys_match_the_api_document)` | exit **101**, no such target — **wave 1** | **exists** |
 
 **A twelfth gate exists as of part 4 and is not one of the eleven.**
 `the_hops_diagram_marks_its_superseded_figures_on_its_own_face` asserts only that the drawing
@@ -5170,11 +5178,11 @@ synthesised links, and none of the six is any of those.
 
 ### 11.4 The gates ADR 0008 nominates — one **wave 1**, one that exists and prints `Starting 14 tests` at exit 0, and one added by part 7 that is not one of §11.0's 25
 
-| gate | selector (`-E`) | binary | at base |
-|---|---|---|---|
-| no emitted SQL contains a `WITH` clause (ADR 0008 D2) | `test(=the_golden_sql_corpus_contains_no_with_clause)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 0 tests`, exit 4 — **wave 1** |
-| the `query_log` half of the same rule, and the round-trip and metered-byte ratios | — | `crates/pulsus-read/tests/query_log_gates.rs` | `Starting 14 tests`, 14 passed, exit 0 — **exists**, but see below |
-| no statement the compile core plans contains a join (ADR 0008's added rule, scoped to the compiled route's corpus) — **added by issue #492 part 7, not one of §11.0's 25** | `test(=no_planned_search_statement_contains_a_join)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | **exists**, `Starting 1 test across 1 binary (3 tests skipped)`, 1 passed, exit 0 |
+| gate | selector (`-E`) | binary | at base | today |
+|---|---|---|---|---|
+| no emitted SQL contains a `WITH` clause (ADR 0008 D2) | `test(=the_golden_sql_corpus_contains_no_with_clause)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| the `query_log` half of the same rule, and the round-trip and metered-byte ratios | — | `crates/pulsus-read/tests/query_log_gates.rs` | `Starting 14 tests`, 14 passed, exit 0 — **exists**, but see below | — |
+| no statement the compile core plans contains a join (ADR 0008's added rule, scoped to the compiled route's corpus) — **added by issue #492 part 7, not one of §11.0's 25** | `test(=no_planned_search_statement_contains_a_join)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | **exists**, `Starting 1 test across 1 binary (3 tests skipped)`, 1 passed, exit 0 | **exists** |
 
 The second binary exists and is **env-gated**, which is exactly the trap: run here at `acf44c49`
 with `PULSUS_TEST_CLICKHOUSE` unset it printed `Starting 14 tests across 1 binary` and
@@ -5200,7 +5208,7 @@ seventh anywhere in the golden tree fails it. That half is why the gate walks th
 than `CORPORA` — two of the six sit in `traces_metrics_base/`, which `CORPORA` does not contain, so
 the digest gate above cannot see them either. §9.8 carries the record of all six.
 
-### 11.5 Adding a link variant is to be a build failure — wave 1 makes it one
+### 11.5 Adding a link variant is to be a build failure — wave 1 made it one
 
 An earlier version of this section said "no crate in this workspace has a compile-failure harness"
 and left the check to be run by hand. **That claim was false.** The workspace already has one, in
@@ -5337,3 +5345,56 @@ is looking. The check the resolution will need —
 `every_permanence_marked_row_is_never_in_the_fit` — is nominated in §11.3 and is **not written**,
 because until the decision is made there is no state for it to assert: today it would fail against
 either half of the record.
+
+### 12.3 The citations, and the hole that is enumerated rather than papered over
+
+The five design artefacts cite source files by line number **582 times**. Nothing derived them until
+part 8: moving `search_plan.rs:1854` to `:2854` in [`query-to-sql.md`](query-to-sql.md) and running
+`cargo nextest run --workspace` exited 0 with no failing test.
+
+**467 of the 582 cite a bare basename**, and six of those basenames match more than one tracked file
+— `plan.rs` matches four. Resolving them needs a rule, and the rule part 8 uses is the one the
+anchor design already states: pick the candidate whose cited line contains an identifier the citing
+prose already prints. That answers **400 of the 582**, leaving **75 distinct `(document, token)`
+pairs** — 185 occurrences — that it cannot answer. §12.3 itself cites three of the blank-line
+targets below, so the frozen set holds **76** rows rather than 75: that is the check noticing a
+citation this very section added, which is the behaviour it exists for.
+
+**The obvious fallback was tested and rejected on measurement.** Resolving by the enclosing
+section's language — a `plan.rs` citation in a LogQL section is `logql/plan.rs` — was checked
+against the 122 citations the anchor rule already answers, and it **disagrees on 22 of them, 18%**.
+Over the 185 that produces roughly 33 citations that resolve and are **wrong**, and a citation that
+resolves wrongly is worse than one that does not resolve: it reads as checked. So the 75 are frozen
+as a named set in `crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`, each with its
+reason:
+
+| reason | rows | what it means |
+|---|---|---|
+| `ambiguous_basename` | 70 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on — `traces/exec.rs:114`, `:1968` and `search_plan.rs:1042`, the first cited from two documents |
+| `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
+
+`every_citation_in_the_design_record_has_a_row` asserts the two datasets **partition** the record's
+citations in both directions: a citation covered by neither is a hole, a citation covered by both is
+covered by neither rule, and an entry that has started resolving must be removed rather than left as
+a standing exemption. **So the hole is enumerated and cannot widen quietly**, which is the failure a
+narrowed check invites.
+
+**What would close it, stated as work rather than promised.** Each of those citing lines needs to
+print an identifier the cited line carries — the same rule the 400 already satisfy — after a reading
+of the cited line against the claim beside it. That is a per-site judgement, not a rewrite a script
+can make, and the `blank_target_line` rows are a smaller job of the same kind: they are citations
+pointing at nothing, and each needs a line number that means something. Neither is part 8's.
+
+**Neither citation dataset has a regenerator, and that is deliberate.** The count dataset's `line`
+column IS derived — the anchor is the stable thing and the line follows from it — so an ignored
+regenerator rewrites it. A citation's line is not derived: it is what the DOCUMENT says, and a target
+that moves means the document's citation is now stale and a person has to re-read it. A regenerator
+there would rewrite the claim to match whatever the source had become, which is the opposite of a
+check.
+
+**What the resolved 310 rows can and cannot show.** 152 carry a `prose` anchor — a token the citing
+prose prints — so the claim and its evidence are reviewable side by side. 158 carry a `line` anchor,
+a snapshot of the cited line, because the citing prose prints no such token: those detect the line
+moving or changing, and they cannot show the citation means the right thing. The `anchor_kind`
+column exists so that difference is visible rather than assumed away.
