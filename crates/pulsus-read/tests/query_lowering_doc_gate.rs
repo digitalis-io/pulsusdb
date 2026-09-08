@@ -45,7 +45,7 @@
 //! asserts unconditionally that no superseded lowered figure is left on
 //! its face.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pulsus_read::compile::plan::{
     BoundShape, CutShape, EnginePartShape, HandoffCost, LinkShape, PartShape, PlanShape, SeedShape,
@@ -2460,6 +2460,151 @@ fn every_never_reason_variant_is_named_in_the_end_state() {
             row.len() == 3 && !row[1].is_empty() && !row[2].is_empty(),
             "§12's row for {name} must state both what the reason rules out and why no state can \
              change it; it reads {row:?}"
+        );
+    }
+}
+
+const REBUILDS_TSV: &str = "docs/benchmarks/data/traces-lowering-92-rebuilds.tsv";
+
+/// **§9.2's rebuild table states the observations the dataset holds.**
+///
+/// The rebuild figures are measurements of runs, not quantities the tree
+/// can derive, so the derivation is a committed dataset with a
+/// `provenance` column saying where each row came from — one rebuild
+/// this harness ran, one a code review ran and reported. Before this
+/// check existed the table was prose: changing `0.689%` to `0.690%` left
+/// every suite green, which is the defect this part exists to end,
+/// sitting in the part's own new text.
+///
+/// Both directions: every dataset row appears in the table with the same
+/// two values, and every table cell comes from a dataset row.
+#[test]
+fn the_rebuild_table_states_the_observations_the_dataset_holds() {
+    let tsv = repo_file(REBUILDS_TSV);
+    let mut dataset: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    for (n, line) in tsv.lines().enumerate() {
+        if n == 0 {
+            assert_eq!(
+                line, "rebuild\tprovenance\tcolumn\tstatements_moved\tlargest_change",
+                "{REBUILDS_TSV} header"
+            );
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 5, "{REBUILDS_TSV}:{}: five columns", n + 1);
+        assert!(
+            !f[1].trim().is_empty(),
+            "{REBUILDS_TSV}:{}: every observation states where it came from",
+            n + 1
+        );
+        dataset.insert(
+            (f[0].to_string(), f[2].to_string()),
+            (f[3].to_string(), f[4].to_string()),
+        );
+    }
+    assert!(!dataset.is_empty(), "{REBUILDS_TSV} is empty");
+
+    let md = repo_file(QUERY_LOWERING);
+    // The reproducibility paragraph and its table live in §9.2b, which
+    // is where the two forms are compared.
+    let s92b = section(&md, S92B_HEADING, S93_HEADING);
+    let table = tables(s92b)
+        .into_iter()
+        .find(|t| {
+            t[0].first().map(String::as_str) == Some("column")
+                && t[0].len() > 2
+                && t[0].iter().skip(1).any(|c| c.starts_with("rebuild "))
+        })
+        .expect("§9.2 must carry the rebuild table");
+    // Each observation column's header names the observation first:
+    // `S: same corpus, twice` or `rebuild A`.
+    let rebuilds: Vec<String> = table[0]
+        .iter()
+        .skip(1)
+        .map(|h| {
+            let h = h.strip_prefix("rebuild ").unwrap_or(h);
+            h.split([':', ' ']).next().unwrap_or("").trim().to_string()
+        })
+        .collect();
+    assert!(
+        rebuilds.iter().all(|r| !r.is_empty()),
+        "each observation column's header must open with its name; got {:?}",
+        table[0]
+    );
+
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for row in table.iter().skip(1) {
+        let column = leading_backtick(&row[0]).unwrap_or_else(|| {
+            panic!(
+                "§9.2's rebuild table names its columns in backticks; got {:?}",
+                row[0]
+            )
+        });
+        for (i, rebuild) in rebuilds.iter().enumerate() {
+            let cell = &row[i + 1];
+            let (moved, change) = cell.split_once(" / ").unwrap_or_else(|| {
+                panic!("§9.2's rebuild cell {cell:?} must read `<statements moved> / <change>`")
+            });
+            let key = (rebuild.clone(), column.clone());
+            let want = dataset.get(&key).unwrap_or_else(|| {
+                panic!("§9.2's rebuild table states {key:?}, which {REBUILDS_TSV} does not hold")
+            });
+            assert_eq!(
+                (moved.trim(), change.trim()),
+                (want.0.as_str(), want.1.as_str()),
+                "§9.2 states {cell:?} for rebuild {rebuild}'s {column}; {REBUILDS_TSV} holds \
+                 {} / {}",
+                want.0,
+                want.1
+            );
+            seen.insert(key);
+        }
+    }
+    let unstated: Vec<&(String, String)> = dataset.keys().filter(|k| !seen.contains(*k)).collect();
+    assert!(
+        unstated.is_empty(),
+        "{REBUILDS_TSV} holds {unstated:?}, which §9.2's rebuild table does not state"
+    );
+
+    // **The sentence beneath the table is derived too.** It said "every
+    // column" while the table above it showed one column agreeing —
+    // prose beside a measurement, which is the pairing this project's
+    // record keeps getting wrong. The number of columns on which the two
+    // rebuilds differ is computed here.
+    let columns: BTreeSet<&String> = dataset.keys().map(|(_, c)| c).collect();
+    let differing = columns
+        .iter()
+        .filter(|c| {
+            let a = dataset.get(&("A".to_string(), (**c).clone()));
+            let b = dataset.get(&("C".to_string(), (**c).clone()));
+            match (a, b) {
+                (Some(a), Some(b)) => a != b,
+                _ => false,
+            }
+        })
+        .count();
+    let para = paragraphs(s92b)
+        .into_iter()
+        .find(|p| p.contains("differs from rebuild A on"))
+        .expect("§9.2b must carry the sentence about how far the fourth observation fell");
+    let claimed: Vec<u64> = para
+        .split("**")
+        .filter_map(|t| t.parse::<u64>().ok())
+        .collect();
+    assert!(
+        !claimed.is_empty(),
+        "the sentence must state the number of differing columns in bold so it can be checked"
+    );
+    for n in &claimed {
+        assert_eq!(
+            *n as usize,
+            differing,
+            "the sentence says rebuild C differs from rebuild A on {n} columns; the dataset says \
+             {differing} of {}",
+            columns.len()
         );
     }
 }

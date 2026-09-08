@@ -189,24 +189,27 @@ output, and CI checks the document against the committed output. No
 wall-clock figure is gated.
 
 **Reproducibility, measured rather than asserted, and two different
-questions.** Re-run against the **same** corpus, `read_rows`,
-`read_bytes`, `SelectedMarks` and `result_bytes` came back
-**bit-identical on all 1,132 statements**;
-`ReadBufferFromFileDescriptorReadBytes` moved on 561 of them (at most
-2.53% on one statement), `ReadCompressedBytes` on 440 (at most 0.19%),
-and `memory_usage` on 982 (up to 25.8%).
+questions.** Re-run against the **same** corpus, the four columns every
+published ratio is computed from — `read_rows`, `read_bytes`,
+`SelectedMarks` and `result_bytes` — are bit-identical on all 1,132
+statements. **Rebuild the corpus and they are not, and no band is
+established for how much.** Four builds have been observed and they
+disagree with each other.
 
-**Rebuild the corpus and these columns vary, by an amount no band
-covers.** Four builds exist. One rebuild moved `read_rows` on 147 of
-1,132 statements by at most 0.013% and left granules and result bytes
-untouched; another moved the same 147 by up to 0.689% and moved a
-granule. §9.2 tabulates both and withdraws the expectation an earlier
-revision stated. The mechanism is adaptive granularity:
-`index_granularity_bytes` is 10 MiB, the corpus is anchored to the day it
-is built, and a `DoubleDelta`-coded timestamp column compresses
-differently at different absolute values, so a granule boundary moves.
-**Expect your rebuild to differ from the committed artefact**; the
-document is gated against the artefact, not against a rebuild.
+**The figures are not restated here.** They live in
+`docs/benchmarks/data/traces-lowering-92-rebuilds.tsv`, one row per
+observation and column with its provenance, and
+`docs/query-lowering.md` §9.2b tabulates them under a check that fails
+when the table and the dataset disagree. Restating a measurement beside
+the measurement is how the last version of this paragraph came to carry
+a figure that was wrong.
+
+The mechanism is adaptive granularity: `index_granularity_bytes` is
+10 MiB, the corpus is anchored to the day it is built, and a
+`DoubleDelta`-coded timestamp column compresses differently at different
+absolute values, so a granule boundary moves. **Expect your rebuild to
+differ from the committed artefact**; the document is gated against the
+artefact, not against a rebuild.
 
 ```text
 podman run -d --name pulsus-lowering-ch -p 18923:8123 \

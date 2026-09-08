@@ -2048,39 +2048,49 @@ predicate to the batch's own span range collapses the same read to a handful of 
 identical answer. That is a separate optimisation from anything in this document and it does not
 need the lowering core.
 
-**What is reproducible here, and what is not — and the two questions are different.**
+**What is reproducible here, and what is not — and the two questions are different.** Re-running
+the harness against the SAME corpus is one question; rebuilding the corpus and re-running is
+another, and only the first was measured when this section was first written.
 
-*Re-running the harness against the SAME corpus.* `read_rows`, `read_bytes` (`decoded †`),
-`SelectedMarks` (`granules`) and `result_bytes` came back **bit-identical on all 1,132 statements**.
-`ReadBufferFromFileDescriptorReadBytes` (`off file system †`) moved on 561 of the 1,132, by at most
-2.53% on a single statement and by 0.03% on the unlowered request's total; `ReadCompressedBytes`
-moved on 440, by at most 0.19%; `memory_usage` moved on 982, by up to 25.8% on a single statement.
+**Every figure below is held in
+[`docs/benchmarks/data/traces-lowering-92-rebuilds.tsv`](benchmarks/data/traces-lowering-92-rebuilds.tsv)**,
+one row per observation and column with the provenance of each, and
+`the_rebuild_table_states_the_observations_the_dataset_holds` fails when this table and that file
+disagree. An earlier revision stated these numbers in prose and one of them was wrong with nothing
+to say so.
 
-*Rebuilding the corpus and re-running.* **These columns vary between builds, and no band is
-established for how much.** Four observations exist — the committed artefact and three rebuilds,
-each on a different day and a different container — and the two rebuilds whose per-statement figures
-were recorded are these:
+Each cell reads *statements moved, of 1,132* / *largest per-statement change*:
 
-| column | rebuild A: statements moved / largest change | rebuild C: statements moved / largest change |
-|---|---|---|
-| `selected_marks` (`granules`) | 0 of 1,132 | **1** of 1,132, 0.71% |
-| `result_bytes` | 0 of 1,132 | 0 of 1,132 |
-| `read_rows` | 147, 0.013% | 147, **0.689%** |
-| `read_bytes` (`decoded †`) | 147, 0.013% | 147, **0.647%** |
-| `read_compressed_bytes` | 977, 0.013% | 996, 0.234% |
-| `fd_read_bytes` (`off file system †`) | 1,124, 2.5% | 1,125, 3.15% |
-| `memory_usage` | 1,132, 18.6% | 1,105, 19.9% |
+| column | S: same corpus, twice | rebuild A | rebuild C |
+|---|---|---|---|
+| `selected_marks` (`granules`) | 0 / — | 0 / — | 1 / 0.71% |
+| `result_bytes` | 0 / — | 0 / — | 0 / — |
+| `read_rows` | 0 / — | 147 / 0.013% | 147 / 0.689% |
+| `read_bytes` (`decoded †`) | 0 / — | 147 / 0.013% | 147 / 0.647% |
+| `read_compressed_bytes` | 440 / 0.19% | 977 / 0.013% | 996 / 0.234% |
+| `fd_read_bytes` (`off file system †`) | 561 / 2.53% | 1124 / 2.5% | 1125 / 3.15% |
+| `memory_usage` | 982 / 25.8% | 1132 / 18.6% | 1105 / 19.9% |
 
-Rebuild B recorded only group totals: it moved the hydration group's granules by 1 and its result
-bytes by 2,323, so it disagrees with rebuild A on the two columns rebuild A found stable, and with
-rebuild C on `result_bytes`.
+**On the same corpus the four columns every published ratio is computed from are bit-identical** —
+`read_rows`, `read_bytes`, `selected_marks` and `result_bytes`, zero of 1,132 statements moved.
+**Rebuild the corpus and they are not, and no band is established for how much.** Four observations
+exist: the committed artefact and three rebuilds, each on a different day and a different host.
+Rebuild A is this harness's own; rebuild C was run by a code review on its own host and is recorded
+from its report rather than re-measured here, which the dataset's `provenance` column says. Rebuild
+B recorded only group totals: it moved the hydration group's granules by 1 and its result bytes by
+2,323, so it disagrees with rebuild A on the two columns rebuild A found stable, and with rebuild C
+on `result_bytes`.
 
 **An earlier revision of this paragraph said a rebuild is expected to land within rebuild A's
-figures. That was three observations predicting a fourth, and the next rebuild anyone ran fell
-outside it on every column** — `read_rows` at 0.689% against 0.013%, and a mark moved where none had
-before. The sentence is withdrawn rather than widened: what these observations establish is that
-these columns vary, not by how much. Anyone re-running the harness should expect their numbers to
-differ from the committed artefact, and should not read a difference of this size as a defect.
+figures. That was three observations predicting a fourth, and rebuild C differs from rebuild A on
+**6** of the seven columns** — every one except `result_bytes`, which is 0 of 1,132 in both, and
+which is also the only column all three rebuilds agree on. `read_rows` is 0.689% against 0.013%,
+and a granule moved where none had before. The expectation is withdrawn rather than widened: what
+these observations establish is that these columns vary, not by how much, and a re-runner should
+expect their numbers to differ from the committed artefact without reading the difference as a
+defect. `the_rebuild_table_states_the_observations_the_dataset_holds` derives that **6** from the
+dataset, so the sentence cannot drift from the table above it — which is how it came to say
+"every column" when one column agreed.
 
 **The mechanism is adaptive granularity.** `index_granularity_bytes` is 10 MiB on these tables, so a
 granule holds as many rows as fit in that many bytes rather than a fixed 8,192. The corpus is
@@ -5388,16 +5398,35 @@ either half of the record.
 
 ### 12.3 The citations, and the hole that is enumerated rather than papered over
 
-The five design artefacts cite source files by line number **588 times** at commit `1a3b5a9e` —
-that figure moves with every edit to the record, so it is stated with the revision it was taken at
-and nothing depends on it. Nothing derived those citations until part 8: moving
-`search_plan.rs:1854` to `:2854` in [`query-to-sql.md`](query-to-sql.md) and running
+The design record cites source files by line number, and nothing derived those citations until
+part 8: moving `search_plan.rs:1854` to `:2854` in [`query-to-sql.md`](query-to-sql.md) and running
 `cargo nextest run --workspace` exited 0 with no failing test.
 
-**469 of them cite a bare basename**, and six of those basenames match more than one tracked file —
+**Every figure in this section is derived, and a check fails when the text and the derivation
+disagree.** An earlier revision of this section stated its census in prose, and six of its numbers
+were wrong at the head with nothing to say so — in the section whose subject is numbers nobody
+derives. `every_figure_section_12_3_states_is_the_one_the_datasets_hold`
+(`crates/pulsus-read/tests/design_record_drift_gate.rs`) computes each row of the three tables below
+and compares.
+
+| quantity | at this revision |
+|---|---|
+| citation occurrences in the five artefacts | 594 |
+| of those, citing a bare basename | 475 |
+| `(document, token)` pairs the rule resolves | 306 |
+| occurrences those resolved pairs cover | 464 |
+| `(document, token)` pairs it cannot resolve | 82 |
+| occurrences those frozen pairs cover | 130 |
+| resolved rows anchored on a token the citing prose prints | 146 |
+| resolved rows anchored on a snapshot of the cited line | 160 |
+
+Most citations name a bare basename, and six of those basenames match more than one tracked file —
 `plan.rs` matches four. The rule that resolves them is the anchor design's own: pick the candidate
-whose cited line contains an identifier the citing prose already prints. It answers **306
-`(document, token)` pairs**, covering 461 occurrences; **80** it cannot answer, covering 127.
+whose cited line contains an identifier the citing prose already prints.
+
+**These counts move when this section is edited, because this section cites source files too.** Six
+of the 594 are citations §12.3 itself added when it started naming the tokens it is about, which is
+content rather than drift — and it is why the census is derived rather than written down.
 
 **The rule lives in `crates/pulsus-read/tests/design_record_drift_gate.rs`, in
 `resolve_citation`, and it is the only implementation.** An earlier revision generated the datasets
@@ -5405,12 +5434,12 @@ from a script beside the repository and checked them with a second reader writte
 two drifted on two citations, which is the two-implementations problem in miniature. An `#[ignore]`d
 test regenerates both datasets from the one rule.
 
-**The 80 are frozen with a reason each**, in
+**The frozen pairs carry a reason each**, in
 `crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`:
 
 | reason | rows | what it means |
 |---|---|---|
-| `ambiguous_basename` | 71 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 73 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on — `traces/exec.rs:114`, `:1968` and `search_plan.rs:1042`, the first cited from two documents |
 | `occurrences_disagree` | 3 | the record cites the token more than once in one document and the rule answers **differently** for two of the occurrences — `labels.rs:363`, `sql.rs:489` and `sql.rs:996`, all in [`query-to-sql.md`](query-to-sql.md) |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
@@ -5431,7 +5460,7 @@ place to put inconvenient citations, and an earlier revision promised it and did
 
 #### The fallback that was rejected, and the cases that rejected it
 
-The obvious next rule for the 80 is the enclosing section's language: a `plan.rs` citation in a
+The obvious next rule for the frozen pairs is the enclosing section's language: a `plan.rs` citation in a
 LogQL section means `logql/plan.rs`. **It is not applied, and the reason is nine citations anyone
 can read** —
 `the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled` finds every
@@ -5462,8 +5491,9 @@ answered with `logql/labels.rs`.
 > measured against itself**, and the test asserts the set of disagreements is exactly the nine that
 > have been read, so a new one cannot appear without a person reading it.
 
-**What would close the hole, stated as work rather than promised.** Each of those 80 citing lines
-needs to print an identifier the cited line carries — the same rule the 306 already satisfy — after
+**What would close the hole, stated as work rather than promised.** Each of those frozen citing
+lines needs to print an identifier the cited line carries — the same rule the resolved ones satisfy
+— after
 a reading of the cited line against the claim beside it. Three of them are already read: the
 `occurrences_disagree` trio, where the review established that the citing prose describes
 `logql/labels.rs`, `logql/sql.rs` and `logql/sql.rs`, and the citations need path-qualifying to say
@@ -5477,8 +5507,9 @@ whatever the source had become. The count dataset is the other way round — its
 derived from an anchor, so regenerating it is the correct response to a document re-wrap. The diff
 is the review in both cases.
 
-**What the 306 resolved rows can and cannot show.** 146 carry a `prose` anchor — a token the citing
-prose prints — so the claim and its evidence are reviewable side by side. 160 carry a `line` anchor,
-a snapshot of the cited line, because the citing prose prints no such token: those detect the line
-moving or changing, and they cannot show the citation means the right thing. The `anchor_kind`
-column exists so that difference is visible rather than assumed away.
+**What a resolved row can and cannot show.** A `prose` anchor is a token the citing prose prints,
+so the claim and its evidence are reviewable side by side; a `line` anchor is a snapshot of the
+cited line, taken because the citing prose prints no such token, and it detects the line moving or
+changing without showing that the citation means the right thing. The two counts are in the census
+table above and the `anchor_kind` column records which kind each row is, so that difference is
+visible rather than assumed away.
