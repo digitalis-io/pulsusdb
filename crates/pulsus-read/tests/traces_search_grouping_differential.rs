@@ -64,6 +64,19 @@
 //! `by_agg_by` are parity fixtures again, and the ledger row is a
 //! withdrawal record.
 //!
+//! ## The hermetic half of the issue #492 item 9 fixtures
+//!
+//! The four `midpipe_*` fixtures below run only with the reference
+//! endpoints set. Their hermetic twins drive the evaluator itself and run
+//! unconditionally, in `crates/pulsus-read/src/traces/search_eval.rs`:
+//! `both_spellings_of_a_mid_pipeline_filter_answer_the_same_one_spanset`,
+//! `a_mid_pipeline_filter_acts_at_its_written_position` and
+//! `the_mid_pipeline_filter_composes_with_every_neighbouring_stage`, over
+//! the same four-span `a b a b` corpus. They live there because the
+//! evaluator's entry point is crate-private; neither half replaces the
+//! other — the hermetic one says our engine computes the answer, this one
+//! says the answer is the reference's.
+//!
 //! ## Corpus isolation on a shared oracle
 //!
 //! This suite runs against the container the syntax and `compare()` legs
@@ -360,6 +373,24 @@ const ORD2: &[SpanDef] = &[
     span(4, "b").kind(2),
 ];
 
+/// Corpus C-ORD3 (issue #492 item 9): four spans named `a b a b`, so a
+/// `{ name = "b" }` written anywhere in the pipeline keeps exactly two of
+/// them and the two `b` spans are `02` and `04`. Durations rise 10/20/
+/// 30/40ms and spans `02`/`04` carry `tag = "x"` while `03` carries
+/// `tag = "y"` — the fixture the item-9 ledger rows were measured on.
+const ORD3: &[SpanDef] = &[
+    span(1, "a").dur(10 * SEC / 1000),
+    span(2, "b")
+        .dur(20 * SEC / 1000)
+        .attrs(&[("tag", r#"{"stringValue":"x"}"#)]),
+    span(3, "a")
+        .dur(30 * SEC / 1000)
+        .attrs(&[("tag", r#"{"stringValue":"y"}"#)]),
+    span(4, "b")
+        .dur(40 * SEC / 1000)
+        .attrs(&[("tag", r#"{"stringValue":"x"}"#)]),
+];
+
 /// The mixed-type pair: identical values, OPPOSITE push order. One order
 /// cannot show order dependence, which is the entire content of the
 /// reference defect these two record.
@@ -429,6 +460,10 @@ fn corpora() -> Vec<Corpus> {
         Corpus {
             service: "grp492b",
             spans: ORD2,
+        },
+        Corpus {
+            service: "grp492c",
+            spans: ORD3,
         },
     ]
 }
@@ -670,6 +705,28 @@ fn fixtures() -> Vec<Fixture> {
                 "by(kind)=stringValue=client,by(name)=stringValue=a | m1 | 02",
                 "by(kind)=stringValue=server,by(name)=stringValue=b | m2 | 03,04",
             ]),
+
+        // ---- issue #492 item 9: the mid-pipeline `{...}` filter -------
+        //
+        // Four fixtures over corpus C-ORD3 (`a b a b`). The first pair is
+        // the two spellings of the item-9 query, which the reference
+        // answers identically and we answered `400` before this change.
+        // The second pair is what makes the written position OBSERVABLE:
+        // the same two stages in opposite order give `count() = 2` and
+        // `count() = 4` over the SAME two spans, so a fold that ran the
+        // filter at a fixed position could not pass both.
+        parity("midpipe_filter_then_by", "grp492c",
+            r#"| { name = "b" } | by(name)"#,
+            &["by(name)=stringValue=b | m2 | 02,04"]),
+        parity("midpipe_by_then_filter", "grp492c",
+            r#"| by(name) | { name = "b" }"#,
+            &["by(name)=stringValue=b | m2 | 02,04"]),
+        parity("midpipe_filter_then_count", "grp492c",
+            r#"| { name = "b" } | count() > 1"#,
+            &["count()=intValue=2 | m2 | 02,04"]),
+        parity("midpipe_count_then_filter", "grp492c",
+            r#"| count() > 1 | { name = "b" }"#,
+            &["count()=intValue=4 | m2 | 02,04"]),
 
         // ---- an attribute by-key renders in the STORED type's arm ------
         parity("by_attr_int", "s510a", "| by(.n)", &[

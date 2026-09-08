@@ -1144,7 +1144,7 @@ on every run.
 
 **Enumerated from the AST, not from this design's needs.** `PipelineStage`
 ([`crates/pulsus-traceql/src/ast.rs`](../crates/pulsus-traceql/src/ast.rs), line 981) has exactly
-**seven** variants; all seven are below, together with `Source` and the three synthesised links of
+**eight** variants; all eight are below, together with `Source` and the three synthesised links of
 §2.1. Every row states the **residual state effect** — what the link applies to the accumulated
 `Relation` when it does *not* lower (§2.5) — because a link with no stated effect is a link whose
 blocking behaviour the reader has to infer.
@@ -1183,11 +1183,12 @@ cannot be reached by any request:
 | `By` | a span-event / span-link intrinsic key (`:1435`) | `unsupported field: by(event:name): grouping by a span-event / span-link intrinsic is not supported (a span carries a collection of events/links, so there is no single group value)` | **yes** — `… \| by(event:name) \| count() > 1` |
 | `Select` | a nested-set intrinsic (`:1277`) | `type mismatch: select() of a nested-set intrinsic is not supported` | **yes** — `… \| select(nestedSetLeft)` |
 | `Select` | one of the twelve trace-level / scoped / event / link intrinsics (`:1322`) | `type mismatch: select() of this intrinsic is not supported` | **yes** — `… \| select(rootName)` |
+| `Filter` | a mid-pipeline spanset OPERATION rather than a single filter | `type mismatch: ({ .b = 2 } && { .c = 3 }) is not executable as a pipeline stage: a ``|`` stage must be a single { ... } filter, not a cross-spanset or structural operation` | **yes** — `{ .a = 1 } \| { .b = 2 } && { .c = 3 }`. The reference's pipeline element is a full spanset expression, so the parser accepts it and the planner decides |
 
 `Coalesce` is zero-arity and has no payload to reject. `Metric`, `MetricSecondStage` and `Compare`
 are rejected whole rather than by payload and are already "not in the chain" below.
 
-**Three of the eleven rows are unreachable, and the fourth was not.** An earlier revision of this
+**Three of the twelve rows are unreachable, and the fourth was not.** An earlier revision of this
 table marked the non-finite numeric threshold parser-shadowed on the strength of `nan`, `inf` and
 `1e400` all being refused by the lexer. They are — but a long decimal literal is not, and
 `{ .service.namespace = "prod" } | max(.a) > <320 nines>` parses, validates and returns
@@ -1205,13 +1206,14 @@ re-checked the same way, with three to eight spellings each, and all four held.
 |---|---|---|---|---|---|
 | `Source` — `SpansetExpr` (`ast.rs:99`) | — → `Spans` | none; lowers by §2.4's lattice | n/a — the seed is always applied. An unlowerable leaf contributes `1` and clears `exact` | **always lowers, possibly partially** | *none*, unless the selector is a disjunction over two sources — then `Cut::DisjointSources` (§2.7.4) |
 | `Aggregate { op, field, cmp, value }` (`ast.rs:994`) | `Spans` → `Traces` | `exact`, **no fragment already in this statement's `HAVING`**, and a fragment `aggregate_having_sql` will render for this (aggregate, operator) pair and this grouping | **shape unchanged** — whatever the fold has accumulated, not reset to `Spans`; **clears `exact`** — the evaluator will drop traces the SQL returned | conditional, **over the accepted payload set only** (above) | *none* |
-| `By { key }` (`ast.rs:1024`) | `Spans` → `Groups{key}` | never lowers (`No(NotYetLowered)`) — the evaluator builds the span sets | **shape unchanged**; records the key as an evaluator-owned group consumer; and then EITHER records `grouping` and leaves `exact` alone, when the key renders on this generator's source and the slot is free and the relation is still exact, OR clears `exact` | never lowers | *none* |
-| `Coalesce` (`ast.rs:1026`), after a `By` | `Groups` → `Spans` | the level carries no `HAVING` — then the grouping slot is FREED. With a `HAVING` it refuses: the aggregate selected groups, and the spans it selected are not recoverable | **shape unchanged** — `Groups` in the ordinary case, but `Spans` if the preceding `By` was itself residual; clears `exact` when it refuses | conditional | *none* |
+| `By { key }` (`ast.rs:1046`) | `Spans` → `Groups{key}` | never lowers (`No(NotYetLowered)`) — the evaluator builds the span sets | **shape unchanged**; records the key as an evaluator-owned group consumer; and then EITHER records `grouping` and leaves `exact` alone, when the key renders on this generator's source and the slot is free and the relation is still exact, OR clears `exact` | never lowers | *none* |
+| `Coalesce` (`ast.rs:1049`), after a `By` | `Groups` → `Spans` | the level carries no `HAVING` — then the grouping slot is FREED. With a `HAVING` it refuses: the aggregate selected groups, and the spans it selected are not recoverable | **shape unchanged** — `Groups` in the ordinary case, but `Spans` if the preceding `By` was itself residual; clears `exact` when it refuses | conditional | *none* |
 | `Coalesce`, with no preceding `By` | `Spans` → `Spans` | none — the identity | none | **always lowers**, contributing no SQL | *none* |
-| `Select { fields }` (`ast.rs:1002`) | any → same shape | **never lowers.** `apply` returns the relation unchanged and `capability` has no `Yes` arm, so field resolution decides only which `BlockReason` is reported: `select(name)` reports `NotYetLowered` and every attribute spelling reports `NameNotResolvable`, because a TraceQL seed's `ColSet` is `Closed([trace_id, name])`. Measured on both seed sources by `traces::compile::tests::select_refuses_and_names_its_reason_per_field`. **No exactness precondition** — projecting a column onto rows the evaluator will drop would be harmless | **wider `cols`**: no existing column moves, and `set_provenance` ADDS the selected field as `EvaluatorOnly` (`compile/fold.rs:242`), which the effect table already expects (`traces/compile.rs:1686`) | **never lowers** — the two refusal reasons are the only outcomes, and `NameNotResolvable` is what the explain surface renders (`compile/plan.rs:879`) for every spelling a client writes | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4, and §9.8 measured the join and refused it |
-| `Metric(MetricStage)` (`ast.rs:1033`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:1228`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:90`) | n/a |
-| `MetricSecondStage(SecondStage)` (`ast.rs:1037`) | — | `400` on search (`search_plan.rs:1235`) | n/a | not in the chain | n/a |
-| `Compare { .. }` (`ast.rs:1049`) | — | `400` on search (`search_plan.rs:1241`) | n/a | not in the chain | n/a |
+| `Select { fields }` (`ast.rs:1024`) | any → same shape | **never lowers.** `apply` returns the relation unchanged and `capability` has no `Yes` arm, so field resolution decides only which `BlockReason` is reported: `select(name)` reports `NotYetLowered` and every attribute spelling reports `NameNotResolvable`, because a TraceQL seed's `ColSet` is `Closed([trace_id, name])`. Measured on both seed sources by `traces::compile::tests::select_refuses_and_names_its_reason_per_field`. **No exactness precondition** — projecting a column onto rows the evaluator will drop would be harmless | **wider `cols`**: no existing column moves, and `set_provenance` ADDS the selected field as `EvaluatorOnly` (`compile/fold.rs:242`), which the effect table already expects (`traces/compile.rs:1745`) | **never lowers** — the two refusal reasons are the only outcomes, and `NameNotResolvable` is what the explain surface renders (`compile/plan.rs:879`) for every spelling a client writes | *none* here; a left join would need an ADR 0008 clause that does not exist — [query-to-sql.md](query-to-sql.md) open question 4, and §9.8 measured the join and refused it |
+| `Filter(SpansetExpr)` (`ast.rs:1021`, issue #492 item 9) | `Spans` → `Spans` | **never lowers** (`No(NotYetLowered)`) — and the reason is soundness, not unfinished work. Pushing the filter as a `WHERE` conjunct is WRONG whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span is supplied by the RIGHT operand, so `val = 'y'` ANDed onto the left leaf's `trace_attrs_idx` generator matches nothing and the trace is dropped. It would also favour one spelling over the identical `{A && B}`, which does not push its second leaf | **shape unchanged**; **clears `exact`** — the evaluator will drop spans, and traces, that the SQL returned | never lowers | *none*. It does decide WHICH generator statement phase 1 sends — `filter::collect`'s `&&` fold continued across the pipe, so `{A} \| {B}` sends the statement `{A && B}` sends — but that is a choice among statements the query already implies, not a fragment added to one |
+| `Metric(MetricStage)` (`ast.rs:1055`) | — | **not a search-path link.** `plan_pipeline` answers `400` (`search_plan.rs:1854`) | n/a | **not in the chain** — the metrics routes compile it in full already (`metrics_sql.rs:90`) | n/a |
+| `MetricSecondStage(SecondStage)` (`ast.rs:1059`) | — | `400` on search (`search_plan.rs:1861`) | n/a | not in the chain | n/a |
+| `Compare { .. }` (`ast.rs:1071`) | — | `400` on search (`search_plan.rs:1867`) | n/a | not in the chain | n/a |
 | `Order` (synthesised) | `Traces` → `Traces` | `exact` — over a superset the sort **key** is wrong, not just the set (§2.2) | leaves `ordering` unset | conditional | *none* |
 | `Limit(n)` (synthesised) | `Traces` → `Traces` | `ordering.is_some()` | leaves `limit` unset | conditional | *none* |
 | `Emit` (synthesised) | `Traces` \| `Groups` → answer | none — see below | records the winners' root read as the evaluator's | **must go residual**: `Never(NeedsUnwindowedRootRead)` | **served by a second SQL part, not by the evaluator** — `Cut::SourceHandoff` (§2.7.2), seeded by the winners' trace ids, `SeedBound::RequestLimit`, `Issue::Once` |
@@ -1255,7 +1257,7 @@ of the pipeline."
 | **spanset aggregate** (`count`/`sum`/`avg`/`min`/`max`) | the whole two-phase loop: 1,110 round trips, 76,616,608 metered bytes, 5,705,629,767 rows read (§9.2) | **measured on C1** |
 | **`by()` regrouping** | adds no query of its own; its saving is the same loop collapse when the selector is lowerable | argued — it adds no read |
 | **`select()` projection** | one extra read per batch; +4.6 KiB per request and one extra round trip. **Measured and refused** in §9.8: for the query whose only attribute-index read is the `select()` value read there is nothing to merge it with, and putting an attribute value into a `trace_spans` statement is a join | measured on C2 (issue #478); the refusal measured on §9.8's corpus |
-| **field-vs-field comparison** `{ .a = .b }` | **four** `attr_values_sql` reads per batch, not two — each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1346-1347`), so a two-operand leaf reads both values twice. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
+| **field-vs-field comparison** `{ .a = .b }` | **four** `attr_values_sql` reads per batch, not two — each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1358-1359`), so a two-operand leaf reads both values twice. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
 | **cross-field arithmetic** `{ .a * 2 > .b }` | the same four reads per batch; 347 statements and 2,869,590,609 rows read for a request matching 9,000 traces (§9.7) | **measured on C6** |
 | **event/link set comparison** `{ .a = event:name }` | one `event_set_sql` co-load per batch **plus the scalar operand's two value reads**; 2,502 statements and 13,995,704,756 rows read (§9.7) | **measured on C6** |
 | **negated attribute leaf** `{ .a != "5" }` | drops the generator to the empty-predicate time-range superset (`GenClass::TimeRange`, `filter.rs:102`) and adds no read of its own, so the window's whole span scan is the cost: 4 statements, 12,097,152 rows read, 1,482 granules (§9.7) | **measured on C6** |
@@ -1690,7 +1692,9 @@ lists and none in neither.
 
 §3.1's TraceQL table was enumerated the same way in the previous round, in the source direction over
 `crates/pulsus-read/src/traces/search_plan.rs`, and came back complete at eleven rows; it is not
-re-derived here.
+re-derived here. Issue #492 item 9 added the twelfth row with the arm it describes — the
+mid-pipeline spanset OPERATION — so the table is twelve rows and the enumeration above covers
+eleven of them.
 
 **The five parameter rejections stay the planner's, and the link must not re-implement them.**
 `parse_vector_agg_params` (`plan.rs:1480`) is the sole producer of parsed aggregation parameters and
@@ -3826,7 +3830,7 @@ at line 11). Six committed goldens carry a join today and **none is planned by t
   line.
 
 All six come from hand-written builders on routes the compile core classifies `Never` —
-`NotASearchLinkLower::capability`, `crates/pulsus-read/src/traces/compile.rs:1188-1196` — so they
+`NotASearchLinkLower::capability`, `crates/pulsus-read/src/traces/compile.rs:1246-1254` — so they
 are not lowered pipelines and the decision never reached them. The sentence reaches further than the
 decision it records: a drafting fault in the record, not shipped code breaking a rule. **The wording
 belongs to the amendment round ADR 0008 already reserves.** This part records the fact, scopes its
@@ -4016,7 +4020,7 @@ at `2f78c53` and printing the error — not transcribed from the `format!` strin
 on the wire: the status code, the content type and the two headers are **read** from
 `crates/pulsus-server/src/traces_api/error.rs:270-304` and
 `crates/pulsus-server/src/logs_api/error.rs:147-212`. The same run established which arms are
-reachable at all: **three** of the eleven TraceQL arms and **four** of the fourteen LogQL arms are
+reachable at all: **three** of the twelve TraceQL arms and **four** of the fourteen LogQL arms are
 shadowed by the parser or by `pulsus_traceql::validate`, which no reading of the planner would have
 shown. The TraceQL count was four until this revision, when the input that defeats the fourth was
 constructed (§3.1); the LogQL count was written as "three of ten" against a table that had already
@@ -4072,7 +4076,7 @@ which its own table already carried; its builder derivation was replaced, becaus
 at all; and its `LabelReplace` row's "removes no series" was replaced by the measured 4-series-to-1
 range collision. The boundary diagram's pipeline D was drawn to the end of its chain and its
 enumeration caption stopped calling a transcription "the shipped function". §11.2b now nominates
-two gates covering all 27 effects, replacing what an earlier revision of that section nominated;
+two gates covering all 28 effects, replacing what an earlier revision of that section nominated;
 this section states no count for that revision and defers to §11.2b, which records that no retained
 artefact contains it —
 `logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states` and
@@ -4135,8 +4139,9 @@ was smaller than the claim it was asked to support.**
    in this document was re-checked by constructing the input that would defeat it** rather than by
    reading the lexer — four TraceQL rows with three to ten spellings each and four LogQL rows with
    three to eight. The other seven held. Two stale counts fell out of it: §10 said "four of the
-   eleven TraceQL arms and three of the ten LogQL arms" where the truth is three of eleven and four
-   of fourteen.
+   eleven TraceQL arms and three of the ten LogQL arms" where the truth was three of eleven and four
+   of fourteen. (The TraceQL table has since gained a twelfth arm — §3.1's `Filter` row, issue #492
+   item 9 — and it is reachable, so §10 now reads three of twelve.)
 3. **Three of the 22 gates then in the inventory had no seed-provenance row, and the diagram row
    said "two" where there are three.** §11.0b now has a row for every gate, each cell parenthesises
    how many gates it covers, the counts sum to the inventory total, and every row repeats §11.0's
@@ -4813,15 +4818,25 @@ can be checked against an artefact either — including "under-checked" just abo
 about the earlier `Drop`/`Keep` revision below.
 
 **Every link with a stated residual state effect gets a row.** Counted off the document's own
-tables: **7** in §3.1 (`Aggregate`, `By`, grouped `Coalesce`, `Select`, `Order`, `Limit`, `Emit`)
-and **20** in §7.1 — 13 `Pipe` rows (`LineFilter`, the four `Parser` forms, `LabelFilter`,
+tables: **8** in §3.1 (`Aggregate`, `By`, grouped `Coalesce`, `Select`, `Filter`, `Order`, `Limit`,
+`Emit`) and **20** in §7.1 — 13 `Pipe` rows (`LineFilter`, the four `Parser` forms, `LabelFilter`,
 `LineFormat`, `LabelFormat`, `Unwrap`, `Unpack`, `Decolorize`, `Drop`, `Keep`) and 7 synthesised
-(`Window`, `RangeAgg`, `VectorAgg`, `LabelReplace`, `Order`, `Limit`, `Emit`) — **27 effects in
+(`Window`, `RangeAgg`, `VectorAgg`, `LabelReplace`, `Order`, `Limit`, `Emit`) — **28 effects in
 all**. The two chain links whose stated effect is *none* — `Source`, and `Coalesce` with no
 preceding `By`, both §3.1 — are to get a row too, asserting the effect **is** the identity, so the
 exemption is itself a check rather than a silence. So `logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states` is specified to
-carry **20** rows and `traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states` **9**
+carry **20** rows and `traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states` **10**
 — in **wave 1**, which writes both; neither exists at base.
+
+The TraceQL count above is this section's own derivation from §3.1 and is **not** the shipped
+test's row count. That test exists and carries **21** rows: the ten derived here, plus the ten
+per-batch read and engine links issue #492 part 3 added (`Hydrate`, the four indexed phase-2 reads,
+the two trace-wide co-loads, `Structural`, `NestedSet`, `BoolTruth`), which §3.1's table does not
+enumerate, plus **one more row for `By`** — the shipped test gives `By` a row per key branch, one
+key that renders and one that does not, where §3.1 gives it a single row. Ten plus ten plus one.
+The shipped row count is gated —
+`assert_every_residual_state_effect::<Tql>(&rows, 21)` in
+`crates/pulsus-read/src/traces/compile.rs` — while the derivation above is prose and is not.
 
 The five other cells reading `n/a` or `none` belong to rows the tables mark **not in the chain** —
 §3.1's `Metric`, `MetricSecondStage` and `Compare`, and §7.1's `MetricExpr::Literal`/`VectorFn` and
@@ -4903,7 +4918,7 @@ Each row therefore carries seeds `S₁` and `S₂` and literals `E₁` and `E₂
    differ in, and `true` only where the effect genuinely resets a field to a constant. This is the
    assertion a single seed cannot make, and it is what would turn "shape unchanged" from a phrase
    into a property — in **wave 1**, which writes it; at base the selector exits 4.
-4. for the **27** rows with a stated effect, on **both** seeds,
+4. for the **28** rows with a stated effect, on **both** seeds,
    `assert_ne!(real.residual_effect(link, Sᵢ.clone()), Neutered(real).residual_effect(link, Sᵢ.clone()))`
    — this is to catch a *missing* effect, and it is the neutering. Like assertion 2 it catches
    nothing until **wave 1** writes it.
@@ -4916,9 +4931,9 @@ retained.** A row saying `cols` is unchanged needs seeds differing in `cols`; on
 untouched needs seeds differing in `exact`; `ordering`, `limit`, `source`, `predicate` and `depth`
 likewise. A row that names nothing as unchanged still gets two seeds differing in `shape`.
 
-29 rows across the two gates **wave 1** writes, 58 seed evaluations, 27 rows carrying assertion 4 on
+30 rows across the two gates **wave 1** writes, 60 seed evaluations, 28 rows carrying assertion 4 on
 both seeds. The
-wrapper cannot silently pass: if `Neutered::residual_effect` were ever made to delegate, all 27
+wrapper cannot silently pass: if `Neutered::residual_effect` were ever made to delegate, all 28
 would fail assertion 4 at once, which is the loudest possible failure.
 
 **`Drop`/`Keep` is fixed by giving each side its own literal.** `Drop` and `Keep` are each given a
@@ -4941,7 +4956,7 @@ satisfy.
 list is to be enumerated by an exhaustive `match` over the link type with no `_` arm, so that once
 the gate exists, adding a variant will fail to build it. That forces a *name* for the new link; it
 does not by itself force a *row*. The closure is to be the count, all of it in **wave 1**: the LogQL gate is to assert it
-has **20** rows and the TraceQL gate **9**, and §11.3's
+has **20** rows and the TraceQL gate **10**, and §11.3's
 `the_document_states_the_residual_effect_counts_the_gates_assert` is to assert the same numbers read
 from this document's own tables. §11.3's four variant gates —
 `every_logql_stage_variant_has_a_row_in_the_lowering_document`,
@@ -4966,7 +4981,7 @@ the *effect* cell. The first parse written for this section did exactly that and
 §7.1's synthesised-link tables each gained a **continuation** column, appended after `disposition`
 so that no existing column index moved. Every parse in §11.2b and §11.3 — including
 `the_document_states_the_residual_effect_counts_the_gates_assert`, **wave 1**, which reads the
-residual-effect counts **7**/**5** and **20**/**2** out of these same tables — must be written
+residual-effect counts **8**/**5** and **20**/**2** out of these same tables — must be written
 against the widened tables and must index the effect column from the left, never from the right. The
 counts themselves did not move: a column was added, no row was.
 
@@ -4996,8 +5011,8 @@ set against [api.md](api.md).
 | every `pulsus_logql::Stage` variant has a row in §7.1 — to be enumerated by an exhaustive `match` with no `_` arm, so that adding a variant will fail to build here | `test(=every_logql_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
 | every `pulsus_traceql::PipelineStage` variant has a row in §3.1, same construction | `test(=every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
 | every `LqlLink` variant has a row in §7.1, same construction — this is where adding a link variant will redden, once wave 1 has written it | `test(=every_lql_link_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every TraceQL chain link — the seven `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit` — has a row in §3.1 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| §3.1 carries exactly **7** rows with a residual state effect and **5** without; §7.1 carries exactly **20** and **2** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** |
+| every TraceQL chain link — the eight `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit` — has a row in §3.1 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
+| §3.1 carries exactly **8** rows with a residual state effect and **5** without; §7.1 carries exactly **20** and **2** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** |
 | the hops diagram's lowered round-trip count and result-byte total equal §9.2's | `test(=the_hops_diagram_and_the_document_agree_on_the_lowered_request)` | exit **101**, no such target — **wave 1** |
 | every link label in the boundary diagram's pipelines is a link this document defines | `test(=the_boundary_diagram_names_only_links_the_document_defines)` | exit **101**, no such target — **wave 1** |
 | every pipeline drawn in the boundary diagram ends in `Order`, `Limit` and `Emit`, because every chain does | `test(=every_boundary_diagram_pipeline_carries_the_three_synthesised_links)` | exit **101**, no such target — **wave 1** |

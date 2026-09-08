@@ -2430,15 +2430,15 @@ when we are asking it to slow down, so we keep `429`; recorded as
 - **Disposition.** Not copied, no code change: our answer was already the
   documented one. Recorded so the difference is not read as our bug.
 
-### `traceql-midpipeline-spanset-filter-unsupported` (issue #492) — **a GAP record, not a divergence**
+### `traceql-midpipeline-spanset-filter-unsupported` (issue #492) — **WITHDRAWN: item 9 closed the gap, and the row's own account of it was wrong**
 
 - **Route.** `GET /api/traces/v1/search` and its `/api/search` alias — the
-  refusal is the same handler on both paths.
+  refusal was the same handler on both paths.
 
-- **What.** The reference's pipeline grammar admits a `{...}` spanset
-  expression as an element in ANY position; ours admits only an
-  identifier-led stage. So a filter written after another stage is a
-  `400` here and a `200` there:
+- **What it recorded (original text, kept).** The reference's pipeline
+  grammar admits a `{...}` spanset expression as an element in ANY
+  position; ours admitted only an identifier-led stage. So a filter
+  written after another stage was a `400` here and a `200` there:
 
   ```
   { resource.service.name = "grp492" } | by(name) | { name = "b" }
@@ -2451,35 +2451,450 @@ when we are asking it to slow down, so we keep `429`; recorded as
   unexpected '{' at byte 50: expected a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)
   ```
 
-  The reference answers `200` with one spanSet, `by(name)=b` over the
-  single `b` span — measured 2026-09-04 against a reference instance
-  started for that run. Written the other way round
-  (`| { name = "b" } | by(name)`) both systems answer that same result,
-  because our parser folds a leading second filter into the spanset
-  expression.
+  Our `Query` carried ONE `spanset: SpansetExpr` plus a
+  `Vec<PipelineStage>` and `parse_pipeline_stage` accepted only an
+  identifier-led stage, so the shape could not be represented at all.
 
-- **Why it is a gap and not a judgement.** Our `Query` carries ONE
-  `spanset: SpansetExpr` plus a `Vec<PipelineStage>`
-  (`crates/pulsus-traceql/src/ast.rs:62-70`) and `parse_pipeline_stage`
-  accepts only an identifier-led stage
-  (`crates/pulsus-traceql/src/parser.rs:843-897`), so the shape cannot be
-  represented at all. Closing it needs a new `PipelineStage` variant
-  carrying a `SpansetExpr`, a planner that can plan more than one filter,
-  and an evaluator stage that filters each spanSet's members — an AST,
-  planner and evaluator change.
+- **One sentence of the original was WRONG, and it contradicted a later
+  sentence of the same row.** The row said that written the other way
+  round (`| { name = "b" } | by(name)`) both systems answer the same
+  result, "because our parser folds a leading second filter into the
+  spanset expression". **There is no fold, and there never was.** Both
+  spellings were the same `400`, which is what the row's own later
+  sentence said (`{a} | {b}` is still the same `400`). Measured on this
+  tree at `3081019b` by calling `pulsus_traceql::parse` directly — the
+  filter-first spelling failed at **byte 39** and the grouping-first one at
+  **byte 50**, which is the same error at the two different offsets, not a
+  fold and a refusal:
 
-- **Tracked as** item 9 of the issue #492 enumeration (comment
-  5536956647), which records the same measurement and points back at this
-  row. Issue #492 item 2 changed the evaluator only and deliberately
-  neither widened nor narrowed this accept surface: `{a} | {b}` is still
-  the same `400`, with the stage list in the message now naming `by` and
-  `coalesce`.
+  ```
+  { resource.service.name = "grp492" } | { name = "b" } | by(name)
+    unexpected '{' at byte 39: expected a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)
+  { resource.service.name = "grp492" } | by(name) | { name = "b" }
+    unexpected '{' at byte 50: expected a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)
+  ```
 
-- **Disposition.** Recorded, not fixed here. Whether to close the gap or
-  keep the refusal is item 9's own decision — it widens the accept
-  surface, the direction this project has previously withdrawn from
-  (`traceql-spanset-by-multi-key-withdrawn`), while "works there, not
-  here" is the case it has previously treated as the worse defect.
+  `parse` calls `parse_spanset_expr`, then loops on `Pipe` into
+  `parse_pipeline_stage`; `|` is `TokenKind::Pipe` and never enters the
+  `&&`/`||` climb. The same held at `d0a410d0`, the last commit before
+  issue #492 item 2 merged, so the sentence was wrong when written rather
+  than having aged.
+
+- **What closed it.** Issue #492 item 9 added `PipelineStage::Filter`, a
+  parser path for a `{`-led (or `(`-led) element, a planner that plans
+  more than one filter, and an ordered evaluator stage. Both spellings now
+  answer `200` with one spanSet, `by(name) = "b"`, `matched 2`, spans
+  `02 04` — measured **2026-09-07** against an instance of the pinned
+  reference build started for this work, on one trace
+  `4929…a1`, service `grp492`, four spans `01 a`, `02 b`, `03 a`,
+  `04 b`:
+
+  ```
+  { resource.service.name = "grp492" } | { name = "b" } | by(name)
+    200  [by(name) = "b"]  matched 2  spans 02 04
+  { resource.service.name = "grp492" } | by(name) | { name = "b" }
+    200  [by(name) = "b"]  matched 2  spans 02 04
+  ```
+
+  Our own answers are the same, and both spellings are live parity
+  fixtures (`midpipe_filter_then_by`, `midpipe_by_then_filter` in
+  `crates/pulsus-read/tests/traces_search_grouping_differential.rs`).
+
+- **Disposition.** **Withdrawn, not deleted**, so the next reader does not
+  re-derive the reasoning — and so the wrong sentence stays visible as a
+  correction rather than disappearing. Three narrower rows survive it, all
+  below: the mid-pipeline spanset OPERATION, the `{...}` stage on the
+  metrics routes, and the reference's empty answer for `select()` before a
+  mid-pipeline filter.
+
+### `traceql-midpipeline-spanset-operation-unsupported` (issue #492 item 9) — **we refuse a shape the reference answers**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** The reference's pipeline element is a full spanset
+  EXPRESSION, not a single filter, so an operation between spansets is
+  legal after a `|`. We parse it — the parser must not answer a semantic
+  question — and refuse it at plan time.
+
+  ```
+  { resource.service.name = "grp492" } | { name = "b" } && { name = "a" }
+  ```
+
+- **Reference.** `200`, one spanSet with no attributes, `matched 4`,
+  spans `01 03 02 04` — the union of both operands. Measured
+  **2026-09-07** against an instance of the pinned reference build
+  started for this work, on the four-span `a b a b` fixture above.
+
+- **Ours.** `400`, `text/plain; charset=utf-8`, no trailing newline, and
+  **no `invalid TraceQL query: ` prefix on THIS refusal** — which is a fact
+  about the refusal, not about the route. The route prefixes its parse and
+  validate refusals (`ApiError::QueryText`,
+  `crates/pulsus-server/src/traces_api/querytext.rs:185,194`, matching the
+  reference's own middleware wrapping at
+  `modules/frontend/pipeline/async_query_validator_middleware.go:51,54`
+  @ v3.0.2)
+  and does not prefix a plan refusal (`ApiError::Plan`,
+  `crates/pulsus-server/src/traces_api/error.rs:303`). Both were measured
+  on 2026-09-08 against a server on this branch: the body below came back
+  unprefixed from `/api/traces/v1/search`, while
+  `{ resource.service.name = "grp492" } | { 1 }` came back from the same
+  route as `invalid TraceQL query: span filter field expressions must
+  resolve to a boolean: { 1 }`. Body verbatim:
+
+  ```
+  type mismatch: ({ name = "b" } && { name = "a" }) is not executable as a pipeline stage: a `|` stage must be a single { ... } filter, not a cross-spanset or structural operation
+  ```
+
+  The parenthesised rendering with double-quoted string values is
+  `SpansetExpr`'s own `Display`.
+
+- **Triage.** Recorded gap, not a judgement. Executing it means evaluating
+  a cross-spanset algebra per surviving spanSet at each pipeline
+  position, which is a second evaluator, not a wider filter. Pinned by
+  `traces::search_plan::tests::a_mid_pipeline_spanset_operation_is_a_clean_400`,
+  which asserts this body byte for byte.
+
+- **Disposition.** Refused cleanly, never silently answered from the left
+  operand alone. Closing it is separate work.
+
+### `traceql-midpipeline-filter-before-metrics-stage-unsupported` (issue #492 item 9) — **the `{...}` stage is search-only**
+
+- **Routes.** `GET /api/traces/v1/metrics/query_range` and
+  `GET /api/traces/v1/metrics/query`.
+
+- **What.** A `{...}` pipeline element before a metrics function. The
+  reference applies it and computes the metric over what survives.
+
+  ```
+  { resource.service.name = "grp492" } | { name = "b" } | rate()
+  ```
+
+- **Reference.** `200`. On the four-span `a b a b` fixture, one non-zero
+  sample: `rate = 0.03333333333333333`. The same query WITHOUT the filter
+  gives `0.06666666666666667` — which is how this row shows the filter is
+  applied rather than ignored. Measured **2026-09-07**,
+  `step=60s`, against an instance of the pinned reference build started
+  for this work.
+
+- **Ours.** `400`, `text/plain; charset=utf-8`. Body verbatim:
+
+  ```
+  type mismatch: a metrics query takes one metrics function stage and at most one topk()/bottomk() second stage; aggregate filters, select(), and { ... } spanset filters are search-only
+  ```
+
+  Before item 9 this query was a PARSER `400`; it is now a planner `400`.
+  The status did not move — the body did, and this row is what records
+  that. Pinned by
+  `traces::metrics_plan::tests::the_metrics_refusal_names_the_mid_pipeline_spanset_filter`.
+
+- **Disposition.** Refused cleanly. The search route serves the stage; the
+  metrics routes do not.
+
+### `traceql-select-before-midpipeline-filter-empty` (issue #492 item 9) — **the reference returns nothing; we return the filtered result**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias.
+
+- **What.** With a `select()` immediately after the leading filter and a
+  `{...}` stage after it, the reference returns no traces for a filter
+  that compares a field. We return the filtered result.
+
+- **The six measured spellings, and the row claims nothing beyond them.**
+  All six against an instance of the pinned reference build started for
+  this work, on the four-span `a b a b` fixture, **2026-09-07**, with
+  `spss=100` on every request (without it the per-spanSet summary cap
+  returns three of four spans and the numbers are not comparable). `{svc}`
+  is `{ resource.service.name = "grp492" }`.
+
+  | spelling | reference |
+  |---|---|
+  | `{svc} \| select(.tag) \| { name = "b" }` | `200`, no traces |
+  | `{svc} \| select(name) \| { name = "b" }` | `200`, no traces |
+  | `{svc} \| select(.tag) \| { .tag = "x" }` | `200`, no traces |
+  | `{svc} \| select(.tag) \| { true }` | `200`, spans `01 02 03 04` |
+  | `{svc} \| { name = "b" } \| select(.tag) \| { name = "b" }` | `200`, spans `02 04` |
+  | `{svc} \| by(name) \| select(.tag) \| { name = "b" }` | `200`, `[by(name) = "b"]`, spans `02 04` |
+
+- **Ours**, for the first spelling: `200`, one spanSet, spans `02 04`.
+  Pinned hermetically in
+  `traces::search_eval::tests::the_mid_pipeline_filter_composes_with_every_neighbouring_stage`.
+
+- **What the six rule out.** That `select()` always empties (row 4
+  answers); that it depends on which field is selected (rows 1 and 2 both
+  empty, one an attribute and one an intrinsic); and that it persists
+  across an intervening filter (row 5) or an intervening grouping
+  (row 6).
+
+- **What the six do NOT cover, and this row claims none of it.** Other
+  comparison operators, other field types, other selector shapes, other
+  intervening stages, more than one selected field, more than one trace,
+  and the mechanism. None of these was measured. **This row is a record of
+  six observations, not a rule.**
+
+- **Triage.** Not copied. Our `select()` is a projection registered once,
+  so the filter that follows it sees the same spans it would have seen
+  without it. This is **not** an entry in
+  `docs/reference-defects-we-do-not-copy.md`: that file admits a
+  behaviour only on its four stated tests, and none of them was
+  established here, because no mechanism was diagnosed.
+
+- **Disposition.** Recorded. Reproducing the empty answer would mean
+  making `select()` change which spans a later stage sees, which nothing
+  in the reference's stated intent asks for.
+
+### `traceql-error-body-unary-not-parenthesises-its-operand` (issue #492 item 9, code review round 1) — **same refusal, different rendering of the quoted expression**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias — the
+  refusal is the same handler on both paths, and both were measured.
+
+- **What.** When `validate` refuses a `!` whose operand has an illegal
+  type, the `400` body quotes the offending expression. The reference
+  prints the operand **bare** when it is a static or an attribute; we
+  always wrap it in parentheses. Status, content type and message text are
+  the same; only the quoted expression differs.
+
+  Measured **2026-09-08**, the same three queries on both sides: here to
+  `/api/traces/v1/search` **and** to the `/api/search` alias, which
+  returned byte-identical bodies on every query in this row and the next;
+  there to `/api/search` on an instance of the pinned reference build
+  started for this work. Every line below is a `400` on both sides with
+  `content-type: text/plain; charset=utf-8` and no trailing newline
+  (`curl … | xxd` on the two rows of the first spelling). `{svc}` is
+  `{ resource.service.name = "grp492" }`.
+
+  | query | reference body, verbatim | our body, verbatim |
+  |---|---|---|
+  | `{svc} \| { !1 }` | `invalid TraceQL query: illegal operation for the given type: !1` | `invalid TraceQL query: illegal operation for the given type: !(1)` |
+  | `{svc} \| { !-1 }` | `invalid TraceQL query: illegal operation for the given type: !-1` | `invalid TraceQL query: illegal operation for the given type: !(-1)` |
+  | `{svc} \| { !(1 + 1) }` | `invalid TraceQL query: illegal operation for the given type: !2` | `invalid TraceQL query: illegal operation for the given type: !((1 + 1))` |
+
+  **The third line carries a SECOND difference and this row does not claim
+  it:** the reference folds `1 + 1` to the static `2` before rendering,
+  where we keep the expression. It is in the table because it is also the
+  clearest view of ours wrapping twice — once for the arithmetic, once for
+  the `!`.
+
+- **The rule on each side, so the row is not just three examples.** The
+  reference renders a unary operation as `op.String() + wrapElement(e)`
+  (`pkg/traceql/ast_stringer.go:233-243` @ v3.0.2), and `wrapElement`
+  parenthesises everything that is **not** a `Static` and **not** an
+  `Attribute` (`ast_stringer.go:245-255`); the message is built at
+  `pkg/traceql/ast_validate.go:295`. Ours renders the whole
+  `FieldExpr::Unary` through its own `Display`
+  (`crates/pulsus-traceql/src/validate.rs:555`), and that `Display` writes
+  `!({expr})` for every operand without exception
+  (`crates/pulsus-traceql/src/ast.rs:387`).
+
+- **Where else it shows.** The same two bodies come back from
+  `GET /api/traces/v1/metrics/query_range` — ours
+  `invalid TraceQL query: illegal operation for the given type: !(1)`, the
+  reference's `/api/metrics/query_range`
+  `compiling query: illegal operation for the given type: !1`, measured in
+  the same run. The *prefix* difference there is not this row's subject and
+  is already recorded, by route, in
+  `traceql-parse-error-body-differs-by-route` above.
+
+- **Triage.** Recorded, **not fixed**, and deliberately not fixed here.
+  `FieldExpr`'s `Display` is the renderer for every field expression in
+  this engine — corpus round-trip goldens, SQL goldens and several pinned
+  `400` bodies all read it — so aligning it with `wrapElement` is a change
+  to how every construct renders, not a change to the mid-pipeline filter.
+  Neither issue #492 item 9's plan nor its code review examined it. The
+  scheduling decision is the task-manager's, on issue #492.
+
+- **Disposition.** No code change. The refusal, the status, the content
+  type and the prefix already match; the divergence is confined to the
+  rendering of the quoted expression.
+
+- **Why the id is not `traceql-validate-…`.** That prefix is reserved:
+  `crates/pulsus-traceql/tests/validate_corpus.rs`'s
+  `every_divergence_is_ledgered_and_every_ledger_row_is_witnessed` requires
+  every live `### \`traceql-validate-` row to be named as a `divergence`
+  by at least one vector of `tests/conformance/validate-vectors.json`, and
+  a vector's `divergence` field means the two sides reach different
+  VERDICTS. Both sides reject these queries; only the body differs, so a
+  witness vector there would record a verdict divergence that does not
+  exist. The `…-error-body-…` prefix follows
+  `traceql-parse-error-body-differs-by-route` above, which is a body row
+  for the same reason. Measured: naming this row
+  `traceql-validate-unary-not-parenthesises-its-operand` fails that suite
+  with `ledger row "…" is witnessed by no vector`.
+
+### `traceql-error-body-binary-does-not-parenthesise-its-operands` (issue #492 item 9, code review round 1) — **the mirror of the row above, in the other direction**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias — the
+  refusal is the same handler on both paths, and both were measured.
+
+- **What.** When `validate` refuses a binary operation whose operands have
+  mismatched types, the `400` body quotes the expression. The reference
+  parenthesises an operand that is itself an operation; we render every
+  operand bare unless its own `Display` adds parentheses. Same status,
+  content type and message text; the quoted expression differs.
+
+  Measured **2026-09-08**, the same run and the same two instances as the
+  row above. Every line is a `400` on both sides.
+
+  | query | reference body tail, verbatim | our body tail, verbatim |
+  |---|---|---|
+  | `{svc} \| { .a = nil && 1 }` | `binary operations must operate on the same type: (.a = nil) && 1` | `binary operations must operate on the same type: .a = nil && 1` |
+  | `{svc} \| { 1 && .a = nil }` | `binary operations must operate on the same type: 1 && (.a = nil)` | `binary operations must operate on the same type: 1 && .a = nil` |
+  | `{svc} \| { (1 = 1) && 2 }` | `binary operations must operate on the same type: true && 2` | `binary operations must operate on the same type: 1 = 1 && 2` |
+
+  Both bodies carry the route's `invalid TraceQL query: ` prefix ahead of
+  the tail shown, on both sides. **The third line carries the same second
+  difference as the row above** — the reference folds `1 = 1` to the static
+  `true` — and this row does not claim it.
+
+  **Two controls, where the two sides agree**, so the row is not read as
+  "we never parenthesise":
+
+  | query | both sides |
+  |---|---|
+  | `{svc} \| { name = 1 }` | `binary operations must operate on the same type: name = 1` |
+  | `{svc} \| { .a + 1 = true }` | `binary operations must operate on the same type: (.a + 1) = true` |
+
+  The second control is an agreement reached by two different rules: the
+  reference wraps `.a + 1` because it is neither a static nor an
+  attribute, and we wrap it because `Display` parenthesises arithmetic.
+
+- **The rule on each side.** The reference renders the whole operation as
+  `wrapElement(lhs) + " " + op + " " + wrapElement(rhs)`
+  (`pkg/traceql/ast_stringer.go:229-231` @ v3.0.2), with `wrapElement`
+  parenthesising everything that is not a `Static` or an `Attribute`
+  (`:245-255`); the message is built at
+  `pkg/traceql/ast_validate.go:214`. Ours builds the text from the two
+  operands separately — `format!("{lhs} {op} {rhs}")`,
+  `crates/pulsus-traceql/src/validate.rs:560` — so no wrapping rule is
+  applied at all: whatever parentheses appear come from each operand's own
+  `Display` (`crates/pulsus-traceql/src/ast.rs:373-415`), which
+  parenthesises `&&`/`||` and arithmetic at their own top level and leaves
+  comparisons and the `nil` forms bare.
+
+- **Where else it shows.** `GET /api/traces/v1/metrics/query_range` gives
+  ours `invalid TraceQL query: binary operations must operate on the same
+  type: .a = nil && 1` against the reference's `/api/metrics/query_range`
+  `compiling query: binary operations must operate on the same type:
+  (.a = nil) && 1`, measured in the same run. The prefix difference is
+  `traceql-parse-error-body-differs-by-route`'s, not this row's.
+
+- **A third difference was measured in the same run and has its own row
+  below.** String statics are backticked by the reference and
+  double-quoted here — `traceql-error-body-string-static-quoting-differs`.
+  String spellings are kept out of both tables above so that no line here
+  differs in two ways at once: `{svc} | { !"x" }`, for one, carries the
+  quoting AND the parenthesisation, which is why it is evidence for
+  neither table.
+
+- **Triage.** Recorded, **not fixed**, for the reason the row above gives:
+  the renderer is shared by every construct, and neither item 9's plan nor
+  its code review examined it.
+
+- **Disposition.** No code change.
+
+### `traceql-error-body-string-static-quoting-differs` (issue #492 item 9, code review round 2) — **the same refusal, with the quoted string spelled differently**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias — the
+  refusal is the same handler on both paths, and both were measured.
+
+- **What.** When `validate` refuses an expression, the `400` body quotes
+  it. A STRING static inside that expression is wrapped in **backticks**
+  by the reference and in **double quotes** here. Status, content type and
+  message text are the same; only the string's spelling differs.
+
+  Measured **2026-09-08**, our server on this branch against an instance
+  of the pinned reference build started for this work; here to
+  `/api/traces/v1/search` **and** to the `/api/search` alias, which
+  returned byte-identical bodies on every query in this row; there to
+  `/api/search`. Every line is a `400` on both sides with
+  `content-type: text/plain; charset=utf-8`. `{svc}` is
+  `{ resource.service.name = "p9f2" }`.
+
+  **Each line below differs in ONE way.** Both operands are statics, and
+  neither side parenthesises a static, so the two parenthesisation rows
+  above do not reach these bodies.
+
+  | query | reference body tail, verbatim | our body tail, verbatim |
+  |---|---|---|
+  | `{svc} \| { "x" = 1 }` | ``binary operations must operate on the same type: `x` = 1`` | `binary operations must operate on the same type: "x" = 1` |
+  | `{svc} \| { 1 = "x" }` | ``binary operations must operate on the same type: 1 = `x` `` | `binary operations must operate on the same type: 1 = "x"` |
+  | ``{svc} \| { `x` = 1 }`` | ``binary operations must operate on the same type: `x` = 1`` | `binary operations must operate on the same type: "x" = 1` |
+
+  Both bodies carry the route's `invalid TraceQL query: ` prefix ahead of
+  the tail shown, on both sides; all six responses were 79 bytes. **The
+  third line is written with backticks on both sides**, and each side
+  still answers in its own spelling — so this is a re-rendering of the
+  parsed value, not an echo of the text the caller sent.
+
+  **Three controls, where the two sides agree byte for byte**, so the row
+  is not read as "our statics all render differently":
+
+  | query | both sides |
+  |---|---|
+  | `{svc} \| { true = 1 }` | `binary operations must operate on the same type: true = 1` |
+  | `{svc} \| { 1s = true }` | `binary operations must operate on the same type: 1s = true` |
+  | `{svc} \| { name = 1 }` | `binary operations must operate on the same type: name = 1` |
+
+- **The escaping differs with the delimiter, and that is the same rule.**
+  Measured in the same run:
+
+  | query | reference body tail | our body tail |
+  |---|---|---|
+  | `{svc} \| { "a\"b" = 1 }` | ``binary operations must operate on the same type: `a"b` = 1`` (81 bytes) | `binary operations must operate on the same type: "a\"b" = 1` (82 bytes) |
+  | ``{svc} \| { "a`b" = 1 }`` | ``binary operations must operate on the same type: `a`b` = 1`` | ``binary operations must operate on the same type: "a`b" = 1`` |
+
+  The reference escapes nothing inside its backticks, so the second line's
+  reference body **cannot be read back by the reference**: sent
+  ``{svc} | { `a`b` = 1 }``, it answers `400`
+  `invalid TraceQL query: parse error at line 1, col 43: syntax error: unexpected IDENTIFIER`
+  (we answer `400 unterminated string starting at byte 43`). Ours escapes
+  its own delimiter, so our rendering re-parses — the first line's query
+  IS our rendering of that value, and it reached the type check.
+
+- **The same difference appears in a unary body, and that body is NOT
+  this row's evidence:** `{svc} | { !"x" }` gives
+  `` illegal operation for the given type: !`x` `` there and
+  `illegal operation for the given type: !("x")` here — the quoting and
+  the parenthesisation of
+  `traceql-error-body-unary-not-parenthesises-its-operand`, two
+  differences in one body.
+
+- **The rule on each side.** The reference renders a static with
+  `Static.String()`, which is `EncodeToString(true)`; its `TypeString`
+  arm returns the raw bytes between backticks and escapes nothing
+  (`pkg/traceql/ast_stringer.go:83-84` and `:101-108` @ v3.0.2). Statics
+  are also the case `wrapElement` returns unwrapped (`:245-255`), which is
+  why these lines carry no parenthesisation difference. Ours renders
+  `Value::String` through `quote`
+  (`crates/pulsus-traceql/src/ast.rs:823` and `:1410-1425`): a
+  double-quoted literal escaping `\`, `"`, `\n`, `\t` and `\r`, which is
+  the spelling the corpus round-trip goldens read back. The message text
+  itself is built in `validate` — `:560` for the binary form and `:555`
+  for the unary one (`crates/pulsus-traceql/src/validate.rs`) — from an
+  already-rendered expression, so neither line chooses the quoting.
+
+- **Where else it shows.** `GET /api/traces/v1/metrics/query_range` gives
+  ours `invalid TraceQL query: binary operations must operate on the same
+  type: "x" = 1` against the reference's `/api/metrics/query_range`
+  ``compiling query: binary operations must operate on the same type: `x` = 1``,
+  measured in the same run. The *prefix* difference there is not this
+  row's subject and is already recorded, by route, in
+  `traceql-parse-error-body-differs-by-route` above.
+
+- **Triage.** Recorded, **not fixed**. `Value`'s `Display` is the renderer
+  for every string in this engine — corpus round-trip goldens, SQL
+  goldens and pinned `400` bodies all read it — so backticking it is a
+  change to how every rendered string appears, not a change to this
+  message. This is the third of the three rendering rows; the
+  task-manager's ruling of 2026-09-08 on issue #492 sends all three to
+  one scheduled renderer change with one review.
+
+- **Disposition.** No code change. The refusal, the status, the content
+  type and the prefix already match; the divergence is confined to the
+  spelling of a string static inside the quoted expression.
+
+- **Why the id is not `traceql-validate-…`.** For the reason
+  `traceql-error-body-unary-not-parenthesises-its-operand` states above:
+  that prefix is reserved for rows where the two sides reach different
+  VERDICTS, and both sides reject every query here.
 
 ### `traceql-spanset-aggregate-precedes-grouping` — **WITHDRAWN: the ordered pipeline fold retired it (issues #510, #492 item 2)**
 

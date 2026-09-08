@@ -47,6 +47,7 @@
 //! PipelineStage     := "count" "(" ")" CmpOp Value
 //!                    | ("avg"|"sum"|"min"|"max") "(" AggField ")" CmpOp Value
 //!                    | "select" "(" Field { "," Field } ")"
+//!                    | SpansetExpr
 //! ```
 //!
 //! Structural operators (`>`/`>>`/`~`, issue #172) bind TIGHTER than
@@ -94,7 +95,7 @@ pub fn parse(input: &str) -> Result<Query, TraceQlError> {
     let mut pipeline = Vec::new();
     while matches!(cursor.peek().kind, TokenKind::Pipe) {
         cursor.advance();
-        pipeline.push(parse_pipeline_stage(&mut cursor)?);
+        pipeline.push(parse_pipeline_stage(&mut cursor, &mut binary_nodes)?);
     }
     // A trailing `with(...)` on a non-metric query carries search hints
     // (issue #185, `hints.most_recent`): `{ … } with(most_recent=true)`.
@@ -835,35 +836,64 @@ fn parse_dotted_key(cursor: &mut Cursor<'_>) -> Result<(String, usize), TraceQlE
     Ok((key, end))
 }
 
-/// `PipelineStage := Aggregate | Select | Metric` (plan v2 F5 / v3 F5;
-/// issue #59 adds the zero-arity metrics stage). The deferred
+/// `PipelineStage := SpansetExpr | Aggregate | Select | Metric` (plan v2
+/// F5 / v3 F5; issue #59 adds the zero-arity metrics stage; issue #492
+/// item 9 adds the leading `SpansetExpr` alternative). The deferred
 /// `*_over_time` metrics functions are recognized here and rejected as
 /// `NotYetSupported` (M7, task-manager adjudication 1 on issue #59), as
 /// is metrics grouping `by` after a metric stage.
 ///
+/// The `SpansetExpr` alternative is the reference's own
+/// `spansetPipeline PIPE spansetExpression` (`pkg/traceql/expr.y:170` @
+/// Tempo v3.0.2), one of the five element alternatives at `:170-174` —
+/// so a `{...}` filter is legal in ANY pipeline position, not only the
+/// leading one. Before issue #492 item 9 this production admitted only an
+/// identifier-led stage, which made `{a} | by(name) | {b}` a `400` here
+/// and a `200` there; the gap is the WITHDRAWN row
+/// `traceql-midpipeline-spanset-filter-unsupported` in
+/// docs/benchmarks/traces-differential-ledger.md.
+///
 /// The three "expected a pipeline stage" messages below — end of input
 /// after the pipe, a non-identifier, and an unknown identifier — name the
-/// SAME legal set, including `by` and `coalesce`, which have been served
-/// pipeline stages since issue #185 (issue #492 item 2). All three, not
-/// one: otherwise the legal set a user is shown depends on which way they
-/// got it wrong. **This refusal is the accept-surface gap recorded as
-/// `traceql-midpipeline-spanset-filter-unsupported` in
-/// docs/benchmarks/traces-differential-ledger.md**: the reference admits a
-/// `{...}` spanset filter in ANY pipeline position and this production
-/// admits only an identifier-led stage, so `{a} | by(name) | {b}` is a
-/// `400` here and a `200` there. Tracked as item 9 of the issue #492
-/// enumeration; widening it is that item's decision, not this one's.
-/// The metrics stage names (`rate`, `count_over_time`,
-/// `topk`, `compare`, ...) are deliberately absent — they parse here and
-/// are refused at plan time on the search route, so naming them would
-/// advertise stages that route does not serve.
-fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
+/// SAME legal set, including the `{...}` filter and `by`/`coalesce`. All
+/// three, not one: otherwise the legal set a user is shown depends on
+/// which way they got it wrong. The metrics stage names (`rate`,
+/// `count_over_time`, `topk`, `compare`, ...) are deliberately absent —
+/// they parse here and are refused at plan time on the search route, so
+/// naming them would advertise stages that route does not serve.
+fn parse_pipeline_stage(
+    cursor: &mut Cursor<'_>,
+    binary_nodes: &mut usize,
+) -> Result<PipelineStage, TraceQlError> {
     let tok = cursor.peek().clone();
+    // Issue #492 item 9: a spanset expression is a pipeline element in ANY
+    // position, not only the leading one. The reference's production is
+    // `spansetPipeline PIPE spansetExpression` (`pkg/traceql/expr.y:170` @
+    // Tempo v3.0.2), one of the five element alternatives at `:170-174`.
+    //
+    // The element is a full `spansetExpression`, so `(` opens one too
+    // (`spansetPrimary` admits a parenthesised expression) and
+    // `| { a } && { b }` parses. WHICH of those shapes is executable is a
+    // semantic question the parser must not answer: the search planner
+    // refuses everything but a single filter with a `400`.
+    //
+    // `binary_nodes` is the QUERY-WIDE budget threaded from `parse`, so a
+    // paren-free `&&` chain written inside a pipeline element is bounded
+    // exactly as one written in the selector is. `depth` restarts at 0
+    // because a pipeline element is not nested inside the selector.
+    if matches!(tok.kind, TokenKind::LBrace | TokenKind::LParen) {
+        return Ok(PipelineStage::Filter(parse_spanset_expr(
+            cursor,
+            0,
+            binary_nodes,
+        )?));
+    }
     let name = match &tok.kind {
         TokenKind::Ident(name) => name.clone(),
         TokenKind::Eof => {
             return Err(TraceQlError::UnexpectedEof {
-                expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+                expected: "a pipeline stage (a `{...}` spanset filter, count, sum, avg, min, \
+                           max, select, by, or coalesce)"
                     .to_string(),
                 span: tok.span,
             });
@@ -871,7 +901,8 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
         _ => {
             return Err(TraceQlError::UnexpectedToken {
                 found: describe(&tok.kind),
-                expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+                expected: "a pipeline stage (a `{...}` spanset filter, count, sum, avg, min, \
+                           max, select, by, or coalesce)"
                     .to_string(),
                 span: tok.span,
             });
@@ -911,7 +942,8 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
     }
     Err(TraceQlError::UnexpectedToken {
         found: describe(&tok.kind),
-        expected: "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)"
+        expected: "a pipeline stage (a `{...}` spanset filter, count, sum, avg, min, max, \
+                   select, by, or coalesce)"
             .to_string(),
         span: tok.span,
     })
@@ -1581,27 +1613,33 @@ mod tests {
     }
 
     /// The three ways of getting a pipeline stage wrong name the SAME
-    /// legal set, and it includes `by` and `coalesce` (issue #492 item 2).
-    /// Two of the three arms had no test before this one: only the
-    /// end-of-input arm is pinned by a corpus golden, so reverting either
-    /// `UnexpectedToken` arm's message changed nothing anywhere in the
-    /// workspace.
+    /// legal set, and it includes the `{...}` spanset filter (issue #492
+    /// item 9) as well as `by` and `coalesce` (item 2). Two of the three
+    /// arms had no test before this one: only the end-of-input arm is
+    /// pinned by a corpus golden, so reverting either `UnexpectedToken`
+    /// arm's message changed nothing anywhere in the workspace.
+    ///
+    /// The non-identifier probe used to be `{ .a = 1 } | by(name) |
+    /// { name = "b" }`. Item 9 made that query PARSE, so it can no longer
+    /// reach the arm; `{ .a = 1 } | 1` is refused for the same reason —
+    /// a token that opens no stage — and names the same legal set.
     #[test]
     fn every_unknown_pipeline_stage_arm_names_the_same_legal_set() {
-        const LEGAL: &str = "a pipeline stage (count, sum, avg, min, max, select, by, or coalesce)";
+        const LEGAL: &str = "a pipeline stage (a `{...}` spanset filter, count, sum, avg, min, \
+                             max, select, by, or coalesce)";
         // End of input after the pipe.
         let err = parse("{ .a = 1 } |").expect_err("end of input after the pipe");
         assert!(
             matches!(&err, TraceQlError::UnexpectedEof { expected, .. } if expected == LEGAL),
             "got {err:?}"
         );
-        // A non-identifier where a stage was expected (the mid-pipeline
-        // spanset filter a user writes: `{...} | by(name) | {...}`).
-        let err = parse(r#"{ .a = 1 } | by(name) | { name = "b" }"#)
-            .expect_err("a spanset filter is not a pipeline stage here");
+        // A non-identifier where a stage was expected. A number opens
+        // neither an identifier-led stage nor a `{...}`/`(` spanset
+        // element.
+        let err = parse("{ .a = 1 } | 1").expect_err("a number is not a pipeline stage");
         assert!(
             matches!(&err, TraceQlError::UnexpectedToken { expected, found, .. }
-                if expected == LEGAL && found == "'{'"),
+                if expected == LEGAL && found == "number \"1\""),
             "got {err:?}"
         );
         // An identifier that names no stage.

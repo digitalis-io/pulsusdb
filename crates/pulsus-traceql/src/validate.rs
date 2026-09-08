@@ -129,10 +129,40 @@ const MAX_GROUP_BYS: usize = 5;
 /// (the reference's parser/validator wording has never been an
 /// identity); the status, the accept/reject decision and the checked
 /// surface are what match the reference, vector for vector.
+///
+/// **One rendering difference cuts across every variant whose message
+/// quotes an expression**, and is recorded rather than fixed: a STRING
+/// static is quoted `"x"` here and `` `x` `` by the reference, whatever
+/// the surrounding operator. Ours renders it through `Value`'s
+/// `Display`, which calls `quote` — a double-quoted literal with `\`,
+/// `"` and the whitespace characters escaped
+/// (`crates/pulsus-traceql/src/ast.rs:823` and `:1410-1425`) — where the
+/// reference's `Static.String()` wraps the raw bytes in backticks and
+/// escapes nothing (`pkg/traceql/ast_stringer.go:83-84` and `:101-108`
+/// @ Tempo v3.0.2). Measured on both sides 2026-09-08 and ledgered as
+/// `traceql-error-body-string-static-quoting-differs`
+/// (`docs/benchmarks/traces-differential-ledger.md`). It is the same
+/// shared-renderer change the two parenthesisation rows name, and is
+/// scheduled with them.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidateError {
     /// `ast_validate.go:198-219` — both operands of a comparison must
     /// have matching types (an `Attribute` operand matches anything).
+    ///
+    /// **The message text matches the reference; the rendering of `expr`
+    /// does not, and the difference is recorded rather than fixed.** The
+    /// reference renders the whole operation with `binaryOp`, which
+    /// parenthesises any operand that is not a `Static` and not an
+    /// `Attribute` (`pkg/traceql/ast_stringer.go:229-231` and `:245-255`
+    /// @ v3.0.2), so `{ .a = nil && 1 }` is refused with
+    /// `(.a = nil) && 1`. We build the text from the two operands
+    /// separately (see the `Binary` arm of `validate_field_expr`), so no
+    /// wrapping rule applies and the same query is refused with
+    /// `.a = nil && 1`. Measured on both sides 2026-09-08 and ledgered as
+    /// `traceql-error-body-binary-does-not-parenthesise-its-operands`
+    /// (`docs/benchmarks/traces-differential-ledger.md`); aligning the two
+    /// is a change to `FieldExpr`'s `Display`, which every construct and
+    /// several frozen goldens read, so it is scheduled separately.
     #[error("binary operations must operate on the same type: {expr}")]
     TypeMismatch { expr: String },
     /// `ast_validate.go:198-219` via `enum_operators.go:77-121` — the
@@ -189,9 +219,21 @@ pub enum ValidateError {
     /// is its own variant rather than a reuse of
     /// [`ValidateError::IllegalOperator`].
     ///
-    /// Measured: `{ !1 }` → `illegal operation for the given type: !1`,
-    /// and likewise `{ !name }`, `{ !"x" }`, `{ -name }`, `{ -true }`.
-    /// `{ !.a }`, `{ -.a }` and `{ !true }` are 200s.
+    /// Measured on the REFERENCE: `{ !1 }` →
+    /// `illegal operation for the given type: !1`, and likewise
+    /// `{ !name }`, `{ !"x" }`, `{ -name }`, `{ -true }`. `{ !.a }`,
+    /// `{ -.a }` and `{ !true }` are 200s.
+    ///
+    /// **Ours renders the operand differently and the difference is
+    /// recorded rather than fixed:** `{ !1 }` is refused here with
+    /// `illegal operation for the given type: !(1)`, because
+    /// `FieldExpr::Unary`'s `Display` wraps every `!` operand
+    /// (`crates/pulsus-traceql/src/ast.rs:387`) where the reference's
+    /// `unaryOp` wraps only what is neither a `Static` nor an `Attribute`
+    /// (`pkg/traceql/ast_stringer.go:233-243`, `:245-255` @ v3.0.2).
+    /// Measured on both sides 2026-09-08 and ledgered as
+    /// `traceql-error-body-unary-not-parenthesises-its-operand`
+    /// (`docs/benchmarks/traces-differential-ledger.md`).
     #[error("illegal operation for the given type: {expr}")]
     IllegalUnaryOperator { expr: String },
     /// An aggregate argument must resolve to a NUMBER type; an
@@ -616,6 +658,13 @@ fn validate_stage(stage: &PipelineStage) -> Result<(), ValidateError> {
                 &format!("{stage}"),
             )
         }
+        // Issue #492 item 9: a `{...}` pipeline element gets the ORDINARY
+        // field-expression rules, the same ones the leading spanset gets.
+        // Measured against the pinned reference: `| { 1 }`, `| { !1 }`,
+        // `| { name = 1 }` and `| { .a = nil && 1 }` produce the same four
+        // messages there that `validate_filter` / `validate_field_expr`
+        // already produce here.
+        PipelineStage::Filter(expr) => validate_spanset(expr),
         PipelineStage::Select { .. } | PipelineStage::By { .. } | PipelineStage::Coalesce => Ok(()),
         PipelineStage::Metric(metric) => validate_metric_stage(metric),
         PipelineStage::MetricSecondStage(second) => match second {

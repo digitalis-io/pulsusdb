@@ -1,0 +1,76 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Binary {
+                    op: Cmp(
+                        Eq,
+                    ),
+                    lhs: Field(
+                        Attribute {
+                            scope: Unscoped,
+                            key: "a",
+                        },
+                    ),
+                    rhs: Literal(
+                        Number(
+                            "1",
+                        ),
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [
+        Filter(
+            Binary {
+                op: And,
+                lhs: Filter(
+                    SpansetFilter {
+                        body: Some(
+                            Binary {
+                                op: Cmp(
+                                    Eq,
+                                ),
+                                lhs: Field(
+                                    Attribute {
+                                        scope: Unscoped,
+                                        key: "b",
+                                    },
+                                ),
+                                rhs: Literal(
+                                    Number(
+                                        "2",
+                                    ),
+                                ),
+                            },
+                        ),
+                    },
+                ),
+                rhs: Filter(
+                    SpansetFilter {
+                        body: Some(
+                            Binary {
+                                op: Cmp(
+                                    Eq,
+                                ),
+                                lhs: Field(
+                                    Attribute {
+                                        scope: Unscoped,
+                                        key: "c",
+                                    },
+                                ),
+                                rhs: Literal(
+                                    Number(
+                                        "3",
+                                    ),
+                                ),
+                            },
+                        ),
+                    },
+                ),
+            },
+        ),
+    ],
+    hints: [],
+}

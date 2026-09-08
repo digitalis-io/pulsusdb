@@ -765,6 +765,15 @@
       "tempo": "accept"
     },
     {
+      "construct": "pipeline.spanset_filter",
+      "status": "supported",
+      "evidence": [
+        "accept/pipeline_spanset_filter",
+        "accept/pipeline_spanset_filter_first"
+      ],
+      "tempo": "accept"
+    },
+    {
       "construct": "pipeline.scalar_expr",
       "status": "reject-parity",
       "evidence": [],
