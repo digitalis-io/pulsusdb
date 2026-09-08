@@ -2141,23 +2141,34 @@ fn label_sets() -> Vec<(String, Vec<String>)> {
 ///
 /// **How a member counts as named.** A label of two words or more cannot
 /// turn up in English by accident, so it counts wherever the swept text
-/// says it, in any punctuation, any case, and through a paraphrase:
-/// [`names_label`] wants the label's words in order, each matching the
-/// start of a word so a plural counts, inside a window of
-/// [`LABEL_MENTION_SPAN`] words. `ambiguous_basename`,
-/// `Ambiguous-Basename`, "ambiguous basenames" and "an ambiguous
-/// basename" all count; "the basename is ambiguous" does not, because
-/// the words are not in order. A label that is a single ordinary word,
-/// like the anchor kinds `line` and `prose`, counts only inside
+/// uses **its own words**, in any punctuation, any case, and with other
+/// words in between: [`names_label`] wants the label's words, in order,
+/// each matching the start of a word so an inflected form still counts,
+/// inside a window of [`LABEL_MENTION_SPAN`] words. So
+/// `ambiguous_basename`, `Ambiguous-Basename`, "ambiguous basenames" and
+/// "an ambiguous basename" all count. A label that is a single ordinary
+/// word, like the anchor kinds `line` and `prose`, counts only inside
 /// backticks, because otherwise every sentence containing the word
 /// "line" would name it.
 ///
-/// **What it does not catch**: an ordering described without naming its
-/// members — "the reasons are listed commonest first" names none of them
-/// and this check sees nothing, because a set is repeated when all of it
-/// is there and none of it is. Reordering the members is likewise
-/// invisible: the rule is about the set, and the generated block is what
-/// holds the order.
+/// **Three things it does not catch.** Each is a case where the set is
+/// there for a reader and absent from the words:
+///
+/// 1. **A word replaced by a synonym.** One sentence naming all four
+///    reasons as "an uncertain basename, a blank target line,
+///    occurrences that disagree, and a token that is not a tracked file"
+///    leaves this green; changing that one word back to "ambiguous"
+///    reddens it. Catching the synonym means a thesaurus, and a check
+///    whose verdict depends on one is a check nobody can predict, so the
+///    limit is taken rather than closed.
+/// 2. **The words out of order, or further apart than
+///    [`LABEL_MENTION_SPAN`] words.** "The basename is ambiguous" does
+///    not count.
+/// 3. **An ordering described without naming its members.** "The reasons
+///    are listed commonest first" names none of them, so this sees
+///    nothing: a set is repeated when all of it is there, and that is
+///    none of it. Reordering members is invisible for the same reason —
+///    the rule is about the set, and the generated block holds the order.
 #[test]
 fn no_label_set_a_dataset_holds_is_duplicated_outside_a_generated_region() {
     let md = read(QUERY_LOWERING);
@@ -2265,15 +2276,41 @@ fn no_label_set_a_dataset_holds_is_duplicated_outside_a_generated_region() {
 ///   `.tsv`, every key and every value at every depth of every tracked
 ///   evidence `.json`, over files discovered by `git ls-files` rather
 ///   than listed here; **or**
-/// * matched by `fn <name>` in a tracked Rust file after line and block
-///   comments and string literals are removed.
+/// * matched in a tracked Rust file by the letters `fn` and one space,
+///   with a character before them that cannot continue an identifier, in
+///   text that has had line comments, non-nested block comments,
+///   ordinary and byte string literals, raw strings with no `#`, and
+///   character literals cut out of it.
 ///
-/// **The second arm is a text scan and not a parser.** It no longer
-/// accepts a name that appears only in a comment — a code review defeated
-/// the previous version with exactly that — but it would accept a `fn`
-/// written inside a macro body that expands to no such function. That is
-/// the limit; it is stated rather than described away, and it is why this
-/// check is called a membership test and not a derivation.
+/// **The second arm is a text scan, not a parser, and this is where that
+/// shows.** Every row below was run through [`function_names`] rather
+/// than reasoned about:
+///
+/// | written in a tracked file | the scan yields |
+/// |---|---|
+/// | `fn` in a macro body that expands to no such function | the name |
+/// | `fn` in an attribute's token tree | the name |
+/// | a raw string with a `#` and an embedded `"`, or a raw byte string of the same shape | a name from inside the string |
+/// | a nested block comment | the names after the **inner** `*/` |
+/// | `fn` behind a disabled `#[cfg]`, or a trait method signature | the name |
+/// | a tab, a newline or two spaces after `fn` | nothing |
+/// | `fn r#match` | `r` |
+///
+/// The first five **over-admit**: a name the workspace does not really
+/// define could be excused by one of them, so a stale name in the
+/// document could survive. The last two **under-admit**: a real
+/// definition written that way would be missing from the domain and the
+/// document naming it would fail. No tracked file writes a definition in
+/// either shape today: `git grep -nP 'fn[\t]|fn[ ]{2}|fn r[#]' -- '*.rs'`
+/// matches once, on the `r#match` row of the table just above, and
+/// `git grep -nP 'fn$' -- '*.rs'` matches twice, both inside doc
+/// comments. All three are comments, and comments are cut out before the
+/// scan. (The pattern uses character classes so that it does not match
+/// itself.)
+///
+/// Closing this list means parsing Rust. This check is a membership test
+/// and not a derivation for exactly that reason, and the list is here so
+/// that the sentence describing it is not wider than the code under it.
 #[test]
 fn no_backticked_name_in_the_reconstructed_sections_is_one_the_tree_does_not_hold() {
     let md = read(QUERY_LOWERING);
@@ -2309,9 +2346,19 @@ fn no_backticked_name_in_the_reconstructed_sections_is_one_the_tree_does_not_hol
     );
 }
 
-/// Source with line comments, block comments and string literals
-/// removed, so a name written in prose beside the code cannot be read as
-/// a definition.
+/// Source with line comments, block comments, string literals and
+/// character literals removed, so a name written in prose beside the
+/// code cannot be read as a definition.
+///
+/// **Nothing in this suite guards the character-literal arm.** Turning
+/// it off drops 340 distinct names out of the scanned domain — 13,203 to
+/// 12,863, from a throwaway probe over `tracked_rust_files()` that
+/// counted the names both ways — and all ten active tests still pass,
+/// because no name the document backticks today rests only on a
+/// definition that disappears. The arm is right and it is unwatched: a
+/// `'"'` opens a string that swallows the code after it, and real
+/// definitions leave the domain silently. The next person to touch it
+/// should know there is no test to catch them.
 fn without_comments_and_strings(src: &str) -> String {
     let b: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
