@@ -606,3 +606,159 @@ fn the_golden_sql_corpus_contains_no_with_clause() {
         "the corpus holds the statements this rule is about: {statements}"
     );
 }
+
+/// The root of the golden tree — every committed golden, not only the
+/// two byte-frozen corpora in [`CORPORA`].
+fn golden_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden")
+}
+
+/// The six committed goldens that carry a join today, none of which the
+/// compile core plans. The list is asserted as an EQUALITY, not used as
+/// a skip list: a seventh file anywhere in the tree fails this test.
+const JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS: [&str; 6] = [
+    "traces_graph/clustered_local_join.sql",
+    "traces_graph/single_node.sql",
+    "traces_metrics/compare_status.sql",
+    "traces_metrics/compare_status_window.sql",
+    "traces_metrics_base/compare_status.sql",
+    "traces_metrics_base/compare_status_window.sql",
+];
+
+/// ADR 0008: **no statement the compile core plans may contain a join**,
+/// and the six committed goldens that carry one, pinned by name.
+///
+/// # The ADR's rule sentence is wider than the decision it records, and this test does not change it
+///
+/// ADR 0008 is titled "SQL composition for lowered query pipelines" and
+/// its three rules govern how a lowered pipeline composes. The rule
+/// added on 2026-09-02 is written without that qualifier — "no emitted
+/// SQL may contain a join until this ADR is amended to name the clause"
+/// (`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`,
+/// the same claim in the summary at line 11). Six committed goldens
+/// carry a join today and **none is planned by the compile core**:
+///
+/// ```text
+/// file                                           emitted by                        current?
+/// traces_graph/clustered_local_join.sql          service_graph_sql                 current
+/// traces_graph/single_node.sql                   (graph_sql.rs:92, INNER JOIN
+///                                                at 109) — one join line each
+/// traces_metrics/compare_status.sql              metrics_compare_sql               current
+/// traces_metrics/compare_status_window.sql       (metrics_sql.rs:1189, LEFT JOIN
+///                                                at 1253 and INNER JOIN at 1257)
+///                                                for six of the seven join lines,
+///                                                and metrics_compare_exemplar_
+///                                                range_sql (metrics_sql.rs:1380,
+///                                                INNER JOIN at 1425) for the
+///                                                seventh
+/// traces_metrics_base/compare_status.sql         metrics_compare_sql AS IT STOOD   HISTORIC
+/// traces_metrics_base/compare_status_window.sql  AT 2f78c53 — four join lines,
+///                                                no exemplars section, so the
+///                                                exemplar builder contributes
+///                                                nothing to these two
+/// ```
+///
+/// The two `traces_metrics_base/` files are the pre-#477 copies: each is
+/// byte-identical to `git show 2f78c53:crates/pulsus-read/tests/golden/
+/// traces_metrics/<same name>`, and no test regenerates them. They are
+/// not unmoored from today's builder, though:
+/// `every_instant_side_section_is_byte_identical_to_base` asserts the
+/// `compare series probe` section — two of their four join lines — is
+/// byte-identical to the current file's, and
+/// `the_declared_inverse_restores_every_moved_section_to_its_base_bytes`
+/// asserts the cross-tab section inverts to the base bytes under three
+/// timestamp substitutions, none of which touches a `JOIN` line.
+///
+/// All six come from hand-written builders on routes the compile core
+/// classifies `Never` — `NotASearchLinkLower::capability`
+/// (`crates/pulsus-read/src/traces/compile.rs:1188-1196`) — so they are
+/// not lowered pipelines and the decision never reached them.
+/// `service_graph_sql` is called at `traces/exec.rs:1693` and nowhere
+/// else; `metrics_compare_sql` and `metrics_compare_exemplar_range_sql`
+/// only at `traces/metrics_plan.rs:607/619/631/646`. The sentence
+/// reaches further than the decision it records: a drafting fault in the
+/// record, not shipped code breaking a rule. **The wording belongs to
+/// the amendment round ADR 0008 already reserves.** This test enforces
+/// the rule the ADR can mean — zero joins in the corpus the compiled
+/// search route freezes — and pins the six by name so a seventh anywhere
+/// in the tree fails. `docs/query-lowering.md` §9.8 carries the same
+/// record.
+///
+/// # Why this walks the golden root and not `CORPORA`
+///
+/// Written over `CORPORA` this gate would be red on day one:
+/// `traces_metrics/` holds two of the six. And two more sit in
+/// `traces_metrics_base/`, which is not in `CORPORA` at all, so the
+/// digest gate above cannot see them either.
+///
+/// # Where this stops
+///
+/// It freezes the CORPUS, not the builders. A builder could emit a join
+/// on an input no golden covers, and nothing here would see it.
+#[test]
+fn no_planned_search_statement_contains_a_join() {
+    let root = golden_root();
+    let mut scanned = 0usize;
+    let mut search_statements = 0usize;
+    let mut with_a_join: Vec<String> = Vec::new();
+
+    for entry in corpus_entries(&root) {
+        let Entry::File { rel, path } = entry else {
+            continue;
+        };
+        if !rel.ends_with(".sql") {
+            continue;
+        }
+        scanned += 1;
+        let in_search = rel.starts_with("traces_search/");
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let mut this_file_joins = false;
+        for (i, line) in text.lines().enumerate() {
+            // The two header lines carry the case name and the query
+            // text, not SQL — and one case is literally named
+            // `attr_semi_join`, whose body renders `IN (SELECT …)` and
+            // holds no join at all.
+            if line.starts_with("-- ") {
+                continue;
+            }
+            if in_search && line.starts_with("== ") {
+                search_statements += 1;
+                continue;
+            }
+            let has_join = line
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|tok| tok.eq_ignore_ascii_case("join"));
+            if !has_join {
+                continue;
+            }
+            assert!(
+                !in_search,
+                "{rel}:{}: ADR 0008 names no join clause, so no statement the compile core plans \
+                 may contain one. Line: {line}",
+                i + 1
+            );
+            this_file_joins = true;
+        }
+        if this_file_joins {
+            with_a_join.push(rel);
+        }
+    }
+
+    with_a_join.sort();
+    assert_eq!(
+        with_a_join, JOINS_OUTSIDE_THE_COMPILED_SEARCH_CORPUS,
+        "the joins outside the compiled search corpus are exactly these six; a seventh means a \
+         builder grew one and nobody said so"
+    );
+    assert_eq!(
+        scanned, 126,
+        "every committed SQL golden in the tree is scanned, not only the two frozen corpora"
+    );
+    assert!(
+        search_statements > 100,
+        "the search corpus holds the statements this rule is about: {search_statements}"
+    );
+}

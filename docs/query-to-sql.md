@@ -518,7 +518,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
 | `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *never becomes SQL*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
-| `\| select(.foo)` | a left join whose right side is `trace_attrs_idx` restricted to `key = 'foo'`, one value per span, projected as an extra column | **decided here**, §2.7.3. The alternative — widening the selector's own `key` predicate and picking the values apart with `anyIf` — was rejected on a measurement: it loses the `val` prune, and `key = 'service.namespace' AND val = 'prod'` reads 14 of 74 granules against 51 of 74 for `key IN ('service.namespace', 'foo')`. Worked in §2.9's TraceQL30. **A join is a clause ADR 0008 does not name** — part 10's open question 4 |
+| `\| select(.foo)` | a left join whose right side is `trace_attrs_idx` restricted to `key = 'foo'`, one value per span, projected as an extra column | **Not decided — refused pending an ADR 0008 clause**, and the per-query form measured in [query-lowering.md](query-lowering.md) §9.8 does not survive the shipped generator memory ceiling: it refuses with `Code: 241` at `maximum: 512.00 MiB` where the same statement with only the join removed succeeds. §2.7.3 and §2.9's TraceQL30 carry the working. The widened `key IN (…)` form the granule comparison rejected is **one** join-free alternative, not the only one: writing both predicates out in full as a disjunction keeps the `val` prune and costs no extra granules at all (§9.8, table 1). **A join is a clause ADR 0008 does not name** — part 10's open question 4 |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:90`. Still `400` on the search route (`search_plan.rs:1854`); this work does not change that |
 | `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:948` records it, `exec.rs:3421` applies it. Still `400` on the search route (`search_plan.rs:1861`) |
 | structural relations `>` `>>` `<` `<<` `~` | none | *never becomes SQL*, `docs/query-lowering.md:776`. Part 5 |
@@ -793,7 +793,7 @@ date (`catalog.rs:381-382`), and `trace_spans`, ordered by `(trace_id, timestamp
 | `\| by(name)` | the key becomes the KEY of a map aggregate inside the `HAVING`: `arrayMax(mapValues(uniqExactMap(map(if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)), span_id)))) > 2` | `HAVING` | *emitted today* (issue #492 part 5). **Not the `SELECT` list and not the `GROUP BY`**: those would make the statement's rows one per (trace, group), which is not what the executor consumes, and would need an outer statement to collapse them back. The map form asks the trace-level question — "does any group satisfy it?" — on the statement part 4 already sends. The key renders through `search_sql::byte_cap_expr`, the same function `hydration_sql` projects the column through, so the SQL partition and the evaluator's are one function of one column. It renders only on a `trace_spans` generator and only when an aggregate lands in the same level |
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING` | — | *emitted today* (issue #492 part 5). **No subquery, no outer statement and no wrap.** With a `HAVING` in the level it refuses: the aggregate selected groups and the spans it selected are not recoverable from a statement that has already reduced them |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | — | *from the design*, `docs/query-lowering.md:611`. It is the identity |
-| `\| select(.foo)` | a left join whose right side is the attribute index restricted to `key = 'foo'`, one value per span, projected as an extra column | `FROM … LEFT JOIN (…)` | **decided here.** The alternative is to widen the selector's own `key` predicate to `key IN ('a', 'foo')` and pick the two values apart with `anyIf`. That form was rejected on a measurement: widening the predicate loses the `val` prune, because `val` is the second column of the ordering key. `key = 'service.namespace' AND val = 'prod'` read **14 of 74** granules; `key IN ('service.namespace', 'foo')` read **51 of 74** — 3.6 times as many. The join keeps the selector's two-column prune and puts the value read on its own side. It replaces one statement **per batch** with one statement per query. **A join is a clause ADR 0008 does not name** — §10's open question 4 |
+| `\| select(.foo)` | a left join whose right side is the attribute index restricted to `key = 'foo'`, one value per span, projected as an extra column | `FROM … LEFT JOIN (…)` | **Not decided — refused pending an ADR 0008 clause.** The per-query form this row describes refuses at the shipped generator memory ceiling: measured in [query-lowering.md](query-lowering.md) §9.8, `Code: 241` at `maximum: 512.00 MiB` on all three takes, where the identical statement with only the join removed answered its 20 rows. Two corrections to what this row used to say. **One:** widening the selector's own `key` predicate to `key IN ('a', 'foo')` and picking the values apart with `anyIf` is **one** join-free alternative, not the only one — and it is the worse one. Written instead as a disjunction of both full predicates, the merged statement keeps the `val` prune and selects exactly the granules the two statements it replaces select (§9.8, table 1). The granule comparison behind the original rejection stands for the widened form alone: `key = 'service.namespace' AND val = 'prod'` read **14 of 74** granules; `key IN ('service.namespace', 'foo')` read **51 of 74**. **Two:** the claim this row used to carry — that the join replaces one statement per batch with one for the whole request — is measured false. The whole-request form is the one that refuses, and the form that runs is the per-batch join, which is one statement per batch (§9.8, table 3). **A join is a clause ADR 0008 does not name** — §10's open question 4 |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | — | `metrics_sql.rs:90`. Still refused with `400` on the search route (`search_plan.rs:1854`) |
 | ordering | `ORDER BY sort_key DESC, trace_id ASC` | `ORDER BY` | *from the design*, `docs/query-lowering.md:616`. Refuses over a set wider than the query: the sort key is the newest matching span's timestamp, so an extra row changes the order, not only the set |
 | `limit=20` | `LIMIT 20` | `LIMIT` | *from the design*, `docs/query-lowering.md:617` |
@@ -1552,11 +1552,27 @@ are the first two columns of the ordering key; `key IN ('service.namespace', 'fo
 selector's two-column prune and gives the value read its own, narrower one. **A join is a clause
 ADR 0008 does not name, and ADR 0008 now forbids one until it is amended** — §10's open question 4, and the ADR's "A clause these rules do not name: the join".
 
-**What it avoids.** One statement per query instead of one per batch. Today the value read is
-issued once per 32 candidates (`search_sql.rs:242`, `exec.rs:114`); at the candidate ceiling that is
-3,125 statements over the same `key = 'foo'` prefix, and the `trace_id IN (…32)` term in each of
-them prunes nothing, because `trace_id` is the fifth column of the ordering key
-(`catalog.rs:382`).
+**What it was said to avoid, and what was measured instead.** This paragraph used to claim the
+form above collapses the per-batch value read into a single read for the whole request. Today the
+value read is issued once per 32 candidates (`search_sql.rs:242`, `exec.rs:114`); at the candidate
+ceiling that is 3,125 statements over the same `key = 'foo'` prefix, and the `trace_id IN (…32)`
+term in each of them prunes nothing, because `trace_id` is the fifth column of the ordering key
+(`catalog.rs:382`). **The collapse does not survive the shipped generator memory ceiling.**
+Reproduced in [query-lowering.md](query-lowering.md) §9.8, table 4, at
+`max_memory_usage = 536870912` — the shipped `reader.traceql_generator_max_memory_bytes` — the form
+above refused on all three takes:
+
+```text
+Code: 241. DB::Exception: Query memory limit exceeded: would use 514.04 MiB (attempt to allocate chunk of 4.00 MiB), maximum: 512.00 MiB: While executing AggregatingTransform. (MEMORY_LIMIT_EXCEEDED) (version 26.3.29.7 (official build))
+```
+
+Only `Code: 241` and `maximum: 512.00 MiB` are asserted; the rest of that message moves take to
+take, and §9.8 publishes all three bodies. The control — the identical statement with the
+`LEFT JOIN (…) AS sel ON …` block and the joined projection removed, and nothing else changed —
+answered 20 rows on all three takes at the same ceiling, so the breach is the join's. The join form
+that does run is the **per-batch** one (§9.8, table 3): it selects exactly the granules and reads
+exactly the rows of the two statements it replaces, in one statement instead of two. That is one
+statement per batch, which is what the value read already is.
 
 #### TraceQL31 — two intrinsic conditions, one statement, no second table
 
@@ -4471,8 +4487,8 @@ noticed and are not grounds for a new round.
    0008's three rules cover one accumulating `SELECT`, the ban on `WITH`, and how a key set crosses
    to `pulsus-server`. They do not say whether a join may be added, or where it goes when a later
    stage needs a clause the join already occupies. The alternative that stays inside D1 was measured
-   and reads 3.6 times the granules, so this document chooses the join and records the gap rather
-   than pretending the ADR covers it.
+   and reads 3.6 times the granules, so this document recorded the gap rather than pretending the
+   ADR covers it. **It no longer chooses the join** — see the measurement below.
 
    **What changed is the disposition of the gap, not the measurement.** ADR 0008 now carries the
    rule explicitly — no emitted SQL may contain a join until the ADR names the clause — and lists
@@ -4481,6 +4497,28 @@ noticed and are not grounds for a new round.
    D3's two ceilings. `Relation` has no join slot, so the prohibition is a type property rather than
    a request. **Field selection is therefore not in the first implementation wave**, and this
    question stays open until whoever builds it amends the ADR first.
+
+   **Measured, and it changes what an amendment has to meet: the whole-request join form does not
+   survive the shipped generator memory ceiling.** At `max_memory_usage = 536870912` — the shipped
+   `reader.traceql_generator_max_memory_bytes` (`crates/pulsus-config/src/model.rs:518`, applied by
+   `generator_settings`, `crates/pulsus-read/src/traces/exec.rs:2869`) — the form §2.9's TraceQL30
+   works refused on all three takes with `Code: 241` at `maximum: 512.00 MiB`, no rows out, while
+   the identical statement with only the join removed answered its 20 rows on all three takes at the
+   same ceiling. Code 241 on a generator read maps to `TooBroadReason::TraceGeneratorMemory`
+   (`exec.rs:701`) and the request answers **422**. The corpus it happened on is a fifth the size of
+   C1 on both tables.
+
+   **And the rejected alternative was not the only one.** Widening the selector's `key` predicate
+   into `key IN (…)` is one join-free form; written instead as a disjunction of both full
+   predicates, the merged statement keeps the `val` prune and selects exactly the granules of the
+   two statements it replaces, in one statement. The full measurement — both merges, the per-batch
+   join, the whole-request join, the recipe that builds the corpus and the statements that produced
+   every figure — is [query-lowering.md](query-lowering.md) §9.8.
+
+   **The question stays open, and the three things an amendment owes are unchanged.** What is added
+   is a fourth input, not a fourth obligation: whichever slot an amendment gives a join, the
+   whole-request shape it was written for is the shape that refuses, and the shape that runs is one
+   join per batch — which is one statement per batch, the same count the value read already costs.
 5. **~~A label filter clears exactness even when its SQL is provably equivalent.~~ ANSWERED,
    2026-09-02: the link says which, and the mechanism is `Fidelity`.** The design's rule used to be
    unconditional, so a compiled parsed-name filter kept today's over-fetch page loop and the request
