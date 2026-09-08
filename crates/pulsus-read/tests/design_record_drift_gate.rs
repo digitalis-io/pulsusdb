@@ -544,31 +544,34 @@ fn regenerate_the_count_site_lines() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #492 part 8, landing 3 — the citations
+// Issue #492 part 8 — the citations
 //
-// The design record cites source files by line number 582 times. Nothing
-// derived them: moving `search_plan.rs:1854` to `:2854` in
+// The design record cites source files by line number, and nothing
+// derived those citations: moving `search_plan.rs:1854` to `:2854` in
 // `docs/query-to-sql.md` and running `cargo nextest run --workspace`
 // exited 0 with no failing test.
 //
-// **The covered set is what resolves, and the rest is enumerated rather
-// than guessed.** 467 of the 582 occurrences cite a bare basename, and
-// six of those basenames match more than one tracked file — `plan.rs`
-// matches four. A resolver that picks the candidate whose cited line
-// contains an identifier the citing prose already prints answers 400 of
-// the 582. The obvious fallback for the remaining 185 — resolve by the
-// enclosing section's language — was tested against the 122 the anchor
-// rule already answers and **disagrees on 22 of them, 18%**, which over
-// 185 would manufacture roughly 33 citations that resolve and are wrong.
-// A citation that resolves wrongly is worse than one that does not
-// resolve, so the 185 are frozen as a named set instead
-// ([`UNRESOLVABLE_TSV`]) and the check below asserts that set does not
-// grow.
+// **No count is written here.** How many citations the record makes is a
+// property of the tree at a revision — it moved on every commit of this
+// part — so it belongs in `docs/query-lowering.md` §12.3 beside the
+// revision it was taken at, and nothing in this file depends on it. An
+// earlier version of this comment carried three such figures and they
+// were all stale within two commits, in the file whose subject is stale
+// figures.
 //
-// **What would close the gap** is making those 185 citing lines print an
-// identifier the cited line carries — the same rule the 400 already
-// satisfy. That is a per-site reading of each cited line against the
-// claim beside it, and it is recorded here as work rather than promised.
+// **The covered set is what the resolver answers, and the rest is
+// enumerated rather than guessed.** Most citations name a bare basename,
+// and six of those basenames match more than one tracked file —
+// `plan.rs` matches four. [`resolve_citation`] picks the candidate whose
+// cited line contains an identifier the citing prose already prints;
+// what it cannot answer is frozen in [`UNRESOLVABLE_TSV`] with a reason
+// each, and the check below asserts the two sets partition the record's
+// citations in every direction.
+//
+// **What would close the gap** is making the frozen citing lines print
+// an identifier the cited line carries — the same rule the resolved ones
+// already satisfy. That is a per-site reading of each cited line against
+// the claim beside it, and it is recorded as work rather than promised.
 // ---------------------------------------------------------------------
 
 const CITATIONS_TSV: &str = "crates/pulsus-read/tests/design_record_citations.tsv";
@@ -668,7 +671,8 @@ fn unresolvable() -> BTreeSet<(String, String, String)> {
                 "ambiguous_basename",
                 "not_a_tracked_file",
                 "blank_target_line",
-                "line_beyond_end_of_file"
+                "line_beyond_end_of_file",
+                "occurrences_disagree"
             ]
             .contains(&f[2]),
             "{UNRESOLVABLE_TSV}:{}: unknown reason {:?}",
@@ -777,6 +781,19 @@ enum Resolution {
     /// Several candidates, and the citing line prints no identifier that
     /// separates them.
     AmbiguousBasename,
+    /// The record cites this token more than once in one document and
+    /// the resolver answers **differently** for two of the occurrences.
+    ///
+    /// An earlier revision assumed this could not happen — "every
+    /// occurrence of a token names the same file and the same line, so
+    /// one occurrence with evidence settles the others" — and kept the
+    /// first answer, discarding the rest. A code review found three
+    /// tokens where the answers differ, so the assumption was false and
+    /// the loop was not checking the set. Two contradictory answers are
+    /// not an answer: the citation is not resolvable by this rule, and
+    /// it is frozen with this reason rather than silently taking
+    /// whichever occurrence came first.
+    OccurrencesDisagree,
 }
 
 impl Resolution {
@@ -788,8 +805,63 @@ impl Resolution {
             Resolution::BeyondEndOfFile => Some("line_beyond_end_of_file"),
             Resolution::BlankTargetLine => Some("blank_target_line"),
             Resolution::AmbiguousBasename => Some("ambiguous_basename"),
+            Resolution::OccurrencesDisagree => Some("occurrences_disagree"),
         }
     }
+}
+
+/// The verdict for one `(document, token)` key, over **every** occurrence
+/// of it — never over the first one that answers.
+///
+/// * two occurrences resolving to different files → `OccurrencesDisagree`;
+/// * exactly one file across all that resolve → `To(that file)`, and the
+///   occurrences that carry no identifier are covered by the ones that
+///   do, because a token names one target wherever it is written;
+/// * none resolving → the most specific reason any occurrence gave, in
+///   the order blank target, not tracked, beyond end of file, ambiguous.
+///   The order is a precedence and not a preference: a blank target is a
+///   fact about the cited line, an ambiguous basename is the absence of
+///   evidence, and the first is the more useful thing to report.
+fn key_verdict(resolutions: &[Resolution]) -> Resolution {
+    let paths: BTreeSet<&String> = resolutions
+        .iter()
+        .filter_map(|r| match r {
+            Resolution::To(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    match paths.len() {
+        n if n > 1 => Resolution::OccurrencesDisagree,
+        1 => Resolution::To((*paths.iter().next().expect("one path")).clone()),
+        _ => {
+            for want in [
+                Resolution::BlankTargetLine,
+                Resolution::NotTracked,
+                Resolution::BeyondEndOfFile,
+            ] {
+                if resolutions.contains(&want) {
+                    return want;
+                }
+            }
+            Resolution::AmbiguousBasename
+        }
+    }
+}
+
+/// Every occurrence's resolution, grouped by `(document, token)`, in
+/// document order.
+fn resolutions_by_key(
+    occurrences: &[Occurrence],
+    tracked: &[String],
+) -> BTreeMap<(String, String), Vec<(Occurrence, Resolution)>> {
+    let mut out: BTreeMap<(String, String), Vec<(Occurrence, Resolution)>> = BTreeMap::new();
+    for occ in occurrences {
+        let r = resolve_citation(occ, tracked);
+        out.entry((occ.doc.clone(), occ.token.clone()))
+            .or_default()
+            .push((occ.clone(), r));
+    }
+    out
 }
 
 /// Every spelling of one backticked token that could occur at a cited
@@ -990,29 +1062,28 @@ fn every_citation_in_the_design_record_has_a_row() {
         occurrences.len()
     );
     let tracked = tracked_rust_files();
-
-    // The verdict per `(document, token)`: a token resolves for a
-    // document if ANY of its occurrences there resolves, because every
-    // occurrence of it names the same file and the same line.
-    let mut verdict: BTreeMap<(String, String), Resolution> = BTreeMap::new();
-    for occ in &occurrences {
-        let key = (occ.doc.clone(), occ.token.clone());
-        let r = resolve_citation(occ, &tracked);
-        match verdict.get(&key) {
-            Some(Resolution::To(_)) => {}
-            _ => {
-                verdict.insert(key, r);
-            }
-        }
-    }
+    let by_key = resolutions_by_key(&occurrences, &tracked);
 
     let mut problems: Vec<String> = Vec::new();
-    for ((doc, token), r) in &verdict {
+    for ((doc, token), group) in &by_key {
         let key = (doc.clone(), token.clone());
-        match r {
+        let verdict = key_verdict(&group.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
+        match &verdict {
             Resolution::To(path) => {
-                // It resolves. It must be in the resolved dataset, at
-                // this path — and it must NOT be frozen.
+                // **Every occurrence is compared, not the first one that
+                // answered.** An occurrence that carries no identifier
+                // resolves to nothing and is covered by the ones that
+                // do; an occurrence that resolves ELSEWHERE cannot
+                // happen here, because that is `OccurrencesDisagree`.
+                for (occ, r) in group {
+                    if let Resolution::To(p) = r {
+                        assert_eq!(
+                            p, path,
+                            "{doc}:{} cites {token}, which the key resolves to {path}",
+                            occ.doc_line
+                        );
+                    }
+                }
                 if frozen_keys.contains(&key) {
                     problems.push(format!(
                         "{UNRESOLVABLE_TSV} freezes {doc} / {token}, which now RESOLVES to \
@@ -1034,11 +1105,8 @@ fn every_citation_in_the_design_record_has_a_row() {
                     Some(_) => {}
                 }
             }
-            _ => {
-                // It does not resolve. It must be frozen, with THIS
-                // reason — and it must not also be in the resolved
-                // dataset.
-                let want = r.reason().expect("a non-resolution has a reason");
+            other => {
+                let want = other.reason().expect("a non-resolution has a reason");
                 if resolved.contains(&key) {
                     problems.push(format!(
                         "{CITATIONS_TSV} carries {doc} / {token}, which no longer resolves \
@@ -1338,17 +1406,23 @@ fn tracked_rust_files() -> Vec<String> {
 #[ignore = "writes the two citation datasets"]
 fn regenerate_the_citation_datasets() {
     let tracked = tracked_rust_files();
-    let mut verdict: BTreeMap<(String, String), (Resolution, Occurrence)> = BTreeMap::new();
-    for occ in citation_occurrences() {
-        let key = (occ.doc.clone(), occ.token.clone());
-        let r = resolve_citation(&occ, &tracked);
-        match verdict.get(&key) {
-            Some((Resolution::To(_), _)) => {}
-            _ => {
-                verdict.insert(key, (r, occ));
-            }
-        }
-    }
+    let occurrences = citation_occurrences();
+    // The SAME key verdict the check uses, over every occurrence.
+    let by_key = resolutions_by_key(&occurrences, &tracked);
+    let verdict: BTreeMap<(String, String), (Resolution, Occurrence)> = by_key
+        .iter()
+        .map(|(k, group)| {
+            let v = key_verdict(&group.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
+            // The anchor comes from the occurrence that resolved, so it
+            // is a token that citing line actually prints.
+            let occ = group
+                .iter()
+                .find(|(_, r)| matches!((r, &v), (Resolution::To(a), Resolution::To(b)) if a == b))
+                .map(|(o, _)| o.clone())
+                .unwrap_or_else(|| group[0].0.clone());
+            (k.clone(), (v, occ))
+        })
+        .collect();
     let mut resolved = String::from("doc\ttoken\tpath\tline\tend_line\tanchor_kind\tanchor\n");
     let mut frozen = String::from("doc\ttoken\treason\n");
     for ((doc, token), (r, occ)) in &verdict {
@@ -1442,48 +1516,141 @@ fn section_language(doc: &str, doc_line: u32) -> Option<SectionLanguage> {
     current
 }
 
-/// **The fallback rule, run against the cases where the answer is
-/// already known, and the number that decides whether to use it.**
+/// What a person concluded after reading one citation's prose against
+/// both candidate files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewedVerdict {
+    /// The fallback's answer is not the file the citing prose describes.
+    FallbackWrong,
+    /// The fallback's answer IS the file the citing prose describes, and
+    /// [`resolve_citation`] is the one that points elsewhere.
+    FallbackRight,
+    /// The citing sentence describes both candidates, so neither answer
+    /// is wrong and neither is evidence.
+    Ambiguous,
+}
+
+/// **Every citation where the language fallback and [`resolve_citation`]
+/// disagree, with a verdict a person reached by reading the citing prose
+/// against both candidate files.**
 ///
-/// 467 of the record's citations name a bare basename, and six of those
+/// The key is `(document, token, nth occurrence of that token in that
+/// document among the citations that need a rule at all)` — line numbers
+/// move whenever the record is re-wrapped, and two occurrences of one
+/// token can be about different things. "Need a rule at all" means a
+/// bare basename with more than one candidate file that has the cited
+/// line; a path-qualified citation, or one with a single candidate, is
+/// not counted, so the index is stable against citations elsewhere in
+/// the document gaining or losing a path.
+///
+/// **This table exists because the earlier measurement judged the
+/// fallback against `resolve_citation`, which is the other rule under
+/// test.** A rate computed that way says how often two rules differ, not
+/// how often either is wrong, and a code review reading the nine cases
+/// found three where the resolver was the one pointing at the wrong
+/// file. So no rate is published. These are the cases, and the note on
+/// each is the reasoning.
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 9] = [
+    (
+        "docs/query-lowering.md",
+        "exec.rs:2869",
+        0,
+        ReviewedVerdict::FallbackWrong,
+        "a LogQL section citing the TraceQL search executor's generator settings;          crates/pulsus-read/src/logql/exec.rs has no such thing",
+    ),
+    (
+        "docs/query-lowering.md",
+        "exec.rs:2869",
+        2,
+        ReviewedVerdict::FallbackWrong,
+        "the same citation again, in the same section, with the same answer",
+    ),
+    (
+        "docs/query-lowering.md",
+        "exec.rs:2830-2836",
+        0,
+        ReviewedVerdict::FallbackWrong,
+        "the search settings block the same section quotes; it is in traces/exec.rs",
+    ),
+    (
+        "docs/query-lowering.md",
+        "exec.rs:701",
+        0,
+        ReviewedVerdict::FallbackWrong,
+        "a LogQL section citing a line of the TraceQL executor",
+    ),
+    (
+        "docs/query-to-sql.md",
+        "labels.rs:157-189",
+        0,
+        ReviewedVerdict::FallbackWrong,
+        "the sentence describes the label ENCODER; the fallback answers          crates/pulsus-read/src/logql/labels.rs, which is not where it lives",
+    ),
+    (
+        "docs/query-to-sql.md",
+        "labels.rs:157-189",
+        1,
+        ReviewedVerdict::Ambiguous,
+        "this sentence describes both the writer and the flat reader; the fallback points at          the flat reader, so neither answer is wrong and the case is evidence for neither rule",
+    ),
+    (
+        "docs/query-to-sql.md",
+        "labels.rs:363",
+        0,
+        ReviewedVerdict::FallbackRight,
+        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs",
+    ),
+    (
+        "docs/query-to-sql.md",
+        "sql.rs:996",
+        2,
+        ReviewedVerdict::FallbackRight,
+        "the citing prose describes metric_raw_samples_sliding, in          crates/pulsus-read/src/logql/sql.rs — the fallback's answer",
+    ),
+    (
+        "docs/query-to-sql.md",
+        "sql.rs:489",
+        3,
+        ReviewedVerdict::FallbackRight,
+        "the citing prose describes stage2, in crates/pulsus-read/src/logql/sql.rs — the          fallback's answer; metrics/sql.rs:489 is a test literal",
+    ),
+];
+
+/// **Where the language fallback and the anchor rule disagree, and what a
+/// person concluded about each.**
+///
+/// 469 of the record's citations name a bare basename and six of those
 /// basenames match more than one tracked file. [`resolve_citation`]
 /// answers the ones whose citing line prints an identifier the cited
-/// line carries. For the rest, the obvious next rule is the enclosing
+/// line carries. The obvious next rule for the rest is the enclosing
 /// section's language: a `plan.rs` citation in a LogQL section means
 /// `logql/plan.rs`.
 ///
-/// **This test measures how often that rule is wrong**, over the
-/// population where the answer is independently known — the bare
-/// citations the anchor rule resolves — and freezes the result, so the
-/// figure that decided the design can be re-run by anyone rather than
-/// quoted from a report.
+/// **No rate is published, and an earlier revision of this test published
+/// one that was measured against itself.** It called `resolve_citation`
+/// the truth and counted how often the fallback differed from it, which
+/// measures disagreement between two rules rather than error in either.
+/// Read one at a time, three of the nine divergences are cases where the
+/// **resolver** points at the wrong file.
 ///
-/// **It also corrects a figure I published and could not reproduce.** An
-/// earlier note said the fallback disagrees on 22 of 122 cases, 18%, and
-/// used that to justify freezing the unresolved set rather than applying
-/// the fallback. That experiment was not committed, and re-running it
-/// here shows the 18% was measured wrongly: it counted a case as a
-/// DISAGREEMENT when the fallback had no candidate in the preferred
-/// family at all — `catalog.rs` is in neither `logql/` nor `traces/`, and
-/// 15 of the 22 were of exactly that kind. A rule that declines is not a
-/// rule that answers wrongly. The measured disagreement rate over the
-/// cases the fallback actually ANSWERS is the assertion below.
+/// What this test asserts instead: the divergence set is exactly the
+/// nine reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
+/// cannot appear without a person reading it; and five of the nine are
+/// citations where the fallback answers a file the citing prose does not
+/// describe. **Five wrong answers out of nine disagreements is why the
+/// fallback is not applied** — not a percentage, five cases anyone can
+/// read.
 #[test]
-fn the_language_fallback_is_measured_over_the_cases_whose_answer_is_known() {
+fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled() {
     let tracked = tracked_rust_files();
-    let mut answered = 0usize;
-    let mut disagreements: Vec<String> = Vec::new();
-    let mut declined = 0usize;
-    let mut population = 0usize;
+    let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut found: Vec<(String, String, usize, String, String)> = Vec::new();
 
     for occ in citation_occurrences() {
         let base = occ.token.split(':').next().unwrap_or("");
         if base.contains('/') {
-            continue; // already path-qualified: the fallback is not needed
+            continue; // already path-qualified: no rule is needed
         }
-        let Resolution::To(truth) = resolve_citation(&occ, &tracked) else {
-            continue; // the answer is not independently known
-        };
         let candidates: Vec<&String> = tracked
             .iter()
             .filter(|t| t.ends_with(&format!("/{base}")))
@@ -1492,46 +1659,80 @@ fn the_language_fallback_is_measured_over_the_cases_whose_answer_is_known() {
         if candidates.len() < 2 {
             continue; // one candidate: no rule is needed to choose
         }
-        population += 1;
+        let nth = {
+            let key = (occ.doc.clone(), occ.token.clone());
+            let n = seen.entry(key).or_insert(0);
+            let v = *n;
+            *n += 1;
+            v
+        };
         let Some(lang) = section_language(&occ.doc, occ.doc_line) else {
-            declined += 1;
-            continue;
+            continue; // the fallback declines: not an answer, right or wrong
         };
         let preferred: Vec<&&String> = candidates
             .iter()
             .filter(|t| lang.prefers().iter().any(|p| t.contains(p)))
             .collect();
         if preferred.len() != 1 {
-            declined += 1;
-            continue;
+            continue; // the fallback declines
         }
-        answered += 1;
-        if **preferred[0] != truth {
-            disagreements.push(format!(
-                "{}:{} cites {} in a {lang:?} section; the fallback answers {} and the anchor \
-                 rule answers {truth}",
-                occ.doc, occ.doc_line, occ.token, preferred[0]
+        let Resolution::To(anchor_answer) = resolve_citation(&occ, &tracked) else {
+            continue; // nothing to disagree with
+        };
+        if **preferred[0] != anchor_answer {
+            found.push((
+                occ.doc.clone(),
+                occ.token.clone(),
+                nth,
+                (**preferred[0]).clone(),
+                anchor_answer,
             ));
         }
     }
 
-    let rate = disagreements.len() as f64 / answered.max(1) as f64;
-    eprintln!(
-        "fallback experiment: population={population} answered={answered} declined={declined} \
-         disagreements={} rate={:.2}%",
-        disagreements.len(),
-        rate * 100.0
+    let got: BTreeSet<(String, String, usize)> = found
+        .iter()
+        .map(|(d, t, n, _, _)| (d.clone(), t.clone(), *n))
+        .collect();
+    let reviewed: BTreeSet<(String, String, usize)> = REVIEWED_FALLBACK_DIVERGENCES
+        .iter()
+        .map(|(d, t, n, _, _)| (d.to_string(), t.to_string(), *n))
+        .collect();
+    let unreviewed: Vec<&(String, String, usize)> = got.difference(&reviewed).collect();
+    assert!(
+        unreviewed.is_empty(),
+        "the fallback and the anchor rule now disagree on {unreviewed:?}, which nobody has read.          Read the citing prose against both candidate files and add the case with its verdict —          this table is a record of judgements, and it is not something a rule may fill in"
     );
-    for d in &disagreements {
-        eprintln!("  DISAGREEMENT {d}");
-    }
+    let gone: Vec<&(String, String, usize)> = reviewed.difference(&got).collect();
+    assert!(
+        gone.is_empty(),
+        "REVIEWED_FALLBACK_DIVERGENCES carries {gone:?}, where the two rules now agree; remove          the reviewed case rather than leaving a judgement about a citation that no longer          diverges"
+    );
 
-    // Frozen so the figure cannot rot unnoticed. If the record's
-    // citations change, these move and someone re-reads the decision
-    // they justify.
+    let wrong: Vec<&(&str, &str, usize, ReviewedVerdict, &str)> = REVIEWED_FALLBACK_DIVERGENCES
+        .iter()
+        .filter(|(_, _, _, v, _)| *v == ReviewedVerdict::FallbackWrong)
+        .collect();
+    let right = REVIEWED_FALLBACK_DIVERGENCES
+        .iter()
+        .filter(|(_, _, _, v, _)| *v == ReviewedVerdict::FallbackRight)
+        .count();
+    let ambiguous = REVIEWED_FALLBACK_DIVERGENCES
+        .iter()
+        .filter(|(_, _, _, v, _)| *v == ReviewedVerdict::Ambiguous)
+        .count();
+    eprintln!(
+        "fallback divergences: {} reviewed — {} the fallback answers wrongly, {right} where the \
+         ANCHOR RULE is the one that is wrong, {ambiguous} where the sentence describes both",
+        REVIEWED_FALLBACK_DIVERGENCES.len(),
+        wrong.len()
+    );
+    for (doc, token, nth, _, note) in &wrong {
+        eprintln!("  FALLBACK WRONG {doc} / {token} (occurrence {nth}): {note}");
+    }
     assert_eq!(
-        (population, answered, declined, disagreements.len()),
-        (112, 109, 3, 9),
-        "the fallback experiment moved; re-read §12.3's decision against the new numbers"
+        (wrong.len(), right, ambiguous),
+        (5, 3, 1),
+        "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

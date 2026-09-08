@@ -195,7 +195,6 @@ docs/query-to-sql.md	filter.rs:76-79	crates/pulsus-read/src/traces/filter.rs	76	
 docs/query-to-sql.md	filter.rs:817	crates/pulsus-read/src/traces/filter.rs	817		line	/// fragment. Fallible for the same reason as [`physical_sql`] (issue
 docs/query-to-sql.md	filter.rs:827	crates/pulsus-read/src/traces/filter.rs	827		line	ValuePred::Regex(pat) => format!("match(val, {})", anchored_regex_sql(pat)?),
 docs/query-to-sql.md	labels.rs:157-189	crates/pulsus-model/src/labels.rs	157	189	prose	structured_metadata
-docs/query-to-sql.md	labels.rs:363	crates/pulsus-read/src/metrics/labels.rs	363		prose	resolve
 docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		prose	render_labels_json_sorted
 docs/query-to-sql.md	logql/charge.rs:1270	crates/pulsus-read/src/logql/charge.rs	1270		line	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:775-781	crates/pulsus-read/src/logql/error.rs	775	781	prose	400
@@ -287,7 +286,6 @@ docs/query-to-sql.md	sql.rs:109	crates/pulsus-read/src/logql/sql.rs	109		prose	c
 docs/query-to-sql.md	sql.rs:111	crates/pulsus-read/src/logql/sql.rs	111		prose	sum(length(body))
 docs/query-to-sql.md	sql.rs:246	crates/pulsus-read/src/logql/sql.rs	246		prose	stage1
 docs/query-to-sql.md	sql.rs:283	crates/pulsus-read/src/logql/sql.rs	283		prose	probe
-docs/query-to-sql.md	sql.rs:489	crates/pulsus-read/src/logql/sql.rs	489		prose	stage2
 docs/query-to-sql.md	sql.rs:538	crates/pulsus-read/src/logql/sql.rs	538		prose	stage3
 docs/query-to-sql.md	sql.rs:563	crates/pulsus-read/src/logql/sql.rs	563		prose	ORDER
 docs/query-to-sql.md	sql.rs:625	crates/pulsus-read/src/logql/sql.rs	625		prose	stage3_keyset
@@ -295,7 +293,6 @@ docs/query-to-sql.md	sql.rs:800	crates/pulsus-read/src/logql/sql.rs	800		prose	m
 docs/query-to-sql.md	sql.rs:849	crates/pulsus-read/src/logql/sql.rs	849		prose	metric_instant
 docs/query-to-sql.md	sql.rs:889-895	crates/pulsus-read/src/logql/sql.rs	889	895	prose	structured_metadata
 docs/query-to-sql.md	sql.rs:948	crates/pulsus-read/src/logql/sql.rs	948		prose	metric_raw_samples
-docs/query-to-sql.md	sql.rs:996	crates/pulsus-read/src/logql/sql.rs	996		prose	metric_raw_samples_sliding
 docs/query-to-sql.md	sql.rs:996-1019	crates/pulsus-read/src/logql/sql.rs	996	1019	prose	metric_raw_samples_sliding
 docs/query-to-sql.md	traces/exec.rs:119	crates/pulsus-read/src/traces/exec.rs	119		line	/// Per-trace hydration span cap; the `+1` probe detects overflow, which
 docs/query-to-sql.md	traces/exec.rs:144	crates/pulsus-read/src/traces/exec.rs	144		line	/// (and merge tuples / root summaries) survive the per-batch charge
