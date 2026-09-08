@@ -2052,45 +2052,64 @@ need the lowering core.
 the harness against the SAME corpus is one question; rebuilding the corpus and re-running is
 another, and only the first was measured when this section was first written.
 
-**Every figure below is held in
-[`docs/benchmarks/data/traces-lowering-92-rebuilds.tsv`](benchmarks/data/traces-lowering-92-rebuilds.tsv)**,
-one row per observation and column with the provenance of each, and
-`the_rebuild_table_states_the_observations_the_dataset_holds` fails when this table and that file
-disagree. An earlier revision stated these numbers in prose and one of them was wrong with nothing
-to say so.
+**The block below is generated from
+[`docs/benchmarks/data/traces-lowering-92-rebuilds.tsv`](benchmarks/data/traces-lowering-92-rebuilds.tsv)**
+— the table and the sentences alike — and
+`the_rebuild_block_is_the_one_the_dataset_produces` compares it byte for byte. Two earlier
+revisions of this paragraph stated these figures in prose and both carried one that was wrong;
+gating the table alone was not enough, because the sentences beside a table are where the next
+wrong number goes. There is nothing here for a person to write a number into.
 
-Each cell reads *statements moved, of 1,132* / *largest per-statement change*:
+<!-- generated from traces-lowering-92-rebuilds.tsv -->
 
-| column | S: same corpus, twice | rebuild A | rebuild C |
+Each cell reads *statements moved, of 1,132* / *largest per-statement change*.
+
+| column | S | A | C |
 |---|---|---|---|
-| `selected_marks` (`granules`) | 0 / — | 0 / — | 1 / 0.71% |
+| `selected_marks` | 0 / — | 0 / — | 1 / 0.71% |
 | `result_bytes` | 0 / — | 0 / — | 0 / — |
 | `read_rows` | 0 / — | 147 / 0.013% | 147 / 0.689% |
-| `read_bytes` (`decoded †`) | 0 / — | 147 / 0.013% | 147 / 0.647% |
+| `read_bytes` | 0 / — | 147 / 0.013% | 147 / 0.647% |
 | `read_compressed_bytes` | 440 / 0.19% | 977 / 0.013% | 996 / 0.234% |
-| `fd_read_bytes` (`off file system †`) | 561 / 2.53% | 1124 / 2.5% | 1125 / 3.15% |
+| `fd_read_bytes` | 561 / 2.53% | 1124 / 2.5% | 1125 / 3.15% |
 | `memory_usage` | 982 / 25.8% | 1132 / 18.6% | 1105 / 19.9% |
 
-**On the same corpus the four columns every published ratio is computed from are bit-identical** —
-`read_rows`, `read_bytes`, `selected_marks` and `result_bytes`, zero of 1,132 statements moved.
-**Rebuild the corpus and they are not, and no band is established for how much.** Four observations
-exist: the committed artefact and three rebuilds, each on a different day and a different host.
-Rebuild A is this harness's own; rebuild C was run by a code review on its own host and is recorded
-from its report rather than re-measured here, which the dataset's `provenance` column says. Rebuild
-B recorded only group totals: it moved the hydration group's granules by 1 and its result bytes by
-2,323, so it disagrees with rebuild A on the two columns rebuild A found stable, and with rebuild C
-on `result_bytes`.
+**S** is the same corpus, run twice by this harness.
 
-**An earlier revision of this paragraph said a rebuild is expected to land within rebuild A's
-figures. That was three observations predicting a fourth, and rebuild C differs from rebuild A on
-**6** of the seven columns** — every one except `result_bytes`, which is 0 of 1,132 in both, and
-which is also the only column all three rebuilds agree on. `read_rows` is 0.689% against 0.013%,
-and a granule moved where none had before. The expectation is withdrawn rather than widened: what
-these observations establish is that these columns vary, not by how much, and a re-runner should
-expect their numbers to differ from the committed artefact without reading the difference as a
-defect. `the_rebuild_table_states_the_observations_the_dataset_holds` derives that **6** from the
-dataset, so the sentence cannot drift from the table above it — which is how it came to say
-"every column" when one column agreed.
+**A** is a corpus rebuilt from the committed generator, measured by this harness.
+
+**C** is a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here.
+
+**B** is a corpus rebuilt on another host by issue #492 part 8's first code review, which reported group totals only, so it appears in no column above: `selected_marks` +1 granule, hydration group; `result_bytes` +2,323 bytes, hydration group.
+
+Changes over the whole unlowered request, where an observation published one: S `fd_read_bytes` 0.03%; A `read_rows` −418 rows, −0.00001%; A `read_bytes` +11,418 bytes, +0.00001%. Every other cell above was published per statement only.
+
+On the same corpus, 4 of the 7 columns did not move on a single statement: `selected_marks`, `result_bytes`, `read_rows`, `read_bytes`.
+
+Rebuild C differs from rebuild A on 6 of the 7 columns; the one it does not differ on is `result_bytes`.
+
+Of the 7 columns, **none** is one every rebuild that recorded it found unmoved.
+
+<!-- end generated -->
+
+> **These two sections were reconstructed, and the reconstruction cannot be verified.** While part 8
+> was being reviewed, `git checkout` was used to revert a break with two document rewrites
+> uncommitted, and both were destroyed — this reproducibility block and §12.3. They were rewritten
+> from what their author remembered writing. **No blob of the destroyed text was retained**, so
+> nobody can compare the reconstruction against it: a reader can check the current text for internal
+> consistency and against the datasets, and that is all. A code review checking it for internal
+> consistency is what found that one paragraph said every rebuild agreed on a column another
+> paragraph said one rebuild had moved. **A reconstruction that cannot be verified is a different
+> thing from one that has been**, and this note exists so a later reader does not mistake the second
+> for the first. Both blocks are generated from committed datasets now, which is a guarantee about
+> the present text and says nothing about what the destroyed text contained.
+
+**These columns vary between builds and no band is established for how much.** An earlier revision
+of this paragraph said a rebuild is expected to land within rebuild A's figures. That was three
+observations predicting a fourth, and the fourth did not. The expectation is withdrawn rather than
+widened: what these observations establish is that the columns vary, not by how much, and a
+re-runner should expect their numbers to differ from the committed artefact without reading the
+difference as a defect.
 
 **The mechanism is adaptive granularity.** `index_granularity_bytes` is 10 MiB on these tables, so a
 granule holds as many rows as fit in that many bytes rather than a fixed 8,192. The corpus is
@@ -5402,12 +5421,20 @@ The design record cites source files by line number, and nothing derived those c
 part 8: moving `search_plan.rs:1854` to `:2854` in [`query-to-sql.md`](query-to-sql.md) and running
 `cargo nextest run --workspace` exited 0 with no failing test.
 
-**Every figure in this section is derived, and a check fails when the text and the derivation
-disagree.** An earlier revision of this section stated its census in prose, and six of its numbers
-were wrong at the head with nothing to say so — in the section whose subject is numbers nobody
-derives. `every_figure_section_12_3_states_is_the_one_the_datasets_hold`
-(`crates/pulsus-read/tests/design_record_drift_gate.rs`) computes each row of the three tables below
-and compares.
+> **This section was reconstructed and the reconstruction cannot be verified.** See the note in
+> §9.2b: `git checkout` destroyed the uncommitted text of both this section and that one, no blob
+> of it was retained, and what stands here was rewritten from memory. It can be checked for
+> internal consistency and against the datasets; it cannot be compared with what it replaced.
+
+**Every figure in this section is generated, not written down.** An earlier revision stated its
+census in prose and six of the numbers were wrong at the head; the revision after that derived the
+table cells and left the sentences beside them, and a code review changed a prose count with every
+suite staying green. Gating prose by pattern is not the fix — numbers in English are unbounded, so
+a pattern that catches today's sentences misses tomorrow's and looks like coverage while doing it.
+The block below, tables and sentences alike, is rendered from the two citation datasets by
+`every_figure_section_12_3_states_is_the_one_the_datasets_hold`, which compares it byte for byte.
+
+<!-- generated from the citation datasets -->
 
 | quantity | at this revision |
 |---|---|
@@ -5420,13 +5447,30 @@ and compares.
 | resolved rows anchored on a token the citing prose prints | 146 |
 | resolved rows anchored on a snapshot of the cited line | 160 |
 
-Most citations name a bare basename, and six of those basenames match more than one tracked file —
-`plan.rs` matches four. The rule that resolves them is the anchor design's own: pick the candidate
-whose cited line contains an identifier the citing prose already prints.
+| reason it cannot be resolved | pairs |
+|---|---|
+| `ambiguous_basename` | 73 |
+| `blank_target_line` | 4 |
+| `not_a_tracked_file` | 2 |
+| `occurrences_disagree` | 3 |
 
-**These counts move when this section is edited, because this section cites source files too.** Six
-of the 594 are citations §12.3 itself added when it started naming the tokens it is about, which is
-content rather than drift — and it is why the census is derived rather than written down.
+| the reviewed verdict on a fallback disagreement | cases |
+|---|---|
+| the fallback answers a file the citing prose does not describe | 5 |
+| the fallback is right and the anchor rule points elsewhere | 3 |
+| the sentence describes both candidates, so neither answer is wrong | 1 |
+
+Of the 594 citation occurrences the five artefacts make, 475 name a bare basename. The rule resolves 306 `(document, token)` pairs covering 464 occurrences, and cannot resolve 82 covering 130. Of the resolved rows, 146 are anchored on a token the citing prose prints and 160 on a snapshot of the cited line.
+
+The language fallback and the anchor rule disagree on 9 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+
+<!-- end generated -->
+
+**These counts move when this section is edited**, because this section cites source files too and
+a citation it makes is a citation like any other. Some of the occurrences the block counts are ones
+§12.3 added when it began naming the tokens it is about, which is content rather than drift — and
+it is why the block is generated rather than typed. Nothing outside the block states one of its
+numbers, so there is no second copy to fall out of step.
 
 **The rule lives in `crates/pulsus-read/tests/design_record_drift_gate.rs`, in
 `resolve_citation`, and it is the only implementation.** An earlier revision generated the datasets
@@ -5435,21 +5479,26 @@ two drifted on two citations, which is the two-implementations problem in miniat
 test regenerates both datasets from the one rule.
 
 **The frozen pairs carry a reason each**, in
-`crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`:
+`crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`, and the block above counts
+them:
 
-| reason | rows | what it means |
-|---|---|---|
-| `ambiguous_basename` | 73 | the basename matches several tracked files and the citing line prints no identifier that separates them |
-| `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on — `traces/exec.rs:114`, `:1968` and `search_plan.rs:1042`, the first cited from two documents |
-| `occurrences_disagree` | 3 | the record cites the token more than once in one document and the rule answers **differently** for two of the occurrences — `labels.rs:363`, `sql.rs:489` and `sql.rs:996`, all in [`query-to-sql.md`](query-to-sql.md) |
-| `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
+- `ambiguous_basename` — the basename matches several tracked files and the citing line prints no
+  identifier that separates them.
+- `blank_target_line` — the cited line exists and is **empty**, so there is nothing to anchor on:
+  `traces/exec.rs:114`, `:1968` and `search_plan.rs:1042`, the first cited from two documents.
+- `occurrences_disagree` — the record cites the token more than once in one document and the rule
+  answers **differently** for two of the occurrences: `labels.rs:363`, `sql.rs:489` and
+  `sql.rs:996`, all in [`query-to-sql.md`](query-to-sql.md).
+- `not_a_tracked_file` — the citation names a throwaway probe that was never committed, which §10
+  records deliberately.
 
 **`occurrences_disagree` is a category part 8 did not expect to need.** An earlier revision assumed
 a token names one target wherever it is written, so one occurrence with evidence settled the
 others, and the check kept the first answer and discarded the rest — which meant it was not
-comparing the set. A code review found three tokens where the answers differ. Two contradictory
-answers are not an answer, so those three are frozen rather than settled by whichever occurrence
-came first, and the check now computes each key's verdict over **every** occurrence of it.
+comparing the set. A code review found tokens where the answers differ — the block above counts
+them under `occurrences_disagree`. Two contradictory answers are not an answer, so they are frozen
+rather than settled by whichever occurrence came first, and the check now computes each key's
+verdict over **every** occurrence of it.
 
 `every_citation_in_the_design_record_has_a_row` runs the rule over every citation and compares its
 verdict with the two datasets **in every direction**: a citation covered by neither is a hole; a
@@ -5461,43 +5510,40 @@ place to put inconvenient citations, and an earlier revision promised it and did
 #### The fallback that was rejected, and the cases that rejected it
 
 The obvious next rule for the frozen pairs is the enclosing section's language: a `plan.rs` citation in a
-LogQL section means `logql/plan.rs`. **It is not applied, and the reason is nine citations anyone
-can read** —
+LogQL section means `logql/plan.rs`. **It is not applied, and the reason is a set of citations
+anyone can read**, counted in the block above —
 `the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled` finds every
 citation where the fallback and the anchor rule disagree, and requires each to carry a verdict a
-person reached by reading the citing prose against both candidate files:
+person reached by reading the citing prose against both candidate files. The three verdicts, whose
+counts the block above holds, are that the fallback answers a file the citing prose does not
+describe; that the fallback is right and the **anchor rule** is the one pointing elsewhere; and
+that the sentence describes both candidates, so neither answer is wrong.
 
-| verdict | cases | what it means |
-|---|---|---|
-| the fallback is **wrong** | 5 | it answers a file the citing prose does not describe |
-| the fallback is **right** | 3 | and the anchor rule is the one pointing elsewhere |
-| ambiguous | 1 | the sentence describes both candidates, so neither answer is wrong |
-
-Five wrong answers in nine disagreements, on a rule whose whole job is to say which file a citation
-means, is why it is not applied. Four of the five are a LogQL section citing the **TraceQL**
-executor — `exec.rs:2869` twice, `exec.rs:2830-2836` and `exec.rs:701` — where the fallback answers
-`logql/exec.rs`, which carries nothing of the kind. The fifth is a sentence about the label encoder
-answered with `logql/labels.rs`.
+Wrong answers on a rule whose whole job is to say which file a citation means are why it is not
+applied; the block above counts them. Most are a LogQL section citing the **TraceQL** executor —
+`exec.rs:2869` twice, `exec.rs:2830-2836` and `exec.rs:701` — where the fallback answers
+`logql/exec.rs`, which carries nothing of the kind. The remaining one is a sentence about the label
+encoder answered with `logql/labels.rs`. Every case is named with its reasoning in
+`REVIEWED_FALLBACK_DIVERGENCES`, and the test prints the wrong ones when it runs.
 
 > **No percentage is published here, and an earlier revision of this section published two.** The
 > first, **18%**, came from an experiment that was never committed and counted a case as a
 > disagreement when the rule had no candidate in the preferred family at all — a rule that declines
 > is not a rule that answers wrongly. The second, **8.26%**, was committed and re-runnable but
 > **measured against itself**: it treated `resolve_citation` as the truth, and `resolve_citation` is
-> the other rule under test. Reading the nine cases one at a time showed three where the **anchor
-> rule** is the one pointing at the wrong file — the same three now frozen as
-> `occurrences_disagree`. A rate computed that way says how often two rules differ, not how often
-> either is wrong. **Five named cases with their reasoning are worth more than a percentage
-> measured against itself**, and the test asserts the set of disagreements is exactly the nine that
-> have been read, so a new one cannot appear without a person reading it.
+> the other rule under test. Reading the cases one at a time showed some where the **anchor rule**
+> is the one pointing at the wrong file — the ones now frozen as `occurrences_disagree`. A rate
+> computed that way says how often two rules differ, not how often either is wrong. **Named cases
+> with their reasoning are worth more than a percentage measured against itself**, and the test
+> asserts the set of disagreements is exactly the set that has been read, so a new one cannot
+> appear without a person reading it.
 
 **What would close the hole, stated as work rather than promised.** Each of those frozen citing
 lines needs to print an identifier the cited line carries — the same rule the resolved ones satisfy
 — after
-a reading of the cited line against the claim beside it. Three of them are already read: the
-`occurrences_disagree` trio, where the review established that the citing prose describes
-`logql/labels.rs`, `logql/sql.rs` and `logql/sql.rs`, and the citations need path-qualifying to say
-so. The `blank_target_line` rows are a smaller job of the same kind: they are citations pointing at
+a reading of the cited line against the claim beside it. The `occurrences_disagree` ones are
+already read: the review established that their citing prose describes `logql/labels.rs`,
+`logql/sql.rs` and `logql/sql.rs`, and those citations need path-qualifying to say so. The `blank_target_line` rows are a smaller job of the same kind: they are citations pointing at
 nothing, and each needs a line number that means something. None of it is part 8's.
 
 **Running the regenerator is not a way to make a red check green.** The `line` and `anchor` of a

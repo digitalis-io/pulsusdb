@@ -189,12 +189,10 @@ output, and CI checks the document against the committed output. No
 wall-clock figure is gated.
 
 **Reproducibility, measured rather than asserted, and two different
-questions.** Re-run against the **same** corpus, the four columns every
-published ratio is computed from — `read_rows`, `read_bytes`,
-`SelectedMarks` and `result_bytes` — are bit-identical on all 1,132
-statements. **Rebuild the corpus and they are not, and no band is
-established for how much.** Four builds have been observed and they
-disagree with each other.
+questions.** Re-running against the **same** corpus and rebuilding the
+corpus are different questions with different answers. **No band is
+established for how much these columns vary between builds**; several
+builds have been observed and they disagree with each other.
 
 **The figures are not restated here.** They live in
 `docs/benchmarks/data/traces-lowering-92-rebuilds.tsv`, one row per

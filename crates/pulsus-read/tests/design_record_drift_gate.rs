@@ -1744,68 +1744,19 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
     );
 }
 
-const S123_HEADING: &str =
-    "### 12.3 The citations, and the hole that is enumerated rather than papered over";
-const S124_HEADING: &str = "#### The fallback that was rejected, and the cases that rejected it";
+const CENSUS_BLOCK_BEGIN: &str = "<!-- generated from the citation datasets -->";
+const CENSUS_BLOCK_END: &str = "<!-- end generated -->";
 
-/// The markdown tables in `slice`, as rows of trimmed cells, with the
-/// `|---|` separator dropped.
-fn md_tables(slice: &str) -> Vec<Vec<Vec<String>>> {
-    let mut out: Vec<Vec<Vec<String>>> = Vec::new();
-    let mut current: Vec<Vec<String>> = Vec::new();
-    for line in slice.lines() {
-        let line = line.trim();
-        if line.starts_with('|') {
-            let cells: Vec<String> = line
-                .trim_matches('|')
-                .split('|')
-                .map(|c| c.trim().to_string())
-                .collect();
-            if cells
-                .iter()
-                .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
-            {
-                continue;
-            }
-            current.push(cells);
-        } else if !current.is_empty() {
-            out.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
-}
-
-fn section_slice<'a>(md: &'a str, heading: &str, end: &str) -> &'a str {
-    let start = md
-        .find(heading)
-        .unwrap_or_else(|| panic!("{QUERY_LOWERING} must carry {heading:?}"));
-    let rest = &md[start..];
-    let len = rest
-        .find(end)
-        .unwrap_or_else(|| panic!("{heading:?} is not followed by {end:?}"));
-    &rest[..len]
-}
-
-/// **Every figure §12.3 states is the one the datasets hold.**
+/// **§12.3's whole numeric block — three tables and the sentences that
+/// state numbers about them — rendered from the datasets.**
 ///
-/// §12.3 is about numbers nobody derives, and an earlier revision of it
-/// stated its own census in prose — six of those figures were wrong at
-/// the head, with nothing to say so, because no check read them. The
-/// three tables it carries are now derived here: the census, the frozen
-/// reasons, and the reviewed fallback verdicts.
-///
-/// **The census moves when §12.3 is edited**, because §12.3 cites source
-/// files too, which is why it is derived rather than written down.
-#[test]
-fn every_figure_section_12_3_states_is_the_one_the_datasets_hold() {
-    let md = read(QUERY_LOWERING);
-    let slice = section_slice(&md, S123_HEADING, S124_HEADING);
-    let tables = md_tables(slice);
-
-    // ---- the census -------------------------------------------------
+/// An earlier revision derived the table cells and left the sentences
+/// beside them as prose; a code review changed a prose count and the
+/// suite stayed green. Gating prose by pattern is not the fix: numbers
+/// in English are unbounded, so a pattern that catches today's sentences
+/// misses tomorrow's and looks like coverage. The sentences are
+/// generated, so there is nothing for a person to write a number into.
+fn census_block() -> String {
     let rows = citation_rows();
     let frozen = unresolvable();
     let resolved_keys: BTreeSet<(String, String)> = rows
@@ -1829,7 +1780,12 @@ fn every_figure_section_12_3_states_is_the_one_the_datasets_hold() {
     };
     let prose = rows.iter().filter(|r| r.kind == AnchorKind::Prose).count();
     let line = rows.iter().filter(|r| r.kind == AnchorKind::Line).count();
-    let census: Vec<(&str, usize)> = vec![
+    let resolved_occ = covered(&resolved_keys);
+    let frozen_occ = covered(&frozen_keys);
+
+    let mut out = String::from(CENSUS_BLOCK_BEGIN);
+    out.push_str("\n\n| quantity | at this revision |\n|---|---|\n");
+    for (label, n) in [
         (
             "citation occurrences in the five artefacts",
             occurrences.len(),
@@ -1839,18 +1795,12 @@ fn every_figure_section_12_3_states_is_the_one_the_datasets_hold() {
             "`(document, token)` pairs the rule resolves",
             resolved_keys.len(),
         ),
-        (
-            "occurrences those resolved pairs cover",
-            covered(&resolved_keys),
-        ),
+        ("occurrences those resolved pairs cover", resolved_occ),
         (
             "`(document, token)` pairs it cannot resolve",
             frozen_keys.len(),
         ),
-        (
-            "occurrences those frozen pairs cover",
-            covered(&frozen_keys),
-        ),
+        ("occurrences those frozen pairs cover", frozen_occ),
         (
             "resolved rows anchored on a token the citing prose prints",
             prose,
@@ -1859,116 +1809,98 @@ fn every_figure_section_12_3_states_is_the_one_the_datasets_hold() {
             "resolved rows anchored on a snapshot of the cited line",
             line,
         ),
-    ];
-    let stated = tables
-        .iter()
-        .find(|t| t[0].first().map(String::as_str) == Some("quantity"))
-        .expect("§12.3 must carry the census table");
-    assert_eq!(
-        stated.len() - 1,
-        census.len(),
-        "§12.3's census states {} quantities; {} are derived",
-        stated.len() - 1,
-        census.len()
-    );
-    for (row, (label, want)) in stated.iter().skip(1).zip(&census) {
-        assert_eq!(
-            row[0], *label,
-            "§12.3's census row {:?} is not the quantity this check derives next",
-            row[0]
-        );
-        let got: usize = row[1]
-            .replace(',', "")
-            .parse()
-            .unwrap_or_else(|_| panic!("§12.3's census states {:?} for {label:?}", row[1]));
-        assert_eq!(
-            got, *want,
-            "§12.3 states {got} for {label:?}; it derives to {want}"
-        );
+    ] {
+        out.push_str(&format!("| {label} | {n} |\n"));
     }
 
-    // ---- the frozen reasons -----------------------------------------
     let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, _, r) in &frozen {
         *by_reason.entry(r.as_str()).or_default() += 1;
     }
-    let reasons = tables
-        .iter()
-        .find(|t| t[0].first().map(String::as_str) == Some("reason"))
-        .expect("§12.3 must carry the frozen-reason table");
-    let mut stated_reasons: BTreeMap<&str, usize> = BTreeMap::new();
-    for row in reasons.iter().skip(1) {
-        let name = row[0].trim_matches('`');
-        let n: usize = row[1]
-            .parse()
-            .unwrap_or_else(|_| panic!("§12.3's reason table states {:?} for {name}", row[1]));
-        stated_reasons.insert(name, n);
-    }
-    let derived: BTreeMap<&str, usize> = by_reason.clone();
-    assert_eq!(
-        stated_reasons.len(),
-        derived.len(),
-        "§12.3 states {} reasons; the dataset holds {}",
-        stated_reasons.len(),
-        derived.len()
-    );
-    for (name, want) in &derived {
-        let got = stated_reasons.get(name).unwrap_or_else(|| {
-            panic!("the dataset holds the reason {name:?}, which §12.3's table does not state")
-        });
-        assert_eq!(
-            got, want,
-            "§12.3 states {got} rows for {name:?}; the dataset holds {want}"
-        );
+    out.push_str("\n| reason it cannot be resolved | pairs |\n|---|---|\n");
+    for (reason, n) in &by_reason {
+        out.push_str(&format!("| `{reason}` | {n} |\n"));
     }
 
-    // ---- the reviewed fallback verdicts ------------------------------
-    let want_verdicts: Vec<(&str, usize)> = vec![
+    out.push_str("\n| the reviewed verdict on a fallback disagreement | cases |\n|---|---|\n");
+    for (label, verdict) in [
         (
-            "the fallback is **wrong**",
-            REVIEWED_FALLBACK_DIVERGENCES
-                .iter()
-                .filter(|(_, _, _, v, _)| *v == ReviewedVerdict::FallbackWrong)
-                .count(),
+            "the fallback answers a file the citing prose does not describe",
+            ReviewedVerdict::FallbackWrong,
         ),
         (
-            "the fallback is **right**",
-            REVIEWED_FALLBACK_DIVERGENCES
-                .iter()
-                .filter(|(_, _, _, v, _)| *v == ReviewedVerdict::FallbackRight)
-                .count(),
+            "the fallback is right and the anchor rule points elsewhere",
+            ReviewedVerdict::FallbackRight,
         ),
         (
-            "ambiguous",
-            REVIEWED_FALLBACK_DIVERGENCES
-                .iter()
-                .filter(|(_, _, _, v, _)| *v == ReviewedVerdict::Ambiguous)
-                .count(),
+            "the sentence describes both candidates, so neither answer is wrong",
+            ReviewedVerdict::Ambiguous,
         ),
-    ];
-    let after = section_slice(&md, S124_HEADING, "**What would close the hole");
-    let verdicts = md_tables(after)
-        .into_iter()
-        .find(|t| t[0].first().map(String::as_str) == Some("verdict"))
-        .expect("§12.3 must carry the reviewed-verdict table");
-    assert_eq!(
-        verdicts.len() - 1,
-        want_verdicts.len(),
-        "the verdict table states {} rows; {} verdicts exist",
-        verdicts.len() - 1,
-        want_verdicts.len()
-    );
-    for (row, (label, want)) in verdicts.iter().skip(1).zip(&want_verdicts) {
-        assert_eq!(
-            row[0], *label,
-            "the verdict table's rows are in a fixed order"
-        );
-        let got: usize = row[1]
-            .parse()
-            .unwrap_or_else(|_| panic!("the verdict table states {:?} for {label:?}", row[1]));
-        assert_eq!(
-            got, *want,
-            "§12.3 states {got} cases for {label:?}; REVIEWED_FALLBACK_DIVERGENCES holds {want}"
-        );
+    ] {
+        let n = REVIEWED_FALLBACK_DIVERGENCES
+            .iter()
+            .filter(|(_, _, _, v, _)| *v == verdict)
+            .count();
+        out.push_str(&format!("| {label} | {n} |\n"));
     }
+
+    out.push_str(&format!(
+        "\nOf the {} citation occurrences the five artefacts make, {bare} name a bare basename. \
+         The rule resolves {} `(document, token)` pairs covering {resolved_occ} occurrences, and \
+         cannot resolve {} covering {frozen_occ}. Of the resolved rows, {prose} are anchored on a \
+         token the citing prose prints and {line} on a snapshot of the cited line.\n\n",
+        occurrences.len(),
+        resolved_keys.len(),
+        frozen_keys.len()
+    ));
+    let wrong = REVIEWED_FALLBACK_DIVERGENCES
+        .iter()
+        .filter(|(_, _, _, v, _)| *v == ReviewedVerdict::FallbackWrong)
+        .count();
+    out.push_str(&format!(
+        "The language fallback and the anchor rule disagree on {} citations, all of them read one \
+         at a time. {wrong} are citations where the fallback answers a file the citing prose does \
+         not describe, which is why it is not applied.\n\n",
+        REVIEWED_FALLBACK_DIVERGENCES.len()
+    ));
+    out.push_str(CENSUS_BLOCK_END);
+    out
+}
+
+fn census_block_in(md: &str) -> String {
+    let a = md
+        .find(CENSUS_BLOCK_BEGIN)
+        .unwrap_or_else(|| panic!("{QUERY_LOWERING} must carry {CENSUS_BLOCK_BEGIN}"));
+    let b = md[a..]
+        .find(CENSUS_BLOCK_END)
+        .unwrap_or_else(|| panic!("the census block is not closed"));
+    md[a..a + b + CENSUS_BLOCK_END.len()].to_string()
+}
+
+/// **Every figure §12.3 states is the one the datasets hold** — and the
+/// sentences that state them are generated, not merely parsed.
+#[test]
+fn every_figure_section_12_3_states_is_the_one_the_datasets_hold() {
+    let md = read(QUERY_LOWERING);
+    assert_eq!(
+        census_block_in(&md),
+        census_block(),
+        "the census block in {QUERY_LOWERING} is not what the citation datasets render. It is \
+         GENERATED — run the ignored `regenerate_the_census_block` and read the diff, rather than \
+         editing the document"
+    );
+}
+
+/// Writes the generated census block into `docs/query-lowering.md`.
+/// Ignored, so it never runs in CI.
+#[test]
+#[ignore = "writes the generated census block in docs/query-lowering.md"]
+fn regenerate_the_census_block() {
+    let md = read(QUERY_LOWERING);
+    let old = census_block_in(&md);
+    std::fs::write(
+        repo_root().join(QUERY_LOWERING),
+        md.replace(&old, &census_block()),
+    )
+    .expect("write the document");
 }

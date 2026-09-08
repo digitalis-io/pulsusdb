@@ -45,7 +45,7 @@
 //! asserts unconditionally that no superseded lowered figure is left on
 //! its face.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use pulsus_read::compile::plan::{
     BoundShape, CutShape, EnginePartShape, HandoffCost, LinkShape, PartShape, PlanShape, SeedShape,
@@ -1370,10 +1370,6 @@ fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
     };
     let s92_headers = per_stage_headers(s92, "§9.2");
     let s92b_headers = per_stage_headers(s92b, "§9.2b");
-    assert_eq!(
-        s92_headers, s92b_headers,
-        "§9.2 and §9.2b must publish the same per-stage columns"
-    );
     let comparison = tables(s92_to_93)
         .into_iter()
         .find(|t| {
@@ -1389,7 +1385,20 @@ fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
         .iter()
         .filter_map(|c| c.headers().1)
         .collect();
-    let per_stage_cells: BTreeSet<&str> = s92_headers.iter().skip(1).map(|s| s.as_str()).collect();
+    // **Every column of BOTH per-stage tables, before the two are
+    // compared with each other.** An earlier revision asserted that §9.2
+    // and §9.2b publish the same columns first, so renaming ONE table's
+    // header reported the two tables disagreeing rather than the column
+    // no accumulator covers — a different message from the one the plan
+    // approved for that edit, and a less useful one: the reader is told
+    // two tables differ when the fact is that a named column is
+    // uncovered. The cross-table equality is still asserted, after.
+    let per_stage_cells: BTreeSet<&str> = s92_headers
+        .iter()
+        .skip(1)
+        .chain(s92b_headers.iter().skip(1))
+        .map(|s| s.as_str())
+        .collect();
     let comparison_cells: BTreeSet<&str> = comparison_headers
         .iter()
         .skip(1)
@@ -1443,6 +1452,10 @@ fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
     // per_stage_absent`**, and a later reader must not count it as live
     // coverage; `comparison_absent` is live and the break above is how
     // to reproduce it.
+    assert_eq!(
+        s92_headers, s92b_headers,
+        "§9.2 and §9.2b must publish the same per-stage columns"
+    );
     let per_stage_absent: Vec<&&str> = declared_per_stage.difference(&per_stage_cells).collect();
     let comparison_absent: Vec<&&str> = declared_comparison.difference(&comparison_cells).collect();
     assert!(
@@ -2465,27 +2478,30 @@ fn every_never_reason_variant_is_named_in_the_end_state() {
 }
 
 const REBUILDS_TSV: &str = "docs/benchmarks/data/traces-lowering-92-rebuilds.tsv";
+const REBUILD_BLOCK_BEGIN: &str = "<!-- generated from traces-lowering-92-rebuilds.tsv -->";
+const REBUILD_BLOCK_END: &str = "<!-- end generated -->";
 
-/// **§9.2's rebuild table states the observations the dataset holds.**
-///
-/// The rebuild figures are measurements of runs, not quantities the tree
-/// can derive, so the derivation is a committed dataset with a
-/// `provenance` column saying where each row came from — one rebuild
-/// this harness ran, one a code review ran and reported. Before this
-/// check existed the table was prose: changing `0.689%` to `0.690%` left
-/// every suite green, which is the defect this part exists to end,
-/// sitting in the part's own new text.
-///
-/// Both directions: every dataset row appears in the table with the same
-/// two values, and every table cell comes from a dataset row.
-#[test]
-fn the_rebuild_table_states_the_observations_the_dataset_holds() {
+/// One observation of one column, read from [`REBUILDS_TSV`].
+#[derive(Debug, Clone)]
+struct Observation {
+    id: String,
+    scope: String,
+    provenance: String,
+    column: String,
+    statements_moved: String,
+    largest_change: String,
+    total_change: String,
+}
+
+fn observations() -> Vec<Observation> {
     let tsv = repo_file(REBUILDS_TSV);
-    let mut dataset: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    let mut out = Vec::new();
     for (n, line) in tsv.lines().enumerate() {
         if n == 0 {
             assert_eq!(
-                line, "rebuild\tprovenance\tcolumn\tstatements_moved\tlargest_change",
+                line,
+                "observation\tscope\tprovenance\tcolumn\tstatements_moved\tlargest_change\t\
+                 total_change",
                 "{REBUILDS_TSV} header"
             );
             continue;
@@ -2494,117 +2510,258 @@ fn the_rebuild_table_states_the_observations_the_dataset_holds() {
             continue;
         }
         let f: Vec<&str> = line.split('\t').collect();
-        assert_eq!(f.len(), 5, "{REBUILDS_TSV}:{}: five columns", n + 1);
+        assert_eq!(f.len(), 7, "{REBUILDS_TSV}:{}: seven columns", n + 1);
         assert!(
-            !f[1].trim().is_empty(),
+            !f[2].trim().is_empty(),
             "{REBUILDS_TSV}:{}: every observation states where it came from",
             n + 1
         );
-        dataset.insert(
-            (f[0].to_string(), f[2].to_string()),
-            (f[3].to_string(), f[4].to_string()),
+        assert!(
+            f[1] == "per_statement" || f[1] == "group_total",
+            "{REBUILDS_TSV}:{}: unknown scope {:?}",
+            n + 1,
+            f[1]
         );
-    }
-    assert!(!dataset.is_empty(), "{REBUILDS_TSV} is empty");
-
-    let md = repo_file(QUERY_LOWERING);
-    // The reproducibility paragraph and its table live in §9.2b, which
-    // is where the two forms are compared.
-    let s92b = section(&md, S92B_HEADING, S93_HEADING);
-    let table = tables(s92b)
-        .into_iter()
-        .find(|t| {
-            t[0].first().map(String::as_str) == Some("column")
-                && t[0].len() > 2
-                && t[0].iter().skip(1).any(|c| c.starts_with("rebuild "))
-        })
-        .expect("§9.2 must carry the rebuild table");
-    // Each observation column's header names the observation first:
-    // `S: same corpus, twice` or `rebuild A`.
-    let rebuilds: Vec<String> = table[0]
-        .iter()
-        .skip(1)
-        .map(|h| {
-            let h = h.strip_prefix("rebuild ").unwrap_or(h);
-            h.split([':', ' ']).next().unwrap_or("").trim().to_string()
-        })
-        .collect();
-    assert!(
-        rebuilds.iter().all(|r| !r.is_empty()),
-        "each observation column's header must open with its name; got {:?}",
-        table[0]
-    );
-
-    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    for row in table.iter().skip(1) {
-        let column = leading_backtick(&row[0]).unwrap_or_else(|| {
-            panic!(
-                "§9.2's rebuild table names its columns in backticks; got {:?}",
-                row[0]
-            )
+        out.push(Observation {
+            id: f[0].into(),
+            scope: f[1].into(),
+            provenance: f[2].into(),
+            column: f[3].into(),
+            statements_moved: f[4].into(),
+            largest_change: f[5].into(),
+            total_change: f[6].into(),
         });
-        for (i, rebuild) in rebuilds.iter().enumerate() {
-            let cell = &row[i + 1];
-            let (moved, change) = cell.split_once(" / ").unwrap_or_else(|| {
-                panic!("§9.2's rebuild cell {cell:?} must read `<statements moved> / <change>`")
-            });
-            let key = (rebuild.clone(), column.clone());
-            let want = dataset.get(&key).unwrap_or_else(|| {
-                panic!("§9.2's rebuild table states {key:?}, which {REBUILDS_TSV} does not hold")
-            });
-            assert_eq!(
-                (moved.trim(), change.trim()),
-                (want.0.as_str(), want.1.as_str()),
-                "§9.2 states {cell:?} for rebuild {rebuild}'s {column}; {REBUILDS_TSV} holds \
-                 {} / {}",
-                want.0,
-                want.1
-            );
-            seen.insert(key);
+    }
+    assert!(!out.is_empty(), "{REBUILDS_TSV} is empty");
+    out
+}
+
+/// **The whole block — table AND the sentences that state numbers about
+/// it — rendered from the dataset.**
+///
+/// An earlier revision gated the table's cells and left the sentences
+/// beside it as prose. A code review changed a prose column count and
+/// the suite stayed green: the check covered what it parsed and the
+/// English beside it was untouched, which is this part's own defect one
+/// layer down.
+///
+/// **Gating prose by pattern would not have fixed it.** Numbers in
+/// English are unbounded — digits, words, ordinals, ranges, "a third of"
+/// — so a pattern that catches today's sentences misses tomorrow's and
+/// looks like coverage while doing it. The sentences are generated
+/// instead: there is nothing here for a person to write a number into.
+fn rebuild_block() -> String {
+    let obs = observations();
+    let per_statement: Vec<&Observation> =
+        obs.iter().filter(|o| o.scope == "per_statement").collect();
+    let mut ids: Vec<&str> = Vec::new();
+    for o in &per_statement {
+        if !ids.contains(&o.id.as_str()) {
+            ids.push(&o.id);
         }
     }
-    let unstated: Vec<&(String, String)> = dataset.keys().filter(|k| !seen.contains(*k)).collect();
-    assert!(
-        unstated.is_empty(),
-        "{REBUILDS_TSV} holds {unstated:?}, which §9.2's rebuild table does not state"
-    );
+    let mut columns: Vec<&str> = Vec::new();
+    for o in &per_statement {
+        if !columns.contains(&o.column.as_str()) {
+            columns.push(&o.column);
+        }
+    }
+    let cell = |id: &str, col: &str| -> Option<&Observation> {
+        per_statement
+            .iter()
+            .copied()
+            .find(|o| o.id == id && o.column == col)
+    };
 
-    // **The sentence beneath the table is derived too.** It said "every
-    // column" while the table above it showed one column agreeing —
-    // prose beside a measurement, which is the pairing this project's
-    // record keeps getting wrong. The number of columns on which the two
-    // rebuilds differ is computed here.
-    let columns: BTreeSet<&String> = dataset.keys().map(|(_, c)| c).collect();
-    let differing = columns
+    let mut out = String::from(REBUILD_BLOCK_BEGIN);
+    out.push_str(
+        "\n\nEach cell reads *statements moved, of 1,132* / *largest per-statement \
+                  change*.\n\n| column |",
+    );
+    for id in &ids {
+        out.push_str(&format!(" {id} |"));
+    }
+    out.push_str("\n|---|");
+    for _ in &ids {
+        out.push_str("---|");
+    }
+    out.push('\n');
+    for col in &columns {
+        out.push_str(&format!("| `{col}` |"));
+        for id in &ids {
+            match cell(id, col) {
+                Some(o) => {
+                    out.push_str(&format!(" {} / {} |", o.statements_moved, o.largest_change))
+                }
+                None => out.push_str(" not recorded |"),
+            }
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+
+    for id in &ids {
+        let p = per_statement
+            .iter()
+            .find(|o| o.id == *id)
+            .expect("an id has rows")
+            .provenance
+            .clone();
+        out.push_str(&format!("**{id}** is {p}.\n\n"));
+    }
+
+    // Observations that recorded group totals rather than per-statement
+    // figures get their own sentence, because they cannot appear in the
+    // table above without inventing a per-statement number.
+    let group: Vec<&Observation> = obs.iter().filter(|o| o.scope == "group_total").collect();
+    for id in group
+        .iter()
+        .map(|o| o.id.clone())
+        .collect::<BTreeSet<String>>()
+    {
+        let rows: Vec<&&Observation> = group.iter().filter(|o| o.id == id).collect();
+        let p = &rows[0].provenance;
+        let listed: Vec<String> = rows
+            .iter()
+            .map(|o| format!("`{}` {}", o.column, o.total_change))
+            .collect();
+        out.push_str(&format!(
+            "**{id}** is {p}, so it appears in no column above: {}.\n\n",
+            listed.join("; ")
+        ));
+    }
+
+    let totals: Vec<String> = obs
+        .iter()
+        .filter(|o| o.scope == "per_statement" && o.total_change != "—")
+        .map(|o| format!("{} `{}` {}", o.id, o.column, o.total_change))
+        .collect();
+    if totals.is_empty() {
+        out.push_str("No observation published a change over the whole unlowered request.\n\n");
+    } else {
+        out.push_str(&format!(
+            "Changes over the whole unlowered request, where an observation published one: {}. \
+             Every other cell above was published per statement only.\n\n",
+            totals.join("; ")
+        ));
+    }
+
+    // The two derived sentences a person kept getting wrong.
+    let unmoved: Vec<String> = columns
+        .iter()
+        .filter(|c| cell("S", c).is_some_and(|o| o.statements_moved == "0"))
+        .map(|c| format!("`{c}`"))
+        .collect();
+    out.push_str(&format!(
+        "On the same corpus, {} of the {} columns did not move on a single statement: {}.\n\n",
+        unmoved.len(),
+        columns.len(),
+        unmoved.join(", ")
+    ));
+
+    let differing: Vec<String> = columns
+        .iter()
+        .filter(|c| match (cell("A", c), cell("C", c)) {
+            (Some(a), Some(b)) => {
+                (&a.statements_moved, &a.largest_change) != (&b.statements_moved, &b.largest_change)
+            }
+            _ => false,
+        })
+        .map(|c| format!("`{c}`"))
+        .collect();
+    let same: Vec<String> = columns
+        .iter()
+        .filter(|c| !differing.contains(&format!("`{c}`")))
+        .map(|c| format!("`{c}`"))
+        .collect();
+    out.push_str(&format!(
+        "Rebuild C differs from rebuild A on {} of the {} columns; the {} it does not differ on \
+         {} {}.\n\n",
+        differing.len(),
+        columns.len(),
+        if same.len() == 1 { "one" } else { "ones" },
+        if same.len() == 1 { "is" } else { "are" },
+        same.join(", ")
+    ));
+
+    // Which columns EVERY rebuild that recorded them found unmoved.
+    let rebuilds: BTreeSet<String> = obs
+        .iter()
+        .filter(|o| o.id != "S")
+        .map(|o| o.id.clone())
+        .collect();
+    let agreed: Vec<String> = columns
         .iter()
         .filter(|c| {
-            let a = dataset.get(&("A".to_string(), (**c).clone()));
-            let b = dataset.get(&("C".to_string(), (**c).clone()));
-            match (a, b) {
-                (Some(a), Some(b)) => a != b,
-                _ => false,
-            }
+            rebuilds.iter().all(|id| {
+                obs.iter()
+                    .filter(|o| o.id == *id && o.column == **c)
+                    .all(|o| {
+                        (o.scope == "per_statement" && o.statements_moved == "0")
+                            || (o.scope == "group_total" && o.total_change == "—")
+                    })
+            })
         })
-        .count();
-    let para = paragraphs(s92b)
-        .into_iter()
-        .find(|p| p.contains("differs from rebuild A on"))
-        .expect("§9.2b must carry the sentence about how far the fourth observation fell");
-    let claimed: Vec<u64> = para
-        .split("**")
-        .filter_map(|t| t.parse::<u64>().ok())
+        .map(|c| format!("`{c}`"))
         .collect();
-    assert!(
-        !claimed.is_empty(),
-        "the sentence must state the number of differing columns in bold so it can be checked"
-    );
-    for n in &claimed {
-        assert_eq!(
-            *n as usize,
-            differing,
-            "the sentence says rebuild C differs from rebuild A on {n} columns; the dataset says \
-             {differing} of {}",
+    if agreed.is_empty() {
+        out.push_str(&format!(
+            "Of the {} columns, **none** is one every rebuild that recorded it found unmoved.\n\n",
             columns.len()
-        );
+        ));
+    } else {
+        out.push_str(&format!(
+            "Of the {} columns, {} {} unmoved by every rebuild that recorded {}: {}.\n\n",
+            columns.len(),
+            agreed.len(),
+            if agreed.len() == 1 { "is" } else { "are" },
+            if agreed.len() == 1 { "it" } else { "them" },
+            agreed.join(", ")
+        ));
     }
+    out.push_str(REBUILD_BLOCK_END);
+    out
+}
+
+fn block_in(md: &str, begin: &str, end: &str) -> String {
+    let a = md
+        .find(begin)
+        .unwrap_or_else(|| panic!("{QUERY_LOWERING} must carry {begin}"));
+    let b = md[a..]
+        .find(end)
+        .unwrap_or_else(|| panic!("{begin} is not closed by {end}"));
+    md[a..a + b + end.len()].to_string()
+}
+
+/// **The rebuild block in §9.2b is the one the dataset produces**, byte
+/// for byte, table and sentences alike.
+#[test]
+fn the_rebuild_block_is_the_one_the_dataset_produces() {
+    let md = repo_file(QUERY_LOWERING);
+    assert_eq!(
+        block_in(&md, REBUILD_BLOCK_BEGIN, REBUILD_BLOCK_END),
+        rebuild_block(),
+        "the rebuild block in {QUERY_LOWERING} is not what {REBUILDS_TSV} renders. It is \
+         GENERATED — run the ignored `regenerate_the_rebuild_block` and read the diff, rather \
+         than editing the document"
+    );
+}
+
+/// Writes the generated block into `docs/query-lowering.md`. Ignored, so
+/// it never runs in CI.
+///
+/// ```text
+/// cargo test -p pulsus-read --test query_lowering_doc_gate -- --ignored
+/// ```
+#[test]
+#[ignore = "writes the generated block in docs/query-lowering.md"]
+fn regenerate_the_rebuild_block() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join(QUERY_LOWERING);
+    let md = repo_file(QUERY_LOWERING);
+    let old = block_in(&md, REBUILD_BLOCK_BEGIN, REBUILD_BLOCK_END);
+    std::fs::write(&root, md.replace(&old, &rebuild_block())).expect("write the document");
 }
