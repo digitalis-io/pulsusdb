@@ -69,8 +69,8 @@ const LEDGER_IDS: [&str; 10] = [
     "traceql-select-before-by-nil-group-key",
     "traceql-midpipeline-spanset-operation-unsupported",
     "traceql-select-before-midpipeline-filter-empty",
-    "traceql-validate-unary-not-parenthesises-its-operand",
-    "traceql-validate-binary-does-not-parenthesise-its-operands",
+    "traceql-error-body-unary-not-parenthesises-its-operand",
+    "traceql-error-body-binary-does-not-parenthesise-its-operands",
 ];
 
 /// The rows WITHDRAWN, each paired with phrases from the measurement that
@@ -535,11 +535,11 @@ fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
             "crates/pulsus-read/src/traces/search_eval.rs",
         ),
         (
-            "traceql-validate-unary-not-parenthesises-its-operand",
+            "traceql-error-body-unary-not-parenthesises-its-operand",
             "crates/pulsus-traceql/src/validate.rs",
         ),
         (
-            "traceql-validate-binary-does-not-parenthesise-its-operands",
+            "traceql-error-body-binary-does-not-parenthesise-its-operands",
             "crates/pulsus-traceql/src/validate.rs",
         ),
     ];

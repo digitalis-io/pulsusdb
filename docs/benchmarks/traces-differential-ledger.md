@@ -2640,7 +2640,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   making `select()` change which spans a later stage sees, which nothing
   in the reference's stated intent asks for.
 
-### `traceql-validate-unary-not-parenthesises-its-operand` (issue #492 item 9, code review round 1) — **same refusal, different rendering of the quoted expression**
+### `traceql-error-body-unary-not-parenthesises-its-operand` (issue #492 item 9, code review round 1) — **same refusal, different rendering of the quoted expression**
 
 - **Route.** `GET /api/traces/v1/search` and its `/api/search` alias — the
   refusal is the same handler on both paths, and both were measured.
@@ -2651,12 +2651,14 @@ when we are asking it to slow down, so we keep `429`; recorded as
   always wrap it in parentheses. Status, content type and message text are
   the same; only the quoted expression differs.
 
-  Measured **2026-09-08**, both sides on the same three queries, each sent
-  to `/api/traces/v1/search` here and to `/api/search` on an instance of
-  the pinned reference build started for this work. Every line below is a
-  `400` on both sides with `content-type: text/plain; charset=utf-8` and
-  no trailing newline (`curl … | xxd` on the two rows of the first
-  spelling). `{svc}` is `{ resource.service.name = "grp492" }`.
+  Measured **2026-09-08**, the same three queries on both sides: here to
+  `/api/traces/v1/search` **and** to the `/api/search` alias, which
+  returned byte-identical bodies on every query in this row and the next;
+  there to `/api/search` on an instance of the pinned reference build
+  started for this work. Every line below is a `400` on both sides with
+  `content-type: text/plain; charset=utf-8` and no trailing newline
+  (`curl … | xxd` on the two rows of the first spelling). `{svc}` is
+  `{ resource.service.name = "grp492" }`.
 
   | query | reference body, verbatim | our body, verbatim |
   |---|---|---|
@@ -2702,7 +2704,21 @@ when we are asking it to slow down, so we keep `429`; recorded as
   type and the prefix already match; the divergence is confined to the
   rendering of the quoted expression.
 
-### `traceql-validate-binary-does-not-parenthesise-its-operands` (issue #492 item 9, code review round 1) — **the mirror of the row above, in the other direction**
+- **Why the id is not `traceql-validate-…`.** That prefix is reserved:
+  `crates/pulsus-traceql/tests/validate_corpus.rs`'s
+  `every_divergence_is_ledgered_and_every_ledger_row_is_witnessed` requires
+  every live `### \`traceql-validate-` row to be named as a `divergence`
+  by at least one vector of `tests/conformance/validate-vectors.json`, and
+  a vector's `divergence` field means the two sides reach different
+  VERDICTS. Both sides reject these queries; only the body differs, so a
+  witness vector there would record a verdict divergence that does not
+  exist. The `…-error-body-…` prefix follows
+  `traceql-parse-error-body-differs-by-route` above, which is a body row
+  for the same reason. Measured: naming this row
+  `traceql-validate-unary-not-parenthesises-its-operand` fails that suite
+  with `ledger row "…" is witnessed by no vector`.
+
+### `traceql-error-body-binary-does-not-parenthesise-its-operands` (issue #492 item 9, code review round 1) — **the mirror of the row above, in the other direction**
 
 - **Route.** `GET /api/traces/v1/search` and its `/api/search` alias — the
   refusal is the same handler on both paths, and both were measured.

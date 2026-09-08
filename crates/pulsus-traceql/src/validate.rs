@@ -144,7 +144,7 @@ pub enum ValidateError {
     /// separately (see the `Binary` arm of `validate_field_expr`), so no
     /// wrapping rule applies and the same query is refused with
     /// `.a = nil && 1`. Measured on both sides 2026-09-08 and ledgered as
-    /// `traceql-validate-binary-does-not-parenthesise-its-operands`
+    /// `traceql-error-body-binary-does-not-parenthesise-its-operands`
     /// (`docs/benchmarks/traces-differential-ledger.md`); aligning the two
     /// is a change to `FieldExpr`'s `Display`, which every construct and
     /// several frozen goldens read, so it is scheduled separately.
@@ -217,7 +217,7 @@ pub enum ValidateError {
     /// `unaryOp` wraps only what is neither a `Static` nor an `Attribute`
     /// (`pkg/traceql/ast_stringer.go:233-243`, `:245-255` @ v3.0.2).
     /// Measured on both sides 2026-09-08 and ledgered as
-    /// `traceql-validate-unary-not-parenthesises-its-operand`
+    /// `traceql-error-body-unary-not-parenthesises-its-operand`
     /// (`docs/benchmarks/traces-differential-ledger.md`).
     #[error("illegal operation for the given type: {expr}")]
     IllegalUnaryOperator { expr: String },
