@@ -2009,78 +2009,279 @@ fn regenerate_the_census_block() {
     .expect("write the document");
 }
 
-/// **No snake_case name the two reconstructed sections print in backticks
-/// is one nothing in the tree defines.**
+/// Every tracked file this workspace treats as a committed dataset:
+/// the tabular ones the tests read and the evidence ones the benchmarks
+/// write. **Discovered from the tree, not listed here** — an earlier
+/// revision held a five-path array and called the result derived, and a
+/// code review was right that a hand-listed input makes the whole
+/// derivation a hand list.
+fn committed_dataset_files() -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "crates/pulsus-read/tests/*.tsv",
+            "docs/benchmarks/data/*.tsv",
+            "docs/benchmarks/data/*.json",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .expect("git ls-files");
+    assert!(out.status.success(), "git ls-files failed");
+    let files: Vec<String> = String::from_utf8(out.stdout)
+        .expect("utf-8")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        files.len() >= 5,
+        "only {} dataset files were discovered; the glob is wrong, not the tree",
+        files.len()
+    );
+    files
+}
+
+/// Every string a committed dataset holds — every cell of every tabular
+/// one, and every key and every string or number value at every depth of
+/// every JSON one.
 ///
-/// The generated regions close one class: a *set* of dataset labels
-/// repeated in prose beside the table it came from. They do not close
-/// the other: a single label named in a sentence — "the
-/// `occurrences_disagree` category" — which goes stale the moment the
-/// label is renamed, with nothing to say so.
+/// An earlier revision took the keys of the FIRST row of one JSON file
+/// and nothing else, which is why it rejected `generator` — a stage name
+/// the artefact holds on 1,132 rows — as a name no dataset holds. **A
+/// check that rejects a true value gets silenced by whoever meets it
+/// next**, so the traversal is now total.
+fn every_value_a_dataset_holds() -> BTreeSet<String> {
+    fn walk(v: &serde_json::Value, out: &mut BTreeSet<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, child) in m {
+                    out.insert(k.clone());
+                    walk(child, out);
+                }
+            }
+            serde_json::Value::Array(a) => {
+                for child in a {
+                    walk(child, out);
+                }
+            }
+            serde_json::Value::String(s) => {
+                out.insert(s.clone());
+            }
+            other => {
+                out.insert(other.to_string());
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    for f in committed_dataset_files() {
+        let text = read(&f);
+        if f.ends_with(".json") {
+            let v: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{f} must parse: {e}"));
+            walk(&v, &mut out);
+        } else {
+            for line in text.lines() {
+                for cell in line.split('\t') {
+                    out.insert(cell.trim().to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The label SETS a tabular dataset holds: the distinct values of each
+/// column whose values are all snake_case.
 ///
-/// **Banning single labels from prose is the wrong fix**, because it
-/// makes the prose unreadable: a section that has to say "the category
-/// the block names third" is worse than one that risks a rename. So the
-/// mention stays and this check makes a stale one fail. Every backticked
-/// snake_case token in the swept text must be a name something in the
-/// tree currently holds:
+/// The snake_case test is what separates a label column from a free-text
+/// one — `reason`, `anchor_kind`, `state`, `rendering` and `scope`
+/// qualify; `doc`, `token`, `path`, `anchor` and `provenance` carry
+/// slashes, dots and spaces and do not. It is a property of the values
+/// rather than a threshold on how many there are.
+fn label_sets() -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for f in committed_dataset_files() {
+        if !f.ends_with(".tsv") {
+            continue;
+        }
+        let text = read(&f);
+        let mut lines = text.lines();
+        let header: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
+        let rows: Vec<Vec<&str>> = lines
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.split('\t').collect())
+            .collect();
+        for (i, name) in header.iter().enumerate() {
+            let mut seen: Vec<String> = Vec::new();
+            let mut all_snake = true;
+            for r in &rows {
+                let Some(cell) = r.get(i) else { continue };
+                if !is_snake_case(cell) {
+                    all_snake = false;
+                    break;
+                }
+                if !seen.iter().any(|s| s == cell) {
+                    seen.push((*cell).to_string());
+                }
+            }
+            if all_snake && seen.len() >= 2 {
+                out.push((format!("{f}:{name}"), seen));
+            }
+        }
+    }
+    out
+}
+
+/// **No complete label set a dataset holds is repeated outside a
+/// generated region.**
 ///
-/// * a value one of the committed datasets holds, or one of their column
-///   names;
-/// * a `fn` the workspace defines.
+/// This is the duplication sweep, and it is a committed test because an
+/// uncommitted one is a description of a sweep rather than a sweep — a
+/// code review had to reconstruct the previous one from prose to test it
+/// at all, and could then only measure its own reconstruction.
 ///
-/// **There is no hand list**, which is what distinguishes this from the
-/// pattern-matching the generated regions exist to avoid: both sides are
-/// read out of the tree, and a token that matches neither is named.
+/// **How a member counts as named.** A label of two words or more cannot
+/// turn up in English by accident, so it counts wherever the swept text
+/// says it, in any punctuation, any case, and through a paraphrase:
+/// [`names_label`] wants the label's words in order, each matching the
+/// start of a word so a plural counts, inside a window of
+/// [`LABEL_MENTION_SPAN`] words. `ambiguous_basename`,
+/// `Ambiguous-Basename`, "ambiguous basenames" and "an ambiguous
+/// basename" all count; "the basename is ambiguous" does not, because
+/// the words are not in order. A label that is a single ordinary word,
+/// like the anchor kinds `line` and `prose`, counts only inside
+/// backticks, because otherwise every sentence containing the word
+/// "line" would name it.
+///
+/// **What it does not catch**: an ordering described without naming its
+/// members — "the reasons are listed commonest first" names none of them
+/// and this check sees nothing, because a set is repeated when all of it
+/// is there and none of it is. Reordering the members is likewise
+/// invisible: the rule is about the set, and the generated block is what
+/// holds the order.
 #[test]
-fn no_backticked_name_in_the_reconstructed_sections_is_one_the_tree_does_not_hold() {
+fn no_label_set_a_dataset_holds_is_duplicated_outside_a_generated_region() {
     let md = read(QUERY_LOWERING);
     let swept = swept_text(&md);
     assert!(
         swept.len() > 40,
-        "only {} lines were swept; the region markers moved and the sweep is looking at nothing",
+        "only {} lines were swept; the region markers moved and the sweep looks at nothing",
         swept.len()
     );
-
-    // Everything the tree holds under a snake_case name.
-    let mut held: BTreeSet<String> = BTreeSet::new();
-    for path in [
-        CITATIONS_TSV,
-        UNRESOLVABLE_TSV,
-        COUNTS_TSV,
-        GATES_TSV,
-        "docs/benchmarks/data/traces-lowering-92-rebuilds.tsv",
-    ] {
-        for (n, line) in read(path).lines().enumerate() {
-            for cell in line.split('\t') {
-                let cell = cell.trim();
-                if is_snake_case(cell) {
-                    held.insert(cell.to_string());
+    let flat: String = swept
+        .iter()
+        .map(|(_, l)| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let flat_words = words(&flat);
+    let backticked: BTreeSet<String> = {
+        let mut out = BTreeSet::new();
+        for (_, l) in &swept {
+            let mut rest = l.as_str();
+            while let Some((_, tail)) = rest.split_once('`') {
+                match tail.split_once('`') {
+                    Some((tok, after)) => {
+                        out.insert(tok.to_string());
+                        rest = after;
+                    }
+                    None => break,
                 }
             }
-            let _ = n;
+        }
+        out
+    };
+
+    // A multi-word label — `ambiguous_basename`, or the verdict phrase
+    // "the fallback answers" — cannot turn up in English by accident, so
+    // it counts wherever the swept text says it, in any punctuation and
+    // any case: `Ambiguous-Basename` and the bare words "ambiguous
+    // basename" both normalise onto the label. A single ordinary word,
+    // like the anchor kinds `line` and `prose`, counts only inside
+    // backticks, because otherwise every sentence containing the word
+    // "line" would name it.
+    let named = |v: &str| -> bool {
+        let w = words(v);
+        if w.len() > 1 {
+            names_label(&flat_words, &w)
+        } else {
+            backticked.contains(v)
+        }
+    };
+
+    let mut sets: Vec<(String, Vec<String>)> = label_sets();
+    // The verdict rows are a label set too; their members are phrases
+    // rather than identifiers, and a phrase cannot occur by accident.
+    sets.push((
+        "VERDICT_LABELS".to_string(),
+        VERDICT_LABELS
+            .iter()
+            .map(|(l, _)| (*l).to_string())
+            .collect(),
+    ));
+    assert!(
+        sets.len() >= 4,
+        "only {} label sets were derived from the committed datasets; the column test found \
+         nothing and the sweep would pass on an empty domain",
+        sets.len()
+    );
+    if std::env::var_os("PULSUS_PRINT_LABEL_SETS").is_some() {
+        for (name, members) in &sets {
+            println!("label set {name}: {members:?}");
         }
     }
-    let artefact: serde_json::Value =
-        serde_json::from_str(&read("docs/benchmarks/data/traces-lowering-92.json"))
-            .expect("the artefact parses");
-    if let Some(row) = artefact["rows"].as_array().and_then(|a| a.first()) {
-        for k in row.as_object().expect("a row is an object").keys() {
-            held.insert(k.clone());
+
+    let mut duplicated: Vec<String> = Vec::new();
+    for (name, members) in &sets {
+        let present: Vec<&String> = members.iter().filter(|m| named(m)).collect();
+        if present.len() == members.len() {
+            duplicated.push(format!(
+                "the complete label set {name} ({members:?}) is repeated outside a generated \
+                 region; move it inside, or name fewer than all of it"
+            ));
         }
     }
+    assert!(
+        duplicated.is_empty(),
+        "{} label set(s) are duplicated outside a generated region:\n  {}",
+        duplicated.len(),
+        duplicated.join("\n  ")
+    );
+}
+
+/// **No backticked snake_case name the two reconstructed sections print
+/// is one nothing in the tree holds.**
+///
+/// The generated regions close one class: a *set* of dataset labels
+/// repeated beside the table it came from, which is the check above.
+/// They do not close the other: a single label named in a sentence —
+/// "the `occurrences_disagree` category" — which goes stale the moment
+/// the label is renamed, with nothing to say so. Banning the mention
+/// makes the section unreadable, so the mention stays and this makes a
+/// stale one fail.
+///
+/// **What this actually checks, stated because an earlier revision
+/// described it as derived and it was not.** A name passes if it is
+///
+/// * any string a committed dataset holds — every cell of every tracked
+///   `.tsv`, every key and every value at every depth of every tracked
+///   evidence `.json`, over files discovered by `git ls-files` rather
+///   than listed here; **or**
+/// * matched by `fn <name>` in a tracked Rust file after line and block
+///   comments and string literals are removed.
+///
+/// **The second arm is a text scan and not a parser.** It no longer
+/// accepts a name that appears only in a comment — a code review defeated
+/// the previous version with exactly that — but it would accept a `fn`
+/// written inside a macro body that expands to no such function. That is
+/// the limit; it is stated rather than described away, and it is why this
+/// check is called a membership test and not a derivation.
+#[test]
+fn no_backticked_name_in_the_reconstructed_sections_is_one_the_tree_does_not_hold() {
+    let md = read(QUERY_LOWERING);
+    let swept = swept_text(&md);
+    let mut held = every_value_a_dataset_holds();
     for f in tracked_rust_files() {
-        let src = read(&f);
-        let mut rest = src.as_str();
-        while let Some((_, tail)) = rest.split_once("fn ") {
-            let name: String = tail
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if is_snake_case(&name) {
-                held.insert(name);
-            }
-            rest = tail;
+        for name in function_names(&read(&f)) {
+            held.insert(name);
         }
     }
 
@@ -2101,11 +2302,81 @@ fn no_backticked_name_in_the_reconstructed_sections_is_one_the_tree_does_not_hol
     }
     assert!(
         unknown.is_empty(),
-        "{} backticked name(s) in §9.2b's reproducibility passage or §12.3 are not held by any \
-         dataset and are defined by no function in the workspace:\n  {}",
+        "{} backticked name(s) in §9.2b's reproducibility passage or §12.3 are held by no \
+         committed dataset and defined by no function in the workspace:\n  {}",
         unknown.len(),
         unknown.join("\n  ")
     );
+}
+
+/// Source with line comments, block comments and string literals
+/// removed, so a name written in prose beside the code cannot be read as
+/// a definition.
+fn without_comments_and_strings(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        let two: String = b[i..(i + 2).min(b.len())].iter().collect();
+        if two == "//" {
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+        } else if two == "/*" {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(b.len());
+        } else if b[i] == '\''
+            && (b.get(i + 2) == Some(&'\'')
+                || (b.get(i + 1) == Some(&'\\') && b.get(i + 3) == Some(&'\'')))
+        {
+            // A character literal, skipped whole so that `'"'` does not
+            // open a string that swallows the code after it. A lifetime
+            // `'a` has no closing quote and falls through to be copied.
+            i += if b.get(i + 1) == Some(&'\\') { 4 } else { 3 };
+        } else if b[i] == '"' {
+            i += 1;
+            while i < b.len() && b[i] != '"' {
+                if b[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(b.len());
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The names `fn <name>` introduces in comment-stripped source.
+fn function_names(src: &str) -> Vec<String> {
+    let stripped = without_comments_and_strings(src);
+    let b = stripped.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= b.len() {
+        if &b[i..i + 3] == b"fn " {
+            let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            if before_ok {
+                let mut j = i + 3;
+                let mut name = String::new();
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    name.push(char::from(b[j]));
+                    j += 1;
+                }
+                if is_snake_case(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn is_snake_case(s: &str) -> bool {
@@ -2149,6 +2420,59 @@ fn swept_text(md: &str) -> Vec<(usize, String)> {
         }
     }
     out
+}
+
+/// The words of a string: lower case, every character that is not a
+/// letter or a digit treated as a separator.
+///
+/// This is what lets the duplication sweep see `ambiguous_basename`
+/// written as `Ambiguous-Basename` or as the bare words "ambiguous
+/// basename" — all three give the same two words.
+fn words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+        .collect()
+}
+
+/// How far apart the words of a label may be and still count as one
+/// mention of it. `occurrences_disagree` written "occurrences that
+/// disagree" spans three words; the allowance is generous enough for a
+/// clause or two of English between them and short enough that two
+/// unrelated sentences cannot supply the words between them.
+const LABEL_MENTION_SPAN: usize = 8;
+
+/// Whether `haystack` names the label whose words are `label`.
+///
+/// The label's words must appear in order, each matching the start of a
+/// word in the text so that a plural or an inflection still counts
+/// ("blank target lines" names `blank_target_line`), and the whole
+/// mention must fit inside [`LABEL_MENTION_SPAN`] words so that a
+/// paraphrase is caught and two separate sentences are not stitched into
+/// one.
+fn names_label(haystack: &[String], label: &[String]) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    for start in 0..haystack.len() {
+        if !haystack[start].starts_with(&label[0]) {
+            continue;
+        }
+        let mut at = 1usize;
+        let end = (start + LABEL_MENTION_SPAN).min(haystack.len());
+        for w in &haystack[start + 1..end] {
+            if at == label.len() {
+                break;
+            }
+            if w.starts_with(&label[at]) {
+                at += 1;
+            }
+        }
+        if at == label.len() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Both generated regions open with this and close with
