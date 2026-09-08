@@ -45,3 +45,12 @@ pulsus-schema = { path = "../crates/pulsus-schema" }
 # the product TraceQL planner (`pulsus_read::traces::plan_search`), which
 # consumes the parsed AST.
 pulsus-traceql = { path = "../crates/pulsus-traceql" }
+# `bench logs-read --dist` asserts its shard roster against
+# `system.query_log`, which ClickHouse writes asynchronously — so it needs
+# the same flush/read/retry helper the live test suites use, from the same
+# place, rather than a second copy of the retry policy. pulsus-testkit is
+# a `[dependencies]` entry here and a dev-dependency everywhere else
+# because xtask's benchmark harness is not a test binary; xtask itself
+# ships in nothing (`publish = false`, and the comment at the top of this
+# file).
+pulsus-testkit = { path = "../crates/pulsus-testkit" }

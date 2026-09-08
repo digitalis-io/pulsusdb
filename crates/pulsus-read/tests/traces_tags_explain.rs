@@ -494,6 +494,12 @@ const TIGHT_BUDGET_ROWS: u64 = 12_000;
 /// one-block overshoot, still far under `BUDGET_TOTAL_ROWS` — the
 /// meaningful claim ("bounded scan, not a full scan") holds either way.
 const READ_ROWS_OVERSHOOT_SLACK: u64 = 100_000;
+/// The four `TraceEngine` calls Gate 3 corroborates, in call order:
+/// unscoped-names, unscoped-values, scoped-names, scoped-values. One
+/// `system.query_log` row each — the number is BOTH the assertion Gate 3
+/// makes and the stopping rule its settle loop waits on, so the two can
+/// never drift apart.
+const BUDGET_QUERY_LOG_CALLS: usize = 4;
 
 async fn seed_budget_catalog(client: &ChClient, db: &str) {
     for (scope, vals_per_key) in [
@@ -654,11 +660,42 @@ async fn tag_discovery_bounds_unscoped_scans_at_the_read_budget() {
     // full scan, for the two aborted shapes (closes the re-review's TEST
     // GAP). Exactly 4 rows in call order: [unscoped-names,
     // unscoped-values, scoped-names, scoped-values]. -----------------------
-    exec(&seed_client, "SYSTEM FLUSH LOGS").await;
-    let rows = budget_query_log_rows(&admin, budget_db).await;
+    //
+    // `SYSTEM FLUSH LOGS` is not a barrier: ClickHouse pushes a query's
+    // `system.query_log` row onto an in-memory queue after the client
+    // already has the response, and the flush writes out only what is on
+    // that queue when it runs. Flushing once and reading once therefore
+    // races the fourth call's own row. In CI run 34198485735 it lost:
+    // `[ExceptionWhileProcessing, ExceptionBeforeStart, QueryFinish]`,
+    // three rows where this assertion wants four.
+    //
+    // The assertion below is unchanged — still exactly 4, still the
+    // thing that makes this gate non-vacuous. Only the moment it is
+    // evaluated moves: `settle_query_log` re-flushes and re-reads until
+    // four rows are on the table or the settle budget runs out, and then
+    // hands back whatever it last saw, so a row that is genuinely
+    // missing still fails here with the real rows in the message.
+    let rows = pulsus_testkit::settle_query_log(
+        std::time::Instant::now() + pulsus_testkit::QUERY_LOG_SETTLE_DEADLINE,
+        pulsus_testkit::QUERY_LOG_SETTLE_INTERVAL,
+        || async {
+            exec(&seed_client, "SYSTEM FLUSH LOGS").await;
+            Ok::<(), std::convert::Infallible>(())
+        },
+        || async { Ok(budget_query_log_rows(&admin, budget_db).await) },
+        // A stopping rule, not the assertion. These four queries are
+        // issued inside `TraceEngine`, which does not expose their query
+        // ids to a test, so the wait is on the count; a fifth row — one
+        // more query than the four calls above — makes the assertion
+        // below fail exactly as it did before.
+        |rows| rows.len() >= BUDGET_QUERY_LOG_CALLS,
+        tokio::time::sleep,
+    )
+    .await
+    .expect("neither the flush nor the read can fail: both panic on their own errors");
     assert_eq!(
         rows.len(),
-        4,
+        BUDGET_QUERY_LOG_CALLS,
         "expected exactly one query_log row per TraceEngine call above: {rows:?}"
     );
     let (unscoped_names, unscoped_values, scoped_names, scoped_values) =

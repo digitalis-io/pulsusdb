@@ -769,6 +769,146 @@ pub fn settle_by<T: Clone + PartialEq + std::fmt::Debug>(
     );
 }
 
+// ---------------------------------------------------------------------------
+// `system.query_log` is written asynchronously: flush, read, retry
+// ---------------------------------------------------------------------------
+
+/// How long [`settle_query_log`] keeps re-flushing and re-reading before it
+/// gives up and hands the caller whatever it last saw.
+///
+/// Sized against the two failures this exists to stop, both of which were
+/// a single row arriving late rather than a row that never arrived:
+/// CI run 34198485735's `schema-it` (three `system.query_log` rows where
+/// the test asserts four) and CI runs 34198485735 / 34199776042's
+/// `bench-cluster` (three participating shards where the roster computes
+/// four). A row that is genuinely absent — a real defect — costs this
+/// whole budget before the assertion fires, so it is a few seconds and
+/// not a minute.
+pub const QUERY_LOG_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The gap between one failed attempt and the next re-flush.
+///
+/// Each attempt is a `SYSTEM FLUSH LOGS` plus a `SELECT` — two round
+/// trips — so the interval sets the retry rate, not the cost. 200 ms
+/// gives ~100 attempts inside [`QUERY_LOG_SETTLE_DEADLINE`], which is far
+/// more than the one or two a late row needs and still cheap.
+pub const QUERY_LOG_SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Flushes `system.query_log`, reads it, and retries until `complete`
+/// accepts the rows or `deadline` passes.
+///
+/// # Why a single flush is not enough
+///
+/// ClickHouse does not write a query's `system.query_log` row as part of
+/// serving that query. The row is pushed onto an in-memory queue by the
+/// server after the client already holds the response, and
+/// `SYSTEM FLUSH LOGS` writes out **what is on that queue when it runs**.
+/// It is therefore not a barrier: a client that finishes query N, sends
+/// `SYSTEM FLUSH LOGS` and then selects from `system.query_log` can lose
+/// the race for query N's own row, and sees N-1 rows.
+///
+/// That is not a hypothesis. It is what
+/// `tag_discovery_bounds_unscoped_scans_at_the_read_budget` saw in CI run
+/// 34198485735 — `[ExceptionWhileProcessing, ExceptionBeforeStart,
+/// QueryFinish]` where the fourth call's `QueryFinish` should also have
+/// been there — and what `bench logs-read --dist` saw in the same run and
+/// in 34199776042: `observed participating shards {1, 2, 3} != expected
+/// {1, 2, 3, 4}`.
+///
+/// # What this function does and does not decide
+///
+/// It moves **when** the caller's assertion is evaluated. It never
+/// evaluates it. On timeout it returns the last rows it read rather than
+/// panicking, so the caller's own `assert_eq!` on an exact count — the
+/// thing that makes these tests non-vacuous — is still the assertion that
+/// fires, with the real rows in its message.
+///
+/// `complete` is a *stopping* rule, not the assertion. It should be the
+/// weakest predicate that means "nothing more is still in flight": the
+/// expected query ids are all present, or the expected shard set is a
+/// subset of the observed one. Waiting on the specific ids beats waiting
+/// on a count wherever the ids are available to the caller.
+///
+/// # Why `flush` and `read` are separate arguments
+///
+/// So that a retry cannot skip the flush. A second `SELECT` with no
+/// second `SYSTEM FLUSH LOGS` in front of it reads the same table state
+/// as the first and can never see the late row, which would give a retry
+/// loop that provably cannot succeed.
+///
+/// # Why the caller passes `sleep`
+///
+/// This crate has no dependencies on purpose (see its manifest): it is a
+/// dev-dependency of every crate in the workspace, four of which
+/// — `pulsus-logql`, `pulsus-promql`, `pulsus-re2`, `pulsus-traceql` — do
+/// not otherwise link tokio at all. Taking the timer as an argument keeps
+/// it that way. Every caller passes `tokio::time::sleep`.
+///
+/// # Example
+///
+/// The example compiles and type-checks the call shape; it is not run
+/// (this crate has no runtime to run it on). The behaviour — that a late
+/// row is picked up by a retry, that every retry re-flushes, and that a
+/// timeout returns the last read instead of panicking — is covered by
+/// this module's own tests, which drive the future with a hand-written
+/// poll loop.
+///
+/// ```
+/// use std::time::{Duration, Instant};
+///
+/// async fn read_four_rows(client: &MyClient) -> Result<Vec<Row>, MyError> {
+///     pulsus_testkit::settle_query_log(
+///         Instant::now() + pulsus_testkit::QUERY_LOG_SETTLE_DEADLINE,
+///         pulsus_testkit::QUERY_LOG_SETTLE_INTERVAL,
+///         || client.flush_logs(),
+///         || client.read_query_log(),
+///         |rows| rows.len() >= 4,
+///         tokio::time::sleep,
+///     )
+///     .await
+/// }
+/// # struct Row;
+/// # struct MyError;
+/// # struct MyClient;
+/// # impl MyClient {
+/// #     async fn flush_logs(&self) -> Result<(), MyError> { Ok(()) }
+/// #     async fn read_query_log(&self) -> Result<Vec<Row>, MyError> { Ok(Vec::new()) }
+/// # }
+/// # mod tokio { pub mod time {
+/// #     pub async fn sleep(_d: std::time::Duration) {}
+/// # } }
+/// # let _ = read_four_rows;
+/// ```
+pub async fn settle_query_log<RowT, ErrT, Flush, FlushFut, Read, ReadFut, Sleep, SleepFut>(
+    deadline: std::time::Instant,
+    interval: std::time::Duration,
+    mut flush: Flush,
+    mut read: Read,
+    complete: impl Fn(&[RowT]) -> bool,
+    sleep: Sleep,
+) -> Result<Vec<RowT>, ErrT>
+where
+    Flush: FnMut() -> FlushFut,
+    FlushFut: std::future::Future<Output = Result<(), ErrT>>,
+    Read: FnMut() -> ReadFut,
+    ReadFut: std::future::Future<Output = Result<Vec<RowT>, ErrT>>,
+    Sleep: Fn(std::time::Duration) -> SleepFut,
+    SleepFut: std::future::Future<Output = ()>,
+{
+    loop {
+        flush().await?;
+        let rows = read().await?;
+        // The deadline is checked AFTER an attempt, never before one, so
+        // an already-expired deadline still yields one real read: a
+        // caller that got an empty vector could not tell "the row is
+        // missing" from "this function never looked".
+        if complete(&rows) || std::time::Instant::now() >= deadline {
+            return Ok(rows);
+        }
+        sleep(interval).await;
+    }
+}
+
 /// The trace reference's build, as its own build-info route reports it.
 ///
 /// Every trace differential leg in this workspace is pointed at ONE pinned
@@ -1517,5 +1657,208 @@ mod tests {
             test_db("pulsus_x_it"),
             compose_db_name(ambient.as_deref(), "pulsus_x_it")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `settle_query_log`
+    //
+    // Driven by a hand-written poll loop rather than a runtime: this
+    // crate has no dependencies (see its manifest), and every future
+    // these tests build is ready on first poll, so a loop that polls
+    // until `Ready` is a complete executor for them.
+    // -----------------------------------------------------------------
+
+    /// Polls `fut` to completion. Panics rather than spinning forever if
+    /// a future is `Pending`, which for these tests would mean the test
+    /// itself built a future this executor cannot drive — a defect in
+    /// the test, and one that must not present as a hung suite.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        for _ in 0..1_000_000 {
+            if let std::task::Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
+                return value;
+            }
+        }
+        panic!("the future never became ready: these tests use only immediately-ready futures");
+    }
+
+    /// A `sleep` that costs nothing, so the tests exercise the retry
+    /// LOGIC at full speed and never the wall clock.
+    fn instant_sleep(_interval: std::time::Duration) -> std::future::Ready<()> {
+        std::future::ready(())
+    }
+
+    /// A deadline far enough out that no test reaches it by accident.
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
+    /// The whole point: a row that is not on the table at the first read
+    /// is picked up by a later one. Without the retry the caller would
+    /// have seen three rows and asserted against four.
+    ///
+    /// This is the exact shape of CI run 34198485735's `schema-it`
+    /// failure — three rows where the assertion wants four.
+    #[test]
+    fn a_row_that_arrives_after_the_first_read_is_picked_up_by_a_retry() {
+        let reads = std::cell::Cell::new(0u32);
+        let rows = block_on(settle_query_log(
+            far_deadline(),
+            std::time::Duration::from_millis(1),
+            || std::future::ready(Ok::<(), &str>(())),
+            || {
+                reads.set(reads.get() + 1);
+                let visible = if reads.get() < 3 { 3 } else { 4 };
+                std::future::ready(Ok::<Vec<u32>, &str>((0..visible).collect()))
+            },
+            |rows| rows.len() >= 4,
+            instant_sleep,
+        ))
+        .expect("no transport error");
+        assert_eq!(rows, vec![0, 1, 2, 3]);
+        assert_eq!(reads.get(), 3, "it should have read three times, not once");
+    }
+
+    /// Every read is preceded by its own flush. A retry that re-reads
+    /// without re-flushing reads the same table state as the attempt
+    /// before it and can never see the late row, so the loop would be
+    /// incapable of succeeding.
+    #[test]
+    fn every_read_is_preceded_by_its_own_flush() {
+        let log = std::cell::RefCell::new(Vec::<&'static str>::new());
+        let rows = block_on(settle_query_log(
+            far_deadline(),
+            std::time::Duration::from_millis(1),
+            || {
+                log.borrow_mut().push("flush");
+                std::future::ready(Ok::<(), &str>(()))
+            },
+            || {
+                log.borrow_mut().push("read");
+                let visible = log.borrow().iter().filter(|e| **e == "read").count();
+                std::future::ready(Ok::<Vec<u32>, &str>((0..visible as u32).collect()))
+            },
+            |rows| rows.len() >= 3,
+            instant_sleep,
+        ))
+        .expect("no transport error");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            *log.borrow(),
+            vec!["flush", "read", "flush", "read", "flush", "read"]
+        );
+    }
+
+    /// On timeout it returns the LAST rows it read. It never panics and
+    /// never invents rows, so the caller's own exact-count assertion is
+    /// the assertion that fires, with the real rows in its message. That
+    /// is what keeps the retry from weakening an `assert_eq!(len, 4)`
+    /// into an `assert!(len >= 4)`.
+    #[test]
+    fn a_deadline_that_passes_hands_back_the_last_read_rather_than_panicking() {
+        let reads = std::cell::Cell::new(0u32);
+        let rows = block_on(settle_query_log(
+            // Already expired.
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+            || std::future::ready(Ok::<(), &str>(())),
+            || {
+                reads.set(reads.get() + 1);
+                std::future::ready(Ok::<Vec<u32>, &str>(vec![0, 1, 2]))
+            },
+            |rows| rows.len() >= 4,
+            instant_sleep,
+        ))
+        .expect("no transport error");
+        assert_eq!(rows, vec![0, 1, 2]);
+        assert_eq!(
+            reads.get(),
+            1,
+            "an expired deadline must still produce one real read: an empty answer that came \
+             from never looking is indistinguishable from a genuinely missing row"
+        );
+    }
+
+    /// The common case costs nothing extra: when the first read is
+    /// already complete there is no second flush, no second read and no
+    /// sleep.
+    #[test]
+    fn a_complete_first_read_does_not_retry() {
+        let attempts = std::cell::Cell::new(0u32);
+        let slept = std::cell::Cell::new(0u32);
+        let rows = block_on(settle_query_log(
+            far_deadline(),
+            std::time::Duration::from_millis(1),
+            || std::future::ready(Ok::<(), &str>(())),
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Ok::<Vec<u32>, &str>(vec![0, 1, 2, 3]))
+            },
+            |rows| rows.len() >= 4,
+            |_| {
+                slept.set(slept.get() + 1);
+                std::future::ready(())
+            },
+        ))
+        .expect("no transport error");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(slept.get(), 0);
+    }
+
+    /// Waiting on the specific ids the caller issued, rather than on a
+    /// count: the second read carries an id nobody asked about, so a
+    /// count-based stop would have accepted the first read's three rows
+    /// and lost `d`. This is the shape `bench logs-read --dist` needs,
+    /// where the wait is for one row per expected shard.
+    #[test]
+    fn waiting_on_named_ids_ignores_rows_that_are_not_the_ones_awaited() {
+        let awaited = ["a", "b", "c", "d"];
+        let reads = std::cell::Cell::new(0u32);
+        let rows = block_on(settle_query_log(
+            far_deadline(),
+            std::time::Duration::from_millis(1),
+            || std::future::ready(Ok::<(), &str>(())),
+            || {
+                reads.set(reads.get() + 1);
+                let seen: Vec<&str> = if reads.get() < 2 {
+                    vec!["a", "b", "c", "zzz"]
+                } else {
+                    vec!["a", "b", "c", "zzz", "d"]
+                };
+                std::future::ready(Ok::<Vec<&str>, &str>(seen))
+            },
+            |rows| awaited.iter().all(|id| rows.contains(id)),
+            instant_sleep,
+        ))
+        .expect("no transport error");
+        assert_eq!(reads.get(), 2);
+        assert!(rows.contains(&"d"));
+        // Returned unfiltered: the caller — not this helper — decides
+        // what an unexpected row means. Here it is what makes the
+        // caller's exact-set assertion fail, which is the point.
+        assert!(rows.contains(&"zzz"));
+    }
+
+    /// A transport error is not a race. It propagates on the spot rather
+    /// than being retried until the deadline, so a wrong endpoint fails
+    /// in milliseconds instead of after the full settle budget.
+    #[test]
+    fn a_transport_error_propagates_instead_of_being_retried() {
+        let reads = std::cell::Cell::new(0u32);
+        let outcome: Result<Vec<u32>, &str> = block_on(settle_query_log(
+            far_deadline(),
+            std::time::Duration::from_millis(1),
+            || std::future::ready(Ok::<(), &str>(())),
+            || {
+                reads.set(reads.get() + 1);
+                std::future::ready(Err("connection refused"))
+            },
+            |rows| rows.len() >= 4,
+            instant_sleep,
+        ));
+        assert_eq!(outcome, Err("connection refused"));
+        assert_eq!(reads.get(), 1);
     }
 }

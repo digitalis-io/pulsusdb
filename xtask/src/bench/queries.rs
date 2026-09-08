@@ -198,6 +198,21 @@ struct RawShardRow {
     selected_marks: u64,
 }
 
+impl RawShardRow {
+    /// Whether this row is `shard_num`'s, AND did nonzero storage work.
+    ///
+    /// The SAME rule the `observed` set below is built from — one
+    /// definition, so the stopping rule a settle loop waits on and the
+    /// assertion it is waiting for cannot disagree about what
+    /// "participating" means. A row that exists but read nothing (a
+    /// pruned coordinator's own orchestration-only row) is not
+    /// participation.
+    fn participated_as(&self, topology: &ClusterTopology, shard_num: u32) -> bool {
+        (self.read_rows > 0 || self.selected_marks > 0)
+            && topology.hostname_to_shard.get(&self.hostname) == Some(&shard_num)
+    }
+}
+
 /// Reads every shard's own correlated `system.query_log` row for
 /// `initial_query_id` — an initial query's own `initial_query_id` equals
 /// its `query_id`, so this matches **both** the initiator's own
@@ -597,14 +612,19 @@ fn pruned_reason(roster: &StageRoster, topology: &ClusterTopology, shard_num: u3
 /// Captures one stage's `--dist` evidence against its **computed expected
 /// shard roster** (issue #16 CODE review round 3 [high] finding — see the
 /// module doc comment's expected-roster model):
-/// 1. Reads every shard's own `system.query_log` row
+/// 1. Computes `expected` from `stage.roster`.
+/// 2. Reads every shard's own `system.query_log` row
 ///    ([`read_stage_query_log_rows`]) and resolves each to a `shard_num`
-///    via `topology.hostname_to_shard`.
-/// 2. Computes `expected` from `stage.roster`.
+///    via `topology.hostname_to_shard` — re-flushing and re-reading until
+///    every expected shard has a participating row or the settle budget
+///    runs out, because a shard writes its row asynchronously and can
+///    still be doing so when the coordinator reads (see the comment at
+///    the call to `settle_query_log` below).
 /// 3. Computes `observed` as the shards that did nonzero storage work
-///    (`read_rows > 0 || selected_marks > 0` — a row that exists but did
-///    zero work, e.g. a pruned coordinator's own orchestration-only row,
-///    does not count as participating).
+///    ([`RawShardRow::participated_as`]: `read_rows > 0 ||
+///    selected_marks > 0` — a row that exists but did zero work, e.g. a
+///    pruned coordinator's own orchestration-only row, does not count as
+///    participating).
 /// 4. Asserts `observed == expected` **exactly**: a shard in `expected`
 ///    but missing from `observed` is a lost `system.query_log` row (FAIL —
 ///    indistinguishable from data loss any other way); a shard in
@@ -630,7 +650,42 @@ async fn capture_stage_evidence(
     topology: &ClusterTopology,
     stage: &StageRef,
 ) -> anyhow::Result<StageEvidence> {
-    let raw_rows = read_stage_query_log_rows(client, cluster, &stage.query_id).await?;
+    let expected: std::collections::BTreeSet<u32> = match &stage.roster {
+        StageRoster::Full => topology.all_shards(),
+        StageRoster::Fingerprints(fingerprints) => fingerprints
+            .iter()
+            .map(|fp| topology.shard_for_fingerprint(*fp))
+            .collect(),
+    };
+    // `SYSTEM FLUSH LOGS ON CLUSTER` is not a barrier. Each shard writes
+    // its own sub-query's `system.query_log` row locally, and it does so
+    // after the coordinator already has that shard's result — so the
+    // coordinator can finish the stage, broadcast the flush and read the
+    // table before a shard has queued its row. In CI runs 34198485735 and
+    // 34199776042 that is what happened: `observed participating shards
+    // {1, 2, 3} != expected {1, 2, 3, 4}`.
+    //
+    // The `observed == expected` assertion below is unchanged, in both
+    // directions. Only its timing moves: this waits until every EXPECTED
+    // shard has a row that did storage work, then asserts. A shard that
+    // is expected and never appears still fails, after the settle budget.
+    // A shard that appears but is not expected — the pruning-violation
+    // direction — is still caught, and strictly more often than before:
+    // the wait can only give a late unexpected row MORE time to show up
+    // than a single immediate read did.
+    let raw_rows = pulsus_testkit::settle_query_log(
+        Instant::now() + pulsus_testkit::QUERY_LOG_SETTLE_DEADLINE,
+        pulsus_testkit::QUERY_LOG_SETTLE_INTERVAL,
+        move || flush_logs_before_shard_read(client, cluster),
+        move || read_stage_query_log_rows(client, cluster, &stage.query_id),
+        |rows| {
+            expected
+                .iter()
+                .all(|shard| rows.iter().any(|row| row.participated_as(topology, *shard)))
+        },
+        tokio::time::sleep,
+    )
+    .await?;
     let explain_pipeline = explain_lines(
         client,
         "PIPELINE",
@@ -666,16 +721,9 @@ async fn capture_stage_evidence(
         by_shard.insert(shard_num, row);
     }
 
-    let expected: std::collections::BTreeSet<u32> = match &stage.roster {
-        StageRoster::Full => topology.all_shards(),
-        StageRoster::Fingerprints(fingerprints) => fingerprints
-            .iter()
-            .map(|fp| topology.shard_for_fingerprint(*fp))
-            .collect(),
-    };
     let observed: std::collections::BTreeSet<u32> = by_shard
         .iter()
-        .filter(|(_, row)| row.read_rows > 0 || row.selected_marks > 0)
+        .filter(|(shard, row)| row.participated_as(topology, **shard))
         .map(|(shard, _)| *shard)
         .collect();
     anyhow::ensure!(
