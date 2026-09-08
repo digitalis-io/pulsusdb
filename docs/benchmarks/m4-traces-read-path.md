@@ -188,13 +188,22 @@ forms about 25 s on a single-node container. It runs by hand, commits its
 output, and CI checks the document against the committed output. No
 wall-clock figure is gated.
 
-**Reproducibility, measured rather than asserted.** The harness was run
-twice against the same corpus. `read_rows`, `read_bytes`, `SelectedMarks`
-and `result_bytes` came back **bit-identical on all 1,132 statements**;
+**Reproducibility, measured rather than asserted, and two different
+questions.** Re-run against the **same** corpus, `read_rows`,
+`read_bytes`, `SelectedMarks` and `result_bytes` came back
+**bit-identical on all 1,132 statements**;
 `ReadBufferFromFileDescriptorReadBytes` moved on 561 of them (at most
 2.53% on one statement, 0.03% on the unlowered request's total),
 `ReadCompressedBytes` on 440 (at most 0.19%), and `memory_usage` on 982
-(up to 25.8% on one statement). §9.2 states which columns are which.
+(up to 25.8%). Re-run against a **rebuilt** corpus — same code, a
+different day, a different container — `selected_marks` and
+`result_bytes` matched exactly while `read_rows` and `read_bytes` moved
+on 147 of the 1,132 by at most 0.013%, which is 418 rows and 11,418 bytes
+on the whole unlowered request. The mechanism is adaptive granularity:
+`index_granularity_bytes` is 10 MiB, the corpus is anchored to the day it
+is built, and a `DoubleDelta`-coded timestamp column compresses
+differently at different absolute values, so a granule boundary moves.
+§9.2 tabulates all of this and states which columns are which.
 
 ```text
 podman run -d --name pulsus-lowering-ch -p 18923:8123 \

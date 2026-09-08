@@ -2048,16 +2048,46 @@ predicate to the batch's own span range collapses the same read to a handful of 
 identical answer. That is a separate optimisation from anything in this document and it does not
 need the lowering core.
 
-**What is exactly reproducible here, and what is not.** The harness was run twice against the same
-corpus. `read_rows`, `read_bytes` (`decoded †`), `SelectedMarks` (`granules`) and `result_bytes`
-came back **bit-identical on all 1,132 statements**. `ReadBufferFromFileDescriptorReadBytes`
-(`off file system †`) moved on 561 of the 1,132, by at most 2.53% on a single statement and by
-0.03% on the unlowered request's total; `ReadCompressedBytes` moved on 440, by at most 0.19%;
-`memory_usage` moved on 982, by up to 25.8% on a single statement. So the four columns the four
-ratios are computed from are stable, and the two that are not are named rather than presented as if
-they were. Both byte counters are recorded in the artefact for every statement, and neither is
-inferred from the other; the memory figures §9.2b prints are one run's, which is why they carry no
-accumulator and no ratio gate beyond the one printed beside them.
+**What is reproducible here, and what is not — and the two questions are different.**
+
+*Re-running the harness against the SAME corpus.* `read_rows`, `read_bytes` (`decoded †`),
+`SelectedMarks` (`granules`) and `result_bytes` came back **bit-identical on all 1,132 statements**.
+`ReadBufferFromFileDescriptorReadBytes` (`off file system †`) moved on 561 of the 1,132, by at most
+2.53% on a single statement and by 0.03% on the unlowered request's total; `ReadCompressedBytes`
+moved on 440, by at most 0.19%; `memory_usage` moved on 982, by up to 25.8% on a single statement.
+
+*Re-running it against a REBUILT corpus* — same code, a different day, a different container:
+
+| column | statements that moved, of 1,132 | largest per-statement change | change in the unlowered request's total |
+|---|---|---|---|
+| `selected_marks` (`granules`) | 0 | — | 0 |
+| `result_bytes` | 0 | — | 0 |
+| `read_rows` | 147 | 0.013% | −418 rows, −0.00001% |
+| `read_bytes` (`decoded †`) | 147 | 0.013% | +11,418 bytes, +0.00001% |
+| `read_compressed_bytes` | 977 | 0.013% | — |
+| `fd_read_bytes` (`off file system †`) | 1,124 | 2.5% | — |
+| `memory_usage` | 1,132 | 18.6% | — |
+
+**A rebuilt corpus is not the same corpus, and the mechanism is adaptive granularity.**
+`index_granularity_bytes` is 10 MiB on these tables, so a granule holds as many rows as fit in that
+many bytes rather than a fixed 8,192. The corpus is anchored to the day it is built, so
+`timestamp_ns` carries different absolute values between builds; under `CODEC(DoubleDelta, ZSTD)`
+those compress differently, the byte size of a row shifts, and a granule boundary moves. That is a
+tenth of a percent on a per-statement row count, and it is why §9.2's figures are gated against
+**the committed artefact** rather than against a rebuild.
+
+**A third build disagreed slightly more than mine did**, which is the reason this table says
+"statements that moved" rather than "these columns are stable": the code review rebuilt the corpus
+on its own host and reported the hydration group's granules differing by 1 and its result bytes by
+2,323 — quantities my own rebuild reproduced exactly. So `selected_marks` and `result_bytes` are
+build-stable in two builds out of three, not in general. Nothing here is a defect in either run: the
+committed artefact is one measurement, `every_figure_section_9_2_states_is_the_one_the_artefact_holds`
+gates the document against **it**, and a rebuild is expected to land within this band rather than to
+reproduce it byte for byte.
+
+Both byte counters are recorded in the artefact for every statement and neither is inferred from the
+other; the memory figures §9.2b prints are one run's, which is why they carry no accumulator and no
+ratio gate beyond the one printed beside them.
 
 ### 9.3 The correctness consequence, measured
 
@@ -5348,53 +5378,86 @@ either half of the record.
 
 ### 12.3 The citations, and the hole that is enumerated rather than papered over
 
-The five design artefacts cite source files by line number **582 times**. Nothing derived them until
-part 8: moving `search_plan.rs:1854` to `:2854` in [`query-to-sql.md`](query-to-sql.md) and running
+The five design artefacts cite source files by line number **588 times** at commit `dddd4fe2` —
+that figure moves with every edit to the record, so it is stated with the revision it was taken at
+and is not a number any check depends on. Nothing derived those citations until part 8: moving
+`search_plan.rs:1854` to `:2854` in [`query-to-sql.md`](query-to-sql.md) and running
 `cargo nextest run --workspace` exited 0 with no failing test.
 
-**467 of the 582 cite a bare basename**, and six of those basenames match more than one tracked file
-— `plan.rs` matches four. Resolving them needs a rule, and the rule part 8 uses is the one the
-anchor design already states: pick the candidate whose cited line contains an identifier the citing
-prose already prints. That answers **400 of the 582**, leaving **75 distinct `(document, token)`
-pairs** — 185 occurrences — that it cannot answer. §12.3 itself cites three of the blank-line
-targets below, so the frozen set holds **76** rows rather than 75: that is the check noticing a
-citation this very section added, which is the behaviour it exists for.
+**469 of them cite a bare basename**, and six of those basenames match more than one tracked file —
+`plan.rs` matches four. Resolving them needs a rule, and the rule is the anchor design's own: pick
+the candidate whose cited line contains an identifier the citing prose already prints. It resolves
+**309 `(document, token)` pairs**; **77** it cannot answer.
 
-**The obvious fallback was tested and rejected on measurement.** Resolving by the enclosing
-section's language — a `plan.rs` citation in a LogQL section is `logql/plan.rs` — was checked
-against the 122 citations the anchor rule already answers, and it **disagrees on 22 of them, 18%**.
-Over the 185 that produces roughly 33 citations that resolve and are **wrong**, and a citation that
-resolves wrongly is worse than one that does not resolve: it reads as checked. So the 75 are frozen
-as a named set in `crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`, each with its
-reason:
+**The rule lives in `crates/pulsus-read/tests/design_record_drift_gate.rs`, in
+`resolve_citation`, and it is the only implementation.** An earlier revision generated the datasets
+from a script beside the repository and checked them with a second reader written in the test; the
+two drifted on two citations, which is the two-implementations problem in miniature. There is one
+implementation now, an `#[ignore]`d test regenerates both datasets from it, and anyone can re-run it.
+
+**The 77 are frozen with a reason each**, in
+`crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`:
 
 | reason | rows | what it means |
 |---|---|---|
-| `ambiguous_basename` | 70 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 71 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on — `traces/exec.rs:114`, `:1968` and `search_plan.rs:1042`, the first cited from two documents |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 
-`every_citation_in_the_design_record_has_a_row` asserts the two datasets **partition** the record's
-citations in both directions: a citation covered by neither is a hole, a citation covered by both is
-covered by neither rule, and an entry that has started resolving must be removed rather than left as
-a standing exemption. **So the hole is enumerated and cannot widen quietly**, which is the failure a
-narrowed check invites.
+`every_citation_in_the_design_record_has_a_row` runs the resolver over every citation and compares
+its verdict with the two datasets **in every direction**: a citation covered by neither is a hole; a
+citation covered by both is covered by neither rule; a resolved row whose citation stops resolving
+fails; a frozen row whose citation **starts** resolving fails, naming the file it now resolves to
+and saying to move the row. That last direction is the one that makes freezing a set honest rather
+than a place to put inconvenient citations, and an earlier revision of this section promised it and
+did not have it.
 
-**What would close it, stated as work rather than promised.** Each of those citing lines needs to
-print an identifier the cited line carries — the same rule the 400 already satisfy — after a reading
-of the cited line against the claim beside it. That is a per-site judgement, not a rewrite a script
-can make, and the `blank_target_line` rows are a smaller job of the same kind: they are citations
-pointing at nothing, and each needs a line number that means something. Neither is part 8's.
+#### The fallback that was rejected, and the figure that rejected it
 
-**Neither citation dataset has a regenerator, and that is deliberate.** The count dataset's `line`
-column IS derived — the anchor is the stable thing and the line follows from it — so an ignored
-regenerator rewrites it. A citation's line is not derived: it is what the DOCUMENT says, and a target
-that moves means the document's citation is now stale and a person has to re-read it. A regenerator
-there would rewrite the claim to match whatever the source had become, which is the opposite of a
-check.
+The obvious next rule for the 77 is the enclosing section's language: a `plan.rs` citation in a
+LogQL section means `logql/plan.rs`. **It is wrong often enough to matter, and the measurement is a
+committed test** —
+`the_language_fallback_is_measured_over_the_cases_whose_answer_is_known` — run over the population
+where the answer is independently known, the bare citations the anchor rule resolves:
 
-**What the resolved 310 rows can and cannot show.** 152 carry a `prose` anchor — a token the citing
-prose prints — so the claim and its evidence are reviewable side by side. 158 carry a `line` anchor,
+```
+fallback experiment: population=112 answered=109 declined=3 disagreements=9 rate=8.26%
+```
+
+The nine are printed individually by the test, so each can be checked by hand rather than taken on
+the rate. They are not near misses: the fallback answers `logql/exec.rs` where the truth is
+`traces/exec.rs`, `logql/labels.rs` where it is `metrics/labels.rs` and `pulsus-model/src/labels.rs`,
+and `logql/sql.rs` where it is `metrics/sql.rs` — a LogQL section citing a file that is not in the
+LogQL tree at all. Applied to the citations the anchor rule cannot answer, an 8% error rate produces
+roughly fifteen citations that resolve and are **wrong**, and a citation that resolves wrongly is
+worse than one that does not resolve: it reads as checked. So the fallback is not applied.
+
+> **A correction, because the figure that first justified this was wrong.** An earlier note gave the
+> disagreement rate as **22 of 122, 18%**, from an experiment that was never committed. Re-run as a
+> test, that reading is not reproducible and was measured wrongly: it counted a case as a
+> disagreement when the fallback had **no candidate in the preferred family at all** — `catalog.rs`
+> is in neither `logql/` nor `traces/` — and a rule that declines is not a rule that answers
+> wrongly. The rate over the cases the fallback actually answers is **8.26%**. The conclusion is
+> unchanged and the reason for it is now re-runnable, which is the part that was missing: **a
+> measurement that decides a design has to be reproducible by someone else, or the decision rests on
+> nothing.**
+
+**What would close the hole, stated as work rather than promised.** Each of those 77 citing lines
+needs to print an identifier the cited line carries — the same rule the 309 already satisfy — after
+a reading of the cited line against the claim beside it. That is a per-site judgement, not a rewrite
+a script can make, and the `blank_target_line` rows are a smaller job of the same kind: they are
+citations pointing at nothing, and each needs a line number that means something. Neither is part
+8's.
+
+**Running the regenerator is not a way to make a red check green.** The `line` and `anchor` of a
+resolved row are what the DOCUMENT claims, so a target that moves means the record's citation is
+stale and a person has to re-read it; re-running the regenerator would rewrite the claim to match
+whatever the source had become. The count dataset is the other way round — its `line` column is
+derived from an anchor, so regenerating it is the correct response to a document re-wrap. The diff
+is the review in both cases.
+
+**What the 309 resolved rows can and cannot show.** 149 carry a `prose` anchor — a token the citing
+prose prints — so the claim and its evidence are reviewable side by side. 160 carry a `line` anchor,
 a snapshot of the cited line, because the citing prose prints no such token: those detect the line
 moving or changing, and they cannot show the citation means the right thing. The `anchor_kind`
 column exists so that difference is visible rather than assumed away.

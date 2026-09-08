@@ -25,7 +25,7 @@
 //! `regenerate_the_count_site_lines` test rewrites it, and editing it by
 //! hand is what the check's message forbids.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const COUNTS_TSV: &str = "crates/pulsus-read/tests/design_record_counts.tsv";
 
@@ -684,13 +684,29 @@ fn ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts, as
-/// `(document, token, first line, last line)`.
-fn citation_occurrences() -> Vec<(String, String, u32, u32)> {
+/// One `<file>.rs:<line>[-<line>]` occurrence.
+#[derive(Debug, Clone)]
+struct Occurrence {
+    doc: String,
+    /// The 1-based line of the document the citation sits on. The
+    /// fallback experiment below needs it to find the enclosing section.
+    doc_line: u32,
+    token: String,
+    first: u32,
+    last: u32,
+    /// The whole line the citation sits on. **The resolver reads it**:
+    /// which of several `plan.rs` files a bare citation means is decided
+    /// by whether the cited line carries an identifier this line prints.
+    citing_line: String,
+}
+
+/// Every `<file>.rs:<line>[-<line>]` occurrence in the five artefacts.
+fn citation_occurrences() -> Vec<Occurrence> {
     let mut out = Vec::new();
     for doc in DESIGN_ARTEFACTS {
         let text = read(doc);
-        for line in text.lines() {
+        for (doc_line, line) in text.lines().enumerate() {
+            let doc_line = doc_line as u32 + 1;
             let bytes = line.as_bytes();
             let mut i = 0usize;
             while let Some(at) = line[i..].find(".rs:") {
@@ -721,18 +737,168 @@ fn citation_occurrences() -> Vec<(String, String, u32, u32)> {
                     }
                 }
                 if !first.is_empty() && start < dot {
-                    out.push((
-                        doc.to_string(),
-                        line[start..j].to_string(),
-                        first.parse().expect("digits"),
-                        last.parse().expect("digits"),
-                    ));
+                    out.push(Occurrence {
+                        doc: doc.to_string(),
+                        doc_line,
+                        token: line[start..j].to_string(),
+                        first: first.parse().expect("digits"),
+                        last: last.parse().expect("digits"),
+                        citing_line: line.to_string(),
+                    });
                 }
                 i = (dot + 4).max(j);
             }
         }
     }
     out
+}
+
+/// What a citation resolves to, and when it does not, why not.
+///
+/// **This is the rule the two datasets record the verdict of**, and it
+/// runs here rather than in a script beside the repository, so that a
+/// frozen entry which starts resolving fails instead of being tolerated.
+/// An earlier revision froze the unresolvable set and checked only that
+/// the record still cited it; a code review made a frozen citation
+/// resolvable and the suite stayed green. That direction is the whole
+/// point of freezing a set — a hole that quietly closes and stays
+/// enumerated is a hole nobody goes back to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resolution {
+    /// Exactly one tracked file, and the cited range carries text.
+    To(String),
+    /// No tracked file ends in that name.
+    NotTracked,
+    /// Tracked files exist, none of them has the cited line.
+    BeyondEndOfFile,
+    /// It resolves, and the cited range is **empty** — a citation
+    /// pointing at a blank line, which nothing can be anchored on.
+    BlankTargetLine,
+    /// Several candidates, and the citing line prints no identifier that
+    /// separates them.
+    AmbiguousBasename,
+}
+
+impl Resolution {
+    /// The word the frozen dataset records for a non-resolution.
+    fn reason(&self) -> Option<&'static str> {
+        match self {
+            Resolution::To(_) => None,
+            Resolution::NotTracked => Some("not_a_tracked_file"),
+            Resolution::BeyondEndOfFile => Some("line_beyond_end_of_file"),
+            Resolution::BlankTargetLine => Some("blank_target_line"),
+            Resolution::AmbiguousBasename => Some("ambiguous_basename"),
+        }
+    }
+}
+
+/// Every spelling of one backticked token that could occur at a cited
+/// line: the token itself, its leading identifier path, the last segment
+/// of that path, and — for `foo()` — the definition `fn foo`.
+fn needles(token: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let t = token.trim();
+    if t.contains(".rs:") || t.starts_with("http") {
+        return out;
+    }
+    out.insert(t.to_string());
+    let head: &str = t
+        .split([' ', '{', '(', '<', '['])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if head.len() >= 3 {
+        out.insert(head.to_string());
+        if let Some((_, tail)) = head.rsplit_once("::") {
+            out.insert(tail.to_string());
+        }
+    }
+    if t.ends_with("()") && t.len() > 4 {
+        out.insert(format!("fn {}", &t[..t.len() - 2]));
+    }
+    out.retain(|n| n.len() >= 3);
+    out
+}
+
+/// The backticked tokens on one line.
+fn backticked(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some((_, tail)) = rest.split_once('`') {
+        match tail.split_once('`') {
+            Some((inner, after)) => {
+                if (2..=120).contains(&inner.chars().count()) {
+                    out.push(inner.to_string());
+                }
+                rest = after;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+fn resolve_citation(occ: &Occurrence, tracked: &[String]) -> Resolution {
+    let base = occ.token.split(':').next().unwrap_or("");
+    let qualified = base.contains('/');
+    let candidates: Vec<&String> = tracked
+        .iter()
+        .filter(|t| *t == base || t.ends_with(&format!("/{base}")))
+        .collect();
+    if candidates.is_empty() {
+        return Resolution::NotTracked;
+    }
+    let in_range: Vec<&&String> = candidates
+        .iter()
+        .filter(|t| read(t).lines().count() >= occ.last as usize)
+        .collect();
+    if in_range.is_empty() {
+        return Resolution::BeyondEndOfFile;
+    }
+    let range_of = |path: &str| -> String {
+        read(path)
+            .lines()
+            .skip(occ.first as usize - 1)
+            .take((occ.last - occ.first + 1) as usize)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut ns: BTreeSet<String> = BTreeSet::new();
+    for tok in backticked(&occ.citing_line) {
+        ns.extend(needles(&tok));
+    }
+    let scored: Vec<(usize, &String)> = in_range
+        .iter()
+        .map(|t| {
+            let body = range_of(t);
+            (ns.iter().filter(|n| body.contains(n.as_str())).count(), **t)
+        })
+        .collect();
+    let top = scored.iter().map(|(s, _)| *s).max().unwrap_or(0);
+    let best: Vec<&String> = scored
+        .iter()
+        .filter(|(s, _)| *s == top && top > 0)
+        .map(|(_, t)| *t)
+        .collect();
+    let picked = if qualified && in_range.len() == 1 {
+        Some((*in_range[0]).clone())
+    } else if best.len() == 1 {
+        Some(best[0].clone())
+    } else if in_range.len() == 1 {
+        Some((*in_range[0]).clone())
+    } else {
+        None
+    };
+    match picked {
+        None => Resolution::AmbiguousBasename,
+        Some(p) => {
+            if ws(&range_of(&p)).is_empty() {
+                Resolution::BlankTargetLine
+            } else {
+                Resolution::To(p)
+            }
+        }
+    }
 }
 
 /// **Every citation the record makes still points at what it names.**
@@ -806,11 +972,11 @@ fn every_citation_in_the_design_record_has_a_row() {
     // document is part of the key. A token that resolves anywhere in a
     // document is resolved for every occurrence of it in that document —
     // they all name the same file and the same line.
-    let targets: BTreeSet<(String, String)> = rows
+    let resolved: BTreeSet<(String, String)> = rows
         .iter()
         .map(|r| (r.doc.clone(), r.token.clone()))
         .collect();
-    let both: Vec<&(String, String)> = targets.intersection(&frozen_keys).collect();
+    let both: Vec<&(String, String)> = resolved.intersection(&frozen_keys).collect();
     assert!(
         both.is_empty(),
         "{both:?} appear in BOTH datasets. The two must PARTITION the record's citations: a \
@@ -823,32 +989,82 @@ fn every_citation_in_the_design_record_has_a_row() {
         "only {} citations were found in the five artefacts; the reader is broken, not the record",
         occurrences.len()
     );
-    let mut holes: Vec<String> = Vec::new();
-    let mut covered: BTreeSet<(String, String)> = BTreeSet::new();
-    for (doc, token, _, _) in &occurrences {
+    let tracked = tracked_rust_files();
+
+    // The verdict per `(document, token)`: a token resolves for a
+    // document if ANY of its occurrences there resolves, because every
+    // occurrence of it names the same file and the same line.
+    let mut verdict: BTreeMap<(String, String), Resolution> = BTreeMap::new();
+    for occ in &occurrences {
+        let key = (occ.doc.clone(), occ.token.clone());
+        let r = resolve_citation(occ, &tracked);
+        match verdict.get(&key) {
+            Some(Resolution::To(_)) => {}
+            _ => {
+                verdict.insert(key, r);
+            }
+        }
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    for ((doc, token), r) in &verdict {
         let key = (doc.clone(), token.clone());
-        if targets.contains(&key) {
-            continue;
+        match r {
+            Resolution::To(path) => {
+                // It resolves. It must be in the resolved dataset, at
+                // this path — and it must NOT be frozen.
+                if frozen_keys.contains(&key) {
+                    problems.push(format!(
+                        "{UNRESOLVABLE_TSV} freezes {doc} / {token}, which now RESOLVES to \
+                         {path}. The frozen set is the enumerated hole, not a standing \
+                         exemption: move the row into {CITATIONS_TSV}"
+                    ));
+                    continue;
+                }
+                match rows.iter().find(|x| x.doc == *doc && x.token == *token) {
+                    None => problems.push(format!(
+                        "{doc} cites {token}, which resolves to {path} and has no row in \
+                         {CITATIONS_TSV}"
+                    )),
+                    Some(row) if row.path != *path => problems.push(format!(
+                        "{doc} cites {token}, which resolves to {path}; {CITATIONS_TSV} records \
+                         {}",
+                        row.path
+                    )),
+                    Some(_) => {}
+                }
+            }
+            _ => {
+                // It does not resolve. It must be frozen, with THIS
+                // reason — and it must not also be in the resolved
+                // dataset.
+                let want = r.reason().expect("a non-resolution has a reason");
+                if resolved.contains(&key) {
+                    problems.push(format!(
+                        "{CITATIONS_TSV} carries {doc} / {token}, which no longer resolves \
+                         ({want})"
+                    ));
+                    continue;
+                }
+                match frozen.iter().find(|(d, t, _)| d == doc && t == token) {
+                    None => problems.push(format!(
+                        "{doc} cites {token}, which resolves to nothing ({want}) and is in \
+                         neither dataset"
+                    )),
+                    Some((_, _, got)) if got != want => problems.push(format!(
+                        "{UNRESOLVABLE_TSV} gives {doc} / {token} the reason {got:?}; it is now \
+                         {want:?}"
+                    )),
+                    Some(_) => {}
+                }
+            }
         }
-        if frozen_keys.contains(&key) {
-            covered.insert(key);
-            continue;
-        }
-        holes.push(format!(
-            "{doc} cites {token}, which has no row in {CITATIONS_TSV}"
-        ));
     }
     assert!(
-        holes.is_empty(),
-        "{} citation(s) are covered by neither dataset:\n  {}",
-        holes.len(),
-        holes.join("\n  ")
-    );
-    let stale: Vec<&(String, String)> = frozen_keys.difference(&covered).collect();
-    assert!(
-        stale.is_empty(),
-        "{UNRESOLVABLE_TSV} names {stale:?}, which now resolves. The frozen set is the enumerated \
-         hole, not a standing exemption: remove the row"
+        problems.is_empty(),
+        "{} citation problem(s):\n  {}",
+        problems.len(),
+        problems.join("\n  ")
     );
 }
 
@@ -862,7 +1078,7 @@ fn no_citation_row_is_unused() {
     let rows = citation_rows();
     let cited: BTreeSet<(String, String)> = citation_occurrences()
         .into_iter()
-        .map(|(doc, token, _, _)| (doc, token))
+        .map(|o| (o.doc, o.token))
         .collect();
     let unused: Vec<String> = rows
         .iter()
@@ -1097,4 +1313,225 @@ fn tracked_rust_files() -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+/// Rewrites both citation datasets from [`resolve_citation`]. Ignored, so
+/// it never runs in CI.
+///
+/// **The resolver is the definition and this is the only producer.** An
+/// earlier revision generated the datasets from a script that lived
+/// beside the repository and checked them with a reader written here;
+/// the two drifted on two citations, which is the two-implementations
+/// problem in miniature. There is one implementation now, it ships in
+/// this file, and anyone can re-run it.
+///
+/// **Running it is not a way to make a red check green.** The `line` and
+/// `anchor` of a resolved row are what the DOCUMENT claims, so a target
+/// that moves means the record's citation is stale and a person has to
+/// re-read it; re-running this would rewrite the claim to match whatever
+/// the source had become. The diff is the review.
+///
+/// ```text
+/// cargo test -p pulsus-read --test design_record_drift_gate -- --ignored
+/// ```
+#[test]
+#[ignore = "writes the two citation datasets"]
+fn regenerate_the_citation_datasets() {
+    let tracked = tracked_rust_files();
+    let mut verdict: BTreeMap<(String, String), (Resolution, Occurrence)> = BTreeMap::new();
+    for occ in citation_occurrences() {
+        let key = (occ.doc.clone(), occ.token.clone());
+        let r = resolve_citation(&occ, &tracked);
+        match verdict.get(&key) {
+            Some((Resolution::To(_), _)) => {}
+            _ => {
+                verdict.insert(key, (r, occ));
+            }
+        }
+    }
+    let mut resolved = String::from("doc\ttoken\tpath\tline\tend_line\tanchor_kind\tanchor\n");
+    let mut frozen = String::from("doc\ttoken\treason\n");
+    for ((doc, token), (r, occ)) in &verdict {
+        match r {
+            Resolution::To(path) => {
+                let body: String = read(path)
+                    .lines()
+                    .skip(occ.first as usize - 1)
+                    .take((occ.last - occ.first + 1) as usize)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let body = ws(&body);
+                // Prefer an anchor the CITING prose prints: the claim and
+                // its evidence are then reviewable side by side. Longest
+                // first, so the most specific spelling wins.
+                let mut prose: Vec<String> = backticked(&occ.citing_line)
+                    .iter()
+                    .flat_map(|t| needles(t))
+                    .filter(|n| body.contains(n.as_str()) && !n.contains('\t'))
+                    .collect();
+                prose.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+                let (kind, anchor) = match prose.first() {
+                    Some(a) => ("prose", a.clone()),
+                    None => (
+                        "line",
+                        body.chars()
+                            .take(120)
+                            .collect::<String>()
+                            .trim()
+                            .to_string(),
+                    ),
+                };
+                let end = if occ.last == occ.first {
+                    String::new()
+                } else {
+                    occ.last.to_string()
+                };
+                resolved.push_str(&format!(
+                    "{doc}\t{token}\t{path}\t{}\t{end}\t{kind}\t{anchor}\n",
+                    occ.first
+                ));
+            }
+            other => frozen.push_str(&format!(
+                "{doc}\t{token}\t{}\n",
+                other.reason().expect("a non-resolution has a reason")
+            )),
+        }
+    }
+    std::fs::write(repo_root().join(CITATIONS_TSV), resolved).expect("write the resolved dataset");
+    std::fs::write(repo_root().join(UNRESOLVABLE_TSV), frozen).expect("write the frozen dataset");
+}
+
+// ---------------------------------------------------------------------
+// The fallback that was rejected, and the measurement that rejected it
+// ---------------------------------------------------------------------
+
+/// The language a document section is about, from the nearest heading
+/// above the citation that names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectionLanguage {
+    LogQl,
+    TraceQl,
+}
+
+impl SectionLanguage {
+    /// The path fragments a candidate file must carry to be preferred.
+    fn prefers(self) -> [&'static str; 2] {
+        match self {
+            SectionLanguage::LogQl => ["logql/", "pulsus-logql/"],
+            SectionLanguage::TraceQl => ["traces/", "pulsus-traceql/"],
+        }
+    }
+}
+
+fn section_language(doc: &str, doc_line: u32) -> Option<SectionLanguage> {
+    let text = read(doc);
+    let mut current = None;
+    for (i, line) in text.lines().enumerate() {
+        if i as u32 + 1 > doc_line {
+            break;
+        }
+        if line.starts_with('#') {
+            let low = line.to_lowercase();
+            if low.contains("traceql") {
+                current = Some(SectionLanguage::TraceQl);
+            } else if low.contains("logql") {
+                current = Some(SectionLanguage::LogQl);
+            }
+        }
+    }
+    current
+}
+
+/// **The fallback rule, run against the cases where the answer is
+/// already known, and the number that decides whether to use it.**
+///
+/// 467 of the record's citations name a bare basename, and six of those
+/// basenames match more than one tracked file. [`resolve_citation`]
+/// answers the ones whose citing line prints an identifier the cited
+/// line carries. For the rest, the obvious next rule is the enclosing
+/// section's language: a `plan.rs` citation in a LogQL section means
+/// `logql/plan.rs`.
+///
+/// **This test measures how often that rule is wrong**, over the
+/// population where the answer is independently known — the bare
+/// citations the anchor rule resolves — and freezes the result, so the
+/// figure that decided the design can be re-run by anyone rather than
+/// quoted from a report.
+///
+/// **It also corrects a figure I published and could not reproduce.** An
+/// earlier note said the fallback disagrees on 22 of 122 cases, 18%, and
+/// used that to justify freezing the unresolved set rather than applying
+/// the fallback. That experiment was not committed, and re-running it
+/// here shows the 18% was measured wrongly: it counted a case as a
+/// DISAGREEMENT when the fallback had no candidate in the preferred
+/// family at all — `catalog.rs` is in neither `logql/` nor `traces/`, and
+/// 15 of the 22 were of exactly that kind. A rule that declines is not a
+/// rule that answers wrongly. The measured disagreement rate over the
+/// cases the fallback actually ANSWERS is the assertion below.
+#[test]
+fn the_language_fallback_is_measured_over_the_cases_whose_answer_is_known() {
+    let tracked = tracked_rust_files();
+    let mut answered = 0usize;
+    let mut disagreements: Vec<String> = Vec::new();
+    let mut declined = 0usize;
+    let mut population = 0usize;
+
+    for occ in citation_occurrences() {
+        let base = occ.token.split(':').next().unwrap_or("");
+        if base.contains('/') {
+            continue; // already path-qualified: the fallback is not needed
+        }
+        let Resolution::To(truth) = resolve_citation(&occ, &tracked) else {
+            continue; // the answer is not independently known
+        };
+        let candidates: Vec<&String> = tracked
+            .iter()
+            .filter(|t| t.ends_with(&format!("/{base}")))
+            .filter(|t| read(t).lines().count() >= occ.last as usize)
+            .collect();
+        if candidates.len() < 2 {
+            continue; // one candidate: no rule is needed to choose
+        }
+        population += 1;
+        let Some(lang) = section_language(&occ.doc, occ.doc_line) else {
+            declined += 1;
+            continue;
+        };
+        let preferred: Vec<&&String> = candidates
+            .iter()
+            .filter(|t| lang.prefers().iter().any(|p| t.contains(p)))
+            .collect();
+        if preferred.len() != 1 {
+            declined += 1;
+            continue;
+        }
+        answered += 1;
+        if **preferred[0] != truth {
+            disagreements.push(format!(
+                "{}:{} cites {} in a {lang:?} section; the fallback answers {} and the anchor \
+                 rule answers {truth}",
+                occ.doc, occ.doc_line, occ.token, preferred[0]
+            ));
+        }
+    }
+
+    let rate = disagreements.len() as f64 / answered.max(1) as f64;
+    eprintln!(
+        "fallback experiment: population={population} answered={answered} declined={declined} \
+         disagreements={} rate={:.2}%",
+        disagreements.len(),
+        rate * 100.0
+    );
+    for d in &disagreements {
+        eprintln!("  DISAGREEMENT {d}");
+    }
+
+    // Frozen so the figure cannot rot unnoticed. If the record's
+    // citations change, these move and someone re-reads the decision
+    // they justify.
+    assert_eq!(
+        (population, answered, declined, disagreements.len()),
+        (112, 109, 3, 9),
+        "the fallback experiment moved; re-read §12.3's decision against the new numbers"
+    );
 }

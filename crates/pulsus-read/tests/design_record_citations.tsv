@@ -64,7 +64,7 @@ docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:173	crates/pulsus-r
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:2869	crates/pulsus-read/src/traces/exec.rs	2869		prose	generator_settings
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:385	crates/pulsus-read/src/traces/exec.rs	385		line	/// The ROOT SPAN's own metadata. `service`/`name` are the reference's
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:386	crates/pulsus-read/src/traces/exec.rs	386		line	/// `rootServiceName`/`rootTraceName`; `start_ns`/`duration_ns` are the
-docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:5254	crates/pulsus-read/src/traces/exec.rs	5254		prose	search_settings_pin_the_layer_1_budget_contract
+docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:5254	crates/pulsus-read/src/traces/exec.rs	5254		line	fn search_settings_pin_the_layer_1_budget_contract() {
 docs/query-lowering.md	crates/pulsus-read/src/traces/exec.rs:701	crates/pulsus-read/src/traces/exec.rs	701		prose	map_trace_generator_error
 docs/query-lowering.md	crates/pulsus-read/src/traces/filter.rs:810	crates/pulsus-read/src/traces/filter.rs	810		prose	match
 docs/query-lowering.md	crates/pulsus-read/src/traces/graph_sql.rs:92	crates/pulsus-read/src/traces/graph_sql.rs	92		prose	service_graph_sql
@@ -107,7 +107,6 @@ docs/query-lowering.md	plan.rs:1075	crates/pulsus-read/src/logql/plan.rs	1075		p
 docs/query-lowering.md	plan.rs:1088	crates/pulsus-read/src/logql/plan.rs	1088		prose	plan_metric_expr
 docs/query-lowering.md	plan.rs:1106	crates/pulsus-read/src/logql/plan.rs	1106		prose	InvalidStep
 docs/query-lowering.md	plan.rs:1480	crates/pulsus-read/src/logql/plan.rs	1480		prose	parse_vector_agg_params
-docs/query-lowering.md	plan.rs:1506	crates/pulsus-read/src/logql/plan.rs	1506		prose	parameter
 docs/query-lowering.md	plan.rs:1616	crates/pulsus-read/src/logql/plan.rs	1616		prose	Pipe
 docs/query-lowering.md	plan.rs:1625	crates/pulsus-read/src/logql/plan.rs	1625		prose	fetch_until_limit
 docs/query-lowering.md	plan.rs:1680	crates/pulsus-read/src/logql/plan.rs	1680		prose	metric_pipeline_construct
@@ -190,13 +189,13 @@ docs/query-to-sql.md	escape.rs:51-67	crates/pulsus-read/src/logql/escape.rs	51	6
 docs/query-to-sql.md	escape.rs:83-92	crates/pulsus-read/src/logql/escape.rs	83	92	prose	ngrambf_v1(4, …)
 docs/query-to-sql.md	escape.rs:93	crates/pulsus-read/src/logql/escape.rs	93		line	pub fn ch_like_contains(needle: &str) -> String {
 docs/query-to-sql.md	escape.rs:93-105	crates/pulsus-read/src/logql/escape.rs	93	105	line	pub fn ch_like_contains(needle: &str) -> String { let mut pattern = String::with_capacity(needle.len() + 2); pattern.pus
-docs/query-to-sql.md	escape.rs:99	crates/pulsus-read/src/logql/escape.rs	99		line	'%' => pattern.push_str("\\%"),
+docs/query-to-sql.md	escape.rs:99	crates/pulsus-read/src/logql/escape.rs	99		prose	\\%
 docs/query-to-sql.md	exec.rs:3421	crates/pulsus-read/src/traces/exec.rs	3421		prose	reduce
 docs/query-to-sql.md	filter.rs:76-79	crates/pulsus-read/src/traces/filter.rs	76	79	prose	unsupported field:
 docs/query-to-sql.md	filter.rs:817	crates/pulsus-read/src/traces/filter.rs	817		line	/// fragment. Fallible for the same reason as [`physical_sql`] (issue
 docs/query-to-sql.md	filter.rs:827	crates/pulsus-read/src/traces/filter.rs	827		line	ValuePred::Regex(pat) => format!("match(val, {})", anchored_regex_sql(pat)?),
 docs/query-to-sql.md	labels.rs:157-189	crates/pulsus-model/src/labels.rs	157	189	prose	structured_metadata
-docs/query-to-sql.md	labels.rs:363	crates/pulsus-promql/src/eval/labels.rs	363		prose	and
+docs/query-to-sql.md	labels.rs:363	crates/pulsus-read/src/metrics/labels.rs	363		prose	resolve
 docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		prose	render_labels_json_sorted
 docs/query-to-sql.md	logql/charge.rs:1270	crates/pulsus-read/src/logql/charge.rs	1270		line	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:775-781	crates/pulsus-read/src/logql/error.rs	775	781	prose	400
@@ -217,8 +216,8 @@ docs/query-to-sql.md	model.rs:376	crates/pulsus-config/src/model.rs	376		line	pu
 docs/query-to-sql.md	model.rs:388	crates/pulsus-config/src/model.rs	388		line	pub traceql_max_candidates: u64,
 docs/query-to-sql.md	model.rs:431	crates/pulsus-config/src/model.rs	431		line	pub logql_read_max_memory_bytes: u64,
 docs/query-to-sql.md	pipeline.rs:2876	crates/pulsus-read/src/logql/pipeline.rs	2876		line	Err(PipelineError::BadParserExpr(format!(
-docs/query-to-sql.md	pipeline.rs:2890	crates/pulsus-read/src/logql/pipeline.rs	2890		prose	DURATION_UNITS
-docs/query-to-sql.md	pipeline.rs:3002	crates/pulsus-read/src/logql/pipeline.rs	3002		prose	QUERY_BYTES_SUFFIXES
+docs/query-to-sql.md	pipeline.rs:2890	crates/pulsus-read/src/logql/pipeline.rs	2890		line	const DURATION_UNITS: &[(&str, f64)] = &[
+docs/query-to-sql.md	pipeline.rs:3002	crates/pulsus-read/src/logql/pipeline.rs	3002		line	const QUERY_BYTES_SUFFIXES: &[&str] = &[
 docs/query-to-sql.md	pipeline.rs:370	crates/pulsus-read/src/logql/pipeline.rs	370		prose	bad
 docs/query-to-sql.md	pipeline.rs:4692-4694	crates/pulsus-read/src/logql/pipeline.rs	4692	4694	line	fn parse_wire_json_prefix(line: &str) -> Result<WireJson, serde_json::Error> { let mut de = serde_json::Deserializer::fr
 docs/query-to-sql.md	pipeline.rs:4725	crates/pulsus-read/src/logql/pipeline.rs	4725		line	// A non-object top level (or a parse failure) is the malformed class:
@@ -290,7 +289,7 @@ docs/query-to-sql.md	sql.rs:246	crates/pulsus-read/src/logql/sql.rs	246		prose	s
 docs/query-to-sql.md	sql.rs:283	crates/pulsus-read/src/logql/sql.rs	283		prose	probe
 docs/query-to-sql.md	sql.rs:489	crates/pulsus-read/src/logql/sql.rs	489		prose	stage2
 docs/query-to-sql.md	sql.rs:538	crates/pulsus-read/src/logql/sql.rs	538		prose	stage3
-docs/query-to-sql.md	sql.rs:563	crates/pulsus-read/src/logql/sql.rs	563		prose	ORDER BY
+docs/query-to-sql.md	sql.rs:563	crates/pulsus-read/src/logql/sql.rs	563		prose	ORDER
 docs/query-to-sql.md	sql.rs:625	crates/pulsus-read/src/logql/sql.rs	625		prose	stage3_keyset
 docs/query-to-sql.md	sql.rs:800	crates/pulsus-read/src/logql/sql.rs	800		prose	metric_range
 docs/query-to-sql.md	sql.rs:849	crates/pulsus-read/src/logql/sql.rs	849		prose	metric_instant

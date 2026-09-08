@@ -1208,7 +1208,17 @@ fn per_stage_row(slice: &str, section_name: &str, label: &str) -> Vec<String> {
 /// green while a field silently stops being totalled.
 #[test]
 fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
-    let evidence = lowering_evidence();
+    // **Closure A runs BEFORE the typed parse, and the order is the
+    // check.** The typed mirror carries `deny_unknown_fields`, so a
+    // producer field the mirror does not know fails the parse — and if
+    // the parse ran first, a new numeric key would fail with serde's
+    // message about an unknown field rather than with this gate's
+    // message about a key no `RowField` covers. The break would then be
+    // passing for a reason that has nothing to do with the closure it
+    // was written to exercise. Reading the raw JSON first makes the
+    // closure the thing that catches it; `deny_unknown_fields` is the
+    // second, independent guard, and `the_lowering_evidence_has_a_row_
+    // per_read` is where it shows.
     let md = repo_file(QUERY_LOWERING);
     // (i) — slice first, match header rows inside the slice.
     let s92 = section(&md, S92_HEADING, S92B_HEADING);
@@ -1244,6 +1254,9 @@ fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
         "docs/query-lowering.md §9.2 gate: RowField {absent:?} names a key the artefact's rows do \
          not carry"
     );
+
+    // Only now the typed read.
+    let evidence = lowering_evidence();
 
     // ---- (f) closure B: the row schema's fields ---------------------
     let part = partition(&SummedColumn::ALL, &DECLARED_NOT_SUMMED);
@@ -1396,19 +1409,40 @@ fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
          covers",
         comparison_uncovered.first().map(|s| **s).unwrap_or("")
     );
-    // **NO BREAK REDDENS THE NEXT TWO ASSERTIONS. A later reader must not
-    // count them as live coverage.** They fire only when a variant
-    // declares a header no table carries WHILE every table column is
-    // still covered — which needs two variants sharing one cell, and the
-    // partition assertion above catches that case first, because the
-    // partition prints the header beside the field it sums. Every edit
-    // that would reach these two reddens the partition or the
-    // `uncovered` assertions instead; that was measured, not reasoned
-    // (issue #492 part 8, landing 1). They stay because they cost
-    // nothing and would matter if the partition assertion were ever
-    // weakened: an assertion known and documented to be unreachable is
-    // defence in depth, one assumed live and actually unreachable is the
-    // defect this gate exists to end.
+    // **These two assertions are NOT alike, and an earlier revision of
+    // this comment said they were.** It claimed no break reddens either,
+    // and a code review showed that was false for the second one, which
+    // is worse than saying nothing: a reader would have discounted
+    // coverage that exists. Both were then re-measured, one edit at a
+    // time, and this is what each produced.
+    //
+    // `comparison_absent` is REACHABLE. Give a variant whose comparison
+    // header is `None` one the comparison table does not carry —
+    // `SummedColumn::Decoded => ("decoded †", Some("ghost comparison"))`
+    // — and every table column stays covered while the declaration is
+    // unmatched, so this assertion is the one that fires:
+    //   `an accumulator declares the comparison header
+    //    ["ghost comparison"], which §9.2's comparison table does not
+    //    carry`
+    // The partition does not move, because the partition prints
+    // `headers().0` and this edit changes `headers().1`.
+    //
+    // `per_stage_absent` is not reached by any edit I could construct,
+    // and three were tried, one at a time:
+    //   * change a field-bearing variant's per-stage header
+    //     (`Decoded`, and `OffFileSystemFd`, which shares its cell with
+    //     another variant) — the partition assertion above fires first,
+    //     because the partition prints that header beside the field;
+    //   * change the counter's per-stage header (`Queries`) — the cell
+    //     it vacated becomes uncovered and `per_stage_uncovered` fires
+    //     first;
+    //   * add a second field-less variant — the "exactly one counter"
+    //     assertion fires first.
+    // It stays because it costs nothing and would matter if the
+    // partition assertion were ever weakened. **`No break reddens
+    // per_stage_absent`**, and a later reader must not count it as live
+    // coverage; `comparison_absent` is live and the break above is how
+    // to reproduce it.
     let per_stage_absent: Vec<&&str> = declared_per_stage.difference(&per_stage_cells).collect();
     let comparison_absent: Vec<&&str> = declared_comparison.difference(&comparison_cells).collect();
     assert!(
