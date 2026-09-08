@@ -3013,17 +3013,34 @@ the statement name, so a re-taker changes the same string literal here as in the
 **These three bodies are this build's own output, read from the container that produced the
 figures below.** They are not an illustration of the shape such a body has: the statement above was
 run against the measurement container while it was still up, and its three rows were copied from
-the terminal into this section. The third body's part path names this measurement's own
-`arch492p7.trace_attrs_idx` and that table's UUID, and all three `query_id`s appear in the capture
-with `exception_code` 241, 721 marks and no rows out — the same three takes.
+the terminal into this section. The copying step itself is checked by nothing: the container is
+gone and its terminal was not saved. What can be shown is that the three takes the statement above
+matches are in the capture, and failed there. These are three rows of the capture output file — the
+scratch file the next paragraph describes — with its header, read out of that file by
+`(head -1 <capture file>; grep '^p7c_t4_join_ceiling_' <capture file>) | cut -f1-5,8 | column -t` —
+the `memory_usage` and `result_bytes` columns are cut, because they are records and this section
+does not publish them:
 
-**That run's stdout was not kept.** The capture statement's output was written to a file at capture
-time — measurement scratch, not in this repository — and the `marks`, `read_rows`, `rows out` and
-`exception_code` columns of the take tables below were read out of that file. The body statement's
-output was not written anywhere: it was read off the terminal, and the block at the top of this
-section is the only copy of it that survives. The container has been removed, so it cannot be read
-again; a re-taker builds the corpus afresh and gets three new bodies, differing in the ways listed
-under "Varies" below.
+```text
+query_id               exception_code  marks  read_rows  result_rows  build_uuid
+p7c_t4_join_ceiling_1  241             721    2551808    0            81e37dde-8239-405e-a5ab-fddd4c68a5de
+p7c_t4_join_ceiling_2  241             721    2592768    0            81e37dde-8239-405e-a5ab-fddd4c68a5de
+p7c_t4_join_ceiling_3  241             721    2699264    0            81e37dde-8239-405e-a5ab-fddd4c68a5de
+```
+
+Those are the three `query_id`s in full, and they are the row the tables below summarise as
+`t4_join at ceiling`: 721 marks, `exception_code` 241, no rows out, three takes, on build
+`81e37dde-8239-405e-a5ab-fddd4c68a5de`. `read_rows` is a record and differs across the three. This
+does not show that the bodies above were copied from that container — nothing here shows that — only
+that the three takes they are attributed to exist in the capture and failed the way the bodies say.
+
+**The body statement's stdout was not kept.** The capture statement's output was written to a file
+at capture time — measurement scratch, not in this repository — and the `marks`, `read_rows`,
+`rows out` and `exception_code` columns of the take tables below were read out of that file. The
+body statement's output was not written anywhere: it was read off the terminal, and the block at the
+top of this section is the only copy of it that survives. The container has been removed, so it
+cannot be read again; a re-taker builds the corpus afresh and gets three new bodies, differing in
+the ways listed under "Varies" below.
 
 What was checked instead is the statement. The SQL printed above is byte-for-byte the file the
 measurement submitted, and it was run once more against a different server, on three throwaway
@@ -3055,11 +3072,13 @@ rebuild of the same recipe gets a different one. The container ran ClickHouse **
 (`SELECT version()`), held one build of the recipe printed below, and was removed when the
 measurement finished.
 
-The third error body above carries `3c6209c2-899e-4088-8041-c0bb02613ec1`, which is the same
-build's `trace_attrs_idx`. A `Code: 241` that fails inside a storage read prints the part path, and
-the part path carries that table's UUID; a failure in the aggregate has no part path, which is why
-two of the three bodies do not carry one. The in-body UUID corroborates the build; the label comes
-from the capture statement.
+The third error body above carries `3c6209c2-899e-4088-8041-c0bb02613ec1`. A `Code: 241` that fails
+inside a storage read prints the part path, and the part path carries the UUID of the table being
+read; a failure in the aggregate has no part path, which is why two of the three bodies do not carry
+one. **That UUID corroborates nothing.** The capture statement returns `trace_spans`'s UUID, not
+`trace_attrs_idx`'s, so no saved output outside the body carries that value, and the container that
+could have been asked for the mapping has been removed. It is repeated here because it is part of
+the body; the build label above rests on the capture statement alone.
 
 **Nothing here checks that a take table carries the right UUID.** No check covers a mistyped or
 swapped label. What makes it unlikely rather than impossible is that the UUID is copied out of the
