@@ -18,6 +18,7 @@ docs/query-lowering.md	exec.rs:2063	ambiguous_basename
 docs/query-lowering.md	exec.rs:2204	ambiguous_basename
 docs/query-lowering.md	exec.rs:2261	ambiguous_basename
 docs/query-lowering.md	exec.rs:666	ambiguous_basename
+docs/query-lowering.md	labels.rs:157-189	ambiguous_basename
 docs/query-lowering.md	labels.rs:363	ambiguous_basename
 docs/query-lowering.md	parser.rs:1298	ambiguous_basename
 docs/query-lowering.md	plan.rs:1171	ambiguous_basename

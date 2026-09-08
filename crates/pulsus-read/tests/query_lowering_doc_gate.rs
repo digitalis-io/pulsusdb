@@ -1393,6 +1393,20 @@ fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
     // approved for that edit, and a less useful one: the reader is told
     // two tables differ when the fact is that a named column is
     // uncovered. The cross-table equality is still asserted, after.
+    // Each table is checked SEPARATELY and the message names the one
+    // the uncovered column is in. An earlier revision unioned the two
+    // header sets, so renaming §9.2b's header reported the column as
+    // being in §9.2 — a diagnostic that points at the wrong place costs
+    // more than none, because somebody goes and looks there.
+    for (name, headers) in [("§9.2", &s92_headers), ("§9.2b", &s92b_headers)] {
+        let cells: BTreeSet<&str> = headers.iter().skip(1).map(|s| s.as_str()).collect();
+        let uncovered: Vec<&&str> = cells.difference(&declared_per_stage).collect();
+        assert!(
+            uncovered.is_empty(),
+            "docs/query-lowering.md {name} has a column {:?} that no accumulator covers",
+            uncovered.first().map(|s| **s).unwrap_or("")
+        );
+    }
     let per_stage_cells: BTreeSet<&str> = s92_headers
         .iter()
         .skip(1)
@@ -1404,6 +1418,8 @@ fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
         .skip(1)
         .map(|s| s.as_str())
         .collect();
+    // Kept, but it can no longer be the first to fire: the per-table
+    // loop above reports the same column and names its table.
     let per_stage_uncovered: Vec<&&str> = per_stage_cells.difference(&declared_per_stage).collect();
     let comparison_uncovered: Vec<&&str> =
         comparison_cells.difference(&declared_comparison).collect();
@@ -2719,6 +2735,30 @@ fn rebuild_block() -> String {
             agreed.join(", ")
         ));
     }
+    // **The withdrawal sentence is generated too, and it did not used
+    // to be.** It sat one line outside the marker and stated a count of
+    // observations; a code review changed that count and every suite
+    // stayed green. A number that satisfies the letter of "the block is
+    // generated" by living just outside it is the same defect one line
+    // further out, so the region was extended rather than the sentence
+    // reworded. It names the observations rather than counting them in
+    // order, so there is no ordinal to go stale when a fifth arrives.
+    let all_ids: Vec<String> = {
+        let mut v: Vec<String> = obs.iter().map(|o| o.id.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    out.push_str(&format!(
+        "An earlier revision of this section said a rebuild is expected to land within rebuild \
+         A's figures. That expectation was written before rebuild C, and rebuild C did not meet \
+         it. {} observations exist now — {} — and no band is established across them: what they \
+         establish is that these columns vary, not by how much. A re-runner should expect their \
+         numbers to differ from the committed artefact without reading the difference as a \
+         defect.\n\n",
+        all_ids.len(),
+        all_ids.join(", ")
+    ));
     out.push_str(REBUILD_BLOCK_END);
     out
 }

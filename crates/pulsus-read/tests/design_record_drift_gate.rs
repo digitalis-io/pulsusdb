@@ -1863,6 +1863,53 @@ fn census_block() -> String {
          not describe, which is why it is not applied.\n\n",
         REVIEWED_FALLBACK_DIVERGENCES.len()
     ));
+    // **The short enumerations belong in here too.** Listing the
+    // blank-target citations, the conflicting ones and the wrong
+    // fallback answers in the prose beside this block put derived
+    // content one line outside a generated region, which is the same
+    // defect the region exists to close.
+    for (reason, lead) in [
+        (
+            "blank_target_line",
+            "The citations pointing at an empty line are",
+        ),
+        (
+            "occurrences_disagree",
+            "The citations the rule answers differently for two occurrences of are",
+        ),
+    ] {
+        let mut listed: Vec<String> = frozen
+            .iter()
+            .filter(|(_, _, r)| r == reason)
+            .map(|(d, t, _)| {
+                let docs = frozen
+                    .iter()
+                    .filter(|(_, t2, r2)| t2 == t && r2 == reason)
+                    .count();
+                if docs > 1 {
+                    format!("`{t}` (cited from {docs} documents)")
+                } else {
+                    format!("`{t}` (in `{d}`)")
+                }
+            })
+            .collect();
+        listed.sort();
+        listed.dedup();
+        out.push_str(&format!("{lead} {}.\n\n", listed.join(", ")));
+    }
+    let mut wrong: Vec<String> = REVIEWED_FALLBACK_DIVERGENCES
+        .iter()
+        .filter(|(_, _, _, v, _)| *v == ReviewedVerdict::FallbackWrong)
+        .map(|(d, t, _, _, _)| format!("`{t}` in `{d}`"))
+        .collect();
+    wrong.sort();
+    wrong.dedup();
+    out.push_str(&format!(
+        "The citations where the fallback answers a file the citing prose does not describe are \
+         {}. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test \
+         prints them when it runs.\n\n",
+        wrong.join(", ")
+    ));
     out.push_str(CENSUS_BLOCK_END);
     out
 }

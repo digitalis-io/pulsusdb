@@ -2090,6 +2090,8 @@ Rebuild C differs from rebuild A on 6 of the 7 columns; the one it does not diff
 
 Of the 7 columns, **none** is one every rebuild that recorded it found unmoved.
 
+An earlier revision of this section said a rebuild is expected to land within rebuild A's figures. That expectation was written before rebuild C, and rebuild C did not meet it. 4 observations exist now — A, B, C, S — and no band is established across them: what they establish is that these columns vary, not by how much. A re-runner should expect their numbers to differ from the committed artefact without reading the difference as a defect.
+
 <!-- end generated -->
 
 > **These two sections were reconstructed, and the reconstruction cannot be verified.** While part 8
@@ -2103,13 +2105,6 @@ Of the 7 columns, **none** is one every rebuild that recorded it found unmoved.
 > thing from one that has been**, and this note exists so a later reader does not mistake the second
 > for the first. Both blocks are generated from committed datasets now, which is a guarantee about
 > the present text and says nothing about what the destroyed text contained.
-
-**These columns vary between builds and no band is established for how much.** An earlier revision
-of this paragraph said a rebuild is expected to land within rebuild A's figures. That was three
-observations predicting a fourth, and the fourth did not. The expectation is withdrawn rather than
-widened: what these observations establish is that the columns vary, not by how much, and a
-re-runner should expect their numbers to differ from the committed artefact without reading the
-difference as a defect.
 
 **The mechanism is adaptive granularity.** `index_granularity_bytes` is 10 MiB on these tables, so a
 granule holds as many rows as fit in that many bytes rather than a fixed 8,192. The corpus is
@@ -5438,18 +5433,18 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 594 |
-| of those, citing a bare basename | 475 |
+| citation occurrences in the five artefacts | 596 |
+| of those, citing a bare basename | 476 |
 | `(document, token)` pairs the rule resolves | 306 |
 | occurrences those resolved pairs cover | 464 |
-| `(document, token)` pairs it cannot resolve | 82 |
-| occurrences those frozen pairs cover | 130 |
+| `(document, token)` pairs it cannot resolve | 83 |
+| occurrences those frozen pairs cover | 132 |
 | resolved rows anchored on a token the citing prose prints | 146 |
 | resolved rows anchored on a snapshot of the cited line | 160 |
 
 | reason it cannot be resolved | pairs |
 |---|---|
-| `ambiguous_basename` | 73 |
+| `ambiguous_basename` | 74 |
 | `blank_target_line` | 4 |
 | `not_a_tracked_file` | 2 |
 | `occurrences_disagree` | 3 |
@@ -5460,9 +5455,15 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | the fallback is right and the anchor rule points elsewhere | 3 |
 | the sentence describes both candidates, so neither answer is wrong | 1 |
 
-Of the 594 citation occurrences the five artefacts make, 475 name a bare basename. The rule resolves 306 `(document, token)` pairs covering 464 occurrences, and cannot resolve 82 covering 130. Of the resolved rows, 146 are anchored on a token the citing prose prints and 160 on a snapshot of the cited line.
+Of the 596 citation occurrences the five artefacts make, 476 name a bare basename. The rule resolves 306 `(document, token)` pairs covering 464 occurrences, and cannot resolve 83 covering 132. Of the resolved rows, 146 are anchored on a token the citing prose prints and 160 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 9 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+
+The citations pointing at an empty line are `crates/pulsus-read/src/traces/exec.rs:1968` (in `docs/query-lowering.md`), `search_plan.rs:1042` (in `docs/query-lowering.md`), `traces/exec.rs:114` (cited from 2 documents).
+
+The citations the rule answers differently for two occurrences of are `labels.rs:363` (in `docs/query-to-sql.md`), `sql.rs:489` (in `docs/query-to-sql.md`), `sql.rs:996` (in `docs/query-to-sql.md`).
+
+The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2830-2836` in `docs/query-lowering.md`, `exec.rs:2869` in `docs/query-lowering.md`, `exec.rs:701` in `docs/query-lowering.md`, `labels.rs:157-189` in `docs/query-to-sql.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
 
 <!-- end generated -->
 
@@ -5484,11 +5485,9 @@ them:
 
 - `ambiguous_basename` — the basename matches several tracked files and the citing line prints no
   identifier that separates them.
-- `blank_target_line` — the cited line exists and is **empty**, so there is nothing to anchor on:
-  `traces/exec.rs:114`, `:1968` and `search_plan.rs:1042`, the first cited from two documents.
+- `blank_target_line` — the cited line exists and is **empty**, so there is nothing to anchor on.
 - `occurrences_disagree` — the record cites the token more than once in one document and the rule
-  answers **differently** for two of the occurrences: `labels.rs:363`, `sql.rs:489` and
-  `sql.rs:996`, all in [`query-to-sql.md`](query-to-sql.md).
+  answers differently for two of those occurrences.
 - `not_a_tracked_file` — the citation names a throwaway probe that was never committed, which §10
   records deliberately.
 
@@ -5514,17 +5513,15 @@ LogQL section means `logql/plan.rs`. **It is not applied, and the reason is a se
 anyone can read**, counted in the block above —
 `the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled` finds every
 citation where the fallback and the anchor rule disagree, and requires each to carry a verdict a
-person reached by reading the citing prose against both candidate files. The three verdicts, whose
-counts the block above holds, are that the fallback answers a file the citing prose does not
-describe; that the fallback is right and the **anchor rule** is the one pointing elsewhere; and
-that the sentence describes both candidates, so neither answer is wrong.
+person reached by reading the citing prose against both candidate files. The verdicts, whose counts
+the block above holds, are that the fallback answers a file the citing prose does not describe; that
+the fallback is right and the **anchor rule** is the one pointing elsewhere; and that the sentence
+describes both candidates, so neither answer is wrong.
 
 Wrong answers on a rule whose whole job is to say which file a citation means are why it is not
-applied; the block above counts them. Most are a LogQL section citing the **TraceQL** executor —
-`exec.rs:2869` twice, `exec.rs:2830-2836` and `exec.rs:701` — where the fallback answers
-`logql/exec.rs`, which carries nothing of the kind. The remaining one is a sentence about the label
-encoder answered with `logql/labels.rs`. Every case is named with its reasoning in
-`REVIEWED_FALLBACK_DIVERGENCES`, and the test prints the wrong ones when it runs.
+applied; the block above counts them and names them. They are LogQL sections citing the **TraceQL**
+executor, where the fallback answers `logql/exec.rs`, which carries nothing of the kind, and a
+sentence about the label encoder answered with `logql/labels.rs`.
 
 > **No percentage is published here, and an earlier revision of this section published two.** The
 > first, **18%**, came from an experiment that was never committed and counted a case as a
