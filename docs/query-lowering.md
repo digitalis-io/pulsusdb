@@ -5442,18 +5442,23 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | resolved rows anchored on a token the citing prose prints | 146 |
 | resolved rows anchored on a snapshot of the cited line | 160 |
 
-| reason it cannot be resolved | pairs |
-|---|---|
-| `ambiguous_basename` | 74 |
-| `blank_target_line` | 4 |
-| `not_a_tracked_file` | 2 |
-| `occurrences_disagree` | 3 |
+| reason it cannot be resolved | pairs | what it means |
+|---|---|---|
+| `ambiguous_basename` | 74 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on |
+| `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
+| `occurrences_disagree` | 3 | the record cites the token more than once in one document and the rule answers differently for two of those occurrences |
 
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
 | the fallback answers a file the citing prose does not describe | 5 |
 | the fallback is right and the anchor rule points elsewhere | 3 |
 | the sentence describes both candidates, so neither answer is wrong | 1 |
+
+| anchor kind | what a row of that kind can show |
+|---|---|
+| `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
+| `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
 Of the 596 citation occurrences the five artefacts make, 476 name a bare basename. The rule resolves 306 `(document, token)` pairs covering 464 occurrences, and cannot resolve 83 covering 132. Of the resolved rows, 146 are anchored on a token the citing prose prints and 160 on a snapshot of the cited line.
 
@@ -5480,16 +5485,9 @@ two drifted on two citations, which is the two-implementations problem in miniat
 test regenerates both datasets from the one rule.
 
 **The frozen pairs carry a reason each**, in
-`crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`, and the block above counts
-them:
-
-- `ambiguous_basename` — the basename matches several tracked files and the citing line prints no
-  identifier that separates them.
-- `blank_target_line` — the cited line exists and is **empty**, so there is nothing to anchor on.
-- `occurrences_disagree` — the record cites the token more than once in one document and the rule
-  answers differently for two of those occurrences.
-- `not_a_tracked_file` — the citation names a throwaway probe that was never committed, which §10
-  records deliberately.
+`crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`. The block above lists the
+reasons, counts them and says what each one means: a list of row labels beside a generated table is
+a second copy of the table's own labels, and this section has already had one go stale.
 
 **`occurrences_disagree` is a category part 8 did not expect to need.** An earlier revision assumed
 a token names one target wherever it is written, so one occurrence with evidence settled the
@@ -5513,10 +5511,8 @@ LogQL section means `logql/plan.rs`. **It is not applied, and the reason is a se
 anyone can read**, counted in the block above —
 `the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled` finds every
 citation where the fallback and the anchor rule disagree, and requires each to carry a verdict a
-person reached by reading the citing prose against both candidate files. The verdicts, whose counts
-the block above holds, are that the fallback answers a file the citing prose does not describe; that
-the fallback is right and the **anchor rule** is the one pointing elsewhere; and that the sentence
-describes both candidates, so neither answer is wrong.
+person reached by reading the citing prose against both candidate files. The block above lists the
+verdicts and counts them.
 
 Wrong answers on a rule whose whole job is to say which file a citation means are why it is not
 applied; the block above counts them and names them. They are LogQL sections citing the **TraceQL**
@@ -5550,9 +5546,6 @@ whatever the source had become. The count dataset is the other way round — its
 derived from an anchor, so regenerating it is the correct response to a document re-wrap. The diff
 is the review in both cases.
 
-**What a resolved row can and cannot show.** A `prose` anchor is a token the citing prose prints,
-so the claim and its evidence are reviewable side by side; a `line` anchor is a snapshot of the
-cited line, taken because the citing prose prints no such token, and it detects the line moving or
-changing without showing that the citation means the right thing. The two counts are in the census
-table above and the `anchor_kind` column records which kind each row is, so that difference is
-visible rather than assumed away.
+**What a resolved row can and cannot show** depends on which kind of anchor it carries, and the
+block above says what each kind can show and how many rows carry it. The dataset's `anchor_kind`
+column is what records the difference per row, so it is visible rather than assumed away.

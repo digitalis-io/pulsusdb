@@ -1817,32 +1817,29 @@ fn census_block() -> String {
     for (_, _, r) in &frozen {
         *by_reason.entry(r.as_str()).or_default() += 1;
     }
-    out.push_str("\n| reason it cannot be resolved | pairs |\n|---|---|\n");
+    out.push_str("\n| reason it cannot be resolved | pairs | what it means |\n|---|---|---|\n");
     for (reason, n) in &by_reason {
-        out.push_str(&format!("| `{reason}` | {n} |\n"));
+        out.push_str(&format!(
+            "| `{reason}` | {n} | {} |\n",
+            reason_meaning(reason)
+        ));
     }
 
     out.push_str("\n| the reviewed verdict on a fallback disagreement | cases |\n|---|---|\n");
-    for (label, verdict) in [
-        (
-            "the fallback answers a file the citing prose does not describe",
-            ReviewedVerdict::FallbackWrong,
-        ),
-        (
-            "the fallback is right and the anchor rule points elsewhere",
-            ReviewedVerdict::FallbackRight,
-        ),
-        (
-            "the sentence describes both candidates, so neither answer is wrong",
-            ReviewedVerdict::Ambiguous,
-        ),
-    ] {
+    for (label, verdict) in VERDICT_LABELS {
         let n = REVIEWED_FALLBACK_DIVERGENCES
             .iter()
             .filter(|(_, _, _, v, _)| *v == verdict)
             .count();
         out.push_str(&format!("| {label} | {n} |\n"));
     }
+    out.push_str(&format!(
+        "\n| anchor kind | what a row of that kind can show |\n|---|---|\n{}",
+        ANCHOR_KIND_MEANINGS
+            .iter()
+            .map(|(k, m)| format!("| `{k}` | {m} |\n"))
+            .collect::<String>()
+    ));
 
     out.push_str(&format!(
         "\nOf the {} citation occurrences the five artefacts make, {bare} name a bare basename. \
@@ -1914,6 +1911,66 @@ fn census_block() -> String {
     out
 }
 
+/// What each frozen reason means. **Generated beside the label**, so the
+/// label set the document shows and the label set the dataset holds are
+/// one list rather than two. An earlier revision listed the labels in
+/// prose beside the table, and a code review renamed one and every suite
+/// stayed green: a list of row labels carries the same drift risk as a
+/// count of them, and it fell outside a sweep drawn around numbers.
+fn reason_meaning(reason: &str) -> &'static str {
+    match reason {
+        "ambiguous_basename" => {
+            "the basename matches several tracked files and the citing line prints no identifier \
+             that separates them"
+        }
+        "blank_target_line" => {
+            "the cited line exists and is **empty**, so there is nothing to anchor on"
+        }
+        "occurrences_disagree" => {
+            "the record cites the token more than once in one document and the rule answers \
+             differently for two of those occurrences"
+        }
+        "not_a_tracked_file" => {
+            "the citation names a throwaway probe that was never committed, which §10 records \
+             deliberately"
+        }
+        other => panic!(
+            "the frozen dataset holds the reason {other:?}, which this renderer cannot explain; a \
+             new reason needs its sentence here, not a note beside the table"
+        ),
+    }
+}
+
+/// The verdict rows, label and variant together.
+const VERDICT_LABELS: [(&str, ReviewedVerdict); 3] = [
+    (
+        "the fallback answers a file the citing prose does not describe",
+        ReviewedVerdict::FallbackWrong,
+    ),
+    (
+        "the fallback is right and the anchor rule points elsewhere",
+        ReviewedVerdict::FallbackRight,
+    ),
+    (
+        "the sentence describes both candidates, so neither answer is wrong",
+        ReviewedVerdict::Ambiguous,
+    ),
+];
+
+/// What each anchor kind can and cannot show.
+const ANCHOR_KIND_MEANINGS: [(&str, &str); 2] = [
+    (
+        "prose",
+        "a token the citing prose prints, so the claim and its evidence are reviewable side by \
+         side",
+    ),
+    (
+        "line",
+        "a snapshot of the cited line, taken because the citing prose prints no such token: it \
+         detects the line moving or changing and cannot show the citation means the right thing",
+    ),
+];
+
 fn census_block_in(md: &str) -> String {
     let a = md
         .find(CENSUS_BLOCK_BEGIN)
@@ -1951,3 +2008,150 @@ fn regenerate_the_census_block() {
     )
     .expect("write the document");
 }
+
+/// **No snake_case name the two reconstructed sections print in backticks
+/// is one nothing in the tree defines.**
+///
+/// The generated regions close one class: a *set* of dataset labels
+/// repeated in prose beside the table it came from. They do not close
+/// the other: a single label named in a sentence — "the
+/// `occurrences_disagree` category" — which goes stale the moment the
+/// label is renamed, with nothing to say so.
+///
+/// **Banning single labels from prose is the wrong fix**, because it
+/// makes the prose unreadable: a section that has to say "the category
+/// the block names third" is worse than one that risks a rename. So the
+/// mention stays and this check makes a stale one fail. Every backticked
+/// snake_case token in the swept text must be a name something in the
+/// tree currently holds:
+///
+/// * a value one of the committed datasets holds, or one of their column
+///   names;
+/// * a `fn` the workspace defines.
+///
+/// **There is no hand list**, which is what distinguishes this from the
+/// pattern-matching the generated regions exist to avoid: both sides are
+/// read out of the tree, and a token that matches neither is named.
+#[test]
+fn no_backticked_name_in_the_reconstructed_sections_is_one_the_tree_does_not_hold() {
+    let md = read(QUERY_LOWERING);
+    let swept = swept_text(&md);
+    assert!(
+        swept.len() > 40,
+        "only {} lines were swept; the region markers moved and the sweep is looking at nothing",
+        swept.len()
+    );
+
+    // Everything the tree holds under a snake_case name.
+    let mut held: BTreeSet<String> = BTreeSet::new();
+    for path in [
+        CITATIONS_TSV,
+        UNRESOLVABLE_TSV,
+        COUNTS_TSV,
+        GATES_TSV,
+        "docs/benchmarks/data/traces-lowering-92-rebuilds.tsv",
+    ] {
+        for (n, line) in read(path).lines().enumerate() {
+            for cell in line.split('\t') {
+                let cell = cell.trim();
+                if is_snake_case(cell) {
+                    held.insert(cell.to_string());
+                }
+            }
+            let _ = n;
+        }
+    }
+    let artefact: serde_json::Value =
+        serde_json::from_str(&read("docs/benchmarks/data/traces-lowering-92.json"))
+            .expect("the artefact parses");
+    if let Some(row) = artefact["rows"].as_array().and_then(|a| a.first()) {
+        for k in row.as_object().expect("a row is an object").keys() {
+            held.insert(k.clone());
+        }
+    }
+    for f in tracked_rust_files() {
+        let src = read(&f);
+        let mut rest = src.as_str();
+        while let Some((_, tail)) = rest.split_once("fn ") {
+            let name: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if is_snake_case(&name) {
+                held.insert(name);
+            }
+            rest = tail;
+        }
+    }
+
+    let mut unknown: Vec<String> = Vec::new();
+    for (line_no, line) in &swept {
+        let mut rest = line.as_str();
+        while let Some((_, tail)) = rest.split_once('`') {
+            match tail.split_once('`') {
+                Some((tok, after)) => {
+                    if is_snake_case(tok) && !held.contains(tok) {
+                        unknown.push(format!("{QUERY_LOWERING}:{line_no} names `{tok}`"));
+                    }
+                    rest = after;
+                }
+                None => break,
+            }
+        }
+    }
+    assert!(
+        unknown.is_empty(),
+        "{} backticked name(s) in §9.2b's reproducibility passage or §12.3 are not held by any \
+         dataset and are defined by no function in the workspace:\n  {}",
+        unknown.len(),
+        unknown.join("\n  ")
+    );
+}
+
+fn is_snake_case(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The two reconstructed sections with the generated regions removed —
+/// the same spans the generated-block checks compare, taken from the
+/// same marker constants so the sweep and the checks cannot disagree
+/// about where the boundary is.
+fn swept_text(md: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = md.lines().collect();
+    let at = |needle: &str, from: usize| {
+        lines[from..]
+            .iter()
+            .position(|l| l.starts_with(needle))
+            .map(|i| i + from)
+            .unwrap_or_else(|| panic!("{QUERY_LOWERING} must carry a line starting {needle:?}"))
+    };
+    let r1a = at("**What is reproducible here, and what is not", 0);
+    let r1b = at("**The mechanism is adaptive granularity.**", r1a);
+    let r2a = at("### 12.3 The citations", 0);
+    let mut out = Vec::new();
+    for (a, b) in [(r1a, r1b), (r2a, lines.len())] {
+        let mut inside = false;
+        for (i, l) in lines.iter().enumerate().take(b).skip(a) {
+            if l.starts_with(REBUILD_BLOCK_BEGIN_MARK) {
+                inside = true;
+                continue;
+            }
+            if l.starts_with(CENSUS_BLOCK_END) {
+                inside = false;
+                continue;
+            }
+            if !inside {
+                out.push((i + 1, (*l).to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Both generated regions open with this and close with
+/// [`CENSUS_BLOCK_END`]; the sweep keys on the shared prefix so a new
+/// region does not need a third constant.
+const REBUILD_BLOCK_BEGIN_MARK: &str = "<!-- generated";
