@@ -11,20 +11,39 @@
 //! test could not read; that was true when it was written and is not
 //! true now.
 //!
-//! **Two of the eleven exist.** One reads
+//! **Three of the eleven exist.** One reads
 //! [`docs/api.md`](../../../docs/api.md), and it is the one that matters
 //! most for a wire surface: its two sides are genuinely independent
 //! producers — the keys come from a serializer and the expectation from a
 //! document in another directory, so neither can produce the other. The
-//! second is `every_superseded_lowered_cost_figure_carries_its_marker`,
-//! added by issue #492 part 4. The other **nine remain owed by part 8**
-//! (item 3 of that issue's scope enumeration).
+//! second is `the_documented_plan_example_round_trips_through_the_renderer_shape`.
+//! The third is `the_hops_diagram_and_the_document_agree_on_the_lowered_request`,
+//! added by issue #492 part 8's first landing. The other **nine remain
+//! owed by part 8's second landing** (item 3 of that issue's scope
+//! enumeration).
+//!
+//! **Issue #492 part 8, first landing: §9.2 stops being unreproducible.**
+//! `the_lowering_evidence_has_a_row_per_read`,
+//! `every_figure_section_9_2_states_is_the_one_the_artefact_holds` and
+//! `every_ratio_in_section_9_2_is_the_quotient_of_two_printed_figures`
+//! read [`docs/benchmarks/data/traces-lowering-92.json`], which holds one
+//! `system.query_log` row per statement, and compare every figure §9.2
+//! and §9.2b publish against a total over those rows. Before that
+//! landing the section's figures came from a run whose corpus was
+//! committed nowhere and whose rows had been discarded.
 //!
 //! **Two further tests in this file are not among the eleven** and are
 //! not claimed to be: `the_hops_diagram_marks_its_superseded_figures_on_its_own_face`
-//! and `the_record_flags_the_two_survivors_nobody_re_measured` assert
-//! that a superseded figure carries its marker, which is a different
-//! question from whether two artefacts agree.
+//! and `the_record_flags_the_survivor_nobody_re_measured` assert that a
+//! superseded figure carries its marker, which is a different question
+//! from whether two artefacts agree. The first of those **returns early
+//! now that the drawing is redrawn** — it is a conditional rule and its
+//! condition is false. What holds the drawing today is
+//! `the_hops_diagram_and_the_document_agree_on_the_lowered_request`,
+//! which lands in the same commit as the redraw, and
+//! `no_superseded_lowered_cost_figure_survives_the_re_measurement`, which
+//! asserts unconditionally that no superseded lowered figure is left on
+//! its face.
 
 use std::collections::BTreeSet;
 
@@ -268,10 +287,16 @@ const HOPS_SVG: &str = "docs/diagrams/query-lowering-hops.svg";
 /// The sentence both markers open with, so the record and the drawing
 /// cannot drift apart silently.
 const MARKER_SENTENCE: &str = "The same answer lowered is four statements, not one: 4 round trips.";
-/// The tag every surviving copy of the figure carries.
+/// The tag the superseded figure used to carry while it was still the
+/// document's live lowered total.
 const MARKER_TAG: &str = "seed + root only";
 /// The superseded figure itself.
 const SUPERSEDED_FIGURE: &str = "43,636";
+/// Issue #492 part 8. **The tag a retirement paragraph must carry.** The
+/// re-measurement replaced the figure, so it may still be NAMED — a
+/// reader who meets `43,636` elsewhere should find it accounted for —
+/// but only inside a paragraph that says it has been retired.
+const RETIREMENT_TAG: &str = "superseded by the §9.2 re-measurement";
 /// The wordings the correction replaces. Each was checked against both
 /// records: together they matched the seven changing sites and nothing
 /// else, so a contributor who edits an unrelated "two statements" line
@@ -299,7 +324,12 @@ const TWO_STATEMENT_WORDING: [&str; 8] = [
 ];
 
 const UNVERIFIED_TAG: &str = "Unverified survivors, nobody re-measured them";
-const UNVERIFIED_FIGURES: [&str; 3] = ["11,340", "169,311,055", "190,353,655"];
+/// Issue #492 part 8 narrowed this from three figures to one. The
+/// peak-memory pair was re-measured on C1 (§9.2b: `169,061,322` /
+/// `193,209,406` with a `1.14×`), so it is no longer a survivor; the
+/// client's `11,340 B` was measured on **corpus C2**, which part 8 did
+/// not rebuild, so it is carried forward still flagged.
+const UNVERIFIED_FIGURES: [&str; 1] = ["11,340"];
 
 fn repo_file(rel: &str) -> String {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -316,50 +346,71 @@ fn paragraphs(md: &str) -> Vec<&str> {
     md.split("\n\n").collect()
 }
 
-/// Issue #492 part 4. The two design records quote a lowered-cost figure
-/// that covers two of the four statements a lowered search issues. The
-/// figure stays until part 8 re-measures §9.2; what may not stay is an
-/// UNMARKED copy of it.
+/// **REPLACES `every_superseded_lowered_cost_figure_carries_its_marker`
+/// (issue #492 part 4), which part 8's re-measurement retired the
+/// subject of.**
 ///
-/// Three mechanical rules:
+/// Part 4's gate asserted that every paragraph quoting the two-statement
+/// lowered total also carried a `seed + root only` tag, and that the
+/// figure was quoted somewhere — a rule about a LIVE figure. §9.2b now
+/// measures all four lowered statements, so that figure is not this
+/// document's total any more and part 4's gate could not pass: its
+/// `seen > 0` clause is about a figure that is no longer stated. The
+/// gate is replaced rather than deleted, and the state it asserts is the
+/// new one.
 ///
-/// 1. `docs/query-lowering.md` carries the marker sentence and the tag;
-/// 2. in BOTH records, every paragraph naming the figure also carries the
-///    tag — which is what makes the marker findable by someone reading
-///    only one of them;
-/// 3. neither record still carries any of the five superseded wordings.
+/// Four rules:
+///
+/// 1. the drawing carries **neither** the superseded figure nor the tag,
+///    and none of the eight two-statement wordings — it is redrawn from
+///    the artefact, so there is nothing left to mark;
+/// 2. in BOTH records, every paragraph naming the figure or the tag also
+///    carries [`RETIREMENT_TAG`], so the number cannot be re-quoted as a
+///    live one;
+/// 3. `docs/query-lowering.md` names it at least once, so rule 2 is
+///    checking something;
+/// 4. neither record carries any of the five superseded wordings.
+///
+/// Whitespace is normalised before matching, because both records are
+/// hard-wrapped and a re-wrap must not turn into a failure.
 #[test]
-fn every_superseded_lowered_cost_figure_carries_its_marker() {
-    let lowering = repo_file(QUERY_LOWERING);
+fn no_superseded_lowered_cost_figure_survives_the_re_measurement() {
+    let svg = repo_file(HOPS_SVG);
+    for stale in [SUPERSEDED_FIGURE, MARKER_TAG] {
+        assert!(
+            !svg.contains(stale),
+            "{HOPS_SVG} still carries {stale:?}: part 8 redrew it from \
+             docs/benchmarks/data/traces-lowering-92.json, so no superseded lowered figure \
+             survives on its face"
+        );
+    }
+    let still_drawn: Vec<&str> = TWO_STATEMENT_WORDING
+        .into_iter()
+        .filter(|w| svg.contains(w))
+        .collect();
     assert!(
-        lowering.contains(MARKER_SENTENCE),
-        "{QUERY_LOWERING} carries no superseded marker: the sentence {MARKER_SENTENCE:?} appears \
-         nowhere in it"
+        still_drawn.is_empty(),
+        "{HOPS_SVG} still carries two-statement figures {still_drawn:?} after the redraw"
     );
-    assert!(
-        lowering.contains(MARKER_TAG),
-        "{QUERY_LOWERING} carries the marker sentence but not the tag {MARKER_TAG:?}, so a reader \
-         cannot tell WHICH figures are superseded"
-    );
+
+    let mut seen = 0usize;
     for rel in [QUERY_LOWERING, QUERY_TO_SQL] {
         let text = repo_file(rel);
-        let mut seen = 0usize;
         for para in paragraphs(&text) {
-            if !para.contains(SUPERSEDED_FIGURE) {
+            let flat = para.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !flat.contains(SUPERSEDED_FIGURE) && !flat.contains(MARKER_TAG) {
                 continue;
             }
-            seen += 1;
+            if rel == QUERY_LOWERING {
+                seen += 1;
+            }
             assert!(
-                para.contains(MARKER_TAG),
-                "{rel}: a paragraph quotes {SUPERSEDED_FIGURE} without the tag {MARKER_TAG:?}. It \
-                 opens: {:?}",
+                flat.contains(RETIREMENT_TAG),
+                "{rel}: a paragraph names {SUPERSEDED_FIGURE:?} or {MARKER_TAG:?} without saying \
+                 it is {RETIREMENT_TAG:?}. It opens: {:?}",
                 para.lines().next().unwrap_or("")
             );
         }
-        assert!(
-            seen > 0,
-            "{rel} quotes {SUPERSEDED_FIGURE} nowhere — this rule is checking nothing"
-        );
         for wording in SUPERSEDED_WORDING {
             assert!(
                 !text.contains(wording),
@@ -368,6 +419,11 @@ fn every_superseded_lowered_cost_figure_carries_its_marker() {
             );
         }
     }
+    assert!(
+        seen > 0,
+        "{QUERY_LOWERING} names {SUPERSEDED_FIGURE:?} nowhere — rule 2 is checking nothing, and a \
+         reader who meets the number elsewhere has no way to learn it was retired"
+    );
 }
 
 /// Issue #492 part 4. **The drawing says on its own face that its lowered
@@ -485,17 +541,16 @@ fn the_hops_diagram_marks_its_superseded_figures_on_its_own_face() {
     );
 }
 
-/// Issue #492 part 4. **The record flags the two figures nobody
-/// re-measured.**
+/// **The record flags the figure nobody re-measured.**
 ///
-/// The client's `11,340 B` and the peak-memory pair are not superseded by
-/// the statement-count correction — and nobody has re-measured them
-/// either, and neither corpus is standing, so the verdict rests on
-/// argument alone. A figure marked *survives* is never looked at again;
-/// this keeps the flag in the record so part 8 either re-measures both or
-/// says it did not.
+/// Issue #492 part 4 wrote this over three figures. Part 8 re-measured
+/// two of them — the peak-memory pair, on corpus C1 — and did **not**
+/// rebuild corpus C2, so the client's `11,340 B` is the one that is
+/// still carried on argument alone. The gate is narrowed to what is
+/// still true rather than deleted: a figure marked *survives* is never
+/// looked at again unless something keeps the flag in the record.
 #[test]
-fn the_record_flags_the_two_survivors_nobody_re_measured() {
+fn the_record_flags_the_survivor_nobody_re_measured() {
     let text = repo_file(QUERY_LOWERING);
     let para = paragraphs(&text)
         .into_iter()
@@ -529,4 +584,1228 @@ fn number_after(text: &str) -> Option<f64> {
 fn attr_number(text: &str, key: &str) -> Option<f64> {
     text.split_once(key)
         .and_then(|(_, rest)| number_after(rest))
+}
+
+// ---------------------------------------------------------------------
+// Issue #492 part 8 — §9.2 and §9.2b against the retained measurement
+//
+// Before part 8, §9.2's figures rested on a run whose corpus was
+// committed nowhere and whose `system.query_log` rows had been discarded,
+// so nothing in this repository could re-derive one of them. The
+// re-measurement retains ONE ROW PER STATEMENT
+// (`docs/benchmarks/data/traces-lowering-92.json`, written by
+// `cargo xtask bench traces-lowering`), and the three checks below total
+// those rows and compare every published cell against its total.
+// ---------------------------------------------------------------------
+
+/// The retained measurement: one object per `query_id`, never a summary.
+const LOWERING_EVIDENCE: &str = "docs/benchmarks/data/traces-lowering-92.json";
+
+const S92_HEADING: &str = "### 9.2 The worked query, per stage";
+const S92B_HEADING: &str = "### 9.2b The lowered request, per stage";
+const S93_HEADING: &str = "### 9.3 The correctness consequence, measured";
+
+/// Which request a statement belongs to.
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum Form {
+    Current,
+    Lowered,
+}
+
+/// Which KIND of read a statement is.
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum Stage {
+    Generator,
+    Hydration,
+    Membership,
+    RootRead,
+}
+
+/// The artefact's row, mirrored here because the producer type lives in
+/// `xtask`, which depends on this crate — importing it would pull the
+/// benchmark crate's two ClickHouse clients into the `ci` job's build.
+///
+/// `deny_unknown_fields` is load-bearing: it is what makes a producer
+/// field that reaches the file impossible to ignore. A key the mirror
+/// does not know is a hard deserialisation error, not a dropped field.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct LoweringStageRow {
+    form: Form,
+    stage: Stage,
+    #[allow(dead_code)]
+    query_id: String,
+    seq: u32,
+    read_rows: u64,
+    read_bytes: u64,
+    read_compressed_bytes: u64,
+    fd_read_bytes: u64,
+    result_bytes: u64,
+    selected_marks: u64,
+    memory_usage: u64,
+    max_block_size_submitted: u64,
+    settings_max_block_size_logged: String,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct LoweringEvidence {
+    #[allow(dead_code)]
+    clickhouse_version: String,
+    #[allow(dead_code)]
+    corpus: String,
+    #[allow(dead_code)]
+    query: String,
+    #[allow(dead_code)]
+    limit: u32,
+    rows: Vec<LoweringStageRow>,
+}
+
+/// Every `u64` field of the row schema, one variant each. The partition
+/// below is over THIS list, not over the document's columns: two
+/// accumulators share the `off file system †` header cell, so a
+/// header-keyed closure stays green when one of them stops summing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RowField {
+    ReadRows,
+    ReadBytes,
+    ReadCompressedBytes,
+    FdReadBytes,
+    SelectedMarks,
+    ResultBytes,
+    MemoryUsage,
+    MaxBlockSizeSubmitted,
+}
+
+impl RowField {
+    const ALL: [RowField; 8] = [
+        RowField::ReadRows,
+        RowField::ReadBytes,
+        RowField::ReadCompressedBytes,
+        RowField::FdReadBytes,
+        RowField::SelectedMarks,
+        RowField::ResultBytes,
+        RowField::MemoryUsage,
+        RowField::MaxBlockSizeSubmitted,
+    ];
+
+    /// No `_` arm: a new field fails to build until it names itself.
+    fn name(self) -> &'static str {
+        match self {
+            RowField::ReadRows => "read_rows",
+            RowField::ReadBytes => "read_bytes",
+            RowField::ReadCompressedBytes => "read_compressed_bytes",
+            RowField::FdReadBytes => "fd_read_bytes",
+            RowField::SelectedMarks => "selected_marks",
+            RowField::ResultBytes => "result_bytes",
+            RowField::MemoryUsage => "memory_usage",
+            RowField::MaxBlockSizeSubmitted => "max_block_size_submitted",
+        }
+    }
+
+    /// No `_` arm: a new field fails to build until it names its accessor.
+    fn get(self, row: &LoweringStageRow) -> u64 {
+        match self {
+            RowField::ReadRows => row.read_rows,
+            RowField::ReadBytes => row.read_bytes,
+            RowField::ReadCompressedBytes => row.read_compressed_bytes,
+            RowField::FdReadBytes => row.fd_read_bytes,
+            RowField::SelectedMarks => row.selected_marks,
+            RowField::ResultBytes => row.result_bytes,
+            RowField::MemoryUsage => row.memory_usage,
+            RowField::MaxBlockSizeSubmitted => row.max_block_size_submitted,
+        }
+    }
+}
+
+/// Row keys that carry a JSON number and are not a quantity.
+const NON_QUANTITY_ROW_KEYS: [(&str, &str); 1] = [(
+    "seq",
+    "a 0-based index within (form, stage), not a measurement",
+)];
+
+/// Why a field is deliberately not totalled. A closed set of two, never a
+/// free string: a rationale that lives only in prose cannot be checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotSummed {
+    /// §9.2 publishes this as a maximum over a named subset of rows,
+    /// never a total. A maximum cannot overflow, so it needs no
+    /// accumulator and gets none.
+    MaximumOverRows,
+    /// The value every statement was submitted with. Requirement (h) of
+    /// the criterion checks it: one distinct value across the artefact's
+    /// rows, equal to `equals`.
+    InstrumentConstant { equals: u64 },
+}
+
+impl NotSummed {
+    fn rendered(self) -> String {
+        match self {
+            NotSummed::MaximumOverRows => "maximum over rows".to_string(),
+            NotSummed::InstrumentConstant { equals } => {
+                format!("instrument constant = {equals}")
+            }
+        }
+    }
+}
+
+const DECLARED_NOT_SUMMED: [(RowField, NotSummed); 2] = [
+    (RowField::MemoryUsage, NotSummed::MaximumOverRows),
+    (
+        RowField::MaxBlockSizeSubmitted,
+        NotSummed::InstrumentConstant {
+            equals: pulsus_read::TRACE_SEARCH_MAX_BLOCK_ROWS,
+        },
+    ),
+];
+
+/// One accumulator, each carrying the header cell it answers to. Seven
+/// variants over six per-stage header cells, because `off file system †`
+/// has two candidate instruments and the harness records both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SummedColumn {
+    Queries,
+    RowsRead,
+    Decoded,
+    OffFileSystemCompressed,
+    OffFileSystemFd,
+    GranuleMarks,
+    ResultBytes,
+}
+
+impl SummedColumn {
+    const ALL: [SummedColumn; 7] = [
+        SummedColumn::Queries,
+        SummedColumn::RowsRead,
+        SummedColumn::Decoded,
+        SummedColumn::OffFileSystemCompressed,
+        SummedColumn::OffFileSystemFd,
+        SummedColumn::GranuleMarks,
+        SummedColumn::ResultBytes,
+    ];
+
+    /// `(per-stage header, comparison header)`. No `_` arm: a new variant
+    /// fails to build until it declares its headers.
+    fn headers(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            SummedColumn::Queries => ("queries", Some("round trips")),
+            SummedColumn::RowsRead => ("rows read", Some("rows read")),
+            SummedColumn::Decoded => ("decoded †", None),
+            SummedColumn::OffFileSystemCompressed => ("off file system †", None),
+            SummedColumn::OffFileSystemFd => ("off file system †", None),
+            SummedColumn::GranuleMarks => ("granules (avg)", Some("granules")),
+            SummedColumn::ResultBytes => ("result bytes", Some("result bytes")),
+        }
+    }
+
+    /// The row field this accumulator sums; `None` for the counter, which
+    /// sums one per row. No `_` arm: a new variant fails to build until
+    /// it names its field.
+    fn field(self) -> Option<RowField> {
+        match self {
+            SummedColumn::Queries => None,
+            SummedColumn::RowsRead => Some(RowField::ReadRows),
+            SummedColumn::Decoded => Some(RowField::ReadBytes),
+            SummedColumn::OffFileSystemCompressed => Some(RowField::ReadCompressedBytes),
+            SummedColumn::OffFileSystemFd => Some(RowField::FdReadBytes),
+            SummedColumn::GranuleMarks => Some(RowField::SelectedMarks),
+            SummedColumn::ResultBytes => Some(RowField::ResultBytes),
+        }
+    }
+
+    /// Expressed through [`Self::field`], so what a variant DECLARES it
+    /// sums and what it DOES sum are one fact rather than two hand-kept
+    /// ones.
+    fn value(self, row: &LoweringStageRow) -> u64 {
+        match self.field() {
+            None => 1,
+            Some(f) => f.get(row),
+        }
+    }
+}
+
+/// A running total that refuses rather than wrapping.
+///
+/// `Default` is hand-written: the derived one is `Total(None)`, which
+/// would make a stage with zero rows refuse instead of totalling zero —
+/// a silent inversion of the whole rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Total(Option<u64>);
+
+impl Default for Total {
+    fn default() -> Self {
+        Total(Some(0))
+    }
+}
+
+impl Total {
+    fn add(&mut self, v: u64) {
+        self.0 = self.0.and_then(|t| t.checked_add(v));
+    }
+    fn get(self, column: &str) -> Result<u64, String> {
+        self.0.ok_or_else(|| {
+            format!(
+                "docs/query-lowering.md §9.2: the total of column \"{column}\" over the \
+                 artefact's rows exceeds u64; this check refuses rather than summing wrapped"
+            )
+        })
+    }
+}
+
+/// Totals one column over a set of rows. **The only producer of a total
+/// in this file**; nothing else writes `+=` on a `u64` total.
+fn total_of(col: SummedColumn, rows: &[&LoweringStageRow]) -> Result<u64, String> {
+    let mut t = Total::default();
+    for r in rows {
+        t.add(col.value(r));
+    }
+    t.get(col.headers().0)
+}
+
+/// Accepts `m / 10^p` as a rendering of the exact quotient `n / d` iff it
+/// is within half of its last printed place:
+///
+/// ```text
+/// |n/d - m/10^p| <= 1/(2*10^p)   <=>   |2*n*10^p - 2*m*d| <= d
+/// ```
+///
+/// Evaluated exactly in `u128`. **`None` is a refusal**, not a verdict:
+/// the exact comparison does not fit, so the check fails rather than
+/// approximating. No floating point anywhere.
+fn accepts(n: u64, d: u64, m: u64, p: u32) -> Option<bool> {
+    if d == 0 {
+        return None;
+    }
+    let pow = 10u128.checked_pow(p)?;
+    let lhs = 2u128.checked_mul(n as u128)?.checked_mul(pow)?;
+    let rhs = 2u128.checked_mul(m as u128)?.checked_mul(d as u128)?;
+    Some(lhs.abs_diff(rhs) <= d as u128)
+}
+
+/// The three groups every row-schema field falls into.
+#[derive(Debug)]
+struct Partition {
+    summed: Vec<(&'static str, Vec<&'static str>)>,
+    declared_not_summed: Vec<(&'static str, String)>,
+    uncovered: Vec<&'static str>,
+}
+
+impl Partition {
+    /// The committed rendering. A field moving between groups changes a
+    /// line here, so taking the exclusion escape hatch cannot be silent.
+    fn rendered(&self) -> String {
+        let mut out = String::new();
+        for (field, headers) in &self.summed {
+            out.push_str(&format!(
+                "{:<19} {} <- {}\n",
+                "summed",
+                field,
+                headers.join(", ")
+            ));
+        }
+        for (field, why) in &self.declared_not_summed {
+            out.push_str(&format!(
+                "{:<19} {} ({})\n",
+                "declared_not_summed", field, why
+            ));
+        }
+        for field in &self.uncovered {
+            out.push_str(&format!("{:<19} {}\n", "UNCOVERED", field));
+        }
+        out
+    }
+}
+
+/// Puts every `RowField::ALL` entry in exactly one of three groups.
+/// A field that is BOTH summed and declared is `uncovered`, because two
+/// answers to "is this totalled?" is not an answer.
+fn partition(accumulators: &[SummedColumn], excluded: &[(RowField, NotSummed)]) -> Partition {
+    let mut p = Partition {
+        summed: Vec::new(),
+        declared_not_summed: Vec::new(),
+        uncovered: Vec::new(),
+    };
+    for field in RowField::ALL {
+        let headers: Vec<&'static str> = accumulators
+            .iter()
+            .filter(|a| a.field() == Some(field))
+            .map(|a| a.headers().0)
+            .collect();
+        let declared = excluded.iter().find(|(f, _)| *f == field).map(|(_, w)| *w);
+        match (headers.is_empty(), declared) {
+            (false, None) => p.summed.push((field.name(), headers)),
+            (true, Some(why)) => p.declared_not_summed.push((field.name(), why.rendered())),
+            _ => p.uncovered.push(field.name()),
+        }
+    }
+    p
+}
+
+/// The committed partition, byte for byte.
+const EXPECTED_PARTITION: &str = "\
+summed              read_rows <- rows read
+summed              read_bytes <- decoded †
+summed              read_compressed_bytes <- off file system †
+summed              fd_read_bytes <- off file system †
+summed              selected_marks <- granules (avg)
+summed              result_bytes <- result bytes
+declared_not_summed memory_usage (maximum over rows)
+declared_not_summed max_block_size_submitted (instrument constant = 4096)
+";
+
+/// The document cell each `(form, stage)` pair is checked against.
+/// No `_` arm: adding a form or a stage fails to build here.
+fn queries_cell(form: Form, stage: Stage) -> (&'static str, &'static str) {
+    match (form, stage) {
+        (Form::Current, Stage::Generator) => ("§9.2", "phase-1 generator"),
+        (Form::Current, Stage::Hydration) => ("§9.2", "phase-2 hydration"),
+        (Form::Current, Stage::Membership) => ("§9.2", "phase-2 membership"),
+        (Form::Current, Stage::RootRead) => ("§9.2", "winners' root read"),
+        (Form::Lowered, Stage::Generator) => ("§9.2b", "lowered generator"),
+        (Form::Lowered, Stage::Hydration) => ("§9.2b", "lowered hydration"),
+        (Form::Lowered, Stage::Membership) => ("§9.2b", "lowered membership"),
+        (Form::Lowered, Stage::RootRead) => ("§9.2b", "winners' root read"),
+    }
+}
+
+fn lowering_evidence() -> LoweringEvidence {
+    let text = repo_file(LOWERING_EVIDENCE);
+    serde_json::from_str(&text).unwrap_or_else(|e| {
+        panic!("{LOWERING_EVIDENCE} must parse as the retained measurement: {e}")
+    })
+}
+
+/// The slice of `md` from `heading` up to `end`.
+///
+/// **Sections are sliced before any header row is matched.** The header
+/// shape `| | round trips |` occurs twice in this document, in §9.2's
+/// comparison table and again in §9.6 with different columns, so a check
+/// that finds a table by matching the header against the whole file gets
+/// the right answer only because §9.2 comes first.
+fn section<'a>(md: &'a str, heading: &str, end: &str) -> &'a str {
+    let start = md
+        .find(heading)
+        .unwrap_or_else(|| panic!("{QUERY_LOWERING} must carry the heading {heading:?}"));
+    assert_eq!(
+        md.matches(heading).count(),
+        1,
+        "{QUERY_LOWERING} carries {heading:?} more than once; the slice would be ambiguous"
+    );
+    let rest = &md[start..];
+    let len = rest
+        .find(end)
+        .unwrap_or_else(|| panic!("{QUERY_LOWERING}: {heading:?} is not followed by {end:?}"));
+    &rest[..len]
+}
+
+/// Every markdown table in `slice`, as rows of trimmed cells. The
+/// `|---|` separator row is dropped.
+fn tables(slice: &str) -> Vec<Vec<Vec<String>>> {
+    let mut out: Vec<Vec<Vec<String>>> = Vec::new();
+    let mut current: Vec<Vec<String>> = Vec::new();
+    for line in slice.lines() {
+        let line = line.trim();
+        if line.starts_with('|') {
+            let cells: Vec<String> = line
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim().to_string())
+                .collect();
+            if cells
+                .iter()
+                .all(|c| c.chars().all(|ch| ch == '-' || ch == ':') && !c.is_empty())
+            {
+                continue;
+            }
+            current.push(cells);
+        } else if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Strips the markdown a figure can be dressed in — bold, code ticks,
+/// thousands separators, the `×` a ratio carries — and nothing else.
+fn bare(cell: &str) -> String {
+    cell.replace("**", "")
+        .replace(['`', ',', '×'], "")
+        .trim()
+        .to_string()
+}
+
+/// A figure as `u64`. Never through `f64`: a figure at or above 2^53
+/// would compare equal to its neighbour there, which is a false green.
+fn figure(cell: &str, what: &str) -> u64 {
+    let b = bare(cell);
+    b.parse::<u64>().unwrap_or_else(|_| {
+        panic!("docs/query-lowering.md §9.2: {cell:?} is not a u64 figure ({what})")
+    })
+}
+
+/// A printed decimal as `(m, p)`: `149.9` is `(1499, 1)`, `1,106` is
+/// `(1106, 0)`, `282×` is `(282, 0)`.
+fn rendering(cell: &str, what: &str) -> (u64, u32) {
+    let b = bare(cell);
+    match b.split_once('.') {
+        None => (
+            b.parse::<u64>().unwrap_or_else(|_| {
+                panic!("docs/query-lowering.md §9.2: {cell:?} is not a printed number ({what})")
+            }),
+            0,
+        ),
+        Some((whole, frac)) => {
+            let joined = format!("{whole}{frac}");
+            (
+                joined.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("docs/query-lowering.md §9.2: {cell:?} is not a printed number ({what})")
+                }),
+                u32::try_from(frac.len()).expect("a printed place count fits u32"),
+            )
+        }
+    }
+}
+
+/// The granules cell: `avg` optionally followed by ` (min A, max B)`.
+fn granules_cell(cell: &str) -> ((u64, u32), Option<(u64, u64)>) {
+    match cell.split_once(" (min ") {
+        None => (rendering(cell, "granules average"), None),
+        Some((avg, rest)) => {
+            let inner = rest.trim_end_matches(')').trim_end_matches("**");
+            let (lo, hi) = inner
+                .split_once(", max ")
+                .unwrap_or_else(|| panic!("granules cell {cell:?} must read `avg (min A, max B)`"));
+            (
+                rendering(avg, "granules average"),
+                Some((figure(lo, "granules min"), figure(hi, "granules max"))),
+            )
+        }
+    }
+}
+
+/// **The artefact holds one row per read, and the counts come from the
+/// document rather than from the file's own length.**
+///
+/// For each of the eight `(form, stage)` pairs the corresponding §9.2 or
+/// §9.2b `queries` cell states a count; the artefact must hold exactly
+/// that many rows with `seq` contiguous from 0. The total is the sum of
+/// the eight cells, and every `query_id` is distinct — so a row that
+/// summarises another row cannot hide inside the file.
+///
+/// *RED when:* a row is deleted (the pair's count and the missing `seq`
+/// are both named), or a row's `form` is changed (both halves of the move
+/// are named, which is the edit a single `stage` string could not even
+/// express).
+#[test]
+fn the_lowering_evidence_has_a_row_per_read() {
+    let evidence = lowering_evidence();
+    let md = repo_file(QUERY_LOWERING);
+    let s92 = section(&md, S92_HEADING, S92B_HEADING);
+    let s92b = section(&md, S92B_HEADING, S93_HEADING);
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut expected_total = 0u64;
+    for form in [Form::Current, Form::Lowered] {
+        for stage in [
+            Stage::Generator,
+            Stage::Hydration,
+            Stage::Membership,
+            Stage::RootRead,
+        ] {
+            let (section_name, label) = queries_cell(form, stage);
+            let slice = if section_name == "§9.2" { s92 } else { s92b };
+            let stated = per_stage_row(slice, section_name, label);
+            let stated = figure(&stated[1], "queries");
+            expected_total += stated;
+
+            let mut held: Vec<&LoweringStageRow> = evidence
+                .rows
+                .iter()
+                .filter(|r| r.form == form && r.stage == stage)
+                .collect();
+            held.sort_by_key(|r| r.seq);
+            if held.len() as u64 != stated {
+                failures.push(format!(
+                    "{form:?}/{stage:?}: docs/query-lowering.md {section_name} states {stated} \
+                     reads for {label:?}, the artefact holds {}",
+                    held.len()
+                ));
+            }
+            for (i, row) in held.iter().enumerate() {
+                if row.seq as usize != i {
+                    failures.push(format!(
+                        "{form:?}/{stage:?}: seq {i} is missing; the artefact must hold every \
+                         read, not a summary"
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    assert_eq!(
+        evidence.rows.len() as u64,
+        expected_total,
+        "{LOWERING_EVIDENCE} holds {} rows; the eight (form, stage) cells of §9.2 and §9.2b state \
+         {expected_total} between them",
+        evidence.rows.len()
+    );
+    let ids: BTreeSet<&str> = evidence.rows.iter().map(|r| r.query_id.as_str()).collect();
+    assert_eq!(
+        ids.len(),
+        evidence.rows.len(),
+        "{LOWERING_EVIDENCE} carries a repeated query_id: {} rows, {} distinct ids — one row per \
+         statement is the contract",
+        evidence.rows.len(),
+        ids.len()
+    );
+}
+
+/// The data row of `slice`'s per-stage table whose first cell is `label`.
+fn per_stage_row(slice: &str, section_name: &str, label: &str) -> Vec<String> {
+    let table = tables(slice)
+        .into_iter()
+        .find(|t| {
+            t.first()
+                .is_some_and(|h| h.first().is_some_and(|c| c == "stage"))
+        })
+        .unwrap_or_else(|| panic!("{section_name} must carry a per-stage table"));
+    table
+        .into_iter()
+        .find(|r| bare(&r[0]) == label)
+        .unwrap_or_else(|| panic!("{section_name}'s per-stage table has no {label:?} row"))
+}
+
+/// **Every figure §9.2 and §9.2b state is the one the artefact holds.**
+///
+/// Nine requirements, in the order the criterion lists them:
+///
+/// (a) every total is produced by [`total_of`], which refuses rather than
+///     wrapping and names the column when it does;
+/// (b) the header set closes both ways against the three tables;
+/// (c) the granules column is checked through its numerator with
+///     [`accepts`], never in floating point;
+/// (d) `off file system †` is checked against whichever instrument §9.2
+///     NAMES, with both totalled through `total_of` regardless;
+/// (e) every numeric key the artefact holds is classified;
+/// (f) every row-schema field is summed or declared, never neither and
+///     never both, and the three-group partition is committed;
+/// (g) each accessor returns its own field, and there is exactly one
+///     counter;
+/// (h) the `InstrumentConstant` declaration is checked, not asserted;
+/// (i) both tables are located inside their own section first.
+///
+/// (e), (f) and (g) close the coverage over three different domains — the
+/// artefact's keys, the schema's fields, and the document's columns —
+/// because no one of them subsumes the others. Two accumulators declare
+/// the same header cell, so deleting either leaves the header closure
+/// green while a field silently stops being totalled.
+#[test]
+fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
+    let evidence = lowering_evidence();
+    let md = repo_file(QUERY_LOWERING);
+    // (i) — slice first, match header rows inside the slice.
+    let s92 = section(&md, S92_HEADING, S92B_HEADING);
+    let s92b = section(&md, S92B_HEADING, S93_HEADING);
+    let s92_to_93 = section(&md, S92_HEADING, S93_HEADING);
+
+    // ---- (e) closure A: the artefact's numeric keys -----------------
+    let raw: serde_json::Value =
+        serde_json::from_str(&repo_file(LOWERING_EVIDENCE)).expect("the artefact is valid JSON");
+    let mut numeric_keys: BTreeSet<String> = BTreeSet::new();
+    for row in raw["rows"].as_array().expect("the artefact carries rows") {
+        for (k, v) in row.as_object().expect("each row is an object") {
+            if v.is_number() {
+                numeric_keys.insert(k.clone());
+            }
+        }
+    }
+    let covered: BTreeSet<String> = RowField::ALL
+        .iter()
+        .map(|f| f.name().to_string())
+        .chain(NON_QUANTITY_ROW_KEYS.iter().map(|(k, _)| k.to_string()))
+        .collect();
+    let unknown: Vec<&String> = numeric_keys.difference(&covered).collect();
+    let absent: Vec<&String> = covered.difference(&numeric_keys).collect();
+    assert!(
+        unknown.is_empty(),
+        "docs/query-lowering.md §9.2 gate: the artefact's rows carry numeric key {:?} that no \
+         RowField covers",
+        unknown.first().map(|s| s.as_str()).unwrap_or("")
+    );
+    assert!(
+        absent.is_empty(),
+        "docs/query-lowering.md §9.2 gate: RowField {absent:?} names a key the artefact's rows do \
+         not carry"
+    );
+
+    // ---- (f) closure B: the row schema's fields ---------------------
+    let part = partition(&SummedColumn::ALL, &DECLARED_NOT_SUMMED);
+    assert!(
+        part.uncovered.is_empty(),
+        "docs/query-lowering.md §9.2 gate: LoweringStageRow field(s) {:?} are summed by no \
+         accumulator and are not in DECLARED_NOT_SUMMED; a field that is deliberately not \
+         totalled must say so and say why",
+        part.uncovered
+    );
+    assert_eq!(
+        part.rendered(),
+        EXPECTED_PARTITION,
+        "docs/query-lowering.md §9.2 gate: the summed/not-summed partition of the row schema moved"
+    );
+
+    // ---- (g) the accessors, and exactly one counter -----------------
+    let counters: Vec<SummedColumn> = SummedColumn::ALL
+        .into_iter()
+        .filter(|c| c.field().is_none())
+        .collect();
+    assert_eq!(
+        counters.len(),
+        1,
+        "exactly one SummedColumn counts rows rather than summing a field; found {counters:?}"
+    );
+    for target in RowField::ALL {
+        let sentinel = 700 + RowField::ALL.iter().position(|f| *f == target).unwrap() as u64;
+        let mut obj = serde_json::Map::new();
+        obj.insert("form".into(), serde_json::json!("current"));
+        obj.insert("stage".into(), serde_json::json!("generator"));
+        obj.insert("query_id".into(), serde_json::json!("sentinel"));
+        obj.insert("seq".into(), serde_json::json!(0));
+        obj.insert(
+            "settings_max_block_size_logged".into(),
+            serde_json::json!(""),
+        );
+        for f in RowField::ALL {
+            obj.insert(
+                f.name().into(),
+                serde_json::json!(if f == target { sentinel } else { 0 }),
+            );
+        }
+        let row: LoweringStageRow = serde_json::from_value(serde_json::Value::Object(obj))
+            .expect("the sentinel row deserialises");
+        assert_eq!(
+            target.get(&row),
+            sentinel,
+            "RowField::{target:?}'s accessor does not return its own field"
+        );
+    }
+
+    // ---- (h) the instrument constant --------------------------------
+    let submitted: BTreeSet<u64> = evidence
+        .rows
+        .iter()
+        .map(|r| r.max_block_size_submitted)
+        .collect();
+    assert_eq!(
+        submitted.len(),
+        1,
+        "docs/query-lowering.md §9.2 gate: max_block_size_submitted is declared an instrument \
+         constant but the artefact holds {} distinct values {submitted:?}",
+        submitted.len()
+    );
+    let submitted = *submitted.iter().next().expect("one value");
+    assert_eq!(
+        submitted,
+        pulsus_read::TRACE_SEARCH_MAX_BLOCK_ROWS,
+        "the artefact was measured at max_block_size {submitted}; the search path submits {}",
+        pulsus_read::TRACE_SEARCH_MAX_BLOCK_ROWS
+    );
+    let logged: Vec<&LoweringStageRow> = evidence
+        .rows
+        .iter()
+        .filter(|r| !r.settings_max_block_size_logged.is_empty())
+        .collect();
+    assert!(
+        !logged.is_empty(),
+        "no row carries settings_max_block_size_logged: the server logged the setting on none of \
+         the {} statements, so the artefact has no server-side witness of what was applied",
+        evidence.rows.len()
+    );
+    for row in &logged {
+        let parsed = row
+            .settings_max_block_size_logged
+            .parse::<u64>()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "settings_max_block_size_logged {:?} does not parse as u64: {e}",
+                    row.settings_max_block_size_logged
+                )
+            });
+        assert_eq!(
+            parsed, submitted,
+            "the server logged max_block_size {parsed} for {}, the harness submitted {submitted}",
+            row.query_id
+        );
+    }
+
+    // ---- (b) closure C: the document's columns ----------------------
+    let per_stage_headers = |slice: &str, name: &str| -> Vec<String> {
+        tables(slice)
+            .into_iter()
+            .find(|t| {
+                t.first()
+                    .is_some_and(|h| h.first().is_some_and(|c| c == "stage"))
+            })
+            .unwrap_or_else(|| panic!("{name} must carry a per-stage table"))[0]
+            .clone()
+    };
+    let s92_headers = per_stage_headers(s92, "§9.2");
+    let s92b_headers = per_stage_headers(s92b, "§9.2b");
+    assert_eq!(
+        s92_headers, s92b_headers,
+        "§9.2 and §9.2b must publish the same per-stage columns"
+    );
+    let comparison = tables(s92_to_93)
+        .into_iter()
+        .find(|t| {
+            t.first()
+                .is_some_and(|h| h.first().is_some_and(|c| c.is_empty()))
+        })
+        .expect("§9.2 must carry a comparison table whose header row opens with an empty cell");
+    let comparison_headers = comparison[0].clone();
+
+    let declared_per_stage: BTreeSet<&str> =
+        SummedColumn::ALL.iter().map(|c| c.headers().0).collect();
+    let declared_comparison: BTreeSet<&str> = SummedColumn::ALL
+        .iter()
+        .filter_map(|c| c.headers().1)
+        .collect();
+    let per_stage_cells: BTreeSet<&str> = s92_headers.iter().skip(1).map(|s| s.as_str()).collect();
+    let comparison_cells: BTreeSet<&str> = comparison_headers
+        .iter()
+        .skip(1)
+        .map(|s| s.as_str())
+        .collect();
+    let per_stage_uncovered: Vec<&&str> = per_stage_cells.difference(&declared_per_stage).collect();
+    let comparison_uncovered: Vec<&&str> =
+        comparison_cells.difference(&declared_comparison).collect();
+    assert!(
+        per_stage_uncovered.is_empty(),
+        "docs/query-lowering.md §9.2 has a column {:?} that no accumulator covers",
+        per_stage_uncovered.first().map(|s| **s).unwrap_or("")
+    );
+    assert!(
+        comparison_uncovered.is_empty(),
+        "docs/query-lowering.md §9.2's comparison table has a column {:?} that no accumulator \
+         covers",
+        comparison_uncovered.first().map(|s| **s).unwrap_or("")
+    );
+    let per_stage_absent: Vec<&&str> = declared_per_stage.difference(&per_stage_cells).collect();
+    let comparison_absent: Vec<&&str> = declared_comparison.difference(&comparison_cells).collect();
+    assert!(
+        per_stage_absent.is_empty(),
+        "an accumulator declares the per-stage header {per_stage_absent:?}, which §9.2 does not \
+         carry"
+    );
+    assert!(
+        comparison_absent.is_empty(),
+        "an accumulator declares the comparison header {comparison_absent:?}, which §9.2's \
+         comparison table does not carry"
+    );
+
+    // ---- (d) which instrument the document names --------------------
+    let named: Vec<SummedColumn> = [
+        (SummedColumn::OffFileSystemCompressed, "ReadCompressedBytes"),
+        (
+            SummedColumn::OffFileSystemFd,
+            "ReadBufferFromFileDescriptorReadBytes",
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, counter)| s92.contains(counter))
+    .map(|(c, _)| c)
+    .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "§9.2 must name exactly one instrument for its `off file system †` column; it names \
+         {named:?}"
+    );
+    let off_file_system = named[0];
+
+    // ---- (a) + (c) the cells themselves -----------------------------
+    let mut checked = 0usize;
+    for (form, slice, section_name) in
+        [(Form::Current, s92, "§9.2"), (Form::Lowered, s92b, "§9.2b")]
+    {
+        let mut form_rows: Vec<&LoweringStageRow> = Vec::new();
+        for stage in [
+            Stage::Generator,
+            Stage::Hydration,
+            Stage::Membership,
+            Stage::RootRead,
+        ] {
+            let (_, label) = queries_cell(form, stage);
+            let rows: Vec<&LoweringStageRow> = evidence
+                .rows
+                .iter()
+                .filter(|r| r.form == form && r.stage == stage)
+                .collect();
+            form_rows.extend(rows.iter().copied());
+            let cells = per_stage_row(slice, section_name, label);
+            checked += check_per_stage_row(
+                &cells,
+                &s92_headers,
+                &rows,
+                off_file_system,
+                section_name,
+                label,
+            );
+        }
+        let cells = per_stage_row(slice, section_name, "total");
+        checked += check_per_stage_row(
+            &cells,
+            &s92_headers,
+            &form_rows,
+            off_file_system,
+            section_name,
+            "total",
+        );
+    }
+
+    // The comparison table's two operand rows.
+    for (label, form) in [("today", Form::Current), ("lowered", Form::Lowered)] {
+        let cells = comparison
+            .iter()
+            .find(|r| bare(&r[0]) == label)
+            .unwrap_or_else(|| panic!("§9.2's comparison table has no {label:?} row"));
+        let rows: Vec<&LoweringStageRow> =
+            evidence.rows.iter().filter(|r| r.form == form).collect();
+        for (i, header) in comparison_headers.iter().enumerate().skip(1) {
+            let col = SummedColumn::ALL
+                .into_iter()
+                .find(|c| c.headers().1 == Some(header.as_str()))
+                .unwrap_or_else(|| panic!("no accumulator for comparison column {header:?}"));
+            let total = total_of(col, &rows).unwrap_or_else(|e| panic!("{e}"));
+            let stated = figure(&cells[i], header);
+            assert_eq!(
+                stated, total,
+                "docs/query-lowering.md §9.2's comparison table states {stated} for {label} \
+                 {header}; the artefact totals to {total}"
+            );
+            checked += 1;
+        }
+    }
+
+    assert!(
+        checked >= 60,
+        "only {checked} cells were compared; §9.2 and §9.2b carry ten table rows of six figures \
+         plus eight comparison cells, so a much smaller number means the tables were not found"
+    );
+
+    // Criterion 4: the total is derived from rows that exist, so the
+    // phrase that flagged it as underived is gone.
+    assert!(
+        !s92.contains("not independent evidence"),
+        "§9.2 still calls a total \"not independent evidence\"; the artefact holds every read, so \
+         the total and the per-read unit are two readings of the same rows"
+    );
+    assert!(
+        s92.contains(LOWERING_EVIDENCE),
+        "§9.2 must name the artefact its figures are totals over ({LOWERING_EVIDENCE})"
+    );
+}
+
+/// One per-stage table row against the rows it summarises. Returns the
+/// number of cells compared, so the caller can assert it found a table
+/// rather than an empty one.
+fn check_per_stage_row(
+    cells: &[String],
+    headers: &[String],
+    rows: &[&LoweringStageRow],
+    off_file_system: SummedColumn,
+    section_name: &str,
+    label: &str,
+) -> usize {
+    let mut checked = 0usize;
+    for (i, header) in headers.iter().enumerate().skip(1) {
+        let cell = &cells[i];
+        match header.as_str() {
+            "granules (avg)" => {
+                let numerator =
+                    total_of(SummedColumn::GranuleMarks, rows).unwrap_or_else(|e| panic!("{e}"));
+                let queries =
+                    total_of(SummedColumn::Queries, rows).unwrap_or_else(|e| panic!("{e}"));
+                let ((m, p), range) = granules_cell(cell);
+                if label == "total" {
+                    // The total row states the SUM, not a mean.
+                    assert_eq!(
+                        m, numerator,
+                        "{section_name} states {m} total granules; the artefact totals to \
+                         {numerator}"
+                    );
+                    assert_eq!(p, 0, "{section_name}'s granule total is a whole number");
+                } else {
+                    assert_eq!(
+                        accepts(numerator, queries, m, p),
+                        Some(true),
+                        "docs/query-lowering.md {section_name}: {numerator} / {queries} is not \
+                         within half of the last printed place of {cell:?} for {label} granules \
+                         (avg)"
+                    );
+                    if let Some((lo, hi)) = range {
+                        let observed_lo = rows.iter().map(|r| r.selected_marks).min().unwrap_or(0);
+                        let observed_hi = rows.iter().map(|r| r.selected_marks).max().unwrap_or(0);
+                        assert_eq!(
+                            (lo, hi),
+                            (observed_lo, observed_hi),
+                            "{section_name} states granules (min {lo}, max {hi}) for {label}; the \
+                             artefact holds (min {observed_lo}, max {observed_hi})"
+                        );
+                    }
+                }
+            }
+            "off file system †" => {
+                // BOTH instruments are totalled through `total_of`,
+                // whichever one the document names.
+                let compressed = total_of(SummedColumn::OffFileSystemCompressed, rows)
+                    .unwrap_or_else(|e| panic!("{e}"));
+                let fd =
+                    total_of(SummedColumn::OffFileSystemFd, rows).unwrap_or_else(|e| panic!("{e}"));
+                let total = match off_file_system {
+                    SummedColumn::OffFileSystemCompressed => compressed,
+                    _ => fd,
+                };
+                let stated = figure(cell, header);
+                assert_eq!(
+                    stated, total,
+                    "docs/query-lowering.md {section_name} states {stated} for {label} {header}; \
+                     the artefact totals to {total}"
+                );
+            }
+            other => {
+                let col = SummedColumn::ALL
+                    .into_iter()
+                    .find(|c| c.headers().0 == other)
+                    .unwrap_or_else(|| panic!("no accumulator for per-stage column {other:?}"));
+                let total = total_of(col, rows).unwrap_or_else(|e| panic!("{e}"));
+                let stated = figure(cell, header);
+                assert_eq!(
+                    stated, total,
+                    "docs/query-lowering.md {section_name} states {stated} for {label} {header}; \
+                     the artefact totals to {total}"
+                );
+            }
+        }
+        checked += 1;
+    }
+    checked
+}
+
+/// **Every ratio §9.2 prints is the quotient of two figures printed
+/// beside it**, and the printed value is within half of its last printed
+/// place. Evaluated exactly in `u128`; `accepts` returning `None` is a
+/// refusal, which fails the check rather than approximating.
+///
+/// Two families:
+///
+/// * the comparison table's `ratio` row — four ratios whose operands are
+///   the two rows immediately above, in the same table;
+/// * the byte renderings §9.2 and §9.2b print for reading, each checked
+///   against the raw byte figure in the table above it with
+///   `d = 1024^k`. A one-place GiB rendering admits a wide band, so the
+///   rendering is checked as a rounding of the raw figure and never
+///   instead of it — the raw `u64` is what the figure check gates.
+#[test]
+fn every_ratio_in_section_9_2_is_the_quotient_of_two_printed_figures() {
+    let md = repo_file(QUERY_LOWERING);
+    let s92 = section(&md, S92_HEADING, S92B_HEADING);
+    let s92b = section(&md, S92B_HEADING, S93_HEADING);
+    let s92_to_93 = section(&md, S92_HEADING, S93_HEADING);
+
+    let comparison = tables(s92_to_93)
+        .into_iter()
+        .find(|t| {
+            t.first()
+                .is_some_and(|h| h.first().is_some_and(|c| c.is_empty()))
+        })
+        .expect("§9.2 must carry a comparison table");
+    let headers = comparison[0].clone();
+    let row = |label: &str| -> Vec<String> {
+        comparison
+            .iter()
+            .find(|r| bare(&r[0]) == label)
+            .unwrap_or_else(|| panic!("§9.2's comparison table has no {label:?} row"))
+            .clone()
+    };
+    let today = row("today");
+    let lowered = row("lowered");
+    let ratio = row("ratio");
+
+    let mut checked = 0usize;
+    for (i, header) in headers.iter().enumerate().skip(1) {
+        let n = figure(&today[i], header);
+        let d = figure(&lowered[i], header);
+        let (m, p) = rendering(&ratio[i], header);
+        assert_eq!(
+            accepts(n, d, m, p),
+            Some(true),
+            "docs/query-lowering.md §9.2: {n} / {d} is not within half of the last printed place \
+             of {} for the {header} ratio",
+            ratio[i]
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked,
+        headers.len() - 1,
+        "every column of the comparison table carries a ratio"
+    );
+
+    // The byte renderings, each against the raw total in its own table.
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let rendered_bytes = |slice: &str, name: &str, column: &str, unit: u64, unit_name: &str| {
+        let table = tables(slice)
+            .into_iter()
+            .find(|t| {
+                t.first()
+                    .is_some_and(|h| h.first().is_some_and(|c| c == "stage"))
+            })
+            .unwrap_or_else(|| panic!("{name} must carry a per-stage table"));
+        let col = table[0]
+            .iter()
+            .position(|h| h == column)
+            .unwrap_or_else(|| panic!("{name} has no {column:?} column"));
+        let total_row = table
+            .iter()
+            .find(|r| bare(&r[0]) == "total")
+            .unwrap_or_else(|| panic!("{name} has no total row"));
+        let raw = figure(&total_row[col], column);
+        // The sentence that renders it: "**102.12 GiB** decoded".
+        let needle = format!(" {unit_name}**");
+        let printed: Vec<(u64, u32)> = slice
+            .match_indices(&needle)
+            .map(|(i, _)| {
+                let head = &slice[..i];
+                let start = head.rfind("**").expect("the rendering is bold");
+                rendering(&head[start + 2..], column)
+            })
+            .collect();
+        assert!(
+            !printed.is_empty(),
+            "{name} states no {unit_name} rendering, so this rule is checking nothing"
+        );
+        let ok = printed
+            .iter()
+            .any(|(m, p)| accepts(raw, unit, *m, *p) == Some(true));
+        assert!(
+            ok,
+            "{name}: none of the printed {unit_name} renderings {printed:?} is within half of its \
+             last printed place of {raw} / {unit} for {column:?}"
+        );
+    };
+    rendered_bytes(s92, "§9.2", "decoded †", GIB, "GiB");
+    rendered_bytes(s92, "§9.2", "off file system †", GIB, "GiB");
+    rendered_bytes(s92b, "§9.2b", "decoded †", MIB, "MiB");
+    rendered_bytes(s92b, "§9.2b", "off file system †", MIB, "MiB");
+
+    // Every ratio §9.2 or §9.2b prints in PROSE is written as
+    // `**<m>×** = <n> / <d>` — the value, then the division it comes
+    // from. Scraping numbers out of a paragraph and taking the largest
+    // over the smallest is not a check: it silently picks the wrong
+    // operands. This form names them.
+    let mut prose_ratios = 0usize;
+    for (slice, name) in [(s92, "§9.2"), (s92b, "§9.2b")] {
+        for (i, _) in slice.match_indices("×** = ") {
+            let head = &slice[..i];
+            let open = head
+                .rfind("**")
+                .unwrap_or_else(|| panic!("{name}: a prose ratio is not opened with `**`"));
+            let (m, p) = rendering(&head[open + 2..], "prose ratio");
+            let tail = &slice[i + "×** = ".len()..];
+            let expr: &str = tail.split(['.', ';', '\n']).next().unwrap_or("");
+            let (n_text, d_text) = expr
+                .split_once(" / ")
+                .unwrap_or_else(|| panic!("{name}: prose ratio {m}/10^{p} does not print `n / d`"));
+            let n = figure(n_text, "prose ratio numerator");
+            let d = figure(
+                d_text.split_whitespace().next().unwrap_or(""),
+                "prose ratio denominator",
+            );
+            assert_eq!(
+                accepts(n, d, m, p),
+                Some(true),
+                "docs/query-lowering.md {name}: {n} / {d} is not within half of the last printed \
+                 place of the ratio it is printed beside"
+            );
+            prose_ratios += 1;
+        }
+    }
+    assert!(
+        prose_ratios > 0,
+        "neither §9.2 nor §9.2b prints a ratio in prose, so this rule is checking nothing"
+    );
+}
+
+/// **The hops drawing's lowered figures are §9.2b's.**
+///
+/// A picture asserts a design more confidently than a sentence, and this
+/// one carried a two-statement lowered model for three rounds while the
+/// prose beside it said four. The drawing now names the two counters it
+/// states about the lowered request in `id` attributes, and this check
+/// reads them by id and compares them with the document.
+///
+/// **What it does not compare:** the drawing's TODAY band, its rows and
+/// granules, and every word of prose on its face. Those are not this
+/// gate's subject, and §11.3 records that limit.
+#[test]
+fn the_hops_diagram_and_the_document_agree_on_the_lowered_request() {
+    let svg = repo_file(HOPS_SVG);
+    let md = repo_file(QUERY_LOWERING);
+    let s92_to_93 = section(&md, S92_HEADING, S93_HEADING);
+    let comparison = tables(s92_to_93)
+        .into_iter()
+        .find(|t| {
+            t.first()
+                .is_some_and(|h| h.first().is_some_and(|c| c.is_empty()))
+        })
+        .expect("§9.2 must carry a comparison table");
+    let headers = comparison[0].clone();
+    let lowered = comparison
+        .iter()
+        .find(|r| bare(&r[0]) == "lowered")
+        .expect("§9.2's comparison table has a lowered row");
+    let cell = |header: &str| -> u64 {
+        let i = headers
+            .iter()
+            .position(|h| h == header)
+            .unwrap_or_else(|| panic!("§9.2's comparison table has no {header:?} column"));
+        figure(&lowered[i], header)
+    };
+
+    let drawn = |id: &str| -> u64 {
+        let node = svg
+            .split_once(&format!("<text id=\"{id}\""))
+            .unwrap_or_else(|| panic!("{HOPS_SVG} must carry a <text id=\"{id}\"> node"))
+            .1
+            .split_once('>')
+            .expect("the node's tag is closed")
+            .1
+            .split_once("</text>")
+            .expect("the node is closed")
+            .0;
+        figure(node.split_whitespace().next().unwrap_or(""), id)
+    };
+
+    let drawn_trips = drawn("lowered-round-trips");
+    let stated_trips = cell("round trips");
+    assert_eq!(
+        drawn_trips, stated_trips,
+        "the hops diagram counts {drawn_trips} lowered round trips; docs/query-lowering.md §9.2 \
+         counts {stated_trips}"
+    );
+    let drawn_bytes = drawn("lowered-result-bytes");
+    let stated_bytes = cell("result bytes");
+    assert_eq!(
+        drawn_bytes, stated_bytes,
+        "the hops diagram states {drawn_bytes} lowered result bytes; docs/query-lowering.md §9.2 \
+         states {stated_bytes}"
+    );
 }
