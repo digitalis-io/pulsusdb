@@ -129,6 +129,21 @@ const MAX_GROUP_BYS: usize = 5;
 /// (the reference's parser/validator wording has never been an
 /// identity); the status, the accept/reject decision and the checked
 /// surface are what match the reference, vector for vector.
+///
+/// **One rendering difference cuts across every variant whose message
+/// quotes an expression**, and is recorded rather than fixed: a STRING
+/// static is quoted `"x"` here and `` `x` `` by the reference, whatever
+/// the surrounding operator. Ours renders it through `Value`'s
+/// `Display`, which calls `quote` — a double-quoted literal with `\`,
+/// `"` and the whitespace characters escaped
+/// (`crates/pulsus-traceql/src/ast.rs:823` and `:1410-1425`) — where the
+/// reference's `Static.String()` wraps the raw bytes in backticks and
+/// escapes nothing (`pkg/traceql/ast_stringer.go:83-84` and `:101-108`
+/// @ Tempo v3.0.2). Measured on both sides 2026-09-08 and ledgered as
+/// `traceql-error-body-string-static-quoting-differs`
+/// (`docs/benchmarks/traces-differential-ledger.md`). It is the same
+/// shared-renderer change the two parenthesisation rows name, and is
+/// scheduled with them.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidateError {
     /// `ast_validate.go:198-219` — both operands of a comparison must

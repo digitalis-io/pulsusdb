@@ -43,13 +43,14 @@ use std::path::PathBuf;
 /// issue #492 item 9 and is in [`WITHDRAWN`] instead — the same edit that
 /// records a retirement.
 ///
-/// **The last two rows are recordings, not gaps.** Issue #492 item 9's
-/// code review measured two places where a `400` body quotes an
-/// expression and our rendering differs from the reference's — `!(1)`
-/// against `!1`, and `.a = nil && 1` against `(.a = nil) && 1`. The
-/// renderer is shared by every construct, so the fix is scheduled
-/// separately and the rows are what stands in the meantime. Their owner
-/// is the file that builds the two messages.
+/// **The last three rows are recordings, not gaps.** Issue #492 item 9's
+/// code review measured three ways a `400` body quotes an expression
+/// differently from the reference — `!(1)` against `!1`,
+/// `.a = nil && 1` against `(.a = nil) && 1`, and a string static
+/// `"x"` against `` `x` ``. The renderer is shared by every construct,
+/// so the fix is scheduled separately and the rows are what stands in
+/// the meantime. Their owner is the file that builds the three
+/// messages.
 ///
 /// **One row of item 9's three is deliberately NOT here.**
 /// `traceql-midpipeline-filter-before-metrics-stage-unsupported` is a
@@ -60,7 +61,7 @@ use std::path::PathBuf;
 /// and it is pinned separately, by
 /// `traces::metrics_plan::tests::the_metrics_refusal_names_the_mid_pipeline_spanset_filter`,
 /// which asserts its body byte for byte.
-const LEDGER_IDS: [&str; 10] = [
+const LEDGER_IDS: [&str; 11] = [
     "traceql-spanset-aggregate-double-lexical-form",
     "traceql-spanset-aggregate-mixed-type-attribute",
     "traceql-spanset-aggregate-string-attribute-contributes",
@@ -71,6 +72,7 @@ const LEDGER_IDS: [&str; 10] = [
     "traceql-select-before-midpipeline-filter-empty",
     "traceql-error-body-unary-not-parenthesises-its-operand",
     "traceql-error-body-binary-does-not-parenthesise-its-operands",
+    "traceql-error-body-string-static-quoting-differs",
 ];
 
 /// The rows WITHDRAWN, each paired with phrases from the measurement that
@@ -501,7 +503,7 @@ fn the_api_section_states_the_measured_rules_and_not_the_retired_ones() {
 /// would pass on every row.
 #[test]
 fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
-    const OWNERS: [(&str, &str); 10] = [
+    const OWNERS: [(&str, &str); 11] = [
         (
             "traceql-spanset-aggregate-double-lexical-form",
             "crates/pulsus-read/src/traces/search_eval.rs",
@@ -540,6 +542,10 @@ fn every_ledger_row_is_referenced_from_the_artefact_that_owns_it() {
         ),
         (
             "traceql-error-body-binary-does-not-parenthesise-its-operands",
+            "crates/pulsus-traceql/src/validate.rs",
+        ),
+        (
+            "traceql-error-body-string-static-quoting-differs",
             "crates/pulsus-traceql/src/validate.rs",
         ),
     ];

@@ -2531,7 +2531,8 @@ when we are asking it to slow down, so we keep `429`; recorded as
   validate refusals (`ApiError::QueryText`,
   `crates/pulsus-server/src/traces_api/querytext.rs:185,194`, matching the
   reference's own middleware wrapping at
-  `modules/frontend/async_query_validator_middleware.go:51,54` @ v3.0.2)
+  `modules/frontend/pipeline/async_query_validator_middleware.go:51,54`
+  @ v3.0.2)
   and does not prefix a plan refusal (`ApiError::Plan`,
   `crates/pulsus-server/src/traces_api/error.rs:303`). Both were measured
   on 2026-09-08 against a server on this branch: the body below came back
@@ -2679,7 +2680,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   `Attribute` (`ast_stringer.go:245-255`); the message is built at
   `pkg/traceql/ast_validate.go:295`. Ours renders the whole
   `FieldExpr::Unary` through its own `Display`
-  (`crates/pulsus-traceql/src/validate.rs:513`), and that `Display` writes
+  (`crates/pulsus-traceql/src/validate.rs:555`), and that `Display` writes
   `!({expr})` for every operand without exception
   (`crates/pulsus-traceql/src/ast.rs:387`).
 
@@ -2762,7 +2763,7 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (`:245-255`); the message is built at
   `pkg/traceql/ast_validate.go:214`. Ours builds the text from the two
   operands separately — `format!("{lhs} {op} {rhs}")`,
-  `crates/pulsus-traceql/src/validate.rs:518` — so no wrapping rule is
+  `crates/pulsus-traceql/src/validate.rs:560` — so no wrapping rule is
   applied at all: whatever parentheses appear come from each operand's own
   `Display` (`crates/pulsus-traceql/src/ast.rs:373-415`), which
   parenthesises `&&`/`||` and arithmetic at their own top level and leaves
@@ -2775,21 +2776,125 @@ when we are asking it to slow down, so we keep `429`; recorded as
   (.a = nil) && 1`, measured in the same run. The prefix difference is
   `traceql-parse-error-body-differs-by-route`'s, not this row's.
 
-- **One further difference was measured in the same run and is NOT
-  recorded, here or anywhere.** String statics render backticked on the
-  reference and double-quoted here: `{svc} | { !"x" }` gives
-  `` illegal operation for the given type: !`x` `` there and
-  `illegal operation for the given type: !("x")` here — two differences in
-  one body, the quoting and this row's parenthesisation. String spellings
-  are kept out of both tables above for that reason. The quoting
-  difference is flagged on issue #492 and has no row until it is
-  scheduled.
+- **A third difference was measured in the same run and has its own row
+  below.** String statics are backticked by the reference and
+  double-quoted here — `traceql-error-body-string-static-quoting-differs`.
+  String spellings are kept out of both tables above so that no line here
+  differs in two ways at once: `{svc} | { !"x" }`, for one, carries the
+  quoting AND the parenthesisation, which is why it is evidence for
+  neither table.
 
 - **Triage.** Recorded, **not fixed**, for the reason the row above gives:
   the renderer is shared by every construct, and neither item 9's plan nor
   its code review examined it.
 
 - **Disposition.** No code change.
+
+### `traceql-error-body-string-static-quoting-differs` (issue #492 item 9, code review round 2) — **the same refusal, with the quoted string spelled differently**
+
+- **Route.** `GET /api/traces/v1/search` and its `/api/search` alias — the
+  refusal is the same handler on both paths, and both were measured.
+
+- **What.** When `validate` refuses an expression, the `400` body quotes
+  it. A STRING static inside that expression is wrapped in **backticks**
+  by the reference and in **double quotes** here. Status, content type and
+  message text are the same; only the string's spelling differs.
+
+  Measured **2026-09-08**, our server on this branch against an instance
+  of the pinned reference build started for this work; here to
+  `/api/traces/v1/search` **and** to the `/api/search` alias, which
+  returned byte-identical bodies on every query in this row; there to
+  `/api/search`. Every line is a `400` on both sides with
+  `content-type: text/plain; charset=utf-8`. `{svc}` is
+  `{ resource.service.name = "p9f2" }`.
+
+  **Each line below differs in ONE way.** Both operands are statics, and
+  neither side parenthesises a static, so the two parenthesisation rows
+  above do not reach these bodies.
+
+  | query | reference body tail, verbatim | our body tail, verbatim |
+  |---|---|---|
+  | `{svc} \| { "x" = 1 }` | ``binary operations must operate on the same type: `x` = 1`` | `binary operations must operate on the same type: "x" = 1` |
+  | `{svc} \| { 1 = "x" }` | ``binary operations must operate on the same type: 1 = `x` `` | `binary operations must operate on the same type: 1 = "x"` |
+  | ``{svc} \| { `x` = 1 }`` | ``binary operations must operate on the same type: `x` = 1`` | `binary operations must operate on the same type: "x" = 1` |
+
+  Both bodies carry the route's `invalid TraceQL query: ` prefix ahead of
+  the tail shown, on both sides; all six responses were 79 bytes. **The
+  third line is written with backticks on both sides**, and each side
+  still answers in its own spelling — so this is a re-rendering of the
+  parsed value, not an echo of the text the caller sent.
+
+  **Three controls, where the two sides agree byte for byte**, so the row
+  is not read as "our statics all render differently":
+
+  | query | both sides |
+  |---|---|
+  | `{svc} \| { true = 1 }` | `binary operations must operate on the same type: true = 1` |
+  | `{svc} \| { 1s = true }` | `binary operations must operate on the same type: 1s = true` |
+  | `{svc} \| { name = 1 }` | `binary operations must operate on the same type: name = 1` |
+
+- **The escaping differs with the delimiter, and that is the same rule.**
+  Measured in the same run:
+
+  | query | reference body tail | our body tail |
+  |---|---|---|
+  | `{svc} \| { "a\"b" = 1 }` | ``binary operations must operate on the same type: `a"b` = 1`` (81 bytes) | `binary operations must operate on the same type: "a\"b" = 1` (82 bytes) |
+  | ``{svc} \| { "a`b" = 1 }`` | ``binary operations must operate on the same type: `a`b` = 1`` | ``binary operations must operate on the same type: "a`b" = 1`` |
+
+  The reference escapes nothing inside its backticks, so the second line's
+  reference body **cannot be read back by the reference**: sent
+  ``{svc} | { `a`b` = 1 }``, it answers `400`
+  `invalid TraceQL query: parse error at line 1, col 43: syntax error: unexpected IDENTIFIER`
+  (we answer `400 unterminated string starting at byte 43`). Ours escapes
+  its own delimiter, so our rendering re-parses — the first line's query
+  IS our rendering of that value, and it reached the type check.
+
+- **The same difference appears in a unary body, and that body is NOT
+  this row's evidence:** `{svc} | { !"x" }` gives
+  `` illegal operation for the given type: !`x` `` there and
+  `illegal operation for the given type: !("x")` here — the quoting and
+  the parenthesisation of
+  `traceql-error-body-unary-not-parenthesises-its-operand`, two
+  differences in one body.
+
+- **The rule on each side.** The reference renders a static with
+  `Static.String()`, which is `EncodeToString(true)`; its `TypeString`
+  arm returns the raw bytes between backticks and escapes nothing
+  (`pkg/traceql/ast_stringer.go:83-84` and `:101-108` @ v3.0.2). Statics
+  are also the case `wrapElement` returns unwrapped (`:245-255`), which is
+  why these lines carry no parenthesisation difference. Ours renders
+  `Value::String` through `quote`
+  (`crates/pulsus-traceql/src/ast.rs:823` and `:1410-1425`): a
+  double-quoted literal escaping `\`, `"`, `\n`, `\t` and `\r`, which is
+  the spelling the corpus round-trip goldens read back. The message text
+  itself is built in `validate` — `:560` for the binary form and `:555`
+  for the unary one (`crates/pulsus-traceql/src/validate.rs`) — from an
+  already-rendered expression, so neither line chooses the quoting.
+
+- **Where else it shows.** `GET /api/traces/v1/metrics/query_range` gives
+  ours `invalid TraceQL query: binary operations must operate on the same
+  type: "x" = 1` against the reference's `/api/metrics/query_range`
+  ``compiling query: binary operations must operate on the same type: `x` = 1``,
+  measured in the same run. The *prefix* difference there is not this
+  row's subject and is already recorded, by route, in
+  `traceql-parse-error-body-differs-by-route` above.
+
+- **Triage.** Recorded, **not fixed**. `Value`'s `Display` is the renderer
+  for every string in this engine — corpus round-trip goldens, SQL
+  goldens and pinned `400` bodies all read it — so backticking it is a
+  change to how every rendered string appears, not a change to this
+  message. This is the third of the three rendering rows; the
+  task-manager's ruling of 2026-09-08 on issue #492 sends all three to
+  one scheduled renderer change with one review.
+
+- **Disposition.** No code change. The refusal, the status, the content
+  type and the prefix already match; the divergence is confined to the
+  spelling of a string static inside the quoted expression.
+
+- **Why the id is not `traceql-validate-…`.** For the reason
+  `traceql-error-body-unary-not-parenthesises-its-operand` states above:
+  that prefix is reserved for rows where the two sides reach different
+  VERDICTS, and both sides reject every query here.
 
 ### `traceql-spanset-aggregate-precedes-grouping` — **WITHDRAWN: the ordered pipeline fold retired it (issues #510, #492 item 2)**
 
