@@ -1200,6 +1200,16 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | link | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|
 | `Source` — `SpansetExpr` (`ast.rs:99`) | — → `Spans` | none; lowers by §2.4's lattice | n/a — the seed is always applied. An unlowerable leaf contributes `1` and clears `exact` | **always lowers, possibly partially** | *none*, unless the selector is a disjunction over two sources — then `Cut::DisjointSources` (§2.7.4) |
+| `Hydrate` (synthesised, `traces/compile.rs:169`) | any → same shape | **never lowers** (`No(NotYetLowered)`) — the batch hydration read is a second statement over a different source keyed by this statement's result, and no SQL form has been written that would put it INTO the seed statement. That is what `NotYetLowered` says here, as against `Never`: nothing about the read is impossible, only unwritten | **none — the identity.** The read adds rows the evaluator consults; it rewrites no column's provenance and narrows no predicate. The row asserts the identity rather than leaving the exemption silent | never lowers | **`Cut::SourceHandoff`** (§2.7.2) — source `trace_spans` (hydration), key `trace_id`, `SeedBound::Config { reader.traceql_max_candidates }` |
+| `Membership(i)` (synthesised, `:172`) | any → same shape | never lowers (`No(NotYetLowered)`), same reason as `Hydrate`. `i` indexes `SearchPlan::probes`, so one attribute probe is one link and one statement | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_attrs_idx` (membership), key `trace_id`, `SeedBound::Config` |
+| `AggValues(i)` (synthesised, `:175`) | any → same shape | never lowers (`No(NotYetLowered)`). `i` indexes `SearchPlan::agg_fields`: one aggregate operand's `val_num` batch read | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_attrs_idx` (values), key `trace_id`, `SeedBound::Config` |
+| `SelectValues(i)` (synthesised, `:178`) | any → same shape | never lowers (`No(NotYetLowered)`). `i` indexes `SearchPlan::select_attrs`: one `select()` field's `val` batch read. It shares a source with `AggValues` and is a separate link because it is a separate statement | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_attrs_idx` (values), key `trace_id`, `SeedBound::Config` |
+| `EventSet(i)` (synthesised, `:181`) | any → same shape | never lowers (`No(NotYetLowered)`). `i` indexes `SearchPlan::event_sets`: one span-event / span-link value-set batch read | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_attrs_idx` (event sets), key `trace_id`, `SeedBound::Config` |
+| `TraceCtx` (synthesised, `:183`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, and the reason is the co-load's REACH rather than a missing SQL form: the trace-context read is deliberately trace-wide and unwindowed, so `traceDuration`, `rootName` and `rootServiceName` evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state | **none — the identity** | **never lowers, in any state** | **`Cut::SourceHandoff`** — source `trace_spans` (trace context), key `trace_id`, `SeedBound::Config` |
+| `ChildCount` (synthesised, `:185`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, same reason: `span:childCount` is counted over the whole trace, not over the window | **none — the identity** | never lowers, in any state | **`Cut::SourceHandoff`** — source `trace_spans` (child counts), key `trace_id`, `SeedBound::Config` |
+| `Structural` (synthesised, `:187`) | any → same shape | **`Never(StructuralRelation)`** — the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it | **clears `exact`** — the generators are the superset union of both operands' sets and the relation is applied afterwards, so the SQL means strictly more than the query | never lowers, in any state | *none* — the link reads no new source, so there is no handoff and no second part |
+| `NestedSet` (synthesised, `:189`) | any → same shape | **`Never(NestedSetNumbering)`** — a modified-preorder numbering computed per trace at query time; no stored column carries it | **clears `exact`** | never lowers, in any state | *none* — same reason |
+| `BoolTruth` (synthesised, `:192`) | any → same shape | **`Never(WholeQueryTypeFailure)`** — one row's type must fail the WHOLE request (a present non-boolean operand under `!` is an error for the query, not a non-match for the span) and SQL evaluates row by row | **clears `exact`** | never lowers, in any state | *none* — same reason |
 | `Aggregate { op, field, cmp, value }` (`ast.rs:994`) | `Spans` → `Traces` | `exact`, **no fragment already in this statement's `HAVING`**, and a fragment `aggregate_having_sql` will render for this (aggregate, operator) pair and this grouping | **shape unchanged** — whatever the fold has accumulated, not reset to `Spans`; **clears `exact`** — the evaluator will drop traces the SQL returned | conditional, **over the accepted payload set only** (above) | *none* |
 | `By { key }` (`ast.rs:1046`) | `Spans` → `Groups{key}` | never lowers (`No(NotYetLowered)`) — the evaluator builds the span sets | **shape unchanged**; records the key as an evaluator-owned group consumer; and then EITHER records `grouping` and leaves `exact` alone, when the key renders on this generator's source and the slot is free and the relation is still exact, OR clears `exact` | never lowers | *none* |
 | `Coalesce` (`ast.rs:1049`), after a `By` | `Groups` → `Spans` | the level carries no `HAVING` — then the grouping slot is FREED. With a `HAVING` it refuses: the aggregate selected groups, and the spans it selected are not recoverable | **shape unchanged** — `Groups` in the ordinary case, but `Spans` if the preceding `By` was itself residual; clears `exact` when it refuses | conditional | *none* |
@@ -1234,6 +1244,12 @@ Four consequences fall out of the table rather than being written down.
 - **The three metrics variants are not chain links at all on this route.** They are listed so the
   enumeration is complete against the AST rather than against the search planner's subset; a reader
   checking `PipelineStage` against this table finds every variant.
+- **The table is complete against `TqlLink`, not only against `PipelineStage`, and that is new in
+  part 8.** It used to carry rows for 5 of the enum's 15 variants — `Source`, `Pipe(_)`, `Order`,
+  `Limit` and `Emit` — while calling itself the complete link set, and three of the missing ten
+  (`Hydrate`, `Membership(n)`, `SelectValues(n)`) appear in **every** rendered plan on the search
+  route. `every_traceql_chain_link_has_a_row_in_the_lowering_document` enumerates the enum
+  exhaustively with no `_` arm, so a sixteenth variant fails to build rather than going unlisted.
 
 ### 3.2 Group 1 — cannot be lowered
 
@@ -1719,6 +1735,7 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 
 | link | source | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|---|
+| `Source` | the stream selector (`LogQL`'s `{…}`) | — → `Lines` | none; the seed is lowered by the predicate lattice rather than by the stage fold, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts the identity rather than leaving the exemption silent (`logql/compile.rs:314-317`) | **always lowers**, `Fidelity::Equivalent` | *none* |
 | `Window` | `LogRange` (`ast.rs:2301`) + the request step | `Lines`\|`Samples` → the same, bucketed | the origin-shifted bucket expression is emittable and the offset is representable | records the bucketing as evaluator-owned, so a following aggregation cannot lower | conditional | *none* |
 | `RangeAgg` | `MetricExpr::Range` (`ast.rs:940`) | `Samples` → `Series{by}` | `exact`, the `Window` lowered, and `__error__` either filtered or carried in the grouping | **shape unchanged** — `Lines` whenever the `Unwrap` above went residual, which is the case its own row describes; clears `exact` | conditional. `AbsentOverTime` is `Never`: the answer is a statement about rows that are **absent**, so there is no row to compute it from | *none* |
 | `VectorAgg`, one link per level | `MetricExpr::Vector` (`ast.rs:956`) | `Series` → `Series` | the prior level lowered and the grouping is expressible | retains the prior series state; clears `exact` | conditional | *none* |
@@ -1960,6 +1977,23 @@ peaks at 190,817,746 B of database memory against the unlowered generator's 167,
 Every ratio this section prints is written that way — the value, then the division it comes from —
 so a reader can check it without leaving the paragraph, and
 `every_ratio_in_section_9_2_is_the_quotient_of_two_printed_figures` checks every one of them.
+
+**Both memory figures are phase-1 generators', and an earlier revision said otherwise.** It
+published `169,311,055 B` as *"the loop's maximum"*. It is not a loop figure at all. Over the same
+request there are two different maxima and this revision names which is which:
+
+| quantity | scope | this measurement |
+|---|---|---|
+| the unlowered phase-1 generator's peak | one statement, `max(memory_usage)` over the single `(current, generator)` row | **167,629,277 B** |
+| the phase-2 loop's peak | 1,126 statements, `max(memory_usage)` over every `(current, hydration)` and `(current, membership)` row | **26,084,032 B** |
+| the lowered phase-1 generator's peak | one statement, `max(memory_usage)` over the single `(lowered, generator)` row | **190,817,746 B** |
+
+The loop's real peak is **6.4 times smaller** than the figure that was labelled as its maximum, and
+the number of that size belongs to the generator. **Nothing but the retained rows could have shown
+this**: a total, or a single published maximum, looks the same whichever subset it was taken over.
+That is the argument for committing one row per statement rather than a summary, and it is why
+`memory_usage` is the one quantity in this section with no accumulator — it is a maximum over a
+*named* subset, never a total, and the check that reads this artefact refuses to sum it.
 
 **Where the round trips go.** The round-trip count is `1 + 2·ceil(k/32) + 1` where `k` is the index
 of the `limit`-th qualifying candidate in `bound_ts DESC` order. On C1 as this harness builds it a
@@ -4876,25 +4910,32 @@ can be checked against an artefact either — including "under-checked" just abo
 about the earlier `Drop`/`Keep` revision below.
 
 **Every link with a stated residual state effect gets a row.** Counted off the document's own
-tables: **8** in §3.1 (`Aggregate`, `By`, grouped `Coalesce`, `Select`, `Filter`, `Order`, `Limit`,
-`Emit`) and **20** in §7.1 — 13 `Pipe` rows (`LineFilter`, the four `Parser` forms, `LabelFilter`,
-`LineFormat`, `LabelFormat`, `Unwrap`, `Unpack`, `Decolorize`, `Drop`, `Keep`) and 7 synthesised
-(`Window`, `RangeAgg`, `VectorAgg`, `LabelReplace`, `Order`, `Limit`, `Emit`) — **28 effects in
-all**. The two chain links whose stated effect is *none* — `Source`, and `Coalesce` with no
-preceding `By`, both §3.1 — are to get a row too, asserting the effect **is** the identity, so the
-exemption is itself a check rather than a silence. So `logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states` is specified to
-carry **20** rows and `traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states` **10**
-— in **wave 1**, which writes both; neither exists at base.
+tables: **11** in §3.1 (`Structural`, `NestedSet`, `BoolTruth`, `Aggregate`, `By`, grouped
+`Coalesce`, `Select`, `Filter`, `Order`, `Limit`, `Emit`) and **20** in §7.1 — 13 `Pipe` rows
+(`LineFilter`, the four `Parser` forms, `LabelFilter`, `LineFormat`, `LabelFormat`, `Unwrap`,
+`Unpack`, `Decolorize`, `Drop`, `Keep`) and 7 synthesised (`Window`, `RangeAgg`, `VectorAgg`,
+`LabelReplace`, `Order`, `Limit`, `Emit`) — **31** effects in all. The **ten** chain links whose
+stated effect is *none* — §3.1's `Source`, `Coalesce` with no preceding `By` and seven per-batch
+reads (`Hydrate`, the four indexed phase-2 reads and the two trace-wide co-loads), and **§7.1's
+`Source`, which part 8 added: `LqlLink::Source` had no row at all, so §7.1 called itself the
+complete LogQL link set while omitting a variant, the same defect §3.1 carried** — are to get a row
+too, asserting the effect **is** the identity, so the exemption is itself a check
+rather than a silence. So
+`logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states` is specified to
+carry **21** rows and
+`traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states` **20** — in
+**wave 1**, which writes both; neither exists at base.
 
-The TraceQL count above is this section's own derivation from §3.1 and is **not** the shipped
-test's row count. That test exists and carries **21** rows: the ten derived here, plus the ten
-per-batch read and engine links issue #492 part 3 added (`Hydrate`, the four indexed phase-2 reads,
-the two trace-wide co-loads, `Structural`, `NestedSet`, `BoolTruth`), which §3.1's table does not
-enumerate, plus **one more row for `By`** — the shipped test gives `By` a row per key branch, one
-key that renders and one that does not, where §3.1 gives it a single row. Ten plus ten plus one.
-The shipped row count is gated —
-`assert_every_residual_state_effect::<Tql>(&rows, 21)` in
-`crates/pulsus-read/src/traces/compile.rs` — while the derivation above is prose and is not.
+**Part 8 closed the gap this paragraph used to describe.** Before it, §3.1 enumerated 5 of
+`TqlLink`'s 15 variants, so this section's derivation from §3.1 came to ten while the shipped test
+carried twenty-one, and the eleven-row difference had to be explained in prose. §3.1 now carries a
+row for every variant, so the derivation is **20**, and the shipped test's **21** is that plus
+**one more row for `By`** — the shipped test gives `By` a row per key branch, one key that renders
+and one that does not, where §3.1 gives it a single row. Twenty plus one. The shipped row count is
+gated — `assert_every_residual_state_effect::<Tql>(&rows, 21)` in
+`crates/pulsus-read/src/traces/compile.rs` — and
+`the_document_states_the_residual_effect_counts_the_gates_assert` now gates the derivation against
+it, so neither side is prose alone.
 
 The five other cells reading `n/a` or `none` belong to rows the tables mark **not in the chain** —
 §3.1's `Metric`, `MetricSecondStage` and `Compare`, and §7.1's `MetricExpr::Literal`/`VectorFn` and
@@ -5014,7 +5055,7 @@ satisfy.
 list is to be enumerated by an exhaustive `match` over the link type with no `_` arm, so that once
 the gate exists, adding a variant will fail to build it. That forces a *name* for the new link; it
 does not by itself force a *row*. The closure is to be the count, all of it in **wave 1**: the LogQL gate is to assert it
-has **20** rows and the TraceQL gate **10**, and §11.3's
+has **21** rows and the TraceQL gate **20**, and §11.3's
 `the_document_states_the_residual_effect_counts_the_gates_assert` is to assert the same numbers read
 from this document's own tables. §11.3's four variant gates —
 `every_logql_stage_variant_has_a_row_in_the_lowering_document`,
@@ -5038,10 +5079,11 @@ the *effect* cell. The first parse written for this section did exactly that and
 **And the three link tables are one column wider than they were.** §3.1's, §7.1's ten-`Stage` and
 §7.1's synthesised-link tables each gained a **continuation** column, appended after `disposition`
 so that no existing column index moved. Every parse in §11.2b and §11.3 — including
-`the_document_states_the_residual_effect_counts_the_gates_assert`, **wave 1**, which reads the
-residual-effect counts **8**/**5** and **20**/**2** out of these same tables — must be written
-against the widened tables and must index the effect column from the left, never from the right. The
-counts themselves did not move: a column was added, no row was.
+`the_document_states_the_residual_effect_counts_the_gates_assert`, which reads the
+residual-effect counts **11**/**12** and **20**/**3** out of these same tables — must be written
+against the widened tables and must index the effect column from the left, never from the right.
+Adding the column moved no count; **part 8's rows did**, and the four numbers above are that
+section's counts after it.
 
 What none of these will see, once **wave 1** has written them, is a row whose **literal `expected`
 values are BOTH wrong in the same
@@ -5069,8 +5111,8 @@ set against [api.md](api.md).
 | every `pulsus_logql::Stage` variant has a row in §7.1 — to be enumerated by an exhaustive `match` with no `_` arm, so that adding a variant will fail to build here | `test(=every_logql_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
 | every `pulsus_traceql::PipelineStage` variant has a row in §3.1, same construction | `test(=every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
 | every `LqlLink` variant has a row in §7.1, same construction — this is where adding a link variant will redden, once wave 1 has written it | `test(=every_lql_link_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every TraceQL chain link — the eight `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit` — has a row in §3.1 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| §3.1 carries exactly **8** rows with a residual state effect and **5** without; §7.1 carries exactly **20** and **2** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** |
+| every `TqlLink` variant — all **15** of them, by an exhaustive `match` with no `_` arm, so adding a sixteenth fails to build here — has a row in §3.1. The LogQL sibling is the same shape: `LqlLink` has exactly **9** variants and §7.1 carries a row for each. An earlier revision specified this gate as a hand list of twelve (the eight `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit`), which would have passed over a §3.1 carrying 5 of the 15 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
+| §3.1 carries exactly **11** rows with a residual state effect and **12** without; §7.1 carries exactly **20** and **3** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** |
 | the hops diagram's lowered round-trip count and result-byte total equal §9.2's | `test(=the_hops_diagram_and_the_document_agree_on_the_lowered_request)` | exit **101**, no such target — **wave 1** |
 | every link label in the boundary diagram's pipelines is a link this document defines | `test(=the_boundary_diagram_names_only_links_the_document_defines)` | exit **101**, no such target — **wave 1** |
 | every pipeline drawn in the boundary diagram ends in `Order`, `Limit` and `Emit`, because every chain does | `test(=every_boundary_diagram_pipeline_carries_the_three_synthesised_links)` | exit **101**, no such target — **wave 1** |
@@ -5225,3 +5267,73 @@ nothing in this repository can see it.
 **Nothing in §11.5 is running today.** The four-state probe below was run and its results are
 measurements; the *repository consequence* drawn from them is a specification for wave 1. The
 distinction is the one §11.0 exists to keep.
+
+---
+
+## 12. The end state
+
+**What this section is.** §§1–11 describe a design and the checks it nominates. This section states
+the **end state** the design reaches: what is permanently outside SQL, and why each of those things
+is permanent rather than unfinished. It exists because "never lowers" and "has not been lowered
+yet" were being written the same way in two records, and a permanence claim that nobody has to
+justify is a claim nobody re-checks.
+
+`every_never_reason_variant_is_named_in_the_end_state`
+(`crates/pulsus-read/tests/query_lowering_doc_gate.rs`) reads `NeverReason` out of
+`crates/pulsus-read/src/compile/fold.rs` and requires a row below for every variant. `NeverReason`
+has exactly **eight** variants, and a ninth permanent reason cannot be added to the compiler
+without being written down here.
+
+### 12.1 Every permanent reason, and what it rules out
+
+`Capability::Never(reason)` is the compiler's own word for *not lowerable in any state, ever* —
+distinct from `Capability::No(reason)`, which means *lowerable in principle, not here*. The two take
+byte-identical paths in the fold (`crates/pulsus-read/src/compile/fold.rs:960-967`) and differ only
+in the reason string the explain surface renders, so nothing about a request changes with the
+choice. What changes is what a reader is entitled to conclude.
+
+| `NeverReason` | what it rules out | why no state can change it |
+|---|---|---|
+| `NeedsUnwindowedRootRead` | folding the winners' root read into the seed statement | the true root may start before the search window, so the root summary is read trace-wide with **no time predicate**, and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:385`). A window-bounded statement cannot produce it, whatever has accumulated |
+| `StructuralRelation` | pushing `>`, `>>`, `<`, `<<`, `~` into the seed statement | the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it |
+| `NestedSetNumbering` | pushing the modified-preorder numbering | it is computed per trace at query time; no stored column carries it, so there is nothing for SQL to read |
+| `TraceLevelIntrinsic` | pushing `traceDuration`, `rootName`, `rootServiceName` or `span:childCount` | they resolve from co-loads that are deliberately trace-wide and unwindowed, so they evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state |
+| `WholeQueryTypeFailure` | pushing a `!`-operand truthiness leaf | one row's type must fail the **whole** request — a present non-boolean operand under `!` is an error for the query, not a non-match for the span — and SQL evaluates row by row |
+| `NoRowToComputeFrom` | pushing an answer about rows that are **absent** | `absent_over_time` is a statement about the empty set; there is no row to compute it from, so no `WHERE` and no `HAVING` can express it |
+| `ResponseBuild` | pushing the response builder | the answer's shape is JSON assembled in our process, not a relation |
+| `NotASearchLink` | anything at all, on this route | the shipped planner answers `400` for the stage before a chain is built, so no link is constructed and there is nothing to lower |
+
+**What this table does not claim.** That the list is complete for all time. It is complete against
+the enum, which is what the check enforces; whether a ninth permanent reason exists is a design
+question, and the record's answer is that a new one must arrive with a row here and an argument in
+it.
+
+### 12.2 The one thing this section does not settle
+
+Two records disagree about **six constructs**, and the disagreement is not a typo in either.
+[`query-to-sql.md`](query-to-sql.md) marks each of them *cannot become SQL* or *never becomes SQL* —
+permanence, by that document's own vocabulary table — while the shipped fit answers
+`Capability::No(...)`, which is the opposite claim:
+
+| construct | the record marks | the fit answers |
+|---|---|---|
+| `\| line_format "…"` (general) | *cannot become SQL* | `No(NotYetLowered)` |
+| `\| label_format dst="{{…}}"` | *cannot become SQL* | `No(NotYetLowered)` |
+| `\| unwrap duration(x)` / `bytes(x)` | *cannot become SQL* | `No(NotYetLowered)` |
+| `sum by (<parsed label>) (…)` | *cannot become SQL* | `No(NotYetLowered)` |
+| `\|= ip("10.0.0.0/8")` | *never becomes SQL* | `No(NotPushable)` |
+| `\| { … }` written after another stage | *never becomes SQL* | `No(NotYetLowered)` |
+
+**The wire cost of resolving it either way is one string on one route.** `set_plan` has exactly one
+non-test caller, so the `plan` key reaches a response only from the TraceQL search executor: the
+five LogQL constructs' `Capability` is invisible to every client on every option, and the only
+user-visible consequence is `links[].why` for a query carrying a mid-pipeline `{ … }` filter. `how`
+stays `"residual"` on every option, so the evaluator still runs the stage and the traces returned do
+not change.
+
+**It is left open deliberately.** Deciding it is a design call, not an implementation one, and it is
+recorded here rather than settled so that the two records cannot drift further apart while nobody
+is looking. The check the resolution will need —
+`every_permanence_marked_row_is_never_in_the_fit` — is nominated in §11.3 and is **not written**,
+because until the decision is made there is no state for it to assert: today it would fail against
+either half of the record.

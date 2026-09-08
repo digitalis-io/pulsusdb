@@ -1396,6 +1396,19 @@ fn every_figure_section_9_2_states_is_the_one_the_artefact_holds() {
          covers",
         comparison_uncovered.first().map(|s| **s).unwrap_or("")
     );
+    // **NO BREAK REDDENS THE NEXT TWO ASSERTIONS. A later reader must not
+    // count them as live coverage.** They fire only when a variant
+    // declares a header no table carries WHILE every table column is
+    // still covered — which needs two variants sharing one cell, and the
+    // partition assertion above catches that case first, because the
+    // partition prints the header beside the field it sums. Every edit
+    // that would reach these two reddens the partition or the
+    // `uncovered` assertions instead; that was measured, not reasoned
+    // (issue #492 part 8, landing 1). They stay because they cost
+    // nothing and would matter if the partition assertion were ever
+    // weakened: an assertion known and documented to be unreachable is
+    // defence in depth, one assumed live and actually unreachable is the
+    // defect this gate exists to end.
     let per_stage_absent: Vec<&&str> = declared_per_stage.difference(&per_stage_cells).collect();
     let comparison_absent: Vec<&&str> = declared_comparison.difference(&comparison_cells).collect();
     assert!(
@@ -1808,4 +1821,611 @@ fn the_hops_diagram_and_the_document_agree_on_the_lowered_request() {
         "the hops diagram states {drawn_bytes} lowered result bytes; docs/query-lowering.md §9.2 \
          states {stated_bytes}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #492 part 8, landing 2 — the record's tables against the enums
+// they claim to enumerate, and the boundary diagram against the tables.
+//
+// Every one of these checks has TWO INDEPENDENT PRODUCERS: a variant list
+// parsed out of the compiler's own source, and a table written by hand in
+// `docs/query-lowering.md`. Neither can produce the other, which is what
+// makes a missing row visible. §3.1 called itself "the complete TraceQL
+// link set" while carrying 5 of `TqlLink`'s 15 variants, and §7.1 called
+// itself the complete LogQL link set with no `Source` row at all; both
+// were found by writing these checks, not by reading the tables.
+// ---------------------------------------------------------------------
+
+const S31_HEADING: &str = "### 3.1 The complete TraceQL link set";
+const S32_HEADING: &str = "### 3.2 Group 1 — cannot be lowered";
+const S71_HEADING: &str = "### 7.1 The complete LogQL link set";
+const S72_HEADING: &str = "### 7.2 Groups 1, 2 and 3";
+const S27_HEADING: &str = "### 2.7 The compiler's output is a PLAN, not a statement";
+const S28_HEADING: &str = "## 3. TraceQL against the model";
+const BOUNDARY_SVG: &str = "docs/diagrams/query-lowering-boundary.svg";
+
+/// The variant identifiers of `pub enum <name>` in `rel`, in declaration
+/// order.
+///
+/// **This is the second producer.** The check does not hold a hand list
+/// of variants that a contributor must remember to extend: it reads the
+/// enum out of the file that declares it, so a variant added there and
+/// not added to the document makes the check name the variant.
+fn enum_variants(rel: &str, name: &str) -> Vec<String> {
+    let src = repo_file(rel);
+    let head = format!("pub enum {name} {{");
+    let start = src
+        .find(&head)
+        .unwrap_or_else(|| panic!("{rel} must declare `{head}`"))
+        + head.len();
+    let mut depth = 1usize;
+    let mut end = start;
+    for (i, c) in src[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(end > start, "{rel}: `{head}` is not closed");
+    let body = &src[start..end];
+    // Variants are the identifiers at brace depth 1 that open a line.
+    let mut depth = 0usize;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if depth == 0 && !t.starts_with("///") && !t.starts_with("//") && !t.starts_with('#') {
+            let ident: String = t
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                out.push(ident);
+            }
+        }
+        depth = depth + t.matches('{').count() + t.matches('(').count() + t.matches('[').count();
+        depth = depth.saturating_sub(
+            t.matches('}').count() + t.matches(')').count() + t.matches(']').count(),
+        );
+    }
+    assert!(!out.is_empty(), "{rel}: parsed no variants out of `{head}`");
+    out
+}
+
+/// The leading backticked token of every table row in `slice`, reduced to
+/// its leading identifier — `` `Aggregate { op, field, cmp, value }` ``
+/// becomes `Aggregate`, `` `Limit(n)` `` becomes `Limit`.
+///
+/// Rows of the rejection tables (four columns) are excluded: they list a
+/// refused payload, not a chain link.
+fn link_row_labels(slice: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for row in link_table_rows(slice) {
+        if let Some(label) = leading_backtick(&row[0]) {
+            out.insert(label);
+        }
+    }
+    out
+}
+
+/// The data rows of `slice`'s LINK tables — the tables whose header row
+/// opens with `link` and carries a `continuation` column. A rejection
+/// table also opens with `link`, and is excluded by that second test.
+fn link_table_rows(slice: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for table in tables(slice) {
+        let header = &table[0];
+        if header.first().map(String::as_str) != Some("link") {
+            continue;
+        }
+        if header.last().map(String::as_str) != Some("continuation") {
+            continue;
+        }
+        out.extend(table.into_iter().skip(1));
+    }
+    out
+}
+
+/// The leading identifier of a cell's first backticked token.
+fn leading_backtick(cell: &str) -> Option<String> {
+    let inner = cell.split('`').nth(1)?;
+    let ident: String = inner
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+        .collect();
+    (!ident.is_empty()).then_some(ident)
+}
+
+/// A variant whose row in the document is carried under another name,
+/// with the reason. **Every alias is asserted to be USED**, so an entry
+/// that stops applying is an error rather than a silent widening of what
+/// counts as covered.
+const LINK_ALIASES: [(&str, &str, &str); 2] = [
+    (
+        "TqlLink",
+        "Pipe",
+        "the `Pipe` arm carries `PipelineStage`, whose eight variants have eight rows of their own; \
+         `every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document` is the check \
+         over those",
+    ),
+    (
+        "LqlLink",
+        "Pipe",
+        "the `Pipe` arm carries `pulsus_logql::Stage`, whose ten variants have thirteen rows of \
+         their own (`Parser` has four forms); \
+         `every_logql_stage_variant_has_a_row_in_the_lowering_document` is the check over those",
+    ),
+];
+
+fn assert_every_variant_has_a_row(
+    enum_name: &str,
+    variants: &[String],
+    rows: &BTreeSet<String>,
+    section: &str,
+) {
+    let aliased: BTreeSet<&str> = LINK_ALIASES
+        .iter()
+        .filter(|(e, _, _)| *e == enum_name)
+        .map(|(_, v, _)| *v)
+        .collect();
+    for alias in &aliased {
+        assert!(
+            variants.iter().any(|v| v == alias),
+            "{enum_name} has no variant {alias:?}, so the alias declared for it is dead"
+        );
+        assert!(
+            !rows.contains(*alias),
+            "{section} carries a row for {enum_name}::{alias}, so the alias is no longer needed \
+             and must be removed rather than kept as a standing exemption"
+        );
+    }
+    let missing: Vec<&String> = variants
+        .iter()
+        .filter(|v| !rows.contains(*v) && !aliased.contains(v.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{enum_name}::{} has no row in docs/query-lowering.md {section}",
+        missing
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// Every `pulsus_logql::Stage` variant has a row in §7.1.
+#[test]
+fn every_logql_stage_variant_has_a_row_in_the_lowering_document() {
+    let md = repo_file(QUERY_LOWERING);
+    let s71 = section(&md, S71_HEADING, S72_HEADING);
+    let variants = enum_variants("crates/pulsus-logql/src/ast.rs", "Stage");
+    assert_eq!(variants.len(), 10, "pulsus_logql::Stage: {variants:?}");
+    assert_every_variant_has_a_row("Stage", &variants, &link_row_labels(s71), "§7.1");
+}
+
+/// Every `pulsus_traceql::PipelineStage` variant has a row in §3.1.
+#[test]
+fn every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document() {
+    let md = repo_file(QUERY_LOWERING);
+    let s31 = section(&md, S31_HEADING, S32_HEADING);
+    let variants = enum_variants("crates/pulsus-traceql/src/ast.rs", "PipelineStage");
+    assert_eq!(
+        variants.len(),
+        8,
+        "pulsus_traceql::PipelineStage: {variants:?}"
+    );
+    assert_every_variant_has_a_row("PipelineStage", &variants, &link_row_labels(s31), "§3.1");
+}
+
+/// Every `LqlLink` variant has a row in §7.1.
+///
+/// **`Source` had none until part 8.** §7.1 named the seed in its chain
+/// diagram and in one prose sentence and gave it no row, so the table
+/// that calls itself the complete LogQL link set was missing a variant —
+/// the same defect §3.1 carried at ten times the size.
+#[test]
+fn every_lql_link_variant_has_a_row_in_the_lowering_document() {
+    let md = repo_file(QUERY_LOWERING);
+    let s71 = section(&md, S71_HEADING, S72_HEADING);
+    let variants = enum_variants("crates/pulsus-read/src/logql/compile.rs", "LqlLink");
+    assert_eq!(variants.len(), 9, "LqlLink: {variants:?}");
+    assert_every_variant_has_a_row("LqlLink", &variants, &link_row_labels(s71), "§7.1");
+}
+
+/// Every `TqlLink` variant has a row in §3.1.
+///
+/// **Ten of the fifteen had none until part 8**, and three of the ten —
+/// `Hydrate`, `Membership(n)` and `SelectValues(n)` — appear in every
+/// rendered plan on the search route. The gate the record originally
+/// nominated was a hand list of twelve names, which would have passed
+/// over exactly that table.
+#[test]
+fn every_traceql_chain_link_has_a_row_in_the_lowering_document() {
+    let md = repo_file(QUERY_LOWERING);
+    let s31 = section(&md, S31_HEADING, S32_HEADING);
+    let variants = enum_variants("crates/pulsus-read/src/traces/compile.rs", "TqlLink");
+    assert_eq!(variants.len(), 15, "TqlLink: {variants:?}");
+    assert_every_variant_has_a_row("TqlLink", &variants, &link_row_labels(s31), "§3.1");
+}
+
+/// The residual-state-effect group a link row states, read off the row's
+/// own effect cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectGroup {
+    /// The row states an effect on the accumulated relation.
+    Stated,
+    /// The row states the effect IS the identity, so the exemption is
+    /// itself a check rather than a silence.
+    Identity,
+    /// The row is marked *not in the chain*, so it has no effect to
+    /// state.
+    NotInChain,
+}
+
+fn effect_group(cell: &str) -> EffectGroup {
+    let flat = cell.replace("**", "");
+    if flat.starts_with("n/a") {
+        // `Source` in §3.1 reads "n/a — the seed is always applied",
+        // which is the identity case, not a not-in-the-chain marking.
+        if flat.contains("the seed is always applied") {
+            EffectGroup::Identity
+        } else {
+            EffectGroup::NotInChain
+        }
+    } else if flat.starts_with("none") {
+        EffectGroup::Identity
+    } else {
+        EffectGroup::Stated
+    }
+}
+
+/// Counts a section's link rows by effect group.
+fn effect_counts(slice: &str) -> (usize, usize, usize) {
+    let (mut stated, mut identity, mut not_in_chain) = (0, 0, 0);
+    for row in link_table_rows(slice) {
+        // The effect cell is third from the right: … | effect |
+        // disposition | continuation |.
+        let cell = &row[row.len() - 3];
+        match effect_group(cell) {
+            EffectGroup::Stated => stated += 1,
+            EffectGroup::Identity => identity += 1,
+            EffectGroup::NotInChain => not_in_chain += 1,
+        }
+    }
+    (stated, identity, not_in_chain)
+}
+
+/// The `**N**` figures a sentence states, in order.
+fn bold_numbers(text: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some((_, tail)) = rest.split_once("**") {
+        let (inner, after) = match tail.split_once("**") {
+            Some(p) => p,
+            None => break,
+        };
+        if let Ok(n) = inner.replace(',', "").parse::<u64>() {
+            out.push(n);
+        }
+        rest = after;
+    }
+    out
+}
+
+/// **The counts the record states about its own tables are the counts
+/// those tables carry**, and the TraceQL one is also the shipped gate's
+/// row count.
+///
+/// Three claims, all in `docs/query-lowering.md`, all with two sides:
+///
+/// 1. §11.3's gate row states §3.1's and §7.1's `stated` and `without`
+///    counts; the tables are counted here;
+/// 2. §11.2b states the same two `stated` counts and their sum;
+/// 3. §11.2b states that the shipped TraceQL residual-effect gate carries
+///    §3.1's row count plus one, and
+///    `assert_every_residual_state_effect::<Tql>(&rows, 21)` is read out
+///    of the source that calls it — so the derivation and the shipped
+///    number are two producers, not one sentence.
+#[test]
+fn the_document_states_the_residual_effect_counts_the_gates_assert() {
+    let md = repo_file(QUERY_LOWERING);
+    let s31 = section(&md, S31_HEADING, S32_HEADING);
+    let s71 = section(&md, S71_HEADING, S72_HEADING);
+    let (t_stated, t_identity, t_na) = effect_counts(s31);
+    let (l_stated, l_identity, l_na) = effect_counts(s71);
+
+    let gate_row = md
+        .lines()
+        .find(|l| l.starts_with("| §3.1 carries exactly "))
+        .expect("§11.3 must carry the residual-effect count row");
+    // The first cell only: the `at base` cell of the same row carries a
+    // bold exit code, and a rule that scanned the whole row would read
+    // it as a fifth count.
+    let claim = gate_row
+        .trim_start_matches('|')
+        .split(" | ")
+        .next()
+        .expect("the row has a first cell");
+    let stated = bold_numbers(claim);
+    assert_eq!(
+        stated,
+        vec![
+            t_stated as u64,
+            (t_identity + t_na) as u64,
+            l_stated as u64,
+            (l_identity + l_na) as u64
+        ],
+        "§11.3's residual-effect row states {stated:?}; §3.1 carries {t_stated} with a stated \
+         effect and {} without ({t_identity} identity + {t_na} not-in-the-chain), and §7.1 carries \
+         {l_stated} and {} ({l_identity} + {l_na})",
+        t_identity + t_na,
+        l_identity + l_na
+    );
+
+    let para = paragraphs(&md)
+        .into_iter()
+        .find(|p| p.contains("effects in all."))
+        .expect("§11.2b must state the effect total");
+    let n = bold_numbers(para);
+    assert!(
+        n.len() >= 3,
+        "§11.2b's effect paragraph must state §3.1's count, §7.1's and their sum; it states {n:?}"
+    );
+    assert_eq!(
+        (n[0], n[1], n[2]),
+        (
+            t_stated as u64,
+            l_stated as u64,
+            (t_stated + l_stated) as u64
+        ),
+        "§11.2b states {n:?}; the tables carry {t_stated} and {l_stated}, summing to {}",
+        t_stated + l_stated
+    );
+
+    // The shipped TraceQL gate's row count, read from the call that
+    // asserts it rather than from a sentence.
+    let src = repo_file("crates/pulsus-read/src/traces/compile.rs");
+    let shipped: u64 = src
+        .split_once("assert_every_residual_state_effect::<Tql>(&rows, ")
+        .expect("traces/compile.rs must assert its residual-effect row count")
+        .1
+        .split(')')
+        .next()
+        .expect("the call is closed")
+        .trim()
+        .parse()
+        .expect("the row count is a number");
+    let derived = (t_stated + t_identity) as u64;
+    assert_eq!(
+        shipped,
+        derived + 1,
+        "§3.1 derives {derived} residual-effect rows and the shipped gate asserts {shipped}; the \
+         difference must be exactly the one extra `By` row the shipped gate carries, one per key \
+         branch"
+    );
+}
+
+/// **The boundary diagram names only links this document defines.**
+///
+/// Each drawn link box carries a `data-links` attribute naming the
+/// document link (or links, for a compressed box) it stands for, and
+/// every one of those names must be the leading identifier of a row in
+/// §3.1 or §7.1. Reading a machine-readable attribute rather than the
+/// drawn caption is deliberate: the captions are query text
+/// (`|= "CONN_REFUSED"`) and abbreviations (`Count(> 2)`), so matching
+/// them against row labels would need a guessed mapping, and a guessed
+/// mapping that happens to work is indistinguishable from a right one.
+#[test]
+fn the_boundary_diagram_names_only_links_the_document_defines() {
+    let md = repo_file(QUERY_LOWERING);
+    let mut defined = link_row_labels(section(&md, S31_HEADING, S32_HEADING));
+    defined.extend(link_row_labels(section(&md, S71_HEADING, S72_HEADING)));
+
+    let svg = repo_file(BOUNDARY_SVG);
+    let drawn = boundary_pipelines(&svg);
+    assert!(
+        !drawn.is_empty(),
+        "{BOUNDARY_SVG} draws no annotated link box"
+    );
+    let mut seen = 0usize;
+    for (pipeline, links) in &drawn {
+        for link in links {
+            assert!(
+                defined.contains(link),
+                "the boundary diagram's pipeline {pipeline} names the link {link:?}, which neither \
+                 §3.1 nor §7.1 defines"
+            );
+            seen += 1;
+        }
+    }
+    assert!(
+        seen >= 20,
+        "only {seen} link names were checked; the diagram draws four pipelines"
+    );
+}
+
+/// **Every pipeline the boundary diagram draws ends in `Order`, `Limit`
+/// and `Emit`**, because every chain does — the three are synthesised by
+/// the chain builder and are not optional. A pipeline drawn without them
+/// is the truncation §11.3 records as one of the diagram's four
+/// contradictions.
+#[test]
+fn every_boundary_diagram_pipeline_carries_the_three_synthesised_links() {
+    let svg = repo_file(BOUNDARY_SVG);
+    let drawn = boundary_pipelines(&svg);
+    assert!(
+        drawn.len() >= 4,
+        "{BOUNDARY_SVG} draws {} annotated pipelines; it has four panels",
+        drawn.len()
+    );
+    for (pipeline, links) in &drawn {
+        let tail: Vec<&str> = links
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            vec!["Order", "Limit", "Emit"],
+            "the boundary diagram's pipeline {pipeline} ends {tail:?}; every chain ends Order, \
+             Limit, Emit"
+        );
+    }
+}
+
+/// `(pipeline, links in drawn order)` for every annotated pipeline.
+fn boundary_pipelines(svg: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for (i, _) in svg.match_indices("<text class=\"label\" data-pipeline=\"") {
+        let rest = &svg[i + "<text class=\"label\" data-pipeline=\"".len()..];
+        let (pipeline, rest) = rest.split_once('"').expect("data-pipeline is quoted");
+        let links = rest
+            .split_once("data-links=\"")
+            .expect("an annotated box carries data-links")
+            .1
+            .split_once('"')
+            .expect("data-links is quoted")
+            .0;
+        let links: Vec<String> = links.split_whitespace().map(str::to_string).collect();
+        match out.last_mut() {
+            Some((p, acc)) if p == pipeline => acc.extend(links),
+            _ => out.push((pipeline.to_string(), links)),
+        }
+    }
+    out
+}
+
+/// **Every `Cut` variant has a section of its own in §2.7**, matched by
+/// an exhaustive list parsed out of the enum rather than by a hand list.
+#[test]
+fn every_cut_variant_has_a_row_in_the_design_record() {
+    let md = repo_file(QUERY_LOWERING);
+    let s27 = section(&md, S27_HEADING, S28_HEADING);
+    let variants = enum_variants("crates/pulsus-read/src/compile/plan.rs", "Cut");
+    assert_eq!(variants.len(), 4, "Cut: {variants:?}");
+    let headings: BTreeSet<String> = s27
+        .lines()
+        .filter(|l| l.starts_with("#### 2.7."))
+        .filter_map(leading_backtick)
+        .filter_map(|h| h.strip_prefix("Cut::").map(str::to_string))
+        .collect();
+    for v in &variants {
+        assert!(
+            headings.contains(v),
+            "Cut::{v} has no section in docs/query-lowering.md §2.7; §2.7 names {headings:?}"
+        );
+    }
+    let extra: Vec<&String> = headings.iter().filter(|h| !variants.contains(h)).collect();
+    assert!(
+        extra.is_empty(),
+        "§2.7 gives a section to {extra:?}, which is not a `Cut` variant"
+    );
+}
+
+/// **Every chain-link row states a continuation, and a continuation that
+/// names a cut names one of the four.**
+///
+/// The continuation column is what says whether a residual link is served
+/// by a second SQL part or by the evaluator. A row with an empty cell is
+/// a link whose answer to that question the reader has to infer.
+#[test]
+fn every_chain_link_row_states_a_continuation() {
+    let md = repo_file(QUERY_LOWERING);
+    let cuts: BTreeSet<String> = enum_variants("crates/pulsus-read/src/compile/plan.rs", "Cut")
+        .into_iter()
+        .collect();
+    let mut checked = 0usize;
+    for (name, heading, end) in [
+        ("§3.1", S31_HEADING, S32_HEADING),
+        ("§7.1", S71_HEADING, S72_HEADING),
+    ] {
+        for row in link_table_rows(section(&md, heading, end)) {
+            let label = &row[0];
+            let cell = row.last().expect("a row has cells");
+            assert!(
+                !cell.is_empty(),
+                "{name}: the row {label:?} states no continuation"
+            );
+            for (i, _) in cell.match_indices("Cut::") {
+                let named: String = cell[i + 5..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                assert!(
+                    cuts.contains(&named),
+                    "{name}: the row {label:?} names a continuation `Cut::{named}`, which is not \
+                     one of the four cuts {cuts:?}"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 40,
+        "only {checked} link rows were checked; §3.1 carries 23 and §7.1 carries 24"
+    );
+}
+
+const S12_HEADING: &str = "## 12. The end state";
+
+/// **Every `NeverReason` variant is named in the end state**, matched
+/// against the enum parsed out of the file that declares it rather than
+/// against a hand list.
+///
+/// `Never` is a permanence claim: it says a construct is not lowerable in
+/// any state, ever, as against `No`, which says *not here*. A ninth
+/// permanent reason added to the compiler without a row in §12 is a
+/// permanence claim nobody had to justify, which is the thing §12 exists
+/// to stop.
+#[test]
+fn every_never_reason_variant_is_named_in_the_end_state() {
+    let md = repo_file(QUERY_LOWERING);
+    let start = md
+        .find(S12_HEADING)
+        .unwrap_or_else(|| panic!("{QUERY_LOWERING} must carry {S12_HEADING:?}"));
+    let end_state = &md[start..];
+    let variants = enum_variants("crates/pulsus-read/src/compile/fold.rs", "NeverReason");
+    assert_eq!(variants.len(), 8, "NeverReason: {variants:?}");
+
+    let table: Vec<Vec<String>> = tables(end_state)
+        .into_iter()
+        .find(|t| t[0].first().map(String::as_str) == Some("`NeverReason`"))
+        .expect("§12.1 must carry a table whose first column is `NeverReason`");
+    let named: BTreeSet<String> = table
+        .iter()
+        .skip(1)
+        .filter_map(|r| leading_backtick(&r[0]))
+        .collect();
+    let missing: Vec<&String> = variants.iter().filter(|v| !named.contains(*v)).collect();
+    assert!(
+        missing.is_empty(),
+        "NeverReason::{} is not named in docs/query-lowering.md §12; §12 names {named:?}",
+        missing
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let extra: Vec<&String> = named.iter().filter(|n| !variants.contains(n)).collect();
+    assert!(
+        extra.is_empty(),
+        "§12 gives a row to {extra:?}, which is not a `NeverReason` variant"
+    );
+    for row in table.iter().skip(1) {
+        let name = leading_backtick(&row[0]).unwrap_or_default();
+        assert!(
+            row.len() == 3 && !row[1].is_empty() && !row[2].is_empty(),
+            "§12's row for {name} must state both what the reason rules out and why no state can \
+             change it; it reads {row:?}"
+        );
+    }
 }

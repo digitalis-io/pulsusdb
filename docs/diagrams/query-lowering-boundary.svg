@@ -32,12 +32,12 @@
 
   <!-- A -->
   <text class="sub" x="32" y="126">A.  { .service.namespace="prod" } | max(duration) &gt; 1s | select(span.http.method)</text>
-  <rect class="low" x="32" y="138" width="140" height="46" rx="5"/><text class="label" x="44" y="158">0 Source</text><text class="tiny" x="44" y="176">Spans exact=T</text>
-  <rect class="low" x="186" y="138" width="140" height="46" rx="5"/><text class="label" x="198" y="158">1 Aggregate</text><text class="tiny" x="198" y="176">Spans→Traces</text>
-  <rect class="low" x="340" y="138" width="140" height="46" rx="5"/><text class="label" x="352" y="158">2 Select</text><text class="tiny" x="352" y="176">cols wider</text>
-  <rect class="low" x="494" y="138" width="120" height="46" rx="5"/><text class="label" x="506" y="158">3 Order</text><text class="tiny" x="506" y="176">needs exact</text>
-  <rect class="low" x="628" y="138" width="120" height="46" rx="5"/><text class="label" x="640" y="158">4 Limit(20)</text><text class="tiny" x="640" y="176">needs order</text>
-  <rect class="res2" x="762" y="138" width="180" height="46" rx="5"/><text class="label" x="774" y="158">5 Emit</text><text class="tiny" x="774" y="176">cut: SourceHandoff</text>
+  <rect class="low" x="32" y="138" width="140" height="46" rx="5"/><text class="label" data-pipeline="A" data-links="Source" x="44" y="158">0 Source</text><text class="tiny" x="44" y="176">Spans exact=T</text>
+  <rect class="low" x="186" y="138" width="140" height="46" rx="5"/><text class="label" data-pipeline="A" data-links="Aggregate" x="198" y="158">1 Aggregate</text><text class="tiny" x="198" y="176">Spans→Traces</text>
+  <rect class="low" x="340" y="138" width="140" height="46" rx="5"/><text class="label" data-pipeline="A" data-links="Select" x="352" y="158">2 Select</text><text class="tiny" x="352" y="176">cols wider</text>
+  <rect class="low" x="494" y="138" width="120" height="46" rx="5"/><text class="label" data-pipeline="A" data-links="Order" x="506" y="158">3 Order</text><text class="tiny" x="506" y="176">needs exact</text>
+  <rect class="low" x="628" y="138" width="120" height="46" rx="5"/><text class="label" data-pipeline="A" data-links="Limit" x="640" y="158">4 Limit(20)</text><text class="tiny" x="640" y="176">needs order</text>
+  <rect class="res2" x="762" y="138" width="180" height="46" rx="5"/><text class="label" data-pipeline="A" data-links="Emit" x="774" y="158">5 Emit</text><text class="tiny" x="774" y="176">cut: SourceHandoff</text>
   <text class="small" x="956" y="156">5 lowered, 1 residual</text>
   <text class="tiny" x="956" y="174">part 0: one statement, no wrap</text>
   <text class="tiny" x="956" y="190">the plan has 2 SQL parts</text>
@@ -45,11 +45,11 @@
 
   <!-- B -->
   <text class="sub" x="32" y="244">B.  { .service.namespace="prod" } | by(name) | count() &gt; 2 | select(.tier)   — a residual link with a LOWERED link after it</text>
-  <rect class="low" x="32" y="256" width="140" height="46" rx="5"/><text class="label" x="44" y="276">0 Source</text><text class="tiny" x="44" y="294">Spans exact=T</text>
-  <rect class="low" x="186" y="256" width="140" height="46" rx="5"/><text class="label" x="198" y="276">1 By(name)</text><text class="tiny" x="198" y="294">Spans→Groups</text>
-  <rect class="res" x="340" y="256" width="160" height="46" rx="5"/><text class="label" x="352" y="276">2 Count(&gt; 2)</text><text class="tiny" x="352" y="294">accepts Spans, has Groups</text>
-  <rect class="low" x="514" y="256" width="150" height="46" rx="5"/><text class="label" x="526" y="276">3 Select(.tier)</text><text class="tiny" x="526" y="294">LOWERS — asked, resolves</text>
-  <rect class="res" x="678" y="256" width="264" height="46" rx="5"/><text class="label" x="690" y="276">4 Order · 5 Limit · 6 Emit</text><text class="tiny" x="690" y="294">exact cleared by link 2; Emit cuts</text>
+  <rect class="low" x="32" y="256" width="140" height="46" rx="5"/><text class="label" data-pipeline="B" data-links="Source" x="44" y="276">0 Source</text><text class="tiny" x="44" y="294">Spans exact=T</text>
+  <rect class="low" x="186" y="256" width="140" height="46" rx="5"/><text class="label" data-pipeline="B" data-links="By" x="198" y="276">1 By(name)</text><text class="tiny" x="198" y="294">Spans→Groups</text>
+  <rect class="res" x="340" y="256" width="160" height="46" rx="5"/><text class="label" data-pipeline="B" data-links="Aggregate" x="352" y="276">2 Count(&gt; 2)</text><text class="tiny" x="352" y="294">accepts Spans, has Groups</text>
+  <rect class="low" x="514" y="256" width="150" height="46" rx="5"/><text class="label" data-pipeline="B" data-links="Select" x="526" y="276">3 Select(.tier)</text><text class="tiny" x="526" y="294">LOWERS — asked, resolves</text>
+  <rect class="res" x="678" y="256" width="264" height="46" rx="5"/><text class="label" data-pipeline="B" data-links="Order Limit Emit" x="690" y="276">4 Order · 5 Limit · 6 Emit</text><text class="tiny" x="690" y="294">exact cleared by link 2; Emit cuts</text>
   <text class="small" x="956" y="274">3 lowered, 4 residual</text>
   <text class="tiny" x="32" y="318">Link 2's residual effect clears `exact`; that is what makes 4 and 5 residual, not their position. Link 3 needs no exactness, so it lowers — projecting a</text>
   <text class="tiny" x="32" y="334">column onto rows the evaluator will later drop is harmless. A prefix model would have stopped at link 2 and lost link 3's projection for nothing.</text>
@@ -66,9 +66,9 @@
   <text class="small" x="520" y="434">Dropping a disjunct would not: it gives a subset.</text>
   <text class="small" x="520" y="454">Negating an over-approximation is unsound, so</text>
   <text class="small" x="520" y="474">NOT refuses unless its operand was exact.</text>
-  <rect class="low" x="32" y="506" width="180" height="44" rx="5"/><text class="label" x="44" y="526">0 Source — PARTIAL</text><text class="tiny" x="44" y="542">Spans exact=FALSE</text>
-  <rect class="res" x="226" y="506" width="180" height="44" rx="5"/><text class="label" x="238" y="526">1 Aggregate</text><text class="tiny" x="238" y="542">max() over a superset</text>
-  <rect class="res" x="420" y="506" width="250" height="44" rx="5"/><text class="label" x="432" y="526">2 Order · 3 Limit · 4 Emit</text><text class="tiny" x="432" y="542">all residual; Emit cuts</text>
+  <rect class="low" x="32" y="506" width="180" height="44" rx="5"/><text class="label" data-pipeline="C" data-links="Source" x="44" y="526">0 Source — PARTIAL</text><text class="tiny" x="44" y="542">Spans exact=FALSE</text>
+  <rect class="res" x="226" y="506" width="180" height="44" rx="5"/><text class="label" data-pipeline="C" data-links="Aggregate" x="238" y="526">1 Aggregate</text><text class="tiny" x="238" y="542">max() over a superset</text>
+  <rect class="res" x="420" y="506" width="250" height="44" rx="5"/><text class="label" data-pipeline="C" data-links="Order Limit Emit" x="432" y="526">2 Order · 3 Limit · 4 Emit</text><text class="tiny" x="432" y="542">all residual; Emit cuts</text>
   <text class="small" x="690" y="524">1 lowered, 4 residual</text>
   <text class="tiny" x="32" y="566">The filter still lowered as far as it could — free, and it strictly reduces rows crossing the metered hop. Measured on corpus C1, lowering the aggregate</text>
   <text class="tiny" x="32" y="582">over a superset instead would turn 333 qualifying traces into 1,000. Falls back to today's behaviour exactly. Order needs exact and Limit needs an ordering,</text>
@@ -77,13 +77,13 @@
 
   <!-- D -->
   <text class="sub" x="32" y="628">D.  LogQL: {service_name="checkout"} |= "CONN_REFUSED" |= ip("10.0.0.1") |= "pod-044"   — why the stopping rule had to change</text>
-  <rect class="low" x="32" y="642" width="150" height="46" rx="5"/><text class="label" x="44" y="662">0 Source</text><text class="tiny" x="44" y="680">body = Stored</text>
-  <rect class="low" x="196" y="642" width="180" height="46" rx="5"/><text class="label" x="208" y="662">1 |= "CONN_REFUSED"</text><text class="tiny" x="208" y="680">literal, pushable</text>
-  <rect class="res" x="390" y="642" width="180" height="46" rx="5"/><text class="label" x="402" y="662">2 |= ip("10.0.0.1")</text><text class="tiny" x="402" y="680">no indexable predicate</text>
-  <rect class="low" x="584" y="642" width="180" height="46" rx="5"/><text class="label" x="596" y="662">3 |= "pod-044"</text><text class="tiny" x="596" y="680">LOWERS — body still Stored</text>
-  <rect class="low" x="778" y="642" width="120" height="46" rx="5"/><text class="label" x="790" y="662">4 Order</text><text class="tiny" x="790" y="680">row timestamp</text>
-  <rect class="res" x="912" y="642" width="130" height="46" rx="5"/><text class="label" x="924" y="662">5 Limit</text><text class="tiny" x="924" y="680">needs exact</text>
-  <rect class="res" x="1056" y="642" width="112" height="46" rx="5"/><text class="label" x="1068" y="662">6 Emit</text><text class="tiny" x="1068" y="680">residual, no cut</text>
+  <rect class="low" x="32" y="642" width="150" height="46" rx="5"/><text class="label" data-pipeline="D" data-links="Source" x="44" y="662">0 Source</text><text class="tiny" x="44" y="680">body = Stored</text>
+  <rect class="low" x="196" y="642" width="180" height="46" rx="5"/><text class="label" data-pipeline="D" data-links="LineFilter" x="208" y="662">1 |= "CONN_REFUSED"</text><text class="tiny" x="208" y="680">literal, pushable</text>
+  <rect class="res" x="390" y="642" width="180" height="46" rx="5"/><text class="label" data-pipeline="D" data-links="LineFilter" x="402" y="662">2 |= ip("10.0.0.1")</text><text class="tiny" x="402" y="680">no indexable predicate</text>
+  <rect class="low" x="584" y="642" width="180" height="46" rx="5"/><text class="label" data-pipeline="D" data-links="LineFilter" x="596" y="662">3 |= "pod-044"</text><text class="tiny" x="596" y="680">LOWERS — body still Stored</text>
+  <rect class="low" x="778" y="642" width="120" height="46" rx="5"/><text class="label" data-pipeline="D" data-links="Order" x="790" y="662">4 Order</text><text class="tiny" x="790" y="680">row timestamp</text>
+  <rect class="res" x="912" y="642" width="130" height="46" rx="5"/><text class="label" data-pipeline="D" data-links="Limit" x="924" y="662">5 Limit</text><text class="tiny" x="924" y="680">needs exact</text>
+  <rect class="res" x="1056" y="642" width="112" height="46" rx="5"/><text class="label" data-pipeline="D" data-links="Emit" x="1068" y="662">6 Emit</text><text class="tiny" x="1068" y="680">residual, no cut</text>
   <text class="tiny" x="32" y="704">4 lowered, 3 residual. D is drawn to the end of its chain, like A, B and C: every chain carries Order, Limit and Emit (query-lowering.md 7.1). Order LOWERS — LogQL's</text>
   <text class="tiny" x="32" y="720">sort key is the row's own timestamp, so a superset does not reorder it, unlike TraceQL's max(matched-span timestamp). Limit is RESIDUAL: link 2 cleared `exact`, and a LIMIT</text>
   <text class="tiny" x="32" y="736">over a superset would lose rows the residual filter would have kept — which is the oversample path that ships today. Emit is residual in every chain — but on the LogQL</text>
