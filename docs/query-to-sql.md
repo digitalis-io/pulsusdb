@@ -5053,7 +5053,7 @@ with `git status` checked clean. The line counts are `git diff --numstat` on the
 | the change | where | `numstat` | result |
 |---|---|---|---|
 | **A** — a measured figure: `5400` becomes `9999` | §5.1 | `1 1` | 7,097 run, 7,097 passed, 36 skipped |
-| **A2** — a citation: `crates/pulsus-read/src/querytext.rs:52` becomes `:53` | §5.1 | `1 1` | 7,097 run, **7,094 passed, 3 failed**, 36 skipped: `design_record_drift_gate` `every_citation_in_the_design_record_has_a_row`, `no_citation_row_is_unused`, `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
+| **A2** — a citation: the `querytext.rs` line reference **in §5.1's instrument table** gains one, `:52` becoming `:53`. The row above names the same reference, so the edit is made positionally inside §5.1 rather than by replacing every occurrence | §5.1 | `1 1` | 7,097 run, **7,094 passed, 3 failed**, 36 skipped: `design_record_drift_gate` `every_citation_in_the_design_record_has_a_row`, `no_citation_row_is_unused`, `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
 | **A3** — a word of prose: "is not a cost" becomes "is not a price" | §5.1 | `1 1` | 7,097 run, 7,097 passed, 36 skipped |
 | **B** — delete §5.1 in full | §5.1 | `0 <B>` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `no_citation_row_is_unused` and `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
 | **C** — insert one blank line as line 431 | part 2 | `1 0` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` and `design_record_drift_gate every_recorded_count_site_resolves_exactly_once` |
