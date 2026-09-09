@@ -4644,7 +4644,7 @@ Cache dropped first, leg 1 warming the entry, every leg after it selecting **the
 | `match( body, RE )` — spaces inside the call | 245,760 | **reused** |
 | `((match(body, RE)))` — redundant parentheses | 245,760 | **reused** |
 | `match(\n body,\n RE)` — newlines | 245,760 | **reused** |
-| `match(<db>.log_samples.body, RE)` — the column fully qualified | 245,760 | **reused** |
+| `match(pulsus_nsqlcost.log_samples.body, RE)` — the column qualified with the database holding `log_samples` | 245,760 | **reused** |
 | `match(t.body, RE)`, the table read `AS t` | 245,760 | **reused** |
 | `match(body, RE) = 1` | 3,000,000 | paid |
 | `1 = match(body, RE)` — operands swapped | 3,000,000 | paid |
@@ -4652,12 +4652,39 @@ Cache dropped first, leg 1 warming the entry, every leg after it selecting **the
 | `toBool(match(body, RE))` | 3,000,000 | paid |
 | `match(body, RE) AND 1` | 3,000,000 | paid |
 | `match(body, RE)` again — leg 1's text | 245,760 | **reused** |
-| `MATCH(body, RE)` — the function name in capitals | — | `Code: 46. DB::Exception: Function with name` `MATCH` `does not exist` |
+| `MATCH(body, RE)` — this one function's name in capitals | — | refused before it runs; the error is printed in full below |
 
 Two further facts about the same surface, so they are not looked for here and missed: query text is
 not the key — a different `SELECT` list carrying this condition reused the entry on its first
 execution — and neither is meaning, since the five that paid select the same thirty rows as the one
-that warmed it. Function names are case-sensitive, so the last leg never reaches the cache at all.
+that warmed it.
+
+**The last leg is one statement's behaviour and nothing more.** It is here because it is the one
+spelling that never reaches the cache at all, and because an earlier revision drew a rule out of it
+that is false. What was measured, in full:
+
+```text
+SELECT count() FROM log_samples PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+  AND MATCH(body, '(^|[^0-9])10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)')
+SETTINGS max_block_size = 65409
+
+Code: 46. DB::Exception: Function with name `MATCH` does not exist. In scope SELECT count()
+FROM log_samples PREWHERE service = 'ipcase' WHERE (timestamp_ns > 1787999999999999999)
+AND (timestamp_ns <= 1788084000000000000) AND MATCH(body,
+'(^|[^0-9])10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)') SETTINGS max_block_size = 65409.
+Maybe you meant: ['match','path']. (UNKNOWN_FUNCTION) (version 26.3.29.7 (official build))
+```
+
+`SELECT count() FROM system.query_condition_cache` read **0** after the drop, **4** after leg 1
+warmed it — one entry per active part — and **4** again after this statement, so it added nothing.
+
+**It says nothing about other function names, and an earlier revision's claim that it did was
+wrong.** Measured on the same server: `COUNT(1)`, `SUM(1)` and `MAX(1)` all answer `1`,
+`LENGTH('ab')` answers `2`, and `LOWER('AB')` answers `ab`. Five names accepted in capitals and one
+refused, so the refusal belongs to `match` and this document claims nothing wider. It is the same
+move as the four cache generalisations above — a result carried one step past the evidence — and it
+is corrected the same way: keep the leg, drop the rule.
 
 **Where the boundary is has not been characterised, and this document does not claim it.** It is
 after name resolution, because qualifying and aliasing the column both reuse; it is before semantic
@@ -5026,16 +5053,18 @@ constants, and that control was red either way.** Those constants are shared by 
 paragraph check over this document, the same check over `docs/query-lowering.md` in the same loop,
 and a check that the hops diagram carries the tag on its own face (`query_lowering_doc_gate.rs:340`,
 `:344`, `:417`). Repointing only the constants makes the test fail on `docs/query-lowering.md` before
-it ever reads this document — measured on the text of the revision that published that control,
-`811192cd`: `1 test run: 0 passed, 1 failed` under a selector and `3 passed, 2 failed` over the whole
-file, with the documented paragraph-local message never appearing at all. **A control that reports failure whether or not the thing it tests is
+it ever reads this document. The control was published at `217531c7`; the replay below was run
+against `811192cd`, a later commit on the same branch whose text carries the same two constants and
+whose copy of the gate is byte-identical. Measured there: `1 test run: 0 passed, 1 failed` under a
+selector and `3 passed, 2 failed` over the whole file, with the documented paragraph-local message
+never appearing at all. **A control that reports failure whether or not the thing it tests is
 broken is the same defect as one that reports success either way.**
 
 **How it was nonetheless reported as passing — reconstructed by replay, because the first published
 explanation was wrong.** That explanation said the run had been scoped with a selector naming one
 test. Repointing the constants and selecting that test does *not* pass, so the explanation could not
-be what happened. Replaying the actual edit set against `811192cd`'s document — the revision that
-published the claim — gives the answer, and it is worse than the published one:
+be what happened. Replaying the actual edit set against `811192cd`'s document gives the answer, and
+it is worse than the published one:
 
 | what was changed | selector, one test | whole file |
 |---|---|---|
@@ -5141,18 +5170,35 @@ and never hand-edited.
 #### What five rounds of review on §5.1 and part 7 found, counted
 
 Sixteen findings over five rounds. **Twelve were about this document's account of its own testing;
-four were about its subject.** The split is worth recording, because it says which parts of these
-sections a reader should weigh differently.
+four were about its subject.** All sixteen are listed rather than sampled, because an earlier
+revision of this passage gave examples instead and three of them were filed in the wrong column while
+a fourth matched no finding at all.
 
-| what the finding was about | count | examples |
-|---|---|---|
-| the account of the evidence | 12 | a control that could not pass, an impossibility claim that was an untested assumption, an explanation of a failure that did not reproduce, a cache generalisation wrong four times, an instrument published without its settings, a corpus loader not published |
-| the subject — the constructs, the defects, the costs | 4 | two cells still reading as permanence, no cost envelope on any direction, the plan rows written as one number for four measurements, a value claimed for a function that had not been measured |
+| round | severity | the finding | about |
+|---|---|---|---|
+| 1 | medium | two cells retained unsupported information boundaries | **subject** |
+| 1 | low | the coverage account omitted a suite | evidence |
+| 1 | medium | the proposed directions lacked measured cost envelopes | evidence |
+| 2 | medium | the perturbation did not support the claimed coverage | evidence |
+| 2 | medium | row 5's instrument was incomplete and cache-sensitive | evidence |
+| 2 | medium | rows 1–3 named the wrong instruments | evidence |
+| 3 | medium | the regional-control impossibility was false | evidence |
+| 3 | medium | the cache was described as keyed by query text | **subject** |
+| 3 | medium | the SQL legs omitted their executable settings | evidence |
+| 4 | medium | controls E and F failed before their perturbation | evidence |
+| 4 | medium | "a condition" exceeded the measured cache equivalence | **subject** |
+| 4 | medium | the query-log reader returned eight rows | evidence |
+| 5 | medium | the claimed selected control run could not pass | evidence |
+| 5 | medium | the cache key was not byte-for-byte condition text | **subject** |
+| 5 | low | the plan figures were not all 35 | evidence |
+| 5 | low | F and the published controls were not isolated | evidence |
 
 **The claims about our code have not moved since round 2.** The six constructs of §5.1, the rule that
-binds the sixth, and part 7's three defects were established then and no round since has changed a
-verdict, a reason or a measured value in them. What has changed, every round, is how this document
-describes the way those things were tested.
+binds the sixth, and part 7's three defects were established then, and no round since has changed a
+verdict, a reason or a measured value in them. The four subject findings above are all about one
+thing — how this document described ClickHouse's condition cache — and none touches a construct, a
+defect or a cost figure. What changed every round is how the document describes the way its own
+claims were tested.
 
 **One exception, and it is in the evidence rather than the claims: the CPU column moved at three
 revisions**, because it is three takes of a figure that is not deterministic on a shared machine. The
@@ -5160,8 +5206,8 @@ read columns beside it were byte-identical across all three, which is the point 
 to make.
 
 So: read §5.1's and part 7's findings about the constructs and the defects as settled and measured;
-read the paragraphs describing how they were tested as the part that took five rounds to get right,
-and the reason each of those paragraphs now carries its own retraction in place.
+read the paragraphs describing how they were tested as the part that took several rounds to get
+right, and the reason each of those paragraphs now carries its own retraction in place.
 
 ### When to open another round on this document
 
