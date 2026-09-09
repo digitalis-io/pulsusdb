@@ -4272,7 +4272,7 @@ different answer from the reference on some input, and the inputs are named belo
 | 2 | LogQL `\| label_format k="{{…}}"`, general form | the same template as row 1 | the same as row 1 | the same as row 1, and one thing row 1 does not have: a template that fails rendering produces a `__error__` label and a `400`, and an expression in a `SELECT` list produces a value |
 | 3 | LogQL `\| unwrap duration(x)`, `\| unwrap bytes(x)` | "ClickHouse has no function for either" | false. Measured below: `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` | neither function is the reference's parser, and rule B requires exactness because the value feeds an aggregate. `parseTimeDelta('-5s')` is a `Code: 36` error where the reference answers `-5` |
 | 4 | LogQL `sum by (k) (…)`, `k` from a parser | "no ClickHouse expression reproduces the parser's rendering of a JSON number" | the claim is about every expression; two were measured. `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, which is the reference's own bytes | that function is a text scanner rather than a parser, and a group key has to be right about more than number bytes. Nesting, absent-versus-empty and key spelling all still disagree, below |
-| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and our own source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it. Measured on a first execution with `use_query_condition_cache = 0` — 3,000,000 rows and 309,060,017 bytes, against 245,760 and 25,313,762 for a literal filter selecting the same 30 lines. On a **second** execution of the same query text at the shipped default that gap closes to nothing, which is why the setting is printed beside the figure |
+| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and our own source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it. Measured uncached (`use_query_condition_cache = 0`) — 3,000,000 rows and 309,060,017 bytes, against 245,760 and 25,313,762 for a literal filter selecting the same 30 lines. Once the condition has been evaluated against those parts the shipped cache closes the gap, which is why the setting is printed beside the figure |
 | 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`catalog.rs:343`) and the attribute index (`catalog.rs:370-384`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:684`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
 
 **Every measurement below was taken on 2026-09-09** against ClickHouse `26.3.29.7`
@@ -4524,56 +4524,110 @@ FROM system.parts WHERE table = 'log_samples' AND active
 -- 3000000	372	4	2
 ```
 
-Every leg carries the same window and the same two pinned settings:
+**Every leg is printed in full, with its settings, because a setting in a comment above a
+placeholder is not a setting anyone can run.** Each was executed exactly as it appears — once
+prefixed with `EXPLAIN indexes = 1` for the granule column, once as written for the rest:
 
 ```sql
--- BASE:
---   FROM log_samples PREWHERE service = 'ipcase'
---   WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
--- run once as EXPLAIN indexes = 1 <leg>, then again as <leg> with:
---   SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:<leg>'
-SELECT sum(length(body))                                                          <BASE>  -- a_none
-SELECT count() <BASE> AND body LIKE '%CONN\_REFUSED\_7734%'                               -- b_literal
-SELECT count() <BASE> AND match(body, '(^|[^0-9])10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)')
-                                                                                          -- c_addr_regex
-SELECT count() <BASE> AND JSONExtractString(body, 'level') = 'error'                       -- d_json
+SELECT sum(length(body))
+FROM log_samples
+PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:a_none'
+```
 
-SELECT splitByChar(':', log_comment)[2] AS leg, read_rows, read_bytes, result_rows,
+```sql
+SELECT count()
+FROM log_samples
+PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+  AND body LIKE '%CONN\_REFUSED\_7734%'
+SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:b_literal'
+```
+
+```sql
+SELECT count()
+FROM log_samples
+PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+  AND match(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')
+SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:c_addr_regex'
+```
+
+```sql
+SELECT count()
+FROM log_samples
+PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+  AND JSONExtractString(body, 'level') = 'error'
+SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:d_json'
+```
+
+Then the readings, once per leg:
+
+```sql
+SELECT splitByChar(':', log_comment)[2] AS leg, read_rows, read_bytes,
        ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds'] AS cpu_us,
        Settings['max_block_size'], Settings['use_query_condition_cache']
 FROM system.query_log WHERE type = 'QueryFinish' AND log_comment LIKE '<tag>:%' ORDER BY leg
 ```
 
-**`use_query_condition_cache = 0` is not decoration — it is what makes these numbers a property of
-the predicate rather than of how recently the same query ran.** The paragraph after the table gives
-the reading at the shipped default, which is a different number for the same query.
+`use_query_condition_cache = 0` is not decoration. It is what makes these numbers a property of the
+predicate rather than of what has already been evaluated against these parts — the two tables after
+the next one show the same query reading twelve times less without it.
 
-| predicate added to `service = 'ipcase'` and the window | `EXPLAIN indexes = 1` | granules | `read_rows` | `read_bytes` | CPU µs | rows it selects |
+| predicate | `EXPLAIN indexes = 1` | granules | `read_rows` | `read_bytes` | CPU µs | rows it selects |
 |---|---|---|---|---|---|---|
-| nothing | `MinMax`, `Partition`, `PrimaryKey` only | 368 of 368 | 3,000,000 | 309,060,017 (294.74 MiB) | 430,207 | 3,000,000 |
-| `body LIKE '%CONN\_REFUSED\_7734%'` | `idx_body_tokens` cuts 368 to 30, `idx_body_ngrams` 30 to 30 | **30 of 368** | 245,760 | 25,313,762 (24.14 MiB) | 55,188 | 30 |
-| `match(body, '(^\|[^0-9])10\.[0-9]{1,3}…')` — the shape an address-range test needs | both body indexes listed, **neither cuts** | 368 of 368 | 3,000,000 | 309,060,017 | 513,619 | 30 |
-| `JSONExtractString(body,'level') = 'error'` | **no `Skip` section at all** | 368 of 368 | 3,000,000 | 309,060,017 | 1,009,495 | 3,000 |
+| none — the window and `service` only | `MinMax`, `Partition`, `PrimaryKey` only | 368 of 368 | 3,000,000 | 309,060,017 (294.74 MiB) | 461,535 | 3,000,000 |
+| `body LIKE '%CONN\_REFUSED\_7734%'` | `idx_body_tokens` cuts 368 to 30, `idx_body_ngrams` 30 to 30 | **30 of 368** | 245,760 | 25,313,762 (24.14 MiB) | 47,977 | 30 |
+| `match(body, '(^\|[^0-9])10\\.[0-9]{1,3}…')` — the shape an address-range test needs | both body indexes listed, **neither cuts** | 368 of 368 | 3,000,000 | 309,060,017 | 534,007 | 30 |
+| `JSONExtractString(body,'level') = 'error'` | **no `Skip` section at all** | 368 of 368 | 3,000,000 | 309,060,017 | 1,057,045 | 3,000 |
 
-**Same thirty lines, twelve times the read — on the first execution.** Rows two and three return the
-same thirty lines out of the same three million. The predicate an index can serve reads 245,760 rows
-and 25,313,762 bytes; the one it cannot reads all 3,000,000 and 309,060,017 —
-`3000000 / 245760 = 12.207` and `309060017 / 25313762 = 12.209`.
+**Same thirty lines, twelve times the read.** Rows two and three return the same thirty lines out of
+the same three million. The predicate an index can serve reads 245,760 rows and 25,313,762 bytes; the
+one it cannot reads all 3,000,000 and 309,060,017 — `3000000 / 245760 = 12.207` and
+`309060017 / 25313762 = 12.209`.
 
-**And that ratio is 1 on the second execution of the same query, because of a cache.** ClickHouse
-26.3 ships `use_query_condition_cache = 1`, which remembers per granule whether a condition can
-match. Running the address-range leg twice at the default, changing nothing else:
+**The read columns are deterministic and the CPU column is not.** Two takes of this table on the
+same box gave byte-identical `read_rows` and `read_bytes` and CPU figures that moved: `a_none`
+430,207 then 461,535 µs, `d_json` 1,009,495 then 1,057,045 µs. The box is shared, so read a CPU cell
+as one take with roughly a tenth of its value in spread, and read a ratio between cells rather than a
+cell alone.
 
-| execution | `read_rows` | `read_bytes` | CPU µs | rows it selects |
+#### The cache that moves that figure, and what it is actually keyed on
+
+ClickHouse 26.3 ships `use_query_condition_cache = 1`. It records, per data part, which marks a
+**condition** can match, and the key is not the query:
+
+```sql
+SELECT name, comment FROM system.columns
+WHERE database = 'system' AND table = 'query_condition_cache'
+-- key_hash     Hash of (table_uuid, part_name, condition_hash).
+-- entry_size   The size of the entry in bytes.
+-- matching_marks  Matching marks.
+```
+
+Three executions at the shipped default, after `SYSTEM DROP QUERY CONDITION CACHE`, all carrying the
+same `match(body, …)` condition. The third is a **different query text** — `SELECT count() + 0`
+rather than `SELECT count()`, 305 bytes against 301 — and it is that text's **first** execution:
+
+| execution | `length(query)` | `read_rows` | `read_bytes` | CPU µs |
 |---|---|---|---|---|
-| first | 3,000,000 | 309,060,017 | 544,932 | 30 |
-| second, same query text | **245,760** | **25,313,762** | 29,503 | 30 |
+| text X, first | 301 | 3,000,000 | 309,060,017 | 548,767 |
+| text X, second | 301 | **245,760** | **25,313,762** | 28,023 |
+| text Y, **first** | 305 | **245,760** | **25,313,762** | 33,833 |
 
-So the cost the table prices is **the cost of the first execution of a given query text**, and it is
-paid again by every query text the cache has not seen. A dashboard refreshing one saved query pays it
-once; a person exploring pays it on each new query. Neither reading is the wrong one, and quoting
-either without the setting beside it is what makes a benchmark unreproducible — two runs of one query
-here differ twelvefold on rows read, and nothing about the query says so.
+**So the thing that is paid once is the first evaluation of a condition against a given set of
+parts** — not the first run of a query, and not the first run of a query text. A query nobody has
+written before goes fast if its condition has already been evaluated against those parts, and a query
+that has run a thousand times pays again on parts that did not exist when it last ran, which on an
+ingesting table is a continuous supply of them. An earlier revision of this section said the key was
+the query text and drew a dashboards-are-cheap, exploring-is-expensive conclusion from it. Both were
+wrong: the measurement above is what replaced them.
+
+What the table above therefore prices is the **uncached** evaluation — the work the predicate causes
+the first time it meets a part. That is the number a design decision should use, because it does not
+depend on what happened to run before it.
 
 **Four things this instrument does not see**, said here rather than left to be assumed.
 `read_bytes` is what ClickHouse reads from its own storage; the bytes crossing to `pulsus-server` are
