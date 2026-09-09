@@ -1,7 +1,7 @@
 id	path	prefix	suffix	rendering	line
 traceql_pipeline_stage_variants	docs/query-to-sql.md	### 1.5 TraceQL — the	stage kinds, and the selector	word	274
 traceql_pipeline_stage_variants	docs/query-to-sql.md	`PipelineStage` has exactly	variants	word	275
-traceql_pipeline_stage_variants	docs/query-to-sql.md	### 2.4 TraceQL — the	stage kinds, and the selector	word	508
+traceql_pipeline_stage_variants	docs/query-to-sql.md	### 2.4 TraceQL — the	stage kinds, and the selector	word	511
 traceql_pipeline_stage_variants	docs/query-lowering.md	([`crates/pulsus-traceql/src/ast.rs`](../crates/pulsus-traceql/src/ast.rs), line 981) has exactly **	** variants	word	1149
 traceql_pipeline_stage_variants	docs/query-lowering.md	** variants; all	are below	word	1149
 logql_stage_variants	docs/query-to-sql.md	### 1.2 LogQL — the	stage kinds	word	182

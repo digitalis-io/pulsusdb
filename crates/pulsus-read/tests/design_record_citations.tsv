@@ -155,9 +155,11 @@ docs/query-to-sql.md	ast.rs:939	crates/pulsus-logql/src/ast.rs	939		prose	Metric
 docs/query-to-sql.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr
 docs/query-to-sql.md	catalog.rs:244-257	crates/pulsus-schema/src/catalog.rs	244	257	prose	log_samples
 docs/query-to-sql.md	catalog.rs:340-384	crates/pulsus-schema/src/catalog.rs	340	384	prose	trace_attrs_idx
+docs/query-to-sql.md	catalog.rs:343	crates/pulsus-schema/src/catalog.rs	343		line	parent_id FixedString(8),\n\
 docs/query-to-sql.md	catalog.rs:352	crates/pulsus-schema/src/catalog.rs	352		prose	idx_duration
 docs/query-to-sql.md	catalog.rs:353-354	crates/pulsus-schema/src/catalog.rs	353	354	line	PROJECTION service_time (\n\ SELECT * ORDER BY (service, timestamp_ns)\n\
 docs/query-to-sql.md	catalog.rs:353-358	crates/pulsus-schema/src/catalog.rs	353	358	prose	(service, timestamp_ns)
+docs/query-to-sql.md	catalog.rs:370-384	crates/pulsus-schema/src/catalog.rs	370	384	line	"CREATE TABLE IF NOT EXISTS {{db}}.trace_attrs_idx{{on_cluster}} (\n\ date Date,\n\ key LowCardinality(String),\n\ val S
 docs/query-to-sql.md	catalog.rs:376	crates/pulsus-schema/src/catalog.rs	376		line	timestamp_ns Int64,\n\
 docs/query-to-sql.md	catalog.rs:379	crates/pulsus-schema/src/catalog.rs	379		prose	duration_ns
 docs/query-to-sql.md	catalog.rs:381-382	crates/pulsus-schema/src/catalog.rs	381	382	line	PARTITION BY date\n\ ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
@@ -167,12 +169,21 @@ docs/query-to-sql.md	controller.rs:57	crates/pulsus-schema/src/controller.rs	57	
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:518	crates/pulsus-config/src/model.rs	518		line	traceql_generator_max_memory_bytes: 536_870_912,
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:133	crates/pulsus-logql/src/ast.rs	133		prose	Stage
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:157-160	crates/pulsus-logql/src/ast.rs	157	160	line	/// One element of a `drop`/`keep` label list: a bare label name, or a /// label qualified by a value matcher (`level="i
+docs/query-to-sql.md	crates/pulsus-read/src/compile/fold.rs:682	crates/pulsus-read/src/compile/fold.rs	682		prose	NotPushable
+docs/query-to-sql.md	crates/pulsus-read/src/compile/fold.rs:688-712	crates/pulsus-read/src/compile/fold.rs	688	712	prose	NotASearchLink
+docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:337	crates/pulsus-read/src/logql/compile.rs	337		prose	BlockReason::NotPushable
+docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:472	crates/pulsus-read/src/logql/compile.rs	472		prose	Never
 docs/query-to-sql.md	crates/pulsus-read/src/logql/error.rs:782-785	crates/pulsus-read/src/logql/error.rs	782	785	line	"pipeline error: '{error_type}' for series: '{series}'.\n\ Use a label filter to intentionally skip this error. (e.g | _
+docs/query-to-sql.md	crates/pulsus-read/src/logql/ip.rs:169	crates/pulsus-read/src/logql/ip.rs	169		prose	[0-9]{1,3}(?:\.[0-9]{1,3}){3}
 docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:157-189	crates/pulsus-read/src/logql/labels.rs	157	189	line	pub(in crate::logql) fn parse_flat_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars
 docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:363	crates/pulsus-read/src/logql/labels.rs	363		prose	structured_metadata
+docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:2890	crates/pulsus-read/src/logql/pipeline.rs	2890		prose	DURATION_UNITS
+docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6099	crates/pulsus-read/src/logql/pipeline.rs	6099		line	serde_json::Value::Number(n) => n.to_string(),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:489	crates/pulsus-read/src/logql/sql.rs	489		line	pub fn stage2(streams_table: &str, fingerprints: &[u64]) -> String {
+docs/query-to-sql.md	crates/pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	crates/pulsus-read/src/traces/exec.rs:2869	crates/pulsus-read/src/traces/exec.rs	2869		prose	generator_settings
 docs/query-to-sql.md	crates/pulsus-read/src/traces/search_plan.rs:1083	crates/pulsus-read/src/traces/search_plan.rs	1083		line	Ok(parts.join(" AND "))
+docs/query-to-sql.md	crates/pulsus-schema/src/catalog.rs:244-257	crates/pulsus-schema/src/catalog.rs	244	257	prose	log_samples
 docs/query-to-sql.md	crates/pulsus-schema/src/controller.rs:57	crates/pulsus-schema/src/controller.rs	57		line	if (major, minor) < (26, 3) {
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/error.rs:303	crates/pulsus-server/src/traces_api/error.rs	303		line	ApiError::Plan(e) => (StatusCode::BAD_REQUEST, e.to_string()),
 docs/query-to-sql.md	crates/pulsus-server/src/traces_api/search_response.rs:428-430	crates/pulsus-server/src/traces_api/search_response.rs	428	430	line	let mut set = json!({ "matched": group.matched, "spans": spans,
@@ -215,7 +226,7 @@ docs/query-to-sql.md	model.rs:376	crates/pulsus-config/src/model.rs	376		line	pu
 docs/query-to-sql.md	model.rs:388	crates/pulsus-config/src/model.rs	388		line	pub traceql_max_candidates: u64,
 docs/query-to-sql.md	model.rs:431	crates/pulsus-config/src/model.rs	431		line	pub logql_read_max_memory_bytes: u64,
 docs/query-to-sql.md	pipeline.rs:2876	crates/pulsus-read/src/logql/pipeline.rs	2876		line	Err(PipelineError::BadParserExpr(format!(
-docs/query-to-sql.md	pipeline.rs:2890	crates/pulsus-read/src/logql/pipeline.rs	2890		line	const DURATION_UNITS: &[(&str, f64)] = &[
+docs/query-to-sql.md	pipeline.rs:2890	crates/pulsus-read/src/logql/pipeline.rs	2890		prose	DURATION_UNITS
 docs/query-to-sql.md	pipeline.rs:3002	crates/pulsus-read/src/logql/pipeline.rs	3002		line	const QUERY_BYTES_SUFFIXES: &[&str] = &[
 docs/query-to-sql.md	pipeline.rs:370	crates/pulsus-read/src/logql/pipeline.rs	370		prose	bad
 docs/query-to-sql.md	pipeline.rs:4692-4694	crates/pulsus-read/src/logql/pipeline.rs	4692	4694	line	fn parse_wire_json_prefix(line: &str) -> Result<WireJson, serde_json::Error> { let mut de = serde_json::Deserializer::fr
@@ -253,6 +264,7 @@ docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	crates/pulsus-logql/src/limit
 docs/query-to-sql.md	pulsus-read/src/logql/plan.rs:1020	crates/pulsus-read/src/logql/plan.rs	1020		line	pub fn plan(expr: &Expr, p: &QueryParams, ctx: &PlanCtx<'_>) -> Result<Plan, ReadError> {
 docs/query-to-sql.md	pulsus-read/src/querytext.rs:52	crates/pulsus-read/src/querytext.rs	52		line	pub const MAX_QUERY_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 docs/query-to-sql.md	pulsus-server/src/logs_api/mod.rs:55-59	crates/pulsus-server/src/logs_api/mod.rs	55	59	line	fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppState> { router .route( &format!("{prefix
+docs/query-to-sql.md	query_lowering_doc_gate.rs:340	crates/pulsus-read/tests/query_lowering_doc_gate.rs	340		line	}
 docs/query-to-sql.md	search_eval.rs:2420	crates/pulsus-read/src/traces/search_eval.rs	2420		line	.get(*field_idx)
 docs/query-to-sql.md	search_eval.rs:878	crates/pulsus-read/src/traces/search_eval.rs	878		line	/// happens in the compare (keeping it out of the per-span hot loop).
 docs/query-to-sql.md	search_plan.rs:1057-1058	crates/pulsus-read/src/traces/search_plan.rs	1057	1058	line	/// /// Derived from the stored spanset rather than from a second stored

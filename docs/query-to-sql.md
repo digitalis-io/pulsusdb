@@ -5070,14 +5070,19 @@ one both times: a claim about a set, checked against a subset. Two committed pos
 searched, neither records anything from this document after line 966, and that was written up as a
 fact about the whole suite. `crates/pulsus-read/tests/query_lowering_doc_gate.rs` reads this document
 directly and asserts a paragraph-local property — every paragraph containing a given figure must also
-contain a given phrase — and it already does that at line 3692, which is after 966.
+contain a given phrase — and at `811192cd` it did that on this document's own line 3692, which is
+after 966. **Both ends of that example have since moved.** Part 8 (`86081ef1`) re-measured the
+figure, so neither `43,636` nor `seed + root only` appears in this document any more, and that same
+test now requires any paragraph naming either to say it is retired. The example is stated as it stood
+because the paragraphs below record an experiment run against `811192cd`.
 
 **The revision after that one tried to use the shipped gate as the control by repointing its two
 constants, and that control was red either way.** Those constants are shared by three tests: the
 paragraph check over this document, the same check over `docs/query-lowering.md` in the same loop,
-and a check that the hops diagram carries the tag on its own face (`query_lowering_doc_gate.rs:340`,
-`:344`, `:417`). Repointing only the constants makes the test fail on `docs/query-lowering.md` before
-it ever reads this document. The control was published at `217531c7`; the replay below was run
+and a check on the hops diagram's own face — `query_lowering_doc_gate.rs:340`, `:344` and `:417`
+**as that file stood at `811192cd`**; part 8 rewrote the test, and those three line numbers resolve
+to unrelated text on the current tree. Repointing only the constants makes the test fail on
+`docs/query-lowering.md` before it ever reads this document. The control was published at `217531c7`; the replay below was run
 against `811192cd`, a later commit on the same branch whose text carries the same two constants and
 whose copy of the gate is byte-identical. Measured there: `1 test run: 0 passed, 1 failed` under a
 selector and `3 passed, 2 failed` over the whole file, with the documented paragraph-local message
