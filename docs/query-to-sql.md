@@ -4282,9 +4282,10 @@ different answer from the reference on some input, and the inputs are named belo
 `b318f282` the checkout at `v3.7.4` resolves to. Row 6 is the one exception and names its own
 instrument. The commands are given so the tables can be re-run.
 
-In them, `$CH` is the ClickHouse HTTP endpoint, `$LOKI` the reference's, and `$S`/`$E` the window
-bounds in nanoseconds. Each query is preceded by a push of a few lines to
-`/loki/api/v1/push`, and these are the three sets:
+In them, `$CH` is the ClickHouse HTTP endpoint and `$LOKI` the reference's. `$S` and `$E` are the
+window bounds — nanoseconds on `query_range`, seconds on the instant `query` route, which is the
+route's own convention. Each query is preceded by a push of a few lines to `/loki/api/v1/push`, and
+these are the three sets:
 
 | stream | lines |
 |---|---|
@@ -4329,8 +4330,8 @@ returns the value unchanged.
 | `é` | `É` | `É` |
 | `привет` | `ПРИВЕТ` | `ПРИВЕТ` |
 
-Two functions, four disagreements, on inputs an ordinary log line can carry. That is what "exactness
-is unmet" means here; it is not an argument that no expression exists.
+Two functions, seven comparisons, five disagreements — on inputs an ordinary log line can carry.
+That is what "exactness is unmet" means here; it is not an argument that no expression exists.
 
 Row 2 has one thing row 1 does not, and it is not about the template at all. A template that fails
 while rendering a **label** makes the whole request `400`:
@@ -4338,7 +4339,7 @@ while rendering a **label** makes the whole request `400`:
 ```sh
 curl -sS -G $LOKI/loki/api/v1/query \
   --data-urlencode 'query=sum by (sev) (count_over_time({…} | json | label_format sev=`{{ div 1 0 }}` [30m]))' \
-  --data-urlencode "time=$T"
+  --data-urlencode "time=$E"
 ```
 
 ```text
@@ -4380,12 +4381,13 @@ curl -sS $CH --data-binary \
   "SELECT '['||simpleJSONExtractRaw('{\"row\":\"absent\"}','c')||']',
           '['||simpleJSONExtractRaw('{\"row\":\"empty\",\"c\":\"\"}','c')||']',
           '['||JSONExtractString('{\"row\":\"empty\",\"c\":\"\"}','c')||']',
-          simpleJSONExtractRaw('{\"d\":{\"c\":1},\"c\":2}','c') FORMAT TabSeparatedRaw"
+          '['||JSONExtractString('{\"row\":\"nested\",\"d\":{\"c\":1},\"c\":2}','c')||']',
+          '['||simpleJSONExtractRaw('{\"row\":\"nested\",\"d\":{\"c\":1},\"c\":2}','c')||']' FORMAT TabSeparatedRaw"
 ```
 
 | line | reference's `c` label | `simpleJSONExtractRaw(body,'c')` | `JSONExtractString(body,'c')` |
 |---|---|---|---|
-| `{"row":"nested","d":{"c":1},"c":2}` | `2` — the top-level key | `1` — the first `"c":` in the text, which is the nested one | `2` |
+| `{"row":"nested","d":{"c":1},"c":2}` | `2` — the top-level key | `1` — the first `"c"` in the text, which here is the nested one | `2` |
 | `{"row":"absent"}` | no `c` label at all, so the series has no `c` | the empty string | the empty string |
 | `{"row":"empty","c":""}` | `c=""` — a series distinct from the one above | `""`, two quote characters | the empty string, so the two rows land in **one** group |
 
@@ -4480,7 +4482,7 @@ table.
 | `{service_name="colors"} \| decolorize \|= "upstream ok"` | `200`, **one** entry | `200`, **zero** entries | **unverified.** See below. Part 4's LogQL24, LogQL25, LogQL26 |
 | `sum by (id) (sum_over_time({…} \| json \| unwrap duration(v) \| __error__="" [30m]))` over `v` in `1d`, `2w`, `-5s`, `+5s` | two series: `{id="d_1d"} 86400`, `{id="d_2w"} 1209600` | two series: `{id="d_minus5s"} -5`, `{id="d_plus5s"} 5` | **measured** 2026-09-09 on both sides. The two answers are disjoint: each engine accepts exactly the values the other rejects. Values, corpus and the source on each side: below |
 | `{…} \|= ip("10.0.0.0/8")` over two lines containing `10.1.2.3.4` and one containing `10.1.2.3` | `200`, **three** entries | `200`, **one** entry | **measured** 2026-09-09 on both sides. We extract a fixed-width dotted quad; the reference parses a maximal run. Below |
-| `{…} \| json` over eight lines whose `c` is a different number spelling | the `c` label differs from the reference on **six** of the eight | — | **measured** 2026-09-09 on both sides. All eight values are in the table below |
+| `{…} \| json` over eight lines whose `c` is a different number spelling | the `c` label differs from the reference on **six** of the eight | the `c` label is the document's own bytes in all eight | **measured** 2026-09-09 on both sides. All eight pairs are in the table below |
 
 ### Three more defects, found on 2026-09-09, with the values on both sides
 
@@ -4491,17 +4493,17 @@ day: the reference against `grafana/loki:3.7.4`, digest
 through the hermetic corpus runner, which drives the planned pipeline
 (`crates/pulsus-read/tests/logqltest_corpus.rs` over `crates/pulsus-read/tests/logqltest/runner.rs`).
 **Part 4.1's corpus does not contain the lines any of the three needs**, so each was measured over a
-corpus written for it, given below. **No committed test covers any of the three**; the last column of
-each table says what would settle it inside the corpus.
+corpus written for it, given below. **No committed test covers any of the three**, and each
+subsection ends with the corpus row that would settle it.
 
-#### The duration parser: two units we accept and it rejects, one sign it accepts and we reject
+#### The duration parser: two units we accept and it rejects, two signs it accepts and we reject
 
 Four lines, `{"id":"…","v":"…"}`, queried as
 `sum by (id) (sum_over_time({…} | json | unwrap duration(v) | __error__="" [30m]))`.
 
 | `v` | PulsusDB | grafana/loki 3.7.4 |
 |---|---|---|
-| `1d` | `86400` | dropped — `time: unknown unit` |
+| `1d` | `86400` | dropped |
 | `2w` | `1209600` | dropped |
 | `-5s` | dropped | `-5` |
 | `+5s` | dropped | `5` |
