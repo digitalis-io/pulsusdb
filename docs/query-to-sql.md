@@ -4605,7 +4605,11 @@ other work. No fourth take was run.
 
 #### The condition cache — the legs run against it
 
-Nothing beyond the legs printed here was tested.
+The legs printed here are those run for this subsection and those transcribed from the verdicts of
+the review rounds that examined it. No other condition was run in preparing it. An earlier revision
+claimed instead that nothing beyond the printed legs had been tested; that was false, because one leg
+run in an earlier round — `match(body, toString(RE))` — had not been printed. It is in the third
+table below.
 
 ```sql
 SELECT getSetting('use_query_condition_cache')
@@ -4651,20 +4655,23 @@ returned thirty rows; leg 13 did not execute. All at `use_query_condition_cache 
 | `match(body, RE)` again — leg 1's text | 245,760 | **reused** |
 | `MATCH(body, RE)` | — | leg 13; did not execute, printed below |
 
-Nine further conditions were run in earlier reviews of this document under the same two settings,
-each after its own cache drop and warm, and are recorded here because they were not printed before:
+Eleven further conditions were run in earlier reviews of this document under the same two settings,
+each after its own cache drop and warm. Each returned thirty rows. The three marked **re-run** were
+executed again here and returned what is printed; the other eight are transcribed from those reviews:
 
-| the condition | `read_rows` | |
-|---|---|---|
-| `WITH body AS b` then `match(b, RE)` | 245,760 | **reused** |
-| `SELECT body AS b …` then `match(b, RE)` | 245,760 | **reused** |
-| a derived table aliasing `body AS payload`, then `match(payload, RE)` | 3,000,000 | paid |
-| `FROM (SELECT body …) s` then `match(s.body, RE)` | 3,000,000 | paid |
-| `match(tupleElement(tuple(body), 1), RE)` | 3,000,000 | paid |
-| `match(body, concat(RE, ''))` | 3,000,000 | paid |
-| `match(body, RE) OR false` | 3,000,000 | paid |
-| `true AND match(body, RE)` | 3,000,000 | paid |
-| `match(body, RE) != 0` | 3,000,000 | paid |
+| the condition | `read_rows` | | |
+|---|---|---|---|
+| `WITH body AS b` then `match(b, RE)` | 245,760 | **reused** | |
+| `SELECT body AS b FROM log_samples PREWHERE service = 'ipcase' WHERE <window> AND match(b, RE)` — the alias in the top-level projection | 245,760 | **reused** | re-run |
+| `SELECT b FROM (SELECT body AS b, timestamp_ns, service FROM log_samples) WHERE service = 'ipcase' AND <window> AND match(b, RE)` — the same alias inside a subquery | 3,000,000 | paid | re-run |
+| a derived table aliasing `body AS payload`, then `match(payload, RE)` | 3,000,000 | paid | |
+| `FROM (SELECT body …) s` then `match(s.body, RE)` | 3,000,000 | paid | |
+| `match(tupleElement(tuple(body), 1), RE)` | 3,000,000 | paid | |
+| `match(body, concat(RE, ''))` | 3,000,000 | paid | |
+| `match(body, toString(RE))` | 3,000,000 | paid | re-run |
+| `match(body, RE) OR false` | 3,000,000 | paid | |
+| `true AND match(body, RE)` | 3,000,000 | paid | |
+| `match(body, RE) != 0` | 3,000,000 | paid | |
 
 Leg 13, the statement as sent and the response as received, byte for byte:
 
@@ -4720,8 +4727,9 @@ refuted by a probe:
 
 **Not measured, and no instrument was used for either:** the bytes crossing from ClickHouse to
 `pulsus-server`, and behaviour at 1 TB ([issue #25](https://github.com/digitalis-io/pulsusdb/issues/25)).
-`read_bytes` above is what `system.query_log` reports for the statement; the CPU column is that
-statement's whole CPU.
+`read_bytes` and the CPU column above are the `read_bytes` and
+`ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']` that
+`system.query_log` returned for each statement.
 
 The two ratios in the priced table were re-run on a shorter window —
 `timestamp_ns <= 1788008400000000000` in place of `1788084000000000000`, everything else unchanged at
@@ -5179,9 +5187,15 @@ and never hand-edited.
 
 #### The findings of five rounds of review on §5.1 and part 7
 
-Every finding of rounds 1 to 5, one row each, transcribed from those rounds' verdicts. Counted over
-the rows below with `awk -F'|' '/^\|/ {n++; if ($5 ~ /subject/) s++} END {print n-2, s}'`:
-**16 rows, 4 of them `subject`**.
+Findings transcribed from the verdicts of rounds 1 to 5. Counted with:
+
+```sh
+awk '/^\| round \| severity \| the finding \| about \|$/,/^$/' docs/query-to-sql.md |
+  awk -F'|' '/^\|/ {n++; if ($5 ~ /subject/) s++} END {print n-2, s}'
+# 16 4
+```
+
+Without the first `awk`, the second reads every table in the document and returns `547 4`.
 
 | round | severity | the finding | about |
 |---|---|---|---|
@@ -5203,9 +5217,8 @@ the rows below with `awk -F'|' '/^\|/ {n++; if ($5 ~ /subject/) s++} END {print 
 | 5 | low | F and the published controls were not isolated | evidence |
 
 An independent enumeration of the same five rounds returned the same 16 rows, the same 12/4 split
-and the same membership. Six sentences that stood under and over this table — three summarising what
-the rows meant, and three counting and classifying them in prose — were removed on rulings of
-2026-09-09.
+and the same membership. Eight sentences that stood under and over this table were removed on rulings
+of 2026-09-09.
 
 ### When to open another round on this document
 
