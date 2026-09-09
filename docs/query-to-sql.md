@@ -4984,7 +4984,7 @@ whole suite rather than the point nextest stopped at:
 | the change | `git diff --numstat` | result |
 |---|---|---|
 | **A** — falsify a measured value in §5.1: `5400` becomes `9999` | `1 1`, one line inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
-| **B** — delete §5.1 in full | `0 392`, all inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
+| **B** — delete §5.1 in full | `0 421`, all inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
 | **C** — insert one blank line as line 431 | `1 0`, in part 2 | 7,070 run, **7,069 passed, 1 failed**, 32 skipped. The failure is `pulsus-read::logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` — "`logql_pattern_expr_sites.tsv` has drifted from the tables that generate it" |
 | **D** — delete part 7's three added subsections in full | `0 79`, all inside part 7 | 7,070 run, 7,070 passed, 32 skipped |
 
