@@ -4606,10 +4606,13 @@ other work. No fourth take was run.
 #### The condition cache — the legs run against it
 
 The legs printed here are those run for this subsection and those transcribed from the verdicts of
-the review rounds that examined it. No other condition was run in preparing it. An earlier revision
-claimed instead that nothing beyond the printed legs had been tested; that was false, because one leg
-run in an earlier round — `match(body, toString(RE))` — had not been printed. It is in the third
-table below.
+the review rounds that examined it. Two earlier revisions overstated that. The first said nothing
+beyond the printed legs had been tested, which was false because `match(body, toString(RE))` had been
+run in an earlier round and not printed. The second said no other condition had been run in preparing
+this subsection, which was false by three: a conjunction with a constant, a disjunction with a
+severity test in both orders, and a heredoc spelling of the regular expression. All four are now in
+the third table below. **One round-8 statement is still not in any table here** — an alias form with
+`PREWHERE` outside the subquery, which returned `Code: 182` rather than a row count.
 
 ```sql
 SELECT getSetting('use_query_condition_cache')
@@ -4655,9 +4658,10 @@ returned thirty rows; leg 13 did not execute. All at `use_query_condition_cache 
 | `match(body, RE)` again — leg 1's text | 245,760 | **reused** |
 | `MATCH(body, RE)` | — | leg 13; did not execute, printed below |
 
-Eleven further conditions were run in earlier reviews of this document under the same two settings,
-each after its own cache drop and warm. Each returned thirty rows. The three marked **re-run** were
-executed again here and returned what is printed; the other eight are transcribed from those reviews:
+Fourteen further conditions were run in earlier reviews of this document under the same two settings,
+each after its own cache drop and warm. Each returned thirty rows. The six marked **re-run** were
+executed again here and returned what is printed; the other eight are transcribed from those reviews.
+The last three warm a condition of their own, given in the row:
 
 | the condition | `read_rows` | | |
 |---|---|---|---|
@@ -4672,6 +4676,9 @@ executed again here and returned what is printed; the other eight are transcribe
 | `match(body, RE) OR false` | 3,000,000 | paid | |
 | `true AND match(body, RE)` | 3,000,000 | paid | |
 | `match(body, RE) != 0` | 3,000,000 | paid | |
+| `match(body, RE) AND (1 + 1 = 2)`, warmed by `match(body, RE)` | 3,000,000 | paid | re-run |
+| `severity = 99 OR match(body, RE)`, warmed by `match(body, RE) OR severity = 99` | 3,000,000 | paid | re-run |
+| the same regular expression written as a heredoc literal, `$$…$$` rather than quoted, warmed by the quoted form. `SELECT '<quoted>' = $$<heredoc>$$` returns `1` | 245,760 | **reused** | re-run |
 
 Leg 13, the statement as sent and the response as received, byte for byte:
 
@@ -5195,7 +5202,10 @@ awk '/^\| round \| severity \| the finding \| about \|$/,/^$/' docs/query-to-sql
 # 16 4
 ```
 
-Without the first `awk`, the second reads every table in the document and returns `547 4`.
+Without the first `awk`, the second reads every table row in the document; on this revision it
+returns `552 4`, and that figure moves whenever any table anywhere in the document gains or loses a
+row — an earlier revision printed `547 4`, measured before the commit that carried it added two rows.
+Re-run it rather than trusting it.
 
 | round | severity | the finding | about |
 |---|---|---|---|
@@ -5217,8 +5227,9 @@ Without the first `awk`, the second reads every table in the document and return
 | 5 | low | F and the published controls were not isolated | evidence |
 
 An independent enumeration of the same five rounds returned the same 16 rows, the same 12/4 split
-and the same membership. Eight sentences that stood under and over this table were removed on rulings
-of 2026-09-09.
+and the same membership. Sentences that stood under and over this table were removed on rulings of
+2026-09-09; an earlier revision counted them without naming the commit the count was taken against,
+and three different baselines give three different numbers, so no number is given here.
 
 ### When to open another round on this document
 
