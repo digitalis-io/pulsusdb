@@ -5109,12 +5109,16 @@ cell leaves F **green**, measured. F detects the tag leaving the table, not any 
 the same is true of E and G: each detects its tag leaving its paragraph.
 
 **And these controls are not purely regional — disclosed rather than fixed.** Publishing the control's
-source above put its constants into this document, so `544,160` now sits in three paragraphs: §5.1's
-cache table, the code block above, and the sentence quoting E's failure. Changing the tag in either of
-the latter two fails E with §5.1 untouched. That does not affect what the runs below establish — each
-perturbation edited only its region and only one control reddened — but it does mean these three cases
-would not stay regional if kept, which is one reason they are a throwaway rather than a committed
-gate.
+source above put its own constants into this document, so E's figure now sits in three paragraphs
+rather than one: §5.1's cache table, the code block above, and the sentence quoting E's failure.
+Changing E's tag inside either of the latter two fails E with §5.1 untouched. Two consequences worth
+stating plainly. **A control published in the document it checks stops being regional the moment it is
+published**, which is one reason these three are a throwaway rather than a committed gate. And writing
+this very paragraph broke E once: an earlier draft of it named E's figure without naming E's tag beside
+it, which is a paragraph quoting the figure without the tag — exactly what E fails on. It was found by
+re-running the control after the edit, and the fix was to name the pair together rather than to add the
+tag as decoration. **The runs below are unaffected**: each perturbation edited only its region, and
+only one control reddened in each.
 
 **What this control is and is not.** It is purpose-built, so it does not show that anything in the
 shipped suite watches these regions — it shows that a test **can** be pointed at them and made to
