@@ -473,10 +473,10 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| status >= 500` | `(JSONType(body, 'status') NOT IN ('Int64', 'UInt64', 'Double') OR JSONExtractFloat(body, 'status') >= 500 OR structured_metadata != '')` | **decided here**, §2.7.1. `JSONExtractFloat`, not a text comparison, because the reference converts the label text to a float before comparing. Worked in §2.8's LogQL46 |
 | `\| trace_id="740e…"` | `JSONExtractString(structured_metadata, 'trace_id') = '740e…'` | **decided here**, §2.7.1. No guards: `structured_metadata` is a stored column holding a flat JSON object of text keys to text values written by our own encoder (`labels.rs:157-189`), so the extraction is the label |
 | `\| __error__=""` after a parser | `match(body, '^[ \t\r\n]*\\{')` | **decided here**, §2.7.1. `JSONType(body) = 'Object'` would be wrong — measured, it answers `Null` for `{"a":1}trailing`, which our prefix parser accepts (`pipeline.rs:4692-4694`) |
-| `\| line_format "…"` | none | *evaluated after the read*, `docs/query-lowering.md:1049`. A Go text/template with control flow has no SQL form. It marks the line computed **with no expression**, so every later stage that needs the line is evaluated after the read too. It removes no lines, so it does not by itself make the predicate wider than the query |
+| `\| line_format "…"` | none | *evaluated after the read*, `docs/query-lowering.md:1049`. A Go text/template with control flow, and **no exact ClickHouse expression for it has been written** — the two obvious analogues disagree with the reference on ordinary values (§5.1, row 1: `leftPad` pads and truncates by bytes where `printf "%05s"` counts characters; `upperUTF8('ß')` is `SS` where `ToUpper` leaves it). The stage marks the line computed **with no expression**, so every later stage that needs the line is evaluated after the read too. It removes no lines, so it does not by itself make the predicate wider than the query |
 | `\| label_format dst=src` | none; `dst` compiles against whatever `src` compiled against, and `src` stops resolving | **decided here**, §2.7.1. A rename moves an entry in the name table and leaves no trace in the SQL. Worked in §2.8's LogQL51 |
 | `\| label_format dst="text"` | none; `dst` compiles against the literal `'text'` | **decided here**. A later filter on `dst` compares two constants, which ClickHouse folds before reading a row |
-| `\| label_format dst="{{…}}"` | none | *evaluated after the read*, the same Go text/template as `\| line_format` and the same reason — §5.1 |
+| `\| label_format dst="{{…}}"` | none | *evaluated after the read*. The same Go text/template as `\| line_format`, so the same unwritten translation and the same measured analogue disagreements, plus one this row has and that one does not: a template that fails while rendering a **label** makes the whole request `400` with a `TemplateFormatErr`, and an expression in a `SELECT` list produces a value (§5.1, rows 1 and 2) |
 | `\| unwrap x` | the sample value becomes the column expression that `x` compiles against — `JSONExtractFloat(body, 'x')` after `\| json` | *from the design*, `docs/query-lowering.md:1051`; the expression **decided here**, §2.7.1 |
 | `\| unwrap duration(x)`, `\| unwrap bytes(x)` | none | *evaluated after the read*. ClickHouse **does** have a function for each — measured on 26.3.29.7, `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` — but neither is the reference's parser, and a sample value feeds an aggregate, so rule B requires an exact answer rather than a close one. §5.1 gives the measured disagreements |
 | `\| unpack` | `if(JSONHas(body,'_entry'), JSONExtractString(body,'_entry'), body)` | *from the design*, fixed at `docs/query-lowering.md:795`. A later line filter compiles against this expression |
@@ -4272,8 +4272,8 @@ different answer from the reference on some input, and the inputs are named belo
 | 2 | LogQL `\| label_format k="{{…}}"`, general form | the same template as row 1 | the same as row 1 | the same as row 1, and one thing row 1 does not have: a template that fails rendering produces a `__error__` label and a `400`, and an expression in a `SELECT` list produces a value |
 | 3 | LogQL `\| unwrap duration(x)`, `\| unwrap bytes(x)` | "ClickHouse has no function for either" | false. Measured below: `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` | neither function is the reference's parser, and rule B requires exactness because the value feeds an aggregate. `parseTimeDelta('-5s')` is a `Code: 36` error where the reference answers `-5` |
 | 4 | LogQL `sum by (k) (…)`, `k` from a parser | "no ClickHouse expression reproduces the parser's rendering of a JSON number" | the claim is about every expression; two were measured. `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, which is the reference's own bytes | that function is a text scanner rather than a parser, and a group key has to be right about more than number bytes. Nesting, absent-versus-empty and key spelling all still disagree, below |
-| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and our own source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning. A predicate that decides the test can be written; none that a body index can serve can, so compiling it moves the work to ClickHouse and reads every granule the window covers |
-| 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`catalog.rs:343`) and the attribute index (`catalog.rs:370-384`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:684`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join |
+| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and our own source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it — measured, 3,000,000 rows and 294.74 MiB against 245,760 rows and 24.14 MiB for a literal filter selecting the same 30 lines |
+| 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`catalog.rs:343`) and the attribute index (`catalog.rs:370-384`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:684`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
 
 **Every measurement below was taken on 2026-09-09** against ClickHouse `26.3.29.7`
 (`clickhouse/clickhouse-server:26.3`) and `grafana/loki:3.7.4`, digest
@@ -4441,8 +4441,72 @@ this ADR is amended to name the clause",
 `docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`) does not reach it. The rule it
 does conflict with is the phase-1 read-path decision in `docs/schemas.md` §4.2 (`docs/schemas.md:684`):
 every generator is its own index-served top-K query, **never a `UNION ALL`**, so that the `GROUP BY`
-stays inside one leaf's pruned prefix. Adopting the form means amending that decision, and the reason
-to amend it or not is the pruning it protects — a cost question, decided by whoever measures it.
+stays inside one leaf's pruned prefix. Adopting the form means amending that decision, and what the
+decision turns on is the pruning that rule protects. That is not measured here, and the instrument
+that would measure it is named in the cost table below.
+
+#### What each direction would cost, and how much of that is measured
+
+A correctness obstacle is not a cost. This section names both, and says for each row whether the cost
+is a number or an unmeasured quantity with a named instrument. **An unnumbered "it would be
+expensive" is the same kind of claim as the permanence claims this section replaced**, so no row
+below carries one.
+
+| row | the cost that would decide it | measured? |
+|---|---|---|
+| 1, 2 — the two templates | per-row CPU of an expression that renders the template, and the size of that expression in the statement text, which counts against the 8 MiB rendered-SQL cap (part 8) | **no, and not measurable yet: no expression exists to measure.** What would produce a number: write a candidate, run the third statement with and without it over a stated row count, and compare `read_rows`, `read_bytes`, `memory_usage` and `query_duration_ms` from `system.query_log`. The **pruning** half is measured and is the table below — a template expression is not a literal substring, so it lands on that table's last two rows |
+| 3 — the two unwrap conversions | per-sample CPU of the parse, over every row the statement reads | **no**, same reason and same instrument. `parseTimeDelta` and `parseReadableSize` exist and could be timed today, but neither is the reference's parser, so timing them prices the wrong expression |
+| 4 — the parsed group key | per-row body parse, plus one aggregation state per distinct key value in the `GROUP BY` | **no.** What would produce a number: `memory_usage` for the grouped statement at a stated key cardinality, read against `max_rows_to_group_by` — the bound part 8 adds for exactly this |
+| 5 — `\|= ip("…")` | the read the statement does when no body index can prune it | **yes**, below |
+| 6 — the TraceQL pipe filter | the pruning `docs/schemas.md` §4.2 protects: what the combined form reads against what the separate per-generator statements read | **no.** What would produce a number: the granule comparison the join question already uses (`docs/query-lowering.md` §9.8) applied to this pair — `EXPLAIN indexes = 1` for granules and `system.query_log` for `read_rows`, `read_bytes` and `memory_usage`, over `trace_attrs_idx` and `trace_spans` at a stated corpus size, for the two generators run separately and for the combined form |
+
+**The 10.5 GiB figure earlier in part 5 prices none of these.** It belongs to the `{ .a = .b }`
+per-span pre-grouping, which is a different statement with a different state count, and reaching for
+it as a cost for any row above would be the same mistake this section exists to correct.
+
+#### Row 5, priced
+
+Instrument: the shared ClickHouse `26.3.29.7`, a `log_samples` built from `catalog.rs:244-256`,
+3,000,000 synthetic rows in two daily partitions, four parts, **368 granules** at
+`index_granularity = 8192`. The middle two predicates each select **exactly 30** of the 3,000,000
+rows, so the two are comparable line for line.
+
+```sh
+CH=http://localhost:18123/; DB=<throwaway>
+BASE="FROM $DB.log_samples PREWHERE service = 'ipcase'
+      WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000"
+curl -sS $CH --data-binary "EXPLAIN indexes = 1 SELECT sum(length(body)) $BASE"
+curl -sS $CH --data-binary "EXPLAIN indexes = 1 SELECT count() $BASE AND body LIKE '%CONN\_REFUSED\_7734%'"
+curl -sS $CH --data-binary "EXPLAIN indexes = 1 SELECT count() $BASE AND match(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')"
+curl -sS $CH --data-binary "EXPLAIN indexes = 1 SELECT count() $BASE AND JSONExtractString(body, 'level') = 'error'"
+# each then re-run with SETTINGS log_comment = '<tag>:<leg>', and:
+curl -sS $CH --data-binary "SELECT splitByChar(':', log_comment)[2], read_rows,
+  formatReadableSize(read_bytes), formatReadableSize(memory_usage)
+  FROM system.query_log WHERE type = 'QueryFinish' AND log_comment LIKE '<tag>:%'"
+```
+
+| predicate added to `service = 'ipcase'` and the window | what `EXPLAIN indexes = 1` says | granules | `read_rows` | `read_bytes` | rows it selects |
+|---|---|---|---|---|---|
+| nothing | `MinMax`, `Partition`, `PrimaryKey` only | 368 of 368 | 3,000,000 | 294.74 MiB | 3,000,000 |
+| `body LIKE '%CONN\_REFUSED\_7734%'` | `idx_body_tokens` cuts 368 to 30, `idx_body_ngrams` 30 to 30 | **30 of 368** | 245,760 | 24.14 MiB | 30 |
+| `match(body, '(^\|[^0-9])10\.[0-9]{1,3}…')` — the shape an address-range test needs | both body indexes listed, **neither cuts** | 368 of 368 | 3,000,000 | 294.74 MiB | 30 |
+| `JSONExtractString(body,'level') = 'error'` | **no `Skip` section at all** | 368 of 368 | 3,000,000 | 294.74 MiB | 3,000 |
+
+**Same thirty lines, twelve times the read.** Rows two and three of that table return the same thirty
+lines out of the same three million. The predicate an index can serve reads 245,760 rows and
+24.14 MiB; the one it cannot reads all 3,000,000 and 294.74 MiB — **12.2 times the rows and 12.2
+times the bytes for the same answer**. That is the figure row 5 was missing.
+
+Two things this table does **not** measure, said here rather than left to be assumed. `read_bytes` is
+what ClickHouse reads from storage, not what crosses to `pulsus-server`; the bytes on that hop are a
+different count and none is taken here. And the ratio is a ratio at CI scale on synthetic data,
+chosen because a ratio survives a change of scale where a wall-clock number does not — behaviour at
+1 TB is [issue #25](https://github.com/digitalis-io/pulsusdb/issues/25), as everywhere else in this
+document.
+
+The last row is what rows 1 to 4 would look like on the pruning axis: none of those expressions is a
+literal substring either, so none of them reaches a body index, and the statement reads what the
+primary key and the window leave it.
 
 ---
 
