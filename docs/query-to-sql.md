@@ -5055,9 +5055,9 @@ with `git status` checked clean. The line counts are `git diff --numstat` on the
 | **A** — a measured figure: `5400` becomes `9999` | §5.1 | `1 1` | 7,097 run, 7,097 passed, 36 skipped |
 | **A2** — a citation: the `querytext.rs` line reference **in §5.1's instrument table** gains one, `:52` becoming `:53`. The row above names the same reference, so the edit is made positionally inside §5.1 rather than by replacing every occurrence | §5.1 | `1 1` | 7,097 run, **7,094 passed, 3 failed**, 36 skipped: `design_record_drift_gate` `every_citation_in_the_design_record_has_a_row`, `no_citation_row_is_unused`, `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
 | **A3** — a word of prose: "is not a cost" becomes "is not a price" | §5.1 | `1 1` | 7,097 run, 7,097 passed, 36 skipped |
-| **B** — delete §5.1 in full | §5.1 | `0 <B>` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `no_citation_row_is_unused` and `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
+| **B** — delete §5.1 in full | §5.1 | `0 493` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `no_citation_row_is_unused` and `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
 | **C** — insert one blank line as line 431 | part 2 | `1 0` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` and `design_record_drift_gate every_recorded_count_site_resolves_exactly_once` |
-| **D** — delete part 7's three added subsections in full | part 7 | `0 <D>` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: the same two as B |
+| **D** — delete part 7's three added subsections in full | part 7 | `0 79` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: the same two as B |
 
 So, over the four kinds tried: **a figure and a word of prose change with nothing reacting; a
 citation changes and three tests react; deleting a region makes two react.** An earlier revision of
@@ -5230,7 +5230,7 @@ awk '/^\| round \| severity \| the finding \| about \|$/,/^$/' docs/query-to-sql
 ```
 
 Without the first `awk`, the second reads every table row in the document; on this revision it
-returns `552 4`, and that figure moves whenever any table anywhere in the document gains or loses a
+returns `554 4`, and that figure moves whenever any table anywhere in the document gains or loses a
 row — an earlier revision printed `547 4`, measured before the commit that carried it added two rows.
 Re-run it rather than trusting it.
 
