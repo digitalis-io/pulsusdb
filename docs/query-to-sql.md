@@ -4577,8 +4577,10 @@ ORDER BY leg
 **`query_kind = 'Select'` is load-bearing.** Each leg is run twice — once behind
 `EXPLAIN indexes = 1` and once as written — and the `EXPLAIN` inherits the leg's `log_comment`, so
 without it the reader returns eight rows and every leg appears twice. Measured: eight rows logged
-under one tag, four after the filter, with the `EXPLAIN` runs logged as `query_kind = 'Explain'` and
-`read_rows` of 35.
+under one tag, four after the filter. The four `EXPLAIN` rows are `query_kind = 'Explain'` and their
+`read_rows` are **25, 35, 35, 25** for `a_none`, `b_literal`, `c_addr_regex`, `d_json` — the plan's
+own row count, larger for the two plans that carry a `Skip` section. They are not comparable to the
+leg's `read_rows` and are given here only so the eight rows can be told apart.
 
 `use_query_condition_cache = 0` is not decoration. It is what makes these numbers a property of the
 predicate rather than of what has already been evaluated against these parts — the two tables after
@@ -4629,30 +4631,53 @@ against the same table and the same parts. Legs 1 to 3 carry the condition
 | 5 | nothing — leg 4 again | 245,760 | 25,313,762 | 24,792 |
 
 **Leg 3 rules out the query text and leg 4 rules out the meaning.** A statement nobody had run before
-reused the entry because it carried the same condition; a condition that selects exactly the same
-thirty rows paid the full read because it is written differently. `condition_hash` is over the
-condition **as written**, so two spellings of one condition are two entries.
+reused the entry because it carried the same condition; a condition selecting exactly the same thirty
+rows paid the full read because it is written differently. So the boundary is somewhere between the
+two, and this is where it is. Ten executions, cache dropped first, leg 1 warming the entry and every
+leg after it selecting **the same thirty rows**:
 
-So what is paid once is **the first evaluation of one spelling of one condition against one data
-part**. Three consequences, each no wider than that:
+| the condition | `read_rows` | |
+|---|---|---|
+| `match(body, RE)` — leg 1, warms the entry | 3,000,000 | paid |
+| `match( body, RE )` — spaces inside the call | 245,760 | **reused** |
+| `((match(body, RE)))` — redundant parentheses | 245,760 | **reused** |
+| `match(\n body,\n RE)` — newlines | 245,760 | **reused** |
+| `match(body, RE) = 1` | 3,000,000 | paid |
+| `1 = match(body, RE)` — operands swapped | 3,000,000 | paid |
+| `NOT NOT match(body, RE)` | 3,000,000 | paid |
+| `toBool(match(body, RE))` | 3,000,000 | paid |
+| `match(body, RE) AND 1` | 3,000,000 | paid |
+| `match(body, RE)` again — leg 1's text | 245,760 | **reused** |
+
+**Formatting is normalised away; any change to the parsed expression is a new entry, even when it
+cannot change the answer.** Whitespace and redundant parentheses do not survive parsing, so they
+reuse. Every one of the five that paid has a different expression tree — an added comparison,
+swapped operands, an extra call, an added conjunct — and every one of them returns the same thirty
+rows. So the key is neither the query's bytes nor the condition's meaning: it is the condition's
+parsed form.
+
+So what is paid once is **the first evaluation of one parsed condition against one data part**:
 
 ```
-   condition text       parts        cache
-   ------------------------------------------
-   byte-identical       same         reused
-   byte-identical       new part     paid again
-   rewritten, same      same         paid again
-     meaning
+   condition                             parts       cache
+   ---------------------------------------------------------
+   same after parsing                    same        reused
+     (spacing, parens, line breaks)
+   same after parsing                    new part    paid again
+   different tree, same answer           same        paid again
+     (= 1, NOT NOT, AND 1, …)
 ```
 
-A query nobody has written before is cheap only if it carries a condition byte-for-byte already
-evaluated against those parts; a rewrite that means the same thing is a new entry; and on a table
-being ingested into, new parts keep arriving, so even an unchanged saved query keeps paying on them.
+A rewrite that a person would call cosmetic is free; a rewrite that a person would call equivalent is
+not; and on a table being ingested into, new parts keep arriving, so even an unchanged saved query
+keeps paying on them.
 
-**An earlier revision of this section said the key was the query text, and the revision after it said
-the key was "a condition".** Both were wider than what had been measured, and the second was written
-after the first had already been corrected. Legs 3 and 4 above are the measurement that bounds it;
-the sentence above them is written to that boundary and no further.
+**This sentence has been wrong twice before, both times too wide.** One revision said the key was the
+query text; the next said it was "a condition", which claimed the byte-identical end. The ten legs
+above were run to find the boundary before the sentence was written rather than after, and the
+sentence is written to them. What it still does not cover: normalisations these ten did not probe —
+constant folding, commutativity in other operators, or a literal spelled differently — each of which
+would be another leg.
 
 What the table before this one therefore prices is the **uncached** evaluation — the work the
 predicate causes the first time that spelling meets a part. That is the number a design decision
@@ -5004,13 +5029,32 @@ contain a given phrase — and it already does that at line 3692, which is after
 constants, and that control was red either way.** Those constants are shared by three tests: the
 paragraph check over this document, the same check over `docs/query-lowering.md` in the same loop,
 and a check that the hops diagram carries the tag on its own face (`query_lowering_doc_gate.rs:340`,
-`:344`, `:417`). Repointing them at text that exists only here makes the other two fail on the
-**unperturbed** document — `5 tests run: 3 passed, 2 failed` before the perturbation and the same
-after it, with the documented paragraph-local message never appearing at all. It was reported as
-passing because it had been run with a test selector naming one test, so the two collateral failures
-were never seen. **A control that reports failure whether or not the thing it tests is broken is the
-same defect as one that reports success either way**, and scoping a run until only the wanted result
-is visible is how it stayed hidden.
+`:344`, `:417`). Repointing only the constants makes the test fail on `docs/query-lowering.md` before
+it ever reads this document — measured on that revision's text, `1 test run: 0 passed, 1 failed`
+under a selector and `3 passed, 2 failed` over the whole file, with the documented paragraph-local
+message never appearing at all. **A control that reports failure whether or not the thing it tests is
+broken is the same defect as one that reports success either way.**
+
+**How it was nonetheless reported as passing — reconstructed by replay, because the first published
+explanation was wrong.** That explanation said the run had been scoped with a selector naming one
+test. Repointing the constants and selecting that test does *not* pass, so the explanation could not
+be what happened. Replaying the actual edit set against that revision's document gives the answer,
+and it is worse than the published one:
+
+| what was changed | selector, one test | whole file |
+|---|---|---|
+| the two constants only — what the document described | 0 passed, 1 failed | 3 passed, 2 failed |
+| **the six edits actually made** | **1 passed, 4 skipped** | 4 passed, **1 failed** |
+
+**Four of those six edits were never published.** Two `true \|\|` short-circuits in front of the
+`docs/query-lowering.md` assertions, restricting the loop to this document alone, and stubbing the
+superseded-wording list to an empty slice: together they disable every assertion in that test that is
+not about this file. That is what made it pass, and because they were not written down, the described
+procedure could not reproduce it. The selector was the second half — it hid the one failure the
+neutralisations did not cover, the diagram test, which the whole-file column shows.
+
+So the lesson is not the one first recorded. **The published procedure was not the procedure that was
+run**, and the missing part was the part doing the work.
 
 **So the control is its own test binary with its own constants, sharing nothing.** It applies the
 same rule the shipped gate applies. This is its whole source; it is not committed, and it was deleted
@@ -5053,11 +5097,24 @@ committed text and then once per perturbation:
 |---|---|---|---|---|
 | baseline | none | pass | pass | pass |
 | E | that table's `33,362` becomes `99,999` | **fail** | pass | pass |
-| F | that table's `9007199254740993` becomes `…94` | pass | **fail** | pass |
+| F | **all three cells** of that table's `9007199254740993` row become `…94` | pass | **fail** | pass |
 | G | "three wrong models" becomes "three incorrect models" | pass | pass | **fail** |
 | restored | none | pass | pass | pass |
 
 Each failure named its own region: *"a paragraph quotes 544,160 without `33,362`. It opens: `| # | what differs from the leg above | …`"*, *"…quotes 1.2345678901234568e+29 without `9007199254740993`. It opens: `| c in the line | PulsusDB | …`"*, and *"…quotes aa8df8d0… without `three wrong models`. It opens: `For { .tag = "x" } && …`"*. Three perturbations, three distinct failures, no crosstalk.
+
+**F's perturbation is all three cells of that row, and that is not a detail.** The value appears three
+times in it, and the rule is that the paragraph must still hold the tag somewhere — so changing one
+cell leaves F **green**, measured. F detects the tag leaving the table, not any edit to the row, and
+the same is true of E and G: each detects its tag leaving its paragraph.
+
+**And these controls are not purely regional — disclosed rather than fixed.** Publishing the control's
+source above put its constants into this document, so `544,160` now sits in three paragraphs: §5.1's
+cache table, the code block above, and the sentence quoting E's failure. Changing the tag in either of
+the latter two fails E with §5.1 untouched. That does not affect what the runs below establish — each
+perturbation edited only its region and only one control reddened — but it does mean these three cases
+would not stay regional if kept, which is one reason they are a throwaway rather than a committed
+gate.
 
 **What this control is and is not.** It is purpose-built, so it does not show that anything in the
 shipped suite watches these regions — it shows that a test **can** be pointed at them and made to
