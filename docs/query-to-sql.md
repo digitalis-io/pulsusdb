@@ -4633,8 +4633,10 @@ against the same table and the same parts. Legs 1 to 3 carry the condition
 **Leg 3 rules out the query text and leg 4 rules out the meaning.** A statement nobody had run before
 reused the entry because it carried the same condition; a condition selecting exactly the same thirty
 rows paid the full read because it is written differently. So the boundary is somewhere between the
-two, and this is where it is. Ten executions, cache dropped first, leg 1 warming the entry and every
-leg after it selecting **the same thirty rows**:
+two. **This section no longer says where.** Thirteen legs are printed instead, because the sentence
+that generalised them has been wrong four times and the legs have been right every time.
+
+Cache dropped first, leg 1 warming the entry, every leg after it selecting **the same thirty rows**:
 
 | the condition | `read_rows` | |
 |---|---|---|
@@ -4642,46 +4644,40 @@ leg after it selecting **the same thirty rows**:
 | `match( body, RE )` — spaces inside the call | 245,760 | **reused** |
 | `((match(body, RE)))` — redundant parentheses | 245,760 | **reused** |
 | `match(\n body,\n RE)` — newlines | 245,760 | **reused** |
+| `match(<db>.log_samples.body, RE)` — the column fully qualified | 245,760 | **reused** |
+| `match(t.body, RE)`, the table read `AS t` | 245,760 | **reused** |
 | `match(body, RE) = 1` | 3,000,000 | paid |
 | `1 = match(body, RE)` — operands swapped | 3,000,000 | paid |
 | `NOT NOT match(body, RE)` | 3,000,000 | paid |
 | `toBool(match(body, RE))` | 3,000,000 | paid |
 | `match(body, RE) AND 1` | 3,000,000 | paid |
 | `match(body, RE)` again — leg 1's text | 245,760 | **reused** |
+| `MATCH(body, RE)` — the function name in capitals | — | `Code: 46. DB::Exception: Function with name` `MATCH` `does not exist` |
 
-**Formatting is normalised away; any change to the parsed expression is a new entry, even when it
-cannot change the answer.** Whitespace and redundant parentheses do not survive parsing, so they
-reuse. Every one of the five that paid has a different expression tree — an added comparison,
-swapped operands, an extra call, an added conjunct — and every one of them returns the same thirty
-rows. So the key is neither the query's bytes nor the condition's meaning: it is the condition's
-parsed form.
+Two further facts about the same surface, so they are not looked for here and missed: query text is
+not the key — a different `SELECT` list carrying this condition reused the entry on its first
+execution — and neither is meaning, since the five that paid select the same thirty rows as the one
+that warmed it. Function names are case-sensitive, so the last leg never reaches the cache at all.
 
-So what is paid once is **the first evaluation of one parsed condition against one data part**:
+**Where the boundary is has not been characterised, and this document does not claim it.** It is
+after name resolution, because qualifying and aliasing the column both reuse; it is before semantic
+equivalence, because five rewrites that cannot change the answer all pay. Between those two lies
+whatever ClickHouse hashes into `condition_hash`, and nothing here establishes its shape.
 
-```
-   condition                             parts       cache
-   ---------------------------------------------------------
-   same after parsing                    same        reused
-     (spacing, parens, line breaks)
-   same after parsing                    new part    paid again
-   different tree, same answer           same        paid again
-     (= 1, NOT NOT, AND 1, …)
-```
+**What would characterise it**, in the order that would settle the most per leg: read the
+`condition_hash` computation in the ClickHouse source for 26.3 and name the representation it hashes;
+then probe that representation's own equivalences — constant folding (`1 + 0` against `1`),
+commutativity in `AND` and `OR`, a literal written differently but parsed to the same value, and a
+column reached through a subquery alias. Until one of those is done, a design decision should use the
+**uncached** figure the table above gives, which is the first-evaluation cost and does not depend on
+what ran before it.
 
-A rewrite that a person would call cosmetic is free; a rewrite that a person would call equivalent is
-not; and on a table being ingested into, new parts keep arriving, so even an unchanged saved query
-keeps paying on them.
-
-**This sentence has been wrong twice before, both times too wide.** One revision said the key was the
-query text; the next said it was "a condition", which claimed the byte-identical end. The ten legs
-above were run to find the boundary before the sentence was written rather than after, and the
-sentence is written to them. What it still does not cover: normalisations these ten did not probe —
-constant folding, commutativity in other operators, or a literal spelled differently — each of which
-would be another leg.
-
-What the table before this one therefore prices is the **uncached** evaluation — the work the
-predicate causes the first time that spelling meets a part. That is the number a design decision
-should use, because it does not depend on what happened to run before it.
+**Why the sentence is gone rather than corrected.** Four revisions of this document generalised these
+legs and all four were wrong: the key is the query text; the key is "a condition"; the key is the
+condition as written; the key is the condition's parsed form. Each was written from the shape of the
+previous correction rather than from a probe chosen to break it, and each survived exactly until
+someone ran the probe. The legs themselves have reproduced in every round. On a ruling of 2026-09-09
+the generalisation is withdrawn and not replaced: the table is the finding.
 
 **Four things this instrument does not see**, said here rather than left to be assumed.
 `read_bytes` is what ClickHouse reads from its own storage; the bytes crossing to `pulsus-server` are
@@ -5030,16 +5026,16 @@ constants, and that control was red either way.** Those constants are shared by 
 paragraph check over this document, the same check over `docs/query-lowering.md` in the same loop,
 and a check that the hops diagram carries the tag on its own face (`query_lowering_doc_gate.rs:340`,
 `:344`, `:417`). Repointing only the constants makes the test fail on `docs/query-lowering.md` before
-it ever reads this document — measured on that revision's text, `1 test run: 0 passed, 1 failed`
-under a selector and `3 passed, 2 failed` over the whole file, with the documented paragraph-local
-message never appearing at all. **A control that reports failure whether or not the thing it tests is
+it ever reads this document — measured on the text of the revision that published that control,
+`811192cd`: `1 test run: 0 passed, 1 failed` under a selector and `3 passed, 2 failed` over the whole
+file, with the documented paragraph-local message never appearing at all. **A control that reports failure whether or not the thing it tests is
 broken is the same defect as one that reports success either way.**
 
 **How it was nonetheless reported as passing — reconstructed by replay, because the first published
 explanation was wrong.** That explanation said the run had been scoped with a selector naming one
 test. Repointing the constants and selecting that test does *not* pass, so the explanation could not
-be what happened. Replaying the actual edit set against that revision's document gives the answer,
-and it is worse than the published one:
+be what happened. Replaying the actual edit set against `811192cd`'s document — the revision that
+published the claim — gives the answer, and it is worse than the published one:
 
 | what was changed | selector, one test | whole file |
 |---|---|---|
@@ -5141,6 +5137,31 @@ What a change to these parts *can* break as things stand is
 regenerated by
 `cargo test -p pulsus-read --test logql_pattern_expr_matrix -- --ignored regenerate_the_sites_dataset`
 and never hand-edited.
+
+#### What five rounds of review on §5.1 and part 7 found, counted
+
+Sixteen findings over five rounds. **Twelve were about this document's account of its own testing;
+four were about its subject.** The split is worth recording, because it says which parts of these
+sections a reader should weigh differently.
+
+| what the finding was about | count | examples |
+|---|---|---|
+| the account of the evidence | 12 | a control that could not pass, an impossibility claim that was an untested assumption, an explanation of a failure that did not reproduce, a cache generalisation wrong four times, an instrument published without its settings, a corpus loader not published |
+| the subject — the constructs, the defects, the costs | 4 | two cells still reading as permanence, no cost envelope on any direction, the plan rows written as one number for four measurements, a value claimed for a function that had not been measured |
+
+**The claims about our code have not moved since round 2.** The six constructs of §5.1, the rule that
+binds the sixth, and part 7's three defects were established then and no round since has changed a
+verdict, a reason or a measured value in them. What has changed, every round, is how this document
+describes the way those things were tested.
+
+**One exception, and it is in the evidence rather than the claims: the CPU column moved at three
+revisions**, because it is three takes of a figure that is not deterministic on a shared machine. The
+read columns beside it were byte-identical across all three, which is the point that column is there
+to make.
+
+So: read §5.1's and part 7's findings about the constructs and the defects as settled and measured;
+read the paragraphs describing how they were tested as the part that took five rounds to get right,
+and the reason each of those paragraphs now carries its own retraction in place.
 
 ### When to open another round on this document
 
