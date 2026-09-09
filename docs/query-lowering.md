@@ -5435,10 +5435,10 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 608 |
+| citation occurrences in the five artefacts | 609 |
 | of those, citing a bare basename | 477 |
 | `(document, token)` pairs the rule resolves | 318 |
-| occurrences those resolved pairs cover | 476 |
+| occurrences those resolved pairs cover | 477 |
 | `(document, token)` pairs it cannot resolve | 83 |
 | occurrences those frozen pairs cover | 132 |
 | resolved rows anchored on a token the citing prose prints | 154 |
@@ -5462,7 +5462,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 608 citation occurrences the five artefacts make, 477 name a bare basename. The rule resolves 318 `(document, token)` pairs covering 476 occurrences, and cannot resolve 83 covering 132. Of the resolved rows, 154 are anchored on a token the citing prose prints and 164 on a snapshot of the cited line.
+Of the 609 citation occurrences the five artefacts make, 477 name a bare basename. The rule resolves 318 `(document, token)` pairs covering 477 occurrences, and cannot resolve 83 covering 132. Of the resolved rows, 154 are anchored on a token the citing prose prints and 164 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 9 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 

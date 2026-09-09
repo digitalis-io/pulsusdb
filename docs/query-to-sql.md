@@ -5042,32 +5042,38 @@ part 1 wrong silently. And **every `file:line` citation ages**: they were all pr
 `2f78c53`, except §5.1's and part 7's last three subsections, which were printed and read at
 `58feb2b`; nothing keeps any of them true afterwards.
 
-**No test asserts on the values §5.1 and part 7's last three subsections state; two tests do react
-to either region being deleted.** Both halves are measured below. The second half is new: it was
-false before `86081ef1` and true after it, because that commit added a gate that records the
-citations these regions make and counts them.
+**Six perturbations, one per run, each a single change to this file on a clean tree.** Four kinds of
+content in these two regions were changed — a measured figure, a word of prose, a citation of the
+form `file:line`, and the region itself — plus one change outside them as a reachability control.
+Nothing else was tried.
 
-Measured by perturbation, re-taken on the merged tree. Four runs of
-`cargo nextest run --workspace --no-fail-fast`, each with one change to this file and nothing else,
-each reverted against a committed tree with `git status` checked clean afterwards. The line counts
-are `git diff --numstat` on the perturbed tree:
+Each run is `cargo nextest run --workspace --no-fail-fast` on the merged tree, reverted afterwards
+with `git status` checked clean. The line counts are `git diff --numstat` on the perturbed tree:
 
-| the change | `git diff --numstat` | result |
-|---|---|---|
-| **A** — falsify a measured value in §5.1: `5400` becomes `9999` | `1 1`, one line inside §5.1 | 7,097 run, 7,097 passed, 36 skipped |
-| **B** — delete §5.1 in full | `0 493`, all inside §5.1 | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `design_record_drift_gate no_citation_row_is_unused` and `design_record_drift_gate every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
-| **C** — insert one blank line as line 431 | `1 0`, in part 2 | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` and `design_record_drift_gate every_recorded_count_site_resolves_exactly_once` |
-| **D** — delete part 7's three added subsections in full | `0 79`, all inside part 7 | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: the same two tests as B |
+| the change | where | `numstat` | result |
+|---|---|---|---|
+| **A** — a measured figure: `5400` becomes `9999` | §5.1 | `1 1` | 7,097 run, 7,097 passed, 36 skipped |
+| **A2** — a citation: `crates/pulsus-read/src/querytext.rs:52` becomes `:53` | §5.1 | `1 1` | 7,097 run, **7,094 passed, 3 failed**, 36 skipped: `design_record_drift_gate` `every_citation_in_the_design_record_has_a_row`, `no_citation_row_is_unused`, `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
+| **A3** — a word of prose: "is not a cost" becomes "is not a price" | §5.1 | `1 1` | 7,097 run, 7,097 passed, 36 skipped |
+| **B** — delete §5.1 in full | §5.1 | `0 <B>` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `no_citation_row_is_unused` and `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
+| **C** — insert one blank line as line 431 | part 2 | `1 0` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` and `design_record_drift_gate every_recorded_count_site_resolves_exactly_once` |
+| **D** — delete part 7's three added subsections in full | part 7 | `0 <D>` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: the same two as B |
 
-The same four runs before the merge, at `2611b4d7` against a tree without that gate, returned
-7,070 passed for A, B and D and one failure for C. **A is the only one whose result did not change.**
+So, over the four kinds tried: **a figure and a word of prose change with nothing reacting; a
+citation changes and three tests react; deleting a region makes two react.** An earlier revision of
+this paragraph rested "no test asserts on the values these regions state" on A alone, and A2 is the
+run that shows a citation is a value a test does assert on.
 
-What the two reddening tests read, from their own datasets: `design_record_citations.tsv` holds one
-row per `(document, citation)` pair, twelve of them added by this correction, and
-`no_citation_row_is_unused` fails when a recorded row has no occurrence left in the document;
+What the reacting tests read, from their own datasets. `design_record_citations.tsv` holds one row
+per `(document, citation)` pair, twelve of them added by this correction:
+`every_citation_in_the_design_record_has_a_row` fails when the document names a citation with no row,
+`no_citation_row_is_unused` when a row has no occurrence left, and
 `every_figure_section_12_3_states_is_the_one_the_datasets_hold` compares a census block in
-`docs/query-lowering.md` against those datasets. Neither reads a sentence: A changes a measured value
-inside §5.1 and leaves both green.
+`docs/query-lowering.md` against those datasets. `every_recorded_count_site_resolves_exactly_once`
+holds recorded line positions, one of which sits at line 511 of this document.
+
+The same four runs before the merge, at `2611b4d7` against a tree without that gate, returned 7,070
+passed for A, B and D and one failure for C. **A2 and A3 were not run then.**
 
 #### A retraction, and the control that replaces it
 
@@ -5190,16 +5196,15 @@ tag as decoration. **The runs below are unaffected**: each perturbation edited o
 only one control reddened in each.
 
 **What this control is and is not.** It is purpose-built, so it does not show that anything in the
-shipped suite asserts on the values in these regions — it shows that a test **can** be pointed at
-them and made to react, which is the claim the withdrawn sentence denied. **A is what shows no
-shipped test asserts on those values:** it changes one and leaves 7,097 green. B and D show something
-different, which is that two shipped tests react to either region being deleted, through the
-citations the region makes rather than through anything it says.
+shipped suite reacts to these regions — it shows that a test **can** be pointed at a figure or a
+sentence in them and made to react, which is the claim the withdrawn sentence denied. **A and A3 are
+the runs where nothing in the shipped suite reacted**, to a figure and to a word of prose. **A2 is
+the run where it did**, to a citation, and B and D are the runs where deleting the region did.
 
 C reddens two tests. One records six positions in this document — lines 200, 471, 701, 733, 734 and
 966, all `| pattern` arguments swept out of the tracked tree, all in part 2 or part 4. The other
-records a count site at line 511. Both are positions, and both are outside the regions A, B and D
-change. E, F and G are what reach those.
+records a count site at line 511. Both are positions, and both are outside the regions the other five
+perturbations change. E, F and G are what reach a figure or a sentence there.
 
 **Three things this paragraph does not claim.** It does not cover the older rows of part 5's table,
 the rest of part 7, or **part 6**, none of which was perturbed; and it does not say what B and D
