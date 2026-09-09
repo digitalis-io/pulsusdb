@@ -28,7 +28,7 @@ reasons rather than left as a gap (§6).
 **What the compiler emits.** Not one statement: a **plan** — an ordered list of parts, each part
 either one SQL statement or work in our own engine, with the value set that crosses between
 parts named, typed and bounded. §2.7 is the plan object and the four **cuts** that are the only ways
-a plan gets a second SQL part. That is not an ambition: §9.2's worked request already sends **1,110**
+a plan gets a second SQL part. That is not an ambition: §9.2's worked request already sends **1,128**
 statements, and an earlier form of this design had no field that could hold a number other than one.
 
 **Status.** The core and the TraceQL side are designed and measured. The LogQL side is
@@ -82,8 +82,8 @@ exactly one place, `search_eval.rs:2420`. Every matching span was therefore tran
 discarded. (Issue #492 part 4 gave `min(duration)`, `max(duration)` and `count()` over a
 single attribute-equality selector a `HAVING` in the generator statement; every other aggregate
 shape still has no SQL path.) On corpus
-C1 (§9), `{ .service.namespace = "prod" } | max(duration) > 1s` at `limit=20` costs **1,110
-sequential round trips** and moves **76,616,608 result bytes**; of that, the ~11 KB the client
+C1 (§9), `{ .service.namespace = "prod" } | max(duration) > 1s` at `limit=20` costs **1,128
+sequential round trips** and moves **77,572,021 result bytes**; of that, the ~11 KB the client
 receives is all that was wanted (11,340 B, measured on C2 — see §9.1).
 
 **The same answer lowered is four statements, not one: 4 round trips.** The compiled generator is
@@ -95,27 +95,22 @@ trace-wide with no time predicate (§3.1's `Emit` row, §5). §9.2's own round-t
 `1 + 2·ceil(k/32) + 1` agrees: after lowering every candidate the generator returns already
 qualifies, so `k` is the request's `limit` of 20 and the count is 4.
 
-> **Superseded figure.** `43,636 B` is **seed + root only**: it was computed from a two-statement
-> model and omits the hydration and membership reads, and its seed row was measured on a statement
-> carrying `LIMIT 20` — the collapsed candidate cap, which arrives with the `Order`/`Limit`
-> lowering and not with the aggregate pushdown. Every figure derived from it — the `1,756×` ratio,
-> the `2` round trips, `9,871,360` rows, `1,205` granules — carries the same omission, and so do
-> the counters in [the hops diagram](diagrams/query-lowering-hops.svg). The replacement totals, and
-> the diagram's redraw, are owed by **part 8's §9.2 re-measurement** (issue #492).
+> **The lowered totals are measured.** An earlier revision published a lowered cost of `43,636 B`
+> tagged `seed + root only`, computed from a two-statement model that left out the window-bounded
+> hydration read and the membership read; every ratio derived from it inherited the omission. That
+> figure, its tag and its ratios are **superseded by the §9.2 re-measurement** and appear nowhere
+> else in this record, in [`query-to-sql.md`](query-to-sql.md) or in
+> [the hops diagram](diagrams/query-lowering-hops.svg), which is redrawn from the same artefact.
+> §9.2b measures all four lowered statements and §9.2's comparison table divides the two whole
+> requests: **212,986 B** against **77,572,021 B**, a saving of **364×**.
 
-> **Two figures are unverified survivors.** The client's `11,340 B` (measured on C2, §9.1) and the
-> peak-memory pair `169,311,055` / `190,353,655 B` with its `1.12×` (C1, §9.2) are **not**
-> superseded by the statement-count correction, and nothing found in part 4 suggests they are wrong
-> — but nobody has re-measured them, and neither corpus is standing, so the verdict rests on
-> argument alone. **Part 8 re-measures both** alongside its §9.2 re-measurement, or records here
-> that the corpus was not rebuilt and carries the figure forward still flagged.
-
-> **16,598× is not this document's figure and appears nowhere as one.** It is 76,616,608 ÷ 4,616 —
-> today's whole request divided by the lowered *statement* alone, with the root read the lowered
-> path still performs left out of the denominator. The figure this document uses everywhere is
-> **1,756×**. The rejected number is written down exactly twice, here and at §9.2, and both times
-> to reject it; a reader who computes it should know it has been considered, not wonder whether it
-> was missed.
+> **One figure is still an unverified survivor.** The client's `11,340 B` was measured on **corpus
+> C2** (§9.1) — the OTLP-ingest corpus — and part 8 did not rebuild C2, so it is carried forward
+> still flagged: nothing suggests it is wrong and nobody has re-measured it. **The peak-memory pair
+> has left this list.** §9.2b re-measures it on C1 as **167,629,277** / **190,817,746 B** with a
+> **1.14×**, and the re-measurement corrects what the smaller figure was *of*: the earlier revision
+> called it "the loop's maximum", and the loop's maximum is 26,084,032 B. The larger of the two is
+> the phase-1 generator's peak, on both sides of the comparison.
 
 ![Bytes per hop, evaluated against lowered](diagrams/query-lowering-hops.svg)
 
@@ -646,7 +641,7 @@ what it does not.
 #### 2.7.1 The plan object
 
 The fold's output was one relation, one disposition per link and a boundary kind. **That cannot say
-what a request actually does.** §9.2's worked query sends **1,110 statements**, and the fold's output
+what a request actually does.** §9.2's worked query sends **1,128 statements**, and the fold's output
 type had no field that could hold a number other than one; worse, a SQL statement — the winners'
 root read — was being described as work in our own engine. A type that cannot represent what the
 system already does is wrong independently of any new requirement.
@@ -1205,6 +1200,16 @@ re-checked the same way, with three to eight spellings each, and all four held.
 | link | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|
 | `Source` — `SpansetExpr` (`ast.rs:99`) | — → `Spans` | none; lowers by §2.4's lattice | n/a — the seed is always applied. An unlowerable leaf contributes `1` and clears `exact` | **always lowers, possibly partially** | *none*, unless the selector is a disjunction over two sources — then `Cut::DisjointSources` (§2.7.4) |
+| `Hydrate` (synthesised, `traces/compile.rs:169`) | any → same shape | **never lowers** (`No(NotYetLowered)`) — the batch hydration read is a second statement over a different source keyed by this statement's result, and no SQL form has been written that would put it INTO the seed statement. That is what `NotYetLowered` says here, as against `Never`: nothing about the read is impossible, only unwritten | **none — the identity.** The read adds rows the evaluator consults; it rewrites no column's provenance and narrows no predicate. The row asserts the identity rather than leaving the exemption silent | never lowers | **`Cut::SourceHandoff`** (§2.7.2) — source `trace_spans` (hydration), key `trace_id`, `SeedBound::Config { reader.traceql_max_candidates }` |
+| `Membership(i)` (synthesised, `:172`) | any → same shape | never lowers (`No(NotYetLowered)`), same reason as `Hydrate`. `i` indexes `SearchPlan::probes`, so one attribute probe is one link and one statement | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_attrs_idx` (membership), key `trace_id`, `SeedBound::Config` |
+| `AggValues(i)` (synthesised, `:175`) | any → same shape | never lowers (`No(NotYetLowered)`). `i` indexes `SearchPlan::agg_fields`: one aggregate operand's `val_num` batch read | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_attrs_idx` (values), key `trace_id`, `SeedBound::Config` |
+| `SelectValues(i)` (synthesised, `:178`) | any → same shape | never lowers (`No(NotYetLowered)`). `i` indexes `SearchPlan::select_attrs`: one `select()` field's `val` batch read. It shares a source with `AggValues` and is a separate link because it is a separate statement | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_attrs_idx` (values), key `trace_id`, `SeedBound::Config` |
+| `EventSet(i)` (synthesised, `:181`) | any → same shape | never lowers (`No(NotYetLowered)`). `i` indexes `SearchPlan::event_sets`: one span-event / span-link value-set batch read | **none — the identity** | never lowers | **`Cut::SourceHandoff`** — source `trace_attrs_idx` (event sets), key `trace_id`, `SeedBound::Config` |
+| `TraceCtx` (synthesised, `:183`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, and the reason is the co-load's REACH rather than a missing SQL form: the trace-context read is deliberately trace-wide and unwindowed, so `traceDuration`, `rootName` and `rootServiceName` evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state | **none — the identity** | **never lowers, in any state** | **`Cut::SourceHandoff`** — source `trace_spans` (trace context), key `trace_id`, `SeedBound::Config` |
+| `ChildCount` (synthesised, `:185`) | any → same shape | **`Never(TraceLevelIntrinsic)`**, same reason: `span:childCount` is counted over the whole trace, not over the window | **none — the identity** | never lowers, in any state | **`Cut::SourceHandoff`** — source `trace_spans` (child counts), key `trace_id`, `SeedBound::Config` |
+| `Structural` (synthesised, `:187`) | any → same shape | **`Never(StructuralRelation)`** — the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it | **clears `exact`** — the generators are the superset union of both operands' sets and the relation is applied afterwards, so the SQL means strictly more than the query | never lowers, in any state | *none* — the link reads no new source, so there is no handoff and no second part |
+| `NestedSet` (synthesised, `:189`) | any → same shape | **`Never(NestedSetNumbering)`** — a modified-preorder numbering computed per trace at query time; no stored column carries it | **clears `exact`** | never lowers, in any state | *none* — same reason |
+| `BoolTruth` (synthesised, `:192`) | any → same shape | **`Never(WholeQueryTypeFailure)`** — one row's type must fail the WHOLE request (a present non-boolean operand under `!` is an error for the query, not a non-match for the span) and SQL evaluates row by row | **clears `exact`** | never lowers, in any state | *none* — same reason |
 | `Aggregate { op, field, cmp, value }` (`ast.rs:994`) | `Spans` → `Traces` | `exact`, **no fragment already in this statement's `HAVING`**, and a fragment `aggregate_having_sql` will render for this (aggregate, operator) pair and this grouping | **shape unchanged** — whatever the fold has accumulated, not reset to `Spans`; **clears `exact`** — the evaluator will drop traces the SQL returned | conditional, **over the accepted payload set only** (above) | *none* |
 | `By { key }` (`ast.rs:1046`) | `Spans` → `Groups{key}` | never lowers (`No(NotYetLowered)`) — the evaluator builds the span sets | **shape unchanged**; records the key as an evaluator-owned group consumer; and then EITHER records `grouping` and leaves `exact` alone, when the key renders on this generator's source and the slot is free and the relation is still exact, OR clears `exact` | never lowers | *none* |
 | `Coalesce` (`ast.rs:1049`), after a `By` | `Groups` → `Spans` | the level carries no `HAVING` — then the grouping slot is FREED. With a `HAVING` it refuses: the aggregate selected groups, and the spans it selected are not recoverable | **shape unchanged** — `Groups` in the ordinary case, but `Spans` if the preceding `By` was itself residual; clears `exact` when it refuses | conditional | *none* |
@@ -1239,6 +1244,12 @@ Four consequences fall out of the table rather than being written down.
 - **The three metrics variants are not chain links at all on this route.** They are listed so the
   enumeration is complete against the AST rather than against the search planner's subset; a reader
   checking `PipelineStage` against this table finds every variant.
+- **The table is complete against `TqlLink`, not only against `PipelineStage`, and that is new in
+  part 8.** It used to carry rows for 5 of the enum's 15 variants — `Source`, `Pipe(_)`, `Order`,
+  `Limit` and `Emit` — while calling itself the complete link set, and three of the missing ten
+  (`Hydrate`, `Membership(n)`, `SelectValues(n)`) appear in **every** rendered plan on the search
+  route. `every_traceql_chain_link_has_a_row_in_the_lowering_document` enumerates the enum
+  exhaustively with no `_` arm, so a sixteenth variant fails to build rather than going unlisted.
 
 ### 3.2 Group 1 — cannot be lowered
 
@@ -1254,7 +1265,7 @@ of the pipeline."
 
 | class | what it costs today | ranked from |
 |---|---|---|
-| **spanset aggregate** (`count`/`sum`/`avg`/`min`/`max`) | the whole two-phase loop: 1,110 round trips, 76,616,608 metered bytes, 5,705,629,767 rows read (§9.2) | **measured on C1** |
+| **spanset aggregate** (`count`/`sum`/`avg`/`min`/`max`) | the whole two-phase loop: 1,128 round trips, 77,572,021 metered bytes, 5,795,940,946 rows read (§9.2) | **measured on C1** |
 | **`by()` regrouping** | adds no query of its own; its saving is the same loop collapse when the selector is lowerable | argued — it adds no read |
 | **`select()` projection** | one extra read per batch; +4.6 KiB per request and one extra round trip. **Measured and refused** in §9.8: for the query whose only attribute-index read is the `select()` value read there is nothing to merge it with, and putting an attribute value into a `trace_spans` statement is a join | measured on C2 (issue #478); the refusal measured on §9.8's corpus |
 | **field-vs-field comparison** `{ .a = .b }` | **four** `attr_values_sql` reads per batch, not two — each attribute operand is interned into `select_attrs` *and* into `agg_fields` (`plan_operand`, `search_plan.rs:1358-1359`), so a two-operand leaf reads both values twice. One whole request on C6: 37 statements and 300,984,841 rows read when 1 trace in 10 matches, **3,127 statements and 25,904,824,756 rows read** when 1 in 1,000 does (§9.7) | **measured on C6** |
@@ -1349,7 +1360,7 @@ Three more entries in this group:
 
 `{ .service.namespace = "prod" } | max(duration) > 1s`, `limit=20`, 5-day window.
 
-**Today** — one generator, then 554 iterations of two queries, then one root read:
+**Today** — one generator, then 563 iterations of two queries, then one root read:
 
 ```sql
 -- phase 1, once
@@ -1360,7 +1371,7 @@ WHERE date >= toDate('…') AND date <= toDate('…')
   AND (key = 'service.namespace' AND val = 'prod')
 GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 
--- phase 2, per batch of 32 candidates, 554 times, serially
+-- phase 2, per batch of 32 candidates, 563 times, serially
 SELECT trace_id, span_id, parent_id, <9 capped/plain columns>
 FROM trace_spans
 WHERE trace_id IN (unhex('…'), … 32 of them)
@@ -1407,13 +1418,14 @@ WHERE trace_id IN (unhex('…'), … the 20 winners)
 a single-attribute-leaf selector with a `duration`- or `count`-sourced aggregate **the attribute
 index covers the whole query** — no join, no subquery, no second table.
 
-**Four round trips, not one, and that is the number every other section quotes.** 1,110 → **4**;
-76,616,608 B → **43,636 B** (4,616 + 39,020); 5,705,629,767 rows → **9,871,360** (9,052,160 +
-819,200); 696,630 granules → **1,205** (1,105 + 100). Both sides of every ratio include the root
-read, so the comparison is like for like — today's 1,110 round trips include it too (§9.2).
-**The three lowered totals here are `seed + root only`**: they add the generator's row to the root
-read's and omit the hydration and membership reads that survive lowering, so each is a lower bound
-rather than the total. Part 8's §9.2 re-measurement replaces them.
+**Four round trips, not one, and that is the number every other section quotes.** 1,128 → **4**;
+77,572,021 B → **212,986 B**; 5,795,940,946 rows → **19,988,480**; 707,689 granules → **2,440**.
+Both sides of every ratio include the root read, so the comparison is like for like — today's
+1,128 round trips include it too (§9.2). **All four lowered totals are measured over all four
+lowered statements** (§9.2b), the window-bounded hydration read and the membership read included.
+An earlier revision of this paragraph published `seed + root only` totals — the generator's row
+added to the root read's, with the two surviving phase-2 reads left out. Those are
+superseded by the §9.2 re-measurement.
 
 ---
 
@@ -1723,6 +1735,7 @@ says so in its own doc comment; that is why `RangeAgg::param` and `VectorAgg::pa
 
 | link | source | accepts → produces | precondition to lower | residual state effect | disposition | continuation |
 |---|---|---|---|---|---|---|
+| `Source` | the stream selector (`LogQL`'s `{…}`) | — → `Lines` | none; the seed is lowered by the predicate lattice rather than by the stage fold, so it always emits | **none — the identity.** The seed is always applied, so there is no residual case, and the row asserts the identity rather than leaving the exemption silent (`logql/compile.rs:314-317`) | **always lowers**, `Fidelity::Equivalent` | *none* |
 | `Window` | `LogRange` (`ast.rs:2301`) + the request step | `Lines`\|`Samples` → the same, bucketed | the origin-shifted bucket expression is emittable and the offset is representable | records the bucketing as evaluator-owned, so a following aggregation cannot lower | conditional | *none* |
 | `RangeAgg` | `MetricExpr::Range` (`ast.rs:940`) | `Samples` → `Series{by}` | `exact`, the `Window` lowered, and `__error__` either filtered or carried in the grouping | **shape unchanged** — `Lines` whenever the `Unwrap` above went residual, which is the case its own row describes; clears `exact` | conditional. `AbsentOverTime` is `Never`: the answer is a statement about rows that are **absent**, so there is no row to compute it from | *none* |
 | `VectorAgg`, one link per level | `MetricExpr::Vector` (`ast.rs:956`) | `Series` → `Series` | the prior level lowered and the grouping is expressible | retains the prior series state; clears `exact` | conditional | *none* |
@@ -1847,6 +1860,15 @@ empty**, so bytes read off the file system are not comparable with C2's; granule
 bytes and peak memory are. After `OPTIMIZE … FINAL`: `trace_spans` 5 parts / 1,230 granules / Wide;
 `trace_attrs_idx` 5 parts / 6,110 granules / Wide.
 
+**C1 is built by a committed generator as of part 8, and that is what makes §9.2 reproducible.**
+`cargo xtask bench traces-lowering` (`xtask/src/bench/traces_lowering.rs`) writes every row of it
+from `numbers_mt()` over an index, with no PRNG, so the corpus is a function of the constants this
+section states and nothing else. After its own `OPTIMIZE … FINAL` it reports **5 parts / 1,230
+granules** for `trace_spans` and **5 parts / 6,110 granules** for `trace_attrs_idx` — the same
+shape recorded above from the earlier, uncommitted build, which is a corroboration rather than a
+restatement: the two builds were made from different code four months apart. The reproduction
+command is in [the M4 traces read-path report](benchmarks/m4-traces-read-path.md).
+
 **C2 — the corpus of [#478](https://github.com/digitalis-io/pulsusdb/issues/478).** The same
 shape at the same scale, but pushed as OTLP/JSON through the product ingest path with real
 payloads, on both PulsusDB and the pinned reference. Used here only where a figure is attributed
@@ -1897,79 +1919,209 @@ the design does not have to choose a layout.
 
 ### 9.2 The worked query, per stage
 
+**Every figure in this section and in §9.2b is read out of
+[`docs/benchmarks/data/traces-lowering-92.json`](benchmarks/data/traces-lowering-92.json), which
+holds one `system.query_log` row per statement — 1,132 rows, one per `query_id`, no summaries.**
+The corpus, the two forms and the retained rows are produced by
+`cargo xtask bench traces-lowering` (`xtask/src/bench/traces_lowering.rs`); the reproduction
+command is in [the M4 traces read-path report](benchmarks/m4-traces-read-path.md). Before this
+re-measurement the section's figures rested on a run whose corpus was committed nowhere and whose
+rows had been discarded, so nothing in this repository could re-derive one of them.
+`every_figure_section_9_2_states_is_the_one_the_artefact_holds`
+(`crates/pulsus-read/tests/query_lowering_doc_gate.rs`) totals the artefact's rows and compares
+every cell below against its total.
+
 Corpus C1, one request, driven serially exactly as the phase-2 loop (`exec.rs:1973`) and its three
-serial reads (`exec.rs:2204`, `2054`, `2079`) drive it:
+serial reads (`exec.rs:2204`, `2054`, `2079`) drive it. Byte columns are raw `system.query_log`
+byte counts; `decoded †` is `read_bytes` and `off file system †` is
+`ProfileEvents['ReadBufferFromFileDescriptorReadBytes']`. The `granules (avg)` column is the mean
+`ProfileEvents['SelectedMarks']` per statement, with the observed range beside it; its **total**
+row is the sum over every statement, not a mean.
 
 | stage | queries | rows read | decoded † | off file system † | granules (avg) | result bytes |
 |---|---|---|---|---|---|---|
-| phase-1 generator | 1 | 9,052,160 | 293.12 MiB | 63.82 MiB | 1,105 | 4,767,944 |
-| phase-2 hydration | 554 | 680,861,767 | 16.51 GiB | 4.09 GiB | 150.3 (min 129, max 161) | 67,395,894 |
-| phase-2 membership | 554 | 5,014,896,640 (see below — this total is **not** a second witness) | 84.11 GiB | 9.93 GiB | **1,105 on 553 of the 554** | 4,413,750 |
-| winners' root read | 1 | 819,200 | 14.28 MiB | 4.01 MiB | 100 | 39,020 |
-| **total** | **1,110** | **5,705,629,767** | **100.9 GiB** | **14.09 GiB** | 696,630 | **76,616,608** |
+| phase-1 generator | 1 | 9,052,160 | 307,228,160 | 78,482,522 | 1,105 (min 1,105, max 1,105) | 4,767,944 |
+| phase-2 hydration | 563 | 689,769,042 | 17,546,569,141 | 6,270,799,741 | 149.9 (min 129, max 161) | 68,260,769 |
+| phase-2 membership | 563 | 5,096,366,080 | 91,782,941,344 | 11,888,515,258 | 1,105 (min 1,105, max 1,105) | 4,485,300 |
+| winners' root read | 1 | 753,664 | 13,345,772 | 8,886,238 | 92 (min 92, max 92) | 58,008 |
+| **total** | **1,128** | **5,795,940,946** | **109,650,084,417** | **18,246,683,759** | **707,689** | **77,572,021** |
 
-against the lowered form's **2 queries** — the lowered statement at 9,052,160 rows, 103,882,082
-bytes off the file system †, 1,105 granules and 4,616 result bytes, at 190,353,655 B peak query
-memory against the loop's maximum of 169,311,055 B, **plus the winners' root read**, which is the
-fourth row of the table above and is unchanged by lowering: 1 query, 819,200 rows, 4.01 MiB off the
-file system †, 100 granules, 39,020 result bytes.
+The two byte totals rendered for reading: **102.12 GiB** decoded and **16.99 GiB** off the file
+system.
+
+### 9.2b The lowered request, per stage
+
+The same request with the spanset aggregate compiled into the phase-1 generator's `HAVING` (issue
+[#492](https://github.com/digitalis-io/pulsusdb/issues/492) part 4). One plan, two statements for
+phase 1: `generator_sqls[0]` carries the `HAVING`, and `SearchPlan::generator_fallback_sql` is the
+byte-identical statement without it. The table above is driven from the second, this one from the
+first; **the hydration, membership and root statements are the same builders in both**, so the
+whole difference between the two tables follows from how many candidates phase 1 returns.
+
+| stage | queries | rows read | decoded † | off file system † | granules (avg) | result bytes |
+|---|---|---|---|---|---|---|
+| lowered generator | 1 | 9,052,160 | 379,317,760 | 83,844,774 | 1,105 (min 1,105, max 1,105) | 24,584 |
+| lowered hydration | 1 | 1,130,496 | 28,818,128 | 15,084,501 | 138 (min 138, max 138) | 114,074 |
+| lowered membership | 1 | 9,052,160 | 164,678,336 | 24,111,699 | 1,105 (min 1,105, max 1,105) | 16,320 |
+| winners' root read | 1 | 753,664 | 13,345,772 | 8,886,238 | 92 (min 92, max 92) | 58,008 |
+| **total** | **4** | **19,988,480** | **586,159,996** | **131,927,212** | **2,440** | **212,986** |
+
+The two byte totals rendered for reading: **559.01 MiB** decoded and **125.82 MiB** off the file
+system.
+
+**The lowered generator is the more expensive statement, and that is the point.** It reads the same
+9,052,160 rows and selects the same 1,105 granules as the unlowered one, but it also reads
+`duration_ns` to evaluate the `HAVING`, so it decodes 379,317,760 bytes against 307,228,160 and
+peaks at 190,817,746 B of database memory against the unlowered generator's 167,629,277 B:
+**1.14×** = 190,817,746 / 167,629,277. Paying that on one statement is what removes 1,124 others.
+Every ratio this section prints is written that way — the value, then the division it comes from —
+so a reader can check it without leaving the paragraph, and
+`every_ratio_in_section_9_2_is_the_quotient_of_two_printed_figures` checks every one of them.
+
+**Both memory figures are phase-1 generators', and an earlier revision said otherwise.** It
+published `169,311,055 B` as *"the loop's maximum"*. It is not a loop figure at all. Over the same
+request there are two different maxima and this revision names which is which:
+
+| quantity | scope | this measurement |
+|---|---|---|
+| the unlowered phase-1 generator's peak | one statement, `max(memory_usage)` over the single `(current, generator)` row | **167,629,277 B** |
+| the phase-2 loop's peak | 1,126 statements, `max(memory_usage)` over every `(current, hydration)` and `(current, membership)` row | **26,084,032 B** |
+| the lowered phase-1 generator's peak | one statement, `max(memory_usage)` over the single `(lowered, generator)` row | **190,817,746 B** |
+
+The loop's real peak is **6.4 times smaller** than the figure that was labelled as its maximum, and
+the number of that size belongs to the generator. **Nothing but the retained rows could have shown
+this**: a total, or a single published maximum, looks the same whichever subset it was taken over.
+That is the argument for committing one row per statement rather than a summary, and it is why
+`memory_usage` is the one quantity in this section with no accumulator — it is a maximum over a
+*named* subset, never a total, and the check that reads this artefact refuses to sum it.
+
+**Where the round trips go.** The round-trip count is `1 + 2·ceil(k/32) + 1` where `k` is the index
+of the `limit`-th qualifying candidate in `bound_ts DESC` order. On C1 as this harness builds it a
+trace qualifies when it carries the one 2.001 s span, which is one trace in a thousand, and 45 of
+the 50 services are `prod`, so the 20th qualifying candidate is at `k = 18,000`; `ceil(18000/32)`
+is 563 and the count is 1,128. Lowered, the generator returns only qualifying candidates, so `k` is
+the request's `limit` of 20, one batch serves it and the count is 4.
 
 | | round trips | rows read | granules | result bytes |
 |---|---|---|---|---|
-| today | 1,110 | 5,705,629,767 | 696,630 | 76,616,608 |
-| lowered (`seed + root only`) | **4** | **9,871,360** | **1,205** | **43,636** |
-| ratio | **277.5×** | **578×** | **578×** | **1,756×** |
+| today | 1,128 | 5,795,940,946 | 707,689 | 77,572,021 |
+| lowered | **4** | **19,988,480** | **2,440** | **212,986** |
+| ratio | **282×** | **290×** | **290×** | **364×** |
 
-**The `lowered` row's three totals are `seed + root only`, and its ratios inherit that.** They were
-computed under a two-statement model: the round-trip count is corrected to 4 here, but the rows,
-granules and result bytes still add only the generator's row to the root read's and omit the
-window-bounded hydration read and the membership read, which survive lowering because
-`spanSets[].matched` and `spanSets[].spans[]` are written unconditionally. The `578×` and `1,756×`
-ratios are therefore upper bounds on the true saving, not the saving. **Part 8's §9.2
-re-measurement replaces every figure in the `lowered` and `ratio` rows.**
+Both rows count the **whole request**, the winners' root read included, so the ratios compare like
+with like. `every_ratio_in_section_9_2_is_the_quotient_of_two_printed_figures` divides the two rows
+above and refuses any printed ratio that is not within half of its last printed place.
 
 **§9.7 is a second table of this kind and it is not this one.** It measures a *refused* push — the
 per-span pre-grouping four group-2 selector classes would need — on a different corpus, with the
 instrument settings stated beside every figure. Anyone re-taking this section should read §9.7
 first, so part 6's numbers are found rather than taken again.
 
-**The root read is why the lowered side is more than 1.** It is not an artefact of the measurement:
+**The root read is why the lowered side is 4 and not 1.** It is not an artefact of the measurement:
 `Emit` is `Never` (§3.1) because the root summary is trace-wide and unwindowed, so no chain removes
-it. **16,598× is not a figure this document reports**, here or anywhere: it is the lowered
-statement's 4,616 B alone against today's total, which compares a whole request against part of one.
-This is the second and last of the two places the number is written down, and both reject it (§1).
+it; and the window-bounded hydration read and the membership read survive lowering because
+`spanSets[].matched` and `spanSets[].spans[]` are written unconditionally. The earlier revision of
+this section published a lowered total of `43,636 B` computed from **two** statements — the
+generator and the root read — and every ratio derived from it. That figure and its ratios are
+superseded by the §9.2 re-measurement: the four rows of §9.2b are what a lowered request costs,
+measured, and the `354×` above is the saving.
 
 **Our own process does not grow while it holds the matched set.** `pulsus-server` resident memory
 stayed at 383 MiB, unchanged from idle, measured on corpus C2. The cost of the two-phase loop is on
 the metered hop and in the database, not in our heap — which is why every ratio above is counted in
 bytes and round trips rather than in memory. Carried over from the hops diagram, where it was the
-only figure this document did not also state; **not re-measured in this revision.**
+only figure this document did not also state; **not re-measured in this revision**, because C2 was
+not rebuilt.
 
-The round-trip count is `1 + 2·ceil(k/32) + 1` where `k` is the index of the `limit`-th qualifying
-candidate in `bound_ts DESC` order; on C1, `k = 17,717`, so 554 batches and 1,110 round trips.
-On C2 the same mechanism gave 1,128 — the constant is corpus-dependent, the mechanism is not.
+**The membership read is the dominant term, it is batch-independent, and this is now stated over
+every batch rather than most of them.** All **563** membership reads selected exactly 1,105
+granules and read exactly 9,052,160 rows — the artefact holds all 563 rows and they agree to the
+byte, so the per-read unit and the phase total are two readings of the same evidence rather than
+one number and a multiplication. The earlier revision could only say "553 of the 554", and had to
+flag its own phase total as *not independent evidence*, because the run's rows had not been kept.
+Retaining one row per statement is the whole reason that flag is gone.
 
-**The membership read is the dominant term and it is batch-independent.** **553 of the 554**
-reads selected exactly 1,105 granules and read exactly 9,052,160 rows. The 554th is not accounted
-for here, and this document does not round the 553 up: the retained `system.query_log` output for
-that run is not in this tree, so 553 is what can be said.
-
-**The phase total is not independent evidence, and must not be read as a second witness.** The
-phase-2 membership row's total, 5,014,896,640 rows, is exactly `554 × 9,052,160`. That is what a
-measured total would look like if all 554 reads were identical — and it is exactly what a total
-*derived* by multiplying the unit by the batch count would look like as well. From inside this
-document the two cases are indistinguishable, so the total is **consistent with** all 554 being
-identical but is **not independent evidence** of it, and it corroborates nothing about the 553.
-The claim this document carries is the 553, on its own. **Wave 1 owes a re-measurement of this
-row**, stated as an obligation in §10.
-
-It reads the same rows on each of those 553; asking about a different 32 candidates changes
-nothing, because
+The read is batch-independent because asking about a different 32 candidates changes nothing:
 `trace_id` is the fifth key column of `trace_attrs_idx` and the fourth, `timestamp_ns`, is left as
-the whole request window. Narrowing that predicate to the batch's own span range (14.7 s for one
-sampled batch) collapses the same read to **5 granules and 40,960 rows** with an identical 320-row
-answer — 221x fewer rows. That is a separate optimisation from anything in this document and it
-does not need the lowering core.
+the whole request window, so every batch scans the same `(key, val)` prefix. Narrowing that
+predicate to the batch's own span range collapses the same read to a handful of granules with an
+identical answer. That is a separate optimisation from anything in this document and it does not
+need the lowering core.
+
+**What is reproducible here, and what is not — and the two questions are different.** Re-running
+the harness against the SAME corpus is one question; rebuilding the corpus and re-running is
+another, and only the first was measured when this section was first written.
+
+**The block below is generated from
+[`docs/benchmarks/data/traces-lowering-92-rebuilds.tsv`](benchmarks/data/traces-lowering-92-rebuilds.tsv)**
+— the table and the sentences alike — and
+`the_rebuild_block_is_the_one_the_dataset_produces` compares it byte for byte. Two earlier
+revisions of this paragraph stated these figures in prose and both carried one that was wrong;
+gating the table alone was not enough, because the sentences beside a table are where the next
+wrong number goes. There is nothing here for a person to write a number into.
+
+<!-- generated from traces-lowering-92-rebuilds.tsv -->
+
+Each cell reads *statements moved, of 1,132* / *largest per-statement change*.
+
+| column | S | A | C |
+|---|---|---|---|
+| `selected_marks` | 0 / — | 0 / — | 1 / 0.71% |
+| `result_bytes` | 0 / — | 0 / — | 0 / — |
+| `read_rows` | 0 / — | 147 / 0.013% | 147 / 0.689% |
+| `read_bytes` | 0 / — | 147 / 0.013% | 147 / 0.647% |
+| `read_compressed_bytes` | 440 / 0.19% | 977 / 0.013% | 996 / 0.234% |
+| `fd_read_bytes` | 561 / 2.53% | 1124 / 2.5% | 1125 / 3.15% |
+| `memory_usage` | 982 / 25.8% | 1132 / 18.6% | 1105 / 19.9% |
+
+**S** is the same corpus, run twice by this harness.
+
+**A** is a corpus rebuilt from the committed generator, measured by this harness.
+
+**C** is a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here.
+
+**B** is a corpus rebuilt on another host by issue #492 part 8's first code review, which reported group totals only, so it appears in no column above: `selected_marks` +1 granule, hydration group; `result_bytes` +2,323 bytes, hydration group.
+
+Changes over the whole unlowered request, where an observation published one: S `fd_read_bytes` 0.03%; A `read_rows` −418 rows, −0.00001%; A `read_bytes` +11,418 bytes, +0.00001%. Every other cell above was published per statement only.
+
+On the same corpus, 4 of the 7 columns did not move on a single statement: `selected_marks`, `result_bytes`, `read_rows`, `read_bytes`.
+
+Rebuild C differs from rebuild A on 6 of the 7 columns; the one it does not differ on is `result_bytes`.
+
+Of the 7 columns, **none** is one every rebuild that recorded it found unmoved.
+
+An earlier revision of this section said a rebuild is expected to land within rebuild A's figures. That expectation was written before rebuild C, and rebuild C did not meet it. 4 observations exist now — A, B, C, S — and no band is established across them: what they establish is that these columns vary, not by how much. A re-runner should expect their numbers to differ from the committed artefact without reading the difference as a defect.
+
+<!-- end generated -->
+
+> **These two sections were reconstructed, and the reconstruction cannot be verified.** While part 8
+> was being reviewed, `git checkout` was used to revert a break with two document rewrites
+> uncommitted, and both were destroyed — this reproducibility block and §12.3. They were rewritten
+> from what their author remembered writing. **No blob of the destroyed text was retained**, so
+> nobody can compare the reconstruction against it: a reader can check the current text for internal
+> consistency and against the datasets, and that is all. A code review checking it for internal
+> consistency is what found that one paragraph said every rebuild agreed on a column another
+> paragraph said one rebuild had moved. **A reconstruction that cannot be verified is a different
+> thing from one that has been**, and this note exists so a later reader does not mistake the second
+> for the first. Both blocks are generated from committed datasets now, which is a guarantee about
+> the present text and says nothing about what the destroyed text contained.
+
+**The mechanism is adaptive granularity.** `index_granularity_bytes` is 10 MiB on these tables, so a
+granule holds as many rows as fit in that many bytes rather than a fixed 8,192. The corpus is
+anchored to the day it is built, so `timestamp_ns` carries different absolute values between builds;
+under `CODEC(DoubleDelta, ZSTD)` those compress differently, the byte size of a row shifts, and a
+granule boundary moves. A moved boundary changes how many rows a `trace_id IN (…)` read touches, and
+that is what the row and byte columns above are showing.
+
+**So §9.2's figures are gated against the committed artefact and against nothing else.**
+`every_figure_section_9_2_states_is_the_one_the_artefact_holds` compares the document with
+`docs/benchmarks/data/traces-lowering-92.json`, which is one measurement kept row by row. A rebuild
+is a second measurement of the same design on a different corpus build, and the two are not required
+to agree.
+
+Both byte counters are recorded in the artefact for every statement and neither is inferred from the
+other; the memory figures §9.2b prints are one run's, which is why they carry no accumulator and no
+ratio gate beyond the one printed beside them.
 
 ### 9.3 The correctness consequence, measured
 
@@ -1993,8 +2145,8 @@ parts. Within 9% at every point, exact at both ends. Two consequences decide emi
 - **A single point lookup costs `P` granules, not 1.** A trace's spans live in one partition, but
   the primary key carries no partition information, so one granule per part is selected.
 - **Pruning saturates at `N ≈ G/P`.** Here `G/P = 246`, and at `N = 256` the query already reads
-  66% of the window. At the emitted `BATCH_TRACES = 32` a batch reads 12.6% of the window, 554
-  times — the loop reads the table 68x over.
+  66% of the window. At the emitted `BATCH_TRACES = 32` a batch reads 12.6% of the window, 563
+  times — the loop reads the table 69x over.
 
 `EXPLAIN indexes = 1` names the mechanism and the count together for the emitted 32-id batch:
 `Granules: 149/1225`, `Ranges: 119`, `Search Algorithm: generic exclusion search`. An `IN`-set on
@@ -4115,8 +4267,8 @@ and neither at base — and §11.5's "no compile-failure harness exists" was fal
    one.
 5. **The hops diagram asserted three things the prose did not** — a specific vendor's datasource as
    the client, a `pulsus-server` resident-memory figure, and "every one of the 554 batches" where
-   §9.2 says 553. The client label is generic, the memory figure is in §9.2, the batch count matches
-   §9.2, and §11.3 records that none of the gates it nominates would have caught any of
+   §9.2 said 553 at the time. The client label is generic, the memory figure is in §9.2, the batch
+   count matches §9.2, and §11.3 records that none of the gates it nominates would have caught any of
    the three.
 
 **Corrected in the revision after that, and four of the five are one defect: a check whose domain
@@ -4149,10 +4301,13 @@ was smaller than the claim it was asked to support.**
 4. **The hops diagram carried three MORE picture-only assertions**, found only when the method
    changed from "look for figures" to "enumerate every text node in both files". §11.3 states the
    method and the count.
-5. **§9.2's phase-2 total is exactly `554 × 9,052,160`**, which is what a measured total and a
-   derived total both look like, so it cannot corroborate the per-read figure beside it. The claim
-   is weakened to the 553 alone, the total is labelled as not independent evidence, and **wave 1
-   owes a re-measurement retaining the raw `system.query_log` rows** (§10's wave-1 paragraph).
+5. **§9.2's phase-2 total was exactly the per-read unit times the batch count**, which is what a
+   measured total and a derived total both look like, so it could not corroborate the per-read
+   figure beside it. The claim was weakened to "553 of the 554" and the total was labelled as not
+   independent evidence. **Part 8 discharged the re-measurement it owed:** §9.2 is now computed
+   from one retained `system.query_log` row per statement
+   ([`docs/benchmarks/data/traces-lowering-92.json`](benchmarks/data/traces-lowering-92.json)), all
+   563 membership reads agree to the byte, and the flag is gone.
 
 **Changed by the plan-object revision, and none of it is compiled.** The compiler's output became a
 **plan** rather than a relation-plus-dispositions (§2.7.1); the four cuts, the three must-not-cut
@@ -4206,17 +4361,19 @@ What changed, so the redraw is reviewable as a redraw:
 | hops panel title | *"one lowered statement, plus the winners' root read"* | *"a plan of 2 SQL parts, the second seeded by the first's 20 trace ids"* |
 | hops caption / `<desc>` | *"2 statements."* / *"stays residual in every chain"* | *"2 SQL parts."* / the same clause the legend gained |
 
-**No number moved.** The hops diagram's counters — 1,110 against 2 round trips, 76,616,608 against
-43,636 result bytes (`seed + root only`), the 553-of-554 batch note — are untouched, and so is
-every box and arrow position; the boundary diagram went from 87 text nodes to 90 (one legend entry,
-two caption lines). Both files parse as XML.
+**No number moved in part 4's edit.** The hops diagram's counters and the 553-of-554 batch note
+were left exactly as they stood, and so was every box and arrow position; the boundary diagram went
+from 87 text nodes to 90 (one legend entry, two caption lines). Both files parse as XML. **Part 8
+then redrew the hops diagram from the retained rows**, so none of those counters survives; the
+boundary diagram is untouched by part 8.
 
-**The table above is a record of a past edit, and the drawing has since grown.** Part 4 (issue
-#492) marked the hops diagram and moved no number. The canvas grew from 620 to 764 px and the ratio
-panel moved down 144 px to make room; every existing `<title>`, `<desc>` and `<text>` node keeps its
-content, and `<desc>` gained a superseded sentence at its end. The drawing therefore carries **43**
-`<text>` nodes where the enumeration above counted 42. Which of its lowered figures are superseded
-and which are not is stated in §1 and on the face of the drawing; the redraw is part 8's.
+**The table above is a record of two past edits.** Part 4 (issue #492) marked the hops diagram and
+moved no number: the canvas grew from 620 to 764 px, the ratio panel moved down 144 px to make room
+for the marker, every existing `<title>`, `<desc>` and `<text>` node kept its content, and `<desc>`
+gained a superseded sentence. **Part 8 then redrew it** against §9.2 and §9.2b: the marker node and
+every figure it named are gone, the canvas is back to 620 px, and
+`the_hops_diagram_and_the_document_agree_on_the_lowered_request` now compares the drawing's lowered
+round-trip count and result-byte total against §9.2b's rather than leaving them to be read.
 
 **The three diagram gates are still wave 1 and are still owed** —
 `the_hops_diagram_and_the_document_agree_on_the_lowered_request`,
@@ -4236,18 +4393,17 @@ It also lands the LogQL `Lang` impl and link set **compiled and unwired**: not c
 `plan.rs`, no LogQL SQL emitted, no LogQL behaviour changed. The gates that make that worth having
 are §11, by name and by selector — four of them exist and the other twenty-one are **wave 1**.
 
-**Wave 1 also owes one re-measurement, and it is a close condition rather than a nicety.** §9.2's
-phase-2 membership row states a total that is exactly `554 × 9,052,160`, which is what both a
-measured and a derived total look like, so the total cannot corroborate the per-read figure beside
-it. Wave 1 must **re-measure** the phase-2 loop on C1 and **retain the raw `system.query_log` rows
-for all 554 membership reads as an artefact**, not as a quoted figure, then replace both the total
-and the "553 of the 554" with what those rows say. Until that lands, §9.2 carries the 553 alone and
-says the total is not independent evidence. The drawing carries the same two claims in its
-own text node at `y=258` (`diagrams/query-lowering-hops.svg`), so the replacement is not complete
-until that node says what the retained rows say. That node, the lowered band's `y=474` sentence and
-the ratio panel's second line each run past the canvas today — measured at `right` 1255.6, 1276.2
-and 1344.7 against a canvas of 1120 — and the rewrite is where the overflow gets fixed. Part 4
-neither widened nor narrowed any of the three.
+**That re-measurement has landed.** §9.2's phase-2 membership row used to state a total that was
+exactly the per-read unit times the batch count, which is what both a measured and a derived total
+look like, so the total could not corroborate the per-read figure beside it. Part 8 re-measured the
+phase-2 loop on C1 and **retained one raw `system.query_log` row per statement** —
+[`docs/benchmarks/data/traces-lowering-92.json`](benchmarks/data/traces-lowering-92.json), 1,132
+rows, no summaries — so the per-read unit and the phase total are now two readings of the same
+evidence. All 563 membership reads selected 1,105 granules and read 9,052,160 rows, so the "553 of
+the 554" is replaced by a statement over every batch. The drawing carried the same two claims in a
+text node of its own and is redrawn from the same artefact. Three of its text runs used to overflow
+the canvas — measured at `right` 1255.6, 1276.2 and 1344.7 against a canvas of 1120 — and the
+redraw is where that was fixed.
 
 **Two behaviours change with the chain, and both were measured rather than ruled on.** Corpus
 **C3**: one trace, four spans, three named `a` and one named `b`, under one resource
@@ -4306,11 +4462,19 @@ ruling and is neither measured nor estimated. Behaviour at 1 TB is
 ## 11. The tests this design nominates
 
 A design that names behaviours and no test selectors cannot be checked before the code exists. Each
-gate below is named with the **`cargo nextest` selector that selects it**, its binary, and its count
-at base: **four of the 25 gates exist and run today, and the other twenty-one do not exist and are
-wave 1**. For those twenty-one the selector is the one that **would** run the gate once wave 1 has written
-it: today it prints `Starting 0 tests` and exits 4, or fails target selection and exits 101. The
-wave that lands each one must make that same selector print `Starting 1 test`.
+gate below is named with the **`cargo nextest` selector that selects it**, its binary, and two
+states: what it printed **at base** — commit `acf44c49`, a measurement that stays as one — and what
+the tree says **today**.
+
+> **Part 8 re-derived the `today` column, and it is why that column exists.** At base four of the 25
+> gates ran and twenty-one were wave 1, and this section stated that in a dozen places. It went on
+> stating it: **27 of the 28 selectors the record names now resolve to a definition in the tree**,
+> and the one that does not is `no_such_test_name_at_all_zzz`, this record's own negative control.
+> `every_gate_the_record_names_exists_or_is_marked_absent` reads the `today` column and the tree and
+> fails when they disagree, so the state cannot go stale again without something saying so. The
+> `at base` column is untouched: it was a measurement at a named commit and it is still true of that
+> commit. **The prose below is written in the tense of that measurement**; where it says "wave 1
+> writes this", read it as what was owed at base, and read the `today` column for what happened.
 
 **Two things about the selector form, both measured on this tree at `acf44c49` with
 `cargo-nextest 0.9.143`.** An integration test's function name carries **no module prefix** and is
@@ -4669,7 +4833,7 @@ any of these can be written at all. **The coder owes their red output**: each mu
 shown failing before it is made to pass, and this document's `at base` column must be replaced by
 the count the same selector prints once wave 1 lands.
 
-### 11.0b Where each of §11's 25 gates gets its expected answer — four exist, twenty-one are **wave 1**
+### 11.0b Where each of §11's 25 gates gets its expected answer — four existed at base, twenty-one were **wave 1** then, and twenty-four exist today
 
 A gate seeded from one example would assert that the example is correct. If the example is wrong,
 such a gate makes the error permanent and looks like coverage while doing it — so every row below
@@ -4694,7 +4858,7 @@ the two tables are a cross-check on each other rather than one table quoted twic
 | §11.2b `Drop`/`Keep` (1) | **wave 1**, `Starting 0 tests`, exit 4 | one payload, two literals | as above, plus `expected_drop != expected_keep` computed from the two literals rather than from the two dispatchers |
 | §11.3's four variant gates — `every_logql_stage_variant_has_a_row_in_the_lowering_document`, `every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document`, `every_lql_link_variant_has_a_row_in_the_lowering_document`, `every_traceql_chain_link_has_a_row_in_the_lowering_document` (4) | **wave 1**, exit 101, no such target | the AST enums against this document's tables | **yes** — two independent producers: the compiler's variant list, and this text |
 | §11.3's `the_document_states_the_residual_effect_counts_the_gates_assert` (1) | **wave 1**, exit 101, no such target | this document's tables against the gates' own row lists | **no** — both sides are written here. It is a consistency gate, and a wrong count agreed on twice still passes |
-| §11.3 the **three** diagram gates — `the_hops_diagram_and_the_document_agree_on_the_lowered_request`, `the_boundary_diagram_names_only_links_the_document_defines`, `every_boundary_diagram_pipeline_carries_the_three_synthesised_links` (3) | **wave 1**, exit 101, no such target | the diagrams' text against this document's | **no**, same reason — and two rounds running have found assertions in the hops diagram the prose did not carry: three in the previous round (a named client product, a resident-memory figure, and "every one of the 554 batches" where §9.2 says 553) and three more in this one (`heap of 20`, `renders 20 rows`, `bounded by limit`). **None of the six would have been caught by any of the three gates**, because they compare only the lowered round-trip count, the result-byte total, the link labels and the three synthesised links |
+| §11.3 the **three** diagram gates — `the_hops_diagram_and_the_document_agree_on_the_lowered_request`, `the_boundary_diagram_names_only_links_the_document_defines`, `every_boundary_diagram_pipeline_carries_the_three_synthesised_links` (3) | **wave 1**, exit 101, no such target | the diagrams' text against this document's | **no**, same reason — and two rounds running have found assertions in the hops diagram the prose did not carry: three in the previous round (a named client product, a resident-memory figure, and "every one of the 554 batches" where §9.2 said 553 at the time) and three more in this one (`heap of 20`, `renders 20 rows`, `bounded by limit`). **None of the six would have been caught by any of the three gates**, because they compare only the lowered round-trip count, the result-byte total, the link labels and the three synthesised links |
 | §11.2's `logql::plan::tests::a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual` (1) | **wave 1**, `Starting 0 tests`, exit 4 | the `Computed`/residual pair this document states for `LineFormat` and the following line filter (§7.1), written as literals in the test | **no** — both sides are this document's claim about the language. It is the §11.2b limit in a smaller frame: it freezes the stated behaviour and cannot discover that the stated behaviour is wrong. What it *can* discover is a fold that drops the effect, which is the §2.5 regression it exists for |
 | §11.3's `every_cut_variant_has_a_row_in_the_design_record` (1) | **wave 1**, exit 101, no such target | an exhaustive `match` over `Cut` on one side, §2.7's headings on the other | **yes** — two independent producers, the compiler's variant list and this text. What it cannot discover is that a **fifth** cut is needed; §2.7.9 says what would falsify the closure argument, and no gate can |
 | §11.3's `every_chain_link_row_states_a_continuation` (1) | **wave 1**, exit 101, no such target | this document's three link tables against the four `Cut` variants | **no** — both sides are written here. It catches a row with no continuation cell and a continuation naming a cut that does not exist; it cannot discover that a stated continuation is the wrong one |
@@ -4702,20 +4866,20 @@ the two tables are a cross-check on each other rather than one table quoted twic
 | §11.4 no-`WITH` (1) | **wave 1**, `Starting 0 tests`, exit 4 | the golden corpus | **yes, and vacuous until wave 2** — at base the corpus contains no lowered SQL at all, so the gate would be green over a population containing none of the case it exists for |
 | §11.4 the live `query_log` half (1) | **exists**, `Starting 14 tests`, exit 0 — and see §11.4: worthless locally | the round-trip and metered-byte counters ClickHouse writes for our own queries | **yes for the counters, and nothing at base** — `system.query_log` is written by the database, not by us, so the numbers are not ours to get wrong; but the ratios it checks are this document's, and locally the binary self-skips green without `PULSUS_TEST_CLICKHOUSE`, so its only real evidence is the `schema-it` CI job (§11.4) |
 
-### 11.1 The three gates that exist at base and must not move — three of the four; each prints `Starting 1 test` and exits 0
+### 11.1 The three gates that existed at base and must not move — three of the four; each prints `Starting 1 test` and exits 0, then and today
 
-| gate | selector | binary | at base |
-|---|---|---|---|
-| the SQL golden corpus keeps its membership | `-E 'test(=the_sql_golden_corpus_has_exactly_its_committed_membership)'` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 1 test`, passes |
-| the SQL golden corpus keeps its digest | `-E 'test(=the_sql_golden_corpus_matches_its_committed_digest)'` | same | `Starting 1 test`, passes |
-| the `EXPLAIN` skip-block reader still discriminates | `-E 'test(=skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other)'` | `crates/pulsus-read/tests/explain_indexes.rs` | `Starting 1 test`, passes |
+| gate | selector | binary | at base | today |
+|---|---|---|---|---|
+| the SQL golden corpus keeps its membership | `-E 'test(=the_sql_golden_corpus_has_exactly_its_committed_membership)'` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 1 test`, passes | **exists** |
+| the SQL golden corpus keeps its digest | `-E 'test(=the_sql_golden_corpus_matches_its_committed_digest)'` | same | `Starting 1 test`, passes | **exists** |
+| the `EXPLAIN` skip-block reader still discriminates | `-E 'test(=skip_block_conditions_are_captured_and_blocks_do_not_swallow_each_other)'` | `crates/pulsus-read/tests/explain_indexes.rs` | `Starting 1 test`, passes | **exists** |
 
 Wave 1 emits no SQL, so the first two must stay green **unchanged** — measured green today,
 `Starting 1 test` each, exit 0 (§11.0). When the fold is wired, the
 goldens and `PINNED_SQL_CORPUS` (`crates/pulsus-read/tests/golden_sql_freeze.rs:168`) move in the
 same commit.
 
-### 11.2 The gates that reproduce each hand-written walk — all **wave 1**, none at base
+### 11.2 The gates that reproduce each hand-written walk — all **wave 1** at base, none of them there then; all six exist today
 
 §1's argument is that the boundary is computed four times by hand. The gates **wave 1** writes are
 to be that argument as tests: the model must reproduce **each** walk, not just the one §9.6
@@ -4731,13 +4895,13 @@ offered a second option — **wave 1** writes them wherever they go — moving t
 `logql::compile`'s test module with the two functions raised to `pub(super)`. That option is **withdrawn**: the widening was never needed, and a design
 that offers two placements has not decided.
 
-| gate | selector (`-E`) | at base |
-|---|---|---|
-| walk 1: the model's ordered pushed-filter list equals `compile_line_filters`' own — the real function, not a transcription — over the 3,375 chains of §9.6 | `test(=logql::plan::tests::the_model_reproduces_compile_line_filters_ordered_predicate_list)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| the same suite recomputes the first-refusal fold's mismatch count and asserts it is **not** 0, so the regression cannot silently return | `test(=logql::plan::tests::a_first_refusal_fold_still_mismatches_the_shipped_walk)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| walk 2: `!exact` on a `Lines` shape after the fold equals `has_unpushed_dropping_stage` on the same pipeline, over the same corpus | `test(=logql::plan::tests::exact_after_the_fold_agrees_with_has_unpushed_dropping_stage)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| walk 3: the first `Pipe` link the fold marks residual is the stage `metric_pipeline_construct` names, and the reason maps to its `&'static str` | `test(=logql::plan::tests::the_first_residual_pipe_link_agrees_with_metric_pipeline_construct)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| the residual rule as behaviour: a refused `line_format` marks `body` `Computed`, and the next line filter is residual because of it | `test(=logql::plan::tests::a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual)` | `Starting 0 tests`, exit 4 — **wave 1** |
+| gate | selector (`-E`) | at base | today |
+|---|---|---|---|
+| walk 1: the model's ordered pushed-filter list equals `compile_line_filters`' own — the real function, not a transcription — over the 3,375 chains of §9.6 | `test(=logql::plan::tests::the_model_reproduces_compile_line_filters_ordered_predicate_list)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| the same suite recomputes the first-refusal fold's mismatch count and asserts it is **not** 0, so the regression cannot silently return | `test(=logql::plan::tests::a_first_refusal_fold_still_mismatches_the_shipped_walk)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| walk 2: `!exact` on a `Lines` shape after the fold equals `has_unpushed_dropping_stage` on the same pipeline, over the same corpus | `test(=logql::plan::tests::exact_after_the_fold_agrees_with_has_unpushed_dropping_stage)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| walk 3: the first `Pipe` link the fold marks residual is the stage `metric_pipeline_construct` names, and the reason maps to its `&'static str` | `test(=logql::plan::tests::the_first_residual_pipe_link_agrees_with_metric_pipeline_construct)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| the residual rule as behaviour: a refused `line_format` marks `body` `Computed`, and the next line filter is residual because of it | `test(=logql::plan::tests::a_refused_line_format_marks_the_body_computed_and_the_next_filter_residual)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
 
 The gate this table used to carry — `logql::compile::tests::drop_and_keep_dispatch_differently_on_the_same_payload_type`,
 **wave 1** — has **moved to §11.2b**, where each side gets its own literal expectation. It is listed there and not here, so there is one gate of that name and not two.
@@ -4767,9 +4931,9 @@ So pushability is to get its own gate — also **wave 1**, `Starting 0 tests`, e
 it is to reach its answer without the helper: the expected answers are to be literals written in the
 test, one per parsed query, never values the helper produced.
 
-| gate | selector (`-E`) | at base |
-|---|---|---|
-| the pushability rule matches a hand-written table of parsed line filters | `test(=logql::plan::tests::the_pushability_rule_matches_a_hand_written_table)` | `Starting 0 tests`, exit 4 — **wave 1** |
+| gate | selector (`-E`) | at base | today |
+|---|---|---|---|
+| the pushability rule matches a hand-written table of parsed line filters | `test(=logql::plan::tests::the_pushability_rule_matches_a_hand_written_table)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
 
 The table, with every row's AST flags captured from the real parser on this tree at `2f78c53`. It
 is chosen adversarially: two rows spell an IP address without being an `ip()` filter, and two put
@@ -4804,7 +4968,7 @@ this document does not claim otherwise. All four are **wave 1**: each selector p
 `Starting 0 tests` and exits 4 at base, so the composition is a specification and covers nothing
 yet.
 
-### 11.2b Every residual state effect, gated in wave 1
+### 11.2b Every residual state effect — gated in wave 1, and all three gates exist today
 
 §2.5's whole repair is that a residual link **still applies its state effect**. §3.1 and §7.1 state
 that effect for every link. An earlier version of this section nominated other gates that did not
@@ -4818,35 +4982,42 @@ can be checked against an artefact either — including "under-checked" just abo
 about the earlier `Drop`/`Keep` revision below.
 
 **Every link with a stated residual state effect gets a row.** Counted off the document's own
-tables: **8** in §3.1 (`Aggregate`, `By`, grouped `Coalesce`, `Select`, `Filter`, `Order`, `Limit`,
-`Emit`) and **20** in §7.1 — 13 `Pipe` rows (`LineFilter`, the four `Parser` forms, `LabelFilter`,
-`LineFormat`, `LabelFormat`, `Unwrap`, `Unpack`, `Decolorize`, `Drop`, `Keep`) and 7 synthesised
-(`Window`, `RangeAgg`, `VectorAgg`, `LabelReplace`, `Order`, `Limit`, `Emit`) — **28 effects in
-all**. The two chain links whose stated effect is *none* — `Source`, and `Coalesce` with no
-preceding `By`, both §3.1 — are to get a row too, asserting the effect **is** the identity, so the
-exemption is itself a check rather than a silence. So `logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states` is specified to
-carry **20** rows and `traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states` **10**
-— in **wave 1**, which writes both; neither exists at base.
+tables: **11** in §3.1 (`Structural`, `NestedSet`, `BoolTruth`, `Aggregate`, `By`, grouped
+`Coalesce`, `Select`, `Filter`, `Order`, `Limit`, `Emit`) and **20** in §7.1 — 13 `Pipe` rows
+(`LineFilter`, the four `Parser` forms, `LabelFilter`, `LineFormat`, `LabelFormat`, `Unwrap`,
+`Unpack`, `Decolorize`, `Drop`, `Keep`) and 7 synthesised (`Window`, `RangeAgg`, `VectorAgg`,
+`LabelReplace`, `Order`, `Limit`, `Emit`) — **31** effects in all. The **ten** chain links whose
+stated effect is *none* — §3.1's `Source`, `Coalesce` with no preceding `By` and seven per-batch
+reads (`Hydrate`, the four indexed phase-2 reads and the two trace-wide co-loads), and **§7.1's
+`Source`, which part 8 added: `LqlLink::Source` had no row at all, so §7.1 called itself the
+complete LogQL link set while omitting a variant, the same defect §3.1 carried** — are to get a row
+too, asserting the effect **is** the identity, so the exemption is itself a check
+rather than a silence. So
+`logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states` is specified to
+carry **21** rows and
+`traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states` **20** — in
+**wave 1**, which writes both; neither exists at base.
 
-The TraceQL count above is this section's own derivation from §3.1 and is **not** the shipped
-test's row count. That test exists and carries **21** rows: the ten derived here, plus the ten
-per-batch read and engine links issue #492 part 3 added (`Hydrate`, the four indexed phase-2 reads,
-the two trace-wide co-loads, `Structural`, `NestedSet`, `BoolTruth`), which §3.1's table does not
-enumerate, plus **one more row for `By`** — the shipped test gives `By` a row per key branch, one
-key that renders and one that does not, where §3.1 gives it a single row. Ten plus ten plus one.
-The shipped row count is gated —
-`assert_every_residual_state_effect::<Tql>(&rows, 21)` in
-`crates/pulsus-read/src/traces/compile.rs` — while the derivation above is prose and is not.
+**Part 8 closed the gap this paragraph used to describe.** Before it, §3.1 enumerated 5 of
+`TqlLink`'s 15 variants, so this section's derivation from §3.1 came to ten while the shipped test
+carried twenty-one, and the eleven-row difference had to be explained in prose. §3.1 now carries a
+row for every variant, so the derivation is **20**, and the shipped test's **21** is that plus
+**one more row for `By`** — the shipped test gives `By` a row per key branch, one key that renders
+and one that does not, where §3.1 gives it a single row. Twenty plus one. The shipped row count is
+gated — `assert_every_residual_state_effect::<Tql>(&rows, 21)` in
+`crates/pulsus-read/src/traces/compile.rs` — and
+`the_document_states_the_residual_effect_counts_the_gates_assert` now gates the derivation against
+it, so neither side is prose alone.
 
 The five other cells reading `n/a` or `none` belong to rows the tables mark **not in the chain** —
 §3.1's `Metric`, `MetricSecondStage` and `Compare`, and §7.1's `MetricExpr::Literal`/`VectorFn` and
 `Binary`/`Variants` — and are excluded by that marking, not by silence.
 
-| gate | selector (`-E`) | at base |
-|---|---|---|
-| every LogQL link's residual state effect is the one §7.1 states, and none of them is the identity | `test(=logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| the same for TraceQL against §3.1 | `test(=traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states)` | `Starting 0 tests`, exit 4 — **wave 1** |
-| `Drop` and `Keep` reach different dispatchers and different effects on the same `Vec<DropKeepElem>` | `test(=logql::compile::tests::drop_and_keep_dispatch_differently_on_the_same_payload_type)` | `Starting 0 tests`, exit 4 — **wave 1** |
+| gate | selector (`-E`) | at base | today |
+|---|---|---|---|
+| every LogQL link's residual state effect is the one §7.1 states, and none of them is the identity | `test(=logql::compile::tests::every_residual_state_effect_is_the_one_the_document_states)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| the same for TraceQL against §3.1 | `test(=traces::compile::tests::every_residual_state_effect_is_the_one_the_document_states)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| `Drop` and `Keep` reach different dispatchers and different effects on the same `Vec<DropKeepElem>` | `test(=logql::compile::tests::drop_and_keep_dispatch_differently_on_the_same_payload_type)` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
 
 All three gates above — **wave 1** writes them — are to be lib unit tests in the modules that will
 define the impls
@@ -4956,7 +5127,7 @@ satisfy.
 list is to be enumerated by an exhaustive `match` over the link type with no `_` arm, so that once
 the gate exists, adding a variant will fail to build it. That forces a *name* for the new link; it
 does not by itself force a *row*. The closure is to be the count, all of it in **wave 1**: the LogQL gate is to assert it
-has **20** rows and the TraceQL gate **10**, and §11.3's
+has **21** rows and the TraceQL gate **20**, and §11.3's
 `the_document_states_the_residual_effect_counts_the_gates_assert` is to assert the same numbers read
 from this document's own tables. §11.3's four variant gates —
 `every_logql_stage_variant_has_a_row_in_the_lowering_document`,
@@ -4980,10 +5151,11 @@ the *effect* cell. The first parse written for this section did exactly that and
 **And the three link tables are one column wider than they were.** §3.1's, §7.1's ten-`Stage` and
 §7.1's synthesised-link tables each gained a **continuation** column, appended after `disposition`
 so that no existing column index moved. Every parse in §11.2b and §11.3 — including
-`the_document_states_the_residual_effect_counts_the_gates_assert`, **wave 1**, which reads the
-residual-effect counts **8**/**5** and **20**/**2** out of these same tables — must be written
-against the widened tables and must index the effect column from the left, never from the right. The
-counts themselves did not move: a column was added, no row was.
+`the_document_states_the_residual_effect_counts_the_gates_assert`, which reads the
+residual-effect counts **11**/**12** and **20**/**3** out of these same tables — must be written
+against the widened tables and must index the effect column from the left, never from the right.
+Adding the column moved no count; **part 8's rows did**, and the four numbers above are that
+section's counts after it.
 
 What none of these will see, once **wave 1** has written them, is a row whose **literal `expected`
 values are BOTH wrong in the same
@@ -4992,7 +5164,7 @@ disagreement between `E₁` and `E₂`, but a row whose stated effect is simply 
 written into both literals and agree with itself. That is the document's claim about the language,
 and it is settled by review, not by the gate **wave 1** writes.
 
-### 11.3 The document and its diagrams, gated in wave 1
+### 11.3 The document and its diagrams — gated in wave 1, and all eleven gates exist today
 
 A diagram asserts a design without being read as a claim, and this one has now carried four
 contradictions across three rounds: a lowered request drawn as one round trip while the text made
@@ -5006,19 +5178,19 @@ The last three are new in the plan-object revision and gate the three things tha
 closure of `Cut`, the continuation column on the three link tables, and the `data.explain.plan` key
 set against [api.md](api.md).
 
-| gate | selector (`-E`) | at base |
-|---|---|---|
-| every `pulsus_logql::Stage` variant has a row in §7.1 — to be enumerated by an exhaustive `match` with no `_` arm, so that adding a variant will fail to build here | `test(=every_logql_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every `pulsus_traceql::PipelineStage` variant has a row in §3.1, same construction | `test(=every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every `LqlLink` variant has a row in §7.1, same construction — this is where adding a link variant will redden, once wave 1 has written it | `test(=every_lql_link_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| every TraceQL chain link — the eight `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit` — has a row in §3.1 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** |
-| §3.1 carries exactly **8** rows with a residual state effect and **5** without; §7.1 carries exactly **20** and **2** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** |
-| the hops diagram's lowered round-trip count and result-byte total equal §9.2's | `test(=the_hops_diagram_and_the_document_agree_on_the_lowered_request)` | exit **101**, no such target — **wave 1** |
-| every link label in the boundary diagram's pipelines is a link this document defines | `test(=the_boundary_diagram_names_only_links_the_document_defines)` | exit **101**, no such target — **wave 1** |
-| every pipeline drawn in the boundary diagram ends in `Order`, `Limit` and `Emit`, because every chain does | `test(=every_boundary_diagram_pipeline_carries_the_three_synthesised_links)` | exit **101**, no such target — **wave 1** |
-| every `Cut` variant has a row in §2.7 — an exhaustive `match` over `Cut` with no `_` arm on one side, a parse of §2.7's headings on the other, so a fifth cut is a build failure rather than a silent addition | `test(=every_cut_variant_has_a_row_in_the_design_record)` | exit **101**, no such target — **wave 1** |
-| every row of §3.1's and §7.1's three link tables states a continuation, and every continuation naming a cut names one of the four | `test(=every_chain_link_row_states_a_continuation)` | exit **101**, no such target — **wave 1** |
-| every key `QueryPlan::shape()` renders is a key [api.md](api.md) documents for `data.explain.plan`, and no other | `test(=the_plan_shape_json_keys_match_the_api_document)` | exit **101**, no such target — **wave 1** |
+| gate | selector (`-E`) | at base | today |
+|---|---|---|---|
+| every `pulsus_logql::Stage` variant has a row in §7.1 — to be enumerated by an exhaustive `match` with no `_` arm, so that adding a variant will fail to build here | `test(=every_logql_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** | **exists** |
+| every `pulsus_traceql::PipelineStage` variant has a row in §3.1, same construction | `test(=every_traceql_pipeline_stage_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** | **exists** |
+| every `LqlLink` variant has a row in §7.1, same construction — this is where adding a link variant will redden, once wave 1 has written it | `test(=every_lql_link_variant_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** | **exists** |
+| every `TqlLink` variant — all **15** of them, by an exhaustive `match` with no `_` arm, so adding a sixteenth fails to build here — has a row in §3.1. The LogQL sibling is the same shape: `LqlLink` has exactly **9** variants and §7.1 carries a row for each. An earlier revision specified this gate as a hand list of twelve (the eight `PipelineStage` variants plus `Source`, `Order`, `Limit`, `Emit`), which would have passed over a §3.1 carrying 5 of the 15 | `test(=every_traceql_chain_link_has_a_row_in_the_lowering_document)` | exit **101**, no such target — **wave 1** | **exists** |
+| §3.1 carries exactly **11** rows with a residual state effect and **12** without; §7.1 carries exactly **20** and **3** — the counts §11.2b's two gates assert against their own row lists | `test(=the_document_states_the_residual_effect_counts_the_gates_assert)` | exit **101**, no such target — **wave 1** | **exists** |
+| the hops diagram's lowered round-trip count and result-byte total equal §9.2's | `test(=the_hops_diagram_and_the_document_agree_on_the_lowered_request)` | exit **101**, no such target — **wave 1** | **exists** |
+| every link label in the boundary diagram's pipelines is a link this document defines | `test(=the_boundary_diagram_names_only_links_the_document_defines)` | exit **101**, no such target — **wave 1** | **exists** |
+| every pipeline drawn in the boundary diagram ends in `Order`, `Limit` and `Emit`, because every chain does | `test(=every_boundary_diagram_pipeline_carries_the_three_synthesised_links)` | exit **101**, no such target — **wave 1** | **exists** |
+| every `Cut` variant has a row in §2.7 — an exhaustive `match` over `Cut` with no `_` arm on one side, a parse of §2.7's headings on the other, so a fifth cut is a build failure rather than a silent addition | `test(=every_cut_variant_has_a_row_in_the_design_record)` | exit **101**, no such target — **wave 1** | **exists** |
+| every row of §3.1's and §7.1's three link tables states a continuation, and every continuation naming a cut names one of the four | `test(=every_chain_link_row_states_a_continuation)` | exit **101**, no such target — **wave 1** | **exists** |
+| every key `QueryPlan::shape()` renders is a key [api.md](api.md) documents for `data.explain.plan`, and no other | `test(=the_plan_shape_json_keys_match_the_api_document)` | exit **101**, no such target — **wave 1** | **exists** |
 
 **A twelfth gate exists as of part 4 and is not one of the eleven.**
 `the_hops_diagram_marks_its_superseded_figures_on_its_own_face` asserts only that the drawing
@@ -5053,7 +5225,7 @@ nowhere, a truncated pipeline and a number that disagrees; they will not certify
 found more than the first — which is a fact about the METHOD, not about the diagram.** The previous
 round re-read the hops diagram looking for figures and found **three** picture-only assertions: the
 generic client labelled as a specific vendor's datasource, a `pulsus-server` resident-memory figure
-the document did not state, and "on every one of the 554 batches" where §9.2 says **553**. This
+the document did not state, and "on every one of the 554 batches" where §9.2 said **553** at the time. This
 round enumerated **every text node in both files** — `<title>`, `<desc>` and every `<text>`: **44**
 nodes in the hops diagram (1 + 1 + 42) and **87** in the boundary (1 + 1 + 85), which is the literal
 and complete set of things an SVG can assert — and found **three more** in the hops diagram, all of them missed before because each earlier pass had searched for the
@@ -5070,11 +5242,11 @@ synthesised links, and none of the six is any of those.
 
 ### 11.4 The gates ADR 0008 nominates — one **wave 1**, one that exists and prints `Starting 14 tests` at exit 0, and one added by part 7 that is not one of §11.0's 25
 
-| gate | selector (`-E`) | binary | at base |
-|---|---|---|---|
-| no emitted SQL contains a `WITH` clause (ADR 0008 D2) | `test(=the_golden_sql_corpus_contains_no_with_clause)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 0 tests`, exit 4 — **wave 1** |
-| the `query_log` half of the same rule, and the round-trip and metered-byte ratios | — | `crates/pulsus-read/tests/query_log_gates.rs` | `Starting 14 tests`, 14 passed, exit 0 — **exists**, but see below |
-| no statement the compile core plans contains a join (ADR 0008's added rule, scoped to the compiled route's corpus) — **added by issue #492 part 7, not one of §11.0's 25** | `test(=no_planned_search_statement_contains_a_join)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | **exists**, `Starting 1 test across 1 binary (3 tests skipped)`, 1 passed, exit 0 |
+| gate | selector (`-E`) | binary | at base | today |
+|---|---|---|---|---|
+| no emitted SQL contains a `WITH` clause (ADR 0008 D2) | `test(=the_golden_sql_corpus_contains_no_with_clause)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | `Starting 0 tests`, exit 4 — **wave 1** | **exists** |
+| the `query_log` half of the same rule, and the round-trip and metered-byte ratios | — | `crates/pulsus-read/tests/query_log_gates.rs` | `Starting 14 tests`, 14 passed, exit 0 — **exists**, but see below | — |
+| no statement the compile core plans contains a join (ADR 0008's added rule, scoped to the compiled route's corpus) — **added by issue #492 part 7, not one of §11.0's 25** | `test(=no_planned_search_statement_contains_a_join)` | `crates/pulsus-read/tests/golden_sql_freeze.rs` | **exists**, `Starting 1 test across 1 binary (3 tests skipped)`, 1 passed, exit 0 | **exists** |
 
 The second binary exists and is **env-gated**, which is exactly the trap: run here at `acf44c49`
 with `PULSUS_TEST_CLICKHOUSE` unset it printed `Starting 14 tests across 1 binary` and
@@ -5100,7 +5272,7 @@ seventh anywhere in the golden tree fails it. That half is why the gate walks th
 than `CORPORA` — two of the six sit in `traces_metrics_base/`, which `CORPORA` does not contain, so
 the digest gate above cannot see them either. §9.8 carries the record of all six.
 
-### 11.5 Adding a link variant is to be a build failure — wave 1 makes it one
+### 11.5 Adding a link variant is to be a build failure — wave 1 made it one
 
 An earlier version of this section said "no crate in this workspace has a compile-failure harness"
 and left the check to be run by hand. **That claim was false.** The workspace already has one, in
@@ -5167,3 +5339,213 @@ nothing in this repository can see it.
 **Nothing in §11.5 is running today.** The four-state probe below was run and its results are
 measurements; the *repository consequence* drawn from them is a specification for wave 1. The
 distinction is the one §11.0 exists to keep.
+
+---
+
+## 12. The end state
+
+**What this section is.** §§1–11 describe a design and the checks it nominates. This section states
+the **end state** the design reaches: what is permanently outside SQL, and why each of those things
+is permanent rather than unfinished. It exists because "never lowers" and "has not been lowered
+yet" were being written the same way in two records, and a permanence claim that nobody has to
+justify is a claim nobody re-checks.
+
+`every_never_reason_variant_is_named_in_the_end_state`
+(`crates/pulsus-read/tests/query_lowering_doc_gate.rs`) reads `NeverReason` out of
+`crates/pulsus-read/src/compile/fold.rs` and requires a row below for every variant. `NeverReason`
+has exactly **eight** variants, and a ninth permanent reason cannot be added to the compiler
+without being written down here.
+
+### 12.1 Every permanent reason, and what it rules out
+
+`Capability::Never(reason)` is the compiler's own word for *not lowerable in any state, ever* —
+distinct from `Capability::No(reason)`, which means *lowerable in principle, not here*. The two take
+byte-identical paths in the fold (`crates/pulsus-read/src/compile/fold.rs:960-967`) and differ only
+in the reason string the explain surface renders, so nothing about a request changes with the
+choice. What changes is what a reader is entitled to conclude.
+
+| `NeverReason` | what it rules out | why no state can change it |
+|---|---|---|
+| `NeedsUnwindowedRootRead` | folding the winners' root read into the seed statement | the true root may start before the search window, so the root summary is read trace-wide with **no time predicate**, and `TraceSearchResult.root` is not optional (`crates/pulsus-read/src/traces/exec.rs:385`). A window-bounded statement cannot produce it, whatever has accumulated |
+| `StructuralRelation` | pushing `>`, `>>`, `<`, `<<`, `~` into the seed statement | the relation holds between two spans of one trace, over a span set our own batching defines. Nothing in the seed statement's row scope can decide it |
+| `NestedSetNumbering` | pushing the modified-preorder numbering | it is computed per trace at query time; no stored column carries it, so there is nothing for SQL to read |
+| `TraceLevelIntrinsic` | pushing `traceDuration`, `rootName`, `rootServiceName` or `span:childCount` | they resolve from co-loads that are deliberately trace-wide and unwindowed, so they evaluate full-trace-exact whatever the search window is. A window-bounded statement cannot read those rows, in any state |
+| `WholeQueryTypeFailure` | pushing a `!`-operand truthiness leaf | one row's type must fail the **whole** request — a present non-boolean operand under `!` is an error for the query, not a non-match for the span — and SQL evaluates row by row |
+| `NoRowToComputeFrom` | pushing an answer about rows that are **absent** | `absent_over_time` is a statement about the empty set; there is no row to compute it from, so no `WHERE` and no `HAVING` can express it |
+| `ResponseBuild` | pushing the response builder | the answer's shape is JSON assembled in our process, not a relation |
+| `NotASearchLink` | anything at all, on this route | the shipped planner answers `400` for the stage before a chain is built, so no link is constructed and there is nothing to lower |
+
+**What this table does not claim.** That the list is complete for all time. It is complete against
+the enum, which is what the check enforces; whether a ninth permanent reason exists is a design
+question, and the record's answer is that a new one must arrive with a row here and an argument in
+it.
+
+### 12.2 The one thing this section does not settle
+
+Two records disagree about **six constructs**, and the disagreement is not a typo in either.
+[`query-to-sql.md`](query-to-sql.md) marks each of them *cannot become SQL* or *never becomes SQL* —
+permanence, by that document's own vocabulary table — while the shipped fit answers
+`Capability::No(...)`, which is the opposite claim:
+
+| construct | the record marks | the fit answers |
+|---|---|---|
+| `\| line_format "…"` (general) | *cannot become SQL* | `No(NotYetLowered)` |
+| `\| label_format dst="{{…}}"` | *cannot become SQL* | `No(NotYetLowered)` |
+| `\| unwrap duration(x)` / `bytes(x)` | *cannot become SQL* | `No(NotYetLowered)` |
+| `sum by (<parsed label>) (…)` | *cannot become SQL* | `No(NotYetLowered)` |
+| `\|= ip("10.0.0.0/8")` | *never becomes SQL* | `No(NotPushable)` |
+| `\| { … }` written after another stage | *never becomes SQL* | `No(NotYetLowered)` |
+
+**The wire cost of resolving it either way is one string on one route.** `set_plan` has exactly one
+non-test caller, so the `plan` key reaches a response only from the TraceQL search executor: the
+five LogQL constructs' `Capability` is invisible to every client on every option, and the only
+user-visible consequence is `links[].why` for a query carrying a mid-pipeline `{ … }` filter. `how`
+stays `"residual"` on every option, so the evaluator still runs the stage and the traces returned do
+not change.
+
+**It is left open deliberately.** Deciding it is a design call, not an implementation one, and it is
+recorded here rather than settled so that the two records cannot drift further apart while nobody
+is looking. The check the resolution will need —
+`every_permanence_marked_row_is_never_in_the_fit` — is nominated in §11.3 and is **not written**,
+because until the decision is made there is no state for it to assert: today it would fail against
+either half of the record.
+
+### 12.3 The citations, and the hole that is enumerated rather than papered over
+
+The design record cites source files by line number, and nothing derived those citations until
+part 8: moving `search_plan.rs:1854` to `:2854` in [`query-to-sql.md`](query-to-sql.md) and running
+`cargo nextest run --workspace` exited 0 with no failing test.
+
+> **This section was reconstructed and the reconstruction cannot be verified.** See the note in
+> §9.2b: `git checkout` destroyed the uncommitted text of both this section and that one, no blob
+> of it was retained, and what stands here was rewritten from memory. It can be checked for
+> internal consistency and against the datasets; it cannot be compared with what it replaced.
+
+**Every figure in this section is generated, not written down.** An earlier revision stated its
+census in prose and six of the numbers were wrong at the head; the revision after that derived the
+table cells and left the sentences beside them, and a code review changed a prose count with every
+suite staying green. Gating prose by pattern is not the fix — numbers in English are unbounded, so
+a pattern that catches today's sentences misses tomorrow's and looks like coverage while doing it.
+The block below, tables and sentences alike, is rendered from the two citation datasets by
+`every_figure_section_12_3_states_is_the_one_the_datasets_hold`, which compares it byte for byte.
+
+<!-- generated from the citation datasets -->
+
+| quantity | at this revision |
+|---|---|
+| citation occurrences in the five artefacts | 596 |
+| of those, citing a bare basename | 476 |
+| `(document, token)` pairs the rule resolves | 306 |
+| occurrences those resolved pairs cover | 464 |
+| `(document, token)` pairs it cannot resolve | 83 |
+| occurrences those frozen pairs cover | 132 |
+| resolved rows anchored on a token the citing prose prints | 146 |
+| resolved rows anchored on a snapshot of the cited line | 160 |
+
+| reason it cannot be resolved | pairs | what it means |
+|---|---|---|
+| `ambiguous_basename` | 74 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on |
+| `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
+| `occurrences_disagree` | 3 | the record cites the token more than once in one document and the rule answers differently for two of those occurrences |
+
+| the reviewed verdict on a fallback disagreement | cases |
+|---|---|
+| the fallback answers a file the citing prose does not describe | 5 |
+| the fallback is right and the anchor rule points elsewhere | 3 |
+| the sentence describes both candidates, so neither answer is wrong | 1 |
+
+| anchor kind | what a row of that kind can show |
+|---|---|
+| `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
+| `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
+
+Of the 596 citation occurrences the five artefacts make, 476 name a bare basename. The rule resolves 306 `(document, token)` pairs covering 464 occurrences, and cannot resolve 83 covering 132. Of the resolved rows, 146 are anchored on a token the citing prose prints and 160 on a snapshot of the cited line.
+
+The language fallback and the anchor rule disagree on 9 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+
+The citations pointing at an empty line are `crates/pulsus-read/src/traces/exec.rs:1968` (in `docs/query-lowering.md`), `search_plan.rs:1042` (in `docs/query-lowering.md`), `traces/exec.rs:114` (cited from 2 documents).
+
+The citations the rule answers differently for two occurrences of are `labels.rs:363` (in `docs/query-to-sql.md`), `sql.rs:489` (in `docs/query-to-sql.md`), `sql.rs:996` (in `docs/query-to-sql.md`).
+
+The citations where the fallback answers a file the citing prose does not describe are `exec.rs:2830-2836` in `docs/query-lowering.md`, `exec.rs:2869` in `docs/query-lowering.md`, `exec.rs:701` in `docs/query-lowering.md`, `labels.rs:157-189` in `docs/query-to-sql.md`. Each is named with its reasoning in `REVIEWED_FALLBACK_DIVERGENCES`, and the test prints them when it runs.
+
+<!-- end generated -->
+
+**These counts move when this section is edited**, because this section cites source files too and
+a citation it makes is a citation like any other. Some of the occurrences the block counts are ones
+§12.3 added when it began naming the tokens it is about, which is content rather than drift — and
+it is why the block is generated rather than typed. Nothing outside the block states one of its
+numbers, so there is no second copy to fall out of step.
+
+**The rule lives in `crates/pulsus-read/tests/design_record_drift_gate.rs`, in
+`resolve_citation`, and it is the only implementation.** An earlier revision generated the datasets
+from a script beside the repository and checked them with a second reader written in the test; the
+two drifted on two citations, which is the two-implementations problem in miniature. An `#[ignore]`d
+test regenerates both datasets from the one rule.
+
+**The frozen pairs carry a reason each**, in
+`crates/pulsus-read/tests/design_record_unresolvable_citations.tsv`. The block above lists the
+reasons, counts them and says what each one means: a list of row labels beside a generated table is
+a second copy of the table's own labels, and this section has already had one go stale.
+
+**`occurrences_disagree` is a category part 8 did not expect to need.** An earlier revision assumed
+a token names one target wherever it is written, so one occurrence with evidence settled the
+others, and the check kept the first answer and discarded the rest — which meant it was not
+comparing the set. A code review found tokens where the answers differ — the block above counts
+them under `occurrences_disagree`. Two contradictory answers are not an answer, so they are frozen
+rather than settled by whichever occurrence came first, and the check now computes each key's
+verdict over **every** occurrence of it.
+
+`every_citation_in_the_design_record_has_a_row` runs the rule over every citation and compares its
+verdict with the two datasets **in every direction**: a citation covered by neither is a hole; a
+citation covered by both is covered by neither rule; a resolved row whose citation stops resolving
+fails; a frozen row whose citation **starts** resolving fails, naming the file it now resolves to
+and saying to move the row. That last direction is what makes freezing a set honest rather than a
+place to put inconvenient citations, and an earlier revision promised it and did not have it.
+
+#### The fallback that was rejected, and the cases that rejected it
+
+The obvious next rule for the frozen pairs is the enclosing section's language: a `plan.rs` citation in a
+LogQL section means `logql/plan.rs`. **It is not applied, and the reason is a set of citations
+anyone can read**, counted in the block above —
+`the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_ruled` finds every
+citation where the fallback and the anchor rule disagree, and requires each to carry a verdict a
+person reached by reading the citing prose against both candidate files. The block above lists the
+verdicts and counts them.
+
+Wrong answers on a rule whose whole job is to say which file a citation means are why it is not
+applied; the block above counts them and names them. They are LogQL sections citing the **TraceQL**
+executor, where the fallback answers `logql/exec.rs`, which carries nothing of the kind, and a
+sentence about the label encoder answered with `logql/labels.rs`.
+
+> **No percentage is published here, and an earlier revision of this section published two.** The
+> first, **18%**, came from an experiment that was never committed and counted a case as a
+> disagreement when the rule had no candidate in the preferred family at all — a rule that declines
+> is not a rule that answers wrongly. The second, **8.26%**, was committed and re-runnable but
+> **measured against itself**: it treated `resolve_citation` as the truth, and `resolve_citation` is
+> the other rule under test. Reading the cases one at a time showed some where the **anchor rule**
+> is the one pointing at the wrong file — the ones now frozen as `occurrences_disagree`. A rate
+> computed that way says how often two rules differ, not how often either is wrong. **Named cases
+> with their reasoning are worth more than a percentage measured against itself**, and the test
+> asserts the set of disagreements is exactly the set that has been read, so a new one cannot
+> appear without a person reading it.
+
+**What would close the hole, stated as work rather than promised.** Each of those frozen citing
+lines needs to print an identifier the cited line carries — the same rule the resolved ones satisfy
+— after
+a reading of the cited line against the claim beside it. The `occurrences_disagree` ones are
+already read: the review established that their citing prose describes `logql/labels.rs`,
+`logql/sql.rs` and `logql/sql.rs`, and those citations need path-qualifying to say so. The `blank_target_line` rows are a smaller job of the same kind: they are citations pointing at
+nothing, and each needs a line number that means something. None of it is part 8's.
+
+**Running the regenerator is not a way to make a red check green.** The `line` and `anchor` of a
+resolved row are what the DOCUMENT claims, so a target that moves means the record's citation is
+stale and a person has to re-read it; re-running the regenerator would rewrite the claim to match
+whatever the source had become. The count dataset is the other way round — its `line` column is
+derived from an anchor, so regenerating it is the correct response to a document re-wrap. The diff
+is the review in both cases.
+
+**What a resolved row can and cannot show** depends on which kind of anchor it carries, and the
+block above says what each kind can show and how many rows carry it. The dataset's `anchor_kind`
+column is what records the difference per row, so it is visible rather than assumed away.
