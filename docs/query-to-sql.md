@@ -19,22 +19,16 @@ Three shorter parts follow: [what can never become SQL](#5-what-can-never-become
 we already refuse](#6-the-queries-we-already-refuse), [where we and the reference disagree](#7-where-we-and-the-reference-disagree),
 and [the limits](#8-the-limits).
 
-**Editing this document: anchor on position, not on text.** Its separators and phrases repeat, and
-three runs have been lost to an edit that matched text and landed somewhere else. On 2026-09-09: a
-whole-document replace of a `file:line` citation edited two occurrences instead of the one intended,
-turning a perturbation into a no-op that returned the baseline; a `---` used as a restore anchor is
-not unique, and a block came back at the wrong separator, caught by a `git diff --numstat` of
-`3148 3148`; and a generated dataset was left stale across a commit, so the next run's failure
-belonged to the staleness rather than to what was being tested. Take the line range first, edit by
-range, and read `git diff --numstat` before believing any run that follows.
+**Editing this document, hazard one: anchor on position, not on text.** Its separators and phrases
+repeat, so an edit that matches text can land somewhere else. Two runs were lost to it on 2026-09-09:
+a whole-document replace of a `file:line` citation edited two occurrences instead of the one intended,
+turning a perturbation into a no-op that returned the baseline; and a `---` used as a restore anchor
+is not unique, so a block came back at the wrong separator, caught by a `git diff --numstat` of
+`3148 3148`. Take the line range first, edit by range, and read `git diff --numstat` before believing
+any run that follows.
 
-**Line numbers into this document age.** Anything citing one — the datasets under
-`crates/pulsus-read/tests/`, `docs/query-lowering.md`, this document's own cross-references — is
-regenerated or re-taken **after** the edit that moves it, never before. Two figures were shipped
-stale that way in one week.
-
-**Four generators, and they are not one command.** An edit anywhere in this file can move positions
-recorded in two independent datasets, and each has its own ignored regenerator:
+**Hazard two: four generators, and they are not one command.** An edit anywhere in this file can move
+positions recorded in two independent datasets, and each has its own ignored regenerator:
 
 ```sh
 cargo test -p pulsus-read --test design_record_drift_gate -- --ignored regenerate_the_count_site_lines
@@ -43,8 +37,17 @@ cargo test -p pulsus-read --test design_record_drift_gate -- --ignored regenerat
 cargo test -p pulsus-read --test logql_pattern_expr_matrix -- --ignored regenerate_the_sites_dataset
 ```
 
-Running the first three and not the fourth is how the note above came to be committed with a stale
-dataset — the fourth occurrence, in the same round, of the hazard the note describes.
+Two runs were lost to this one as well, and it is the one that bit most recently: a dataset left
+stale across a commit, so the next run's failure belonged to the staleness rather than to what was
+being tested; and the first three of those four run without the fourth, which is how the paragraph
+above came to be committed with a stale dataset. **The two hazards look alike and are not.** The
+first is about where an edit lands; the second is about what an edit invalidates elsewhere.
+
+**And the same for prose that quotes a generated position.** Anything citing a line into this
+document — the datasets under `crates/pulsus-read/tests/`, `docs/query-lowering.md`, and this
+document's own sentences — is regenerated or re-taken **after** the edit that moves it, never before.
+Three figures were shipped stale that way in one week, the third being a sentence in part 9 that
+quoted seven positions the same commit's regenerators had already corrected in the dataset.
 
 **The code in part 2 does not exist yet.** Nothing in this tree makes the per-stage decision part 2
 describes, so every statement marked *from the design* was worked out from the design record and
@@ -5228,10 +5231,22 @@ sentence in them and made to react, which is the claim the withdrawn sentence de
 the runs where nothing in the shipped suite reacted**, to a figure and to a word of prose. **A2 is
 the run where it did**, to a citation, and B and D are the runs where deleting the region did.
 
-C reddens two tests. One records six positions in this document — lines 200, 471, 701, 733, 734 and
-966, all `| pattern` arguments swept out of the tracked tree, all in part 2 or part 4. The other
-records a count site at line 511. Both are positions, and both are outside the regions the other five
-perturbations change. E, F and G are what reach a figure or a sentence there.
+C reddens two tests, and both hold positions rather than content. One records six `| pattern`
+arguments swept out of the tracked tree; the other records one count site. **Their positions move
+whenever anything above them moves, so read them rather than quoting them:**
+
+```sh
+grep -o 'docs/query-to-sql.md:[0-9]*' crates/pulsus-read/tests/logql_pattern_expr_sites.tsv | sort -t: -k2 -n
+awk -F'\t' '$2 == "docs/query-to-sql.md" && $3 ~ /2\.4/ {print $6}' \
+  crates/pulsus-read/tests/design_record_counts.tsv
+```
+
+On this revision that is lines 230, 501, 731, 763, 764 and 996 for the six, and 541 for the count
+site — all in part 2 or part 4, all outside the regions the other five perturbations change. An
+earlier revision printed seven such numbers as plain prose; the commit that added the note above
+moved every one of them and regenerated the datasets without correcting the sentence, which is the
+third occurrence of hazard two and the reason the command is printed here. E, F and G are what reach
+a figure or a sentence in those regions.
 
 **Three things this paragraph does not claim.** It does not cover the older rows of part 5's table,
 the rest of part 7, or **part 6**, none of which was perturbed; and it does not say what B and D
