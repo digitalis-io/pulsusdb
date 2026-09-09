@@ -4272,7 +4272,7 @@ different answer from the reference on some input, and the inputs are named belo
 | 2 | LogQL `\| label_format k="{{…}}"`, general form | the same template as row 1 | the same as row 1 | the same as row 1, and one thing row 1 does not have: a template that fails rendering produces a `__error__` label and a `400`, and an expression in a `SELECT` list produces a value |
 | 3 | LogQL `\| unwrap duration(x)`, `\| unwrap bytes(x)` | "ClickHouse has no function for either" | false. Measured below: `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` | neither function is the reference's parser, and rule B requires exactness because the value feeds an aggregate. `parseTimeDelta('-5s')` is a `Code: 36` error where the reference answers `-5` |
 | 4 | LogQL `sum by (k) (…)`, `k` from a parser | "no ClickHouse expression reproduces the parser's rendering of a JSON number" | the claim is about every expression; two were measured. `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, which is the reference's own bytes | that function is a text scanner rather than a parser, and a group key has to be right about more than number bytes. Nesting, absent-versus-empty and key spelling all still disagree, below |
-| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and our own source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it — measured, 3,000,000 rows and 294.74 MiB against 245,760 rows and 24.14 MiB for a literal filter selecting the same 30 lines |
+| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and our own source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it. Measured on a first execution with `use_query_condition_cache = 0` — 3,000,000 rows and 309,060,017 bytes, against 245,760 and 25,313,762 for a literal filter selecting the same 30 lines. On a **second** execution of the same query text at the shipped default that gap closes to nothing, which is why the setting is printed beside the figure |
 | 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`catalog.rs:343`) and the attribute index (`catalog.rs:370-384`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:684`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
 
 **Every measurement below was taken on 2026-09-09** against ClickHouse `26.3.29.7`
@@ -4452,61 +4452,143 @@ is a number or an unmeasured quantity with a named instrument. **An unnumbered "
 expensive" is the same kind of claim as the permanence claims this section replaced**, so no row
 below carries one.
 
+Three instrument names are used throughout, and each is the one that measures what the row claims,
+which is not always the obvious field:
+
+| what is being priced | the field that measures it | why not the obvious one |
+|---|---|---|
+| CPU spent evaluating an expression | `ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']` in `system.query_log` | `query_duration_ms` is **elapsed** time. On a shared box it moves with whatever else is running and says nothing about the expression |
+| how much text an expression adds to the statement | `length(query)` on the rendered statement, against the 8 MiB cap (`crates/pulsus-read/src/querytext.rs:52`, part 8) | there is no other meter for it; the cap is a byte count, so the measurement has to be one too |
+| how much a predicate is made to read | `read_rows` and `read_bytes` in `system.query_log`, with `EXPLAIN indexes = 1` for the granules behind them | `result_rows` is the answer's size, which is the thing held constant while the read varies |
+
 | row | the cost that would decide it | measured? |
 |---|---|---|
-| 1, 2 — the two templates | per-row CPU of an expression that renders the template, and the size of that expression in the statement text, which counts against the 8 MiB rendered-SQL cap (part 8) | **no, and not measurable yet: no expression exists to measure.** What would produce a number: write a candidate, run the third statement with and without it over a stated row count, and compare `read_rows`, `read_bytes`, `memory_usage` and `query_duration_ms` from `system.query_log`. The **pruning** half is measured and is the table below — a template expression is not a literal substring, so it lands on that table's last two rows |
-| 3 — the two unwrap conversions | per-sample CPU of the parse, over every row the statement reads | **no**, same reason and same instrument. `parseTimeDelta` and `parseReadableSize` exist and could be timed today, but neither is the reference's parser, so timing them prices the wrong expression |
-| 4 — the parsed group key | per-row body parse, plus one aggregation state per distinct key value in the `GROUP BY` | **no.** What would produce a number: `memory_usage` for the grouped statement at a stated key cardinality, read against `max_rows_to_group_by` — the bound part 8 adds for exactly this |
-| 5 — `\|= ip("…")` | the read the statement does when no body index can prune it | **yes**, below |
+| 1, 2 — the two templates | CPU per row of an expression that renders the template, and the bytes that expression adds to the statement text | **no, and not measurable yet: no expression exists to measure.** What would produce a number: write a candidate, then compare `UserTimeMicroseconds + SystemTimeMicroseconds` for the third statement with and without it over a stated row count, and `length(query)` for the two rendered texts. The **pruning** half is measured and is the table below — a template expression is not a literal substring, so it lands on that table's last two rows |
+| 3 — the two unwrap conversions | CPU per sample of the parse, over every row the statement reads | **no**, same reason and same instrument. `parseTimeDelta` and `parseReadableSize` exist and could be timed today, but neither is the reference's parser, so timing them prices the wrong expression |
+| 4 — the parsed group key | CPU per row of the body parse, plus one aggregation state per distinct key value in the `GROUP BY` | **no.** What would produce a number: the same CPU pair for the parse, and `memory_usage` for the grouped statement at a stated key cardinality, read against `max_rows_to_group_by` — the bound part 8 adds for exactly this |
+| 5 — `\|= ip("…")` | the read the statement is made to do when no body index can prune it | **yes**, below — and the number depends on a setting that is named there |
 | 6 — the TraceQL pipe filter | the pruning `docs/schemas.md` §4.2 protects: what the combined form reads against what the separate per-generator statements read | **no.** What would produce a number: the granule comparison the join question already uses (`docs/query-lowering.md` §9.8) applied to this pair — `EXPLAIN indexes = 1` for granules and `system.query_log` for `read_rows`, `read_bytes` and `memory_usage`, over `trace_attrs_idx` and `trace_spans` at a stated corpus size, for the two generators run separately and for the combined form |
 
 **The 10.5 GiB figure earlier in part 5 prices none of these.** It belongs to the `{ .a = .b }`
 per-span pre-grouping, which is a different statement with a different state count, and reaching for
 it as a cost for any row above would be the same mistake this section exists to correct.
 
-#### Row 5, priced
+#### Row 5, priced — and the whole instrument, so it can be rebuilt
 
-Instrument: the shared ClickHouse `26.3.29.7`, a `log_samples` built from `catalog.rs:244-256`,
-3,000,000 synthetic rows in two daily partitions, four parts, **368 granules** at
-`index_granularity = 8192`. The middle two predicates each select **exactly 30** of the 3,000,000
-rows, so the two are comparable line for line.
+Everything below was run on 2026-09-09 against ClickHouse `26.3.29.7`
+(`clickhouse/clickhouse-server:26.3`). **The table, the loader and the two settings are all printed**,
+because a byte figure whose corpus is not published is a number nobody else can produce.
 
-```sh
-CH=http://localhost:18123/; DB=<throwaway>
-BASE="FROM $DB.log_samples PREWHERE service = 'ipcase'
-      WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000"
-curl -sS $CH --data-binary "EXPLAIN indexes = 1 SELECT sum(length(body)) $BASE"
-curl -sS $CH --data-binary "EXPLAIN indexes = 1 SELECT count() $BASE AND body LIKE '%CONN\_REFUSED\_7734%'"
-curl -sS $CH --data-binary "EXPLAIN indexes = 1 SELECT count() $BASE AND match(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')"
-curl -sS $CH --data-binary "EXPLAIN indexes = 1 SELECT count() $BASE AND JSONExtractString(body, 'level') = 'error'"
-# each then re-run with SETTINGS log_comment = '<tag>:<leg>', and:
-curl -sS $CH --data-binary "SELECT splitByChar(':', log_comment)[2], read_rows,
-  formatReadableSize(read_bytes), formatReadableSize(memory_usage)
-  FROM system.query_log WHERE type = 'QueryFinish' AND log_comment LIKE '<tag>:%'"
+The table is `log_samples` as `crates/pulsus-schema/src/catalog.rs:244-257` declares it, with the
+template's placeholders resolved and the `TTL` clause dropped so the rows do not age out of a re-run:
+
+```sql
+CREATE TABLE log_samples (
+  service       LowCardinality(String),
+  fingerprint   UInt64,
+  timestamp_ns  Int64   CODEC(DoubleDelta, ZSTD(1)),
+  severity      Int8    DEFAULT 0,
+  body          String  CODEC(ZSTD(1)),
+  INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
+  INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1,
+  INDEX idx_severity severity TYPE minmax GRANULARITY 4
+) ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+ORDER BY (service, fingerprint, timestamp_ns)
+SETTINGS ttl_only_drop_parts = 1
 ```
 
-| predicate added to `service = 'ipcase'` and the window | what `EXPLAIN indexes = 1` says | granules | `read_rows` | `read_bytes` | rows it selects |
-|---|---|---|---|---|---|
-| nothing | `MinMax`, `Partition`, `PrimaryKey` only | 368 of 368 | 3,000,000 | 294.74 MiB | 3,000,000 |
-| `body LIKE '%CONN\_REFUSED\_7734%'` | `idx_body_tokens` cuts 368 to 30, `idx_body_ngrams` 30 to 30 | **30 of 368** | 245,760 | 24.14 MiB | 30 |
-| `match(body, '(^\|[^0-9])10\.[0-9]{1,3}…')` — the shape an address-range test needs | both body indexes listed, **neither cuts** | 368 of 368 | 3,000,000 | 294.74 MiB | 30 |
-| `JSONExtractString(body,'level') = 'error'` | **no `Skip` section at all** | 368 of 368 | 3,000,000 | 294.74 MiB | 3,000 |
+The loader. One row in 100,000 carries an address inside `10.0.0.0/8` and a different one in 100,000
+carries the literal needle, so **the two predicates below select exactly 30 rows each**:
 
-**Same thirty lines, twelve times the read.** Rows two and three of that table return the same thirty
-lines out of the same three million. The predicate an index can serve reads 245,760 rows and
-24.14 MiB; the one it cannot reads all 3,000,000 and 294.74 MiB — **12.2 times the rows and 12.2
-times the bytes for the same answer**. That is the figure row 5 was missing.
+```sql
+INSERT INTO log_samples (service, fingerprint, timestamp_ns, severity, body)
+SELECT 'ipcase', 1, 1788000000000000000 + number * 28000000, 0,
+       concat('{"level":"', if(number % 1000 = 7, 'error', 'info'),
+              '","msg":"conn from ',
+              if(number % 100000 = 5, '10', toString(11 + (number % 200))), '.',
+              toString(number % 251), '.', toString(number % 253), '.', toString(number % 249),
+              if(number % 100000 = 3, ' CONN_REFUSED_7734', ''),
+              ' accepted for pod-', toString(number % 997),
+              '","status":200,"c":', toString(number % 10000), '}')
+FROM numbers(3000000)
+SETTINGS max_insert_threads = 4
+```
 
-Two things this table does **not** measure, said here rather than left to be assumed. `read_bytes` is
-what ClickHouse reads from storage, not what crosses to `pulsus-server`; the bytes on that hop are a
-different count and none is taken here. And the ratio is a ratio at CI scale on synthetic data,
-chosen because a ratio survives a change of scale where a wall-clock number does not — behaviour at
-1 TB is [issue #25](https://github.com/digitalis-io/pulsusdb/issues/25), as everywhere else in this
-document.
+That gives 3,000,000 rows in **two daily partitions and four active parts**, 372 marks — 368 data
+granules at the default `index_granularity = 8192` — read back from `system.parts`:
 
-The last row is what rows 1 to 4 would look like on the pruning axis: none of those expressions is a
-literal substring either, so none of them reaches a body index, and the statement reads what the
-primary key and the window leave it.
+```sql
+SELECT sum(rows), sum(marks), count() AS parts, uniqExact(partition) AS partitions
+FROM system.parts WHERE table = 'log_samples' AND active
+-- 3000000	372	4	2
+```
+
+Every leg carries the same window and the same two pinned settings:
+
+```sql
+-- BASE:
+--   FROM log_samples PREWHERE service = 'ipcase'
+--   WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+-- run once as EXPLAIN indexes = 1 <leg>, then again as <leg> with:
+--   SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:<leg>'
+SELECT sum(length(body))                                                          <BASE>  -- a_none
+SELECT count() <BASE> AND body LIKE '%CONN\_REFUSED\_7734%'                               -- b_literal
+SELECT count() <BASE> AND match(body, '(^|[^0-9])10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)')
+                                                                                          -- c_addr_regex
+SELECT count() <BASE> AND JSONExtractString(body, 'level') = 'error'                       -- d_json
+
+SELECT splitByChar(':', log_comment)[2] AS leg, read_rows, read_bytes, result_rows,
+       ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds'] AS cpu_us,
+       Settings['max_block_size'], Settings['use_query_condition_cache']
+FROM system.query_log WHERE type = 'QueryFinish' AND log_comment LIKE '<tag>:%' ORDER BY leg
+```
+
+**`use_query_condition_cache = 0` is not decoration — it is what makes these numbers a property of
+the predicate rather than of how recently the same query ran.** The paragraph after the table gives
+the reading at the shipped default, which is a different number for the same query.
+
+| predicate added to `service = 'ipcase'` and the window | `EXPLAIN indexes = 1` | granules | `read_rows` | `read_bytes` | CPU µs | rows it selects |
+|---|---|---|---|---|---|---|
+| nothing | `MinMax`, `Partition`, `PrimaryKey` only | 368 of 368 | 3,000,000 | 309,060,017 (294.74 MiB) | 430,207 | 3,000,000 |
+| `body LIKE '%CONN\_REFUSED\_7734%'` | `idx_body_tokens` cuts 368 to 30, `idx_body_ngrams` 30 to 30 | **30 of 368** | 245,760 | 25,313,762 (24.14 MiB) | 55,188 | 30 |
+| `match(body, '(^\|[^0-9])10\.[0-9]{1,3}…')` — the shape an address-range test needs | both body indexes listed, **neither cuts** | 368 of 368 | 3,000,000 | 309,060,017 | 513,619 | 30 |
+| `JSONExtractString(body,'level') = 'error'` | **no `Skip` section at all** | 368 of 368 | 3,000,000 | 309,060,017 | 1,009,495 | 3,000 |
+
+**Same thirty lines, twelve times the read — on the first execution.** Rows two and three return the
+same thirty lines out of the same three million. The predicate an index can serve reads 245,760 rows
+and 25,313,762 bytes; the one it cannot reads all 3,000,000 and 309,060,017 —
+`3000000 / 245760 = 12.207` and `309060017 / 25313762 = 12.209`.
+
+**And that ratio is 1 on the second execution of the same query, because of a cache.** ClickHouse
+26.3 ships `use_query_condition_cache = 1`, which remembers per granule whether a condition can
+match. Running the address-range leg twice at the default, changing nothing else:
+
+| execution | `read_rows` | `read_bytes` | CPU µs | rows it selects |
+|---|---|---|---|---|
+| first | 3,000,000 | 309,060,017 | 544,932 | 30 |
+| second, same query text | **245,760** | **25,313,762** | 29,503 | 30 |
+
+So the cost the table prices is **the cost of the first execution of a given query text**, and it is
+paid again by every query text the cache has not seen. A dashboard refreshing one saved query pays it
+once; a person exploring pays it on each new query. Neither reading is the wrong one, and quoting
+either without the setting beside it is what makes a benchmark unreproducible — two runs of one query
+here differ twelvefold on rows read, and nothing about the query says so.
+
+**Four things this instrument does not see**, said here rather than left to be assumed.
+`read_bytes` is what ClickHouse reads from its own storage; the bytes crossing to `pulsus-server` are
+a different count on a different hop and none is taken here. The CPU column is the whole query's CPU,
+not the predicate's alone — the difference between a row and the first row is the closest this gives
+to an expression's own cost. The ratios are ratios at CI scale on synthetic data, chosen because a
+ratio survives a change of scale where a wall-clock number does not, and behaviour at 1 TB is
+[issue #25](https://github.com/digitalis-io/pulsusdb/issues/25). And every absolute figure belongs to
+the loader printed above; a different corpus moves the bytes while leaving the ratio alone.
+
+The last row of the first table is what rows 1 to 4 would look like on the pruning axis: none of
+those expressions is a literal substring either, so none reaches a body index, and the statement
+reads what the primary key and the window leave it. Its CPU column is also the one measured thing
+those rows have — 1,009,495 µs against the 430,207 µs of the same read with no predicate, for one
+JSON extraction over 3,000,000 rows.
 
 ---
 
@@ -4805,26 +4887,50 @@ part 1 wrong silently. And **every `file:line` citation ages**: they were all pr
 `2f78c53`, except §5.1's and part 7's last three subsections, which were printed and read at
 `58feb2b`; nothing keeps any of them true afterwards.
 
-**Nothing in the test suite reads a claim in part 5, §5.1 or part 7 — and the domain of that
-sentence is the whole suite, not a list of suites.** Measured by perturbation on 2026-09-09 rather
-than read off the code, three runs of `cargo nextest run --workspace`, each with one change to this
-file and nothing else:
+**No test asserts on the text §5.1 and part 7's last three subsections contain.** That sentence is
+deliberately narrower than "nothing covers parts 5 and 7", and the next two paragraphs say why.
 
-| the change | result |
-|---|---|
-| **A** — falsify a measured value in §5.1: `5400` becomes `9999`, same line count | 7,070 run, 7,070 passed, 32 skipped |
-| **B** — delete §5.1 in full, 256 lines removed | 7,070 run, 7,070 passed, 32 skipped |
-| **C** — the control: insert one blank line at line 431, moving positions the tracked-file sweep records | **1 failed**, `pulsus-read::logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` — "`logql_pattern_expr_sites.tsv` has drifted from the tables that generate it" |
+Measured by perturbation on 2026-09-09 rather than read off the code. Four runs of
+`cargo nextest run --workspace`, each with one change to this file and nothing else, each reverted
+against a committed tree with `git status` checked clean afterwards:
 
-**C is why A and B mean anything.** Without it, "nothing reddened" could as easily be "no test opens
-this file". C shows the suite does open it, and shows exactly what it looks at: a **position**, not a
-sentence. Several suites open the document — every one that sweeps the tracked tree does — and
-listing them is not how this was established, because a list can be short by one and a run cannot.
-An earlier draft of this paragraph did name suites, named two, and missed at least one; the domain is
-now the run.
+| the change | lines it touched | result |
+|---|---|---|
+| **A** — falsify a measured value in §5.1: `5400` becomes `9999` | one line inside §5.1, same line count | 7,070 run, 7,070 passed, 32 skipped |
+| **B** — delete §5.1 in full | 256 lines removed, all inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
+| **C** — the reachability control: insert one blank line at line 431 | one line, in part 2 | **1 failed**: `pulsus-read::logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` — "`logql_pattern_expr_sites.tsv` has drifted from the tables that generate it" |
+| **D** — delete part 7's three added subsections in full | lines removed, all inside part 7 | 7,070 run, 7,070 passed, 32 skipped |
 
-So every sentence in those parts is held true by a reader and by nothing else. What a change to them
-can break is `crates/pulsus-read/tests/logql_pattern_expr_sites.tsv`, which is regenerated by
+**What C does and does not show, stated because an earlier draft of this paragraph got it wrong.**
+C reddens one test, and that test records six positions in this document — lines 200, 471, 701, 733,
+734 and 966, all of them `| pattern` arguments swept out of the tracked tree. **Every one of those is
+in part 2 or part 4. A, B and D all change text after line 4200.** So C proves the suite opens this
+file and reacts to it *somewhere*, and proves nothing about the region A, B and D changed. It is a
+control for the file, not for the region.
+
+**And no control for that region exists.** Both committed position datasets were searched —
+`crates/pulsus-read/tests/logql_pattern_expr_sites.tsv` has the six lines above and
+`crates/pulsus-read/tests/logql_json_expr_sites.tsv` has none from this document — so nothing in the
+suite records a position, a phrase or a value from anywhere after line 966. A control there cannot be
+built without first putting something into the region for a sweep to find, which would be arranging
+the evidence rather than taking it.
+
+**What the green runs therefore establish, and what they do not.** B and D each delete their region
+outright. Any test asserting anything about that text — a value in it, a phrase, its presence — takes
+different input under those runs, and none reddened; that is what makes "no test asserts on this
+text" a measured statement rather than a hopeful one. What is **not** established is the positive
+form: nothing here shows a test reads those regions and declines to check them, as against never
+opening them at all. For the conclusion the two are the same — under either, no test holds these
+sentences true — but they are different facts and only one of them was measured.
+
+**Two things this paragraph does not claim.** It does not cover the older rows of part 5's table or
+the rest of part 7, which were not perturbed. And it says nothing about how many suites open this
+document: that is a fact about reading source, no perturbation counted it, and an earlier draft
+asserted it inside this measured paragraph, which is exactly the mixing this document exists to
+avoid.
+
+What a change to these parts *can* break is `crates/pulsus-read/tests/logql_pattern_expr_sites.tsv`,
+if it moves one of those six positions — regenerated by
 `cargo test -p pulsus-read --test logql_pattern_expr_matrix -- --ignored regenerate_the_sites_dataset`
 and never hand-edited.
 
