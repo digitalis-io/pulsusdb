@@ -4603,11 +4603,14 @@ byte-identical in all three. The CPU figures did not: `a_none` returned 430,207 
 443,564 µs, and `d_json` returned 1,009,495 then 1,057,045 then 1,100,737 µs. The box is shared with
 other work. No fourth take was run.
 
-#### The cache that moves that figure — every leg run against it
+#### The condition cache — the legs run against it
 
-ClickHouse 26.3 ships `use_query_condition_cache = 1`. `system.columns` describes the cache table:
+Nothing beyond the legs printed here was tested.
 
 ```sql
+SELECT getSetting('use_query_condition_cache')
+-- true
+
 SELECT name, comment FROM system.columns
 WHERE database = 'system' AND table = 'query_condition_cache'
 -- key_hash        Hash of (table_uuid, part_name, condition_hash).
@@ -4618,24 +4621,19 @@ WHERE database = 'system' AND table = 'query_condition_cache'
 Five executions at the shipped default after `SYSTEM DROP QUERY CONDITION CACHE`, in this order,
 against the same table and the same parts. Legs 1 to 3 carry the condition
 `match(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')`; legs 4 and 5 carry
-`… = 1` appended to it, which selects the same thirty rows:
+`… = 1` appended to it, and each of the five returned thirty rows:
 
 | # | what differs from the leg above | `read_rows` | `read_bytes` | CPU µs |
 |---|---|---|---|---|
 | 1 | first execution after the cache was dropped | 3,000,000 | 309,060,017 | 544,160 |
 | 2 | nothing — the same statement again | 245,760 | 25,313,762 | 33,362 |
-| 3 | the `SELECT` list: `count() + 0` rather than `count()`, first execution of **this text** | 245,760 | 25,313,762 | 29,837 |
+| 3 | the `SELECT` list: `count() + 0` rather than `count()`, first execution of this text | 245,760 | 25,313,762 | 29,837 |
 | 4 | `= 1` appended to the condition; first execution of this form | **3,000,000** | **309,060,017** | 550,425 |
 | 5 | nothing — leg 4 again | 245,760 | 25,313,762 | 24,792 |
 
-**This subsection records results and nothing else.** Every entry below is a statement that was run,
-the settings it carried, and what it returned. **No sentence here says what the cache is keyed on,
-what a function name does, or what any of it implies.** Five such sentences were written across five
-revisions and each was refuted by a probe; they are listed as withdrawn at the end, beside the probe
-that refuted each. Nothing beyond the legs printed here was tested.
-
-Cache dropped first; leg 1 warms the entry; legs 2 to 12 execute and each returns thirty rows; leg 13
-does not execute. All at `use_query_condition_cache = 1`, `max_block_size = 65409`:
+A second sequence, cache dropped first, legs run in the order printed. Legs 1 to 12 executed and each
+returned thirty rows; leg 13 did not execute. All at `use_query_condition_cache = 1`,
+`max_block_size = 65409`:
 
 | the condition | `read_rows` | |
 |---|---|---|
@@ -4653,8 +4651,20 @@ does not execute. All at `use_query_condition_cache = 1`, `max_block_size = 6540
 | `match(body, RE)` again — leg 1's text | 245,760 | **reused** |
 | `MATCH(body, RE)` | — | leg 13; did not execute, printed below |
 
-One more statement, run earlier in this subsection's five-leg table: a different `SELECT` list
-(`count() + 0`) carrying leg 1's condition read 245,760 rows on its first execution.
+Nine further conditions were run in earlier reviews of this document under the same two settings,
+each after its own cache drop and warm, and are recorded here because they were not printed before:
+
+| the condition | `read_rows` | |
+|---|---|---|
+| `WITH body AS b` then `match(b, RE)` | 245,760 | **reused** |
+| `SELECT body AS b …` then `match(b, RE)` | 245,760 | **reused** |
+| a derived table aliasing `body AS payload`, then `match(payload, RE)` | 3,000,000 | paid |
+| `FROM (SELECT body …) s` then `match(s.body, RE)` | 3,000,000 | paid |
+| `match(tupleElement(tuple(body), 1), RE)` | 3,000,000 | paid |
+| `match(body, concat(RE, ''))` | 3,000,000 | paid |
+| `match(body, RE) OR false` | 3,000,000 | paid |
+| `true AND match(body, RE)` | 3,000,000 | paid |
+| `match(body, RE) != 0` | 3,000,000 | paid |
 
 Leg 13, the statement as sent and the response as received, byte for byte:
 
@@ -4669,12 +4679,19 @@ SETTINGS max_block_size = 65409
 Code: 46. DB::Exception: Function with name `MATCH` does not exist. In scope SELECT count() FROM log_samples PREWHERE service = 'ipcase' WHERE (timestamp_ns > 1787999999999999999) AND (timestamp_ns <= 1788084000000000000) AND MATCH(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)') SETTINGS max_block_size = 65409. Maybe you meant: ['match','path']. (UNKNOWN_FUNCTION) (version 26.3.29.7 (official build))
 ```
 
-`SELECT count() FROM system.query_condition_cache`, run three times: **0** after
-`SYSTEM DROP QUERY CONDITION CACHE`, **4** after leg 1, **4** after leg 13.
+`SELECT count() FROM system.query_condition_cache`, in two sequences, each begun with
+`SYSTEM DROP QUERY CONDITION CACHE` and each leg at `use_query_condition_cache = 1`,
+`max_block_size = 65409`:
 
-All 32 capitalisations of the six letters of `match` were run as `SELECT <spelling>('a','a')`:
-**one returned a value and 31 returned `Code: 46`**. Nine further spellings, each run once on the
-same server:
+| sequence | counts |
+|---|---|
+| drop, then leg 1, then leg 13 | **0**, then **4**, then **4** |
+| drop, then legs 1 to 13 in the order printed above | **0**, then **28** |
+
+All 32 capitalisations of the five letters of `match` were run as `SELECT <spelling>('a','a')`: **one
+returned a value and 31 returned `Code: 46`**. Nine further spellings, each run once on the same
+server. The four `Code: 46` cells are response prefixes, cut at the first sentence; each response
+continues with the scope and the version, in the form printed for leg 13 above:
 
 | statement | response |
 |---|---|
@@ -4683,15 +4700,12 @@ same server:
 | `SELECT MAX(1)` | `1` |
 | `SELECT LENGTH('ab')` | `2` |
 | `SELECT LOWER('AB')` | `ab` |
-| `SELECT TOBOOL(1)` | ``Code: 46. DB::Exception: Function with name `TOBOOL` does not exist`` |
-| `SELECT TOSTRING(1)` | ``Code: 46. DB::Exception: Function with name `TOSTRING` does not exist`` |
-| `SELECT STARTSWITH('ab','a')` | ``Code: 46. DB::Exception: Function with name `STARTSWITH` does not exist`` |
-| `SELECT SIPHASH64('a')` | ``Code: 46. DB::Exception: Function with name `SIPHASH64` does not exist`` |
+| `SELECT TOBOOL(1)` | ``Code: 46. DB::Exception: Function with name `TOBOOL` does not exist.`` … |
+| `SELECT TOSTRING(1)` | ``Code: 46. DB::Exception: Function with name `TOSTRING` does not exist.`` … |
+| `SELECT STARTSWITH('ab','a')` | ``Code: 46. DB::Exception: Function with name `STARTSWITH` does not exist.`` … |
+| `SELECT SIPHASH64('a')` | ``Code: 46. DB::Exception: Function with name `SIPHASH64` does not exist.`` … |
 
-**What has not been run**, so that a reader looks for it rather than assuming it settled: the
-`condition_hash` computation in the ClickHouse source for 26.3 has not been read, and no leg here
-probes constant folding (`1 + 0` against `1`), commutativity in `AND` or `OR`, a literal written
-differently but parsed to the same value, or a column reached through a subquery alias.
+**Not run:** the `condition_hash` computation in the ClickHouse source for 26.3 has not been read.
 
 **Withdrawn, and not replaced.** Five sentences generalising the legs above were written and each was
 refuted by a probe:
@@ -4704,22 +4718,17 @@ refuted by a probe:
 | the key is the condition's parsed form | qualifying and aliasing the column reused |
 | the refusal of `MATCH` belongs to `match` | `TOBOOL`, `TOSTRING`, `STARTSWITH` and `SIPHASH64` are refused in capitals too |
 
-On a ruling of 2026-09-09 this subsection carries no sentence of that kind.
+**Not measured, and no instrument was used for either:** the bytes crossing from ClickHouse to
+`pulsus-server`, and behaviour at 1 TB ([issue #25](https://github.com/digitalis-io/pulsusdb/issues/25)).
+`read_bytes` above is what `system.query_log` reports for the statement; the CPU column is that
+statement's whole CPU.
 
-**Four things this instrument does not see**, said here rather than left to be assumed.
-`read_bytes` is what ClickHouse reads from its own storage; the bytes crossing to `pulsus-server` are
-a different count on a different hop and none is taken here. The CPU column is the whole query's CPU,
-not the predicate's alone — the difference between a row and the first row is the closest this gives
-to an expression's own cost. The ratios are ratios at CI scale on synthetic data, chosen because a
-ratio survives a change of scale where a wall-clock number does not, and behaviour at 1 TB is
-[issue #25](https://github.com/digitalis-io/pulsusdb/issues/25). And every absolute figure belongs to
-the loader printed above; a different corpus moves the bytes while leaving the ratio alone.
+The two ratios in the priced table were re-run on a shorter window —
+`timestamp_ns <= 1788008400000000000` in place of `1788084000000000000`, everything else unchanged at
+`use_query_condition_cache = 0`, `max_block_size = 65409`. The literal leg returned 32,768 rows and
+3,374,881 bytes, the address-range leg 303,104 and 31,224,865: ratios of **9.25** and **9.252**,
+against **12.207** and **12.209** on the longer window. No third window was run.
 
-The last row of the first table is what rows 1 to 4 would look like on the pruning axis: none of
-those expressions is a literal substring either, so none reaches a body index, and the statement
-reads what the primary key and the window leave it. Its CPU column is also the one measured thing
-those rows have — 1,009,495 µs against the 430,207 µs of the same read with no predicate, for one
-JSON extraction over 3,000,000 rows.
 
 ---
 
@@ -5168,12 +5177,11 @@ regenerated by
 `cargo test -p pulsus-read --test logql_pattern_expr_matrix -- --ignored regenerate_the_sites_dataset`
 and never hand-edited.
 
-#### What five rounds of review on §5.1 and part 7 found, counted
+#### The findings of five rounds of review on §5.1 and part 7
 
-Sixteen findings over five rounds. **Twelve were about this document's account of its own testing;
-four were about its subject.** All sixteen are listed rather than sampled, because an earlier
-revision of this passage gave examples instead and three of them were filed in the wrong column while
-a fourth matched no finding at all.
+Every finding of rounds 1 to 5, one row each, transcribed from those rounds' verdicts. Counted over
+the rows below with `awk -F'|' '/^\|/ {n++; if ($5 ~ /subject/) s++} END {print n-2, s}'`:
+**16 rows, 4 of them `subject`**.
 
 | round | severity | the finding | about |
 |---|---|---|---|
@@ -5194,11 +5202,10 @@ a fourth matched no finding at all.
 | 5 | low | the plan figures were not all 35 | evidence |
 | 5 | low | F and the published controls were not isolated | evidence |
 
-**Nothing is summarised under this table.** An independent enumeration of the same five rounds
-matched it row for row, in total, in split and in membership. Three sentences that stood here — one
-about what has not moved since round 2, one about what the four subject rows have in common, and one
-telling a reader how to weigh the two columns — were removed on a ruling of 2026-09-09, after the
-second of them was contradicted by this table's own first row.
+An independent enumeration of the same five rounds returned the same 16 rows, the same 12/4 split
+and the same membership. Six sentences that stood under and over this table — three summarising what
+the rows meant, and three counting and classifying them in prose — were removed on rulings of
+2026-09-09.
 
 ### When to open another round on this document
 
