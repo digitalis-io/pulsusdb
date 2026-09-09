@@ -154,3 +154,68 @@ cargo run -p xtask -- bench traces-read \
     --cluster pulsus_test_cluster \
     --out docs/benchmarks/data/traces-read-cluster-ci.json
 ```
+
+## The `docs/query-lowering.md` §9.2 re-measurement (issue #492 part 8)
+
+A second traces scenario lives beside this one and is reported here
+because it shares the harness conventions above: one unique `query_id`
+per statement, the product planner's own SQL, and `system.query_log`
+read back per statement rather than in aggregate.
+
+**What it is for.** `docs/query-lowering.md` §9.2 publishes the per-stage
+cost of one TraceQL request in two forms — as the engine drives it today
+and as a lowered request. The corpus those figures were taken on (§9.1's
+C1) was committed nowhere and the run's rows had been discarded, so
+nothing in this repository could re-derive a single figure in that
+section. `bench traces-lowering` builds C1 from a deterministic
+generator, drives both forms, and retains **one row per statement** in
+`docs/benchmarks/data/traces-lowering-92.json` — 1,132 rows, no
+summaries. `crates/pulsus-read/tests/query_lowering_doc_gate.rs` totals
+those rows and compares every published cell against its total, so §9.2
+cannot drift from the measurement it quotes.
+
+**The two forms are two statements from one plan.** `plan_search` renders
+the phase-1 generator twice: `generator_sqls[0]` carries the spanset
+aggregate's `HAVING`, and `SearchPlan::generator_fallback_sql` is the
+byte-identical statement without it. Everything downstream — hydration,
+membership, the winners' root read — is the same builder in both forms,
+so the whole difference between the two tables follows from how many
+candidates phase 1 returns.
+
+**Nothing here runs in CI.** The corpus is ten million spans and fifty
+million attribute-index rows; building it takes about 50 s and the two
+forms about 25 s on a single-node container. It runs by hand, commits its
+output, and CI checks the document against the committed output. No
+wall-clock figure is gated.
+
+**Reproducibility, measured rather than asserted, and two different
+questions.** Re-running against the **same** corpus and rebuilding the
+corpus are different questions with different answers. **No band is
+established for how much these columns vary between builds**; several
+builds have been observed and they disagree with each other.
+
+**The figures are not restated here.** They live in
+`docs/benchmarks/data/traces-lowering-92-rebuilds.tsv`, one row per
+observation and column with its provenance, and
+`docs/query-lowering.md` §9.2b tabulates them under a check that fails
+when the table and the dataset disagree. Restating a measurement beside
+the measurement is how the last version of this paragraph came to carry
+a figure that was wrong.
+
+The mechanism is adaptive granularity: `index_granularity_bytes` is
+10 MiB, the corpus is anchored to the day it is built, and a
+`DoubleDelta`-coded timestamp column compresses differently at different
+absolute values, so a granule boundary moves. **Expect your rebuild to
+differ from the committed artefact**; the document is gated against the
+artefact, not against a rebuild.
+
+```text
+podman run -d --name pulsus-lowering-ch -p 18923:8123 \
+    docker.io/clickhouse/clickhouse-server:26.3
+cargo run -p xtask -- bench traces-lowering \
+    --http-url http://127.0.0.1:18923 --database pulsus_lowering_bench \
+    --out docs/benchmarks/data/traces-lowering-92.json
+```
+
+The scenario reuses an existing corpus when the database already carries
+`trace_attrs_idx`; drop the database to rebuild it.

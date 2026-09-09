@@ -534,7 +534,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 
 `{ .service.namespace = "prod" } | max(duration) > 1s`, `limit=20`, five-day window.
 
-**Today** — one first statement, then 554 rounds of two statements, then one final statement:
+**Today** — one first statement, then 563 rounds of two statements, then one final statement:
 
 ```sql
 -- emitted today, search_sql.rs:153
@@ -549,7 +549,7 @@ LIMIT 100001
 ```
 
 ```sql
--- emitted today, search_sql.rs:194, once per batch of 32 candidates, 554 times, one after another
+-- emitted today, search_sql.rs:194, once per batch of 32 candidates, 563 times, one after another
 SELECT trace_id, span_id, parent_id,
        if(length(service) <= 8192, service, substringUTF8(service, 1, 2048)) AS service,
        if(length(name) <= 8192, name, substringUTF8(name, 1, 2048)) AS name,
@@ -566,7 +566,7 @@ LIMIT 10001 BY trace_id
 ```
 
 ```sql
--- emitted today, search_sql.rs:222, the second statement of each of those 554 rounds
+-- emitted today, search_sql.rs:222, the second statement of each of those 563 rounds
 SELECT DISTINCT trace_id, span_id
 FROM trace_attrs_idx
 WHERE date >= toDate('<d0>') AND date <= toDate('<d1>')
@@ -649,13 +649,13 @@ attribute** — `AttrScope::Unscoped` maps to `None` (`filter.rs:827`) and the g
 corresponds to `resource.service.namespace`, not to the `.service.namespace` it is written beside.
 Recorded as an open question at the end of this document rather than resolved here.
 
-**Round trips and bytes, from the design's measurement** (`docs/query-lowering.md:762-766`): 1,110
-statements become **4**; 76,616,608 bytes become **43,636**; 5,705,629,767 rows read become
-**9,871,360**; 696,630 granules become **1,205**.
-**The three totals on the right are `seed + root only`**: they were computed under a two-statement
-model and omit the window-bounded hydration read and the membership read, so the true lowered
-totals are larger by those two statements' cost. The replacements are owed by part 8's §9.2
-re-measurement (issue #492); the left-hand side of every ratio is unaffected.
+**Round trips and bytes, from the design's measurement** (`docs/query-lowering.md` §9.2 and
+§9.2b): 1,128 statements become **4**; 77,572,021 bytes become **212,986**; 5,795,940,946 rows read
+become **19,988,480**; 707,689 granules become **2,440**. **Both sides count all four lowered
+statements**, the window-bounded hydration read and the membership read included, and every figure
+is a total over
+[`docs/benchmarks/data/traces-lowering-92.json`](benchmarks/data/traces-lowering-92.json),
+which holds one row per statement.
 
 ### 2.6 What decides how the statement is assembled
 
@@ -664,8 +664,8 @@ Three rules, from ADR 0008 (`docs/decisions/0008-sql-composition-for-lowered-pip
 | rule | what it says | why |
 |---|---|---|
 | **D1** | one `SELECT` accumulating clauses, wrapped in a subquery exactly when a stage needs a clause that is already filled | measured: one statement and the same statement wrapped three deep read identical granules, rows and bytes, and differ by 0.005% in peak memory. ClickHouse flattens the nesting, so wrapping costs nothing |
-| **D2** | **no `WITH` clause, ever** | measured: a `WITH` clause referenced twice reads 2,210 granules and 18,104,321 rows against 1,105 and 9,052,160 for one reference — exactly double, and byte-identical to writing the subquery out twice. ClickHouse substitutes the text rather than computing it once |
-| **D3** | a set of keys crossing to `pulsus-server` is handed over as literal values, never as a subquery | measured on the final statement for 20 traces: `trace_id IN (<20 literal ids>)` reads 100 granules and 819,200 rows; `trace_id IN (SELECT … LIMIT 20)` reads 1,205 granules and 9,871,360 rows. Twelve times the rows for the same 20 traces, because the subquery form leaves the key set unknown and the read degrades to a scan of the window |
+| **D2** | **no `WITH` clause, ever** | measured on the pre-part-8 build of corpus C1, whose rows were not retained, so these four figures are not re-derivable from `traces-lowering-92.json` and are not §9.2's: a `WITH` clause referenced twice reads 2,210 granules and 18,104,321 rows against 1,105 and 9,052,160 for one reference — exactly double, and byte-identical to writing the subquery out twice. ClickHouse substitutes the text rather than computing it once |
+| **D3** | a set of keys crossing to `pulsus-server` is handed over as literal values, never as a subquery | measured on the pre-part-8 build of corpus C1, whose rows were not retained, so these four figures are not re-derivable from `traces-lowering-92.json` and are not §9.2's; on the final statement for 20 traces: `trace_id IN (<20 literal ids>)` reads 100 granules and 819,200 rows; `trace_id IN (SELECT … LIMIT 20)` reads 1,205 granules and 9,871,360 rows. Twelve times the rows for the same 20 traces, because the subquery form leaves the key set unknown and the read degrades to a scan of the window |
 
 D3 has a ceiling, and it was measured rather than assumed: 32,768 literal ids is 1,409,081 bytes of
 query text and ClickHouse refuses it with
@@ -3688,9 +3688,9 @@ ORDER BY sort_key DESC, trace_id ASC
 LIMIT 20
 ```
 
-This is the query part 2.5 measures: 1,110 statements become 4, and 76,616,608 bytes become
-43,636 — a figure that is `seed + root only` and omits the hydration and membership reads, which
-part 8's §9.2 re-measurement replaces.
+This is the query part 2.5 measures: 1,128 statements become 4, and 77,572,021 bytes become
+212,986 — a total over all four lowered statements, taken from the retained per-statement rows
+(`docs/query-lowering.md` §9.2b).
 
 #### TraceQL11 — grouping the matched spans
 

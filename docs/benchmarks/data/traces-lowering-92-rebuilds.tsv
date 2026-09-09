@@ -1,0 +1,24 @@
+observation	scope	provenance	column	statements_moved	largest_change	total_change
+S	per_statement	the same corpus, run twice by this harness	selected_marks	0	—	—
+S	per_statement	the same corpus, run twice by this harness	result_bytes	0	—	—
+S	per_statement	the same corpus, run twice by this harness	read_rows	0	—	—
+S	per_statement	the same corpus, run twice by this harness	read_bytes	0	—	—
+S	per_statement	the same corpus, run twice by this harness	read_compressed_bytes	440	0.19%	—
+S	per_statement	the same corpus, run twice by this harness	fd_read_bytes	561	2.53%	0.03%
+S	per_statement	the same corpus, run twice by this harness	memory_usage	982	25.8%	—
+A	per_statement	a corpus rebuilt from the committed generator, measured by this harness	selected_marks	0	—	—
+A	per_statement	a corpus rebuilt from the committed generator, measured by this harness	result_bytes	0	—	—
+A	per_statement	a corpus rebuilt from the committed generator, measured by this harness	read_rows	147	0.013%	−418 rows, −0.00001%
+A	per_statement	a corpus rebuilt from the committed generator, measured by this harness	read_bytes	147	0.013%	+11,418 bytes, +0.00001%
+A	per_statement	a corpus rebuilt from the committed generator, measured by this harness	read_compressed_bytes	977	0.013%	—
+A	per_statement	a corpus rebuilt from the committed generator, measured by this harness	fd_read_bytes	1124	2.5%	—
+A	per_statement	a corpus rebuilt from the committed generator, measured by this harness	memory_usage	1132	18.6%	—
+B	group_total	a corpus rebuilt on another host by issue #492 part 8's first code review, which reported group totals only	selected_marks	—	—	+1 granule, hydration group
+B	group_total	a corpus rebuilt on another host by issue #492 part 8's first code review, which reported group totals only	result_bytes	—	—	+2,323 bytes, hydration group
+C	per_statement	a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here	selected_marks	1	0.71%	—
+C	per_statement	a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here	result_bytes	0	—	—
+C	per_statement	a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here	read_rows	147	0.689%	—
+C	per_statement	a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here	read_bytes	147	0.647%	—
+C	per_statement	a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here	read_compressed_bytes	996	0.234%	—
+C	per_statement	a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here	fd_read_bytes	1125	3.15%	—
+C	per_statement	a corpus rebuilt on another host by issue #492 part 8's second code review; not re-measured here	memory_usage	1105	19.9%	—
