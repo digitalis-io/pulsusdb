@@ -4338,7 +4338,7 @@ while rendering a **label** makes the whole request `400`:
 
 ```sh
 curl -sS -G $LOKI/loki/api/v1/query \
-  --data-urlencode 'query=sum by (sev) (count_over_time({…} | json | label_format sev=`{{ div 1 0 }}` [30m]))' \
+  --data-urlencode 'query=sum by (sev) (count_over_time({service_name="nsql_fmt"} | json | label_format sev=`{{ div 1 0 }}` [30m]))' \
   --data-urlencode "time=$E"
 ```
 
@@ -4598,16 +4598,14 @@ the same three million. The predicate an index can serve reads 245,760 rows and 
 one it cannot reads all 3,000,000 and 309,060,017 — `3000000 / 245760 = 12.207` and
 `309060017 / 25313762 = 12.209`.
 
-**The read columns are deterministic and the CPU column is not.** Three takes of this table on the
-same box gave byte-identical `read_rows` and `read_bytes` every time and CPU figures that moved:
-`a_none` 430,207 then 461,535 then 443,564 µs, `d_json` 1,009,495 then 1,057,045 then 1,100,737 µs —
-about 7% and 9% of spread. The box is shared, so read a CPU cell as one take with roughly a tenth of
-its value in spread, and read a ratio between cells rather than a cell alone.
+**Three takes of this table were run on the same box.** `read_rows` and `read_bytes` came back
+byte-identical in all three. The CPU figures did not: `a_none` returned 430,207 then 461,535 then
+443,564 µs, and `d_json` returned 1,009,495 then 1,057,045 then 1,100,737 µs. The box is shared with
+other work. No fourth take was run.
 
-#### The cache that moves that figure, and exactly what it is keyed on
+#### The cache that moves that figure — every leg run against it
 
-ClickHouse 26.3 ships `use_query_condition_cache = 1`. It records, per data part, which marks a
-condition can match, and the key is neither the query nor the meaning of the condition:
+ClickHouse 26.3 ships `use_query_condition_cache = 1`. `system.columns` describes the cache table:
 
 ```sql
 SELECT name, comment FROM system.columns
@@ -4627,16 +4625,17 @@ against the same table and the same parts. Legs 1 to 3 carry the condition
 | 1 | first execution after the cache was dropped | 3,000,000 | 309,060,017 | 544,160 |
 | 2 | nothing — the same statement again | 245,760 | 25,313,762 | 33,362 |
 | 3 | the `SELECT` list: `count() + 0` rather than `count()`, first execution of **this text** | 245,760 | 25,313,762 | 29,837 |
-| 4 | the condition's **spelling**, not its meaning: `match(…) = 1`, first execution | **3,000,000** | **309,060,017** | 550,425 |
+| 4 | `= 1` appended to the condition; first execution of this form | **3,000,000** | **309,060,017** | 550,425 |
 | 5 | nothing — leg 4 again | 245,760 | 25,313,762 | 24,792 |
 
-**Leg 3 rules out the query text and leg 4 rules out the meaning.** A statement nobody had run before
-reused the entry because it carried the same condition; a condition selecting exactly the same thirty
-rows paid the full read because it is written differently. So the boundary is somewhere between the
-two. **This section no longer says where.** Thirteen legs are printed instead, because the sentence
-that generalised them has been wrong four times and the legs have been right every time.
+**This subsection records results and nothing else.** Every entry below is a statement that was run,
+the settings it carried, and what it returned. **No sentence here says what the cache is keyed on,
+what a function name does, or what any of it implies.** Five such sentences were written across five
+revisions and each was refuted by a probe; they are listed as withdrawn at the end, beside the probe
+that refuted each. Nothing beyond the legs printed here was tested.
 
-Cache dropped first, leg 1 warming the entry, every leg after it selecting **the same thirty rows**:
+Cache dropped first; leg 1 warms the entry; legs 2 to 12 execute and each returns thirty rows; leg 13
+does not execute. All at `use_query_condition_cache = 1`, `max_block_size = 65409`:
 
 | the condition | `read_rows` | |
 |---|---|---|
@@ -4652,59 +4651,60 @@ Cache dropped first, leg 1 warming the entry, every leg after it selecting **the
 | `toBool(match(body, RE))` | 3,000,000 | paid |
 | `match(body, RE) AND 1` | 3,000,000 | paid |
 | `match(body, RE)` again — leg 1's text | 245,760 | **reused** |
-| `MATCH(body, RE)` — this one function's name in capitals | — | refused before it runs; the error is printed in full below |
+| `MATCH(body, RE)` | — | leg 13; did not execute, printed below |
 
-Two further facts about the same surface, so they are not looked for here and missed: query text is
-not the key — a different `SELECT` list carrying this condition reused the entry on its first
-execution — and neither is meaning, since the five that paid select the same thirty rows as the one
-that warmed it.
+One more statement, run earlier in this subsection's five-leg table: a different `SELECT` list
+(`count() + 0`) carrying leg 1's condition read 245,760 rows on its first execution.
 
-**The last leg is one statement's behaviour and nothing more.** It is here because it is the one
-spelling that never reaches the cache at all, and because an earlier revision drew a rule out of it
-that is false. What was measured, in full:
+Leg 13, the statement as sent and the response as received, byte for byte:
 
 ```text
 SELECT count() FROM log_samples PREWHERE service = 'ipcase'
 WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
-  AND MATCH(body, '(^|[^0-9])10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)')
+  AND MATCH(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')
 SETTINGS max_block_size = 65409
-
-Code: 46. DB::Exception: Function with name `MATCH` does not exist. In scope SELECT count()
-FROM log_samples PREWHERE service = 'ipcase' WHERE (timestamp_ns > 1787999999999999999)
-AND (timestamp_ns <= 1788084000000000000) AND MATCH(body,
-'(^|[^0-9])10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)') SETTINGS max_block_size = 65409.
-Maybe you meant: ['match','path']. (UNKNOWN_FUNCTION) (version 26.3.29.7 (official build))
 ```
 
-`SELECT count() FROM system.query_condition_cache` read **0** after the drop, **4** after leg 1
-warmed it — one entry per active part — and **4** again after this statement, so it added nothing.
+```text
+Code: 46. DB::Exception: Function with name `MATCH` does not exist. In scope SELECT count() FROM log_samples PREWHERE service = 'ipcase' WHERE (timestamp_ns > 1787999999999999999) AND (timestamp_ns <= 1788084000000000000) AND MATCH(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)') SETTINGS max_block_size = 65409. Maybe you meant: ['match','path']. (UNKNOWN_FUNCTION) (version 26.3.29.7 (official build))
+```
 
-**It says nothing about other function names, and an earlier revision's claim that it did was
-wrong.** Measured on the same server: `COUNT(1)`, `SUM(1)` and `MAX(1)` all answer `1`,
-`LENGTH('ab')` answers `2`, and `LOWER('AB')` answers `ab`. Five names accepted in capitals and one
-refused, so the refusal belongs to `match` and this document claims nothing wider. It is the same
-move as the four cache generalisations above — a result carried one step past the evidence — and it
-is corrected the same way: keep the leg, drop the rule.
+`SELECT count() FROM system.query_condition_cache`, run three times: **0** after
+`SYSTEM DROP QUERY CONDITION CACHE`, **4** after leg 1, **4** after leg 13.
 
-**Where the boundary is has not been characterised, and this document does not claim it.** It is
-after name resolution, because qualifying and aliasing the column both reuse; it is before semantic
-equivalence, because five rewrites that cannot change the answer all pay. Between those two lies
-whatever ClickHouse hashes into `condition_hash`, and nothing here establishes its shape.
+All 32 capitalisations of the six letters of `match` were run as `SELECT <spelling>('a','a')`:
+**one returned a value and 31 returned `Code: 46`**. Nine further spellings, each run once on the
+same server:
 
-**What would characterise it**, in the order that would settle the most per leg: read the
-`condition_hash` computation in the ClickHouse source for 26.3 and name the representation it hashes;
-then probe that representation's own equivalences — constant folding (`1 + 0` against `1`),
-commutativity in `AND` and `OR`, a literal written differently but parsed to the same value, and a
-column reached through a subquery alias. Until one of those is done, a design decision should use the
-**uncached** figure the table above gives, which is the first-evaluation cost and does not depend on
-what ran before it.
+| statement | response |
+|---|---|
+| `SELECT COUNT(1)` | `1` |
+| `SELECT SUM(1)` | `1` |
+| `SELECT MAX(1)` | `1` |
+| `SELECT LENGTH('ab')` | `2` |
+| `SELECT LOWER('AB')` | `ab` |
+| `SELECT TOBOOL(1)` | ``Code: 46. DB::Exception: Function with name `TOBOOL` does not exist`` |
+| `SELECT TOSTRING(1)` | ``Code: 46. DB::Exception: Function with name `TOSTRING` does not exist`` |
+| `SELECT STARTSWITH('ab','a')` | ``Code: 46. DB::Exception: Function with name `STARTSWITH` does not exist`` |
+| `SELECT SIPHASH64('a')` | ``Code: 46. DB::Exception: Function with name `SIPHASH64` does not exist`` |
 
-**Why the sentence is gone rather than corrected.** Four revisions of this document generalised these
-legs and all four were wrong: the key is the query text; the key is "a condition"; the key is the
-condition as written; the key is the condition's parsed form. Each was written from the shape of the
-previous correction rather than from a probe chosen to break it, and each survived exactly until
-someone ran the probe. The legs themselves have reproduced in every round. On a ruling of 2026-09-09
-the generalisation is withdrawn and not replaced: the table is the finding.
+**What has not been run**, so that a reader looks for it rather than assuming it settled: the
+`condition_hash` computation in the ClickHouse source for 26.3 has not been read, and no leg here
+probes constant folding (`1 + 0` against `1`), commutativity in `AND` or `OR`, a literal written
+differently but parsed to the same value, or a column reached through a subquery alias.
+
+**Withdrawn, and not replaced.** Five sentences generalising the legs above were written and each was
+refuted by a probe:
+
+| the sentence | what refuted it |
+|---|---|
+| the key is the query text | a different `SELECT` list carrying the condition reused the entry |
+| the key is "a condition" | `match(…) = 1` paid |
+| the key is the condition as written | spaces and redundant parentheses reused |
+| the key is the condition's parsed form | qualifying and aliasing the column reused |
+| the refusal of `MATCH` belongs to `match` | `TOBOOL`, `TOSTRING`, `STARTSWITH` and `SIPHASH64` are refused in capitals too |
+
+On a ruling of 2026-09-09 this subsection carries no sentence of that kind.
 
 **Four things this instrument does not see**, said here rather than left to be assumed.
 `read_bytes` is what ClickHouse reads from its own storage; the bytes crossing to `pulsus-server` are
@@ -5115,8 +5115,9 @@ fn paragraph_local(figure: &str, tag: &str) {
 ```
 
 Every constant is text **already in the regions**, put there by the measurements above and not for
-this purpose. Run as `cargo nextest run -p pulsus-read --test <the file> --no-fail-fast`, on the
-committed text and then once per perturbation:
+this purpose. The file was `crates/pulsus-read/tests/zz_nsql_control.rs`, so the invocation was
+`cargo nextest run -p pulsus-read --test zz_nsql_control --no-fail-fast`, run on the committed text
+and then once per perturbation:
 
 | run | perturbation | E — §5.1's cache table | F — part 7's number table | G — §5.1's row-6 subsection |
 |---|---|---|---|---|
@@ -5193,21 +5194,11 @@ a fourth matched no finding at all.
 | 5 | low | the plan figures were not all 35 | evidence |
 | 5 | low | F and the published controls were not isolated | evidence |
 
-**The claims about our code have not moved since round 2.** The six constructs of §5.1, the rule that
-binds the sixth, and part 7's three defects were established then, and no round since has changed a
-verdict, a reason or a measured value in them. The four subject findings above are all about one
-thing — how this document described ClickHouse's condition cache — and none touches a construct, a
-defect or a cost figure. What changed every round is how the document describes the way its own
-claims were tested.
-
-**One exception, and it is in the evidence rather than the claims: the CPU column moved at three
-revisions**, because it is three takes of a figure that is not deterministic on a shared machine. The
-read columns beside it were byte-identical across all three, which is the point that column is there
-to make.
-
-So: read §5.1's and part 7's findings about the constructs and the defects as settled and measured;
-read the paragraphs describing how they were tested as the part that took several rounds to get
-right, and the reason each of those paragraphs now carries its own retraction in place.
+**Nothing is summarised under this table.** An independent enumeration of the same five rounds
+matched it row for row, in total, in split and in membership. Three sentences that stood here — one
+about what has not moved since round 2, one about what the four subject rows have in common, and one
+telling a reader how to weigh the two columns — were removed on a ruling of 2026-09-09, after the
+second of them was contradicted by this table's own first row.
 
 ### When to open another round on this document
 
