@@ -2139,17 +2139,28 @@ fn label_sets() -> Vec<(String, Vec<String>)> {
 /// code review had to reconstruct the previous one from prose to test it
 /// at all, and could then only measure its own reconstruction.
 ///
-/// **How a member counts as named.** A label of two words or more cannot
-/// turn up in English by accident, so it counts wherever the swept text
-/// uses **its own words**, in any punctuation, any case, and with other
-/// words in between: [`names_label`] wants the label's words, in order,
-/// each matching the start of a word so an inflected form still counts,
-/// inside a window of [`LABEL_MENTION_SPAN`] words. So
-/// `ambiguous_basename`, `Ambiguous-Basename`, "ambiguous basenames" and
-/// "an ambiguous basename" all count. A label that is a single ordinary
-/// word, like the anchor kinds `line` and `prose`, counts only inside
-/// backticks, because otherwise every sentence containing the word
-/// "line" would name it.
+/// **How a member counts as named.** A label of two words or more counts
+/// wherever the swept text has a word **starting with** each of the
+/// label's words, in the label's order, inside a window of
+/// [`LABEL_MENTION_SPAN`] words — in any punctuation, any case, and with
+/// other words in between. So `ambiguous_basename`,
+/// `Ambiguous-Basename`, "ambiguous basenames" and "an ambiguous
+/// basename" all count. A label that is a single ordinary word, like the
+/// anchor kinds `line` and `prose`, counts only inside backticks,
+/// because otherwise every sentence containing the word "line" would
+/// name it.
+///
+/// **Starting with is not the same as being, and that is loose in one
+/// direction.** It is what lets an inflected form count, and it also
+/// lets an unrelated word count whenever it happens to begin with a
+/// label word. Take `not_a_tracked_file`: "nothing" begins with `not`,
+/// "and" begins with `a`, "filenames" begins with `file`, and so
+/// "... and nothing and tracked filenames" is read as naming that label
+/// although not one of those three words is the label's. A code review
+/// measured exactly that sentence. Short members are where it bites —
+/// `a` is the start of every word beginning with that letter. The effect
+/// runs one way only: this makes the check say "duplicated" more often
+/// than a reader of the labels would, never less.
 ///
 /// **Three things it does not catch.** Each is a case where the set is
 /// there for a reader and absent from the words:
@@ -2351,14 +2362,23 @@ fn no_backticked_name_in_the_reconstructed_sections_is_one_the_tree_does_not_hol
 /// code cannot be read as a definition.
 ///
 /// **Nothing in this suite guards the character-literal arm.** Turning
-/// it off drops 340 distinct names out of the scanned domain — 13,203 to
-/// 12,863, from a throwaway probe over `tracked_rust_files()` that
-/// counted the names both ways — and all ten active tests still pass,
-/// because no name the document backticks today rests only on a
-/// definition that disappears. The arm is right and it is unwatched: a
-/// `'"'` opens a string that swallows the code after it, and real
-/// definitions leave the domain silently. The next person to touch it
-/// should know there is no test to catch them.
+/// it off changes the scanned domain by 340 distinct names, and all ten
+/// active tests still pass, because no name the document backticks today
+/// rests only on a definition that disappears. The arm is right and it
+/// is unwatched: a `'"'` opens a string that swallows the code after it,
+/// and real definitions leave the domain silently. The next person to
+/// touch it should know there is no test to catch them.
+///
+/// **That 340 is a net figure, not a subtraction.** A throwaway probe
+/// over `tracked_rust_files()` that built both domains and took the two
+/// set differences printed `removed=347 added=7 net=340`. The seven
+/// additions are `forge`, `from_unchecked_literal`,
+/// `from_unchecked_month`, `from_unchecked_sql`, `test_aggregation_expr`,
+/// `test_context_function_calls` and `test_function_call`: removing the
+/// character-literal step changes where the string-literal step thinks
+/// strings begin and end, so some text that was inside a string comes
+/// back out and some that was outside goes in. Anyone re-measuring this
+/// should take both differences; the single number hides one of them.
 fn without_comments_and_strings(src: &str) -> String {
     let b: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
