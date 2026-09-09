@@ -5072,9 +5072,14 @@ fact about the whole suite. `crates/pulsus-read/tests/query_lowering_doc_gate.rs
 directly and asserts a paragraph-local property — every paragraph containing a given figure must also
 contain a given phrase — and at `811192cd` it did that on this document's own line 3692, which is
 after 966. **Both ends of that example have since moved.** Part 8 (`86081ef1`) re-measured the
-figure, so neither `43,636` nor `seed + root only` appears in this document any more, and that same
-test now requires any paragraph naming either to say it is retired. The example is stated as it stood
-because the paragraphs below record an experiment run against `811192cd`.
+figure: `43,636` and the tag `seed + root only` are superseded by the §9.2 re-measurement, and that
+same test now requires any paragraph naming either to say so — which is why this one does. The
+example is stated as it stood at `811192cd` because the paragraphs below record an experiment run
+against that revision.
+
+Writing the sentence above tripped that test on its first run, because naming the two strings is
+what the rule is about. That is the second time a sentence in this document describing a check has
+broken the check by naming what it describes; the first is recorded under the controls below.
 
 **The revision after that one tried to use the shipped gate as the control by repointing its two
 constants, and that control was red either way.** Those constants are shared by three tests: the
