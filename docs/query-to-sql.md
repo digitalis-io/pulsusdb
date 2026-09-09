@@ -4892,14 +4892,16 @@ deliberately narrower than "nothing covers parts 5 and 7", and the next two para
 
 Measured by perturbation on 2026-09-09 rather than read off the code. Four runs of
 `cargo nextest run --workspace`, each with one change to this file and nothing else, each reverted
-against a committed tree with `git status` checked clean afterwards:
+against a committed tree with `git status` checked clean afterwards. The line counts are
+`git diff --numstat` on the perturbed tree, and C was run with `--no-fail-fast` so its total is the
+whole suite rather than the point nextest stopped at:
 
-| the change | lines it touched | result |
+| the change | `git diff --numstat` | result |
 |---|---|---|
-| **A** — falsify a measured value in §5.1: `5400` becomes `9999` | one line inside §5.1, same line count | 7,070 run, 7,070 passed, 32 skipped |
-| **B** — delete §5.1 in full | 256 lines removed, all inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
-| **C** — the reachability control: insert one blank line at line 431 | one line, in part 2 | **1 failed**: `pulsus-read::logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` — "`logql_pattern_expr_sites.tsv` has drifted from the tables that generate it" |
-| **D** — delete part 7's three added subsections in full | lines removed, all inside part 7 | 7,070 run, 7,070 passed, 32 skipped |
+| **A** — falsify a measured value in §5.1: `5400` becomes `9999` | `1 1`, one line inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
+| **B** — delete §5.1 in full | `0 338`, all inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
+| **C** — the reachability control: insert one blank line as line 431 | `1 0`, in part 2 | 7,070 run, **7,069 passed, 1 failed**, 32 skipped. The failure is `pulsus-read::logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` — "`logql_pattern_expr_sites.tsv` has drifted from the tables that generate it" |
+| **D** — delete part 7's three added subsections in full | `0 79`, all inside part 7 | 7,070 run, 7,070 passed, 32 skipped |
 
 **What C does and does not show, stated because an earlier draft of this paragraph got it wrong.**
 C reddens one test, and that test records six positions in this document — lines 200, 471, 701, 733,
