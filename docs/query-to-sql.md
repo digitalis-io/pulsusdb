@@ -4569,8 +4569,16 @@ Then the readings, once per leg:
 SELECT splitByChar(':', log_comment)[2] AS leg, read_rows, read_bytes,
        ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds'] AS cpu_us,
        Settings['max_block_size'], Settings['use_query_condition_cache']
-FROM system.query_log WHERE type = 'QueryFinish' AND log_comment LIKE '<tag>:%' ORDER BY leg
+FROM system.query_log
+WHERE type = 'QueryFinish' AND query_kind = 'Select' AND log_comment LIKE '<tag>:%'
+ORDER BY leg
 ```
+
+**`query_kind = 'Select'` is load-bearing.** Each leg is run twice — once behind
+`EXPLAIN indexes = 1` and once as written — and the `EXPLAIN` inherits the leg's `log_comment`, so
+without it the reader returns eight rows and every leg appears twice. Measured: eight rows logged
+under one tag, four after the filter, with the `EXPLAIN` runs logged as `query_kind = 'Explain'` and
+`read_rows` of 35.
 
 `use_query_condition_cache = 0` is not decoration. It is what makes these numbers a property of the
 predicate rather than of what has already been evaluated against these parts — the two tables after
@@ -4578,56 +4586,77 @@ the next one show the same query reading twelve times less without it.
 
 | predicate | `EXPLAIN indexes = 1` | granules | `read_rows` | `read_bytes` | CPU µs | rows it selects |
 |---|---|---|---|---|---|---|
-| none — the window and `service` only | `MinMax`, `Partition`, `PrimaryKey` only | 368 of 368 | 3,000,000 | 309,060,017 (294.74 MiB) | 461,535 | 3,000,000 |
-| `body LIKE '%CONN\_REFUSED\_7734%'` | `idx_body_tokens` cuts 368 to 30, `idx_body_ngrams` 30 to 30 | **30 of 368** | 245,760 | 25,313,762 (24.14 MiB) | 47,977 | 30 |
-| `match(body, '(^\|[^0-9])10\\.[0-9]{1,3}…')` — the shape an address-range test needs | both body indexes listed, **neither cuts** | 368 of 368 | 3,000,000 | 309,060,017 | 534,007 | 30 |
-| `JSONExtractString(body,'level') = 'error'` | **no `Skip` section at all** | 368 of 368 | 3,000,000 | 309,060,017 | 1,057,045 | 3,000 |
+| none — the window and `service` only | `MinMax`, `Partition`, `PrimaryKey` only | 368 of 368 | 3,000,000 | 309,060,017 (294.74 MiB) | 443,564 | 3,000,000 |
+| `body LIKE '%CONN\_REFUSED\_7734%'` | `idx_body_tokens` cuts 368 to 30, `idx_body_ngrams` 30 to 30 | **30 of 368** | 245,760 | 25,313,762 (24.14 MiB) | 47,506 | 30 |
+| `match(body, '(^\|[^0-9])10\\.[0-9]{1,3}…')` — the shape an address-range test needs | both body indexes listed, **neither cuts** | 368 of 368 | 3,000,000 | 309,060,017 | 559,430 | 30 |
+| `JSONExtractString(body,'level') = 'error'` | **no `Skip` section at all** | 368 of 368 | 3,000,000 | 309,060,017 | 1,100,737 | 3,000 |
 
 **Same thirty lines, twelve times the read.** Rows two and three return the same thirty lines out of
 the same three million. The predicate an index can serve reads 245,760 rows and 25,313,762 bytes; the
 one it cannot reads all 3,000,000 and 309,060,017 — `3000000 / 245760 = 12.207` and
 `309060017 / 25313762 = 12.209`.
 
-**The read columns are deterministic and the CPU column is not.** Two takes of this table on the
-same box gave byte-identical `read_rows` and `read_bytes` and CPU figures that moved: `a_none`
-430,207 then 461,535 µs, `d_json` 1,009,495 then 1,057,045 µs. The box is shared, so read a CPU cell
-as one take with roughly a tenth of its value in spread, and read a ratio between cells rather than a
-cell alone.
+**The read columns are deterministic and the CPU column is not.** Three takes of this table on the
+same box gave byte-identical `read_rows` and `read_bytes` every time and CPU figures that moved:
+`a_none` 430,207 then 461,535 then 443,564 µs, `d_json` 1,009,495 then 1,057,045 then 1,100,737 µs —
+about 7% and 9% of spread. The box is shared, so read a CPU cell as one take with roughly a tenth of
+its value in spread, and read a ratio between cells rather than a cell alone.
 
-#### The cache that moves that figure, and what it is actually keyed on
+#### The cache that moves that figure, and exactly what it is keyed on
 
 ClickHouse 26.3 ships `use_query_condition_cache = 1`. It records, per data part, which marks a
-**condition** can match, and the key is not the query:
+condition can match, and the key is neither the query nor the meaning of the condition:
 
 ```sql
 SELECT name, comment FROM system.columns
 WHERE database = 'system' AND table = 'query_condition_cache'
--- key_hash     Hash of (table_uuid, part_name, condition_hash).
--- entry_size   The size of the entry in bytes.
+-- key_hash        Hash of (table_uuid, part_name, condition_hash).
+-- entry_size      The size of the entry in bytes.
 -- matching_marks  Matching marks.
 ```
 
-Three executions at the shipped default, after `SYSTEM DROP QUERY CONDITION CACHE`, all carrying the
-same `match(body, …)` condition. The third is a **different query text** — `SELECT count() + 0`
-rather than `SELECT count()`, 305 bytes against 301 — and it is that text's **first** execution:
+Five executions at the shipped default after `SYSTEM DROP QUERY CONDITION CACHE`, in this order,
+against the same table and the same parts. Legs 1 to 3 carry the condition
+`match(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')`; legs 4 and 5 carry
+`… = 1` appended to it, which selects the same thirty rows:
 
-| execution | `length(query)` | `read_rows` | `read_bytes` | CPU µs |
+| # | what differs from the leg above | `read_rows` | `read_bytes` | CPU µs |
 |---|---|---|---|---|
-| text X, first | 301 | 3,000,000 | 309,060,017 | 548,767 |
-| text X, second | 301 | **245,760** | **25,313,762** | 28,023 |
-| text Y, **first** | 305 | **245,760** | **25,313,762** | 33,833 |
+| 1 | first execution after the cache was dropped | 3,000,000 | 309,060,017 | 544,160 |
+| 2 | nothing — the same statement again | 245,760 | 25,313,762 | 33,362 |
+| 3 | the `SELECT` list: `count() + 0` rather than `count()`, first execution of **this text** | 245,760 | 25,313,762 | 29,837 |
+| 4 | the condition's **spelling**, not its meaning: `match(…) = 1`, first execution | **3,000,000** | **309,060,017** | 550,425 |
+| 5 | nothing — leg 4 again | 245,760 | 25,313,762 | 24,792 |
 
-**So the thing that is paid once is the first evaluation of a condition against a given set of
-parts** — not the first run of a query, and not the first run of a query text. A query nobody has
-written before goes fast if its condition has already been evaluated against those parts, and a query
-that has run a thousand times pays again on parts that did not exist when it last ran, which on an
-ingesting table is a continuous supply of them. An earlier revision of this section said the key was
-the query text and drew a dashboards-are-cheap, exploring-is-expensive conclusion from it. Both were
-wrong: the measurement above is what replaced them.
+**Leg 3 rules out the query text and leg 4 rules out the meaning.** A statement nobody had run before
+reused the entry because it carried the same condition; a condition that selects exactly the same
+thirty rows paid the full read because it is written differently. `condition_hash` is over the
+condition **as written**, so two spellings of one condition are two entries.
 
-What the table above therefore prices is the **uncached** evaluation — the work the predicate causes
-the first time it meets a part. That is the number a design decision should use, because it does not
-depend on what happened to run before it.
+So what is paid once is **the first evaluation of one spelling of one condition against one data
+part**. Three consequences, each no wider than that:
+
+```
+   condition text       parts        cache
+   ------------------------------------------
+   byte-identical       same         reused
+   byte-identical       new part     paid again
+   rewritten, same      same         paid again
+     meaning
+```
+
+A query nobody has written before is cheap only if it carries a condition byte-for-byte already
+evaluated against those parts; a rewrite that means the same thing is a new entry; and on a table
+being ingested into, new parts keep arriving, so even an unchanged saved query keeps paying on them.
+
+**An earlier revision of this section said the key was the query text, and the revision after it said
+the key was "a condition".** Both were wider than what had been measured, and the second was written
+after the first had already been corrected. Legs 3 and 4 above are the measurement that bounds it;
+the sentence above them is written to that boundary and no further.
+
+What the table before this one therefore prices is the **uncached** evaluation — the work the
+predicate causes the first time that spelling meets a part. That is the number a design decision
+should use, because it does not depend on what happened to run before it.
 
 **Four things this instrument does not see**, said here rather than left to be assumed.
 `read_bytes` is what ClickHouse reads from its own storage; the bytes crossing to `pulsus-server` are
