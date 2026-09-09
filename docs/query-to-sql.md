@@ -19,6 +19,20 @@ Three shorter parts follow: [what can never become SQL](#5-what-can-never-become
 we already refuse](#6-the-queries-we-already-refuse), [where we and the reference disagree](#7-where-we-and-the-reference-disagree),
 and [the limits](#8-the-limits).
 
+**Editing this document: anchor on position, not on text.** Its separators and phrases repeat, and
+three runs have been lost to an edit that matched text and landed somewhere else. On 2026-09-09: a
+whole-document replace of a `file:line` citation edited two occurrences instead of the one intended,
+turning a perturbation into a no-op that returned the baseline; a `---` used as a restore anchor is
+not unique, and a block came back at the wrong separator, caught by a `git diff --numstat` of
+`3148 3148`; and a generated dataset was left stale across a commit, so the next run's failure
+belonged to the staleness rather than to what was being tested. Take the line range first, edit by
+range, and read `git diff --numstat` before believing any run that follows.
+
+**Line numbers into this document age.** Anything citing one — the datasets under
+`crates/pulsus-read/tests/`, `docs/query-lowering.md`, this document's own cross-references — is
+regenerated or re-taken **after** the edit that moves it, never before. Two figures were shipped
+stale that way in one week.
+
 **The code in part 2 does not exist yet.** Nothing in this tree makes the per-stage decision part 2
 describes, so every statement marked *from the design* was worked out from the design record and
 **was not produced by our code**. That sentence applies to every such block in the document and is
