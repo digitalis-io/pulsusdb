@@ -5100,7 +5100,8 @@ per `(document, citation)` pair, twelve of them added by this correction:
 `no_citation_row_is_unused` when a row has no occurrence left, and
 `every_figure_section_12_3_states_is_the_one_the_datasets_hold` compares a census block in
 `docs/query-lowering.md` against those datasets. `every_recorded_count_site_resolves_exactly_once`
-holds recorded line positions, one of which sits at line 511 of this document.
+holds recorded line positions, one of them in this document; the commands under C below read it
+rather than restating it.
 
 The same four runs before the merge, at `2611b4d7` against a tree without that gate, returned 7,070
 passed for A, B and D and one failure for C. **A2 and A3 were not run then.**
@@ -5241,12 +5242,43 @@ awk -F'\t' '$2 == "docs/query-to-sql.md" && $3 ~ /2\.4/ {print $6}' \
   crates/pulsus-read/tests/design_record_counts.tsv
 ```
 
-On this revision that is lines 230, 501, 731, 763, 764 and 996 for the six, and 541 for the count
-site — all in part 2 or part 4, all outside the regions the other five perturbations change. An
-earlier revision printed seven such numbers as plain prose; the commit that added the note above
-moved every one of them and regenerated the datasets without correcting the sentence, which is the
-third occurrence of hazard two and the reason the command is printed here. E, F and G are what reach
-a figure or a sentence in those regions.
+On this revision the first returns 230, 501, 731, 763, 764 and 996, and the second returns 541.
+**Which part each falls in is derived from the headings, not asserted**, by feeding both into a third
+command:
+
+```sh
+{ grep -o 'docs/query-to-sql.md:[0-9]*' crates/pulsus-read/tests/logql_pattern_expr_sites.tsv | cut -d: -f2
+  awk -F'\t' '$2 == "docs/query-to-sql.md" && $3 ~ /2\.4/ {print $6}' \
+    crates/pulsus-read/tests/design_record_counts.tsv
+} | sort -n | while read n; do
+    printf '%5s  %s\n' "$n" "$(awk -v n="$n" 'NR<=n && /^## /{h=$0} END{print h}' docs/query-to-sql.md)"
+  done
+```
+
+```text
+  230  ## 1. The SQL we send today
+  501  ## 2. The SQL we will send
+  541  ## 2. The SQL we will send
+  731  ## 2. The SQL we will send
+  763  ## 2. The SQL we will send
+  764  ## 2. The SQL we will send
+  996  ## 2. The SQL we will send
+```
+
+One in part 1 and six in part 2; **none is in part 4**, and none is in the regions the other five
+perturbations change.
+
+**Read the output, not the exit code.** Measured on this tree: the `grep | sort` pipeline exits **0**
+when it matches nothing, and **0 again when its input file does not exist**, because `sort` is last
+and masks `grep`'s failure. The `awk` command exits 0 on no match and 2 on a missing file. So a run
+that prints nothing has found nothing, and that is a result to act on rather than a pass — the
+printed output above is what makes a silent miss visible.
+
+An earlier revision printed seven such positions as plain prose and asserted their parts. The commit
+that added the note above moved every one of them and regenerated the datasets without correcting the
+sentence, and the part claim was wrong in both halves. That is the third and fourth occurrences of
+hazard two, and the reason nothing here is transcribed. E, F and G are what reach a figure or a
+sentence in those regions.
 
 **Three things this paragraph does not claim.** It does not cover the older rows of part 5's table,
 the rest of part 7, or **part 6**, none of which was perturbed; and it does not say what B and D
