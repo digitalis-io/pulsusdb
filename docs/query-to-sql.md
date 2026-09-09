@@ -4996,35 +4996,84 @@ piece of work produced that turned out to be an untested assumption** — the fi
 constructs part 5 called permanent, which is what §5.1 exists to correct. The mistake was the same
 one both times: a claim about a set, checked against a subset. Two committed position datasets were
 searched, neither records anything from this document after line 966, and that was written up as a
-fact about the whole suite.
+fact about the whole suite. `crates/pulsus-read/tests/query_lowering_doc_gate.rs` reads this document
+directly and asserts a paragraph-local property — every paragraph containing a given figure must also
+contain a given phrase — and it already does that at line 3692, which is after 966.
 
-`crates/pulsus-read/tests/query_lowering_doc_gate.rs` reads this document directly and asserts a
-paragraph-local property — every paragraph containing a given figure must also contain a given
-phrase. It already does that at line 3692, which is after 966. Pointing that same test at values
-**already present** in these two regions, and adding nothing to either, gives a control for each:
+**The revision after that one tried to use the shipped gate as the control by repointing its two
+constants, and that control was red either way.** Those constants are shared by three tests: the
+paragraph check over this document, the same check over `docs/query-lowering.md` in the same loop,
+and a check that the hops diagram carries the tag on its own face (`query_lowering_doc_gate.rs:340`,
+`:344`, `:417`). Repointing them at text that exists only here makes the other two fail on the
+**unperturbed** document — `5 tests run: 3 passed, 2 failed` before the perturbation and the same
+after it, with the documented paragraph-local message never appearing at all. It was reported as
+passing because it had been run with a test selector naming one test, so the two collateral failures
+were never seen. **A control that reports failure whether or not the thing it tests is broken is the
+same defect as one that reports success either way**, and scoping a run until only the wanted result
+is visible is how it stayed hidden.
 
-| control | the test's two constants, pointed at existing text | perturbation of the document | result |
-|---|---|---|---|
-| **E** — §5.1 | figure `548,767`, tag `28,023` — both in the cache table above | that table's `28,023` becomes `99,999` | **FAIL**: "a paragraph quotes 548,767 without the tag `28,023`. It opens: `\| execution \| length(query) \| read_rows \| read_bytes \| CPU µs \|`" |
-| **F** — part 7 | figure `1.2345678901234568e+29`, tag `9007199254740993` — both in part 7's JSON-number table | that table's `9007199254740993` becomes `9007199254740994` | **FAIL**: "a paragraph quotes 1.2345678901234568e+29 without the tag `9007199254740993`. It opens: `\| c in the line \| PulsusDB \| grafana/loki 3.7.4 \|`" |
+**So the control is its own test binary with its own constants, sharing nothing.** It applies the
+same rule the shipped gate applies. This is its whole source; it is not committed, and it was deleted
+after the runs below:
 
-Both controls passed before their perturbation and failed after it, and both the test file and the
-document were restored afterwards, with the shipped gate re-run at 5 passed.
+```rust
+fn doc() -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().and_then(std::path::Path::parent).expect("workspace root");
+    std::fs::read_to_string(root.join("docs/query-to-sql.md")).expect("read the document")
+}
 
-**So the regions are reachable, and A, B and D mean what they say and no more.** A test *can* be
-pointed at this text and made to react to it; the shipped constants point elsewhere. What A, B and D
-establish is therefore the narrow thing: **no test as shipped asserts on this text.** They do not
-establish that none could, and the earlier revision's claim that none could is withdrawn.
+/// The same rule query_lowering_doc_gate applies: every paragraph holding
+/// `figure` must also hold `tag`, and `figure` must appear at least once.
+fn paragraph_local(figure: &str, tag: &str) {
+    let text = doc();
+    let mut seen = 0usize;
+    for para in text.split("\n\n") {
+        if !para.contains(figure) { continue; }
+        seen += 1;
+        assert!(para.contains(tag),
+            "a paragraph quotes {figure} without {tag:?}. It opens: {:?}",
+            para.lines().next().unwrap_or(""));
+    }
+    assert!(seen > 0, "{figure} appears nowhere — this control is checking nothing");
+}
+
+#[test] fn e_section_5_1_cache_table() { paragraph_local("544,160", "33,362"); }
+#[test] fn f_part_7_json_number_table() { paragraph_local("1.2345678901234568e+29", "9007199254740993"); }
+#[test] fn g_section_5_1_row_6_subsection() {
+    paragraph_local("aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7", "three wrong models");
+}
+```
+
+Every constant is text **already in the regions**, put there by the measurements above and not for
+this purpose. Run as `cargo nextest run -p pulsus-read --test <the file> --no-fail-fast`, on the
+committed text and then once per perturbation:
+
+| run | perturbation | E — §5.1's cache table | F — part 7's number table | G — §5.1's row-6 subsection |
+|---|---|---|---|---|
+| baseline | none | pass | pass | pass |
+| E | that table's `33,362` becomes `99,999` | **fail** | pass | pass |
+| F | that table's `9007199254740993` becomes `…94` | pass | **fail** | pass |
+| G | "three wrong models" becomes "three incorrect models" | pass | pass | **fail** |
+| restored | none | pass | pass | pass |
+
+Each failure named its own region: *"a paragraph quotes 544,160 without `33,362`. It opens: `| # | what differs from the leg above | …`"*, *"…quotes 1.2345678901234568e+29 without `9007199254740993`. It opens: `| c in the line | PulsusDB | …`"*, and *"…quotes aa8df8d0… without `three wrong models`. It opens: `For { .tag = "x" } && …`"*. Three perturbations, three distinct failures, no crosstalk.
+
+**What this control is and is not.** It is purpose-built, so it does not show that anything in the
+shipped suite watches these regions — it shows that a test **can** be pointed at them and made to
+react, which is the claim the withdrawn sentence denied. **So A, B and D mean the narrow thing and no
+more: no test as shipped asserts on this text.** Not that none could.
 
 C keeps its own, smaller job. The test it reddens records six positions in this document — lines 200,
 471, 701, 733, 734 and 966, all `| pattern` arguments swept out of the tracked tree, all in part 2 or
-part 4 — so C shows the suite reacts to this file somewhere, and nothing about the regions A, B and D
-changed. E and F are what reach those.
+part 4 — so C shows the shipped suite reacts to this file somewhere, and nothing about the regions A,
+B and D changed. E, F and G are what reach those.
 
-**Two things this paragraph does not claim.** It does not cover the older rows of part 5's table or
-the rest of part 7, which were not perturbed. And it says nothing about how many suites open this
-document: that is a fact about reading source, no perturbation counted it, and an earlier revision
-asserted it inside this measured paragraph.
+**Three things this paragraph does not claim.** It does not cover the older rows of part 5's table,
+the rest of part 7, or **part 6**, none of which was perturbed. It says nothing about how many suites
+open this document: that is a fact about reading source, no perturbation counted it, and an earlier
+revision asserted it inside this measured paragraph. And it is not a statement about any other
+document.
 
 What a change to these parts *can* break as things stand is
 `crates/pulsus-read/tests/logql_pattern_expr_sites.tsv`, if it moves one of those six positions —
