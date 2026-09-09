@@ -101,7 +101,7 @@ qualifies, so `k` is the request's `limit` of 20 and the count is 4.
 > figure, its tag and its ratios are **superseded by the §9.2 re-measurement** and appear nowhere
 > else in this record or in [the hops diagram](diagrams/query-lowering-hops.svg), which is redrawn
 > from the same artefact. [`query-to-sql.md`](query-to-sql.md) names the figure and the tag once, at
-> its line 5104, in a paragraph that identifies them as superseded by the §9.2 re-measurement; that
+> its line 5117, in a paragraph that identifies them as superseded by the §9.2 re-measurement; that
 > paragraph explains why a historical example in it still quotes them.
 > §9.2b measures all four lowered statements and §9.2's comparison table divides the two whole
 > requests: **212,986 B** against **77,572,021 B**, a saving of **364×**.

@@ -33,6 +33,19 @@ range, and read `git diff --numstat` before believing any run that follows.
 regenerated or re-taken **after** the edit that moves it, never before. Two figures were shipped
 stale that way in one week.
 
+**Four generators, and they are not one command.** An edit anywhere in this file can move positions
+recorded in two independent datasets, and each has its own ignored regenerator:
+
+```sh
+cargo test -p pulsus-read --test design_record_drift_gate -- --ignored regenerate_the_count_site_lines
+cargo test -p pulsus-read --test design_record_drift_gate -- --ignored regenerate_the_citation_datasets
+cargo test -p pulsus-read --test design_record_drift_gate -- --ignored regenerate_the_census_block
+cargo test -p pulsus-read --test logql_pattern_expr_matrix -- --ignored regenerate_the_sites_dataset
+```
+
+Running the first three and not the fourth is how the note above came to be committed with a stale
+dataset — the fourth occurrence, in the same round, of the hazard the note describes.
+
 **The code in part 2 does not exist yet.** Nothing in this tree makes the per-stage decision part 2
 describes, so every statement marked *from the design* was worked out from the design record and
 **was not produced by our code**. That sentence applies to every such block in the document and is
