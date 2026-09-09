@@ -4941,8 +4941,10 @@ part 1 wrong silently. And **every `file:line` citation ages**: they were all pr
 `2f78c53`, except §5.1's and part 7's last three subsections, which were printed and read at
 `58feb2b`; nothing keeps any of them true afterwards.
 
-**No test asserts on the text §5.1 and part 7's last three subsections contain.** That sentence is
-deliberately narrower than "nothing covers parts 5 and 7", and the next two paragraphs say why.
+**No test asserts on the text §5.1 and part 7's last three subsections contain.** That is narrower
+than "nothing covers parts 5 and 7", and narrower again than the sentence an earlier revision of this
+paragraph carried, which was false. The retraction is below, because how it was wrong is worth more
+than the corrected sentence.
 
 Measured by perturbation on 2026-09-09 rather than read off the code. Four runs of
 `cargo nextest run --workspace`, each with one change to this file and nothing else, each reverted
@@ -4953,40 +4955,51 @@ whole suite rather than the point nextest stopped at:
 | the change | `git diff --numstat` | result |
 |---|---|---|
 | **A** — falsify a measured value in §5.1: `5400` becomes `9999` | `1 1`, one line inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
-| **B** — delete §5.1 in full | `0 338`, all inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
-| **C** — the reachability control: insert one blank line as line 431 | `1 0`, in part 2 | 7,070 run, **7,069 passed, 1 failed**, 32 skipped. The failure is `pulsus-read::logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` — "`logql_pattern_expr_sites.tsv` has drifted from the tables that generate it" |
-| **D** — delete part 7's three added subsections in full | `0 79`, all inside part 7 | 7,070 run, 7,070 passed, 32 skipped |
+| **B** — delete §5.1 in full | `0 <B>`, all inside §5.1 | 7,070 run, 7,070 passed, 32 skipped |
+| **C** — insert one blank line as line 431 | `1 0`, in part 2 | 7,070 run, **7,069 passed, 1 failed**, 32 skipped. The failure is `pulsus-read::logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` — "`logql_pattern_expr_sites.tsv` has drifted from the tables that generate it" |
+| **D** — delete part 7's three added subsections in full | `0 <D>`, all inside part 7 | 7,070 run, 7,070 passed, 32 skipped |
 
-**What C does and does not show, stated because an earlier draft of this paragraph got it wrong.**
-C reddens one test, and that test records six positions in this document — lines 200, 471, 701, 733,
-734 and 966, all of them `| pattern` arguments swept out of the tracked tree. **Every one of those is
-in part 2 or part 4. A, B and D all change text after line 4200.** So C proves the suite opens this
-file and reacts to it *somewhere*, and proves nothing about the region A, B and D changed. It is a
-control for the file, not for the region.
+#### A retraction, and the control that replaces it
 
-**And no control for that region exists.** Both committed position datasets were searched —
-`crates/pulsus-read/tests/logql_pattern_expr_sites.tsv` has the six lines above and
-`crates/pulsus-read/tests/logql_json_expr_sites.tsv` has none from this document — so nothing in the
-suite records a position, a phrase or a value from anywhere after line 966. A control there cannot be
-built without first putting something into the region for a sweep to find, which would be arranging
-the evidence rather than taking it.
+**An earlier revision of this paragraph said no control for these regions could be built without
+planting material for a sweep to find. That was false, and it was the second impossibility claim this
+piece of work produced that turned out to be an untested assumption** — the first being the six
+constructs part 5 called permanent, which is what §5.1 exists to correct. The mistake was the same
+one both times: a claim about a set, checked against a subset. Two committed position datasets were
+searched, neither records anything from this document after line 966, and that was written up as a
+fact about the whole suite.
 
-**What the green runs therefore establish, and what they do not.** B and D each delete their region
-outright. Any test asserting anything about that text — a value in it, a phrase, its presence — takes
-different input under those runs, and none reddened; that is what makes "no test asserts on this
-text" a measured statement rather than a hopeful one. What is **not** established is the positive
-form: nothing here shows a test reads those regions and declines to check them, as against never
-opening them at all. For the conclusion the two are the same — under either, no test holds these
-sentences true — but they are different facts and only one of them was measured.
+`crates/pulsus-read/tests/query_lowering_doc_gate.rs` reads this document directly and asserts a
+paragraph-local property — every paragraph containing a given figure must also contain a given
+phrase. It already does that at line 3692, which is after 966. Pointing that same test at values
+**already present** in these two regions, and adding nothing to either, gives a control for each:
+
+| control | the test's two constants, pointed at existing text | perturbation of the document | result |
+|---|---|---|---|
+| **E** — §5.1 | figure `548,767`, tag `28,023` — both in the cache table above | that table's `28,023` becomes `99,999` | **FAIL**: "a paragraph quotes 548,767 without the tag `28,023`. It opens: `\| execution \| length(query) \| read_rows \| read_bytes \| CPU µs \|`" |
+| **F** — part 7 | figure `1.2345678901234568e+29`, tag `9007199254740993` — both in part 7's JSON-number table | that table's `9007199254740993` becomes `9007199254740994` | **FAIL**: "a paragraph quotes 1.2345678901234568e+29 without the tag `9007199254740993`. It opens: `\| c in the line \| PulsusDB \| grafana/loki 3.7.4 \|`" |
+
+Both controls passed before their perturbation and failed after it, and both the test file and the
+document were restored afterwards, with the shipped gate re-run at 5 passed.
+
+**So the regions are reachable, and A, B and D mean what they say and no more.** A test *can* be
+pointed at this text and made to react to it; the shipped constants point elsewhere. What A, B and D
+establish is therefore the narrow thing: **no test as shipped asserts on this text.** They do not
+establish that none could, and the earlier revision's claim that none could is withdrawn.
+
+C keeps its own, smaller job. The test it reddens records six positions in this document — lines 200,
+471, 701, 733, 734 and 966, all `| pattern` arguments swept out of the tracked tree, all in part 2 or
+part 4 — so C shows the suite reacts to this file somewhere, and nothing about the regions A, B and D
+changed. E and F are what reach those.
 
 **Two things this paragraph does not claim.** It does not cover the older rows of part 5's table or
 the rest of part 7, which were not perturbed. And it says nothing about how many suites open this
-document: that is a fact about reading source, no perturbation counted it, and an earlier draft
-asserted it inside this measured paragraph, which is exactly the mixing this document exists to
-avoid.
+document: that is a fact about reading source, no perturbation counted it, and an earlier revision
+asserted it inside this measured paragraph.
 
-What a change to these parts *can* break is `crates/pulsus-read/tests/logql_pattern_expr_sites.tsv`,
-if it moves one of those six positions — regenerated by
+What a change to these parts *can* break as things stand is
+`crates/pulsus-read/tests/logql_pattern_expr_sites.tsv`, if it moves one of those six positions —
+regenerated by
 `cargo test -p pulsus-read --test logql_pattern_expr_matrix -- --ignored regenerate_the_sites_dataset`
 and never hand-edited.
 
