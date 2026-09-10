@@ -748,14 +748,6 @@ SELECT lower(hex(SHA256(concat(layout, '#', content)))) AS c1_identity
     spans_old  20231114_1_5_1  1,185,089 rows  148 marks
     spans_old  20231115_6_9_1    814,911 rows  102 marks
 
-**The derived tables must be filled BY THE VIEWS, during ingestion.** Populating them
-afterwards with identical row counts gives different readable-granule counts — measured
-`22/3` for `trace_recent`/`trace_error_spans` when the views were in place before the
-inserts, and `20/2` when the same rows were written into the tables directly, with
-`system.parts` showing `22/4` marks against the full fixture's `24/5`. Any figure quoted
-from those tables therefore names its fill order, and the criteria that assert granule
-counts require the view-populated construction.
-
 **The mark arithmetic, corrected.** `system.parts.marks` counts one terminal mark per
 part. C1's window runs 22:13:20 → 01:13:20 UTC, so `PARTITION BY toDate(…)` gives **two
 parts** with 148 + 102 = 250 marks, which is `(148−1) + (102−1) = 248` readable granules —
@@ -1626,6 +1618,17 @@ than by trying one statement. Measured on 26.3.29.7:
     table functions,   none re-keys an existing MergeTree in place
     engines, views,
     formats
+    SQL statements     `MODIFY PRIMARY KEY` -> Code 62; `MODIFY SAMPLE BY` -> Code 36;
+    and grammar        `ATTACH PARTITION FROM`, `REPLACE PARTITION FROM` and
+                       `MOVE PARTITION TO TABLE` between differently ordered tables all
+                       -> Code 36, "Tables have different ordering"
+
+**The enumeration is per claim, not a fixed list.** `ALTER … MODIFY TTL` and
+`EXCHANGE TABLES` are capabilities exposed by SQL grammar and belong to none of the
+classes above; a search that stopped at those classes would have missed them. What the
+rule requires is that a capability claim names the surfaces it searched and why that set
+is the relevant one for the claim — here, every surface that could re-key or re-partition
+an existing part.
 
 What **is** available is a rebuild plus `EXCHANGE TABLES`, which is what §8.1's second
 backfill uses. With no data to keep, the drop is the same thing at lower cost.
@@ -1819,11 +1822,25 @@ there is none; that was false.
    What is not: that a schema with OTLP's own field numbers decodes a real stored span
    payload, and that a batched rewrite runs within a stated memory and row budget.
 
-       IF an exactly-numbered schema decodes a real stored payload carrying a duplicated
-       key, AND a bounded batched rewrite completes with measured rows, memory and
-       failures, THEN the exact backfill is a server-side scan.
+       IF   (1) a committed `.proto` artefact whose every nested field number equals the
+                encoded message's decodes a stored `trace_spans.payload` written by the
+                repository's own OTLP path, for a span carrying one key twice, and yields
+                the two values in the sender's order;
+       AND  (2) a batched rewrite of 2,000,000 spans completes under these limits:
+                batch                  <= 100,000 rows and <= 256 MiB of framed payload
+                peak server memory     <= 4 GiB, read from system.query_log's
+                                          memory_usage for every statement in the run
+                permitted failures     0 statements returning non-200
+                retry rule             none; the first non-200 aborts the run
+       THEN the exact backfill is a bounded server-side scan and its cost is the measured
+            wall time and bytes of that run.
        UNTIL both, its cost is unknown and an application re-ingest remains the only
        demonstrated route.
+
+   Condition (1) is constructible today: the writer builds the self-contained payload at
+   `otlp_traces.rs:657` and a live test already decodes the stored column
+   (`crates/pulsus-write/tests/trace_ingest_roundtrip.rs:281`). Condition (2) has not been
+   attempted.
 
    **Under the issue's premise neither backfill runs.** If one ever does, choosing the
    cheap one is choosing to let duplicated keys answer differently on either side of the
