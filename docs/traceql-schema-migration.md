@@ -748,6 +748,14 @@ SELECT lower(hex(SHA256(concat(layout, '#', content)))) AS c1_identity
     spans_old  20231114_1_5_1  1,185,089 rows  148 marks
     spans_old  20231115_6_9_1    814,911 rows  102 marks
 
+**The derived tables must be filled BY THE VIEWS, during ingestion.** Populating them
+afterwards with identical row counts gives different readable-granule counts — measured
+`22/3` for `trace_recent`/`trace_error_spans` when the views were in place before the
+inserts, and `20/2` when the same rows were written into the tables directly, with
+`system.parts` showing `22/4` marks against the full fixture's `24/5`. Any figure quoted
+from those tables therefore names its fill order, and the criteria that assert granule
+counts require the view-populated construction.
+
 **The mark arithmetic, corrected.** `system.parts.marks` counts one terminal mark per
 part. C1's window runs 22:13:20 → 01:13:20 UTC, so `PARTITION BY toDate(…)` gives **two
 parts** with 148 + 102 = 250 marks, which is `(148−1) + (102−1) = 248` readable granules —
@@ -1577,8 +1585,8 @@ and the row count was 50,000 before and after:
   57  PerShard           ALTER TABLE trace_spans MATERIALIZE PROJECTION service_time
   58  PerShard           ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time    (<the same 14>  ORDER BY (name, timestamp_ns))
   59  PerShard           ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time
-  60  Global             DROP TABLE IF EXISTS trace_tag_catalog        <- PARTITION BY and ORDER BY
-  61  Global             CREATE TABLE trace_tag_catalog (<the new shape>)  cannot be ALTERed
+  60  Global             DROP TABLE IF EXISTS trace_tag_catalog        <- see the note below
+  61  Global             CREATE TABLE trace_tag_catalog (<the new shape>)
   62  PerShard, CLUSTER  DROP TABLE IF EXISTS trace_attrs_idx_dist
   63  PerShard           DROP TABLE IF EXISTS trace_attrs_idx
   64  PerShard           CREATE TABLE trace_attr_traces   (AggregatingMergeTree)
@@ -1595,6 +1603,32 @@ applied the first time clustering is enabled. `PerShard, Dist` is `Ddl::Dist`, r
 by `render::dist_ddl_template` from `Family::Traces`'s single sharding expression, so all
 four trace wrappers co-shard on `cityHash64(trace_id)` and every read joins shard-locally
 (§7). `Global` is the catalogue's one cluster-wide replica set, no wrapper.
+
+**Why ids 60/61 drop and recreate rather than alter.** The catalogue's new shape changes
+both `PARTITION BY` and the leading columns of `ORDER BY`. Neither is reachable by an
+`ALTER`, and that is established by enumerating every place a capability can live rather
+than by trying one statement. Measured on 26.3.29.7:
+
+    ALTER TABLE t MODIFY ORDER BY (scope, key, d, val)   -- a prefix change
+      Code: 36  Primary key must be a prefix of the sorting key …
+    ALTER TABLE t MODIFY ORDER BY (scope, key, val, d)   -- appending an existing column
+      Code: 36  Existing column d is used in the expression that was added to the sorting key
+    ALTER TABLE t MODIFY PARTITION BY d
+      Code: 62  Syntax error … Expected …          (not grammar at all)
+    ALTER TABLE t MODIFY SETTING partition_by = 'd'
+      Code: 115 Unknown setting 'partition_by'
+
+    settings           `system.settings` and `system.merge_tree_settings` matching
+                       `order_by`/`partition` are query-planner and merge-scheduling
+                       settings; none re-keys or re-partitions a table
+    schema providers   `format_schema_source` supplies a schema to a FORMAT; it does not
+                       touch table storage
+    table functions,   none re-keys an existing MergeTree in place
+    engines, views,
+    formats
+
+What **is** available is a rebuild plus `EXCHANGE TABLES`, which is what §8.1's second
+backfill uses. With no data to keep, the drop is the same thing at lower cost.
 
 **One grammar note, because every example in this section is a statement someone will
 paste.** `SETTINGS` goes **before** `VALUES` in an `INSERT`, or in the HTTP query string.
@@ -1779,11 +1813,21 @@ there is none; that was false.
       decode of a real span payload is not demonstrated here**; the mechanism is, and the
       framing is.
 
-   So the cost of the exact backfill is **a bounded server-side read/decode/write scan** —
-   batches of spans framed, decoded and rewritten by the server — not necessarily an
-   application re-ingest. **Under the issue's premise neither backfill runs.** If one ever
-   does, choosing the cheap one is choosing to let duplicated keys answer differently on
-   either side of the cut-over, and that is a choice rather than a limitation.
+   **So the cost of the exact backfill is not settled here, and this states the condition
+   rather than the answer.** What is established: the decode mechanism exists, it reads a
+   stored column, it preserves element order, and bulk framing works with a correct varint.
+   What is not: that a schema with OTLP's own field numbers decodes a real stored span
+   payload, and that a batched rewrite runs within a stated memory and row budget.
+
+       IF an exactly-numbered schema decodes a real stored payload carrying a duplicated
+       key, AND a bounded batched rewrite completes with measured rows, memory and
+       failures, THEN the exact backfill is a server-side scan.
+       UNTIL both, its cost is unknown and an application re-ingest remains the only
+       demonstrated route.
+
+   **Under the issue's premise neither backfill runs.** If one ever does, choosing the
+   cheap one is choosing to let duplicated keys answer differently on either side of the
+   cut-over, and that is a choice rather than a limitation.
 
 Under the issue's premise — no tagged release, no deployments, CI databases created fresh
 per run — none of this arises. **The premise should be
