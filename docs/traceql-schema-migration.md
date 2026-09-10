@@ -40,12 +40,14 @@ substitute your own and Appendix B's calculator recomputes them.
 phase-2 read was given as 2.2× the bytes it reads today. That figure was taken by
 repeating an identical statement. ClickHouse 26.3 defaults
 `use_query_condition_cache = 1`, which memoises the granules a condition selected, and a
-search batch's statement carries a different 32-trace-id list every time — so a
-production batch is always a miss. On a first-seen batch with
+search batch's statement carries a different 32-trace-id list every time, and a list
+that has not been seen before is a miss. **How often a real deployment repeats a list is
+not measured**; what was measured is that a fresh list misses even with the cache warm
+from a previous one. On a first-seen batch with
 `use_query_condition_cache = 0`, today's two statements read 63,987,313 bytes and the new
 single statement reads 30,144,320: the new form reads **0.47×**, not 2.2×. In the warm
-regime the same corpus reproduces the direction, at 2.48×. §4 Q1 carries both
-readings and the instrument.
+regime the same corpus reproduces the direction, at 2.39×. §4 Q1 carries both
+readings, the corpus and the full instrument.
 
 **Whether the original measurement was itself a warm reading is not established.** It was
 taken on a different corpus of a different physical size and its per-statement settings
@@ -614,6 +616,19 @@ The "before" SQL is copied from committed golden files under
 `crates/pulsus-read/tests/golden/`, which are byte-frozen against the builders.
 The "after" SQL is what the same builders would produce against the new tables.
 
+**The corpus every `[M]` figure below was taken on, defined once.** 2,000,000 spans,
+166,667 traces of 12 spans, 8 attributes per span, three hours from
+`1700000000000000000`, two UTC day partitions. `spans_old` and `spans_new` are built by
+the **same** eight `INSERT … SELECT … FROM numbers(<lo>, 250000)` statements at
+`max_insert_threads = 1, max_threads = 1, max_block_size = 65409`; `payload` is
+`repeat(substring(concat(four sipHash128 hex digests of the row number), 1, 100), 4)`,
+so it is a deterministic function of the row number. Then `OPTIMIZE … FINAL` on every
+table. **Its `payload` compresses 15.91× (816,000,000 raw to 51,292,209 on disk), well
+above Appendix A's `Z_p` = 4**, which matters to §5's storage row and to nothing else —
+no query below selects `payload` except Q5.
+
+Unless a row says otherwise, its instrument is: ClickHouse 26.3.29.7, `use_query_condition_cache = 0`, `optimize_move_to_prewhere = 1`, `max_block_size = 65409`, `max_threads = auto(16)`, three repetitions, zero counter spread.
+
 ### Q0 — `{}`, the query the search form sends before you type anything
 
 ```sql
@@ -653,8 +668,9 @@ The witness is trace `009c0bde7c7bcbcdd0952fd56bbb74bc`:
 Q2 below already omits the bound, for the same reason.
 
 Reads **3.48·10⁶ trace rows instead of 4.17·10⁷ span rows — 12× fewer**, and that
-is guaranteed by row counts alone. **Measured** at 11.96×: 167,277 rows against
-2,000,000 on the corpus of §4's table, both returning 100,001 rows.
+is guaranteed by row counts alone. **Measured** at 11.96×: today
+2,000,000 / 48,000,408 / 248 marks, new 167,277 / 5,018,350 / 22 marks, both returning
+100,001 rows.
 
 **The 144× does not happen.** §11 P4 asked whether the read can stop at the newest
 bucket. `EXPLAIN indexes = 1` on the statement above reports `Granules: 22/22` — the
@@ -767,31 +783,72 @@ SQL, because the reader already holds the `negated` flag.
 `root_sql`, `trace_ctx_sql` and `child_count_sql` (`:428, 468, 492`) read `trace_spans`
 by `trace_id IN` and are untouched.
 
+**Which value a duplicated key yields, and why the rule is the one below.** A span may
+carry the same key twice. Today `attr_values_sql` reads `any(val)` /
+`any(val_num)` over a `GROUP BY (trace_id, span_id)`, which picks arbitrarily and is not
+stable across merges. The array form picks by position, so a rule has to be chosen, and
+the reference already has one:
+
+```
+   the reference, tempodb/encoding/vparquet4/block_traceql.go:128-152 @ v3.0.2
+     scoped    scan the scope's attribute slice IN ORDER, return the FIRST match
+
+   the reference, block_traceql.go:248-275 @ v3.0.2
+     unscoped  try scopes in this order and take the first that has the name:
+               span -> resource -> event -> link -> instrumentation
+```
+
+So a stored span in sender order `[7, 5]` answers **7**, not 5. Today's `any()` returned
+5 in one measurement; that is not a contract, it is whichever row the aggregate reached
+first. **This design adopts the reference's rule, and it is a change of answer** — a
+ledger row and a differential test, not a silent improvement. Both forms were measured on
+26.3.29.7:
+
+    scoped     arrayFirstIndex((key, scope) -> key = K AND scope = S, attr_key, attr_scope)
+               on ['7','5'] returned index 1, value 7, kind int
+
+    unscoped   five arrayFirstIndex calls, taken in the precedence order above:
+               attrs ['resource','link','span','event','instrumentation'] chose 'span'
+               attrs ['link','resource','event']                          chose 'resource'
+
 **The byte cost of the batch, measured on a first-seen batch.** Corpus: 2,000,000 spans,
 166,667 traces of 12 spans, 8 attributes per span, three hours from
-`1700000000000000000`, both shapes built from one source table, `OPTIMIZE … FINAL`.
-Instrument: ClickHouse 26.3.29.7, `use_query_condition_cache = 0`,
-`optimize_move_to_prewhere = 1`, `max_block_size = 65409`, `max_threads = auto(16)`,
-five repetitions, identical counters on every repetition. The 32 ids are the first batch
-phase 1 returns for `service = 'svc-3'`, first `e948da06ce241975afd4e7d6d8026e69`, last
+`1700000000000000000`. **Both span tables are built by the same eight
+`INSERT … SELECT … FROM numbers(<lo>, 250000)` statements at
+`max_insert_threads = 1, max_threads = 1, max_block_size = 65409`, with a payload that is
+a deterministic function of the row number**, then `OPTIMIZE … FINAL`. That construction
+is what makes the counters reproducible: an earlier corpus built `spans_old` with a
+single `INSERT … SELECT` and used `randomPrintableASCII`, and its hydration counters and
+several mark counts did not reproduce on a rebuild.
+
+Instrument: ClickHouse 26.3.29.7, `use_query_condition_cache = 0`, `optimize_move_to_prewhere = 1`, `max_block_size = 65409`, `max_threads = auto(16)`, five repetitions,
+zero counter spread. The 32 ids are the first batch phase 1 returns for
+`service = 'svc-3'`, first `e948da06ce241975afd4e7d6d8026e69`, last
 `0141358bb246527351994c56ce011868`:
 
 | statement | read_rows | read_bytes | marks | ms |
 |---|---|---|---|---|
-| today, hydration | 453,824 | 15,464,235 | 56 | 17/18/14/16/13 |
-| today, membership | 2,015,232 | 48,523,078 | 246 | 16/13/11/11/12 |
-| **today, both** | | **63,987,313** | | |
-| new, one statement, `WHERE` | 449,736 | 32,529,648 | 56 | 21/22/22/19/25 |
-| **new, one statement, `PREWHERE`** | 449,736 | **30,144,320** | 56 | 21/21/20/19/21 |
+| today, hydration | 449,736 | 15,809,612 | 56 | 16/16/15/15/15 |
+| today, membership | 2,015,232 | 48,523,078 | 246 | 13/13/11/13/12 |
+| **today, both** | | **64,332,690** | | |
+| new, one statement, `WHERE` | 449,736 | 32,529,648 | 56 | 22/22/21/22/20 |
+| **new, one statement, `PREWHERE`** | 449,736 | **30,144,320** | 56 | 23/22/22/20/21 |
 
-**0.47×, not 2.2×.** The 2.2× reading is the warm one: after
-`SYSTEM DROP QUERY CONDITION CACHE` with `use_query_condition_cache = 1`, the membership
-read costs 2,015,232 rows / 246 marks on its first run and 24,576 rows / 3 marks on
-every repeat, and the whole batch comes out at `9,789,907 + 845,198 = 10,635,105`
-against `26,417,997` — **2.48×**. A fresh 32-id list goes
-straight back to 246 marks with the cache warm from the previous list, so **a production
-batch never gets the repeat**. `use_query_condition_cache` defaults to 1 on this server
-and `git grep -n use_query_condition_cache -- crates/*/src` finds no production pin.
+**0.47×, not 2.2×.** The 2.2× reading is the warm one. Same corpus, same statements,
+instrument as above but `use_query_condition_cache = 1`, after
+`SYSTEM DROP QUERY CONDITION CACHE`, three consecutive runs each:
+
+| statement | run 1 | runs 2 and 3 |
+|---|---|---|
+| today, hydration | 449,736 / 15,809,996 / 56, hits 0 misses 4 | 216,780 / 10,218,940 / 27, hits 4 misses 0 |
+| today, membership | 2,015,232 / 48,523,078 / 246, hits 0 misses 4 | 24,576 / 845,198 / 3, hits 4 misses 0 |
+| new, `PREWHERE` | 449,736 / 30,145,517 / 56, hits 0 misses 4 | 216,780 / 26,417,997 / 27, hits 4 misses 0 |
+
+`11,064,138` against `26,417,997` — **2.39×**. A fresh 32-id list goes straight back to
+246 marks with the cache warm from the previous list. `use_query_condition_cache`
+defaults to 1 on this server and `git grep -n use_query_condition_cache -- crates/*/src`
+finds no production pin. **How often a real deployment issues the same 32-id list twice
+is not measured**; what is measured is that a list not seen before does not hit.
 
 **The `PREWHERE` remedy is close to a no-op**, and §11 P2 asked the wrong question of it.
 `optimize_move_to_prewhere = 1` already moves the whole `WHERE` into the prewhere pass by
@@ -801,17 +858,18 @@ and the explicit-`PREWHERE` form prints only the `in(trace_id, …)` half. The 7
 difference is which conditions sit in that pass, not whether there is one.
 
 **What the batch's cost actually turns on is how selective the probed value is.** Same
-corpus, same batch, same instrument:
+corpus, same batch, instrument as the first-seen table above, three repetitions, zero
+spread:
 
     probe                                              read_rows  read_bytes   marks
     key='http.status_code' AND val_num >= 500          2,015,232  48,523,078    246
     key='http.method' AND val='GET'                      516,096   9,380,321     63
     key='request.id' AND val='r-1234567'                  16,384     294,928      2
 
-    whole batch, today (hydration+membership) vs new (PREWHERE)
-    numeric range                63,987,313  ->  30,144,320   0.47x
-    string eq, 4 distinct vals   24,844,556  ->  30,144,320   1.21x
-    string eq, unique per span   15,759,163  ->  30,144,320   1.91x
+    whole batch, today (hydration 15,809,612 + membership) vs new (PREWHERE 30,144,320)
+    numeric range                64,332,690  ->  30,144,320   0.47x
+    string eq, 4 distinct vals   25,189,933  ->  30,144,320   1.20x
+    string eq, unique per span   16,104,540  ->  30,144,320   1.87x
 
 ### Q2 — an attribute-only search: `{ span.http.status_code >= 500 }`
 
@@ -838,10 +896,10 @@ The absent `ts_max <= <end>` is the same rule Q0 states: an upper bound on a
 bucket-grained maximum drops traces the window contains.
 
 Same sorted prefix, same seek, **2.5× fewer rows** — the trace-grain collapse
-factor `d` (Appendix A). **Measured** at 2.96× on the corpus of §4's table:
-2,015,232 rows / 49,578,272 bytes / 246 marks against 679,936 / 19,685,496 / 83, both
-returning 100,001 rows. Uncapped, the new candidate set is a strict superset of the old
-— 166,664 traces become 166,667, **0 lost and 3 gained**.
+factor `d` (Appendix A). **Measured** at 2.96×: 2,015,232 rows / 49,578,272 bytes /
+246 marks against 679,936 / 19,685,496 / 83, both returning 100,001 rows. Uncapped, the
+new candidate set is a strict superset of the old — 166,664 traces become 166,667,
+**0 lost and 3 gained**.
 
 ### Q3a — `{ status = error }`
 
@@ -862,9 +920,9 @@ GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 ```
 
 Whole-window scan becomes a time-ordered read of a table that holds only the
-error spans: **100× fewer rows** at `σ_err` = 1%. **Measured** at exactly 100× on the
-corpus of §4's table: 2,000,000 rows / 48,080,549 bytes / 246 marks against 20,000 /
-520,016 / 3, both returning the same 19,999 traces — identical sets, not a superset.
+error spans: **100× fewer rows** at `σ_err` = 1%. **Measured** at exactly 100×:
+2,000,000 rows / 50,000,488 bytes / 248 marks against 20,000 / 520,016 / 3, both
+returning the same 19,999 traces — identical sets, not a superset.
 
 ### Q3b — `{ name = "GET /pay" }`
 
@@ -880,9 +938,9 @@ GROUP BY trace_id ORDER BY bound_ts DESC, trace_id ASC LIMIT 100001
 Today no table in the family is sorted by `name`, so this reads the whole window.
 The `name_time` projection re-sorts every row by `(name, timestamp_ns)`, and
 ClickHouse's optimiser selects it for this predicate without the SQL changing:
-**50× fewer rows** at `σ_name` = 2%. **Measured** at 35× on the corpus of §4's table,
-where one span name in fifty is 2% of 2,000,000 spans but a granule holds 8,192 rows:
-2,000,000 / 50,000,488 / 246 against 57,142 / 1,428,566 / 7, both returning the same
+**50× fewer rows** at `σ_name` = 2%. **Measured** at 35×, where one span name in fifty
+is 2% of 2,000,000 spans but a granule holds 8,192 rows:
+2,000,000 / 50,000,488 / 248 against 57,142 / 1,428,566 / 7, both returning the same
 39,998 traces. `EXPLAIN indexes = 1` prints `ReadFromMergeTree (name_time)` and
 `Granules: 7/248`, so the projection is selected rather than assumed.
 
@@ -920,12 +978,15 @@ SELECT trace_id, span_id, parent_id, payload_type, kind, payload
 FROM trace_spans WHERE trace_id = unhex('4bf92f3577b34da6a3ce929d0e0e4736')
 ```
 
-**The id above is illustrative and is not in any corpus measured here** — against the
-2,000,000-span corpus of §4's table it returns 0 rows, 16,384 read rows, 262,160 bytes,
-2 marks. Re-measured with an id that IS in that corpus,
-`000018d4dfe8a7a22d8f5b96d0ac2759`: **8,192 rows / 136,124 bytes / 1 mark / 12 span
-rows, identical on both shapes**, three repetitions each, `use_query_condition_cache = 0`.
-This is the latency-critical read and nothing here touches it.
+**The id above is illustrative and is not in the corpus** — it returns 0 result rows,
+16,384 read rows, 262,160 bytes, 2 marks, identically on both shapes. Re-measured with an
+id that IS in the corpus, `000018d4dfe8a7a22d8f5b96d0ac2759`: **8,192 rows / 136,124
+bytes / 1 mark / 12 result rows, identical on both shapes**. This is the
+latency-critical read and nothing here touches it.
+
+**The earlier figure `1 granule of 245, 8,192 rows, 132,564 bytes` was taken on a corpus
+this document no longer describes and by a method it no longer accepts. It is withdrawn,
+not carried.**
 
 ### Q6 — a metrics query: `{ duration > 1s } | rate() by(resource.service.name)`
 
@@ -964,42 +1025,58 @@ A metrics query with an attribute filter is a semi-join today
                   attr_key, attr_scope, attr_num)
 ```
 
-**Measured** at 20,000,000 spans: the inline form reads 3.9× more bytes and is
-**1.7–2.3× faster** (1436/1543/1627 ms against 2442/3659/3479 ms), because
-building a hash table over 20 million `(trace_id, span_id)` tuples costs more
-than reading the arrays. Both numbers are worth quoting; only one flatters the
-change. **That pair was not re-derived and stands as taken.**
+**The 20,000,000-span pair that stood here — "3.9× more bytes … 1.7–2.3× faster
+(1436/1543/1627 ms against 2442/3659/3479 ms)" — is withdrawn.** Its method was not
+recorded, the corpus no longer exists, and the same two statements re-measured at
+2,000,000 spans give a different byte ratio. It is not replaced by an estimate.
 
-**Re-measured at 2,000,000 spans**, on the corpus of §4's table, with
-`use_query_condition_cache = 0`, `max_block_size = 65409`, `max_threads = auto(16)`,
-three repetitions, identical counters each time:
+**Measured at 2,000,000 spans.** Instrument: ClickHouse 26.3.29.7,
+`use_query_condition_cache = 0`, `optimize_move_to_prewhere = 1`,
+`max_block_size = 65409`, `max_threads = auto(16)`, three repetitions, zero counter
+spread:
 
 | statement | read_rows | read_bytes | marks | result rows | ms |
 |---|---|---|---|---|---|
-| Q6, `\| rate() by(service)`, today | 2,000,000 | 82,001,456 | 246 | 3,620 | 79/78/81 |
-| Q6, same statement, new tables | 2,000,000 | 82,001,456 | 248 | 3,620 | 75/78/73 |
-| Q6b, the semi-join, today | 4,015,232 | 121,706,304 | 492 | 181 | 433/408/411 |
-| Q6b, the inline probe, new | 2,000,000 | 288,001,456 | 248 | 181 | 144/162/147 |
+| Q6, `\| rate() by(service)`, today | 2,000,000 | 82,001,456 | 248 | 3,620 | 83/80/74 |
+| Q6, same statement, new tables | 2,000,000 | 82,001,456 | 248 | 3,620 | 77/82/84 |
+| Q6b, the semi-join, today | 4,015,232 | 121,706,304 | 494 | 181 | 429/416/458 |
+| Q6b, the inline probe, new | 2,000,000 | 288,001,456 | 248 | 181 | 154/153/144 |
 
-So at this corpus size the inline form reads **2.37×** the bytes and is **2.6–3.0×
+So at this corpus size the inline form reads **2.37×** the bytes and is **2.7–3.0×
 faster**.
 
-**The byte figures previously carried for these two statements — 34,000,000 and
-240,000,000 — cannot come from the SQL above.** They were taken through a
-`SELECT count() FROM ( <the statement> )` wrapper, which lets the optimiser drop the
-subquery columns nothing outside it reads; `uniqExact(trace_id, span_id)` is then never
-evaluated and `trace_id` + `span_id` are never read. The difference is exactly
-24 bytes × 2,000,000 rows on both. **A counter taken through a wrapper is a counter for
-the wrapper.** Every figure in this document that carries an instrument line was taken by
-running the statement itself.
+**Where the earlier 34,000,000 and 240,000,000 came from.** They were taken through a
+`SELECT count() FROM ( <the statement> )` wrapper. `EXPLAIN header = 1` shows what that
+costs: the wrapper's `ReadFromMergeTree` header is `timestamp_ns, service`, the bare
+statement's is `timestamp_ns, service, trace_id, span_id`. The optimiser drops the two id
+columns because nothing outside the subquery reads `uniqExact(trace_id, span_id)`.
+
+The arithmetic, so it is not asserted as rounder than it is:
+
+    bare Q6                                       82,001,456
+    the same statement inside count()             34,000,000
+    difference                                    48,001,456
+
+    measured on their own, same corpus and instrument
+      SELECT uniqExact(trace_id) FROM spans_old   32,000,320
+      SELECT uniqExact(span_id)  FROM spans_old   16,000,320
+      SELECT service, count() … GROUP BY service   2,000,000
+                                                  ----------
+      trace_id + span_id                          48,000,640
+
+**The residue is 816 bytes, and it is not attributed.** The mechanism is established —
+the wrapper does not read the two id columns — the exact total is not, and no round
+`24 × 2,000,000` identity holds. **A counter taken through a wrapper is a counter for the
+wrapper.** Every `[M]` figure in this document was taken by running the statement itself.
 
 ### Q7 — the service graph
 
 Reads `trace_edges`, which this design does not touch. The statement is
-byte-identical (`golden/traces_graph/single_node.sql`); measured 1,516,384 rows
-and 65,764,280 bytes on both shapes. **Re-measured** on the corpus of §4's table,
-where the edge ledger holds 1,200,000 half-rows: 1,216,384 rows / 51,624,512 bytes /
-149 marks, returning 2 edges, three repetitions identical.
+byte-identical (`golden/traces_graph/single_node.sql`). **The earlier counters,
+1,516,384 rows and 65,764,280 bytes, are withdrawn: their method was not recorded and
+their corpus no longer exists.** Measured on the corpus above, where the edge ledger holds
+1,200,000 half-rows: 1,216,384 rows / 51,624,512 bytes / 149 marks, returning 2 edges,
+three repetitions, zero spread.
 
 ---
 
@@ -1012,7 +1089,8 @@ spans.
 | # | dimension | today | new | change | |
 |---|---|---|---|---|---|
 | 1 | storage, B/span, at `A` = 20 | 1047.9 | **625.7** | **−40.3%** | [D] |
-| 1 | storage, B/span, **measured** at `A` = 8 on the corpus of §4's table, `sum(bytes_on_disk)` over `system.parts` after `OPTIMIZE … FINAL` | 407.2 | **272.1** | **−33.2%** | [M] |
+| 1 | storage, B/span, **measured** at `A` = 8 and `Z_p` = 15.91 on §4's corpus; `sum(bytes_on_disk)` over `system.parts` after `OPTIMIZE … FINAL`, both span tables built identically | 306.6 | **212.9** | **−30.6%** | [M] |
+| 1 | … the payload component of each, so `Z_p` can be substituted: today 180,471,375 B (base 51,292,209 + a second copy of 129,179,166 in `service_time`), new 51,292,209 B (its two projections carry none). Payload-free: today 216.4 B/span, new 187.2 B/span | | | | [M] |
 | 1 | storage at 10⁹ spans/day, 7 days | 7.34 TB | **4.38 TB** | −2.96 TB | [D] |
 | 2 | rows read, `{}` | 4.17·10⁷ | 3.48·10⁶ | **÷12** | [D] |
 | 2 | rows read, `{status = error}` | 4.17·10⁷ | 4.17·10⁵ | **÷100** | [D] |
@@ -1020,17 +1098,17 @@ spans.
 | 2 | rows read, `\| rate() by(service)` | 4.17·10⁷ | 4.17·10⁷ | **unchanged** — §3.5 | [D] |
 | 2 | rows read, attribute search | 2.08·10⁷ | 8.33·10⁶ | **÷2.5** | [D] |
 | 2 | rows read, the tag dropdown | 10⁶ and rising with deployment age | 10⁴ | **÷100, and bounded** | [D] |
-| 2 | rows read, the narrowed dropdown | 2,138,112 at 2M / 21,037,056 at 20M | a key seek | **≫100×**, service-narrowed only | [M] |
-| 2 | rows read, trace-by-id and the service graph | — | — | **identical** | [M] |
-| 3 | bytes, storage → reader, one search batch, **first-seen** | 63,987,313 | **30,144,320** | **−53%** | [M] |
-| 3 | … the same batch, **repeated identically** (warm condition cache) | 10,635,105 | 26,417,997 | +148% | [M] |
+| 2 | rows read, the narrowed dropdown, §4's corpus and instrument | 2,129,920 rows / 72,453,720 B / 260 marks | 16,384 / 51,826 / 2 | **÷130 on rows, ÷1398 on bytes**, service-narrowed only. Both return `DELETE POST PUT` | [M] |
+| 2 | rows read, trace-by-id and the service graph, §4's corpus and instrument | Q5 8,192 / 136,124 / 1; Q7 1,216,384 / 51,624,512 / 149 | Q5 identical; Q7 untouched table | **identical** | [M] |
+| 3 | bytes, storage → reader, one search batch, **first-seen** (§4 Q1's instrument) | 64,332,690 | **30,144,320** | **−53%** | [M] |
+| 3 | … the same batch, **repeated identically**, `use_query_condition_cache = 1`, runs 2 and 3 | 11,064,138 | 26,417,997 | +139% | [M] |
 | 3 | bytes, writer → ClickHouse | 1838 raw B/span, 2 statements | 1038, 1 | **−43.5%** | [D] |
 | 3 | rows crossing to every replica (the catalog is `Replication::Global`, `catalog.rs:406`) | 20 per span | ≤ distinct tuples per block | **≈500×** | [D] |
 | 3 | bytes, reader → client | — | — | **unchanged** — set by the API response shape, not by storage | [D] |
 | 4 | SQL statements, one-condition search, `M`=20 | 4 | **3** | −25% | [D] |
 | 4 | … a search that compares an `event:`/`link:` intrinsic against another field | | **keeps its extra per-batch statement** — §4 Q1 says why the multi-valued read cannot become a column | [D] |
 | 4 | … at the candidate ceiling | 6252 | **3127** | −50% | [D] |
-| 5 | ClickHouse CPU | tracks the uncompressed bytes of the selected columns | | ÷2.5 on attribute search; ÷2.1 on a first-seen search batch; 2.6–3.0× **faster** on an attribute metrics query at 2M, 1.7–2.3× at 20M | [M] |
+| 5 | ClickHouse CPU | tracks the uncompressed bytes of the selected columns | | ÷2.5 on attribute search; ÷2.1 on a first-seen search batch; 2.7–3.0× **faster** on an attribute metrics query at 2M (§4 Q6's instrument). The 20,000,000-span claim is withdrawn with the figures it rested on | [M] |
 | 6 | our own CPU | 66 statements, 28,384 rows decoded at `M`=1000 | 34 statements, 25,312 rows | **strictly lower** | [D] |
 | 7 | disk read work | tracks the compressed bytes of the selected columns | | as row 2 and row 3 | [D] |
 | 8 | merge, LZ4-equivalent B/span/level | 9856 | **5341** | **−45.8%** | [D] |
@@ -1061,7 +1139,7 @@ agree on.
 | `A_t`, distinct attribute values per trace | the new layout stops being smaller at `A_t` = **246.5**. `A_t` can never exceed `A·S` = 240 | **the new layout is smaller at every parameter value.** Even in the degenerate case where no attribute value repeats anywhere in a trace it is 1027.9 B/span against 1047.9 |
 | `σ_err`, the fraction of spans in error | `trace_error_spans` costs `σ_err·(37.6 + 16)` B/span and reads `σ_err·N_W` rows. It stops being cheaper than the base table at `σ_err` = 1 | at 1% it is 0.5 B/span for a 100× read reduction; a deployment where most spans are errors gets neither |
 | `σ_name`, the fraction of spans sharing one span name | `name_time` costs a flat 37.6 B/span and reads `σ_name·N_W` rows | it is the most expensive of the three additions and the only one that is a full re-sorted copy. At `σ_name` = 1 — one span name in the whole deployment — it buys nothing and still costs 37.6 |
-| `n_k`, attribute-index **rows** a batch's membership read touches | the search batch's byte cost crosses at `n_k` ≈ **9.5·10⁵** | below it, two statements read fewer bytes. **Measured on a first-seen batch: `n_k` = 2,015,232 rows** — above the crossover, so the new design **wins** this dimension there. The earlier reading of 24,576 rows is what the same statement returns on a repeat, once the query-condition cache has memoised its granules; a production batch never gets the repeat, because its 32-id list changes. `n_k` moves with the probed value's selectivity: 2,015,232 rows for a numeric range, 516,096 for a four-value string equality, 16,384 for a value unique to one span |
+| `n_k`, attribute-index **rows** a batch's membership read touches | the search batch's byte cost crosses at `n_k` ≈ **9.5·10⁵** | below it, two statements read fewer bytes. **Measured on a first-seen batch, §4 Q1's corpus and instrument: `n_k` = 2,015,232 rows** — above the crossover, so the new design **wins** this dimension there. The earlier reading of 24,576 rows is what the same statement returns on a repeat, once the query-condition cache has memoised its granules; a list not seen before does not hit, measured with the cache warm from another list. `n_k` moves with the probed value's selectivity: 2,015,232 rows for a numeric range, 516,096 for a four-value string equality, 16,384 for a value unique to one span |
 
 ---
 
@@ -1080,6 +1158,8 @@ from names.
 | the comparison `val_num >= 500` | `Nullable(UInt8)` | `Nullable(UInt8)` | none | **agree** |
 | the PROBE's result, as the reader sees it | a row present or absent in the membership set | `arrayExists(…)`, printed `UInt8` | none on the row set: `arrayExists` returns 0 exactly where the column form returns NULL, and a `WHERE` treats NULL as 0. Measured for `>=`, `!=` and `=` against a NULL element, all three 0 | **agree** |
 | the probe under NEGATION | positive probe, reader inverts (`search_eval.rs:1213-1216`, `member != *negated`) | **must stay exactly that** | negating inside `arrayExists` differs on an absent key and on a multi-valued key — §4 Q1's five-case table | **agree only if the negation stays out of the SQL** |
+| the value a DUPLICATED key yields | `any(val)` / `any(val_num)` over `GROUP BY (trace_id, span_id)` — arbitrary, not stable across merges | first match in stored order, scope precedence span → resource → event → link → instrumentation | on `['7','5']`: today returned 5 in one measurement, the new form returns 7 | **CHANGED, deliberately.** The new rule is the reference's, `block_traceql.go:128-152, 248-275 @ v3.0.2`; today's has no contract. Needs a ledger row and a differential test |
+| `val_num`'s determinant | — | `(scope, key, val)`, **not `val` alone** | `link:spanID` = `'0000000000000001'` stores `val_num = NULL` while the same text under an attribute key stores `1.0` (`otlp_traces.rs:558-607` sets `val_num: None` unconditionally for both link intrinsics) | **determined**, and all three columns are in the sorting key |
 | `timestamp_ns`, `duration_ns` | `Int64` nanoseconds | `Int64` nanoseconds | none | **agree** |
 | the bucket | — | `UInt32` | ingest bounds `timestamp_ns` to `[0, 4.29·10¹⁸]` (`otlp_traces.rs:465-486`), so the bucket is `≤ 1.43·10⁷` against a ceiling of 4.29·10⁹ | **cannot overflow** |
 
@@ -1244,6 +1324,9 @@ What remains unmeasured:
 | the byte cost of the `event_set_sql` read after it moves to an `ARRAY JOIN` over `trace_spans` | it is the one phase-2 read that stays a separate statement. §4 Q1 |
 | the scalar value read (`arrayFirstIndex` + element extraction) against today's `attr_values_sql` | the shape is bounded by construction; the byte cost is not measured |
 | whether `Array(LowCardinality(String))` and `Array(Nullable(Float64))` insert through our own writer | `metric_hist_samples` proves `Array(Int32)`/`Array(Float64)` from a `Vec` field (`catalog.rs:492-498`, `rows.rs:437, 443`); the low-cardinality and nullable element types have no precedent in this repository |
+| the cost of the drop/add/materialise interval on `service_time` (§8 ids 55–57) on a populated table | during it, a `resource.service.name` search falls back to a base-table scan. Empty on a fresh database |
+| the clustered path beyond column presence | §8's twins were measured on a single-node `Distributed('default', …)`: the column appears and the insert lands. Multi-shard routing, `cityHash64(trace_id)` co-sharding of the four new wrappers, and a clustered read were not measured |
+| storage at Appendix A's `Z_p` = 4 | §5's measured storage row was taken at `Z_p` = 15.91 and carries its payload component so the figure can be re-derived at another `Z_p`; it was not re-run at 4 |
 | concurrency, and ClickHouse's mark, uncompressed and query-condition caches | every figure here is one request on an idle server; a repeated query is cheaper than this says |
 | the write path's own CPU | building five array fields instead of `A` separate rows is almost certainly cheaper, and is not counted |
 | the eleven compression ratios in Appendix A | they are judgement. Every worked byte figure moves with them; the **signs** of the crossovers in §5.2 survive the whole stated range, the magnitudes do not |
@@ -1289,27 +1372,109 @@ and populated with 50,000 rows. Every statement returned HTTP 200 with an empty 
 and the row count was 50,000 before and after:
 
 ```
-  new ids, in order          ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_key    Array(LowCardinality(String))
-                             ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_scope  Array(LowCardinality(String))
-                             ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_val    Array(String)
-                             ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_type   Array(LowCardinality(String))
-                             ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_num    Array(Nullable(Float64))
-                             ALTER TABLE trace_spans ADD CONSTRAINT IF NOT EXISTS attr_arrays_aligned CHECK …
-                             ALTER TABLE trace_spans DROP PROJECTION IF EXISTS service_time
-                             ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS service_time (<14 named columns> ORDER BY (service, timestamp_ns))
-                             ALTER TABLE trace_spans MATERIALIZE PROJECTION service_time
-                             ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time    (<the same 14>  ORDER BY (name, timestamp_ns))
-                             ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time
-                             DROP TABLE IF EXISTS trace_tag_catalog          <- PARTITION BY and ORDER BY
-                             CREATE TABLE trace_tag_catalog (<the new shape>)   cannot be ALTERed; there
-                             DROP TABLE IF EXISTS trace_attrs_idx               is no data to keep
-                             CREATE TABLE trace_attr_traces / trace_error_spans / trace_recent  (+ their _dist wrappers)
+  id  scope              statement
+  --  -----------------  --------------------------------------------------------------
+  44  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_key    Array(LowCardinality(String))
+  45  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_key    Array(LowCardinality(String))
+  46  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_scope  Array(LowCardinality(String))
+  47  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_scope  Array(LowCardinality(String))
+  48  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_val    Array(String)
+  49  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_val    Array(String)
+  50  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_type   Array(LowCardinality(String))
+  51  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_type   Array(LowCardinality(String))
+  52  PerShard           ALTER TABLE trace_spans ADD COLUMN IF NOT EXISTS attr_num    Array(Nullable(Float64))
+  53  PerShard, CLUSTER  ALTER TABLE trace_spans_dist ADD COLUMN IF NOT EXISTS attr_num    Array(Nullable(Float64))
+  54  PerShard           ALTER TABLE trace_spans ADD CONSTRAINT IF NOT EXISTS attr_arrays_aligned CHECK …
+                         (no _dist twin — see below)
+  55  PerShard           ALTER TABLE trace_spans DROP PROJECTION IF EXISTS service_time
+  56  PerShard           ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS service_time (<14 named columns> ORDER BY (service, timestamp_ns))
+  57  PerShard           ALTER TABLE trace_spans MATERIALIZE PROJECTION service_time
+  58  PerShard           ALTER TABLE trace_spans ADD PROJECTION IF NOT EXISTS name_time    (<the same 14>  ORDER BY (name, timestamp_ns))
+  59  PerShard           ALTER TABLE trace_spans MATERIALIZE PROJECTION name_time
+  60  Global             DROP TABLE IF EXISTS trace_tag_catalog        <- PARTITION BY and ORDER BY
+  61  Global             CREATE TABLE trace_tag_catalog (<the new shape>)  cannot be ALTERed
+  62  PerShard, CLUSTER  DROP TABLE IF EXISTS trace_attrs_idx_dist
+  63  PerShard           DROP TABLE IF EXISTS trace_attrs_idx
+  64  PerShard           CREATE TABLE trace_attr_traces   (AggregatingMergeTree)
+  65  PerShard, Dist     CREATE TABLE trace_attr_traces_dist   AS trace_attr_traces
+                         ENGINE = Distributed('{cluster}', {db}, trace_attr_traces, cityHash64(trace_id))
+  66  PerShard           CREATE TABLE trace_error_spans   (ReplacingMergeTree)
+  67  PerShard, Dist     CREATE TABLE trace_error_spans_dist   … cityHash64(trace_id)
+  68  PerShard           CREATE TABLE trace_recent        (AggregatingMergeTree)
+  69  PerShard, Dist     CREATE TABLE trace_recent_dist        … cityHash64(trace_id)
 ```
 
+`PerShard, CLUSTER` is `Ddl::StaticClusterOnly`: skipped and unrecorded on a single node,
+applied the first time clustering is enabled. `PerShard, Dist` is `Ddl::Dist`, rendered
+by `render::dist_ddl_template` from `Family::Traces`'s single sharding expression, so all
+four trace wrappers co-shard on `cityHash64(trace_id)` and every read joins shard-locally
+(§7). `Global` is the catalogue's one cluster-wide replica set, no wrapper.
+
+**The odd ids are not decoration.** `trace_spans_dist` is
+`CREATE TABLE … AS trace_spans`, which copies the column list at creation and **does not
+inherit a later base-table `ALTER`**. Migration 32's own comment says so, and in cluster
+mode every read and write goes through the wrapper. Measured on 26.3.29.7 with a
+single-node `Distributed('default', …)`:
+
+    after the base ALTERs only
+      local columns        ['attr_key','attr_num']
+      distributed columns  []
+      INSERT INTO trace_spans_dist (…, attr_key, attr_num) VALUES (…)
+        -> Code: 16. DB::Exception: No such column attr_key in table … (NO_SUCH_COLUMN_IN_TABLE)
+
+    after the cluster-only twins
+      distributed columns  ['attr_key','attr_num']
+      the same INSERT       -> 200, and the row lands in the LOCAL table
+
+**The `CONSTRAINT` gets no twin, and does not need one.** Measured:
+`ALTER TABLE trace_spans_dist ADD CONSTRAINT …` returns
+`Code: 48 … not supported by storage Distributed (NOT_IMPLEMENTED)`. And the base-table
+constraint fires on a wrapper insert anyway — a misaligned row sent to
+`trace_spans_dist` returned
+`Code: 469 … Constraint attr_arrays_aligned for table <db>.trace_spans is violated at row 1`.
+Projections likewise exist only on the base table.
+
 `ADD PROJECTION` followed by `MATERIALIZE PROJECTION` is the pattern migrations 42/43
-already use. The named-column `service_time` requires `shared`, `status_message`,
-`scope_name` and `scope_version` to exist, which they do by the time a new id runs —
-migrations 31/35/37 have already applied.
+already use — **but 42/43 add a projection that did not exist, where 55–57 first drop one
+that is serving reads.** Between 55 and 57 a `resource.service.name` search falls back to
+a base-table scan: a correct answer, a slower one, for as long as the materialise takes.
+On a fresh database that interval is empty. The named-column `service_time` requires
+`shared`, `status_message`, `scope_name` and `scope_version` to exist, which they do by
+the time a new id runs — 31/35/37 have already applied.
+
+**Three of these statements destroy data, and the policy does not stop them.** The
+append-only rule constrains mutation of an already-listed migration entry; it says nothing
+about what a *new* entry may contain. So ids 60, 62 and 63 are formally allowed and would
+drop a populated catalogue and a populated attribute index. **"There is no data to keep"
+is the issue's premise, not a property the sequence checks.**
+
+### 8.1 What happens to rows that already exist
+
+Measured, and it is not a migration. Starting from a database reconciled by the
+repository's own initialiser (migrations 16/31/35/37/42/43) and populated with 50,000
+spans, then running ids 44–69:
+
+    SELECT count(), countIf(all five array lengths = 0) FROM trace_spans
+      -> 50000, 50000
+
+    uniqExact(trace_id) in trace_spans                          50000
+    SELECT count() FROM trace_recent                                0
+    the `{}` generator over trace_recent                            0 traces
+    a trace-by-id read for one of those traces                      1 row
+
+So every pre-existing span **survives, keeps its 50,000 distinct traces, is fetchable by
+id, and is returned by no search of any shape**, because the arrays are empty and the
+views only see rows inserted after they exist. Their attributes were in
+`trace_attrs_idx`, which id 63 drops.
+
+**There is no `ALTER` that fixes this.** Filling the arrays from `trace_attrs_idx` is a
+per-row correlated aggregate, which `ALTER TABLE … UPDATE` cannot express; it is a
+rebuild, not a mutation. Under the issue's premise — no tagged release, no deployments,
+CI databases created fresh per run — the case does not arise. **The premise should be
+checked rather than assumed**: `run_init` already refuses on a server below the minimum
+version (`controller.rs`'s `check_version`, called at `:89`), and the same place can
+refuse when `trace_spans` is non-empty at the point ids 44–69 would first apply, naming
+the remedy (drop the database and re-reconcile) in the error.
 
 The MV list and `TTL_STMTS` change either way:
 
@@ -1355,6 +1520,9 @@ The MV list and `TTL_STMTS` change either way:
 | a materialized view throws and leaves the span stored with no derived rows | a trace is fetchable by id and returns from no search | **read: this happens.** §6.3. No remedy is chosen here |
 | a probe's negation is rendered inside `arrayExists` rather than left to the reader | `{ span.k != "x" }` starts matching spans that carry `k = "x"` and stops matching spans with no `k` | §4 Q1's five-case table is the test. Three of the five cases go wrong |
 | the writer moves only the resource/span/instrumentation loop | `event:name`, `event:timeSinceStart`, `link:spanID`, `link:traceID` and every event and link attribute stop being searchable | §1.2. `otlp_traces.rs:505-607` is a second and third emission site with the same row shape |
+| the base-table `ALTER`s ship without their `_dist` twins | single-node CI is green; the first clustered insert fails with `Code: 16 NO_SUCH_COLUMN_IN_TABLE` | §8. Single-node execution cannot see it — the check has to be a clustered insert |
+| the duplicate-key rule is left to `arrayFirstIndex` without being stated | `avg`, `select` and `by` change answer on a span that repeats a key, silently | §4 Q1. The rule is the reference's; it is a change of answer and needs a ledger row |
+| ids 44–69 run against a database that already holds trace rows | those spans stay fetchable by id and are returned by no search | §8.1. Measured: 50,000 rows survive with five empty arrays and every derived table at 0 |
 | five materialized views instead of two make ingest slower than the measurements suggest | insert wall time rises rather than falls | the nine write takes in §5 already measured the two-view case against the one-INSERT case; two of the three new views are a narrow filter and a narrow group. `trace_attr_traces_mv` is the one that expands and groups `A` rows per span, and it is the one to measure on its own. Measure insert wall time with each view added in turn |
 | the metrics range query stays the slowest shape and someone adds a rollup later without re-checking §3.5 | `rate()` starts under-counting or over-counting after a client resends spans | §3.5 states the property the rollup must have. Any future rollup is checked against the duplicate table in §3.4 before it is built |
 | wider candidate sets push queries into the 100,000 ceiling that did not hit it before | responses turn partial | the ceiling is already reported to the client; the two tests in §6.1 pin the behaviour at the boundary |
@@ -1396,7 +1564,7 @@ and the reading that refutes it.
 | # | prediction | how to read it | refuted if |
 |---|---|---|---|
 | **P1** — **READ, not refuted** | a view doing `ARRAY JOIN` **and** `GROUP BY` can write `SimpleAggregateFunction` columns of an `AggregatingMergeTree`, producing one row per (value, trace, bucket) after merge | create it; insert two blocks holding the same trace; compare `SELECT count()` and the `ts_max`/`dur_max`/`dur_min` values before and after `OPTIMIZE … FINAL` against the expected distinct-tuple count and the expected aggregates | the view is rejected, or the post-merge count is not the distinct-tuple count, or an aggregate column holds anything but the max/min over the collapsed rows. **Outcome:** all three statements accepted on 26.3.29.7; 14 rows across two parts before `OPTIMIZE … FINAL`, 11 after, against 11 distinct tuples computed from the span table; `countIf(ts_max/dur_max/dur_min disagree)` = 0 over 11 compared rows. Ran identically under `async_insert` 0 and 1 |
-| **P2** — **READ; the stopping test itself was defective** | the search batch's 2.2× byte cost falls materially under `PREWHERE trace_id IN (…)`, and today's membership read is expensive on real data | the same batch statement with `WHERE` and with `PREWHERE`, comparing `read_bytes`; then `EXPLAIN indexes = 1` and the membership read's granule selection on a corpus with **high-cardinality** attribute values | **This row compared a mark count against a row count.** §5.2's 24,576 is a number of ROWS — three granules of 8,192 — and this row asked whether `SelectedMarks` stays near it. The two quantities are three orders of magnitude apart and the rule could never be met. Restated: *refuted if `read_bytes` does not fall AND the membership read still selects about 3 marks on a first-seen batch.* **Outcome:** `read_bytes` falls 7.33%, which is not material and is explained in §4 Q1; the membership read selects **246 marks / 2,015,232 rows** on a first-seen batch, not 3 / 24,576. The regression the row exists to price is not there on a first-seen batch |
+| **P2** — **READ; the stopping test itself was defective** | the search batch's 2.2× byte cost falls materially under `PREWHERE trace_id IN (…)`, and today's membership read is expensive on real data | the same batch statement with `WHERE` and with `PREWHERE`, comparing `read_bytes`; then `EXPLAIN indexes = 1` and the membership read's granule selection on a corpus with **high-cardinality** attribute values | **This row compared a mark count against a row count.** §5.2's 24,576 is a number of ROWS — three granules of 8,192 — and this row asked whether `SelectedMarks` stays near it. The two quantities are three orders of magnitude apart and the rule could never be met. Restated: *refuted if `read_bytes` does not fall AND the membership read still selects about 3 marks on a first-seen batch.* **Materiality is now a number, not a word:** the remedy is material if the `PREWHERE` form's `read_bytes` is **at most 0.80×** the `WHERE` form's — a 20% fall, a fifth of the excess the single statement carries. **Outcome:** 30,144,320 / 32,529,648 = **0.927**, so the remedy is refuted at that threshold, and would be at any threshold below 0.93. The membership read selects **246 marks / 2,015,232 rows** on a first-seen batch, not 3 / 24,576. The regression the row exists to price is not there on a first-seen batch |
 | **P3** — **READ, REFUTED** | a materialized view that throws fails the whole `INSERT`, so nothing is stored rather than half | insert a block through a view built to throw; check whether the source part exists | the source part is written and only the view's target is missing. **Outcome: exactly that.** `SELECT count() FROM src` = 2, part `20231114_1_1_0` active with 2 rows, target 0, client told `Code: 395`. §6.3 carries the full reading and what it means |
 | **P4** — **READ, not refuted; the conditional half is refuted** | `{}` reads 12× fewer rows guaranteed, and 144× if the read can stop at the newest bucket | `EXPLAIN indexes = 1` and `read_rows` for the `trace_recent` statement in §4 Q0 | `read_rows` is not below the span-table figure. **Outcome:** 167,277 against 2,000,000 — 11.96×, so not refuted. The 144× does not occur: `Granules: 22/22`, and three optimiser settings each read the same 167,277 rows and 22 marks. §4 Q0 has the detail |
 | **P5** | `d`, the trace-grain collapse factor, is ≈2.5 on real traces | on one hour of real traffic: `count() / uniqExact((trace_id, scope, key, val))` over the expanded attribute rows | `d` < 1.3, at which point the index saving is a width saving only and the storage case weakens from −40% to roughly −20% |
@@ -1480,10 +1648,24 @@ ZSTD(3)-to-LZ4 cost ratio. Every worked byte figure moves with them.
   bitwise on 6,000,000 values (§6). It fails if any future path populates
   `attr_num` from something other than the stored text.
 
-**A figure taken through a wrapper is not a figure.** Every counter this document quotes
-with an instrument line was taken by running the statement itself. Two that were not —
-Q6 and Q6b's byte figures — are corrected in §4 Q6, with the reason. Figures carried from
-the earlier 20,000,000-span corpus were not re-derived and say so where they appear.
+**A figure taken through a wrapper is not a figure.** Every `[M]` counter in this
+document was taken by running the statement itself, on the corpus defined at the head of
+§4, with that section's instrument. Figures whose method was not recorded and whose corpus
+no longer exists — the 20,000,000-span Q6b byte and timing ratio, and Q7's original
+1,516,384 / 65,764,280 — are **withdrawn rather than carried**, and are not replaced by
+estimates.
+
+**Three things are established more narrowly than an earlier version of this document
+said.**
+
+- The wrapper's byte difference is 48,001,456, and `trace_id` + `span_id` measured
+  separately are 48,000,640. The mechanism is established from `EXPLAIN header = 1`; the
+  816-byte residue is not attributed.
+- The query-condition cache misses on a 32-id list not seen before, measured with the
+  cache warm from a different list. **How often a real deployment repeats a list is not
+  measured**, so "a production batch never repeats" is not a claim this document makes.
+- The source-committed / no-view-committed boundary was measured with one throwing view
+  beside one healthy view, not independently for all five proposed views.
 
 **The stopping rule.** A new version of this document is warranted by a finding
 that **moves a crossover in §5.2** — the `A_t` at which the storage sign flips,
