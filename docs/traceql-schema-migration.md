@@ -649,8 +649,36 @@ d1246c2c66ba8a932e37eba813769ca7  dfa13942a69d591baaf61bac0fa72a52  4bf1b1119bb6
 8f1b096e54ca056d661e37ff9c76ca41  0141358bb246527351994c56ce011868
 ```
 
-`SHA256` of that list joined by single commas, computed in ClickHouse, is
+`SHA256` of that list joined by single commas, computed in ClickHouse **and by
+`printf %s | sha256sum` on the same bytes**, is
 `73a0e7b4ba4cc136686150904074d6d902318cb598e867a5c0f870e338fad75b`.
+
+**C1 is pinned by a construction script, not by prose.** The script creates both span
+tables, runs the sixteen inserts and the two `OPTIMIZE … FINAL`, and ends by printing one
+digest over the physical layout every counter in §4 depends on:
+
+```sql
+SELECT lower(hex(SHA256(arrayStringConcat(groupArray(
+         concat(table,'|',name,'|',toString(rows),'|',toString(marks))), ';'))))
+FROM (SELECT table, name, rows, marks FROM system.parts
+      WHERE database='c1' AND active AND table IN ('spans_old','spans_new')
+      ORDER BY table, name)
+```
+
+On 26.3.29.7 it prints
+`e58c2eb30291fa579a90fe947f3327776424ffcce2d999507c327c5f39b9d1a0`, over this layout:
+
+    spans_new  20231114_1_5_1  1,185,089 rows  148 marks
+    spans_new  20231115_6_9_1    814,911 rows  102 marks
+    spans_old  20231114_1_5_1  1,185,089 rows  148 marks
+    spans_old  20231115_6_9_1    814,911 rows  102 marks
+
+**A different digest is a different corpus, and that is what a granule disagreement
+is.** C1's window runs from 22:13:20 on one UTC day to 01:13:20 on the next, so
+`PARTITION BY toDate(…)` gives **two parts** and 148 + 102 = 250 marks; a full-window read
+selects 248 of them. A corpus whose spans fall inside one UTC day is **one part** of
+⌈2,000,000 / 8,192⌉ = 245 marks, and the same query then reports 245. Neither is wrong;
+they are different corpora, and the digest is how to tell.
 
 **One earlier attribution is withdrawn.** An earlier version of this section explained a
 non-reproducing hydration counter — 453,824 / 15,464,235 — as an artefact of building the
@@ -1346,12 +1374,33 @@ writer's pin, `client.rs:137`), with a view built to throw on one row of a two-r
     system.parts                       20231114_1_1_0   2 rows   active = 1
     SELECT count() FROM tgt            0
 
-The span rows are stored in an active part and are visible to `SELECT`; the view's target
-is empty. A healthy sibling view's target is empty too — `src tgt tgt_ok` = `2 0 0` with
-the healthy view created before the throwing one and again with it created after — so the
-boundary is **source committed, no view committed**. That was established for one
-throwing view beside one healthy view; it was not measured independently for all five
-views this design proposes.
+The span rows are stored in an active part and are visible to `SELECT`; the throwing
+view's target is empty.
+
+**An earlier version of this section said the boundary is "source committed, no view
+committed". That is wrong, and the correct statement is worse.** Measured with one
+throwing view and **three** healthy sibling views, on twenty fresh databases, stock
+config with `async_insert = 0`, `parallel_view_processing = 0`,
+`materialized_views_ignore_errors = 0`, one two-row block per trial of which the second
+row makes the view throw:
+
+    outcome (src / throwing target / healthy b / healthy c / healthy d)   trials
+    2 / 0 / 0 / 0 / 0     no healthy sibling committed                      14
+    2 / 0 / 0 / 2 / 0     one committed                                      2
+    2 / 0 / 2 / 0 / 0     one committed                                      1
+    2 / 0 / 0 / 0 / 2     one committed                                      1
+    2 / 0 / 2 / 2 / 2     all three committed                                2
+
+What holds on **every** trial: the source rows are committed, and the throwing view's own
+target is empty. What does **not** hold: that the other views commit nothing. **Each
+healthy sibling independently may or may not commit, and which ones do varies between
+runs of the identical statement.** So the failure leaves **partial derived state**, not
+no derived state.
+
+**How many trials it takes to see it.** 6 of 20 trials showed at least one healthy
+sibling committing, so a single trial misses it about 70% of the time. At that rate nine
+trials give about 95% and thirteen about 99%. Twenty trials pin the rate itself only to
+roughly 12–54%, so those trial counts are a working figure, not a measured bound.
 
 The failure therefore leaves the span fetchable by id and **absent from
 `trace_attr_traces`, `trace_recent`, `trace_error_spans` and `trace_tag_catalog`** —
@@ -1472,6 +1521,18 @@ by `render::dist_ddl_template` from `Family::Traces`'s single sharding expressio
 four trace wrappers co-shard on `cityHash64(trace_id)` and every read joins shard-locally
 (§7). `Global` is the catalogue's one cluster-wide replica set, no wrapper.
 
+**One grammar note, because every example in this section is a statement someone will
+paste.** `SETTINGS` goes **before** `VALUES` in an `INSERT`, or in the HTTP query string.
+After `VALUES` it is parsed as row data and rejected. Measured on 26.3.29.7:
+
+    INSERT INTO t VALUES (1) SETTINGS async_insert=0   HTTP 400  Code: 27  Cannot parse input: expected '(' before: 'SETTINGS …
+    INSERT INTO t SETTINGS async_insert=0 VALUES (2)   HTTP 200
+    INSERT INTO t VALUES (3)   with ?async_insert=0    HTTP 200
+
+The rejection code depends on where the parser gives up — `Code: 27` here, `Code: 62`
+where the row text differs — but it is an HTTP 400 either way, and it is easy to read as
+"the setting was applied and the insert failed" when the setting was never seen.
+
 **The odd ids are not decoration.** `trace_spans_dist` is
 `CREATE TABLE … AS trace_spans`, which copies the column list at creation and **does not
 inherit a later base-table `ALTER`**. Migration 32's own comment says so, and in cluster
@@ -1545,8 +1606,10 @@ on the same database, by running each shape's generator:
 
 So a surviving span is reachable by **service, span name, duration and id**, and
 unreachable by **the empty search, every attribute condition, `status = error` and the tag
-dropdown**. `status = error` is the one that changes character: it works today off
-`trace_spans` and stops working because it moves to a derived table. Their attributes were
+dropdown**. **Two shapes change character** — `{}` and `{ status = error }` both read
+`trace_spans` today and both move to a derived table, so both go from answering to
+returning nothing. The rest of the "return nothing" column never read `trace_spans`
+directly in the first place. Their attributes were
 in `trace_attrs_idx`, which id 63 drops.
 
 **Two ways to fix it exist, and both were run.** An earlier version of this section said
@@ -1571,10 +1634,16 @@ there is none; that was false.
    `Code: 469 … Constraint attr_arrays_aligned … is violated at row 1`. **A mutation can
    create rows a later insert would reject**, so any backfill must check alignment itself
    after running.
-3. **Sender order cannot be recovered.** `trace_attrs_idx` stores no position, so a
-   backfill must impose an order of its own. Under §4 Q1's rule — first match in stored
-   order — a backfilled span's answer for a duplicated key is whatever order the backfill
-   chose, not the sender's.
+3. **Sender order cannot be recovered.** `trace_attrs_idx` stores no element position
+   (`catalog.rs:370-384`), so a backfill must impose an order of its own. Under §4 Q1's
+   rule — first match in stored order — a backfilled span's answer for a duplicated key is
+   whatever order the backfill chose, not the sender's. **So the rule is defined over two
+   populations, and the boundary between them is not visible in the data**: live rows
+   answer in the sender's order, backfilled rows in the backfill's. A design that runs a
+   backfill has to either accept that a duplicated key answers differently on either side
+   of the cut-over, or add an element-position column to the index before backfilling —
+   which is a change to a table this design deletes, so in practice it means accepting
+   it and saying so.
 
 Under the issue's premise — no tagged release, no deployments, CI databases created fresh
 per run — none of this arises. **The premise should be
@@ -1634,7 +1703,7 @@ The MV list and `TTL_STMTS` change either way:
 |---|---|---|
 | ~~the `SimpleAggregateFunction` half of the new view is rejected~~ | — | **read: it is not.** §11 P1 |
 | ~~a search batch's 2.2× byte cost is structural~~ | — | **read: on a first-seen batch there is no 2.2×.** The cost of that batch turns on how selective the probed value is, and it is worse than today only for a highly selective probe. §4 Q1 |
-| a materialized view throws and leaves the span stored with no derived rows | a trace is fetchable by id and returns from no search | **read: this happens.** §6.3. No remedy is chosen here |
+| a materialized view throws and leaves the span stored with **some** derived rows and not others | a trace answers some search shapes and not others, and which ones varies between runs of the identical write | **read: this happens, non-deterministically.** §6.3's twenty trials. No remedy is chosen here |
 | a probe's negation is rendered inside `arrayExists` rather than left to the reader | `{ span.k != "x" }` starts matching spans that carry `k = "x"` and stops matching spans with no `k` | §4 Q1's five-case table is the test. Three of the five cases go wrong |
 | the writer moves only the resource/span/instrumentation loop | `event:name`, `event:timeSinceStart`, `link:spanID`, `link:traceID` and every event and link attribute stop being searchable | §1.2. `otlp_traces.rs:505-607` is a second and third emission site with the same row shape |
 | the base-table `ALTER`s ship without their `_dist` twins | single-node CI is green; the first clustered insert fails with `Code: 16 NO_SUCH_COLUMN_IN_TABLE` | §8. Single-node execution cannot see it — the check has to be a clustered insert |
@@ -1684,7 +1753,7 @@ and the reading that refutes it.
 |---|---|---|---|
 | **P1** — **READ, not refuted** | a view doing `ARRAY JOIN` **and** `GROUP BY` can write `SimpleAggregateFunction` columns of an `AggregatingMergeTree`, producing one row per (value, trace, bucket) after merge | create it; insert two blocks holding the same trace; compare `SELECT count()` and the `ts_max`/`dur_max`/`dur_min` values before and after `OPTIMIZE … FINAL` against the expected distinct-tuple count and the expected aggregates | the view is rejected, or the post-merge count is not the distinct-tuple count, or an aggregate column holds anything but the max/min over the collapsed rows. **Outcome:** all three statements accepted on 26.3.29.7; 14 rows across two parts before `OPTIMIZE … FINAL`, 11 after, against 11 distinct tuples computed from the span table; `countIf(ts_max/dur_max/dur_min disagree)` = 0 over 11 compared rows. Ran identically under `async_insert` 0 and 1 |
 | **P2** — **READ; the stopping test itself was defective** | the search batch's 2.2× byte cost falls materially under `PREWHERE trace_id IN (…)`, and today's membership read is expensive on real data | the same batch statement with `WHERE` and with `PREWHERE`, comparing `read_bytes`; then `EXPLAIN indexes = 1` and the membership read's granule selection on a corpus with **high-cardinality** attribute values | **This row compared a mark count against a row count.** §5.2's 24,576 is a number of ROWS — three granules of 8,192 — and this row asked whether `SelectedMarks` stays near it. The two quantities are three orders of magnitude apart and the rule could never be met. Restated: *refuted if `read_bytes` does not fall AND the membership read still selects about 3 marks on a first-seen batch.* **Materiality is now a number, not a word:** the remedy is material if the `PREWHERE` form's `read_bytes` is **at most 0.80×** the `WHERE` form's — a 20% fall, a fifth of the excess the single statement carries. **Outcome:** 30,144,320 / 32,529,648 = **0.927** (26.3.29.7; `use_query_condition_cache=0`, `optimize_move_to_prewhere=1`, `max_block_size=65409`, `max_threads=auto(16)`; corpus C1), 5 reps, zero spread — so the remedy is refuted at that threshold, and at any threshold below 0.93. The membership read selects **246 marks / 2,015,232 rows** on a first-seen batch, not 3 / 24,576. The regression the row exists to price is not there on a first-seen batch |
-| **P3** — **READ, REFUTED** | a materialized view that throws fails the whole `INSERT`, so nothing is stored rather than half | insert a block through a view built to throw; check whether the source part exists | the source part is written and only the view's target is missing. **Outcome: exactly that.** `SELECT count() FROM src` = 2, part `20231114_1_1_0` active with 2 rows, target 0, client told `Code: 395`. §6.3 carries the full reading and what it means |
+| **P3** — **READ, REFUTED, and the refutation is wider than first recorded** | a materialized view that throws fails the whole `INSERT`, so nothing is stored rather than half | insert a block through a view built to throw; check whether the source part exists | the source part is written and only the view's target is missing. **Outcome: the source part is written, the throwing view's target is empty, and the OTHER views commit or not, non-deterministically.** Twenty trials with three healthy siblings: 14 committed none, 4 committed exactly one, 2 committed all three. §6.3 has the distribution. The first reading of this row saw one healthy sibling and one throwing view and concluded "no view committed"; with a single sibling that outcome appears about 70% of the time |
 | **P4** — **READ, not refuted; the conditional half is refuted** | `{}` reads 12× fewer rows guaranteed, and 144× if the read can stop at the newest bucket | `EXPLAIN indexes = 1` and `read_rows` for the `trace_recent` statement in §4 Q0 | `read_rows` is not below the span-table figure. **Outcome:** 167,277 against 2,000,000 — 11.96×, so not refuted. The 144× does not occur: `Granules: 22/22`, and three optimiser settings each read the same 167,277 rows and 22 marks. §4 Q0 has the detail |
 | **P5** | `d`, the trace-grain collapse factor, is ≈2.5 on real traces | on one hour of real traffic: `count() / uniqExact((trace_id, scope, key, val))` over the expanded attribute rows | `d` < 1.3, at which point the index saving is a width saving only and the storage case weakens from −40% to roughly −20% |
 | **P6** | storage is 1047.9 → 625.7 B/span | build both schemas from one source table, `OPTIMIZE … FINAL`, `sum(bytes_on_disk)` from `system.parts`, on two corpora with `A_t` at both ends of its range | the new schema is not smaller on a corpus with `A_t` ≥ 200 |
@@ -1783,8 +1852,11 @@ said.**
 - The query-condition cache misses on a 32-id list not seen before, measured with the
   cache warm from a different list. **How often a real deployment repeats a list is not
   measured**, so "a production batch never repeats" is not a claim this document makes.
-- The source-committed / no-view-committed boundary was measured with one throwing view
-  beside one healthy view, not independently for all five proposed views.
+- **The source-committed / no-view-committed boundary is withdrawn.** It came from one
+  throwing view beside one healthy view, an outcome that appears about 70% of the time
+  with a single sibling. With three siblings and twenty trials the failure leaves
+  **partial** derived state, non-deterministically. §6.3 carries the distribution and
+  what it takes to observe it.
 - The clustered path is measured for **column presence and one insert** through a
   single-node `Distributed`. Multi-shard routing, `cityHash64(trace_id)` co-sharding of
   the four new wrappers, and a clustered read were not measured here.
