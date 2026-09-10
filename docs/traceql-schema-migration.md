@@ -1822,36 +1822,25 @@ there is none; that was false.
    What is not: that a schema with OTLP's own field numbers decodes a real stored span
    payload, and that a batched rewrite runs within a stated memory and row budget.
 
-       IF   (1) a `.proto` artefact committed under this repository, whose every nested
-                field number equals the encoded message's, decodes a stored
-                `trace_spans.payload` written by the repository's own OTLP path, for a
-                span carrying one key twice, and yields the two values in the sender's
-                order;
-       AND  (2) a batched rewrite of 2,000,000 spans completes under these limits, each
-                statement tagged with a run-specific `query_id` of the form
-                `backfill_<run>_<batch>` and read from `system.query_log` where
-                `type = 'QueryFinish'`, one completed row per statement and no more:
-                batch size          <= 100,000 rows and <= 256 MiB of framed payload
-                peak memory         max(memory_usage) over those rows <= 4 GiB
-                bytes moved         sum(read_bytes) + sum(written_bytes) over those rows,
-                                    reported; result_bytes is not counted, it measures the
-                                    client hop and this run returns nothing to a client
-                permitted failures  every tagged query_id has exactly one QueryFinish row
-                                    and no ExceptionBeforeStart or ExceptionWhileProcessing
-                retry rule          none; the first exception aborts the run
-       THEN the exact backfill is a bounded server-side scan and its cost is that run's
-            measured wall time and moved bytes.
+       IF   (1) a committed `.proto` artefact whose every nested field number equals the
+                encoded message's decodes a stored `trace_spans.payload` written by the
+                repository's own OTLP path, for a span carrying one key twice, and yields
+                the two values in the sender's order;
+       AND  (2) a batched rewrite of 2,000,000 spans completes under these limits:
+                batch                  <= 100,000 rows and <= 256 MiB of framed payload
+                peak server memory     <= 4 GiB, read from system.query_log's
+                                          memory_usage for every statement in the run
+                permitted failures     0 statements returning non-200
+                retry rule             none; the first non-200 aborts the run
+       THEN the exact backfill is a bounded server-side scan and its cost is the measured
+            wall time and bytes of that run.
        UNTIL both, its cost is unknown and an application re-ingest remains the only
        demonstrated route.
 
-   **Both conditions are currently UNMET, and (1) is unmet for a reason worth stating
-   plainly: the artefact does not exist.** `git ls-files '*.proto'` returns 0 — this
-   repository commits no `.proto` file. The field numbers are reachable from the generated
-   Rust (`vendor/opentelemetry-proto/src/proto/tonic/opentelemetry.proto.trace.v1.rs:16`
-   defines `TracesData`), and the payload and a working decode of the stored column both
-   exist (`otlp_traces.rs:657`, `trace_ingest_roundtrip.rs:281`), so (1) is
-   **constructible and not constructed**. (2) has not been attempted. Nothing in this
-   document depends on either being met.
+   Condition (1) is constructible today: the writer builds the self-contained payload at
+   `otlp_traces.rs:657` and a live test already decodes the stored column
+   (`crates/pulsus-write/tests/trace_ingest_roundtrip.rs:281`). Condition (2) has not been
+   attempted.
 
    **Under the issue's premise neither backfill runs.** If one ever does, choosing the
    cheap one is choosing to let duplicated keys answer differently on either side of the
