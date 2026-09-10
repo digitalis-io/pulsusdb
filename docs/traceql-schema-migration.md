@@ -653,40 +653,107 @@ d1246c2c66ba8a932e37eba813769ca7  dfa13942a69d591baaf61bac0fa72a52  4bf1b1119bb6
 `printf %s | sha256sum` on the same bytes**, is
 `73a0e7b4ba4cc136686150904074d6d902318cb598e867a5c0f870e338fad75b`.
 
-**C1 is pinned by a construction script, not by prose.** The script creates both span
-tables, runs the sixteen inserts and the two `OPTIMIZE … FINAL`, and ends by printing one
-digest over the physical layout every counter in §4 depends on:
+**C1 is pinned by the construction itself, not by prose and not by a layout digest.**
+An earlier version of this section published only the final digest query; reconstructing
+the build from the surrounding prose produced 146/101 marks and a different digest, which
+is what an unpublished construction is worth. The script, in full:
 
-```sql
-SELECT lower(hex(SHA256(arrayStringConcat(groupArray(
-         concat(table,'|',name,'|',toString(rows),'|',toString(marks))), ';'))))
-FROM (SELECT table, name, rows, marks FROM system.parts
-      WHERE database='c1' AND active AND table IN ('spans_old','spans_new')
-      ORDER BY table, name)
+```bash
+#!/bin/bash
+set -eu
+CH="${1:-http://127.0.0.1:8123}"
+q() { curl -sS --data-binary @- "$CH/?database=c1&max_insert_threads=1&max_threads=1&max_block_size=65409&max_execution_time=3600"; }
+curl -sS --data-binary "DROP DATABASE IF EXISTS c1" "$CH/" >/dev/null
+curl -sS --data-binary "CREATE DATABASE c1" "$CH/" >/dev/null
+for T in spans_old spans_new; do
+  EXTRA=""
+  [ "$T" = spans_new ] && EXTRA=",
+    attr_key Array(LowCardinality(String)), attr_scope Array(LowCardinality(String)),
+    attr_val Array(String), attr_type Array(LowCardinality(String)), attr_num Array(Nullable(Float64))"
+  q <<EOF
+CREATE TABLE c1.$T (
+  trace_id FixedString(16), span_id FixedString(8), parent_id FixedString(8),
+  name LowCardinality(String), service LowCardinality(String),
+  timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)), duration_ns Int64 CODEC(T64, ZSTD(1)),
+  status_code Int8, kind Int8, payload_type Int8, shared UInt8, status_message String,
+  scope_name LowCardinality(String), scope_version LowCardinality(String),
+  payload String CODEC(ZSTD(3))$EXTRA
+) ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+ORDER BY (trace_id, timestamp_ns) SETTINGS ttl_only_drop_parts = 1
+EOF
+done
+for i in 0 1 2 3 4 5 6 7; do LO=$((i*250000))
+ for T in spans_new spans_old; do
+  COLS=""
+  [ "$T" = spans_new ] && COLS=",
+  ['service.name','deployment.environment','k8s.cluster','http.method','http.status_code','http.target','user.id','request.id'],
+  ['resource','resource','resource','span','span','span','span','span'],
+  [concat('svc-', toString(intDiv(n,3) % 20)), 'prod', 'eu-west-1',
+   ['GET','POST','PUT','DELETE'][(n % 4) + 1], ['200','400','500','503'][(n % 4) + 1],
+   concat('/api/v1/r', toString(n % 50)), concat('u-', toString(intDiv(n,12))), concat('r-', toString(n))],
+  ['string','string','string','string','int','string','string','string'],
+  [NULL,NULL,NULL,NULL, toFloat64([200,400,500,503][(n % 4) + 1]), NULL,NULL,NULL]"
+  q <<EOF
+INSERT INTO c1.$T SELECT
+  reinterpretAsFixedString(sipHash128(intDiv(n,12))), reinterpretAsFixedString(sipHash64(n)),
+  reinterpretAsFixedString(sipHash64(intDiv(n,12)*12)),
+  concat('GET /op/', toString(n % 50)), concat('svc-', toString(intDiv(n,3) % 20)),
+  toInt64(1700000000000000000 + intDiv(n,12)*64800000 + (n%12)*100000000),
+  toInt64(100000 + (n % 997) * 3000000),
+  if(n % 100 = 0, toInt8(2), toInt8(0)), toInt8(n % 5), toInt8(0), toUInt8(0), '', 'scope', '1.0',
+  repeat(substring(concat(lower(hex(sipHash128(n))), lower(hex(sipHash128(n+1))),
+                          lower(hex(sipHash128(n+2))), lower(hex(sipHash128(n+3)))), 1, 100), 4)$COLS
+FROM (SELECT number AS n FROM numbers($LO, 250000))
+EOF
+ done
+done
+for T in spans_old spans_new; do curl -sS --data-binary "OPTIMIZE TABLE c1.$T FINAL" "$CH/?database=c1&max_execution_time=3600" >/dev/null; done
 ```
 
-On 26.3.29.7 it prints
-`e58c2eb30291fa579a90fe947f3327776424ffcce2d999507c327c5f39b9d1a0`, over this layout:
+**The identity is content, not layout.** A digest over parts, rows and marks alone does
+not distinguish two corpora whose queries behave differently. Measured: a second corpus
+built by the same script with the span name changed from `n % 50` to `n % 51` produced the
+**identical** layout digest `e58c2eb3…` and a different `{name = …}` granule count. The
+identity below covers both:
+
+```sql
+WITH
+  (SELECT arrayStringConcat(groupArray(concat(table,'|',name,'|',toString(rows),'|',toString(marks))), ';')
+     FROM (SELECT table, name, rows, marks FROM system.parts
+           WHERE database='c1' AND active AND table IN ('spans_old','spans_new')
+           ORDER BY table, name)) AS layout,
+  (SELECT arrayStringConcat(arraySort(groupArray(concat(k,'=',v))), ';') FROM (
+     SELECT 'a_rows' AS k, toString(count()) AS v FROM spans_new
+     UNION ALL SELECT 'b_traces',   toString(uniqExact(trace_id))        FROM spans_new
+     UNION ALL SELECT 'c_names',    toString(uniqExact(name))            FROM spans_new
+     UNION ALL SELECT 'd_services', toString(uniqExact(service))         FROM spans_new
+     UNION ALL SELECT 'e_errors',   toString(countIf(status_code = 2))   FROM spans_new
+     UNION ALL SELECT 'f_tsmin',    toString(min(timestamp_ns))          FROM spans_new
+     UNION ALL SELECT 'g_tsmax',    toString(max(timestamp_ns))          FROM spans_new
+     UNION ALL SELECT 'h_cells',    toString(sum(length(attr_key)))      FROM spans_new
+     UNION ALL SELECT 'i_sumdur',   toString(sum(duration_ns))           FROM spans_new
+     UNION ALL SELECT 'j_ckold',    toString(sum(sipHash64(trace_id, timestamp_ns, name, service, status_code, duration_ns))) FROM spans_old
+     UNION ALL SELECT 'k_cknew',    toString(sum(sipHash64(trace_id, timestamp_ns, name, service, status_code, duration_ns))) FROM spans_new
+  )) AS content
+SELECT lower(hex(SHA256(concat(layout, '#', content)))) AS c1_identity
+```
+
+    C1                                  fa2b69757f6737a368868c47cfd210e8eeb7043d0c8ea7277c2ae10a01ef1581
+    the same script, name n % 51        5119ae707931f577f7d8c29d3e8526bf569bb46a46f6930a8d84b4ab9e68fa0e
+    layout-only digest, BOTH corpora    e58c2eb30291fa579a90fe947f3327776424ffcce2d999507c327c5f39b9d1a0
 
     spans_new  20231114_1_5_1  1,185,089 rows  148 marks
     spans_new  20231115_6_9_1    814,911 rows  102 marks
     spans_old  20231114_1_5_1  1,185,089 rows  148 marks
     spans_old  20231115_6_9_1    814,911 rows  102 marks
 
-**A different digest is a different corpus, and that is what a granule disagreement
-is.** C1's window runs from 22:13:20 on one UTC day to 01:13:20 on the next, so
-`PARTITION BY toDate(…)` gives **two parts** and 148 + 102 = 250 marks; a full-window read
-selects 248 of them. A corpus whose spans fall inside one UTC day is **one part** of
-⌈2,000,000 / 8,192⌉ = 245 marks, and the same query then reports 245. Neither is wrong;
-they are different corpora, and the digest is how to tell.
-
-**One earlier attribution is withdrawn.** An earlier version of this section explained a
-non-reproducing hydration counter — 453,824 / 15,464,235 — as an artefact of building the
-old span table with a single `INSERT … SELECT` and a random payload. Two independent
-reconstructions of that build produced 455,036 / 15,580,652 and 451,852 / 15,416,907;
-neither is the figure the explanation was offered for. **The construction accounts for the
-mark counts 246/492, which both reconstructions reproduced, and not for the hydration
-counter. That counter's corpus no longer exists and its cause is unknown.**
+**The mark arithmetic, corrected.** `system.parts.marks` counts one terminal mark per
+part. C1's window runs 22:13:20 → 01:13:20 UTC, so `PARTITION BY toDate(…)` gives **two
+parts** with 148 + 102 = 250 marks, which is `(148−1) + (102−1) = 248` readable granules —
+the figure `EXPLAIN` and `SelectedMarks` report. A corpus inside one UTC day is one part
+of `ceil(2,000,000 / 8,192) = 245` readable granules, which `system.parts` records as
+**246** marks. An earlier version of this section equated the two counts.
 
 ### Q0 — `{}`, the query the search form sends before you type anything
 
@@ -1374,40 +1441,48 @@ writer's pin, `client.rs:137`), with a view built to throw on one row of a two-r
     system.parts                       20231114_1_1_0   2 rows   active = 1
     SELECT count() FROM tgt            0
 
-The span rows are stored in an active part and are visible to `SELECT`; the throwing
-view's target is empty.
+**This section records a measured distribution and states no invariant beyond the one
+that survived every trial.** Two earlier versions of it stated a rule — first "no view
+committed", then "the source is always committed" — and both were refuted by more trials.
 
-**An earlier version of this section said the boundary is "source committed, no view
-committed". That is wrong, and the correct statement is worse.** Measured with one
-throwing view and **three** healthy sibling views, on twenty fresh databases, stock
-config with `async_insert = 0`, `parallel_view_processing = 0`,
-`materialized_views_ignore_errors = 0`, one two-row block per trial of which the second
-row makes the view throw:
+Topology: one throwing view and **three** healthy sibling views over the same source
+table, one two-row block per trial whose second row makes the view throw, a fresh
+database per trial. Stock config with `async_insert = 0`,
+`parallel_view_processing = 0`, `materialized_views_ignore_errors = 0`, ClickHouse
+26.3.29.7. Every insert returned `HTTP 500`, `Code: 395`.
 
-    outcome (src / throwing target / healthy b / healthy c / healthy d)   trials
-    2 / 0 / 0 / 0 / 0     no healthy sibling committed                      14
-    2 / 0 / 0 / 2 / 0     one committed                                      2
-    2 / 0 / 2 / 0 / 0     one committed                                      1
-    2 / 0 / 0 / 0 / 2     one committed                                      1
-    2 / 0 / 2 / 2 / 2     all three committed                                2
+    src / throwing / b / c / d      20 trials    300 trials
+    0 / 0 / 0 / 0 / 0                      0            3
+    2 / 0 / 0 / 0 / 0                     14          246
+    2 / 0 / 2 / 0 / 0                      1            7
+    2 / 0 / 0 / 2 / 0                      2            6
+    2 / 0 / 0 / 0 / 2                      1           11
+    2 / 0 / 2 / 2 / 0                      0            6
+    2 / 0 / 2 / 0 / 2                      0            8
+    2 / 0 / 0 / 2 / 2                      0            6
+    2 / 0 / 2 / 2 / 2                      2            7
+    per-sibling commits b/c/d              -    28/25/32
 
-What holds on **every** trial: the source rows are committed, and the throwing view's own
-target is empty. What does **not** hold: that the other views commit nothing. **Each
-healthy sibling independently may or may not commit, and which ones do varies between
-runs of the identical statement.** So the failure leaves **partial derived state**, not
-no derived state.
+**One thing held on every one of the 300 trials: the throwing view's own target is
+empty.** Nothing else did.
 
-**How many trials it takes to see it.** 6 of 20 trials showed at least one healthy
-sibling committing, so a single trial misses it about 70% of the time. At that rate nine
-trials give about 95% and thirteen about 99%. Twenty trials pin the rate itself only to
-roughly 12–54%, so those trial counts are a working figure, not a measured bound.
+- **Source-present is not an invariant.** 3 of 300 trials left the source table empty as
+  well, and those rows were still absent three seconds later. An assertion that the span
+  rows survive rejects real server behaviour.
+- **The siblings are not independent.** All-three-commit came out 7 times against about
+  0.25 expected from the marginals `28/300, 25/300, 32/300`. Whatever couples them is not
+  measured here.
+- **No trial-count rule is derived from this.** An earlier version computed "9 trials for
+  95%" from a three-sibling rate applied to a one-sibling experiment; that inference is
+  withdrawn, and no replacement is offered. What the table supports is that a single
+  trial commonly shows the all-empty outcome and that more trials show others.
 
-The failure therefore leaves the span fetchable by id and **absent from
-`trace_attr_traces`, `trace_recent`, `trace_error_spans` and `trace_tag_catalog`** —
-invisible to every search shape. Today's equivalent failure (§2.5 row 1) removes only
-the attribute index. `trace_spans` passes `on_flush_poisoned: None`
-(`writer/trace.rs:172`), the structural append-only exclusion (`backfill.rs:23-28`), so
-nothing replays it.
+**What the failure leaves is per-target state, and which targets varies.** A span whose
+write failed this way may be present or absent; each derived table may or may not hold
+its rows; the search shapes that answer for it follow from which targets happen to be
+populated. Today's equivalent failure (§2.5 row 1) removes only the attribute index.
+`trace_spans` passes `on_flush_poisoned: None` (`writer/trace.rs:172`), the structural
+append-only exclusion (`backfill.rs:23-28`), so nothing replays it.
 
 One further reading, same server: with the source at
 `non_replicated_deduplication_window = 100`, inserting the identical block twice left the
@@ -1525,13 +1600,31 @@ four trace wrappers co-shard on `cityHash64(trace_id)` and every read joins shar
 paste.** `SETTINGS` goes **before** `VALUES` in an `INSERT`, or in the HTTP query string.
 After `VALUES` it is parsed as row data and rejected. Measured on 26.3.29.7:
 
-    INSERT INTO t VALUES (1) SETTINGS async_insert=0   HTTP 400  Code: 27  Cannot parse input: expected '(' before: 'SETTINGS …
-    INSERT INTO t SETTINGS async_insert=0 VALUES (2)   HTTP 200
-    INSERT INTO t VALUES (3)   with ?async_insert=0    HTTP 200
+    INSERT INTO t VALUES (1) SETTINGS async_insert=0        HTTP 400  Code: 27  Cannot parse input: expected '(' before: 'SETTINGS …
+    INSERT INTO t (a) VALUES ( SETTINGS async_insert=0       HTTP 400  Code: 62  Cannot parse expression of type UInt8 here: SETTINGS …
+    INSERT INTO t SETTINGS async_insert=0 VALUES (2)         HTTP 200
+    INSERT INTO t VALUES (3)   with ?async_insert=0          HTTP 200
+    INSERT INTO t VALUES (4); SETTINGS async_insert=0        HTTP 200   <- the row lands, the setting is DROPPED
+    INSERT INTO t VALUES (5); THIS IS IGNORED                HTTP 200   <- so does anything else after the semicolon
 
-The rejection code depends on where the parser gives up — `Code: 27` here, `Code: 62`
-where the row text differs — but it is an HTTP 400 either way, and it is easy to read as
-"the setting was applied and the insert failed" when the setting was never seen.
+The rejection code depends on where the parser gives up: `Code: 27` when the row is
+complete and the clause is read as another row, `Code: 62` when the row is incomplete and
+the clause is read as a missing expression. Both are HTTP 400, and both read like "the
+setting was applied and the insert failed" when the setting was never seen.
+
+**The semicolon case is the dangerous one, because it returns 200.** A semicolon ends the
+`VALUES` input over HTTP and everything after it is ignored — including a `SETTINGS`
+clause meant to be applied. Measured with a setting whose effect is visible:
+
+    INSERT INTO t2 SETTINGS max_partitions_per_insert_block=1 VALUES ('2023-11-14',1),('2023-11-15',2)
+      -> HTTP 500  Code: 252  Too many partitions for single INSERT block
+    the same statement with the setting as a query parameter
+      -> HTTP 500  Code: 252
+    INSERT INTO t2 VALUES ('2023-11-14',5),('2023-11-15',6); SETTINGS max_partitions_per_insert_block=1
+      -> HTTP 200, two rows stored
+
+So a statement that looks like it carries a setting, returns success, and stores its rows
+may have run with none of it applied.
 
 **The odd ids are not decoration.** `trace_spans_dist` is
 `CREATE TABLE … AS trace_spans`, which copies the column list at creation and **does not
@@ -1634,16 +1727,27 @@ there is none; that was false.
    `Code: 469 … Constraint attr_arrays_aligned … is violated at row 1`. **A mutation can
    create rows a later insert would reject**, so any backfill must check alignment itself
    after running.
-3. **Sender order cannot be recovered.** `trace_attrs_idx` stores no element position
-   (`catalog.rs:370-384`), so a backfill must impose an order of its own. Under §4 Q1's
-   rule — first match in stored order — a backfilled span's answer for a duplicated key is
-   whatever order the backfill chose, not the sender's. **So the rule is defined over two
-   populations, and the boundary between them is not visible in the data**: live rows
-   answer in the sender's order, backfilled rows in the backfill's. A design that runs a
-   backfill has to either accept that a duplicated key answers differently on either side
-   of the cut-over, or add an element-position column to the index before backfilling —
-   which is a change to a table this design deletes, so in practice it means accepting
-   it and saying so.
+3. **Sender order IS recoverable, from a column this design keeps.** An earlier version
+   of this list said it was not, on the premise that only `trace_attrs_idx` could carry
+   it and that table has no element-position column (`catalog.rs:370-384`). That premise
+   was wrong. `trace_spans.payload` holds a self-contained `TracesData` — this span with
+   its own resource and scope, prost-encoded, both schema URLs kept — built by
+   `build_payload` at `otlp_traces.rs:654-674`. **The sender's attribute order is inside
+   it, for every stored span, on the table this change keeps.**
+
+   So there are two backfills, not one, and they differ in exactly this:
+
+   | backfill | attribute order | mechanism |
+   |---|---|---|
+   | from `trace_attrs_idx` | **imposed by the backfill.** A duplicated key can answer differently from a live row | pure SQL: the `joinGet` mutation or the rebuild above |
+   | from `payload` | **the sender's, exactly.** A backfilled row answers identically to a live one | **not expressible in SQL.** `system.functions` on 26.3.29.7 has no expression-level protobuf decoder — only `structureToProtobufSchema`, which generates a schema. Decoding is a pass through our own code: read each span, decode, write the arrays |
+
+   The second is the one that preserves §4 Q1's rule across the cut-over, and its cost is
+   a full read-decode-write pass over every stored span rather than a server-side
+   mutation. **Under the issue's premise neither runs.** What this section records is that
+   if one ever does, choosing the cheap one is choosing to let duplicated keys answer
+   differently on either side of the cut-over, and that is a choice rather than a
+   limitation.
 
 Under the issue's premise — no tagged release, no deployments, CI databases created fresh
 per run — none of this arises. **The premise should be
@@ -1753,7 +1857,7 @@ and the reading that refutes it.
 |---|---|---|---|
 | **P1** — **READ, not refuted** | a view doing `ARRAY JOIN` **and** `GROUP BY` can write `SimpleAggregateFunction` columns of an `AggregatingMergeTree`, producing one row per (value, trace, bucket) after merge | create it; insert two blocks holding the same trace; compare `SELECT count()` and the `ts_max`/`dur_max`/`dur_min` values before and after `OPTIMIZE … FINAL` against the expected distinct-tuple count and the expected aggregates | the view is rejected, or the post-merge count is not the distinct-tuple count, or an aggregate column holds anything but the max/min over the collapsed rows. **Outcome:** all three statements accepted on 26.3.29.7; 14 rows across two parts before `OPTIMIZE … FINAL`, 11 after, against 11 distinct tuples computed from the span table; `countIf(ts_max/dur_max/dur_min disagree)` = 0 over 11 compared rows. Ran identically under `async_insert` 0 and 1 |
 | **P2** — **READ; the stopping test itself was defective** | the search batch's 2.2× byte cost falls materially under `PREWHERE trace_id IN (…)`, and today's membership read is expensive on real data | the same batch statement with `WHERE` and with `PREWHERE`, comparing `read_bytes`; then `EXPLAIN indexes = 1` and the membership read's granule selection on a corpus with **high-cardinality** attribute values | **This row compared a mark count against a row count.** §5.2's 24,576 is a number of ROWS — three granules of 8,192 — and this row asked whether `SelectedMarks` stays near it. The two quantities are three orders of magnitude apart and the rule could never be met. Restated: *refuted if `read_bytes` does not fall AND the membership read still selects about 3 marks on a first-seen batch.* **Materiality is now a number, not a word:** the remedy is material if the `PREWHERE` form's `read_bytes` is **at most 0.80×** the `WHERE` form's — a 20% fall, a fifth of the excess the single statement carries. **Outcome:** 30,144,320 / 32,529,648 = **0.927** (26.3.29.7; `use_query_condition_cache=0`, `optimize_move_to_prewhere=1`, `max_block_size=65409`, `max_threads=auto(16)`; corpus C1), 5 reps, zero spread — so the remedy is refuted at that threshold, and at any threshold below 0.93. The membership read selects **246 marks / 2,015,232 rows** on a first-seen batch, not 3 / 24,576. The regression the row exists to price is not there on a first-seen batch |
-| **P3** — **READ, REFUTED, and the refutation is wider than first recorded** | a materialized view that throws fails the whole `INSERT`, so nothing is stored rather than half | insert a block through a view built to throw; check whether the source part exists | the source part is written and only the view's target is missing. **Outcome: the source part is written, the throwing view's target is empty, and the OTHER views commit or not, non-deterministically.** Twenty trials with three healthy siblings: 14 committed none, 4 committed exactly one, 2 committed all three. §6.3 has the distribution. The first reading of this row saw one healthy sibling and one throwing view and concluded "no view committed"; with a single sibling that outcome appears about 70% of the time |
+| **P3** — **READ, REFUTED, and the refutation is wider than first recorded** | a materialized view that throws fails the whole `INSERT`, so nothing is stored rather than half | insert a block through a view built to throw; check whether the source part exists | the source part is written and only the view's target is missing. **Outcome, over 300 trials: one thing held every time — the throwing view's own target is empty. Nothing else did**, including the source part, which was absent in 3 of 300. §6.3 has the distribution. This row's prediction is refuted; no replacement rule is stated |
 | **P4** — **READ, not refuted; the conditional half is refuted** | `{}` reads 12× fewer rows guaranteed, and 144× if the read can stop at the newest bucket | `EXPLAIN indexes = 1` and `read_rows` for the `trace_recent` statement in §4 Q0 | `read_rows` is not below the span-table figure. **Outcome:** 167,277 against 2,000,000 — 11.96×, so not refuted. The 144× does not occur: `Granules: 22/22`, and three optimiser settings each read the same 167,277 rows and 22 marks. §4 Q0 has the detail |
 | **P5** | `d`, the trace-grain collapse factor, is ≈2.5 on real traces | on one hour of real traffic: `count() / uniqExact((trace_id, scope, key, val))` over the expanded attribute rows | `d` < 1.3, at which point the index saving is a width saving only and the storage case weakens from −40% to roughly −20% |
 | **P6** | storage is 1047.9 → 625.7 B/span | build both schemas from one source table, `OPTIMIZE … FINAL`, `sum(bytes_on_disk)` from `system.parts`, on two corpora with `A_t` at both ends of its range | the new schema is not smaller on a corpus with `A_t` ≥ 200 |
@@ -1852,11 +1956,12 @@ said.**
 - The query-condition cache misses on a 32-id list not seen before, measured with the
   cache warm from a different list. **How often a real deployment repeats a list is not
   measured**, so "a production batch never repeats" is not a claim this document makes.
-- **The source-committed / no-view-committed boundary is withdrawn.** It came from one
-  throwing view beside one healthy view, an outcome that appears about 70% of the time
-  with a single sibling. With three siblings and twenty trials the failure leaves
-  **partial** derived state, non-deterministically. §6.3 carries the distribution and
-  what it takes to observe it.
+- **Every boundary rule this document has stated for a throwing view is withdrawn.**
+  "No view committed" was refuted by three-sibling trials; "the source is always
+  committed" was refuted at 3 of 300. §6.3 now records the distribution and asserts one
+  thing only: the throwing view's own target was empty on 300 of 300 trials. The coupling
+  between siblings, the cause of the empty-source cases, and any trial count for
+  detection are **not** established here.
 - The clustered path is measured for **column presence and one insert** through a
   single-node `Distributed`. Multi-shard routing, `cityHash64(trace_id)` co-sharding of
   the four new wrappers, and a clustered read were not measured here.
