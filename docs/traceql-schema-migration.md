@@ -1505,7 +1505,7 @@ What remains unmeasured:
 
 | not measured | why it matters |
 |---|---|
-| whether the source-committed/no-view-committed boundary holds for all **five** proposed views | it was established for one throwing view beside one healthy view. §6.3 |
+| **why the per-target outcomes are distributed the way §6.3 records** | 300 trials give the distribution and explain none of it. The siblings are not independent — all-three came out 7 against about 0.25 from the marginals — and 3 trials left the source table empty too. Neither the coupling nor the empty-source cases is explained. There is no boundary rule to hold or fail for five views; there is a distribution whose mechanism is unknown |
 | `d`, the trace-grain collapse factor, on real traces | it scales the whole index saving. §11 P5 |
 | the byte cost of the `event_set_sql` read after it moves to an `ARRAY JOIN` over `trace_spans` | it is the one phase-2 read that stays a separate statement. §4 Q1 |
 | the scalar value read (`arrayFirstIndex` + element extraction) against today's `attr_values_sql` | the shape is bounded by construction; the byte cost is not measured |
@@ -1740,14 +1740,50 @@ there is none; that was false.
    | backfill | attribute order | mechanism |
    |---|---|---|
    | from `trace_attrs_idx` | **imposed by the backfill.** A duplicated key can answer differently from a live row | pure SQL: the `joinGet` mutation or the rebuild above |
-   | from `payload` | **the sender's, exactly.** A backfilled row answers identically to a live one | **not expressible in SQL.** `system.functions` on 26.3.29.7 has no expression-level protobuf decoder — only `structureToProtobufSchema`, which generates a schema. Decoding is a pass through our own code: read each span, decode, write the arrays |
+   | from `payload` | **the sender's, exactly.** A backfilled row answers identically to a live one | **a bounded server-side scan.** The `format` table function decodes a stored `String` and preserves element order. See below for what it takes |
 
-   The second is the one that preserves §4 Q1's rule across the cut-over, and its cost is
-   a full read-decode-write pass over every stored span rather than a server-side
-   mutation. **Under the issue's premise neither runs.** What this section records is that
-   if one ever does, choosing the cheap one is choosing to let duplicated keys answer
-   differently on either side of the cut-over, and that is a choice rather than a
-   limitation.
+   **An earlier version of this section said the second was "not expressible in SQL". It
+   is.** That claim rested on a search of `system.functions`, which is the wrong place to
+   look: a capability can live in a scalar function, a table function, a table engine, a
+   view, or a **format**, and protobuf decoding lives in the last two. Measured on
+   26.3.29.7:
+
+       system.functions      no scalar protobuf decoder      (the search that produced the false claim)
+       system.formats        Protobuf, ProtobufList, ProtobufSingle
+       table functions       file, format, input, url, values
+         file(...)           Code 107
+         url(...)            bad URI, HTTP 500
+         input(...)          Code 477 outside an INSERT
+         format(...)         WORKS
+
+       SELECT * FROM format(ProtobufSingle, 'x UInt8', unhex('0801'))                     -> 1
+       SELECT * FROM format(ProtobufSingle, 'x UInt8', (SELECT payload FROM t WHERE id=1)) -> 1
+       SELECT * FROM format(ProtobufSingle, 'x Array(UInt32)', unhex('0a020705'))          -> [7,5]
+       SELECT * FROM format(ProtobufSingle, 'x Array(UInt32)', unhex('0a020507'))          -> [5,7]
+
+   **Element order survives**, which is the whole point of decoding the payload at all.
+
+   Two conditions the recipe has to meet, both measured:
+
+   1. **Bulk decoding needs correct varint framing.** `ProtobufSingle` takes one message.
+      `Protobuf` takes a length-delimited stream, and the blob can be built server-side
+      from a stored column. The obvious `concat(char(length(p)), p)` is a **one-byte**
+      varint and breaks above 127 bytes — on a 400-byte payload it returns
+      `Code: 32 … Attempt to read after eof`. The two-byte form
+      `char(bitOr(bitAnd(len,127),128), intDiv(len,128))` decoded the same payload and
+      returned its 397 content bytes.
+   2. **The generated schema numbers fields sequentially from 1.**
+      `structureToProtobufSchema` builds nested `message`s with `repeated` fields, so the
+      shape of `TracesData` is expressible — but a structure only decodes OTLP correctly
+      where OTLP's own field numbers line up with the generated ones. **That end-to-end
+      decode of a real span payload is not demonstrated here**; the mechanism is, and the
+      framing is.
+
+   So the cost of the exact backfill is **a bounded server-side read/decode/write scan** —
+   batches of spans framed, decoded and rewritten by the server — not necessarily an
+   application re-ingest. **Under the issue's premise neither backfill runs.** If one ever
+   does, choosing the cheap one is choosing to let duplicated keys answer differently on
+   either side of the cut-over, and that is a choice rather than a limitation.
 
 Under the issue's premise — no tagged release, no deployments, CI databases created fresh
 per run — none of this arises. **The premise should be
