@@ -19,6 +19,36 @@ Three shorter parts follow: [what can never become SQL](#5-what-can-never-become
 we already refuse](#6-the-queries-we-already-refuse), [where we and the reference disagree](#7-where-we-and-the-reference-disagree),
 and [the limits](#8-the-limits).
 
+**Editing this document, hazard one: anchor on position, not on text.** Its separators and phrases
+repeat, so an edit that matches text can land somewhere else. Two runs were lost to it on 2026-09-09:
+a whole-document replace of a `file:line` citation edited two occurrences instead of the one intended,
+turning a perturbation into a no-op that returned the baseline; and a `---` used as a restore anchor
+is not unique, so a block came back at the wrong separator, caught by a `git diff --numstat` of
+`3148 3148`. Take the line range first, edit by range, and read `git diff --numstat` before believing
+any run that follows.
+
+**Hazard two: four generators, and they are not one command.** An edit anywhere in this file can move
+positions recorded in two independent datasets, and each has its own ignored regenerator:
+
+```sh
+cargo test -p pulsus-read --test design_record_drift_gate -- --ignored regenerate_the_count_site_lines
+cargo test -p pulsus-read --test design_record_drift_gate -- --ignored regenerate_the_citation_datasets
+cargo test -p pulsus-read --test design_record_drift_gate -- --ignored regenerate_the_census_block
+cargo test -p pulsus-read --test logql_pattern_expr_matrix -- --ignored regenerate_the_sites_dataset
+```
+
+Two runs were lost to this one as well, and it is the one that bit most recently: a dataset left
+stale across a commit, so the next run's failure belonged to the staleness rather than to what was
+being tested; and the first three of those four run without the fourth, which is how the paragraph
+above came to be committed with a stale dataset. **The two hazards look alike and are not.** The
+first is about where an edit lands; the second is about what an edit invalidates elsewhere.
+
+**And the same for prose that quotes a generated position.** Anything citing a line into this
+document — the datasets under `crates/pulsus-read/tests/`, `docs/query-lowering.md`, and this
+document's own sentences — is regenerated or re-taken **after** the edit that moves it, never before.
+Three figures were shipped stale that way in one week, the third being a sentence in part 9 that
+quoted seven positions the same commit's regenerators had already corrected in the dataset.
+
 **The code in part 2 does not exist yet.** Nothing in this tree makes the per-stage decision part 2
 describes, so every statement marked *from the design* was worked out from the design record and
 **was not produced by our code**. That sentence applies to every such block in the document and is
@@ -42,7 +72,7 @@ Defined once, at first use, and used in only that sense afterwards.
 | **compiles to SQL** | the stage becomes part of the statement we send to ClickHouse, so ClickHouse does that work |
 | **evaluated after the read** | the stage does not become SQL; `pulsus-server` does that work itself, over the rows ClickHouse sent back |
 | **the engine** | the code that decides, stage by stage, which of those two happens |
-| **the walk** | the engine's single pass over the steps, left to right. It never stops early: a step that cannot become SQL is skipped and the next one is asked anyway |
+| **the walk** | the engine's single pass over the steps, left to right. It never stops early: a step that does not become SQL is skipped and the next one is asked anyway |
 | **candidate trace** | a trace whose id came back from the first statement and which may or may not satisfy the whole query. TraceQL reads candidates in groups of 32, and this document calls one group a **batch** |
 | **root span** | the span of a trace that has no parent; if a trace has none, the earliest span |
 | **bucket**, **grid** | a metric query returns one value per step-sized interval. Each interval is a bucket, and the sequence of them is the grid |
@@ -67,9 +97,9 @@ no SQL, carries one of these markings.
 | *emitted today* | our shipped code produces this text now. Cited to the function that produces it |
 | *from the design* | worked out from the design record `docs/query-lowering.md`. No code produces it |
 | *decided here* | the design settles that the stage can compile to SQL and does not fix the text, so **this document fixes it**. Every such cell names what the decision rests on, and every SQL text so marked was executed against ClickHouse 26.3 — see part 2.7 |
-| *cannot become SQL* | no correct SQL exists for it, and the reason is given in the cell. Distinct from *never becomes SQL* only in that part 5 collects the latter; the two mean the same thing |
-| *evaluated after the read* | the stage always runs in `pulsus-server` |
-| *never becomes SQL* | SQL cannot have the information. Part 5 gives the reason for each |
+| *cannot become SQL* | no correct SQL exists for it, and the reason is given in the cell. Distinct from *never becomes SQL* only in that part 5 collects the latter; the two mean the same thing. **The bar is information, not effort.** A cell may carry this marking only when it names a value that is not stored, state that is unbounded, or something only the query process can know. How long the work would take, how large it would be, and a composition rule of ours are none of those — §5.1 lists six constructs that carried this marking on one of those grounds until 2026-09-09 |
+| *evaluated after the read* | the stage runs in `pulsus-server` on every request. It says where the work happens today, not that it must happen there — the six constructs of §5.1 carry this marking, and each cell says what would move it |
+| *never becomes SQL* | SQL cannot have the information. Part 5 gives the reason for each, and §5.1 gives the six that were listed there on a reason that was not about information |
 | *already compiled in full* | the TraceQL metrics routes compile the whole query, filter and aggregation alike. These stages are not part of the search route at all |
 
 Placeholders used in statement text: `<fps>` is the resolved fingerprint list, `<start>` and `<end>`
@@ -193,7 +223,7 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 | `\|~ "re"` | `match(body, 're')` | *emitted today*, `predicate.rs:542`. Not anchored: a LogQL line filter searches for a substring |
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `predicate.rs:521` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `predicate.rs:500`. A filter with one value is not wrapped, so its text is unchanged |
-| `\|= ip("10.0.0.0/8")` | none | *never becomes SQL*. `is_pushable_line_filter` returns `false` (`plan.rs:3086`), the stage is skipped, and **the walk continues** — a later literal filter still compiles |
+| `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3086`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
 | `\| json` | none | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1688`) |
 | `\| logfmt` | none | *evaluated after the read*, `plan.rs:1689` |
 | `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1690` |
@@ -422,10 +452,13 @@ fragment lands in and what the database stops doing because of it. Parts 2.8 and
 LogQL and eight TraceQL complete pipelines end to end. The tables immediately below are the summary;
 read them against part 1 and the difference is the work.
 
-**Four things cannot become SQL and are marked so rather than left open**: the general form of
-`| line_format` and of `| label_format`, both Go text/templates; `| unwrap duration(x)` and
-`| unwrap bytes(x)`; and grouping a metric query by a name a parser produced. Each cell gives the
-reason.
+**Four things are not compiled here and are marked *evaluated after the read* rather than left
+open**: the general form of `| line_format` and of `| label_format`, both Go text/templates;
+`| unwrap duration(x)` and `| unwrap bytes(x)`; and grouping a metric query by a name a parser
+produced. **None of the four is a boundary.** Each is held back by the size of the work, or by an
+exactness requirement no expression tried so far meets; §5.1 says which, and what would move it. No
+SQL is offered for any of them here, because every expression tried so far returns a different answer
+from the reference on some input.
 
 ### 2.1 The two rules that decide most rows
 
@@ -461,7 +494,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\|~ "re"` | `match(body, 're')` | *emitted today*, unchanged |
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, unchanged |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, unchanged |
-| `\|= ip("10.0.0.0/8")` | none | *never becomes SQL*, `docs/query-lowering.md:1043`. Unchanged: the walk skips it and continues |
+| `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*, `docs/query-lowering.md:1043`. Unchanged: the walk skips it and continues. `BlockReason::NotPushable` — a pruning fact, not a boundary (§5.1) |
 | `\| json` | none of its own; a later reference to name `k` compiles against `JSONExtractString(body, 'k')` | **decided here**, §2.7.1. The design widens the known column set through an *open source* over `body` — a source whose member names are not known until a row is read — and records that its `resolve` answers `None` (`docs/query-lowering.md:1044`). This document gives it an answer. A parser adds no predicate of its own; what it adds is the expression a later stage compiles against, and today's flattening and malformed-input rules (`pipeline.rs:4725`) and the collision renaming (`labels.rs:363`) are what the guards in §2.7.0 are for |
 | `\| logfmt` | none of its own; `k` compiles against `extractKeyValuePairs(body, '=', ' \t\r\n', '"')['k']` | **decided here**, §2.7.1 |
 | `\| regexp "re"` | none of its own; the *n*-th capture group compiles against `extractGroups(body, '(?-s)re')[n]` | **decided here**, §2.7.1. The `(?-s)` prefix is required and was measured: ClickHouse compiles the pattern with RE2's dot-matches-newline option on and the reference does not |
@@ -470,12 +503,12 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| status >= 500` | `(JSONType(body, 'status') NOT IN ('Int64', 'UInt64', 'Double') OR JSONExtractFloat(body, 'status') >= 500 OR structured_metadata != '')` | **decided here**, §2.7.1. `JSONExtractFloat`, not a text comparison, because the reference converts the label text to a float before comparing. Worked in §2.8's LogQL46 |
 | `\| trace_id="740e…"` | `JSONExtractString(structured_metadata, 'trace_id') = '740e…'` | **decided here**, §2.7.1. No guards: `structured_metadata` is a stored column holding a flat JSON object of text keys to text values written by our own encoder (`labels.rs:157-189`), so the extraction is the label |
 | `\| __error__=""` after a parser | `match(body, '^[ \t\r\n]*\\{')` | **decided here**, §2.7.1. `JSONType(body) = 'Object'` would be wrong — measured, it answers `Null` for `{"a":1}trailing`, which our prefix parser accepts (`pipeline.rs:4692-4694`) |
-| `\| line_format "…"` | none | *evaluated after the read*, `docs/query-lowering.md:1049`. A Go text/template with control flow has no SQL form. It marks the line computed **with no expression**, so every later stage that needs the line is evaluated after the read too. It removes no lines, so it does not by itself make the predicate wider than the query |
+| `\| line_format "…"` | none | *evaluated after the read*, `docs/query-lowering.md:1049`. A Go text/template with control flow, and **no exact ClickHouse expression for it has been written** — the two obvious analogues disagree with the reference on ordinary values (§5.1, row 1: `leftPad` pads and truncates by bytes where `printf "%05s"` counts characters; `upperUTF8('ß')` is `SS` where `ToUpper` leaves it). The stage marks the line computed **with no expression**, so every later stage that needs the line is evaluated after the read too. It removes no lines, so it does not by itself make the predicate wider than the query |
 | `\| label_format dst=src` | none; `dst` compiles against whatever `src` compiled against, and `src` stops resolving | **decided here**, §2.7.1. A rename moves an entry in the name table and leaves no trace in the SQL. Worked in §2.8's LogQL51 |
 | `\| label_format dst="text"` | none; `dst` compiles against the literal `'text'` | **decided here**. A later filter on `dst` compares two constants, which ClickHouse folds before reading a row |
-| `\| label_format dst="{{…}}"` | | **cannot become SQL.** A Go text/template with conditionals, ranges and function calls, the same reason as `\| line_format` |
+| `\| label_format dst="{{…}}"` | none | *evaluated after the read*. The same Go text/template as `\| line_format`, so the same unwritten translation and the same measured analogue disagreements, plus one this row has and that one does not: a template that fails while rendering a **label** makes the whole request `400` with a `TemplateFormatErr`, and an expression in a `SELECT` list produces a value (§5.1, rows 1 and 2) |
 | `\| unwrap x` | the sample value becomes the column expression that `x` compiles against — `JSONExtractFloat(body, 'x')` after `\| json` | *from the design*, `docs/query-lowering.md:1051`; the expression **decided here**, §2.7.1 |
-| `\| unwrap duration(x)`, `\| unwrap bytes(x)` | | **cannot become SQL.** The conversion parses a duration such as `1h30m` or a size such as `4KiB`; ClickHouse has no function for either, and a hand-built expression over the unit tables (`pipeline.rs:2890`, `:3002`) would be a second implementation of a parser whose agreement with the first cannot be established by reading it. A sample value feeds an aggregate, so rule B leaves no room for a wider-than-needed answer |
+| `\| unwrap duration(x)`, `\| unwrap bytes(x)` | none | *evaluated after the read*. ClickHouse **does** have a function for each — measured on 26.3.29.7, `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` — but neither is the reference's parser, and a sample value feeds an aggregate, so rule B requires an exact answer rather than a close one. §5.1 gives the measured disagreements |
 | `\| unpack` | `if(JSONHas(body,'_entry'), JSONExtractString(body,'_entry'), body)` | *from the design*, fixed at `docs/query-lowering.md:795`. A later line filter compiles against this expression |
 | `\| decolorize` | `replaceRegexpAll(body, '\x1B\[[0-9;]*m', '')` | *from the design*, fixed at `docs/query-lowering.md:794`. **See part 7's last row:** the reference tests a following line filter against the **raw** line, and this expression would make us test the rewritten one |
 | `\| drop a, b` | removes `a` and `b` from the known column set; contributes no SQL of its own | *from the design*, `docs/query-lowering.md:1054`. A later filter on a removed name is evaluated after the read; every other name is untouched, which is §2.8's LogQL50 |
@@ -493,7 +526,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `absent_over_time` | none | *never becomes SQL*, `docs/query-lowering.md:1062` |
 | `sum by (env) (…)`, `env` a stream label | `transform(fingerprint, [<fps>], [<env's value for each>], '') AS g0`, added to the `GROUP BY` | **decided here**, §2.7.2. The values come from the second statement, which has already read every selected stream's label set (`sql.rs:489`), so the group key is a lookup in a literal array — no extra read, no per-row parsing. Worked in §2.8's LogQL55 |
 | `sum by (k) (…)`, `k` a structured-metadata key | `JSONExtractString(structured_metadata, 'k') AS g0` | **decided here**, §2.7.2 |
-| `sum by (level) (…)`, `level` a parsed label | | **cannot become SQL.** A group key must reproduce the label's text exactly. No ClickHouse expression reproduces the parser's rendering of a JSON number: measured, `JSONExtractString('{"c":31.0}','c')` is `31`, and the reference's own captured answer for that corpus line is `dur_ms="31.0"` (§4.3's LogQL19). A filter may be wider than the query; a group key may not, because a wrong key is a wrong series name |
+| `sum by (level) (…)`, `level` a parsed label | none | *evaluated after the read*. A group key must reproduce the label's text exactly: a filter may be wider than the query, a group key may not, because a wrong key is a wrong series name. **The number-rendering reason this cell used to give is false** — `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, the reference's own bytes (measured, 26.3.29.7). What is open is a key expression exact in general; §5.1 lists the shapes where each function tried still disagrees |
 | `topk(3, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT 3 BY bucket_ns`, over the first level wrapped in a subquery | **decided here**, §2.7.2. `LIMIT n BY` is ClickHouse's own "n rows per group", so the second level is one more statement layer rather than a second read — ADR 0008 D1's wrap. Worked in §2.8's LogQL56, which has a genuine tie the reference breaks the same way |
 | `label_replace(…)` | none | *evaluated after the read*, `docs/query-lowering.md:1064` and `:1064-1079`. Not for want of a SQL spelling of the rewrite: at range, label sets that collide after the rewrite merge into **one** series whose points repeat per grid timestamp, and a `GROUP BY` on the rewritten key gives one point per timestamp instead. Measured on the reference: the operand alone returns four series, the rewritten form returns one with four points at each of two timestamps (`crates/pulsus-read/tests/logqltest/corpus/b16_label_replace.test:252-262`). Because it removes series the SQL returned, it makes the predicate wider than the query |
 | ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | *emitted today*, unchanged. Conditional on the ordering columns being in the projection |
@@ -506,7 +539,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 |---|---|---|
 | `{ .k = "v" }` | `key = 'k' AND val = 'v'` | *emitted today*, unchanged |
 | `{ span.http.status_code >= 500 }` | `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` | *emitted today*, unchanged |
-| `{ a && b }` | `sql_a AND sql_b` in **one** statement | *from the design*, `docs/query-lowering.md:302`. A side that cannot become SQL contributes the constant `1`, so the conjunction keeps every row that side would have kept. **This is a change:** today the second conjunct of `{ (.a \|\| .b) && (.c \|\| .d) }` produces no SQL at all |
+| `{ a && b }` | `sql_a AND sql_b` in **one** statement | *from the design*, `docs/query-lowering.md:302`. A side that does not become SQL contributes the constant `1`, so the conjunction keeps every row that side would have kept. **This is a change:** today the second conjunct of `{ (.a \|\| .b) && (.c \|\| .d) }` produces no SQL at all |
 | `{ a \|\| b }` | `sql_a OR sql_b` in **one** statement, or the constant `1` if either side cannot | *from the design*, `docs/query-lowering.md:303`. **This is a change:** today each side is its own statement, merged in `pulsus-server` |
 | `{ !a }` | `NOT sql_a`, only when `a` means exactly what it says; otherwise the constant `1` | *from the design*, `docs/query-lowering.md:304-305` |
 | `{ .a != nil }` | `key = 'a' AND 1` | *emitted today*, unchanged |
@@ -517,7 +550,7 @@ every `LIMIT` refuses unless the predicate so far means exactly what the query m
 | `\| by(name)` | the key becomes the KEY of a map aggregate inside the `HAVING`, not a `GROUP BY` column: `HAVING arrayMax(mapValues(uniqExactMap(map(<capped name>, span_id)))) > 2` when an aggregate lands in the same level, and nothing at all when none does | *emitted today* (issue #492 part 5), superseding `docs/query-lowering.md:609`'s `GROUP BY name`. The statement keeps one aggregation state per (trace × key value) where the ungrouped one keeps one per trace; the map form measured 334 MB against the wrapped `GROUP BY trace_id, name` form's 523 MB on the same corpus, with byte-identical `EXPLAIN indexes = 1` |
 | `\| coalesce()` after a `by()` | none — it FREES the grouping slot when the level carries no `HAVING`, and refuses when it does | *emitted today* (issue #492 part 5), superseding ADR 0008 D1's wrap. No wrap is emitted, and none was ever emitted |
 | `\| coalesce()` with no preceding `by()` | none, and none is needed | *from the design*, `docs/query-lowering.md:611`. It is the identity |
-| `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *never becomes SQL*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
+| `\| { name = "b" }` — a `{ ... }` filter written after another stage | none | *evaluated after the read*, `docs/query-lowering.md` §3.1's `Filter` row (issue #492 item 9). Pushing it as a `WHERE` conjunct **onto the leading generator** is unsound whenever the leading spanset is not a single filter: for `{ .tag = "x" } && { name = "a" } \| { .tag = "y" }` the qualifying span comes from the RIGHT operand, so the pushed statement returns a wrong answer rather than a wider one. **That is a fact about one statement shape, not about SQL:** both tables store what the stage reads — `trace_spans.name` (`catalog.rs:343`) and the attribute index (`catalog.rs:370-384`) — and §5.1 names the rule of ours that holds the two-table form back. It clears exactness, and a mid-pipeline spanset OPERATION is a plan-time `400` |
 | `\| select(.foo)` | a left join whose right side is `trace_attrs_idx` restricted to `key = 'foo'`, one value per span, projected as an extra column | **Not decided — refused pending an ADR 0008 clause**, and the per-query form measured in [query-lowering.md](query-lowering.md) §9.8 does not survive the shipped generator memory ceiling: it refuses with `Code: 241` at `maximum: 512.00 MiB` where the same statement with only the join removed succeeds. §2.7.3 and §2.9's TraceQL30 carry the working. The widened `key IN (…)` form the granule comparison rejected is **one** join-free alternative, not the only one: writing both predicates out in full as a disjunction keeps the `val` prune and costs no extra granules at all (§9.8, table 1). **A join is a clause ADR 0008 does not name** — part 10's open question 4 |
 | `\| rate()`, `\| quantile_over_time(…)`, `compare(…)` | *already compiled in full* on the metrics routes | `metrics_sql.rs:90`. Still `400` on the search route (`search_plan.rs:1854`); this work does not change that |
 | `\| topk(3)`, `\| bottomk(3)` — the metrics SECOND stage | none | *evaluated after the read*, unchanged. It reduces the SERIES the first stage produced, so no clause of ADR 0008 carries it and no row set exists to apply it to: `metrics_plan.rs:948` records it, `exec.rs:3421` applies it. Still `400` on the search route (`search_plan.rs:1861`) |
@@ -723,7 +756,7 @@ after the read, `stage3_keyset` (`sql.rs:625`) when something does.
 | `\|~ "re"` | `match(body, 're')` | `WHERE`, third statement | *emitted today*. Whether a granule can be skipped depends on whether ClickHouse can pull a required substring out of the pattern and test it against the body indexes. **That was not measured here**, so no figure is claimed for it |
 | `!~ "re"` | `NOT (match(body, 're'))` | `WHERE`, third statement | *emitted today*. As `!=` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | `WHERE`, third statement | *emitted today*. A granule survives if it can hold either alternative, so the prune is the union |
-| `\|= ip("10.0.0.0/8")` | none | — | *never becomes SQL* (`plan.rs:3086`). The walk skips it and asks the next stage, so a later literal filter still compiles — §2.8's LogQL58 |
+| `\|= ip("10.0.0.0/8")` | none | — | *evaluated after the read* (`plan.rs:3086`). The walk skips it and asks the next stage, so a later literal filter still compiles — §2.8's LogQL58. What holds it back is that no predicate it could render prunes: `BlockReason::NotPushable` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`), which is a cost, not a boundary — §5.1 |
 | `\| json` | none of its own; it makes a name `k` resolve to `JSONExtractString(body, 'k')` | nothing until a later stage names `k` | **decided here.** A parser is not a filter and adds no predicate. `JSONExtractString` decodes `\uXXXX` escapes in both the key and the value, and so does our parser, so the two agree byte for byte whenever the value is a JSON string. On a repeated key both take the **first** occurrence (measured: `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; our parser renames the second to `a_extracted`, `pipeline.rs:5934`) |
 | `\| logfmt` | none of its own; `k` resolves to `extractKeyValuePairs(body, '=', ' \t\r\n', '"')['k']` | as above | **decided here.** The delimiter set is `' \t\r\n'`, not a single space, because the reference's decoder ends a key or an unquoted value at any byte at or below `0x20` (`pkg/logql/log/logfmt/decode.go`, the `c <= ' '` arms @ `v3.7.4`). Measured over eleven awkward lines; one shape disagrees and the escape guard covers it |
 | `\| regexp "re"` | none of its own; the *n*-th capture group resolves to `extractGroups(body, '(?-s)re')[n]` | as above | **decided here.** The `(?-s)` prefix is load-bearing and was measured: ClickHouse compiles this pattern with RE2's dot-matches-newline option **on**, so `extractGroups('a\nb', '(?P<x>a.b)')` answers `['a\nb']` while `extractGroups('a\nb', '(?-s)(?P<x>a.b)')` answers `[]`. The reference leaves that option off. Our line-filter path already carries the same prefix for the same reason (`escape.rs:213-236`) |
@@ -732,12 +765,12 @@ after the read, `stage3_keyset` (`sql.rs:625`) when something does.
 | `\| k >= 500` after a parser | `(JSONType(body,'k') NOT IN ('Int64','UInt64','Double') OR JSONExtractFloat(body,'k') >= 500 OR structured_metadata != '')` | `WHERE`, third statement | **decided here.** `JSONExtractFloat` is used rather than a text comparison because the reference converts the label text to a float before comparing. It agrees across spellings: measured, `JSONExtractFloat('{"i":1e3}','i')` is `1000`. Restricted to JSON numbers because a numeric-looking **string** can hold text the two sides parse differently (`JSONExtractFloat('{"s":"12abc"}','s')` is `0`) |
 | `\| k="v"` where `k` is a structured-metadata key | `JSONExtractString(structured_metadata, 'k') = 'v'` | `WHERE`, third statement | **decided here.** No guard and no page loop: `structured_metadata` is a stored column holding a flat JSON object of text keys to text values, written by our own encoder and read by a flat reader that accepts nothing else (`labels.rs:157-189`), so the extraction is the label. The plan-time precondition still applies, and here it is decidable in full — a metadata key that collides with a stream label is renamed at merge time (`labels.rs:363`) and the stream label sets are already in hand |
 | `\| __error__=""` after `\| json` | `match(body, '^[ \t\r\n]*\{')` | `WHERE`, third statement | **decided here.** Reading `JSONType(body) = 'Object'` would be wrong: measured, `JSONType('{"a":1}trailing')` is `Null` while our parser accepts a JSON object followed by anything, because it parses a **prefix** (`pipeline.rs:4692-4694`). Every line our parser flattens begins, after optional whitespace, with `{`, so this term keeps all of them and drops the rest without parsing anything |
-| `\| line_format "…"` | | — | **cannot become SQL.** A Go text/template with conditionals, ranges and function calls has no ClickHouse expression. The stage marks the line as computed with no expression, so every later stage that needs the line is evaluated after the read (`docs/query-lowering.md:1049`) |
+| `\| line_format "…"` | | — | *evaluated after the read*. A Go text/template with conditionals, ranges and function calls. The stage marks the line as computed with no expression, so every later stage that needs the line is evaluated after the read too (`docs/query-lowering.md:1049`). **Our own source already calls this unfinished work rather than a boundary** — "A Go text/template has no SQL form here. `No`, not `Never`." (`crates/pulsus-read/src/logql/compile.rs:472`, answering `BlockReason::NotYetLowered` at `:474`). §5.1 gives the size of the surface and the measured disagreements |
 | `\| label_format dst=src` | none; `dst` resolves to whatever `src` resolved to, and `src` stops resolving | nothing of its own | **decided here.** A rename moves an entry in the name table. §2.8's LogQL51 is the worked case |
 | `\| label_format dst="text"` | none; `dst` resolves to the literal `'text'` | nothing of its own | **decided here.** A later filter on `dst` becomes a comparison of two constants, which ClickHouse folds before reading a row |
-| `\| label_format dst="{{…}}"` | | — | **cannot become SQL**, the same template as `\| line_format` |
+| `\| label_format dst="{{…}}"` | | — | *evaluated after the read*, the same template as `\| line_format` and the same reason — §5.1 |
 | `\| unwrap x` | `JSONExtractFloat(body, 'x')` after `\| json`; `toFloat64OrNull(<x's expression>)` after any other parser | the aggregate's argument | **decided here** for the expression, and executed: over this corpus it answers `12.5`, `31` and `3`, which are the reference's own three values (§4.6's LogQL37). Whether an aggregate over it compiles is a separate question this row does not settle: rule B (§2.1) requires an aggregate's input to be exactly right, and both forms answer `0` or `NULL` where the evaluator raises a sample-extraction error instead. Making them agree needs a further term — `JSONType(body, 'x') IN ('Int64', 'UInt64', 'Double')` — which drops lines, so it is sound only when the query already drops them itself with `\| unwrap x \| __error__=""`. §2.8's LogQL57 works a query where the aggregation cannot compile for a different reason again |
-| `\| unwrap duration(x)`, `\| unwrap bytes(x)` | | — | **cannot become SQL.** The conversion parses a duration such as `1h30m` or a size such as `4KiB`. There is no ClickHouse function for either, and a hand-built expression over the unit tables (`pipeline.rs:2890`, `:3002`) would be a second implementation of a parser whose agreement with the first cannot be established by reading it. Because the result is an aggregate's input, rule B leaves no room for a wider-than-needed answer |
+| `\| unwrap duration(x)`, `\| unwrap bytes(x)` | | — | *evaluated after the read*. The conversion parses a duration such as `1h30m` or a size such as `4KiB`, and ClickHouse **does** have a function for each: measured on 26.3.29.7, `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096`. Neither is the reference's parser, though, and because the result is an aggregate's input, rule B requires an exact answer rather than a close one. §5.1 gives the measured disagreements and what would move this row |
 | `\| unpack` | `if(JSONHas(body,'_entry'), JSONExtractString(body,'_entry'), body)` replaces `body` in every later fragment | wherever `body` would have gone | *from the design*, fixed at `docs/query-lowering.md:795`; executed on the container and confirmed to leave a line without `_entry` unchanged |
 | `\| decolorize` | `replaceRegexpAll(body, '\x1B\[[0-9;]*m', '')` replaces `body` in every later fragment | wherever `body` would have gone | *from the design*, `docs/query-lowering.md:794`. **Held back by §10's open question 2** — the reference tests a following line filter against the raw line, so compiling this would make our known-wrong answer faster |
 | `\| drop a, b` | none | nothing | *from the design*, `docs/query-lowering.md:1054`. `a` and `b` stop resolving; every other name is untouched, which is §2.8's LogQL50 |
@@ -757,7 +790,7 @@ after the read, `stage3_keyset` (`sql.rs:625`) when something does.
 | `absent_over_time` | | — | **cannot become SQL.** The answer is about lines that are **absent**; there is no row to compute it from |
 | `sum by (k) (…)`, `k` a stream label | `transform(fingerprint, [<fps>], [<the value of k for each>], '') AS g0`, added to the `GROUP BY` | `SELECT` and `GROUP BY` | **decided here.** The values come from the second statement, which has already read every selected stream's label set (`sql.rs:489`), so the group key costs no extra read and no per-row parsing — it is a lookup in a literal array. Exact, because a structured-metadata key that collides with a stream label is renamed and can never overwrite it (`labels.rs:363`). Requires `k` to be a label of **every** selected stream |
 | `sum by (k) (…)`, `k` a structured-metadata key | `JSONExtractString(structured_metadata, 'k') AS g0` | `SELECT` and `GROUP BY` | **decided here.** Same reasoning as the structured-metadata label filter above: a stored column, our own encoding, an exact extraction |
-| `sum by (k) (…)`, `k` a parsed label | | — | **cannot become SQL.** A group key must reproduce the label's text exactly, and no ClickHouse expression reproduces the parser's rendering of a JSON number: measured, `JSONExtractString('{"c":31.0}','c')` is `31` and `JSONExtractRaw` is also `31`, while the reference's own captured answer for that corpus line is `dur_ms="31.0"` (part 4's LogQL19). A filter may be wider than the query; a group key may not, because a wrong key is a wrong series name |
+| `sum by (k) (…)`, `k` a parsed label | | — | *evaluated after the read*. A group key must reproduce the label's text exactly: a filter may be wider than the query, a group key may not, because a wrong key is a wrong series name. **The reason this cell used to give is false.** `JSONExtractString('{"c":31.0}','c')` is `31` and `JSONExtractRaw` is also `31`, but `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0` — the reference's own bytes (measured, 26.3.29.7). The claim was about all ClickHouse expressions and was checked against two. What is open is a key expression exact in general; §5.1 lists the shapes where each function tried still disagrees |
 | `topk(k, …)` | `ORDER BY bucket_ns ASC, n DESC, g0 ASC` then `LIMIT <k> BY bucket_ns`, over the first level wrapped in a subquery — `n` is the first level's count column | the outer statement | **decided here.** `LIMIT n BY` is ClickHouse's own "n rows per group" clause, so a second aggregation level is one more statement layer rather than a second read — ADR 0008 D1's wrap, which is measured to cost nothing. Executed against part 4.1's corpus: `topk(2, sum by (service_name) (count_over_time({env="prod"}[1m])))` has a genuine tie at 3 between `edge` and `ipcase`, the reference returns `edge`, and `g0 ASC` returns `edge`. Reachable only when the first level compiled |
 | `label_replace(…)` | none | — | *evaluated after the read*, `docs/query-lowering.md:1064` |
 | ordering | `ORDER BY timestamp_ns …, fingerprint …, cityHash64(body) …, body …` | `ORDER BY` | *emitted today*, `sql.rs:563` |
@@ -779,7 +812,7 @@ date (`catalog.rs:381-382`), and `trace_spans`, ordered by `(trace_id, timestamp
 | `{ resource.service.name =~ "check.*" }` | `key = 'service.name' AND match(val, '^(?:check.*)$') AND scope = 'resource'` | `WHERE` | *emitted today*. Anchored, unlike a LogQL line filter |
 | `{ .a != nil }` | `key = 'a' AND 1` | `WHERE` | *emitted today*. A pure `key` prefix scan |
 | `{ .env != "prod" }` | `NOT (key = 'env' AND val = 'prod')` when the inner condition means exactly what it says, otherwise the constant `1` | `WHERE` | *from the design*, `docs/query-lowering.md:304-305`. **This is a change:** today the negation is applied after the read against the set that matched the positive form |
-| `{ a && b }` | `sql_a AND sql_b`, in one statement | `WHERE` | *from the design*, `docs/query-lowering.md:302`. A side that cannot become SQL contributes the constant `1`. **This is a change:** today the second half of `{ (.a \|\| .b) && (.c \|\| .d) }` produces no SQL at all |
+| `{ a && b }` | `sql_a AND sql_b`, in one statement | `WHERE` | *from the design*, `docs/query-lowering.md:302`. A side that does not become SQL contributes the constant `1`. **This is a change:** today the second half of `{ (.a \|\| .b) && (.c \|\| .d) }` produces no SQL at all |
 | `{ a \|\| b }` | `sql_a OR sql_b`, in one statement, or the constant `1` if either side cannot | `WHERE` | *from the design*, `docs/query-lowering.md:303`. **This is a change:** today each side is its own statement. Executed on the container: an `OR` of two different `key` values runs as one statement and reads both key prefixes |
 | `{ duration > 2s }` | `duration_ns > 2000000000` | `WHERE`, over `trace_spans` | *emitted today*. The `idx_duration` minmax index on `duration_ns` skips granules at granularity 4 (`catalog.rs:352`) |
 | `{ nestedSetParent < 0 }` | `parent_id = toFixedString(unhex('0000000000000000'), 8)` | `WHERE` | *from the design*, `docs/query-lowering.md:777`. The text already exists on the metrics route (`metrics_sql.rs:414`) |
@@ -1303,7 +1336,7 @@ is not in the statement. **The answer must be `200`:**
 ```
 
 The `192.168.0.9` line is in the statement's rows and not in the answer: `pulsus-server` removes it.
-`|= ip(…)` never becomes SQL (`plan.rs:3086`). It is the **first** stage here, and the walk does not
+`|= ip(…)` does not become SQL (`plan.rs:3086`). It is the **first** stage here, and the walk does not
 treat it as the end: the `or` group written after it still compiles. An engine that stopped at the
 first refusal would emit no `body` term and read every `ipcase` line.
 
@@ -1840,7 +1873,7 @@ a property of the SQL rather than a policy.
 **This part is the deliverable.** Every entry is one input query with three things attached: the SQL
 we send for it today, the SQL we must send after this work, and the answer it must return. **No
 entry leaves the target SQL out any more.** Where the design fixed no text, part 2.7 fixes it and
-the entry either carries it or says which of four things cannot become SQL and why.
+the entry either carries it or says which of four things are not compiled here and why (§5.1).
 
 Entries are numbered `LogQL1`…`LogQL44` and `TraceQL1`…`TraceQL24`, and the numbering is stable —
 cite an entry by its number. **The numbering continues into part 2**: the worked pipelines of §2.8
@@ -2310,7 +2343,7 @@ LIMIT 100
 unanchored and uncorrupted; `pulsus_re2::clickhouse_match_strategy` classifies it `Verbatim`, so it
 renders exactly as written (`escape.rs:157-160`).
 
-#### LogQL13 — an address filter, which never becomes SQL
+#### LogQL13 — an address filter, which does not become SQL
 
 ```
 {service_name="ipcase"} |= ip("10.0.0.0/8")
@@ -2328,7 +2361,8 @@ ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC
 LIMIT 1000
 ```
 
-**SQL after this work** — unchanged. `docs/query-lowering.md:1043` keeps it as never becoming SQL.
+**SQL after this work** — unchanged. `docs/query-lowering.md:1043` keeps the stage out of the
+statement; §5.1's row 5 says why, and the reason is pruning rather than a boundary.
 
 **The answer must be `200`**, with this body:
 
@@ -2339,7 +2373,7 @@ LIMIT 1000
 Two of the three `ipcase` entries hold an address in `10.0.0.0/8`; the third holds `192.168.0.9`.
 An implementation emitting any `body` predicate here drops entries the evaluator must see.
 
-#### LogQL14 — a filter that cannot compile, between two that can
+#### LogQL14 — a filter that does not compile, between two that do
 
 ```
 {service_name="ipcase"} |= "CONN_REFUSED" |= ip("10.0.0.0/8") |= "pod-044"
@@ -2924,7 +2958,7 @@ ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 
 `| __error__=""` becomes `match(body, '^[ \t\r\n]*\{')` (§2.7.1): every line our parser flattens begins, after optional whitespace, with `{`, so the term keeps all of them and drops the rest without parsing anything. Executed over this corpus it drops the fourth line and keeps three.
 
-**`sum by (level)` cannot become SQL, and the reason is measurable.** The group key must reproduce the label's text exactly, and no ClickHouse expression reproduces the parser's rendering of a JSON number — `JSONExtractString('{"c":31.0}','c')` is `31` and `JSONExtractRaw` is also `31`, while the reference's own captured answer for that corpus line is `dur_ms="31.0"` (LogQL19's body). A filter may be wider than the query; a group key may not, because a wrong key is a wrong series name. §2.8's LogQL55 shows the case that **does** compile: a group key that is a stream label.
+**`sum by (level)` is not compiled here, and the reason this entry used to give was wrong.** The group key must reproduce the label's text exactly, which is the part that stands: a filter may be wider than the query, a group key may not, because a wrong key is a wrong series name. The part that does not stand is "no ClickHouse expression reproduces the parser's rendering of a JSON number". `JSONExtractString('{"c":31.0}','c')` is `31` and `JSONExtractRaw` is also `31` — but `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, which is the reference's own captured answer for that corpus line, `dur_ms="31.0"` (LogQL19's body). Two functions were measured and the claim was made about all of them. §5.1 records what a group-key expression still has to solve; §2.8's LogQL55 shows the case that **does** compile, a group key that is a stream label.
 
 **The answer must be `200`**, with this body:
 
@@ -3123,7 +3157,7 @@ ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 
 **SQL after this work** — the sample value is `JSONExtractFloat(body, 'dur_ms')` (§2.7.1, **decided here**), and the aggregation still does not compile. Look at the three `metric` objects below: each is the **whole parsed label set** of one line. A grouped statement must name its group columns and these names are not known until a line is read, so there is nothing to group the sum by. §2.8's LogQL57 works the same query with the statement written out.
 
-**`unwrap duration(x)` and `unwrap bytes(x)` cannot become SQL** (§2.7.1): the conversion parses a duration such as `1h30m` or a size such as `4KiB`, ClickHouse has no function for either, and a sample value feeds an aggregate, so rule B leaves no room for a wider-than-needed answer.
+**`unwrap duration(x)` and `unwrap bytes(x)` are not compiled here** (§2.7.1). The conversion parses a duration such as `1h30m` or a size such as `4KiB`, and the reason this entry used to give — that ClickHouse has no function for either — is false: measured on 26.3.29.7, `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096`. What stands is that neither is the reference's parser and that a sample value feeds an aggregate, so rule B leaves no room for an answer that is merely close. §5.1 has the measured disagreements.
 
 **The answer must be `200`**, with this body:
 
@@ -4201,6 +4235,19 @@ process evaluates it, never whether the request is refused.
 `Never` here means SQL does not have the information — not that the work has not been done. Each row
 is a permanent boundary, and part 4 gives a worked entry for most of them.
 
+**The test a row has to pass, stated so the next row can be checked against it.** A construct belongs
+in this table only when its cell names one of three things: a value that is **not stored**, state
+that is **unbounded**, or something **only the query process can know**. Three things that look like
+reasons and are not: how long the work would take, how large the work would be, and a composition
+rule of ours. A rule of ours can be amended, and a cell that rests on one is recording a decision,
+not a boundary. §5.1 is where six constructs went when that test was applied to them.
+
+Our own source carries the same distinction as a type. `Capability::Never(NeverReason)` has eight
+variants — `NeedsUnwindowedRootRead`, `StructuralRelation`, `NestedSetNumbering`,
+`TraceLevelIntrinsic`, `WholeQueryTypeFailure`, `NoRowToComputeFrom`, `ResponseBuild`,
+`NotASearchLink` (`crates/pulsus-read/src/compile/fold.rs:688-712`) — and every row below is one of
+them. Nothing in §5.1 is.
+
 | construct | why SQL cannot have it | worked entry |
 |---|---|---|
 | TraceQL structural relations `>` `>>` `<` `<<` `~` and their `!` and `&` forms | the relation holds between two spans of one trace and is evaluated over the spans read back, which are bounded by the window and cut at 10,000 spans per trace (`exec.rs:119`). The answer depends on our own batching, so a SQL form would have to reproduce a ceiling that only the read defines | TraceQL18 |
@@ -4209,12 +4256,9 @@ is a permanent boundary, and part 4 gives a worked entry for most of them.
 | TraceQL `!` against a value that is present and is not a boolean | it must refuse the whole request, not skip the span. SQL evaluates row by row and cannot turn one row's type into a request-level refusal | part 4.10's last row |
 | the TraceQL search response | the trace's root summary is read across the whole trace with no time bound, and `TraceSearchResult.root` is not optional (`exec.rs:385`). Unconditional on that route, not a case that sometimes arises | part 3.6 |
 | LogQL `absent_over_time` | the answer is a statement about rows that are **absent**. There is no row to compute it from | LogQL38 |
-| LogQL `\|= ip("...")` | an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use (`plan.rs:3086`) | LogQL13, LogQL14 |
-| LogQL `\| line_format "…"`, and `\| label_format k="{{…}}"` | a Go text/template with conditionals, ranges and function calls. Reproducing it as a ClickHouse expression would be writing a second template engine, and there would be nothing to check the second against but the first | LogQL21, LogQL22 |
-| LogQL `\| unwrap duration(x)` and `\| unwrap bytes(x)` | the conversion parses a duration such as `1h30m` or a size such as `4KiB`. ClickHouse has no function for either, and a hand-built expression over the unit tables (`pipeline.rs:2890`, `:3002`) is a second implementation of a parser whose agreement with the first cannot be established by reading it. Unlike a filter, a sample value feeds an aggregate, so rule B leaves no room for an answer that is merely close | LogQL37 |
-| LogQL `sum by (k) (…)` where `k` comes from a parser | a group key must reproduce the label's text exactly, and no ClickHouse expression reproduces the parser's rendering of a JSON number — measured, `JSONExtractString('{"c":31.0}','c')` is `31` and the reference's own answer for that corpus line is `dur_ms="31.0"`. **Grouping by a stream label or a structured-metadata key does become SQL** (§2.7.2) | LogQL31 |
 
-**Four constructs are deliberately not in that table, and each was a candidate.**
+**Four more constructs are deliberately not in that table, and each was a candidate.** These are
+separate from §5.1's six, which were in it and were taken out.
 
 - `| decolorize` and `| unpack` **do** have SQL forms (part 2.2), so a filter after them compiles
   against the rewritten expression. That was settled by running each expression against a container,
@@ -4233,9 +4277,503 @@ is a permanent boundary, and part 4 gives a worked entry for most of them.
   whatever the matcher says, because refusing to resolve a name is always safe and the alternative
   is a predicate that has to be right about a value nobody has parsed yet. A later document could
   compile the matcher; nothing in SQL prevents it.
-- The **general** form of `| label_format` is in the table above and its **rename** and **constant**
-  forms are not, because those two are decided and contribute a name-table move and a literal
-  respectively (§2.7.1, worked in §2.8's LogQL51). One stage, three forms, two verdicts.
+- `| label_format`'s **rename** and **constant** forms are not candidates at all: both are decided
+  and contribute a name-table move and a literal respectively (§2.7.1, worked in §2.8's LogQL51).
+  Its **general** form was in the table above until 2026-09-09 and is now §5.1's row 2. One stage,
+  three forms, three dispositions.
+
+### 5.1 Six constructs that were in that table until 2026-09-09
+
+Each of these carried *cannot become SQL* or *never becomes SQL*, and each now carries
+*evaluated after the read*. **None of them moved because SQL for it has been written.** They moved
+because the reason each cell gave was not about information: two were size-of-work judgements, two
+were factual claims about ClickHouse that are false, one was a pruning cost, and one was a
+composition rule of ours. Applying the test above to the six left nothing standing on the
+information side.
+
+**Read the last column as work, not as a promise.** Where an expression has been tried and found to
+disagree with the reference, the disagreement is written down here so the next attempt starts from
+it. No statement text is offered for any of the six, because every expression tried so far returns a
+different answer from the reference on some input, and the inputs are named below.
+
+| # | construct | the reason the cell gave | why that reason does not hold | what actually holds it back |
+|---|---|---|---|---|
+| 1 | LogQL `\| line_format "…"`, general form | "writing a second template engine, and there would be nothing to check the second against but the first" | the first half is about how large the work is. The second half is false: the reference is the check, and this document uses it as one throughout part 4 | the size of the surface, and an exactness requirement nothing tried meets. The reference's two function maps hold 23 + 42 names (`pkg/logql/log/fmt.go:29`, `:76` @ `v3.7.4`), and Go's `text/template` built-ins are callable on top of them — the running reference accepts `printf`, which appears nowhere in that file. Two ClickHouse analogues that look right are measured wrong below |
+| 2 | LogQL `\| label_format k="{{…}}"`, general form | the same template as row 1 | the same as row 1 | the same as row 1, and one thing row 1 does not have: a template that fails rendering produces a `__error__` label and a `400`, and an expression in a `SELECT` list produces a value |
+| 3 | LogQL `\| unwrap duration(x)`, `\| unwrap bytes(x)` | "ClickHouse has no function for either" | false. Measured below: `parseTimeDelta('1h30m')` is `5400` and `parseReadableSize('4KiB')` is `4096` | neither function is the reference's parser, and rule B requires exactness because the value feeds an aggregate. `parseTimeDelta('-5s')` is a `Code: 36` error where the reference answers `-5` |
+| 4 | LogQL `sum by (k) (…)`, `k` from a parser | "no ClickHouse expression reproduces the parser's rendering of a JSON number" | the claim is about every expression; two were measured. `simpleJSONExtractRaw('{"c":31.0}','c')` is `31.0`, which is the reference's own bytes | that function is a text scanner rather than a parser, and a group key has to be right about more than number bytes. Nesting, absent-versus-empty and key spelling all still disagree, below |
+| 5 | LogQL `\|= ip("…")` | "an address-range test over substrings has no `LIKE` or `match` predicate the body indexes could use" | that is a statement about pruning, and our own source already classifies it as one: `BlockReason::NotPushable`, never `NeverReason` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`) | pruning, and it is priced below: a predicate that decides the test can be written, but none that a body index can serve can, so the statement reads what the primary key and the window leave it. Measured uncached (`use_query_condition_cache = 0`) — 3,000,000 rows and 309,060,017 bytes, against 245,760 and 25,313,762 for a literal filter selecting the same 30 lines. Once the condition has been evaluated against those parts the shipped cache closes the gap, which is why the setting is printed beside the figure |
+| 6 | TraceQL `\| { … }` written after another stage | pushing it as a `WHERE` conjunct returns a wrong answer | true of that one statement shape, and that shape is not the only one. Both tables store what the stage reads: `trace_spans.name` (`catalog.rs:343`) and the attribute index (`catalog.rs:370-384`) | for the attribute-only form, exactness — two shapes disagree, below. For the mixed-source form, **`docs/schemas.md` §4.2** (`docs/schemas.md:684`): every phase-1 generator is its own index-served top-K query, "never a `UNION ALL`". That is a rule of ours and can be amended. **ADR 0008's join clause is not the obstacle**, because a statement reading both tables needs no join. What an amendment turns on is the pruning that rule protects, which is unmeasured; the cost table below names the instrument that would measure it |
+
+**Every measurement below was taken on 2026-09-09** against ClickHouse `26.3.29.7`
+(`clickhouse/clickhouse-server:26.3`) and `grafana/loki:3.7.4`, digest
+`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`, whose
+`/loki/api/v1/status/buildinfo` answered `{"version":"3.7.4","revision":"b318f282",…}` — the same
+`b318f282` the checkout at `v3.7.4` resolves to. Row 6 is the one exception and names its own
+instrument. The commands are given so the tables can be re-run.
+
+In them, `$CH` is the ClickHouse HTTP endpoint and `$LOKI` the reference's. `$S` and `$E` are the
+window bounds — nanoseconds on `query_range`, seconds on the instant `query` route, which is the
+route's own convention. Each query is preceded by a push of a few lines to `/loki/api/v1/push`, and
+these are the three sets:
+
+| stream | lines |
+|---|---|
+| `nsql_fmt` | `{"case":"long","v":"abcdef"}`, `{"case":"multibyte","v":"é"}`, `{"case":"eszett","v":"ß"}`, `{"case":"cyrillic","v":"привет"}` |
+| `nsql_ip6` | `mapped ::ffff:10.1.2.3 here`, `run deadbeef2001:db8::1 here`, `plain 2001:db8::1 here` |
+| `nsql_grp` | `{"row":"nested","d":{"c":1},"c":2}`, `{"row":"absent"}`, `{"row":"empty","c":""}` |
+
+**Two settings on the reference decide whether a re-run sees anything at all, and neither is
+obvious from a failed attempt** — both return an empty result rather than an error. The LogQL
+reference answers from its ingester only for the recent window `query_ingesters_within` names,
+`3h` in the running configuration; rows pushed with a timestamp older than that are invisible to a
+query until a `POST /flush` (which answers `204`) moves them to the store. Every corpus here was
+therefore pushed at a timestamp inside the last minute. The TraceQL reference has the mirror-image
+setting, `query_backend_after`, `15m`, which routes a query window older than that past its live
+store — so row 6's traces were written at wall-clock-near timestamps for the same reason. A fixed
+timestamp chosen once and reused later trips one or the other.
+
+#### Rows 1 and 2 — two analogues that look right and are not
+
+```sh
+curl -sS -G $LOKI/loki/api/v1/query_range \
+  --data-urlencode 'query={service_name="nsql_fmt"} | json | line_format `{{.case}}|{{ printf "%05s" .v }}|{{ ToUpper .v }}`' \
+  --data-urlencode "start=$S" --data-urlencode "end=$E" --data-urlencode 'direction=forward'
+curl -sS $CH --data-binary \
+  "SELECT leftPad('abcdef',5,'0'), leftPad('é',5,'0'), leftPad('ß',5,'0'), hex(leftPad('привет',5,'0')),
+          upperUTF8('ß'), upperUTF8('é'), upperUTF8('привет') FORMAT TabSeparatedRaw"
+```
+
+| value | reference `printf "%05s"` | ClickHouse `leftPad(…, 5, '0')` |
+|---|---|---|
+| `abcdef` | `abcdef` | `abcde` |
+| `é` | `0000é` | `000é` |
+| `ß` | `0000ß` | `000ß` |
+| `привет` | `привет` | `D0BFD180D0` printed as hex — five **bytes**, cutting a character in half |
+
+The pad width is characters on one side and bytes on the other, and one truncates where the other
+returns the value unchanged.
+
+| value | reference `ToUpper` (`strings.ToUpper`, `fmt.go:32` @ `v3.7.4`) | ClickHouse `upperUTF8` |
+|---|---|---|
+| `ß` | `ß` | `SS` |
+| `é` | `É` | `É` |
+| `привет` | `ПРИВЕТ` | `ПРИВЕТ` |
+
+Two functions, seven comparisons, five disagreements — on inputs an ordinary log line can carry.
+That is what "exactness is unmet" means here; it is not an argument that no expression exists.
+
+Row 2 has one thing row 1 does not, and it is not about the template at all. A template that fails
+while rendering a **label** makes the whole request `400`:
+
+```sh
+curl -sS -G $LOKI/loki/api/v1/query \
+  --data-urlencode 'query=sum by (sev) (count_over_time({service_name="nsql_fmt"} | json | label_format sev=`{{ div 1 0 }}` [30m]))' \
+  --data-urlencode "time=$E"
+```
+
+```text
+HTTP 400
+pipeline error: 'TemplateFormatErr' for series: '{__error__="TemplateFormatErr",
+__error_details__="template: label:1:3: executing \"label\" at <div 1 0>: error calling div:
+runtime error: integer divide by zero", …}'.
+```
+
+An expression in a `SELECT` list produces a value, not a request-level refusal, so a compiled
+`label_format` would have to keep that arm outside SQL whatever else it did.
+
+#### Row 3 — the two functions exist, and are not the reference's parsers
+
+```sh
+curl -sS $CH --data-binary \
+  "SELECT parseTimeDelta('1h30m'), parseReadableSize('4KiB') FORMAT TabSeparatedRaw"
+curl -sS $CH --data-binary "SELECT parseTimeDelta('-5s') FORMAT TabSeparatedRaw"
+```
+
+```text
+5400	4096
+Code: 36. DB::Exception: Invalid argument of function parseTimeDelta, number not found, str: "-5s"
+```
+
+The reference's conversions are Go's `time.ParseDuration` and `humanize.ParseBytes`
+(`pkg/logql/log/metrics_extraction.go:321`, `:329` @ `v3.7.4`), and `-5s` is `-5` there. So the
+sentence the cell carried was wrong about ClickHouse and right about the conclusion for a reason it
+did not give: an aggregate's input has to be exactly right, and neither ClickHouse function is that
+parser.
+
+#### Row 4 — what a group key still has to be right about
+
+```sh
+curl -sS -G $LOKI/loki/api/v1/query \
+  --data-urlencode 'query=sum by (c) (count_over_time({service_name="nsql_grp"} | json | __error__="" [30m]))' \
+  --data-urlencode "time=$E"
+curl -sS $CH --data-binary \
+  "SELECT '['||simpleJSONExtractRaw('{\"row\":\"absent\"}','c')||']',
+          '['||simpleJSONExtractRaw('{\"row\":\"empty\",\"c\":\"\"}','c')||']',
+          '['||JSONExtractString('{\"row\":\"empty\",\"c\":\"\"}','c')||']',
+          '['||JSONExtractString('{\"row\":\"nested\",\"d\":{\"c\":1},\"c\":2}','c')||']',
+          '['||simpleJSONExtractRaw('{\"row\":\"nested\",\"d\":{\"c\":1},\"c\":2}','c')||']' FORMAT TabSeparatedRaw"
+```
+
+| line | reference's `c` label | `simpleJSONExtractRaw(body,'c')` | `JSONExtractString(body,'c')` |
+|---|---|---|---|
+| `{"row":"nested","d":{"c":1},"c":2}` | `2` — the top-level key | `1` — the first `"c"` in the text, which here is the nested one | `2` |
+| `{"row":"absent"}` | no `c` label at all, so the series has no `c` | the empty string | the empty string |
+| `{"row":"empty","c":""}` | `c=""` — a series distinct from the one above | `""`, two quote characters | the empty string, so the two rows land in **one** group |
+
+Three lines, and the two functions fail on different ones. A group key is a series name, so each of
+those is a wrong answer rather than a wide one — which is the part of the old cell that was right.
+What is open is whether an expression exists that is right about all three at once; nothing here
+says it does not.
+
+#### Row 5 — what an expression would have to reproduce
+
+The reference does not test fixed-width dotted quads. It takes a **maximal run** of the address
+character set and parses that (`pkg/logql/log/ip.go:183-226`, `:284-298` @ `v3.7.4`), so a longer run
+containing an in-range address does not match, and a longer IPv6 run that still parses does.
+
+```sh
+curl -sS -G $LOKI/loki/api/v1/query_range \
+  --data-urlencode 'query={service_name="nsql_ip6"} |= ip("10.0.0.0/8")' \
+  --data-urlencode "start=$S" --data-urlencode "end=$E"
+curl -sS -G $LOKI/loki/api/v1/query_range \
+  --data-urlencode 'query={service_name="nsql_ip6"} |= ip("2001:db8::/32")' \
+  --data-urlencode "start=$S" --data-urlencode "end=$E"
+```
+
+| line | `ip("10.0.0.0/8")` | `ip("2001:db8::/32")` |
+|---|---|---|
+| `mapped ::ffff:10.1.2.3 here` | no match | no match |
+| `run deadbeef2001:db8::1 here` | no match | **match** |
+| `plain 2001:db8::1 here` | no match | match |
+
+Both of the first two are traps for the obvious expression: a substring test for a dotted quad
+matches the first line, and an anchored or fixed-width IPv6 test misses the second. Our own
+evaluator is wrong about a third shape of the same kind — part 7's `10.1.2.3.4` row.
+
+#### Row 6 — the attribute-only form, and the rule that blocks the other one
+
+For `{ .tag = "x" } && { .name2 = "a" } | { .tag = "y" }` — every value in the attribute index — a
+single statement with no join and no `WHERE` conjunct on the leading generator returned the
+reference's answer: one trace, one span, the same `(trace_id, span_id)` the reference returns.
+Measured against `grafana/tempo:v3.0.2`, digest
+`sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7`, over a five-trace corpus
+built so that three wrong models each fail on a different trace. **It is not exact in general**: two
+shapes outside that corpus disagree — a pipe key the leading selector does not name (the reference
+returns a span, the statement returns no row), and a span/resource scope collision on one key (the
+reference returns one span, the statement returns two).
+
+For the mixed-source form `{ .tag = "x" } && { name = "a" } | { .tag = "y" }`, where `name` is a
+column of `trace_spans` and `tag` is a row of `trace_attrs_idx`, a single statement reading both
+tables also returned the reference's answer, and it contains **no join** — the two reads are
+combined, not matched row against row. So ADR 0008's clause ("no emitted SQL may contain a join until
+this ADR is amended to name the clause",
+`docs/decisions/0008-sql-composition-for-lowered-pipelines.md:201`) does not reach it. The rule it
+does conflict with is the phase-1 read-path decision in `docs/schemas.md` §4.2 (`docs/schemas.md:684`):
+every generator is its own index-served top-K query, **never a `UNION ALL`**, so that the `GROUP BY`
+stays inside one leaf's pruned prefix. Adopting the form means amending that decision, and what the
+decision turns on is the pruning that rule protects. That is not measured here, and the instrument
+that would measure it is named in the cost table below.
+
+#### What each direction would cost, and how much of that is measured
+
+A correctness obstacle is not a cost. This section names both, and says for each row whether the cost
+is a number or an unmeasured quantity with a named instrument. **An unnumbered "it would be
+expensive" is the same kind of claim as the permanence claims this section replaced**, so no row
+below carries one.
+
+Three instrument names are used throughout, and each is the one that measures what the row claims,
+which is not always the obvious field:
+
+| what is being priced | the field that measures it | why not the obvious one |
+|---|---|---|
+| CPU spent evaluating an expression | `ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']` in `system.query_log` | `query_duration_ms` is **elapsed** time. On a shared box it moves with whatever else is running and says nothing about the expression |
+| how much text an expression adds to the statement | `length(query)` on the rendered statement, against the 8 MiB cap (`crates/pulsus-read/src/querytext.rs:52`, part 8) | there is no other meter for it; the cap is a byte count, so the measurement has to be one too |
+| how much a predicate is made to read | `read_rows` and `read_bytes` in `system.query_log`, with `EXPLAIN indexes = 1` for the granules behind them | `result_rows` is the answer's size, which is the thing held constant while the read varies |
+
+| row | the cost that would decide it | measured? |
+|---|---|---|
+| 1, 2 — the two templates | CPU per row of an expression that renders the template, and the bytes that expression adds to the statement text | **no, and not measurable yet: no expression exists to measure.** What would produce a number: write a candidate, then compare `UserTimeMicroseconds + SystemTimeMicroseconds` for the third statement with and without it over a stated row count, and `length(query)` for the two rendered texts. The **pruning** half is measured and is the table below — a template expression is not a literal substring, so it lands on that table's last two rows |
+| 3 — the two unwrap conversions | CPU per sample of the parse, over every row the statement reads | **no**, same reason and same instrument. `parseTimeDelta` and `parseReadableSize` exist and could be timed today, but neither is the reference's parser, so timing them prices the wrong expression |
+| 4 — the parsed group key | CPU per row of the body parse, plus one aggregation state per distinct key value in the `GROUP BY` | **no.** What would produce a number: the same CPU pair for the parse, and `memory_usage` for the grouped statement at a stated key cardinality, read against `max_rows_to_group_by` — the bound part 8 adds for exactly this |
+| 5 — `\|= ip("…")` | the read the statement is made to do when no body index can prune it | **yes**, below — and the number depends on a setting that is named there |
+| 6 — the TraceQL pipe filter | the pruning `docs/schemas.md` §4.2 protects: what the combined form reads against what the separate per-generator statements read | **no.** What would produce a number: the granule comparison the join question already uses (`docs/query-lowering.md` §9.8) applied to this pair — `EXPLAIN indexes = 1` for granules and `system.query_log` for `read_rows`, `read_bytes` and `memory_usage`, over `trace_attrs_idx` and `trace_spans` at a stated corpus size, for the two generators run separately and for the combined form |
+
+**The 10.5 GiB figure earlier in part 5 prices none of these.** It belongs to the `{ .a = .b }`
+per-span pre-grouping, which is a different statement with a different state count, and reaching for
+it as a cost for any row above would be the same mistake this section exists to correct.
+
+#### Row 5, priced — and the whole instrument, so it can be rebuilt
+
+Everything below was run on 2026-09-09 against ClickHouse `26.3.29.7`
+(`clickhouse/clickhouse-server:26.3`). **The table, the loader and the two settings are all printed**,
+because a byte figure whose corpus is not published is a number nobody else can produce.
+
+The table is `log_samples` as `crates/pulsus-schema/src/catalog.rs:244-257` declares it, with the
+template's placeholders resolved and the `TTL` clause dropped so the rows do not age out of a re-run:
+
+```sql
+CREATE TABLE log_samples (
+  service       LowCardinality(String),
+  fingerprint   UInt64,
+  timestamp_ns  Int64   CODEC(DoubleDelta, ZSTD(1)),
+  severity      Int8    DEFAULT 0,
+  body          String  CODEC(ZSTD(1)),
+  INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
+  INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1,
+  INDEX idx_severity severity TYPE minmax GRANULARITY 4
+) ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))
+ORDER BY (service, fingerprint, timestamp_ns)
+SETTINGS ttl_only_drop_parts = 1
+```
+
+The loader. One row in 100,000 carries an address inside `10.0.0.0/8` and a different one in 100,000
+carries the literal needle, so **the two predicates below select exactly 30 rows each**:
+
+```sql
+INSERT INTO log_samples (service, fingerprint, timestamp_ns, severity, body)
+SELECT 'ipcase', 1, 1788000000000000000 + number * 28000000, 0,
+       concat('{"level":"', if(number % 1000 = 7, 'error', 'info'),
+              '","msg":"conn from ',
+              if(number % 100000 = 5, '10', toString(11 + (number % 200))), '.',
+              toString(number % 251), '.', toString(number % 253), '.', toString(number % 249),
+              if(number % 100000 = 3, ' CONN_REFUSED_7734', ''),
+              ' accepted for pod-', toString(number % 997),
+              '","status":200,"c":', toString(number % 10000), '}')
+FROM numbers(3000000)
+SETTINGS max_insert_threads = 4
+```
+
+That gives 3,000,000 rows in **two daily partitions and four active parts**, 372 marks — 368 data
+granules at the default `index_granularity = 8192` — read back from `system.parts`:
+
+```sql
+SELECT sum(rows), sum(marks), count() AS parts, uniqExact(partition) AS partitions
+FROM system.parts WHERE table = 'log_samples' AND active
+-- 3000000	372	4	2
+```
+
+**Every leg is printed in full, with its settings, because a setting in a comment above a
+placeholder is not a setting anyone can run.** Each was executed exactly as it appears — once
+prefixed with `EXPLAIN indexes = 1` for the granule column, once as written for the rest:
+
+```sql
+SELECT sum(length(body))
+FROM log_samples
+PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:a_none'
+```
+
+```sql
+SELECT count()
+FROM log_samples
+PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+  AND body LIKE '%CONN\_REFUSED\_7734%'
+SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:b_literal'
+```
+
+```sql
+SELECT count()
+FROM log_samples
+PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+  AND match(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')
+SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:c_addr_regex'
+```
+
+```sql
+SELECT count()
+FROM log_samples
+PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+  AND JSONExtractString(body, 'level') = 'error'
+SETTINGS use_query_condition_cache = 0, max_block_size = 65409, log_comment = '<tag>:d_json'
+```
+
+Then the readings, once per leg:
+
+```sql
+SELECT splitByChar(':', log_comment)[2] AS leg, read_rows, read_bytes,
+       ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds'] AS cpu_us,
+       Settings['max_block_size'], Settings['use_query_condition_cache']
+FROM system.query_log
+WHERE type = 'QueryFinish' AND query_kind = 'Select' AND log_comment LIKE '<tag>:%'
+ORDER BY leg
+```
+
+**`query_kind = 'Select'` is load-bearing.** Each leg is run twice — once behind
+`EXPLAIN indexes = 1` and once as written — and the `EXPLAIN` inherits the leg's `log_comment`, so
+without it the reader returns eight rows and every leg appears twice. Measured: eight rows logged
+under one tag, four after the filter. The four `EXPLAIN` rows are `query_kind = 'Explain'` and their
+`read_rows` are **25, 35, 35, 25** for `a_none`, `b_literal`, `c_addr_regex`, `d_json` — the plan's
+own row count, larger for the two plans that carry a `Skip` section. They are not comparable to the
+leg's `read_rows` and are given here only so the eight rows can be told apart.
+
+`use_query_condition_cache = 0` is not decoration. It is what makes these numbers a property of the
+predicate rather than of what has already been evaluated against these parts — the two tables after
+the next one show the same query reading twelve times less without it.
+
+| predicate | `EXPLAIN indexes = 1` | granules | `read_rows` | `read_bytes` | CPU µs | rows it selects |
+|---|---|---|---|---|---|---|
+| none — the window and `service` only | `MinMax`, `Partition`, `PrimaryKey` only | 368 of 368 | 3,000,000 | 309,060,017 (294.74 MiB) | 443,564 | 3,000,000 |
+| `body LIKE '%CONN\_REFUSED\_7734%'` | `idx_body_tokens` cuts 368 to 30, `idx_body_ngrams` 30 to 30 | **30 of 368** | 245,760 | 25,313,762 (24.14 MiB) | 47,506 | 30 |
+| `match(body, '(^\|[^0-9])10\\.[0-9]{1,3}…')` — the shape an address-range test needs | both body indexes listed, **neither cuts** | 368 of 368 | 3,000,000 | 309,060,017 | 559,430 | 30 |
+| `JSONExtractString(body,'level') = 'error'` | **no `Skip` section at all** | 368 of 368 | 3,000,000 | 309,060,017 | 1,100,737 | 3,000 |
+
+**Same thirty lines, twelve times the read.** Rows two and three return the same thirty lines out of
+the same three million. The predicate an index can serve reads 245,760 rows and 25,313,762 bytes; the
+one it cannot reads all 3,000,000 and 309,060,017 — `3000000 / 245760 = 12.207` and
+`309060017 / 25313762 = 12.209`.
+
+**Three takes of this table were run on the same box.** `read_rows` and `read_bytes` came back
+byte-identical in all three. The CPU figures did not: `a_none` returned 430,207 then 461,535 then
+443,564 µs, and `d_json` returned 1,009,495 then 1,057,045 then 1,100,737 µs. The box is shared with
+other work. No fourth take was run.
+
+#### The condition cache — the legs run against it
+
+The legs printed here are those run for this subsection and those transcribed from the verdicts of
+the review rounds that examined it. Two earlier revisions overstated that. The first said nothing
+beyond the printed legs had been tested, which was false because `match(body, toString(RE))` had been
+run in an earlier round and not printed. The second said no other condition had been run in preparing
+this subsection, which was false by three: a conjunction with a constant, a disjunction with a
+severity test in both orders, and a heredoc spelling of the regular expression. All four are now in
+the third table below. **One round-8 statement is still not in any table here** — an alias form with
+`PREWHERE` outside the subquery, which returned `Code: 182` rather than a row count.
+
+```sql
+SELECT getSetting('use_query_condition_cache')
+-- true
+
+SELECT name, comment FROM system.columns
+WHERE database = 'system' AND table = 'query_condition_cache'
+-- key_hash        Hash of (table_uuid, part_name, condition_hash).
+-- entry_size      The size of the entry in bytes.
+-- matching_marks  Matching marks.
+```
+
+Five executions at the shipped default after `SYSTEM DROP QUERY CONDITION CACHE`, in this order,
+against the same table and the same parts. Legs 1 to 3 carry the condition
+`match(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')`; legs 4 and 5 carry
+`… = 1` appended to it, and each of the five returned thirty rows:
+
+| # | what differs from the leg above | `read_rows` | `read_bytes` | CPU µs |
+|---|---|---|---|---|
+| 1 | first execution after the cache was dropped | 3,000,000 | 309,060,017 | 544,160 |
+| 2 | nothing — the same statement again | 245,760 | 25,313,762 | 33,362 |
+| 3 | the `SELECT` list: `count() + 0` rather than `count()`, first execution of this text | 245,760 | 25,313,762 | 29,837 |
+| 4 | `= 1` appended to the condition; first execution of this form | **3,000,000** | **309,060,017** | 550,425 |
+| 5 | nothing — leg 4 again | 245,760 | 25,313,762 | 24,792 |
+
+A second sequence, cache dropped first, legs run in the order printed. Legs 1 to 12 executed and each
+returned thirty rows; leg 13 did not execute. All at `use_query_condition_cache = 1`,
+`max_block_size = 65409`:
+
+| the condition | `read_rows` | |
+|---|---|---|
+| `match(body, RE)` — leg 1, warms the entry | 3,000,000 | paid |
+| `match( body, RE )` — spaces inside the call | 245,760 | **reused** |
+| `((match(body, RE)))` — redundant parentheses | 245,760 | **reused** |
+| `match(\n body,\n RE)` — newlines | 245,760 | **reused** |
+| `match(pulsus_nsqlcost.log_samples.body, RE)` — the column qualified with the database holding `log_samples` | 245,760 | **reused** |
+| `match(t.body, RE)`, the table read `AS t` | 245,760 | **reused** |
+| `match(body, RE) = 1` | 3,000,000 | paid |
+| `1 = match(body, RE)` — operands swapped | 3,000,000 | paid |
+| `NOT NOT match(body, RE)` | 3,000,000 | paid |
+| `toBool(match(body, RE))` | 3,000,000 | paid |
+| `match(body, RE) AND 1` | 3,000,000 | paid |
+| `match(body, RE)` again — leg 1's text | 245,760 | **reused** |
+| `MATCH(body, RE)` | — | leg 13; did not execute, printed below |
+
+Fourteen further conditions were run in earlier reviews of this document under the same two settings,
+each after its own cache drop and warm. Each returned thirty rows. The six marked **re-run** were
+executed again here and returned what is printed; the other eight are transcribed from those reviews.
+The last three warm a condition of their own, given in the row:
+
+| the condition | `read_rows` | | |
+|---|---|---|---|
+| `WITH body AS b` then `match(b, RE)` | 245,760 | **reused** | |
+| `SELECT body AS b FROM log_samples PREWHERE service = 'ipcase' WHERE <window> AND match(b, RE)` — the alias in the top-level projection | 245,760 | **reused** | re-run |
+| `SELECT b FROM (SELECT body AS b, timestamp_ns, service FROM log_samples) WHERE service = 'ipcase' AND <window> AND match(b, RE)` — the same alias inside a subquery | 3,000,000 | paid | re-run |
+| a derived table aliasing `body AS payload`, then `match(payload, RE)` | 3,000,000 | paid | |
+| `FROM (SELECT body …) s` then `match(s.body, RE)` | 3,000,000 | paid | |
+| `match(tupleElement(tuple(body), 1), RE)` | 3,000,000 | paid | |
+| `match(body, concat(RE, ''))` | 3,000,000 | paid | |
+| `match(body, toString(RE))` | 3,000,000 | paid | re-run |
+| `match(body, RE) OR false` | 3,000,000 | paid | |
+| `true AND match(body, RE)` | 3,000,000 | paid | |
+| `match(body, RE) != 0` | 3,000,000 | paid | |
+| `match(body, RE) AND (1 + 1 = 2)`, warmed by `match(body, RE)` | 3,000,000 | paid | re-run |
+| `severity = 99 OR match(body, RE)`, warmed by `match(body, RE) OR severity = 99` | 3,000,000 | paid | re-run |
+| the same regular expression written as a heredoc literal, `$$…$$` rather than quoted, warmed by the quoted form. `SELECT '<quoted>' = $$<heredoc>$$` returns `1` | 245,760 | **reused** | re-run |
+
+Leg 13, the statement as sent and the response as received, byte for byte:
+
+```text
+SELECT count() FROM log_samples PREWHERE service = 'ipcase'
+WHERE timestamp_ns > 1787999999999999999 AND timestamp_ns <= 1788084000000000000
+  AND MATCH(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)')
+SETTINGS max_block_size = 65409
+```
+
+```text
+Code: 46. DB::Exception: Function with name `MATCH` does not exist. In scope SELECT count() FROM log_samples PREWHERE service = 'ipcase' WHERE (timestamp_ns > 1787999999999999999) AND (timestamp_ns <= 1788084000000000000) AND MATCH(body, '(^|[^0-9])10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}([^0-9]|$)') SETTINGS max_block_size = 65409. Maybe you meant: ['match','path']. (UNKNOWN_FUNCTION) (version 26.3.29.7 (official build))
+```
+
+`SELECT count() FROM system.query_condition_cache`, in two sequences, each begun with
+`SYSTEM DROP QUERY CONDITION CACHE` and each leg at `use_query_condition_cache = 1`,
+`max_block_size = 65409`:
+
+| sequence | counts |
+|---|---|
+| drop, then leg 1, then leg 13 | **0**, then **4**, then **4** |
+| drop, then legs 1 to 13 in the order printed above | **0**, then **28** |
+
+All 32 capitalisations of the five letters of `match` were run as `SELECT <spelling>('a','a')`: **one
+returned a value and 31 returned `Code: 46`**. Nine further spellings, each run once on the same
+server. The four `Code: 46` cells are response prefixes, cut at the first sentence; each response
+continues with the scope and the version, in the form printed for leg 13 above:
+
+| statement | response |
+|---|---|
+| `SELECT COUNT(1)` | `1` |
+| `SELECT SUM(1)` | `1` |
+| `SELECT MAX(1)` | `1` |
+| `SELECT LENGTH('ab')` | `2` |
+| `SELECT LOWER('AB')` | `ab` |
+| `SELECT TOBOOL(1)` | ``Code: 46. DB::Exception: Function with name `TOBOOL` does not exist.`` … |
+| `SELECT TOSTRING(1)` | ``Code: 46. DB::Exception: Function with name `TOSTRING` does not exist.`` … |
+| `SELECT STARTSWITH('ab','a')` | ``Code: 46. DB::Exception: Function with name `STARTSWITH` does not exist.`` … |
+| `SELECT SIPHASH64('a')` | ``Code: 46. DB::Exception: Function with name `SIPHASH64` does not exist.`` … |
+
+**Not run:** the `condition_hash` computation in the ClickHouse source for 26.3 has not been read.
+
+**Withdrawn, and not replaced.** Five sentences generalising the legs above were written and each was
+refuted by a probe:
+
+| the sentence | what refuted it |
+|---|---|
+| the key is the query text | a different `SELECT` list carrying the condition reused the entry |
+| the key is "a condition" | `match(…) = 1` paid |
+| the key is the condition as written | spaces and redundant parentheses reused |
+| the key is the condition's parsed form | qualifying and aliasing the column reused |
+| the refusal of `MATCH` belongs to `match` | `TOBOOL`, `TOSTRING`, `STARTSWITH` and `SIPHASH64` are refused in capitals too |
+
+**Not measured, and no instrument was used for either:** the bytes crossing from ClickHouse to
+`pulsus-server`, and behaviour at 1 TB ([issue #25](https://github.com/digitalis-io/pulsusdb/issues/25)).
+`read_bytes` and the CPU column above are the `read_bytes` and
+`ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']` that
+`system.query_log` returned for each statement.
+
+The two ratios in the priced table were re-run on a shorter window —
+`timestamp_ns <= 1788008400000000000` in place of `1788084000000000000`, everything else unchanged at
+`use_query_condition_cache = 0`, `max_block_size = 65409`. The literal leg returned 32,768 rows and
+3,374,881 bytes, the address-range leg 303,104 and 31,224,865: ratios of **9.25** and **9.252**,
+against **12.207** and **12.209** on the longer window. No third window was run.
+
 
 ---
 
@@ -4261,6 +4799,11 @@ captured on 2026-09-01 from `grafana/loki:3.7.4`, digest `sha256:87f0a067...cfcc
 corpus. The PulsusDB column was **not** measured end to end in every row, and the last column says
 what evidence there is for each.
 
+**The last three rows were added on 2026-09-09**, against the same digest and with both sides
+measured. Each needed lines part 4.1's corpus does not contain, so each was measured over a corpus
+written for it; the values on both sides, the corpora and the source on each side are below the
+table.
+
 | query | PulsusDB | grafana/loki 3.7.4, measured | evidence for the PulsusDB column |
 |---|---|---|---|
 | `sum by (level) (count_over_time({service_name="checkout"} \| json \| __error__!="LogfmtParserErr" [1m]))` | `400` `pipeline error: 'JSONParserErr' ...` | `200`, four series: `{level="error"} 1`, `{level="info"} 1`, `{level="warn"} 1`, `{} 1` | **unverified.** Read only: the filter does not clear a `JSONParserErr` label, and a non-empty error label reaching the aggregation raises the error at `logql/error.rs:782-785`. Settled by one live request against the streams route with the fourth corpus line ingested, asserting status and body |
@@ -4268,6 +4811,88 @@ what evidence there is for each.
 | `vector(1e3)` | `400` `unexpected duration "1e3" at byte 7: expected the vector value (e.g. vector(0))` | `200`, one series, `{}` = `1000` at every grid point | **measured** 2026-09-01, the same way |
 | `{service_name="checkout"} \| json \| dur_ms > 1e1` | `400` `bad parser expression: literal "1e1" is neither a duration nor a bytes quantity` | `200`, two entries — `dur_ms` `12.5` and `31.0` | **partly measured.** The parse was run: it succeeds, giving a comparison whose right-hand side is the literal `1e1`. The refusal itself is read, not executed — the suffix `e1` is in neither `QUERY_BYTES_SUFFIXES` (`pipeline.rs:3002`) nor `DURATION_UNITS` (`pipeline.rs:2890`), so `classify_numeric_literal` (`pipeline.rs:2876`) returns that message. Part 4's LogQL19 |
 | `{service_name="colors"} \| decolorize \|= "upstream ok"` | `200`, **one** entry | `200`, **zero** entries | **unverified.** See below. Part 4's LogQL24, LogQL25, LogQL26 |
+| `sum by (id) (sum_over_time({…} \| json \| unwrap duration(v) \| __error__="" [30m]))` over `v` in `1d`, `2w`, `-5s`, `+5s` | two series: `{id="d_1d"} 86400`, `{id="d_2w"} 1209600` | two series: `{id="d_minus5s"} -5`, `{id="d_plus5s"} 5` | **measured** 2026-09-09 on both sides. The two answers are disjoint: each engine accepts exactly the values the other rejects. Values, corpus and the source on each side: below |
+| `{…} \|= ip("10.0.0.0/8")` over two lines containing `10.1.2.3.4` and one containing `10.1.2.3` | `200`, **three** entries | `200`, **one** entry | **measured** 2026-09-09 on both sides. We extract a fixed-width dotted quad; the reference parses a maximal run. Below |
+| `{…} \| json` over eight lines whose `c` is a different number spelling | the `c` label differs from the reference on **six** of the eight | the `c` label is the document's own bytes in all eight | **measured** 2026-09-09 on both sides. All eight pairs are in the table below |
+
+### Three more defects, found on 2026-09-09, with the values on both sides
+
+These three are the last three rows of the table above. Each was measured on both sides on the same
+day: the reference against `grafana/loki:3.7.4`, digest
+`sha256:87f0a067673756a3cede1bcbf0c74875f7df9b09fddb53e399d0c576f756cfcc`, whose
+`/loki/api/v1/status/buildinfo` answered `{"version":"3.7.4","revision":"b318f282",…}`; PulsusDB
+through the hermetic corpus runner, which drives the planned pipeline
+(`crates/pulsus-read/tests/logqltest_corpus.rs` over `crates/pulsus-read/tests/logqltest/runner.rs`).
+**Part 4.1's corpus does not contain the lines any of the three needs**, so each was measured over a
+corpus written for it, given below. **No committed test covers any of the three**, and each
+subsection ends with the corpus row that would settle it.
+
+#### The duration parser: two units we accept and it rejects, two signs it accepts and we reject
+
+Four lines, `{"id":"…","v":"…"}`, queried as
+`sum by (id) (sum_over_time({…} | json | unwrap duration(v) | __error__="" [30m]))`.
+
+| `v` | PulsusDB | grafana/loki 3.7.4 |
+|---|---|---|
+| `1d` | `86400` | dropped |
+| `2w` | `1209600` | dropped |
+| `-5s` | dropped | `-5` |
+| `+5s` | dropped | `5` |
+
+The two answers are disjoint sets: every value one engine accepts, the other rejects. Ours reads
+`DURATION_UNITS` (`crates/pulsus-read/src/logql/pipeline.rs:2890`), which carries `d` at `:2898` and
+`w` at `:2899`, through a scanner whose first token must begin with an ASCII digit or `.`
+(`:2950`). The reference's conversion is Go's `time.ParseDuration`
+(`pkg/logql/log/metrics_extraction.go:321` @ `v3.7.4`), which has neither `d` nor `w` and does take
+a leading `+` or `-`. A full port of the Go parser already exists in this tree —
+`go_parse_duration` (`crates/pulsus-read/src/logql/template/funcs.rs`), used by the `duration`
+template function — and the `unwrap` path does not use it. **What would settle it in the corpus:**
+four rows in `crates/pulsus-read/tests/logqltest/corpus/` carrying those four values under
+`unwrap duration`.
+
+#### The address filter: a five-group run matches for us and not for the reference
+
+Three lines, queried as `{…} |= ip("10.0.0.0/8")`.
+
+| line | PulsusDB | grafana/loki 3.7.4 |
+|---|---|---|
+| `ts=2026-09-08 10.1.2.3.4 five groups` | **match** | no match |
+| `t=10.1.2.3.4 five groups again` | **match** | no match |
+| `control conn from 10.1.2.3 accepted` | match | match |
+
+Three entries against one. Our extractor is a fixed-width dotted quad,
+`[0-9]{1,3}(?:\.[0-9]{1,3}){3}` (`crates/pulsus-read/src/logql/ip.rs:169`), scanned with `find_iter`
+and parsed per match (`:197-210`), so `10.1.2.3.4` offers it `10.1.2.3` and that parses. The
+reference takes a **maximal run** of the address character set and parses the whole run
+(`pkg/logql/log/ip.go:183-226`, `:284-298` @ `v3.7.4`), so the same text offers it `10.1.2.3.4`,
+which does not parse. **What would settle it in the corpus:** one row in
+`crates/pulsus-read/tests/logqltest/corpus/b20_nested_ip.test` carrying `10.1.2.3.4` with a
+`|= ip("10.0.0.0/8")` query.
+
+#### The `| json` parser: six of eight number spellings render differently
+
+Eight lines, `{"id":"n…","c":<number>}`, read for the text of the `c` label.
+
+| `c` in the line | PulsusDB | grafana/loki 3.7.4 |
+|---|---|---|
+| `31.0` | `31.0` | `31.0` |
+| `1e3` | `1000.0` | `1e3` |
+| `0.30` | `0.3` | `0.30` |
+| `-0` | `-0.0` | `-0` |
+| `1.000000000000000005` | `1.0` | `1.000000000000000005` |
+| `123456789012345678901234567890` | `1.2345678901234568e+29` | `123456789012345678901234567890` |
+| `1.5e300` | `1.5e+300` | `1.5e300` |
+| `9007199254740993` | `9007199254740993` | `9007199254740993` |
+
+Six differ. Each difference is a different label value, so on a metric query each is a different
+series name. Ours ends at `Value::Number(n) => n.to_string()`
+(`crates/pulsus-read/src/logql/pipeline.rs:6099`), which renders through the parsed number; the
+reference copies the document's own bytes (`pkg/logql/log/parser.go:258-259` @ `v3.7.4`). Note the
+direction this one points: §5.1's row 4 records that `simpleJSONExtractRaw` returns the reference's
+bytes, so an expression that made the group key compile would move our answer **towards** the
+reference on these six — a behaviour change that must be stated as one rather than arriving inside a
+performance change. **What would settle it in the corpus:** one row loading `{"c":1e3}` with
+`| json`.
 
 ### The colour-stripping row, and what the committed corpus cannot tell us
 
@@ -4371,6 +4996,11 @@ cheaper than having the next reader find them.
 | the ClickHouse behaviours the guards rest on | run and pasted into the cells that use them: `JSONExtractString('{"c":31.0}','c')` is `31`; `JSONExtractString('{"b":500}','b')` is `500`; `JSONExtractFloat('{"i":1e3}','i')` is `1000`; `JSONExtractFloat('{"s":"12abc"}','s')` is `0`; `JSONType('{"a":1}trailing')` is `Null`; `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; `extractGroups('a\nb','(?P<x>a.b)')` is `['a\nb']` and with `(?-s)` is `[]` | that they hold on another ClickHouse version. They were run on 26.3.17.110 only, which is the version floor (`controller.rs:57`) |
 | the granule and byte figures | `EXPLAIN indexes=1` and `system.query_log` over 3,000,000 synthetic log rows and 200,000 synthetic spans on the same server. Log side: the primary key cuts 367 granules to 124; a rare needle's `LIKE` cuts 124 to 10 and reads 81,920 rows against 1,015,808; the parsed-field predicate adds **no `Skip` section at all**; a 1,000-row page holds 250 matching entries without it and 1,000 with it; today's range-count shape returns 192,956 rows and reads 27.54 MiB where the bucketed form returns 12 rows and reads 3.72 MiB. Trace side: `key='service.namespace' AND val='prod'` reads 14 of 74 granules and `key IN ('service.namespace','foo')` reads 51 of 74 | how any of it scales. These are CI-scale ratios on synthetic data, chosen because a ratio is scale-invariant and a wall-clock number is not. Behaviour at 1 TB is [issue #25](https://github.com/digitalis-io/pulsusdb/issues/25) |
 | the key/value extractor disagrees with the reference's logfmt decoder on exactly one of eleven shapes tried | eleven awkward lines were run through `extractKeyValuePairs(body, '=', ' \t\r\n', '"')` and each answer compared to what `pkg/logql/log/logfmt/decode.go` @ `v3.7.4` produces by its own rules. Ten agree or answer the empty string; `k="a\"b" x=1` answers `a\` where the reference answers `a"b` | **that eleven is enough.** It is an enumeration, not a proof. §10's open question 3 says what would close it |
+| §5.1's ClickHouse answers — `parseTimeDelta`, `parseReadableSize`, `simpleJSONExtractRaw`, `JSONExtractString`, `leftPad`, `upperUTF8` | each run on 2026-09-09 against `clickhouse/clickhouse-server:26.3`, `SELECT version()` = **26.3.29.7**; the command sits beside each table | that they hold on 26.3.17.110, the version part 4's *decided here* statements were run on. `simpleJSONExtractRaw` is a text scanner and `parseTimeDelta` a parser, and both are the kind of surface a patch release moves |
+| §5.1's and part 7's reference answers | replayed on 2026-09-09 against `grafana/loki:3.7.4`, digest `sha256:87f0a067…cfcc`, with buildinfo read from the running process, over the corpora printed in each subsection | only that the reference answers this way over **those** lines. Each corpus is 3–8 lines, chosen against a specific wrong model, not a sample of anything |
+| part 7's three PulsusDB columns | driven on 2026-09-09 through the hermetic corpus runner — `crates/pulsus-read/tests/logqltest_corpus.rs` over `crates/pulsus-read/tests/logqltest/runner.rs` — which plans the query and evaluates the **planned** pipeline | that a live request answers the same. The runner executes no SQL; all three defects are in the evaluator, which it does execute, and none of the three is a stage that compiles. **No committed test covers any of them** — each subsection names the corpus row that would |
+| §5.1's row 6 — a single statement with no join reproduces the reference's answer | measured on 2026-09-09 against `grafana/tempo:v3.0.2`, digest `sha256:aa8df8d0…d8f7`, over a five-trace corpus built so that three wrong models each fail on a different trace | that the statement is exact in general. Two shapes outside that corpus disagree and the row names both. What it establishes is that the permanence claim was wrong, not that a translation exists |
+| the reference's template function surface is larger than its two maps | counted in the checkout at `v3.7.4` (`b318f2829f`): `pkg/logql/log/fmt.go:29` holds 23 quoted names and `:76` holds 42 | that 65 is the callable surface. `printf` appears nowhere in that file and the running reference evaluates it, so Go's `text/template` built-ins are callable on top and are not enumerated here |
 
 ### Read
 
@@ -4431,19 +5061,288 @@ the reference's answer, and require containment. **This document does not contai
 cannot stand in for one.** What it contains is fourteen worked cases with the answer captured from
 the reference beside each statement, which is the material such a test would be built from.
 
-Three smaller stopping points. **The `31.0` finding rests on one value.** `sum by (…)` over a parsed
-label is ruled out because ClickHouse renders a JSON number differently from our parser, and the
-evidence is `31.0` against `31` on one corpus line and one captured reference answer. If that
-rendering were made to agree, the row would move. **The reachability arguments above have no test
-behind them**, so a future change can make part 1 wrong silently. And **every `file:line` citation
-ages**: they were all printed and read at `2f78c53`, and nothing keeps them true afterwards.
+Three smaller stopping points. **The `31.0` finding was wrong, and the shape of the mistake is worth
+keeping.** `sum by (…)` over a parsed label was ruled out on the ground that no ClickHouse expression
+renders a JSON number as the reference does; two functions had been measured and the sentence was
+written about all of them. A third, `simpleJSONExtractRaw`, returns `31.0` — the reference's own
+bytes (§5.1, row 4). A claim whose subject is every member of a set, checked against two members, is
+the defect; the row has moved to §5.1 and what remains open there is stated over the shapes that were
+tried. **The reachability arguments above have no test behind them**, so a future change can make
+part 1 wrong silently. And **every `file:line` citation ages**: they were all printed and read at
+`2f78c53`, except §5.1's and part 7's last three subsections, which were printed and read at
+`58feb2b`; nothing keeps any of them true afterwards.
+
+**Six perturbations, one per run, each a single change to this file on a clean tree.** Four kinds of
+content in these two regions were changed — a measured figure, a word of prose, a citation of the
+form `file:line`, and the region itself — plus one change outside them as a reachability control.
+Nothing else was tried.
+
+Each run is `cargo nextest run --workspace --no-fail-fast` on the merged tree, reverted afterwards
+with `git status` checked clean. The line counts are `git diff --numstat` on the perturbed tree:
+
+| the change | where | `numstat` | result |
+|---|---|---|---|
+| **A** — a measured figure: `5400` becomes `9999` | §5.1 | `1 1` | 7,097 run, 7,097 passed, 36 skipped |
+| **A2** — a citation: the `querytext.rs` line reference **in §5.1's instrument table** gains one, `:52` becoming `:53`. The row above names the same reference, so the edit is made positionally inside §5.1 rather than by replacing every occurrence | §5.1 | `1 1` | 7,097 run, **7,094 passed, 3 failed**, 36 skipped: `design_record_drift_gate` `every_citation_in_the_design_record_has_a_row`, `no_citation_row_is_unused`, `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
+| **A3** — a word of prose: "is not a cost" becomes "is not a price" | §5.1 | `1 1` | 7,097 run, 7,097 passed, 36 skipped |
+| **B** — delete §5.1 in full | §5.1 | `0 493` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `no_citation_row_is_unused` and `every_figure_section_12_3_states_is_the_one_the_datasets_hold` |
+| **C** — insert one blank line as line 431 | part 2 | `1 0` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: `logql_pattern_expr_matrix the_sites_dataset_is_regenerated_not_retyped` and `design_record_drift_gate every_recorded_count_site_resolves_exactly_once` |
+| **D** — delete part 7's three added subsections in full | part 7 | `0 79` | 7,097 run, **7,095 passed, 2 failed**, 36 skipped: the same two as B |
+
+So, over the four kinds tried: **a figure and a word of prose change with nothing reacting; a
+citation changes and three tests react; deleting a region makes two react.** An earlier revision of
+this paragraph rested "no test asserts on the values these regions state" on A alone, and A2 is the
+run that shows a citation is a value a test does assert on.
+
+What the reacting tests read, from their own datasets. `design_record_citations.tsv` holds one row
+per `(document, citation)` pair, twelve of them added by this correction:
+`every_citation_in_the_design_record_has_a_row` fails when the document names a citation with no row,
+`no_citation_row_is_unused` when a row has no occurrence left, and
+`every_figure_section_12_3_states_is_the_one_the_datasets_hold` compares a census block in
+`docs/query-lowering.md` against those datasets. `every_recorded_count_site_resolves_exactly_once`
+holds recorded line positions, one of them in this document; the commands under C below read it
+rather than restating it.
+
+The same four runs before the merge, at `2611b4d7` against a tree without that gate, returned 7,070
+passed for A, B and D and one failure for C. **A2 and A3 were not run then.**
+
+#### A retraction, and the control that replaces it
+
+**An earlier revision of this paragraph said no control for these regions could be built without
+planting material for a sweep to find. That was false, and it was the second impossibility claim this
+piece of work produced that turned out to be an untested assumption** — the first being the six
+constructs part 5 called permanent, which is what §5.1 exists to correct. The mistake was the same
+one both times: a claim about a set, checked against a subset. Two committed position datasets were
+searched, neither records anything from this document after line 966, and that was written up as a
+fact about the whole suite. `crates/pulsus-read/tests/query_lowering_doc_gate.rs` reads this document
+directly and asserts a paragraph-local property — every paragraph containing a given figure must also
+contain a given phrase — and at `811192cd` it did that on this document's own line 3692, which is
+after 966. **Both ends of that example have since moved.** Part 8 (`86081ef1`) re-measured the
+figure: `43,636` and the tag `seed + root only` are superseded by the §9.2 re-measurement, and that
+same test now requires any paragraph naming either to say so — which is why this one does. The
+example is stated as it stood at `811192cd` because the paragraphs below record an experiment run
+against that revision.
+
+Writing the sentence above tripped that test on its first run, because naming the two strings is
+what the rule is about. That is the second time a sentence in this document describing a check has
+broken the check by naming what it describes; the first is recorded under the controls below.
+
+**The revision after that one tried to use the shipped gate as the control by repointing its two
+constants, and that control was red either way.** Those constants are shared by three tests: the
+paragraph check over this document, the same check over `docs/query-lowering.md` in the same loop,
+and a check on the hops diagram's own face — `query_lowering_doc_gate.rs:340`, `:344` and `:417`
+**as that file stood at `811192cd`**; part 8 rewrote the test, and those three line numbers resolve
+to unrelated text on the current tree. Repointing only the constants makes the test fail on
+`docs/query-lowering.md` before it ever reads this document. The control was published at `217531c7`; the replay below was run
+against `811192cd`, a later commit on the same branch whose text carries the same two constants and
+whose copy of the gate is byte-identical. Measured there: `1 test run: 0 passed, 1 failed` under a
+selector and `3 passed, 2 failed` over the whole file, with the documented paragraph-local message
+never appearing at all. **A control that reports failure whether or not the thing it tests is
+broken is the same defect as one that reports success either way.**
+
+**How it was nonetheless reported as passing — reconstructed by replay, because the first published
+explanation was wrong.** That explanation said the run had been scoped with a selector naming one
+test. Repointing the constants and selecting that test does *not* pass, so the explanation could not
+be what happened. Replaying the actual edit set against `811192cd`'s document gives the answer, and
+it is worse than the published one:
+
+| what was changed | selector, one test | whole file |
+|---|---|---|
+| the two constants only — what the document described | 0 passed, 1 failed | 3 passed, 2 failed |
+| **the six edits actually made** | **1 passed, 4 skipped** | 4 passed, **1 failed** |
+
+**Four of those six edits were never published.** Two `true \|\|` short-circuits in front of the
+`docs/query-lowering.md` assertions, restricting the loop to this document alone, and stubbing the
+superseded-wording list to an empty slice: together they disable every assertion in that test that is
+not about this file. That is what made it pass, and because they were not written down, the described
+procedure could not reproduce it. The selector was the second half — it hid the one failure the
+neutralisations did not cover, the diagram test, which the whole-file column shows.
+
+So the lesson is not the one first recorded. **The published procedure was not the procedure that was
+run**, and the missing part was the part doing the work.
+
+**So the control is its own test binary with its own constants, sharing nothing.** It applies the
+same rule the shipped gate applies. This is its whole source; it is not committed, and it was deleted
+after the runs below:
+
+```rust
+fn doc() -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().and_then(std::path::Path::parent).expect("workspace root");
+    std::fs::read_to_string(root.join("docs/query-to-sql.md")).expect("read the document")
+}
+
+/// The same rule query_lowering_doc_gate applies: every paragraph holding
+/// `figure` must also hold `tag`, and `figure` must appear at least once.
+fn paragraph_local(figure: &str, tag: &str) {
+    let text = doc();
+    let mut seen = 0usize;
+    for para in text.split("\n\n") {
+        if !para.contains(figure) { continue; }
+        seen += 1;
+        assert!(para.contains(tag),
+            "a paragraph quotes {figure} without {tag:?}. It opens: {:?}",
+            para.lines().next().unwrap_or(""));
+    }
+    assert!(seen > 0, "{figure} appears nowhere — this control is checking nothing");
+}
+
+#[test] fn e_section_5_1_cache_table() { paragraph_local("544,160", "33,362"); }
+#[test] fn f_part_7_json_number_table() { paragraph_local("1.2345678901234568e+29", "9007199254740993"); }
+#[test] fn g_section_5_1_row_6_subsection() {
+    paragraph_local("aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7", "three wrong models");
+}
+```
+
+Every constant is text **already in the regions**, put there by the measurements above and not for
+this purpose. The file was `crates/pulsus-read/tests/zz_nsql_control.rs`, so the invocation was
+`cargo nextest run -p pulsus-read --test zz_nsql_control --no-fail-fast`, run on the committed text
+and then once per perturbation:
+
+| run | perturbation | E — §5.1's cache table | F — part 7's number table | G — §5.1's row-6 subsection |
+|---|---|---|---|---|
+| baseline | none | pass | pass | pass |
+| E | that table's `33,362` becomes `99,999` | **fail** | pass | pass |
+| F | **all three cells** of that table's `9007199254740993` row become `…94` | pass | **fail** | pass |
+| G | "three wrong models" becomes "three incorrect models" | pass | pass | **fail** |
+| restored | none | pass | pass | pass |
+
+Each failure named its own region: *"a paragraph quotes 544,160 without `33,362`. It opens: `| # | what differs from the leg above | …`"*, *"…quotes 1.2345678901234568e+29 without `9007199254740993`. It opens: `| c in the line | PulsusDB | …`"*, and *"…quotes aa8df8d0… without `three wrong models`. It opens: `For { .tag = "x" } && …`"*. Three perturbations, three distinct failures, no crosstalk.
+
+**F's perturbation is all three cells of that row, and that is not a detail.** The value appears three
+times in it, and the rule is that the paragraph must still hold the tag somewhere — so changing one
+cell leaves F **green**, measured. F detects the tag leaving the table, not any edit to the row, and
+the same is true of E and G: each detects its tag leaving its paragraph.
+
+**And these controls are not purely regional — disclosed rather than fixed.** Publishing the control's
+source above put its own constants into this document, so E's figure now sits in three paragraphs
+rather than one: §5.1's cache table, the code block above, and the sentence quoting E's failure.
+Changing E's tag inside either of the latter two fails E with §5.1 untouched. Two consequences worth
+stating plainly. **A control published in the document it checks stops being regional the moment it is
+published**, which is one reason these three are a throwaway rather than a committed gate. And writing
+this very paragraph broke E once: an earlier draft of it named E's figure without naming E's tag beside
+it, which is a paragraph quoting the figure without the tag — exactly what E fails on. It was found by
+re-running the control after the edit, and the fix was to name the pair together rather than to add the
+tag as decoration. **The runs below are unaffected**: each perturbation edited only its region, and
+only one control reddened in each.
+
+**What this control is and is not.** It is purpose-built, so it does not show that anything in the
+shipped suite reacts to these regions — it shows that a test **can** be pointed at a figure or a
+sentence in them and made to react, which is the claim the withdrawn sentence denied. **A and A3 are
+the runs where nothing in the shipped suite reacted**, to a figure and to a word of prose. **A2 is
+the run where it did**, to a citation, and B and D are the runs where deleting the region did.
+
+C reddens two tests, and both hold positions rather than content. One records six `| pattern`
+arguments swept out of the tracked tree; the other records one count site. **Their positions move
+whenever anything above them moves, so read them rather than quoting them:**
+
+```sh
+grep -o 'docs/query-to-sql.md:[0-9]*' crates/pulsus-read/tests/logql_pattern_expr_sites.tsv | sort -t: -k2 -n
+awk -F'\t' '$2 == "docs/query-to-sql.md" && $3 ~ /2\.4/ {print $6}' \
+  crates/pulsus-read/tests/design_record_counts.tsv
+```
+
+On this revision the first returns 230, 501, 731, 763, 764 and 996, and the second returns 541.
+**Which part each falls in is derived from the headings, not asserted**, by feeding both into a third
+command:
+
+```sh
+{ grep -o 'docs/query-to-sql.md:[0-9]*' crates/pulsus-read/tests/logql_pattern_expr_sites.tsv | cut -d: -f2
+  awk -F'\t' '$2 == "docs/query-to-sql.md" && $3 ~ /2\.4/ {print $6}' \
+    crates/pulsus-read/tests/design_record_counts.tsv
+} | sort -n | while read n; do
+    printf '%5s  %s\n' "$n" "$(awk -v n="$n" 'NR<=n && /^## /{h=$0} END{print h}' docs/query-to-sql.md)"
+  done
+```
+
+```text
+  230  ## 1. The SQL we send today
+  501  ## 2. The SQL we will send
+  541  ## 2. The SQL we will send
+  731  ## 2. The SQL we will send
+  763  ## 2. The SQL we will send
+  764  ## 2. The SQL we will send
+  996  ## 2. The SQL we will send
+```
+
+One in part 1 and six in part 2; **none is in part 4**, and none is in the regions the other five
+perturbations change.
+
+**Read the output, not the exit code.** Measured on this tree: the `grep | sort` pipeline exits **0**
+when it matches nothing, and **0 again when its input file does not exist**, because `sort` is last
+and masks `grep`'s failure. The `awk` command exits 0 on no match and 2 on a missing file. So a run
+that prints nothing has found nothing, and that is a result to act on rather than a pass — the
+printed output above is what makes a silent miss visible.
+
+An earlier revision printed seven such positions as plain prose and asserted their parts. The commit
+that added the note above moved every one of them and regenerated the datasets without correcting the
+sentence, and the part claim was wrong in both halves. That is the third and fourth occurrences of
+hazard two, and the reason nothing here is transcribed. E, F and G are what reach a figure or a
+sentence in those regions.
+
+**Three things this paragraph does not claim.** It does not cover the older rows of part 5's table,
+the rest of part 7, or **part 6**, none of which was perturbed; and it does not say what B and D
+would do to a region that cites nothing, which was not tried. It says nothing about how many suites
+open this document: that is a fact about reading source, no perturbation counted it, and an earlier
+revision asserted it inside this measured paragraph. And it is not a statement about any other
+document.
+
+What a change to these parts *can* break as things stand is
+`crates/pulsus-read/tests/logql_pattern_expr_sites.tsv`, if it moves one of those six positions —
+regenerated by
+`cargo test -p pulsus-read --test logql_pattern_expr_matrix -- --ignored regenerate_the_sites_dataset`
+and never hand-edited.
+
+#### The findings of five rounds of review on §5.1 and part 7
+
+Findings transcribed from the verdicts of rounds 1 to 5. Counted with:
+
+```sh
+awk '/^\| round \| severity \| the finding \| about \|$/,/^$/' docs/query-to-sql.md |
+  awk -F'|' '/^\|/ {n++; if ($5 ~ /subject/) s++} END {print n-2, s}'
+# 16 4
+```
+
+Without the first `awk`, the second reads every table row in the document; on this revision it
+returns `554 4`, and that figure moves whenever any table anywhere in the document gains or loses a
+row — an earlier revision printed `547 4`, measured before the commit that carried it added two rows.
+Re-run it rather than trusting it.
+
+| round | severity | the finding | about |
+|---|---|---|---|
+| 1 | medium | two cells retained unsupported information boundaries | **subject** |
+| 1 | low | the coverage account omitted a suite | evidence |
+| 1 | medium | the proposed directions lacked measured cost envelopes | evidence |
+| 2 | medium | the perturbation did not support the claimed coverage | evidence |
+| 2 | medium | row 5's instrument was incomplete and cache-sensitive | evidence |
+| 2 | medium | rows 1–3 named the wrong instruments | evidence |
+| 3 | medium | the regional-control impossibility was false | evidence |
+| 3 | medium | the cache was described as keyed by query text | **subject** |
+| 3 | medium | the SQL legs omitted their executable settings | evidence |
+| 4 | medium | controls E and F failed before their perturbation | evidence |
+| 4 | medium | "a condition" exceeded the measured cache equivalence | **subject** |
+| 4 | medium | the query-log reader returned eight rows | evidence |
+| 5 | medium | the claimed selected control run could not pass | evidence |
+| 5 | medium | the cache key was not byte-for-byte condition text | **subject** |
+| 5 | low | the plan figures were not all 35 | evidence |
+| 5 | low | F and the published controls were not isolated | evidence |
+
+An independent enumeration of the same five rounds returned the same 16 rows, the same 12/4 split
+and the same membership. Sentences that stood under and over this table were removed on rulings of
+2026-09-09; an earlier revision counted them without naming the commit the count was taken against,
+and three different baselines give three different numbers, so no number is given here.
 
 ### When to open another round on this document
 
 Another round is warranted when a finding **changes what a person implementing this would write** —
 specifically, when it changes a SQL statement's text, moves a row between *emitted today*, *from the
-design*, *decided here* and *cannot become SQL*, changes an expected status or body in part 4 or in
-§2.8, or changes which construct part 5 says can never become SQL.
+design*, *decided here*, *evaluated after the read* and *cannot become SQL*, changes an expected
+status or body in part 4 or in §2.8, or changes which construct part 5 says can never become SQL.
+
+**A second class always warrants a round: a cell in part 5 whose reason is not one of the three the
+part 5 preamble names.** Six were found that way on 2026-09-09 and are now §5.1. The check is
+mechanical — read the cell and ask which of "not stored", "unbounded" and "only the query process
+can know" it names — and it is worth re-running whenever a row is added.
 
 **One class of finding always warrants a round: a query for which a *decided here* statement drops a
 line the reference's answer contains.** That is a wrong answer, not a wording problem, and it moves
@@ -4550,6 +5449,8 @@ noticed and are not grounds for a new round.
    pointless extraction on every row.
 
 **No cell is marked *not yet determined* any more.** The marking is retired: part 2.7 decides every
-row that carried it, and the four constructs for which no correct SQL exists are marked *cannot
-become SQL* with the reason in the cell — the general forms of `| line_format` and `| label_format`,
+row that carried it, and the four constructs it does not compile are marked *evaluated after the
+read* with the reason in the cell — the general forms of `| line_format` and `| label_format`,
 `| unwrap duration(x)` and `| unwrap bytes(x)`, and a metric grouping whose key is a parsed label.
+**None of the four is claimed to be impossible**; §5.1 says what holds each back and what would move
+it, and no SQL is offered for any of them.

@@ -99,8 +99,10 @@ qualifies, so `k` is the request's `limit` of 20 and the count is 4.
 > tagged `seed + root only`, computed from a two-statement model that left out the window-bounded
 > hydration read and the membership read; every ratio derived from it inherited the omission. That
 > figure, its tag and its ratios are **superseded by the §9.2 re-measurement** and appear nowhere
-> else in this record, in [`query-to-sql.md`](query-to-sql.md) or in
-> [the hops diagram](diagrams/query-lowering-hops.svg), which is redrawn from the same artefact.
+> else in this record or in [the hops diagram](diagrams/query-lowering-hops.svg), which is redrawn
+> from the same artefact. [`query-to-sql.md`](query-to-sql.md) names the figure and the tag once, at
+> its line 5121, in a paragraph that identifies them as superseded by the §9.2 re-measurement; that
+> paragraph explains why a historical example in it still quotes them.
 > §9.2b measures all four lowered statements and §9.2's comparison table divides the two whole
 > requests: **212,986 B** against **77,572,021 B**, a saving of **364×**.
 
@@ -5433,14 +5435,14 @@ The block below, tables and sentences alike, is rendered from the two citation d
 
 | quantity | at this revision |
 |---|---|
-| citation occurrences in the five artefacts | 596 |
-| of those, citing a bare basename | 476 |
-| `(document, token)` pairs the rule resolves | 306 |
-| occurrences those resolved pairs cover | 464 |
+| citation occurrences in the five artefacts | 608 |
+| of those, citing a bare basename | 477 |
+| `(document, token)` pairs the rule resolves | 318 |
+| occurrences those resolved pairs cover | 476 |
 | `(document, token)` pairs it cannot resolve | 83 |
 | occurrences those frozen pairs cover | 132 |
-| resolved rows anchored on a token the citing prose prints | 146 |
-| resolved rows anchored on a snapshot of the cited line | 160 |
+| resolved rows anchored on a token the citing prose prints | 154 |
+| resolved rows anchored on a snapshot of the cited line | 164 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
@@ -5460,7 +5462,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 596 citation occurrences the five artefacts make, 476 name a bare basename. The rule resolves 306 `(document, token)` pairs covering 464 occurrences, and cannot resolve 83 covering 132. Of the resolved rows, 146 are anchored on a token the citing prose prints and 160 on a snapshot of the cited line.
+Of the 608 citation occurrences the five artefacts make, 477 name a bare basename. The rule resolves 318 `(document, token)` pairs covering 476 occurrences, and cannot resolve 83 covering 132. Of the resolved rows, 154 are anchored on a token the citing prose prints and 164 on a snapshot of the cited line.
 
 The language fallback and the anchor rule disagree on 9 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
