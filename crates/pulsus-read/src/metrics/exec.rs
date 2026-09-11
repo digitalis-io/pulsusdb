@@ -1035,7 +1035,12 @@ impl MetricsEngine {
                 let series_rows: Vec<HydratedLabelsRow> = self.fetch_rows(hydrate_sql).await?;
                 let labels_by_fp: HashMap<Fingerprint, LabelSet> = series_rows
                     .into_iter()
-                    .map(|r| (r.fingerprint, parse_canonical_labels(&r.labels)))
+                    .map(|r| {
+                        (
+                            r.fingerprint,
+                            crate::canonical_labels::parse_canonical_label_set(&r.labels),
+                        )
+                    })
                     .collect();
                 group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)
             }
@@ -1193,7 +1198,10 @@ impl MetricsEngine {
         for rows in results {
             for row in rows? {
                 if seen.insert((row.metric_name.clone(), row.fingerprint)) {
-                    out.push((row.metric_name, parse_canonical_labels(&row.labels)));
+                    out.push((
+                        row.metric_name,
+                        crate::canonical_labels::parse_canonical_label_set(&row.labels),
+                    ));
                 }
             }
         }
@@ -2312,84 +2320,6 @@ fn to_promql_labels(ls: &LabelSet) -> Labels {
     Labels::new(ls.iter().map(|(k, v)| (k.to_string(), v.to_string())))
 }
 
-/// Parses PulsusDB's canonical flat label JSON — duplicated (not shared)
-/// from [`super::refresh`]'s own private helper of the same shape, per
-/// that module's own precedent (module-private, no JSON crate dependency
-/// added for this single use).
-fn parse_canonical_labels(json: &str) -> LabelSet {
-    let mut chars = json.chars().peekable();
-    let mut pairs = Vec::new();
-    while let Some(&c) = chars.peek() {
-        chars.next();
-        if c == '{' {
-            break;
-        }
-    }
-    loop {
-        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
-            chars.next();
-        }
-        match chars.peek() {
-            None | Some('}') => break,
-            Some(',') => {
-                chars.next();
-                continue;
-            }
-            Some('"') => {}
-            Some(_) => break,
-        }
-        let Some(key) = parse_json_string(&mut chars) else {
-            break;
-        };
-        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
-            chars.next();
-        }
-        if chars.peek() == Some(&':') {
-            chars.next();
-        }
-        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
-            chars.next();
-        }
-        let Some(value) = parse_json_string(&mut chars) else {
-            break;
-        };
-        pairs.push((key, value));
-    }
-    LabelSet::from_verbatim(pairs)
-}
-
-fn parse_json_string<I: Iterator<Item = char>>(
-    chars: &mut std::iter::Peekable<I>,
-) -> Option<String> {
-    if chars.next() != Some('"') {
-        return None;
-    }
-    let mut out = String::new();
-    loop {
-        match chars.next()? {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                'u' => {
-                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16)
-                        && let Some(c) = char::from_u32(code)
-                    {
-                        out.push(c);
-                    }
-                }
-                other => out.push(other),
-            },
-            c => out.push(c),
-        }
-    }
-}
-
 /// Splices `metric_name` back in as a `__name__` entry (issue #37 fix) —
 /// exactly the pattern `MetricsEngine::series` already uses for `/series`'s
 /// discovery results (`series.push(("__name__".to_string(), metric_name))`),
@@ -3489,18 +3419,6 @@ mod tests {
         }];
         let series = group_rows(rows, &HashMap::new(), "up");
         assert_eq!(series[0].metric_name.as_deref(), Some("up"));
-    }
-
-    #[test]
-    fn parse_canonical_labels_round_trips_a_flat_object() {
-        let set = parse_canonical_labels(r#"{"job":"api","env":"prod"}"#);
-        assert_eq!(set.get("job"), Some("api"));
-        assert_eq!(set.get("env"), Some("prod"));
-    }
-
-    #[test]
-    fn parse_canonical_labels_of_empty_object_is_empty() {
-        assert!(parse_canonical_labels("{}").is_empty());
     }
 
     #[test]

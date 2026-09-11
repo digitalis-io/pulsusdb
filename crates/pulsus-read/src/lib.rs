@@ -1,6 +1,9 @@
 //! Query HTTP APIs, response encoders, and live tail. See
 //! docs/architecture.md §5.
 
+/// The one decoder of the canonical flat-label JSON the writer stores
+/// (issue #539). Private: nothing outside this crate reads those columns.
+mod canonical_labels;
 pub mod compile;
 pub mod eval_gate;
 pub mod logql;

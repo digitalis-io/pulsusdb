@@ -18,10 +18,11 @@ use std::collections::HashMap;
 
 use super::charge::{StreamsResultBudget, alloc_block_bytes, entry_category_bytes};
 use super::exec::{EntryCategories, StreamResult, TailCursor};
+use crate::canonical_labels::{parse_canonical_labels, parse_canonical_labels_into};
+
 use super::labels::{
     EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
-    merge_labels_with_structured_metadata, parse_flat_labels, parse_flat_labels_into,
-    render_labels_json_sorted,
+    merge_labels_with_structured_metadata, render_labels_json_sorted,
 };
 use super::pipeline::{JsonPaths, LabelCategory};
 
@@ -499,7 +500,7 @@ fn observe_detected_row<'a>(
         // D1 (explanatory, #244 plan §6): the SM re-parse, on survival
         // only.
         buf.clear();
-        parse_flat_labels_into(sm_json, buf);
+        parse_canonical_labels_into(sm_json, buf);
         for (k, v) in buf.iter() {
             acc.observe_pair(k, v, detected::FieldSource::Unattributed);
         }
@@ -948,7 +949,7 @@ impl DetectedFieldsProbe {
         let has_sm = !structured_metadata.is_empty();
         if has_sm {
             self.legacy_sm_obs.clear();
-            parse_flat_labels_into(structured_metadata, &mut self.legacy_sm_obs);
+            parse_canonical_labels_into(structured_metadata, &mut self.legacy_sm_obs);
             merge_labels_with_structured_metadata(
                 base,
                 structured_metadata,
@@ -1087,7 +1088,7 @@ impl SmFanOutAccumulator {
         let base = self
             .base_cache
             .entry(row.fingerprint)
-            .or_insert_with(|| parse_flat_labels(&m.labels));
+            .or_insert_with(|| parse_canonical_labels(&m.labels));
         // Merge base + SM (colliding SM keys renamed `_extracted`, per the
         // oracle — no duplicate keys under any collision pattern), then sort for
         // canonical rendering. NO PIPELINE runs on this path, so the

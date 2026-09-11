@@ -1408,16 +1408,19 @@ mod census {
 /// `(file, impl type, fn name)` — a census frame's anchor.
 type FrameKey = (&'static str, Option<&'static str>, &'static str);
 
-/// The DECLARED closure of `DetectedRowFeeder::feed_row` (15 frames,
+/// The DECLARED closure of `DetectedRowFeeder::feed_row` (16 frames,
 /// under the ~30 cap) — issue #254 added `store_json_path` /
-/// `json_path_bytes`, the charge site for the captured json path.
-const FRAMES: [FrameKey; 15] = [
+/// `json_path_bytes`, the charge site for the captured json path, and
+/// issue #539 moved the label decoder out of `labels.rs` into the
+/// crate-level `canonical_labels.rs` that the metric readers share.
+const FRAMES: [FrameKey; 16] = [
     ("detected_probe.rs", Some("DetectedRowFeeder"), "feed_row"),
     ("detected_probe.rs", Some("DetectedRowFeeder"), "trim"),
     ("detected_probe.rs", None, "observe_detected_row"),
     ("detected_probe.rs", None, "auto_parse_observe"),
     ("labels.rs", None, "merge_labels_with_structured_metadata"),
-    ("labels.rs", None, "parse_flat_labels_into"),
+    ("canonical_labels.rs", None, "parse_canonical_labels_into"),
+    ("canonical_labels.rs", None, "parse_json_string"),
     ("detected_probe.rs", None, "recycle_label_scratch"),
     ("detected.rs", Some("FieldAccumulator"), "observe_pair"),
     ("detected.rs", None, "observe_admitted"),
@@ -1432,6 +1435,7 @@ const FRAMES: [FrameKey; 15] = [
 fn parse_frame_source(name: &str) -> syn::File {
     let src = match name {
         "labels.rs" => include_str!("../src/logql/labels.rs"),
+        "canonical_labels.rs" => include_str!("../src/canonical_labels.rs"),
         "detected_probe.rs" => include_str!("../src/logql/detected_probe.rs"),
         "detected.rs" => include_str!("../src/logql/detected.rs"),
         other => panic!("unknown frame file {other}"),
@@ -1527,13 +1531,13 @@ fn ac14_frame_census_pins_the_explanatory_account() {
 
 /// The pinned callee multisets (regenerate with `zz_print_frame_censuses`).
 #[rustfmt::skip]
-const EXPECTED_CENSUS: [(FrameKey, &str); 15] = [
+const EXPECTED_CENSUS: [(FrameKey, &str); 16] = [
     (("detected_probe.rs", Some("DetectedRowFeeder"), "feed_row"),
      ".getx1 .is_emptyx1 .trimx1 Errx1 Okx2 Somex1 merge_labels_with_structured_metadatax1 observe_detected_rowx1 takex1"),
     (("detected_probe.rs", Some("DetectedRowFeeder"), "trim"),
      ".capacityx2 .clearx2 newx2 trim_strx2 trim_vecx3"),
     (("detected_probe.rs", None, "observe_detected_row"),
-     ".anyx1 .as_refx4 .as_strx1 .clearx3 .intox1 .iterx3 .observe_pairx2 .run_into_with_smx1 Errx1 Okx1 auto_parse_observex1 parse_flat_labels_intox1 recycle_label_scratchx2"),
+     ".anyx1 .as_refx4 .as_strx1 .clearx3 .intox1 .iterx3 .observe_pairx2 .run_into_with_smx1 Errx1 Okx1 auto_parse_observex1 parse_canonical_labels_intox1 recycle_label_scratchx2"),
     (("detected_probe.rs", None, "auto_parse_observe"),
      ".as_refx2 .clearx1 .enumeratex1 .getx1 .intox1 .iterx1 .observe_pairx1 Errx1 Okx1 auto_parse_intox1 defaultx1 recycle_label_scratchx1"),
     // Issue #463 moved the upsert from `.find` to `.position`: the INDEX
@@ -1542,9 +1546,17 @@ const EXPECTED_CENSUS: [(FrameKey, &str); 15] = [
     // object has to drop. Same single scan, one more `.clear` (the new
     // `sm_over_stream` list) and one more `.push`.
     (("labels.rs", None, "merge_labels_with_structured_metadata"),
-     ".anyx1 .clearx5 .clonedx1 .drainx1 .extendx1 .is_emptyx1 .iterx3 .lenx1 .positionx1 .pushx2 .push_strx1 Somex1 parse_flat_labels_intox1"),
-    (("labels.rs", None, "parse_flat_labels_into"),
+     ".anyx1 .clearx5 .clonedx1 .drainx1 .extendx1 .is_emptyx1 .iterx3 .lenx1 .positionx1 .pushx2 .push_strx1 Somex1 parse_canonical_labels_intox1"),
+    // Issue #539 moved this frame out of `labels.rs`: the LogQL reader
+    // and the two metric readers each carried a private copy of it, and
+    // all three decoded `\b` and `\f` wrongly. `parse_json_string` is a
+    // frame in its own right now — it is where the per-pair `String` is
+    // built, and in `labels.rs` it was a file-private callee the witness
+    // could name but not reach.
+    (("canonical_labels.rs", None, "parse_canonical_labels_into"),
      ".charsx1 .nextx3 .peekx3 .peekablex1 .pushx1 Somex1 parse_json_stringx2 skip_wsx3"),
+    (("canonical_labels.rs", None, "parse_json_string"),
+     ".collectx1 .filter_mapx1 .nextx4 .pushx11 Somex2 from_str_radixx1 from_u32x1 newx1"),
     (("detected_probe.rs", None, "recycle_label_scratch"),
      ".clearx1 .collectx1 .into_iterx1 .into_ownedx2 .mapx1 Ownedx2"),
     // Issue #482 added the one-statement name filter (`/detected_field/
