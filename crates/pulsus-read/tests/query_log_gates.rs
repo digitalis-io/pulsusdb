@@ -3110,3 +3110,310 @@ async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound
          measurement it records has changed"
     );
 }
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): the spread gate and the reproducibility gate.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct PartCountRow {
+    n: u64,
+}
+
+/// The unwrapped-value corpus both W4 gates read: `n` deterministic values
+/// of mixed magnitude and sign, one fingerprint, one JSON body each.
+///
+/// Returns the values in timestamp order. **The caller asserts the row
+/// count against `n` before measuring anything** — the standing rule this
+/// issue adopted after an insert that reported success and left zero rows
+/// (a fixed 2023 timestamp against the table's retention rule, which drops
+/// whole parts).
+fn unwrap_values(n: u64) -> Vec<f64> {
+    (0..n)
+        .map(|i| {
+            let r = splitmix64(i);
+            let mag = 10f64.powi(((r >> 40) % 13) as i32 - 6);
+            let frac = ((r & 0xFFFF_FFFF) as f64) / (u32::MAX as f64);
+            let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+            sign * mag * (1.0 + frac)
+        })
+        .collect()
+}
+
+fn unwrap_rows(fp: u64, t0: i64, values: &[f64]) -> Vec<UnwrapSeedRow> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| UnwrapSeedRow {
+            service: "w4".to_string(),
+            fingerprint: fp,
+            timestamp_ns: t0 + i as i64,
+            severity: 0,
+            body: format!(r#"{{"v":{v:?}}}"#),
+            structured_metadata: String::new(),
+        })
+        .collect()
+}
+
+/// `2(n−1)·u·Σ|vᵢ|` with `u = 2⁻⁵³` — the most two evaluation orders of the
+/// same `n` values can differ by (issue #507 W4 §5).
+fn summation_spread_bound(values: &[f64]) -> f64 {
+    let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+    2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs
+}
+
+/// **The gate that would tell us the ruling was wrong** (issue #507 W4 §6).
+///
+/// The owner accepted that the database chooses the summation order and may
+/// choose differently between two executions. What that ruling assumes is
+/// that the resulting answers stay within a rounding difference of each
+/// other. This asserts exactly that, and against nothing foreign: it
+/// compares our own answers at four thread counts **with each other**, so
+/// it needs no tolerance against another implementation, and it is
+/// scale-invariant, so it is a Tier-1 gate.
+///
+/// It fails precisely when the accepted divergence stops being last-bits.
+#[tokio::test]
+async fn the_thread_count_spread_stays_inside_the_summation_bound() {
+    skip_unless_live!();
+    const N: u64 = 1_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4spread_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let values = unwrap_values(N);
+    let rows = unwrap_rows(1, now_ns() - 3_600_000_000_000, &values);
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert");
+
+    let sql = format!(
+        "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+         groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+         count() AS n FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = 1"
+    );
+    let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+
+    let mut answers: Vec<(u64, f64)> = Vec::new();
+    for threads in [1u64, 2, 4, 8] {
+        for _rep in 0..6 {
+            let settings = QuerySettings::new().set("max_threads", threads);
+            let mut stream = client
+                .query_stream::<SumRow>(&sql, &settings)
+                .await
+                .expect("execute");
+            let row = stream.next().await.expect("one row").expect("decode");
+            drop(stream);
+            // The standing rule: the input is asserted present, and the
+            // same values, before the result is read for anything.
+            assert_eq!(
+                row.n, N,
+                "max_threads={threads}: the corpus must be present"
+            );
+            assert_eq!(row.x, our_xor, "max_threads={threads}: the same value set");
+            answers.push((threads, row.s));
+        }
+    }
+
+    let bound = summation_spread_bound(&values);
+    for (ta, a) in &answers {
+        for (tb, b) in &answers {
+            let diff = (a - b).abs();
+            assert!(
+                diff <= bound,
+                "max_threads={ta} answered {a:?} and max_threads={tb} answered {b:?}: two \
+                 evaluation orders of the same {N} values may differ by at most \
+                 2(n-1)*u*sum|v| = {bound:e}, got {diff:e} — the accepted divergence has \
+                 stopped being a rounding difference"
+            );
+        }
+    }
+    // Non-vacuity: the thread count DOES move the answer, so the bound is
+    // doing work rather than passing on equality.
+    let distinct: std::collections::BTreeSet<u64> =
+        answers.iter().map(|(_, v)| v.to_bits()).collect();
+    assert!(
+        distinct.len() > 1,
+        "every thread count answered the same bits: the spread this bounds no longer \
+         exists, and the gate is passing on equality rather than on the bound"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+}
+
+/// **Repeated executions of the same query on unchanged data agree bit for
+/// bit, at a fixed thread count and a fixed part layout** (issue #507 W4
+/// §3).
+///
+/// Its failure means a source of nondeterminism exists that is neither the
+/// thread count nor the part count — which is a thing we would want to know
+/// and currently could not learn. It is exact, not tolerance-based: the
+/// claim is reproducibility, not closeness.
+///
+/// **The scope was measured rather than assumed**, because the plan scoped
+/// it to one part and named the measurement that would widen it. Six
+/// repetitions per cell at `max_threads = 4`, over 1 000 000 identical
+/// values laid out in 1, 2 and 8 parts with merges stopped:
+///
+/// ```text
+///  parts  threads=1           threads=4           threads=8
+///  1      C1B845C49C9466C4    C1B845C49C9465EC    C1B845C49C946670
+///  2      C1B845C49C94663A    C1B845C49C946623    C1B845C49C946622
+///  8      C1B845C49C946663    C1B845C49C946662    C1B845C49C946663
+/// ```
+///
+/// **Constant in every cell, and different between cells.** So the gate
+/// covers any fixed part layout, not one part — and **the part count is a
+/// third source of divergence**, alongside the thread count and the block
+/// accumulation that separates us from the database in the first place.
+/// The user-facing sentence names it.
+///
+/// `SYSTEM STOP MERGES` is what makes the part count an input rather than a
+/// race: without it a background merge rewrites eight parts into three
+/// while the test runs, which was measured before this test was written.
+#[tokio::test]
+async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
+    skip_unless_live!();
+    const N: u64 = 1_000_000;
+    const THREADS: u64 = 4;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4parts_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+    client
+        .execute(
+            &format!("SYSTEM STOP MERGES {db}.log_samples"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("stop merges");
+
+    let values = unwrap_values(N);
+    let t0 = now_ns() - 3_600_000_000_000;
+    let mut per_layout: Vec<(usize, u64)> = Vec::new();
+    for (parts, fp) in [(1usize, 11u64), (2, 12), (8, 13)] {
+        let chunk = values.len() / parts;
+        for c in 0..parts {
+            let lo = c * chunk;
+            let hi = if c + 1 == parts {
+                values.len()
+            } else {
+                lo + chunk
+            };
+            let rows = unwrap_rows(fp, t0 + lo as i64, &values[lo..hi]);
+            client
+                .insert_block("log_samples", &rows)
+                .await
+                .expect("insert");
+        }
+        let sql = format!(
+            "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+             groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+             count() AS n FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = {fp}"
+        );
+        let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+        let mut seen: Vec<u64> = Vec::new();
+        for rep in 0..6 {
+            let settings = QuerySettings::new().set("max_threads", THREADS);
+            let mut stream = client
+                .query_stream::<SumRow>(&sql, &settings)
+                .await
+                .expect("execute");
+            let row = stream.next().await.expect("one row").expect("decode");
+            drop(stream);
+            assert_eq!(row.n, N, "parts={parts}: the corpus must be present");
+            assert_eq!(row.x, our_xor, "parts={parts}: the same value set");
+            seen.push(row.s.to_bits());
+            assert_eq!(
+                seen[0], seen[rep],
+                "parts={parts}, max_threads={THREADS}: repetition {rep} answered different \
+                 bits from repetition 0, so a source of nondeterminism exists that is \
+                 neither the thread count nor the part count"
+            );
+        }
+        // The layout is the one asked for, not the one a merge left behind.
+        let layout_sql = format!(
+            "SELECT count() AS n FROM system.parts WHERE database = '{db}' \
+             AND table = 'log_samples' AND active AND rows > 0"
+        );
+        let mut stream = admin
+            .query_stream::<PartCountRow>(&layout_sql, &QuerySettings::new())
+            .await
+            .expect("read the part layout");
+        let observed = stream.next().await.expect("one row").expect("decode").n;
+        drop(stream);
+        per_layout.push((parts, seen[0]));
+        assert!(
+            observed >= parts as u64,
+            "parts={parts}: the table holds {observed} active parts, so the layout this cell \
+             names was merged away before it was measured"
+        );
+    }
+    // The measured finding this gate's scope rests on: the part layout
+    // moves the answer. If it stopped doing so, the scope could be widened
+    // and the user-facing sentence loses a clause — which should be a
+    // decision, not a silent pass.
+    let distinct: std::collections::BTreeSet<u64> = per_layout.iter().map(|(_, b)| *b).collect();
+    assert!(
+        distinct.len() > 1,
+        "every part layout answered the same bits: {per_layout:?} — the part count is no \
+         longer a source of divergence and the documentation says it is"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+}
