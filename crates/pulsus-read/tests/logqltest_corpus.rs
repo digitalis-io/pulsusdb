@@ -1028,3 +1028,74 @@ fn unwrap_takes_the_metadata_value_when_the_metadata_carries_the_name() {
         run.cases[0].detail
     );
 }
+
+/// Issue #507 W4 — **what `| json | unwrap x` does with each kind of JSON
+/// value, measured, because a lowered statement has to reproduce it.**
+///
+/// `JSONExtractFloat(body, 'x')` — the expression W4 would emit — answers
+/// `0` for every kind the evaluator does not turn into a number, and `0`
+/// is a value, not an absence. The three columns below are what a lowered
+/// aggregate has to agree with:
+///
+/// ```text
+///  body               the evaluator                  JSONExtractFloat   agree?
+///  {"x":1.5}          sample 1.5                     1.5                yes
+///  {"x":"1.5"}        sample 1.5                     1.5                yes
+///  {"x":"abc"}        400, SampleExtractionErr       0                  NO
+///  {"x":true}         400, SampleExtractionErr       0                  NO
+///  {"x":null}         NO SERIES AT ALL               0, and counted      NO
+///  {"y":1}            NO SERIES AT ALL               0, and counted      NO
+/// ```
+///
+/// The `JSONExtractFloat` column was measured against
+/// `clickhouse/clickhouse-server:26.3`; this test measures the evaluator
+/// column, which is the half that can change under us.
+///
+/// **So a lowered `| unwrap` needs a per-group guard**: the statement must
+/// report how many of a group's rows carry a value both sides agree on,
+/// and the reader must refuse to use the aggregate when that is not all of
+/// them. Without it a line whose value does not parse turns a 400 into a
+/// number, and a missing key turns an absent series into a zero.
+#[test]
+fn unwrap_turns_each_json_value_kind_into_a_sample_an_error_or_nothing() {
+    let case = |body: &str| {
+        let dataset = format!(
+            "load\n  {{env=\"prod\", service_name=\"checkout\"}} service=checkout\n\t10s  {body}\n\n"
+        );
+        let q = format!(
+            "{dataset}eval instant at 60s sum_over_time({{env=\"prod\"}} | json | unwrap x [1m])\n\
+             \t{{env=\"prod\", service_name=\"checkout\"}} 1.5\n"
+        );
+        let run = run_file("inline/unwrap_kind.test", &q).expect("parse");
+        (run.cases[0].passed, run.cases[0].detail.clone())
+    };
+
+    // A number, and a string holding a number, are both samples — and both
+    // are the value `JSONExtractFloat` returns.
+    assert!(case(r#"{"x":1.5}"#).0, "a JSON number is a sample");
+    assert!(
+        case(r#"{"x":"1.5"}"#).0,
+        "a JSON string holding a number is a sample of the same value"
+    );
+
+    // A value that does not parse is an ERROR for the whole series, not a
+    // skipped sample and not a zero.
+    for body in [r#"{"x":"abc"}"#, r#"{"x":true}"#] {
+        let (passed, detail) = case(body);
+        assert!(!passed, "{body} must not be a sample");
+        assert!(
+            detail.contains("SampleExtractionErr") && detail.contains("ParseFloat"),
+            "{body} must raise the sample-extraction error with its parse message: {detail}"
+        );
+    }
+
+    // An absent value is no series at all — not a zero-valued one.
+    for body in [r#"{"x":null}"#, r#"{"y":1}"#] {
+        let (passed, detail) = case(body);
+        assert!(!passed, "{body} must produce no sample");
+        assert!(
+            detail.contains("series count mismatch") && detail.contains("got 0"),
+            "{body} must produce NO series: {detail}"
+        );
+    }
+}
