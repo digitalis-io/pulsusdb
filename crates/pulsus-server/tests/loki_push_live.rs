@@ -3055,3 +3055,303 @@ async fn each_ingest_transport_supplies_its_own_detected_level_series() {
         res.body
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #539: the two escapes the reader decoded wrongly.
+//
+// Our writer has always escaped U+0008 and U+000C as JSON's `\b` and `\f`.
+// The reader's escape table listed neither, and its catch-all keeps the
+// letter after the backslash, so a label value stored as `a` U+0008 `b`
+// read back as the three letters `abb` — a different, real value one byte
+// away. Two streams that differ only at U+0008 therefore merged into one,
+// and a `| trace_id="abb"` filter admitted the row whose trace id is not
+// `abb`.
+//
+// These cases assert the DECODED value out of the response, never the
+// bytes: our response spells U+0008 with JSON's two-character escape and
+// the reference spells it as the six-character form backslash-u-0-0-0-8,
+// and both are the same string.
+// ---------------------------------------------------------------------
+
+/// `a` + `c` + `b` — the corpus shape. With `c` = U+0008 the wrong decode
+/// is `abb`, which is also in the corpus, so a wrong build is caught by
+/// two stored values colliding rather than by one going missing.
+fn around(c: char) -> String {
+    format!("a{c}b")
+}
+
+/// One pushed entry: its timestamp, its line, and its structured metadata.
+type PushEntry<'a> = (i64, &'a str, Vec<(&'a str, String)>);
+
+/// A JSON push body for one stream, built with `serde_json` so the wire
+/// escaping is the library's and not a hand-written literal.
+fn json_push_body(stream_labels: &[(&str, String)], entries: &[PushEntry<'_>]) -> String {
+    let labels: serde_json::Map<String, serde_json::Value> = stream_labels
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), serde_json::Value::String(v.clone())))
+        .collect();
+    let values: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(ts, line, sm)| {
+            let sm_obj: serde_json::Map<String, serde_json::Value> = sm
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), serde_json::Value::String(v.clone())))
+                .collect();
+            serde_json::json!([ts.to_string(), line, sm_obj])
+        })
+        .collect();
+    serde_json::json!({"streams": [{"stream": labels, "values": values}]}).to_string()
+}
+
+/// Polls `query_range` for `query` until it returns `want` streams, then
+/// returns them sorted by their lines, so a case can name entries rather
+/// than depend on the order two streams come back in.
+fn wait_for_streams(
+    port: u16,
+    query: &str,
+    base_ns: i64,
+    want: usize,
+) -> Vec<(std::collections::BTreeMap<String, String>, Vec<String>)> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut streams = query_streams_raw(port, "/api/logs/v1", query, base_ns);
+        if streams.len() == want {
+            streams.sort_by(|a, b| a.1.cmp(&b.1));
+            return streams;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{query} returned {} stream(s), want {want}: {streams:?}",
+            streams.len()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Q1/Q2/Q3/Q5/Q6 of issue #539, pushed through the real receiver so the
+/// values reach the columns through the real writer.
+#[tokio::test(flavor = "multi_thread")]
+async fn c0_escaped_label_values_survive_push_and_come_back_decoded() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_228;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_c0_escape_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let backspace = around('\u{8}');
+    let form_feed = around('\u{c}');
+
+    // Three streams that differ only in the one character, plus the value
+    // the wrong decode produced.
+    for (key, value, line) in [
+        ("bs", backspace.clone(), "line with backspace label"),
+        ("ff", form_feed.clone(), "line with form feed label"),
+        ("bs", "abb".to_string(), "line with the letters only"),
+    ] {
+        let body = json_push_body(
+            &[("service_name", "s539".to_string()), (key, value.clone())],
+            &[(base_ns, line, Vec::new())],
+        );
+        let res = push(port, "application/json", body.as_bytes());
+        assert_eq!(
+            res.status, 204,
+            "push of {key}={value:?} -> 204 (body {})",
+            res.body
+        );
+    }
+
+    // One stream, two entries, whose structured metadata differs only at
+    // U+0008 — the per-row decoder, not the per-stream one.
+    let sm_body = json_push_body(
+        &[("service_name", "s539sm".to_string())],
+        &[
+            (
+                base_ns,
+                "sm backspace",
+                vec![("trace_id", backspace.clone())],
+            ),
+            (
+                base_ns + 1,
+                "sm plain",
+                vec![("trace_id", "abb".to_string())],
+            ),
+        ],
+    );
+    let res = push(port, "application/json", sm_body.as_bytes());
+    assert_eq!(res.status, 204, "sm push -> 204 (body {})", res.body);
+
+    // Q1 — a stream selector on the TRUE value returns the stream, and the
+    // label it renders is the value that was stored.
+    let q1 = wait_for_streams(port, r#"{bs="a\bb"}"#, base_ns, 1);
+    assert_eq!(
+        q1[0].0.get("bs").map(String::as_str),
+        Some(backspace.as_str()),
+        "the backspace selector must render the stored value, not {:?}",
+        q1[0].0.get("bs")
+    );
+    assert_eq!(q1[0].1, vec!["line with backspace label".to_string()]);
+
+    // Q2 — the value the wrong decode DISPLAYED selects the other stream,
+    // and only that one. Q1 and Q2 together are the whole defect: before
+    // the fix Q1 showed a label value that Q2 proves belongs elsewhere.
+    let q2 = wait_for_streams(port, r#"{bs="abb"}"#, base_ns, 1);
+    assert_eq!(q2[0].0.get("bs").map(String::as_str), Some("abb"));
+    assert_eq!(q2[0].1, vec!["line with the letters only".to_string()]);
+
+    // Q3 — the form feed, through the same arm pair.
+    let q3 = wait_for_streams(port, r#"{ff="a\fb"}"#, base_ns, 1);
+    assert_eq!(
+        q3[0].0.get("ff").map(String::as_str),
+        Some(form_feed.as_str()),
+        "the form-feed selector must render the stored value, not {:?}",
+        q3[0].0.get("ff")
+    );
+
+    // Q5 — two entries whose structured metadata differs only at U+0008
+    // are TWO streams. Before the fix both decoded to `abb` and the two
+    // entries merged into one stream.
+    let q5 = wait_for_streams(port, r#"{service_name="s539sm"}"#, base_ns, 2);
+    let trace_ids: Vec<Option<&str>> = q5
+        .iter()
+        .map(|(labels, _)| labels.get("trace_id").map(String::as_str))
+        .collect();
+    assert_eq!(
+        trace_ids,
+        vec![Some(backspace.as_str()), Some("abb")],
+        "the two entries must stay two streams: {q5:?}"
+    );
+    assert_eq!(q5[0].1, vec!["sm backspace".to_string()]);
+    assert_eq!(q5[1].1, vec!["sm plain".to_string()]);
+
+    // Q6 — a label filter over the decoded value admits exactly the entry
+    // that matches it.
+    let q6 = wait_for_streams(
+        port,
+        r#"{service_name="s539sm"} | trace_id="abb""#,
+        base_ns,
+        1,
+    );
+    assert_eq!(
+        q6[0].1,
+        vec!["sm plain".to_string()],
+        "the label filter must not admit the entry whose trace id is not abb: {q6:?}"
+    );
+
+    drop_db(db).await;
+}
+
+/// Q4 of issue #539 — the criterion that proves the DECODER rather than
+/// the storage.
+///
+/// One stream, two queries, one pipeline stage apart:
+///
+/// ```text
+///   {service_name="s539v"}                       labels spliced verbatim
+///                                                from the stored column
+///   {service_name="s539v"} | label_format x="1"  labels re-rendered
+///                                                through the decoder
+/// ```
+///
+/// Before the fix the first was right and the second was wrong, on the
+/// same server and the same stored bytes. The seed is written with
+/// `LabelSet::to_canonical_json` — the writer's own expression
+/// (`crates/pulsus-write/src/writer/rows.rs:103`) — and with EMPTY
+/// structured metadata, which is what makes the verbatim path reachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_label_rendering_paths_agree_on_a_c0_escaped_value() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_229;
+    let db = &pulsus_testkit::test_db("pulsus_loki_push_c0_verbatim_it");
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let backspace = around('\u{8}');
+    let (labels, _collisions) = pulsus_model::LabelSet::from_normalized(vec![
+        ("service_name".to_string(), "s539v".to_string()),
+        ("b8".to_string(), backspace.clone()),
+    ]);
+
+    let client = ChClient::new(ChConnConfig {
+        server: ch_host(),
+        http_port: ch_http_port(),
+        database: db.to_string(),
+        proto: ChProto::Http,
+        pool_size: 2,
+        query_timeout: Duration::from_secs(20),
+        ..ChConnConfig::default()
+    })
+    .await
+    .expect("connect to seed");
+    let fingerprint = 539_539_539_u64;
+    client
+        .insert_block(
+            "log_streams",
+            &[pulsus_write::writer::LogStreamRow {
+                month: pulsus_model::Date::start_of_month_utc(base_ns)
+                    .expect("a month for now")
+                    .days_since_epoch(),
+                fingerprint,
+                service: "s539v".to_string(),
+                labels: labels.to_canonical_json(),
+                updated_ns: base_ns,
+            }],
+        )
+        .await
+        .expect("seed log_streams");
+    client
+        .insert_block(
+            "log_samples",
+            &[pulsus_write::writer::LogSampleRow {
+                service: "s539v".to_string(),
+                fingerprint,
+                timestamp_ns: base_ns,
+                severity: 0,
+                body: "verbatim vs re-rendered".to_string(),
+                structured_metadata: String::new(),
+            }],
+        )
+        .await
+        .expect("seed log_samples");
+
+    let verbatim = wait_for_streams(port, r#"{service_name="s539v"}"#, base_ns, 1);
+    let re_rendered = wait_for_streams(
+        port,
+        r#"{service_name="s539v"} | label_format x="1""#,
+        base_ns,
+        1,
+    );
+
+    assert_eq!(
+        verbatim[0].0.get("b8").map(String::as_str),
+        Some(backspace.as_str()),
+        "the verbatim path must render the stored value: {:?}",
+        verbatim[0].0
+    );
+    assert_eq!(
+        re_rendered[0].0.get("b8").map(String::as_str),
+        Some(backspace.as_str()),
+        "the re-rendered path must render the same value one pipeline stage later: {:?}",
+        re_rendered[0].0
+    );
+    assert_eq!(
+        verbatim[0].0.get("b8"),
+        re_rendered[0].0.get("b8"),
+        "the two rendering paths must agree on one stored value"
+    );
+    assert_eq!(
+        re_rendered[0].0.get("x").map(String::as_str),
+        Some("1"),
+        "the pipeline stage ran: {:?}",
+        re_rendered[0].0
+    );
+
+    drop_db(db).await;
+}

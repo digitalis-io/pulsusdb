@@ -1738,3 +1738,290 @@ async fn prom_api_name_values_bodies_and_narrow_dispatch_issue_472() {
 
     drop_db(db).await;
 }
+
+// ---------------------------------------------------------------------
+// Issue #539: two series whose `bs` label differs only at U+0008.
+//
+// The stored label text is `LabelSet::to_canonical_json`'s output — the
+// exact expression `MetricSeriesRow::from_series_at_bucket` uses at
+// `crates/pulsus-write/src/writer/rows.rs:342` — so this seed is the
+// writer's own bytes and not a hand-written literal.
+//
+// Before the fix both series decoded to the same label set and the
+// evaluator refused the whole query with `422 vector cannot contain
+// metrics with the same labelset`.
+// ---------------------------------------------------------------------
+
+/// `a` + `c` + `b`.
+fn around(c: char) -> String {
+    format!("a{c}b")
+}
+
+/// The two seeded series, in the order their fingerprints are assigned:
+/// the U+0008 one carries value 1, the three-letter one carries value 2.
+async fn seed_c0_series(client: &ChClient, values: [f64; 2]) {
+    let bucket_ms: i64 = 3_600_000;
+    let now = now_ms();
+    let recent_bucket = (now / bucket_ms) * bucket_ms;
+    let label_json = |bs: &str| {
+        let (set, _collisions) = pulsus_model::LabelSet::from_normalized(vec![
+            ("bs".to_string(), bs.to_string()),
+            ("job".to_string(), "m539".to_string()),
+        ]);
+        set.to_canonical_json()
+    };
+    client
+        .insert_block(
+            "metric_series",
+            &[
+                SeedSeriesRow {
+                    metric_name: "t539".to_string(),
+                    fingerprint: 1,
+                    unix_milli: recent_bucket,
+                    labels: label_json(&around('\u{8}')),
+                },
+                SeedSeriesRow {
+                    metric_name: "t539".to_string(),
+                    fingerprint: 2,
+                    unix_milli: recent_bucket,
+                    labels: label_json("abb"),
+                },
+            ],
+        )
+        .await
+        .expect("seed metric_series");
+    client
+        .insert_block(
+            "metric_samples",
+            &[
+                SeedSampleRow {
+                    metric_name: "t539".to_string(),
+                    fingerprint: 1,
+                    unix_milli: now,
+                    value: values[0],
+                },
+                SeedSampleRow {
+                    metric_name: "t539".to_string(),
+                    fingerprint: 2,
+                    unix_milli: now,
+                    value: values[1],
+                },
+            ],
+        )
+        .await
+        .expect("seed metric_samples");
+}
+
+fn urlencode_query(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Spawns a server against `db` on `port` with `extra_env`, waits for
+/// `/ready`.
+fn spawn_prom_server(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
+    command
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("PULSUS_CACHE_TTL", "1s")
+        .env(
+            "CLICKHOUSE_SERVER",
+            std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        )
+        .env(
+            "CLICKHOUSE_HTTP_PORT",
+            std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
+        )
+        .env("CLICKHOUSE_DB", db);
+    for (k, v) in extra_env {
+        command.env(k, v);
+    }
+    let guard = ChildGuard(command.spawn().expect("spawn pulsusdb"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if let Some((200, _)) = http_get(port, "/ready") {
+            return guard;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("/ready never reached 200 within 60s (port {port})");
+}
+
+/// Polls `path` until it answers 200 with a body `accept` likes, and
+/// returns the parsed body. The label cache sweeps on a timer, so a
+/// query over freshly seeded series needs a bounded wait.
+fn wait_for_body(
+    port: u16,
+    path: &str,
+    accept: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut last = String::new();
+    loop {
+        if let Some((status, body)) = http_get(port, path) {
+            last = format!("{status} {body}");
+            if status == 200
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+                && accept(&json)
+            {
+                return json;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{path} never answered acceptably within 40s; last was {last}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `[(the series' `bs` label, its value)]`, sorted by the label — the
+/// shape every assertion below is written against.
+fn vector_bs_values(json: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = json["data"]["result"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|s| {
+            (
+                s["metric"]["bs"].as_str().unwrap_or_default().to_string(),
+                s["value"][1].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Q7, Q8 and Q9 of issue #539, and the criterion that pins the cache
+/// path and the SQL path to the same answer
+/// (`crates/pulsus-read/src/metrics/labels.rs:629-632`).
+#[tokio::test(flavor = "multi_thread")]
+async fn two_metric_series_differing_only_at_a_c0_escape_stay_two_series() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_prom_api_c0_escape_it");
+    drop_db(db).await;
+    let cache_port: u16 = 31_230;
+    let sql_port: u16 = 31_231;
+    let backspace = around('\u{8}');
+
+    let guard = spawn_prom_server(cache_port, db, &[]);
+    let client = ChClient::new(test_ch_config(db))
+        .await
+        .expect("connect to seed data");
+    seed_c0_series(&client, [1.0, 2.0]).await;
+
+    // Q7 — the whole metric. Two series, not one, and HTTP 200: before the
+    // fix the two label sets collided and the evaluator answered 422.
+    let all = wait_for_body(cache_port, "/api/v1/query?query=t539", |json| {
+        json["data"]["result"]
+            .as_array()
+            .is_some_and(|r| r.len() == 2)
+    });
+    assert_eq!(
+        vector_bs_values(&all),
+        vec![
+            (backspace.clone(), "1".to_string()),
+            ("abb".to_string(), "2".to_string()),
+        ],
+        "t539 must return both series, each with its own value: {all}"
+    );
+
+    // Q8 — the selector on the three-letter value picks exactly its own
+    // series, and the two routes agree. `PULSUS_CACHE_MAX_SERIES=1` puts
+    // the second server over its cardinality ceiling for this selector,
+    // which is what sends it down the SQL path instead of the cache.
+    let letters_path = format!(
+        "/api/v1/query?query={}",
+        urlencode_query(r#"t539{bs="abb"}"#)
+    );
+    let via_cache = wait_for_body(cache_port, &letters_path, |json| {
+        json["data"]["result"]
+            .as_array()
+            .is_some_and(|r| r.len() == 1)
+    });
+    assert_eq!(
+        vector_bs_values(&via_cache),
+        vec![("abb".to_string(), "2".to_string())],
+        "the three-letter selector must pick its own series: {via_cache}"
+    );
+
+    let sql_guard = spawn_prom_server(sql_port, db, &[("PULSUS_CACHE_MAX_SERIES", "1")]);
+    let via_sql = wait_for_body(sql_port, &letters_path, |json| {
+        json["data"]["result"]
+            .as_array()
+            .is_some_and(|r| r.len() == 1)
+    });
+    assert_eq!(
+        vector_bs_values(&via_sql),
+        vector_bs_values(&via_cache),
+        "the cache route and the SQL route must answer the same query the same way\n\
+         cache: {via_cache}\n  sql: {via_sql}"
+    );
+    drop(sql_guard);
+
+    // …and the selector on the U+0008 value picks the other one. The
+    // PromQL lexer decodes `\b` itself, so the matcher carries the right
+    // byte and only the decode of the STORED value was ever wrong.
+    let backspace_path = format!(
+        "/api/v1/query?query={}",
+        urlencode_query(r#"t539{bs="a\bb"}"#)
+    );
+    let via_backspace = wait_for_body(cache_port, &backspace_path, |json| {
+        json["data"]["result"]
+            .as_array()
+            .is_some_and(|r| r.len() == 1)
+    });
+    assert_eq!(
+        vector_bs_values(&via_backspace),
+        vec![(backspace.clone(), "1".to_string())],
+        "the backspace selector must pick the U+0008 series: {via_backspace}"
+    );
+
+    // Q9 — the discovery endpoints see two series and two label values.
+    let series = wait_for_body(cache_port, "/api/v1/series?match[]=t539", |json| {
+        json["data"].as_array().is_some_and(|r| r.len() == 2)
+    });
+    let mut seen: Vec<&str> = series["data"]
+        .as_array()
+        .expect("two series")
+        .iter()
+        .map(|s| s["bs"].as_str().unwrap_or_default())
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![backspace.as_str(), "abb"],
+        "/series must list both label values: {series}"
+    );
+
+    let values = wait_for_body(cache_port, "/api/v1/label/bs/values", |json| {
+        json["data"].as_array().is_some_and(|r| r.len() == 2)
+    });
+    let listed: Vec<&str> = values["data"]
+        .as_array()
+        .expect("two values")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        listed,
+        vec![backspace.as_str(), "abb"],
+        "/label/bs/values must list both: {values}"
+    );
+
+    drop(guard);
+    drop_db(db).await;
+}
