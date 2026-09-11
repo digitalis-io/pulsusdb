@@ -853,3 +853,178 @@ fn only_the_397_section_has_a_wrapped_variant_with_a_pipeline() {
          assertion above is vacuous — fix the extraction, not the assertion"
     );
 }
+
+/// Issue #507 W4 — **`eval_approx` is admitted only where the database
+/// chooses the summation order, and it is not weaker than `eval` in any
+/// dimension that is not that order.**
+///
+/// The tolerance exists because the five unwrapped reducers sum in the
+/// database, which picks an accumulation order and may pick differently
+/// between two executions. A tolerance that could be written on any entry
+/// would be reached for whenever an unrelated comparison failed, so the
+/// verb is refused at parse time on every other query, and the refusal
+/// names what it saw.
+#[test]
+fn eval_approx_is_admitted_only_for_the_five_and_is_not_weaker_than_exact() {
+    use driver::runner::values_agree;
+
+    let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"} service=checkout\n\
+                   \t10s  c=10\n\t20s  c=30\n\t30s  c=5\n\t40s  c=12\n\n";
+    // The value `eval` pins exactly, and a one-ULP perturbation of it.
+    let perturbed = f64::from_bits(0.5333344_f64.to_bits() + 1);
+
+    // The exact verb rejects one ULP — the property this corpus has
+    // always had, restated here as the control for the two rows below.
+    let exact = format!(
+        "{dataset}eval instant at 60s rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
+    );
+    let run = run_file("inline/approx_control.test", &exact).expect("parse");
+    assert!(
+        !run.cases[0].passed,
+        "the control must still reject one ULP"
+    );
+
+    // `eval_approx` with a tolerance above one ULP accepts it.
+    let approx = format!(
+        "{dataset}eval_approx 1e-9 instant at 60s \
+         rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
+    );
+    let run = run_file("inline/approx_ok.test", &approx).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "a one-ULP difference is inside 1e-9: {}",
+        run.cases[0].detail
+    );
+    assert_eq!(run.cases[0].mode, EvalMode::Approx);
+    assert_eq!(
+        run.counts.eval_approx, 1,
+        "the verb is counted on its own axis, not folded into `eval`"
+    );
+
+    // A tolerance is a NUMBER, not a licence: at zero it rejects the same
+    // one ULP the exact verb rejects.
+    let tight = format!(
+        "{dataset}eval_approx 0 instant at 60s \
+         rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
+    );
+    let run = run_file("inline/approx_zero.test", &tight).expect("parse");
+    assert!(
+        !run.cases[0].passed,
+        "at t = 0 the tolerance path must reject what the exact path rejects"
+    );
+
+    // The control against sprinkling: a reducer outside the five is a
+    // GRAMMAR error, naming what it saw, so the verb cannot be reached
+    // for to silence an unrelated failure.
+    let wrong = format!(
+        "{dataset}eval_approx 1e-9 instant at 60s count_over_time({{env=\"prod\"}}[1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 4\n"
+    );
+    let err = run_file("inline/approx_wrong.test", &wrong)
+        .expect_err("a non-qualifying reducer must be a grammar error");
+    assert!(
+        err.contains("count_over_time") && err.contains("eval_approx"),
+        "the refusal must name the reducer it saw: {err}"
+    );
+
+    // And a query with no range aggregation at all.
+    let selector = format!("{dataset}eval_approx 1e-9 instant at 60s {{env=\"prod\"}}\n");
+    let err = run_file("inline/approx_selector.test", &selector)
+        .expect_err("a log selector must be a grammar error");
+    assert!(err.contains("range aggregation"), "{err}");
+
+    // A malformed tolerance is a grammar error rather than a default.
+    let bad_t = format!(
+        "{dataset}eval_approx wat instant at 60s \
+         sum_over_time({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 57\n"
+    );
+    let err = run_file("inline/approx_badt.test", &bad_t).expect_err("not a number");
+    assert!(err.contains("is not a number"), "{err}");
+
+    // The two dimensions the tolerance must not widen, asserted directly
+    // because no query in this corpus produces either value.
+    assert!(
+        !values_agree(-0.0, 0.0, Some(0.0)),
+        "a magnitude test accepts -0.0 against +0.0 at any tolerance; the exact path \
+         rejects them and so must this one"
+    );
+    assert!(!values_agree(-0.0, 0.0, Some(1e9)), "and at any tolerance");
+    assert!(values_agree(0.0, 0.0, Some(0.0)));
+    assert!(
+        values_agree(f64::NAN, f64::NAN, Some(0.0)),
+        "an identical NaN agrees on the exact path, so it must agree here — a magnitude \
+         test alone would reject it, which is stricter rather than weaker"
+    );
+    assert!(!values_agree(f64::NAN, 1.0, Some(1e9)));
+    assert!(!values_agree(1.0, f64::NAN, Some(1e9)));
+    // And the default path is untouched: `None` is bit equality.
+    assert!(values_agree(1.0, 1.0, None));
+    assert!(!values_agree(
+        1.0,
+        f64::from_bits(1.0f64.to_bits() + 1),
+        None
+    ));
+    assert!(!values_agree(-0.0, 0.0, None));
+}
+
+/// Issue #507 W4 — **`| unwrap <name>` takes the STRUCTURED METADATA
+/// value when the metadata carries that name, and the parsed one is
+/// renamed away.**
+///
+/// One entry, whose metadata says `x="5"` and whose body says
+/// `{"x":"7"}`, aggregated by `sum_over_time(… | json | unwrap x [1m])`:
+///
+/// ```text
+///   labels   {env="prod", service_name="checkout", x_extracted="7"}
+///   value    5
+/// ```
+///
+/// The metadata occupies the `x` slot, `unwrap` consumes it, and the
+/// parser's `x` is renamed to `x_extracted` and stays as a label — the
+/// collision rule `labels.rs` holds, measured here through the evaluator
+/// rather than read off it.
+///
+/// **Why this is a W4 gate and not a curiosity.** A lowered
+/// `sum_over_time` would compute `JSONExtractFloat(body, 'x')` and answer
+/// **7** where the evaluator answers **5** — a different number, not a
+/// rounding difference — and no SQL expression may interpret the metadata
+/// column to find that out. The name's source is a per-row property, so a
+/// plan-time test cannot exclude it either. Any design that lowers
+/// `| unwrap` has to answer this case, and this test is what tells it the
+/// answer changed.
+#[test]
+fn unwrap_takes_the_metadata_value_when_the_metadata_carries_the_name() {
+    let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"} service=checkout\n\
+                   \t10s  sm{x=\"5\"} {\"x\":\"7\"}\n\n";
+    let q = format!(
+        "{dataset}eval instant at 60s sum_over_time({{env=\"prod\"}} | json | unwrap x [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\", x_extracted=\"7\"}} 5\n"
+    );
+    let run = run_file("inline/unwrap_shadowed.test", &q).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "the unwrapped value must be the metadata's 5, and the parsed 7 must survive as \
+         `x_extracted`: {}",
+        run.cases[0].detail
+    );
+
+    // The control, so the row above is about the COLLISION and not about
+    // `| json | unwrap` in general: with no metadata on the entry the
+    // parsed value is the unwrapped one.
+    let plain = "load\n  {env=\"prod\", service_name=\"checkout\"} service=checkout\n\
+                 \t10s  {\"x\":\"7\"}\n\n";
+    let q = format!(
+        "{plain}eval instant at 60s sum_over_time({{env=\"prod\"}} | json | unwrap x [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 7\n"
+    );
+    let run = run_file("inline/unwrap_plain.test", &q).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "without the collision the parsed value is the unwrapped one: {}",
+        run.cases[0].detail
+    );
+}
