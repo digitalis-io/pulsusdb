@@ -2379,3 +2379,121 @@ async fn the_anchored_bucket_expression_is_the_grid_the_window_implies() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// W3 (issue #507): the rule every pushdown cell is built to, executed.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct KeptRow {
+    kept: u8,
+}
+
+/// **A pushed parsed-name filter never drops a row the evaluator keeps**
+/// (issue #507, W3).
+///
+/// A `Fidelity::Wider` predicate may emit rows the evaluator discards and
+/// may never discard one it keeps. The two halves of that claim live in
+/// one file, `tests/logql_parsed_filter_witnesses.tsv`: its `keeps` column
+/// is the shipped pipeline's own answer, verified by
+/// `logql::predicate::tests::every_witness_row_states_the_answer_the_pipeline_gives`,
+/// and this test executes the rendered fragment against the database over
+/// the same bodies.
+///
+/// **The assertion is one-directional on purpose.** A row the database
+/// keeps and the evaluator drops is the predicate being wider, which is
+/// allowed and is counted rather than failed — the count is asserted to be
+/// non-zero, because a predicate that admitted exactly the evaluator's set
+/// would mean the witnesses cannot tell the two directions apart.
+#[tokio::test]
+async fn a_pushed_parsed_name_filter_never_drops_a_row_the_evaluator_keeps() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/logql_parsed_filter_witnesses.tsv"
+    );
+    let text = std::fs::read_to_string(path).expect("the witness table is readable");
+    let mut checked = 0usize;
+    let mut wider = 0usize;
+    for line in text.lines() {
+        if line.starts_with('#') || line.trim().is_empty() || line.starts_with("form\t") {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 7, "seven columns: {line:?}");
+        let (form, parser_name, arg, name, value, body) = (f[0], f[1], f[2], f[3], f[4], f[5]);
+        let evaluator_keeps = f[6] == "1";
+
+        let parser = match parser_name {
+            "json" => pulsus_logql::ParserStage::Json {
+                extractions: Vec::new(),
+            },
+            "logfmt" => pulsus_logql::ParserStage::Logfmt {
+                strict: false,
+                keep_empty: false,
+                extractions: Vec::new(),
+            },
+            "regexp" => pulsus_logql::ParserStage::Regexp(arg.to_string()),
+            "pattern" => pulsus_logql::ParserStage::Pattern(arg.to_string()),
+            other => panic!("unknown parser {other}"),
+        };
+        let fragment = if form == "numeric" {
+            pulsus_read::logql::predicate::parsed_numeric_filter(
+                name,
+                pulsus_logql::CompareOp::Gte,
+                value.parse::<f64>().expect("a numeric witness value"),
+                &parser,
+            )
+        } else {
+            pulsus_read::logql::predicate::parsed_string_filter(
+                name,
+                pulsus_logql::MatchOp::Eq,
+                value,
+                &parser,
+            )
+        };
+        // A refused filter emits nothing, so there is no predicate to be
+        // wrong about; the evaluator answers as it does today.
+        let Ok(fragment) = fragment else { continue };
+        checked += 1;
+
+        let body_literal = pulsus_read::logql::predicate::literal(body);
+        let sql = format!(
+            "SELECT toUInt8({}) AS kept FROM (SELECT {} AS body, '' AS structured_metadata)",
+            fragment.as_sql(),
+            body_literal.as_sql()
+        );
+        let mut stream = client
+            .query_stream::<KeptRow>(&sql, &QuerySettings::new())
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let row = stream
+            .next()
+            .await
+            .expect("one row")
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let sql_keeps = row.kept == 1;
+
+        if evaluator_keeps {
+            assert!(
+                sql_keeps,
+                "`{form} {parser_name} {name} {value}` over `{body}`: the evaluator keeps this \
+                 row and the pushed predicate drops it, which a Wider predicate may never do.\n\
+                 {sql}"
+            );
+        } else if sql_keeps {
+            wider += 1;
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} witness rows reached a fragment"
+    );
+    assert!(
+        wider > 0,
+        "no witness row is kept by the predicate and dropped by the evaluator, so these \
+         witnesses cannot tell a wider predicate from an exact one"
+    );
+}

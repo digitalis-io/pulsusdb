@@ -50,6 +50,7 @@ Site	Literal	crates/pulsus-read/src/logql/compile.rs:1282	-	-	<a>	accept	accept	
 Site	Literal	crates/pulsus-read/src/logql/compile.rs:1661	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:4710	-	-	<x> y	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/plan.rs:5963	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/predicate.rs:1156	-	-	{}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:198	-	-	<method> <path> <status> <took>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1013	-	-	<method> <_> <status> took <took>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1032	-	-	level=<level> msg	accept	accept	-	-	-

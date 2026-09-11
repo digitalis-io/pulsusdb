@@ -2309,7 +2309,7 @@ fn check_g_match_render_inventory() {
 /// mint added to an existing `impl` block, which is exactly where a future
 /// contributor would reach first (issue #286 review round 1).
 const PREDICATE_ITEMS: &[&str] = &[
-    "use pulsus_logql::{LineFilter, LineFilterOp}",
+    "use pulsus_logql::{CompareOp, LineFilter, LineFilterOp, MatchOp, ParserStage}",
     "use super::escape::ch_like_contains",
     "use super::escape::{ch_regex_anchored_checked, ch_regex_unanchored_checked, ch_string}",
     "use super::pipeline::PipelineError",
@@ -2335,6 +2335,32 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
+    // Issue #507 (W3): the metadata column's two named routes, the one
+    // private constant that holds its name, and the private whole-value
+    // guard. No item here renders an extraction over the column, which is
+    // the property the typed boundary exists for.
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum MetadataTerm",
+    "pub enum MetadataTerm :: Project,",
+    "pub enum MetadataTerm :: Group,",
+    "const METADATA_COLUMN: &str = _",
+    "impl MetadataTerm",
+    "impl MetadataTerm :: pub fn as_sql(self) -> &'static str",
+    "fn metadata_non_empty_guard() -> CheckedFragment",
+    // Issue #507 (W3): the parsed-name filter, its refusals, and the two
+    // predicates that decide which route a name takes.
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum ParsedFilterRefusal",
+    "pub enum ParsedFilterRefusal :: OperatorNotServed,",
+    "pub enum ParsedFilterRefusal :: AmbiguousName,",
+    "pub enum ParsedFilterRefusal :: NoKeyExpression,",
+    "pub enum ParsedFilterRefusal :: ThresholdNotFinite,",
+    "pub enum ParsedFilterRefusal :: NameNotRenderable,",
+    "fn name_is_unambiguous(name: &str) -> bool",
+    "fn name_is_renderable(name: &str) -> bool",
+    "fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String>",
+    "pub fn parsed_string_filter(name: &str, op: MatchOp, value: &str, parser: &ParserStage) -> Result<CheckedFragment, ParsedFilterRefusal>",
+    "pub fn parsed_numeric_filter(name: &str, op: CompareOp, threshold: f64, parser: &ParserStage) -> Result<CheckedFragment, ParsedFilterRefusal>",
     // Issue #507 (W2): the anchored bucket grid and the three ways it
     // refuses. `BucketGridRefusal` is deliberately not a `PipelineError` —
     // every one of its reasons leaves the link residual rather than
@@ -2376,6 +2402,31 @@ const PREDICATE_ITEMS: &[&str] = &[
     "mod tests :: fn no_line_filter_op_mints_a_token_prefilter_for_any_shaped_needle() :: const SHAPED: &[&str] = &[ _, _, _, _, _, _, _, _, _, _, _, ]",
     "mod tests :: #[test]",
     "mod tests :: fn a_contains_line_filter_renders_an_escaped_like_pattern()",
+    // Issue #507 (W3): the witness table and the four cells it governs.
+    // `Witness` and its two readers are `pub(crate)` because the live half
+    // of the rule reads the same file from an integration target.
+    "mod tests :: pub(crate) struct Witness",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) form: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) parser: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) arg: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) name: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) value: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) body: String,",
+    "mod tests :: pub(crate) struct Witness :: pub(crate) keeps: bool,",
+    "mod tests :: pub(crate) fn witnesses() -> Vec<Witness>",
+    "mod tests :: pub(crate) fn witness_query(w: &Witness) -> String",
+    "mod tests :: #[test]",
+    "mod tests :: fn every_witness_row_states_the_answer_the_pipeline_gives()",
+    "mod tests :: fn json_parser() -> ParserStage",
+    "mod tests :: fn logfmt_parser() -> ParserStage",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_parsed_name_filter_renders_the_specified_fragment()",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_numeric_threshold_renders_as_a_float_literal()",
+    "mod tests :: #[test]",
+    "mod tests :: fn a_parsed_name_filter_refuses_with_the_stated_reason()",
+    "mod tests :: #[test]",
+    "mod tests :: fn the_metadata_column_is_named_in_one_place()",
 ];
 
 /// The number of MINT-shaped entries: an `fn` whose OWN signature (the last
@@ -2385,10 +2436,13 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// Judging the own segment rather than the qualified string matters:
 /// `impl CheckedFragment :: pub fn as_sql(&self) -> &str` must NOT count (it
 /// is the unwrap point, not a mint), and `-> Self` inside the impl must.
-/// **8 at issue #507**: `bucket_expr` is the eighth, and it is a mint in
-/// the sense this count means — it is a function outside an `impl` whose
-/// signature names [`CheckedFragment`], so it can produce one.
-const MINT_COUNT: usize = 8;
+/// **11 at issue #507**: `bucket_expr`, `metadata_non_empty_guard`,
+/// `parsed_string_filter` and `parsed_numeric_filter` join the seven, each
+/// a function outside an `impl` whose signature names [`CheckedFragment`]
+/// and can therefore produce one. `metadata_non_empty_guard` is private
+/// and still counts: the count is over what can MINT, not over what is
+/// reachable.
+const MINT_COUNT: usize = 11;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[
@@ -2405,6 +2459,10 @@ const PREDICATE_IMPLS: &[&str] = &[
     "impl CheckedFragment",
     "impl CheckedLiteral",
     "impl MonthLiteral",
+    // Issue #507 (W3): `MetadataTerm` is not a sealed newtype — it carries
+    // no text at all. Its `impl` renders the column name from the one
+    // private constant that holds it.
+    "impl MetadataTerm",
 ];
 
 const NEWTYPES: &[&str] = &["CheckedFragment", "CheckedLiteral", "MonthLiteral"];

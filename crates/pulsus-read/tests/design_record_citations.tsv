@@ -255,10 +255,10 @@ docs/query-to-sql.md	predicate.rs:492	crates/pulsus-read/src/logql/predicate.rs	
 docs/query-to-sql.md	predicate.rs:500	crates/pulsus-read/src/logql/predicate.rs	500		line	let core = if lf.or_matches.is_empty() {
 docs/query-to-sql.md	predicate.rs:500-519	crates/pulsus-read/src/logql/predicate.rs	500	519	line	let core = if lf.or_matches.is_empty() { disjuncts .into_iter() .next() .expect("a line filter always has a head alterna
 docs/query-to-sql.md	predicate.rs:521	crates/pulsus-read/src/logql/predicate.rs	521		prose	NOT
-docs/query-to-sql.md	predicate.rs:623	crates/pulsus-read/src/logql/predicate.rs	623		line	fn contains_predicate(phrase: &str) -> String {
-docs/query-to-sql.md	predicate.rs:627	crates/pulsus-read/src/logql/predicate.rs	627		line	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
-docs/query-to-sql.md	predicate.rs:794-801	crates/pulsus-read/src/logql/predicate.rs	794	801	prose	LIKE
-docs/query-to-sql.md	predicate.rs:800	crates/pulsus-read/src/logql/predicate.rs	800		prose	'%%'
+docs/query-to-sql.md	predicate.rs:914	crates/pulsus-read/src/logql/predicate.rs	914		line	fn contains_predicate(phrase: &str) -> String {
+docs/query-to-sql.md	predicate.rs:918	crates/pulsus-read/src/logql/predicate.rs	918		line	fn regex_predicate(pattern: &str) -> Result<String, PipelineError> {
+docs/query-to-sql.md	predicate.rs:1085-1092	crates/pulsus-read/src/logql/predicate.rs	1085	1092	prose	LIKE
+docs/query-to-sql.md	predicate.rs:1091	crates/pulsus-read/src/logql/predicate.rs	1091		prose	'%%'
 docs/query-to-sql.md	pulsus-config/src/model.rs:354	crates/pulsus-config/src/model.rs	354		line	pub logql_scan_budget_bytes: ByteSize,
 docs/query-to-sql.md	pulsus-logql/src/limits.rs:96	crates/pulsus-logql/src/limits.rs	96		line	pub const MAX_QUERY_SPAN_NS: i64 = 157_680_000_000_000_000;
 docs/query-to-sql.md	pulsus-read/src/logql/plan.rs:1020	crates/pulsus-read/src/logql/plan.rs	1020		line	pub fn plan(expr: &Expr, p: &QueryParams, ctx: &PlanCtx<'_>) -> Result<Plan, ReadError> {
