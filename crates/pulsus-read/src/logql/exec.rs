@@ -7375,6 +7375,122 @@ mod tests {
         );
     }
 
+    /// Issue #507, condition 3 — **the rate divisor is applied once per
+    /// series, before the outer vector aggregation consumes the series**,
+    /// and the two orders give different answers.
+    ///
+    /// The reader's order over pre-aggregated rows ends
+    ///
+    /// ```text
+    /// 5  sum the integer partials for the series
+    /// 6  apply the rate divisor ONCE, per series      <- here
+    /// 7  the outer vector aggregation consumes the divided series
+    /// ```
+    ///
+    /// Step 6 before step 7 is a choice with an observable consequence,
+    /// because floating-point addition is not associative. With counts 1
+    /// and 4 over a 3-second window:
+    ///
+    /// ```text
+    /// divide first   1/3 + 4/3  =  1.6666666666666665   bits 0x3FFAAAAAAAAAAAAA
+    /// divide after   (1 + 4)/3  =  1.6666666666666667   bits 0x3FFAAAAAAAAAAAAB
+    /// ```
+    ///
+    /// The fixture is asserted to distinguish the two before either answer
+    /// is checked, so the test cannot pass by both sides collapsing
+    /// together.
+    ///
+    /// **What this reaches, and what it does not.** It drives the shipped
+    /// `PushdownInstantGroups::finish` and the shipped instant
+    /// vector-aggregation chain, so removing the divisor from `finish`, or
+    /// changing what `finish` divides, reddens it. It does **not** reach
+    /// the two statements in `run_metric_instant_pushdown` that put those
+    /// two functions in that order — reaching those needs a database
+    /// stream, and no hermetic test reaches them.
+    #[test]
+    fn ac32_divisor_precedes_the_vector_aggregation() {
+        const DIVIDE_FIRST_BITS: u64 = 0x3FFA_AAAA_AAAA_AAAA;
+        const DIVIDE_AFTER_BITS: u64 = 0x3FFA_AAAA_AAAA_AAAB;
+        let window_ns = Some(3_000_000_000u64);
+
+        // The fixture can tell the two orders apart at all.
+        assert_eq!((1.0f64 / 3.0 + 4.0f64 / 3.0).to_bits(), DIVIDE_FIRST_BITS);
+        assert_eq!((5.0f64 / 3.0).to_bits(), DIVIDE_AFTER_BITS);
+        assert_ne!(
+            DIVIDE_FIRST_BITS, DIVIDE_AFTER_BITS,
+            "1/3 + 4/3 and 5/3 must be different doubles, or this fixture \
+             asserts nothing about the order"
+        );
+
+        // Two streams, so the outer aggregation has two series to fold.
+        let rows = vec![
+            MetricInstantRow {
+                fingerprint: 1,
+                n: 1,
+                structured_metadata: String::new(),
+            },
+            MetricInstantRow {
+                fingerprint: 2,
+                n: 4,
+                structured_metadata: String::new(),
+            },
+        ];
+        let fold = |rate_window_ns: Option<u64>| -> Vec<InstantSeries> {
+            let meta = sm_meta();
+            let mut g = PushdownInstantGroups::new(&meta, AggCaps::DEFAULT);
+            for r in &rows {
+                g.push_row(r).expect("under the cap");
+            }
+            g.finish(rate_window_ns)
+        };
+        let sum_chain = |series: Vec<InstantSeries>| -> Vec<InstantSeries> {
+            charged_instant_chain(
+                series,
+                &[(pulsus_logql::VectorAggOp::Sum, None, None)],
+                MAX_POST_AGG_BYTES,
+            )
+            .expect("under the cap")
+        };
+
+        // Step 6: `finish` hands back series that are ALREADY divided.
+        let divided = fold(window_ns);
+        assert_eq!(divided.len(), 2, "two streams must give two series");
+        let mut per_series: Vec<u64> = divided.iter().map(|s| s.value.to_bits()).collect();
+        per_series.sort_unstable();
+        assert_eq!(
+            per_series,
+            vec![(1.0f64 / 3.0).to_bits(), (4.0f64 / 3.0).to_bits()],
+            "the divisor must already have been applied per series"
+        );
+
+        // Step 7 over the divided series is the shipped answer.
+        let shipped = sum_chain(divided);
+        assert_eq!(shipped.len(), 1, "an ungrouped sum is one series");
+        assert_eq!(
+            shipped[0].value.to_bits(),
+            DIVIDE_FIRST_BITS,
+            "the shipped order divides each series before summing them"
+        );
+        assert_ne!(
+            shipped[0].value.to_bits(),
+            DIVIDE_AFTER_BITS,
+            "dividing after the vector aggregation would be a different double"
+        );
+
+        // The other order, built from the same two functions: sum the
+        // undivided counts, then divide. It is the value the shipped order
+        // must NOT produce.
+        let after = sum_chain(fold(None));
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].value.to_bits(), 5.0f64.to_bits());
+        assert_eq!(
+            apply_rate(after[0].value, window_ns).to_bits(),
+            DIVIDE_AFTER_BITS,
+            "the reversed order is the other double, so the assertion above \
+             is about the order and not about the arithmetic"
+        );
+    }
+
     /// Issue #249 — a structured-metadata `__error__` fails the pushdown
     /// query, with the same named error the client paths raise. Captured:
     /// the container answers 400 to `count_over_time({service_name="sm3"}[5m])`
