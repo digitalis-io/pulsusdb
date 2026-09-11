@@ -3,9 +3,8 @@
 //!
 //! [`render_labels_json_sorted`] and [`render_series_labels`] are the
 //! only writers of the labels JSON a response carries; the reader is
-//! [`crate::canonical_labels`], shared with the two metric readers since
-//! issue #539 (three private copies of it decoded `\b` and `\f`
-//! wrongly, in the same way). [`fnv1a64`] and [`stream_hash`] are the stable hashes, and
+//! [`crate::canonical_labels`], shared with the metric readers since #539.
+//! [`fnv1a64`] and [`stream_hash`] are the stable hashes, and
 //! [`StructuredMetadataCtx`] carries the reserved structured-metadata
 //! routing [`merge_labels_with_structured_metadata`] performs.
 
