@@ -6429,6 +6429,19 @@ gated by
   Decoded with `json.loads`, the `bs` value on both sides is the three
   code points U+0061, U+0008, U+0062.
 
+  The form feed, same corpus shape and same request against both builds
+  (`{ff="a\fb"}`, label `ff`, service `s539f`):
+
+  ```
+  ours        "stream":{"detected_level":"unknown","ff":"a\fb","service_name":"s539f"}
+  reference   "stream":{"detected_level":"unknown","ff":"a\u000cb","service_name":"s539f"}
+  ```
+
+  Both decode to U+0061, U+000C, U+0062. Those two code points are the
+  whole of this row: every other C0 control is written `\u00XX` by both
+  sides, and every scalar value at or above U+0020 is written verbatim by
+  both.
+
 - **What this row is NOT.** It is not the defect issue #539 fixed. At
   `d3a1f4c9` our reader's escape table had no `\b` arm and its catch-all
   kept the letter, so the same request returned
