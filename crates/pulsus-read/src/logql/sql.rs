@@ -1768,4 +1768,621 @@ mod tests {
             "no inclusive lower bound: {sliding}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // W0 (issue #507): the two metric raw-scan builders and the
+    // selectivity probe, frozen byte for byte over every argument.
+    //
+    // Why these three. Measured, one builder at a time: an extra column
+    // added to the builder's leading `SELECT` list, then
+    // `cargo nextest run -p pulsus-read --no-fail-fast`. Before the three
+    // tests below existed, TWO of these builders were reddened by nothing
+    // in the crate —
+    //
+    //     metric_raw_samples           nothing reddened
+    //     probe                        nothing reddened
+    //     metric_raw_samples_sliding   sql_snapshots::an_unwrapped_sum_over_time_
+    //                                  renders_a_sliding_raw_scan_with_no_aggregate_and_no_limit
+    //
+    // so the sliding builder is here because it shares its four argument
+    // axes with `metric_raw_samples`, not because it was uncovered. The
+    // gap in the other two is a property of what the existing tests
+    // assert, not of the builders: `metric_raw_samples`'s only caller in
+    // `tests/sql_snapshots.rs` compares two of its OWN renderings against
+    // each other, and a relational equality between two productions of
+    // one function cannot see a change to that function.
+    //
+    // Each test enumerates its builder's arguments rather than sampling
+    // them, so a change confined to one argument value cannot pass by
+    // landing outside the fixture.
+    // -----------------------------------------------------------------
+
+    /// The 36 statements W0 freezes, in the order the three tests below
+    /// enumerate them: 16 `metric_raw_samples`, then 16
+    /// `metric_raw_samples_sliding`, then 4 `probe`. Each entry is its
+    /// axis label and the statement written out line by line.
+    #[allow(clippy::type_complexity)]
+    const W0_STATEMENTS: [(&str, &[&str]); 36] = [
+        (
+            "metric_raw_samples Lean Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Exclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Inclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Inclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples Lean Inclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Exclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Inclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Inclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples WithStructuredMetadata Inclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Exclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Inclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Inclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding Lean Inclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Exclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Inclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Inclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "metric_raw_samples_sliding WithStructuredMetadata Inclusive 3svc 1pred",
+            &[
+                r"SELECT fingerprint, timestamp_ns, body, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1782906900000000000 AND timestamp_ns <= 1782928800000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC",
+            ],
+        ),
+        (
+            "probe 1mo plain",
+            &[
+                r"SELECT count() AS n",
+                r"FROM log_streams_idx",
+                r"WHERE month = '2026-07-01' AND key = 'service_name'",
+            ],
+        ),
+        (
+            "probe 1mo escaped",
+            &[
+                r"SELECT count() AS n",
+                r"FROM log_streams_idx",
+                r"WHERE month = '2026-07-01' AND key = 'a\'b\\c'",
+            ],
+        ),
+        (
+            "probe 2mo plain",
+            &[
+                r"SELECT count() AS n",
+                r"FROM log_streams_idx",
+                r"WHERE month IN ('2026-07-01', '2026-08-01') AND key = 'service_name'",
+            ],
+        ),
+        (
+            "probe 2mo escaped",
+            &[
+                r"SELECT count() AS n",
+                r"FROM log_streams_idx",
+                r"WHERE month IN ('2026-07-01', '2026-08-01') AND key = 'a\'b\\c'",
+            ],
+        ),
+    ];
+
+    /// One statement of [`W0_STATEMENTS`], joined back into the text the
+    /// builder produces.
+    fn w0_expected(index: usize) -> String {
+        W0_STATEMENTS[index].1.join("\n")
+    }
+
+    /// Every argument of the three frozen builders, given a value. These
+    /// are held FIXED across all 36 rows, so a difference between two
+    /// rendered statements is a difference the builder made and not one
+    /// the fixture made.
+    ///
+    /// **Not enumerated, named here so the tests are not read as
+    /// exhaustive:** the fingerprint count and values, the table names,
+    /// the concrete window bounds, a second or third extra predicate,
+    /// zero or more than two months, and broader key spellings.
+    struct W0Fixtures {
+        fingerprints: Vec<u64>,
+        window: TimeWindow,
+        one_service: Vec<CheckedLiteral>,
+        three_services: Vec<CheckedLiteral>,
+        no_predicate: Vec<CheckedFragment>,
+        one_predicate: Vec<CheckedFragment>,
+        one_month: Vec<MonthLiteral>,
+        two_months: Vec<MonthLiteral>,
+        plain_key: CheckedLiteral,
+        escaped_key: CheckedLiteral,
+    }
+
+    impl W0Fixtures {
+        fn new() -> Self {
+            let one_predicate = vec![
+                crate::logql::predicate::line_filter(&pulsus_logql::LineFilter {
+                    op: pulsus_logql::LineFilterOp::Contains,
+                    value: "CONN_REFUSED".to_string(),
+                    value_is_ip: false,
+                    or_matches: Vec::new(),
+                })
+                .expect("a Contains filter compiles no regex"),
+            ];
+            W0Fixtures {
+                fingerprints: vec![18374, 99120],
+                window: TimeWindow {
+                    start_ns: 1_782_906_900_000_000_000,
+                    end_ns: 1_782_928_800_000_000_000,
+                },
+                one_service: vec![literal("checkout")],
+                three_services: vec![literal("checkout"), literal("edge"), literal("ipcase")],
+                no_predicate: Vec::new(),
+                one_predicate,
+                one_month: vec![month_literal(2026, 7)],
+                two_months: vec![month_literal(2026, 7), month_literal(2026, 8)],
+                plain_key: literal("service_name"),
+                escaped_key: literal("a'b\\c"),
+            }
+        }
+
+        /// The scan builders' four axes, in the order [`W0_STATEMENTS`]
+        /// lists them: projection, then lower bound, then service count,
+        /// then predicate presence.
+        fn scan_axes(
+            &self,
+        ) -> Vec<(
+            ScanProjection,
+            ScanLowerBound,
+            &[CheckedLiteral],
+            &[CheckedFragment],
+        )> {
+            let mut rows = Vec::new();
+            for projection in [ScanProjection::Lean, ScanProjection::WithStructuredMetadata] {
+                for lower in [ScanLowerBound::Exclusive, ScanLowerBound::Inclusive] {
+                    for services in [&self.one_service, &self.three_services] {
+                        for predicates in [&self.no_predicate, &self.one_predicate] {
+                            rows.push((
+                                projection,
+                                lower,
+                                services.as_slice(),
+                                predicates.as_slice(),
+                            ));
+                        }
+                    }
+                }
+            }
+            rows
+        }
+    }
+
+    /// Asserts that each of `rendered` equals its [`W0_STATEMENTS`] entry
+    /// and that no entry outside this block renders the same text — so
+    /// the 36 statements are distinct as a whole rather than only within
+    /// one builder's block.
+    fn assert_w0_block(rendered: &[String], first_index: usize) {
+        for (offset, sql) in rendered.iter().enumerate() {
+            let index = first_index + offset;
+            let (label, _) = W0_STATEMENTS[index];
+            assert_eq!(
+                *sql,
+                w0_expected(index),
+                "W0 statement {} ({label}) is not the frozen text",
+                index + 1
+            );
+            for (other, (other_label, other_lines)) in W0_STATEMENTS.iter().enumerate() {
+                if other == index {
+                    continue;
+                }
+                assert_ne!(
+                    other_lines.join("\n"),
+                    *sql,
+                    "W0 statements {} ({label}) and {} ({other_label}) render the same text, so \
+                     one of them proves nothing",
+                    index + 1,
+                    other + 1,
+                );
+            }
+        }
+    }
+
+    /// W0, criterion 1 (issue #507): 16 rows — `ScanProjection` ×
+    /// `ScanLowerBound` × {one service, three services} × {no extra
+    /// predicate, one}.
+    #[test]
+    fn metric_raw_samples_is_byte_exact_over_projection_lower_bound_service_count_and_predicate_presence()
+     {
+        let f = W0Fixtures::new();
+        let rendered: Vec<String> = f
+            .scan_axes()
+            .into_iter()
+            .map(|(projection, lower, services, predicates)| {
+                metric_raw_samples(
+                    "log_samples",
+                    services,
+                    &f.fingerprints,
+                    f.window,
+                    lower,
+                    predicates,
+                    projection,
+                )
+            })
+            .collect();
+        assert_eq!(rendered.len(), 16);
+        assert_w0_block(&rendered, 0);
+    }
+
+    /// W0, criterion 1 (issue #507): the same 16 rows through the sliding
+    /// builder, whose `ORDER BY` is the physical primary key.
+    #[test]
+    fn metric_raw_samples_sliding_is_byte_exact_over_the_same_four_axes() {
+        let f = W0Fixtures::new();
+        let rendered: Vec<String> = f
+            .scan_axes()
+            .into_iter()
+            .map(|(projection, lower, services, predicates)| {
+                metric_raw_samples_sliding(
+                    "log_samples",
+                    services,
+                    &f.fingerprints,
+                    f.window,
+                    lower,
+                    predicates,
+                    projection,
+                )
+            })
+            .collect();
+        assert_eq!(rendered.len(), 16);
+        assert_w0_block(&rendered, 16);
+    }
+
+    /// W0, criterion 1 (issue #507): 4 rows — {one month, two months} ×
+    /// {a plain key, a key needing escaping}.
+    #[test]
+    fn probe_is_byte_exact_over_month_count_and_key_escaping() {
+        let f = W0Fixtures::new();
+        let mut rendered = Vec::new();
+        for months in [&f.one_month, &f.two_months] {
+            for key in [&f.plain_key, &f.escaped_key] {
+                rendered.push(probe("log_streams_idx", months, key));
+            }
+        }
+        assert_eq!(rendered.len(), 4);
+        assert_w0_block(&rendered, 32);
+    }
 }
