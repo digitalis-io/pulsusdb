@@ -2891,3 +2891,222 @@ async fn the_explain_seam_reports_the_bucketed_statement_the_reader_issues() {
         .await
         .expect("drop the run database");
 }
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): does a single-threaded `sum` accumulate in scan order?
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct UnwrapSeedRow {
+    service: String,
+    fingerprint: u64,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SumRow {
+    s: f64,
+    /// XOR of every extracted value's bit pattern — order-independent, so
+    /// it compares the VALUE SET and cannot be confused with a summation
+    /// order difference.
+    x: u64,
+    n: u64,
+}
+
+/// **The claim W4's exact comparison rested on, measured — and it is
+/// false** (issue #507 W4 §6).
+///
+/// The claim was: at `max_threads = 1` the database's `sum` accumulates a
+/// single fingerprint's rows in `(service, fingerprint, timestamp_ns)`
+/// order, which within one fingerprint is timestamp order, so the two
+/// summations are the same summation and agree bit for bit.
+///
+/// **They do not agree, at any of the three sizes**, measured on
+/// `clickhouse/clickhouse-server:26.3` (server 26.3.29.7):
+///
+/// ```text
+///  N        ours                 the database         ULPs   |diff|      bound
+///  1e3      0xc16bd86f1537bba1   0xc16bd86f1537bba2      1   1.86e-9   3.29e-5
+///  1e5      0x41b936b66d98bf1a   0x41b936b66d98bf12      8   4.77e-7   2.90e-1
+///  1e6      0x41ac0f9d50e2fd32   0x41ac0f9d50e2fd51     31   9.24e-7   2.86e+1
+/// ```
+///
+/// **The cause is the block, not the thread.** At `max_threads = 1` and
+/// `max_block_size = 1` the database reproduces the left-to-right sum
+/// exactly; every larger block size differs, and not monotonically —
+/// measured over 100 000 of these values against a strictly sequential
+/// `arrayFold` in the database itself:
+///
+/// ```text
+///  left to right (arrayFold)  C193FE7B56D2A381
+///  max_block_size = 1         C193FE7B56D2A381   equal
+///  max_block_size = 64        C193FE7B56D2A394
+///  max_block_size = 1024      C193FE7B56D2A3A9
+///  max_block_size = 8192      C193FE7B56D2A3AE
+///  max_block_size = 65505     C193FE7B56D2A193
+/// ```
+///
+/// A block size of one is not a setting a read path can carry, so pinning
+/// the thread count does not recover a bit-exact comparison.
+///
+/// **What this test therefore asserts** is the property that does hold and
+/// that a reader needs: the two answers differ by at most
+/// `2(n−1)·u·Σ|vᵢ|`, the bound any two evaluation orders of the same `n`
+/// values obey. It also rules out the one confound that would make the
+/// sums incomparable — a value set that is not the same on both sides —
+/// before reading anything from them.
+///
+/// The values are generated once, in Rust, and written with `{:?}` —
+/// Rust's shortest round-tripping float form — so the bytes the database
+/// parses decode back to exactly the `f64` this test summed.
+#[tokio::test]
+async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound() {
+    skip_unless_live!();
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4sum_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let mut results: Vec<(u64, f64, f64, f64, f64)> = Vec::new();
+    for (n, fp) in [(1_000u64, 901u64), (100_000, 902), (1_000_000, 903)] {
+        // Mixed magnitude and sign, deterministic (the splitmix64 pattern).
+        let values: Vec<f64> = (0..n)
+            .map(|i| {
+                let r = splitmix64(i);
+                let mag = 10f64.powi(((r >> 40) % 13) as i32 - 6);
+                let frac = ((r & 0xFFFF_FFFF) as f64) / (u32::MAX as f64);
+                let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+                sign * mag * (1.0 + frac)
+            })
+            .collect();
+        // Recent, not a fixed epoch: `log_samples` carries a TTL on
+        // `timestamp_ns` with `ttl_only_drop_parts`, so a part written at a
+        // date older than the retention window is dropped on arrival and
+        // the query answers `0` with no error. Measured: a 2023 timestamp
+        // inserted, reported success, and left zero rows.
+        let t0 = now_ns() - 3_600_000_000_000;
+        let rows: Vec<UnwrapSeedRow> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| UnwrapSeedRow {
+                service: "w4".to_string(),
+                fingerprint: fp,
+                timestamp_ns: t0 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"v":{v:?}}}"#),
+                structured_metadata: String::new(),
+            })
+            .collect();
+        client
+            .insert_block("log_samples", &rows)
+            .await
+            .expect("insert");
+
+        // Left to right, in timestamp order — the evaluator's accumulation.
+        let mut ours = 0.0f64;
+        for v in &values {
+            ours += *v;
+        }
+
+        let sql = format!(
+            "SELECT sum(JSONExtractFloat(body, 'v')) AS s, \
+             groupBitXor(reinterpretAsUInt64(JSONExtractFloat(body, 'v'))) AS x, \
+             count() AS n \
+             FROM {db}.log_samples WHERE service = 'w4' AND fingerprint = {fp}"
+        );
+        let settings = QuerySettings::new().set("max_threads", 1);
+        let mut stream = client
+            .query_stream::<SumRow>(&sql, &settings)
+            .await
+            .expect("execute");
+        let row = stream.next().await.expect("one row").expect("decode");
+        drop(stream);
+
+        // The confound, ruled out first: if the database decoded even one
+        // value differently from the bytes we wrote, the sums would differ
+        // for a reason that has nothing to do with order. The XOR of the
+        // bit patterns is order-independent, so it compares the value SET.
+        let our_xor = values.iter().fold(0u64, |a, v| a ^ v.to_bits());
+        assert_eq!(row.n, n, "N={n}: every row must be present");
+        assert_eq!(
+            row.x, our_xor,
+            "N={n}: the database decoded a different value set, so nothing \
+             about summation order can be read from the sums"
+        );
+
+        let theirs = row.s;
+        let sum_abs: f64 = values.iter().map(|v| v.abs()).sum();
+        let bound = 2.0 * ((n - 1) as f64) * (f64::EPSILON / 2.0) * sum_abs;
+        let ulps = (ours.to_bits() as i64 - theirs.to_bits() as i64).abs();
+        eprintln!(
+            "N={n}: ours={ours:?} ({:#018x})  theirs={theirs:?} ({:#018x})  \
+             ulps={ulps}  diff={:e}  bound={bound:e}  sum|v|={sum_abs:e}",
+            ours.to_bits(),
+            theirs.to_bits(),
+            (ours - theirs).abs()
+        );
+        results.push((n, ours, theirs, sum_abs, bound));
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+
+    for (n, ours, theirs, sum_abs, bound) in &results {
+        eprintln!(
+            "N={n}: agree={}  |diff|={:e}  bound={:e}  sum|v|={:e}",
+            ours.to_bits() == theirs.to_bits(),
+            (ours - theirs).abs(),
+            bound,
+            sum_abs
+        );
+    }
+    // The property that holds, and the one a reader can rely on.
+    for (n, ours, theirs, _sum_abs, bound) in &results {
+        let diff = (ours - theirs).abs();
+        assert!(
+            diff <= *bound,
+            "N={n}: two evaluation orders of the same {n} values may differ by \
+             at most 2(n-1)*u*sum|v| = {bound:e}, got {diff:e}"
+        );
+    }
+    // And the non-vacuity of the sentence above: they DO differ, so the
+    // bound is doing work rather than passing on equality. If this ever
+    // stops holding, the database has changed its accumulation and W4's
+    // comparison can be tightened — which is good news and should not be
+    // discovered by a silent pass.
+    assert!(
+        results
+            .iter()
+            .any(|(_, o, t, _, _)| o.to_bits() != t.to_bits()),
+        "every size agreed bit for bit: re-read this test's doc comment, the \
+         measurement it records has changed"
+    );
+}
