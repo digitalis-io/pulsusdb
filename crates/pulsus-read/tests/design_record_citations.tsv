@@ -35,11 +35,11 @@ docs/query-lowering.md	crates/pulsus-config/src/model.rs:518	crates/pulsus-confi
 docs/query-lowering.md	crates/pulsus-logql/src/ast.rs:1002	crates/pulsus-logql/src/ast.rs	1002		line	LabelReplace {
 docs/query-lowering.md	crates/pulsus-logql/src/ast.rs:133	crates/pulsus-logql/src/ast.rs	133		prose	Stage
 docs/query-lowering.md	crates/pulsus-re2/src/compile_budget.rs:343	crates/pulsus-re2/src/compile_budget.rs	343		line	pub fn compile_user_regex_anchored(pattern: &str) -> Result<regex::Regex, RegexCompileError> {
+docs/query-lowering.md	crates/pulsus-read/src/canonical_labels.rs:93-125	crates/pulsus-read/src/canonical_labels.rs	93	125	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
 docs/query-lowering.md	crates/pulsus-read/src/compile/fold.rs:623	crates/pulsus-read/src/compile/fold.rs	623		prose	Relation
 docs/query-lowering.md	crates/pulsus-read/src/compile/fold.rs:960-967	crates/pulsus-read/src/compile/fold.rs	960	967	line	Capability::No(reason) => { rel = lw.residual_effect(stage, rel); how.push(Disposition::Residual(ResidualReason::Blocked
 docs/query-lowering.md	crates/pulsus-read/src/compile/plan.rs:543	crates/pulsus-read/src/compile/plan.rs	543		line	Disposition::Residual(_) => {
 docs/query-lowering.md	crates/pulsus-read/src/logql/error.rs:771-772	crates/pulsus-read/src/logql/error.rs	771	772	line	#[error("{reason}")] PipelineInvalid { reason: String },
-docs/query-lowering.md	crates/pulsus-read/src/logql/labels.rs:157-189	crates/pulsus-read/src/logql/labels.rs	157	189	line	pub(in crate::logql) fn parse_flat_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars
 docs/query-lowering.md	crates/pulsus-read/src/logql/params.rs:121	crates/pulsus-read/src/logql/params.rs	121		line	pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:1625	crates/pulsus-read/src/logql/plan.rs	1625		line	let fetch_until_limit = has_unpushed_dropping_stage(&log_expr.pipeline);
 docs/query-lowering.md	crates/pulsus-read/src/logql/plan.rs:171	crates/pulsus-read/src/logql/plan.rs	171		line	let translated = pulsus_promql::re2_pattern_to_rust(regex);
@@ -153,6 +153,7 @@ docs/query-to-sql.md	ast.rs:151	crates/pulsus-logql/src/ast.rs	151		prose	Vec<Dr
 docs/query-to-sql.md	ast.rs:2301	crates/pulsus-logql/src/ast.rs	2301		prose	LogRange
 docs/query-to-sql.md	ast.rs:939	crates/pulsus-logql/src/ast.rs	939		prose	MetricExpr
 docs/query-to-sql.md	ast.rs:99	crates/pulsus-traceql/src/ast.rs	99		prose	SpansetExpr
+docs/query-to-sql.md	canonical_labels.rs:93-125	crates/pulsus-read/src/canonical_labels.rs	93	125	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
 docs/query-to-sql.md	catalog.rs:244-257	crates/pulsus-schema/src/catalog.rs	244	257	prose	log_samples
 docs/query-to-sql.md	catalog.rs:340-384	crates/pulsus-schema/src/catalog.rs	340	384	prose	trace_attrs_idx
 docs/query-to-sql.md	catalog.rs:343	crates/pulsus-schema/src/catalog.rs	343		line	parent_id FixedString(8),\n\
@@ -169,14 +170,14 @@ docs/query-to-sql.md	controller.rs:57	crates/pulsus-schema/src/controller.rs	57	
 docs/query-to-sql.md	crates/pulsus-config/src/model.rs:518	crates/pulsus-config/src/model.rs	518		line	traceql_generator_max_memory_bytes: 536_870_912,
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:133	crates/pulsus-logql/src/ast.rs	133		prose	Stage
 docs/query-to-sql.md	crates/pulsus-logql/src/ast.rs:157-160	crates/pulsus-logql/src/ast.rs	157	160	line	/// One element of a `drop`/`keep` label list: a bare label name, or a /// label qualified by a value matcher (`level="i
+docs/query-to-sql.md	crates/pulsus-read/src/canonical_labels.rs:93-125	crates/pulsus-read/src/canonical_labels.rs	93	125	line	pub(crate) fn parse_canonical_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars().pe
 docs/query-to-sql.md	crates/pulsus-read/src/compile/fold.rs:682	crates/pulsus-read/src/compile/fold.rs	682		prose	NotPushable
 docs/query-to-sql.md	crates/pulsus-read/src/compile/fold.rs:688-712	crates/pulsus-read/src/compile/fold.rs	688	712	prose	NotASearchLink
 docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:337	crates/pulsus-read/src/logql/compile.rs	337		prose	BlockReason::NotPushable
 docs/query-to-sql.md	crates/pulsus-read/src/logql/compile.rs:472	crates/pulsus-read/src/logql/compile.rs	472		prose	Never
 docs/query-to-sql.md	crates/pulsus-read/src/logql/error.rs:782-785	crates/pulsus-read/src/logql/error.rs	782	785	line	"pipeline error: '{error_type}' for series: '{series}'.\n\ Use a label filter to intentionally skip this error. (e.g | _
 docs/query-to-sql.md	crates/pulsus-read/src/logql/ip.rs:169	crates/pulsus-read/src/logql/ip.rs	169		prose	[0-9]{1,3}(?:\.[0-9]{1,3}){3}
-docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:157-189	crates/pulsus-read/src/logql/labels.rs	157	189	line	pub(in crate::logql) fn parse_flat_labels_into(json: &str, out: &mut Vec<(String, String)>) { let mut chars = json.chars
-docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:363	crates/pulsus-read/src/logql/labels.rs	363		prose	structured_metadata
+docs/query-to-sql.md	crates/pulsus-read/src/logql/labels.rs:318	crates/pulsus-read/src/logql/labels.rs	318		prose	structured_metadata
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:2890	crates/pulsus-read/src/logql/pipeline.rs	2890		prose	DURATION_UNITS
 docs/query-to-sql.md	crates/pulsus-read/src/logql/pipeline.rs:6099	crates/pulsus-read/src/logql/pipeline.rs	6099		line	serde_json::Value::Number(n) => n.to_string(),
 docs/query-to-sql.md	crates/pulsus-read/src/logql/sql.rs:489	crates/pulsus-read/src/logql/sql.rs	489		line	pub fn stage2(streams_table: &str, fingerprints: &[u64]) -> String {
@@ -205,7 +206,6 @@ docs/query-to-sql.md	exec.rs:3421	crates/pulsus-read/src/traces/exec.rs	3421		pr
 docs/query-to-sql.md	filter.rs:76-79	crates/pulsus-read/src/traces/filter.rs	76	79	prose	unsupported field:
 docs/query-to-sql.md	filter.rs:817	crates/pulsus-read/src/traces/filter.rs	817		line	/// fragment. Fallible for the same reason as [`physical_sql`] (issue
 docs/query-to-sql.md	filter.rs:827	crates/pulsus-read/src/traces/filter.rs	827		line	ValuePred::Regex(pat) => format!("match(val, {})", anchored_regex_sql(pat)?),
-docs/query-to-sql.md	labels.rs:157-189	crates/pulsus-model/src/labels.rs	157	189	prose	structured_metadata
 docs/query-to-sql.md	labels.rs:66	crates/pulsus-read/src/logql/labels.rs	66		prose	render_labels_json_sorted
 docs/query-to-sql.md	logql/charge.rs:1270	crates/pulsus-read/src/logql/charge.rs	1270		line	pub const MAX_STREAMS_RESULT_BYTES: u64 = 1024 * 1024 * 1024;
 docs/query-to-sql.md	logql/error.rs:775-781	crates/pulsus-read/src/logql/error.rs	775	781	prose	400

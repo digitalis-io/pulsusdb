@@ -6392,3 +6392,84 @@ gated by
 - **Pinned by** `b26_json_expr.test`'s two `eval_fail` rows and
   `json_expr.rs`'s
   `a_bracket_ends_a_quoted_key_so_such_a_key_is_unreachable`.
+
+## Issue #539 — how a label value's C0 control characters are spelled on the wire
+
+### `label-value-c0-escape-form` (issue #539 — the two bodies decode to the same string; no action)
+
+- **What differs: the SPELLING of U+0008 and U+000C inside a
+  `query_range` stream-label object, and nothing else.** We write JSON's
+  two-character escapes, `\b` and `\f`; the reference writes the
+  six-character `\u0008` and `\u000c`. Both are valid JSON for the same
+  string, and every JSON client decodes them identically — the two
+  responses below parse to byte-identical label values.
+
+- **Measured** 2026-09-11 on one machine, single node, against the pinned
+  oracle (`grafana/loki@sha256:87f0a067…f756cfcc`, in-process identity
+  `3.7.4` / `b318f282` read from `/loki/api/v1/status/buildinfo`) with
+  the committed `ci/logql/config.yaml`, and against PulsusDB at
+  `5a73a2b6` over ClickHouse `26.3.29.7`. One stream was pushed to each,
+  through each side's own `POST /loki/api/v1/push`, with the same body:
+
+  ```
+  {"streams":[{"stream":{"service_name":"s539","bs":"a\bb"},
+               "values":[["1789126940000000000","line with backspace label"]]}]}
+  ```
+
+  Both answered `204`. Both were then asked the same question —
+  `GET /loki/api/v1/query_range?query=%7Bbs%3D%22a%5Cbb%22%7D&start=…&end=…&limit=10`,
+  which is `{bs="a\bb"}` url-encoded. The `stream` objects, quoted from
+  the two response bodies (`stats` elided; nothing else is):
+
+  ```
+  ours        "stream":{"bs":"a\bb","detected_level":"unknown","service_name":"s539"}
+  reference   "stream":{"bs":"a\u0008b","detected_level":"unknown","service_name":"s539"}
+  ```
+
+  Decoded with `json.loads`, the `bs` value on both sides is the three
+  code points U+0061, U+0008, U+0062.
+
+  The form feed, same corpus shape and same request against both builds
+  (`{ff="a\fb"}`, label `ff`, service `s539f`):
+
+  ```
+  ours        "stream":{"detected_level":"unknown","ff":"a\fb","service_name":"s539f"}
+  reference   "stream":{"detected_level":"unknown","ff":"a\u000cb","service_name":"s539f"}
+  ```
+
+  Both decode to U+0061, U+000C, U+0062. Those two code points are the
+  whole of this row: every other C0 control is written `\u00XX` by both
+  sides, and every scalar value at or above U+0020 is written verbatim by
+  both.
+
+- **What this row is NOT.** It is not the defect issue #539 fixed. At
+  `d3a1f4c9` our reader's escape table had no `\b` arm and its catch-all
+  kept the letter, so the same request returned
+  `"stream":{"bs":"abb",…}` — a different string, one that belongs to a
+  different stream. That was ours being wrong and is fixed;
+  `crates/pulsus-read/src/canonical_labels.rs` is the one decoder now.
+  The escape FORM above is what remains, and it was already the case
+  before that fix — the writer has always emitted `\b`.
+
+- **Why we do not change it.** Our renderer escapes exactly the mandatory
+  set the way `serde_json` does
+  (`crates/pulsus-read/src/logql/labels.rs`'s `push_json_string`), which
+  is the same set our own writer stores with
+  (`pulsus_model::LabelSet::to_canonical_json`). Making the response
+  spelling match the reference's would mean a second escaping rule that
+  disagrees with the stored one, to produce a string no client can
+  distinguish.
+
+- **Close condition:** none. This row is recorded so that a reader
+  comparing the two responses byte for byte knows the difference is
+  spelling, not value. A client that compares the raw bytes of a JSON
+  string rather than its decoded value would see it; nothing in this
+  repository does.
+
+- **Pinned by** `crates/pulsus-read/src/canonical_labels.rs`'s
+  `every_unicode_scalar_value_survives_the_writer_then_the_reader` (the
+  decode, over the whole domain) and `crates/pulsus-server/tests/`'s live
+  push case `c0_escaped_label_values_survive_push_and_come_back_decoded`
+  (the decoded value out of a real response). **Neither pins the escape
+  form itself** — no test asserts the raw bytes of this field, and the
+  measurement above is the only record of them.

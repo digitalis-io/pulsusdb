@@ -46,93 +46,6 @@ pub(crate) fn now_unix_ms() -> i64 {
     i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// Parses PulsusDB's canonical flat label JSON (`{"key":"value", ...}`,
-/// already sorted/normalized keys — docs/architecture.md §2.2) into a
-/// [`LabelSet`], without pulling in a JSON crate dependency (mirrors
-/// `logql::exec`'s private `parse_flat_labels` helper — duplicated here,
-/// not shared, since that helper is module-private in a sibling module and
-/// this crate's Cargo.toml deliberately adds no JSON crate for this single
-/// use). Malformed input — which should never occur, this only ever reads
-/// back what the writer produced — yields whatever pairs parsed so far
-/// rather than panicking.
-fn parse_canonical_labels(json: &str) -> LabelSet {
-    LabelSet::from_verbatim(parse_flat_label_pairs(json))
-}
-
-fn parse_flat_label_pairs(json: &str) -> Vec<(String, String)> {
-    let mut chars = json.chars().peekable();
-    let mut out = Vec::new();
-    while let Some(&c) = chars.peek() {
-        chars.next();
-        if c == '{' {
-            break;
-        }
-    }
-    loop {
-        skip_ws(&mut chars);
-        match chars.peek() {
-            None | Some('}') => break,
-            Some(',') => {
-                chars.next();
-                continue;
-            }
-            Some('"') => {}
-            Some(_) => break,
-        }
-        let Some(key) = parse_json_string(&mut chars) else {
-            break;
-        };
-        skip_ws(&mut chars);
-        if chars.peek() == Some(&':') {
-            chars.next();
-        }
-        skip_ws(&mut chars);
-        let Some(value) = parse_json_string(&mut chars) else {
-            break;
-        };
-        out.push((key, value));
-    }
-    out
-}
-
-fn skip_ws<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
-    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
-        chars.next();
-    }
-}
-
-fn parse_json_string<I: Iterator<Item = char>>(
-    chars: &mut std::iter::Peekable<I>,
-) -> Option<String> {
-    if chars.next() != Some('"') {
-        return None;
-    }
-    let mut out = String::new();
-    loop {
-        match chars.next()? {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                'u' => {
-                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16)
-                        && let Some(c) = char::from_u32(code)
-                    {
-                        out.push(c);
-                    }
-                }
-                other => out.push(other),
-            },
-            c => out.push(c),
-        }
-    }
-}
-
 /// One sweep + swap: streams [`SeriesRow`]s, builds a whole new
 /// [`CacheSnapshot`], swaps it into `cache.snapshot` under a brief write
 /// lock (never held across an `.await`), and updates `cache.metrics`. On a
@@ -166,7 +79,10 @@ pub(crate) async fn run_sweep(cache: &LabelCache) -> Result<(), ChError> {
         // same label set (verbatim identity, not merely `==`-equal), so
         // whichever the sweep saw last simply overwrites with the same
         // content.
-        by_fingerprint.insert(row.fingerprint, parse_canonical_labels(&row.labels));
+        by_fingerprint.insert(
+            row.fingerprint,
+            crate::canonical_labels::parse_canonical_label_set(&row.labels),
+        );
         by_metric
             .entry(row.metric_name)
             .or_default()
@@ -273,36 +189,6 @@ mod tests {
         assert!(sql.contains("unix_milli >= 1000"));
         assert!(!sql.contains("unix_milli <="));
         assert!(sql.ends_with("LIMIT 1 BY metric_name, fingerprint"));
-    }
-
-    #[test]
-    fn parse_flat_label_pairs_reads_simple_pairs() {
-        let pairs = parse_flat_label_pairs(r#"{"env":"prod","team":"checkout"}"#);
-        assert_eq!(
-            pairs,
-            vec![
-                ("env".to_string(), "prod".to_string()),
-                ("team".to_string(), "checkout".to_string())
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_flat_label_pairs_handles_escaped_quotes_and_backslashes() {
-        let pairs = parse_flat_label_pairs(r#"{"msg":"a\"b\\c"}"#);
-        assert_eq!(pairs, vec![("msg".to_string(), "a\"b\\c".to_string())]);
-    }
-
-    #[test]
-    fn parse_flat_label_pairs_of_empty_object_is_empty() {
-        assert!(parse_flat_label_pairs("{}").is_empty());
-    }
-
-    #[test]
-    fn parse_canonical_labels_round_trips_through_label_set() {
-        let set = parse_canonical_labels(r#"{"job":"api","env":"prod"}"#);
-        assert_eq!(set.get("job"), Some("api"));
-        assert_eq!(set.get("env"), Some("prod"));
     }
 
     #[test]

@@ -2,9 +2,9 @@
 //! JSON, parsing it back, and the stable hashes keyed off it.
 //!
 //! [`render_labels_json_sorted`] and [`render_series_labels`] are the
-//! only writers of the labels JSON a response carries;
-//! [`parse_flat_labels`] and [`parse_flat_labels_into`] are the only
-//! readers. [`fnv1a64`] and [`stream_hash`] are the stable hashes, and
+//! only writers of the labels JSON a response carries; the reader is
+//! [`crate::canonical_labels`], shared with the metric readers since #539.
+//! [`fnv1a64`] and [`stream_hash`] are the stable hashes, and
 //! [`StructuredMetadataCtx`] carries the reserved structured-metadata
 //! routing [`merge_labels_with_structured_metadata`] performs.
 
@@ -91,6 +91,11 @@ where
 /// set the same way `serde_json` does (`"`/`\` escaped, the five short
 /// control escapes, `\u00xx` lowercase for the rest of C0, everything
 /// else verbatim).
+///
+/// Its inverse is [`crate::canonical_labels::parse_canonical_labels`].
+/// The two were not compared until issue #539, and the escape table 320
+/// lines below this one was missing the `\b` and `\f` this function has
+/// always emitted.
 pub(in crate::logql) fn push_json_string(out: &mut String, s: &str) {
     use std::fmt::Write as _;
     out.push('"');
@@ -131,61 +136,11 @@ pub(in crate::logql) fn fnv1a64(bytes: &[u8]) -> u64 {
 /// `service_name` — the §3.2 canonical vector-agg example — works without
 /// special-casing it against the JSON blob.
 pub(in crate::logql) fn series_labels(meta: &StreamMetaRow) -> Vec<(String, String)> {
-    let mut labels = parse_flat_labels(&meta.labels);
+    let mut labels = crate::canonical_labels::parse_canonical_labels(&meta.labels);
     labels.retain(|(k, _)| k != "service_name");
     labels.push(("service_name".to_string(), meta.service.clone()));
     labels.sort();
     labels
-}
-
-/// Parses PulsusDB's canonical flat label JSON (`{"key":"value", ...}`,
-/// sorted keys, no nesting — docs/architecture.md §2.3) without a JSON
-/// crate dependency (not part of this module's declared dependency set).
-/// Malformed input — which should never occur, this only ever reads back
-/// what the writer produced — yields whatever pairs were parsed so far
-/// rather than panicking.
-pub(in crate::logql) fn parse_flat_labels(json: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    parse_flat_labels_into(json, &mut out);
-    out
-}
-
-/// [`parse_flat_labels`] that APPENDS into a caller-owned buffer instead of
-/// allocating a fresh `Vec` (issue #97): the structured-metadata merge reuses
-/// one buffer across rows (clear + refill), so the parse must not allocate its
-/// own return vector per row.
-pub(in crate::logql) fn parse_flat_labels_into(json: &str, out: &mut Vec<(String, String)>) {
-    let mut chars = json.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        chars.next();
-        if c == '{' {
-            break;
-        }
-    }
-    loop {
-        skip_ws(&mut chars);
-        match chars.peek() {
-            None | Some('}') => break,
-            Some(',') => {
-                chars.next();
-                continue;
-            }
-            Some('"') => {}
-            Some(_) => break,
-        }
-        let Some(key) = parse_json_string(&mut chars) else {
-            break;
-        };
-        skip_ws(&mut chars);
-        if chars.peek() == Some(&':') {
-            chars.next();
-        }
-        skip_ws(&mut chars);
-        let Some(value) = parse_json_string(&mut chars) else {
-            break;
-        };
-        out.push((key, value));
-    }
 }
 
 /// `LabelsBuilder.Add`'s routing of ONE row's structured metadata
@@ -379,7 +334,7 @@ pub(in crate::logql) fn merge_labels_with_structured_metadata(
     // rest of the row, whatever the SM merge writes into it.
     sm_ctx.stream_label_count = Some(base_len);
     sm_buf.clear();
-    parse_flat_labels_into(structured_metadata, sm_buf);
+    crate::canonical_labels::parse_canonical_labels_into(structured_metadata, sm_buf);
     // `base_len` is small (a stream's label count), so these scans are bounded
     // by the fixed label cardinality, not by row count. `drain` moves the owned
     // key/value Strings out of the reused scratch without cloning.
@@ -409,44 +364,6 @@ pub(in crate::logql) fn merge_labels_with_structured_metadata(
                 merge_buf[at].1 = value;
             }
             None => merge_buf.push((key, value)),
-        }
-    }
-}
-
-fn skip_ws<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
-    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
-        chars.next();
-    }
-}
-
-fn parse_json_string<I: Iterator<Item = char>>(
-    chars: &mut std::iter::Peekable<I>,
-) -> Option<String> {
-    if chars.next() != Some('"') {
-        return None;
-    }
-    let mut out = String::new();
-    loop {
-        match chars.next()? {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                'u' => {
-                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16)
-                        && let Some(c) = char::from_u32(code)
-                    {
-                        out.push(c);
-                    }
-                }
-                other => out.push(other),
-            },
-            c => out.push(c),
         }
     }
 }
@@ -530,7 +447,7 @@ mod tests {
         reference.push('}');
         assert_eq!(ours, reference);
         // And the canonical shape stays round-trippable / re-parseable.
-        let parsed = parse_flat_labels(&ours);
+        let parsed = crate::canonical_labels::parse_canonical_labels(&ours);
         assert_eq!(parsed.len(), pairs.len());
     }
 
@@ -539,29 +456,6 @@ mod tests {
         let a = fnv1a64(br#"{"a":"1"}"#);
         assert_eq!(a, fnv1a64(br#"{"a":"1"}"#));
         assert_ne!(a, fnv1a64(br#"{"a":"2"}"#));
-    }
-
-    #[test]
-    fn parse_flat_labels_reads_simple_pairs() {
-        let pairs = parse_flat_labels(r#"{"env":"prod","team":"checkout"}"#);
-        assert_eq!(
-            pairs,
-            vec![
-                ("env".to_string(), "prod".to_string()),
-                ("team".to_string(), "checkout".to_string())
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_flat_labels_handles_escaped_quotes_and_backslashes() {
-        let pairs = parse_flat_labels(r#"{"msg":"a\"b\\c"}"#);
-        assert_eq!(pairs, vec![("msg".to_string(), "a\"b\\c".to_string())]);
-    }
-
-    #[test]
-    fn parse_flat_labels_of_empty_object_is_empty() {
-        assert!(parse_flat_labels("{}").is_empty());
     }
 
     #[test]

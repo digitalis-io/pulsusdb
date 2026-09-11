@@ -48,8 +48,7 @@ use super::detected_probe::{
 
 use super::labels::{
     EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
-    merge_labels_with_structured_metadata, parse_flat_labels, render_labels_json_sorted,
-    series_labels,
+    merge_labels_with_structured_metadata, render_labels_json_sorted, series_labels,
 };
 use super::post_agg::{
     MAX_POST_AGG_BYTES, apply_label_replace, apply_vector_aggs, charged_instant_chain,
@@ -58,6 +57,7 @@ use super::post_agg::{
 use super::variants::{MAX_VARIANT_FANOUT_STATE_BYTES, VariantArena, VariantsAggState};
 use super::warnings::Warnings;
 use super::window::{ClientWindow, materialize_vector_lit};
+use crate::canonical_labels::parse_canonical_labels;
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
 /// `max_bytes_to_read` overflow this module sets from
@@ -2949,7 +2949,7 @@ impl LogQlEngine {
         // `StreamAccumulator` idiom).
         let base_labels: HashMap<u64, Vec<(String, String)>> = meta
             .iter()
-            .map(|(fp, m)| (*fp, parse_flat_labels(&m.labels)))
+            .map(|(fp, m)| (*fp, parse_canonical_labels(&m.labels)))
             .collect();
         let window = super::sql::TimeWindow {
             start_ns: sp.start_ns,
@@ -3854,7 +3854,7 @@ impl FastPathGroups {
         let base = self
             .cat_base
             .entry(row.fingerprint)
-            .or_insert_with(|| parse_flat_labels(&m.labels));
+            .or_insert_with(|| parse_canonical_labels(&m.labels));
         merge_labels_with_structured_metadata(
             base,
             &row.structured_metadata,
@@ -4085,7 +4085,7 @@ impl<'m> StreamAccumulator<'m> {
     pub fn with_cap(meta: &'m HashMap<u64, StreamMetaRow>, result_limit: u32, cap: u64) -> Self {
         let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
         for (fp, m) in meta {
-            base_labels.insert(*fp, parse_flat_labels(&m.labels));
+            base_labels.insert(*fp, parse_canonical_labels(&m.labels));
         }
         Self {
             meta,

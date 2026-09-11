@@ -1555,7 +1555,7 @@ enum ReviewedVerdict {
 /// found three where the resolver was the one pointing at the wrong
 /// file. So no rate is published. These are the cases, and the note on
 /// each is the reasoning.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 9] = [
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 7] = [
     (
         "docs/query-lowering.md",
         "exec.rs:2869",
@@ -1586,24 +1586,10 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
     ),
     (
         "docs/query-to-sql.md",
-        "labels.rs:157-189",
-        0,
-        ReviewedVerdict::FallbackWrong,
-        "the sentence describes the label ENCODER; the fallback answers          crates/pulsus-read/src/logql/labels.rs, which is not where it lives",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "labels.rs:157-189",
-        1,
-        ReviewedVerdict::Ambiguous,
-        "this sentence describes both the writer and the flat reader; the fallback points at          the flat reader, so neither answer is wrong and the case is evidence for neither rule",
-    ),
-    (
-        "docs/query-to-sql.md",
-        "labels.rs:363",
+        "labels.rs:318",
         0,
         ReviewedVerdict::FallbackRight,
-        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs",
+        "the citing prose describes merge_labels_with_structured_metadata, which is in          crates/pulsus-read/src/logql/labels.rs — the fallback's answer. The resolver points          at metrics/labels.rs, whose line carries the word resolve in an unrelated doc          comment. Issue #539 moved this citation from :363 to :318 with the declaration it          names; the reading is unchanged",
     ),
     (
         "docs/query-to-sql.md",
@@ -1739,7 +1725,7 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
     }
     assert_eq!(
         (wrong.len(), right, ambiguous),
-        (5, 3, 1),
+        (4, 3, 0),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }

@@ -18,8 +18,7 @@ docs/query-lowering.md	exec.rs:2063	ambiguous_basename
 docs/query-lowering.md	exec.rs:2204	ambiguous_basename
 docs/query-lowering.md	exec.rs:2261	ambiguous_basename
 docs/query-lowering.md	exec.rs:666	ambiguous_basename
-docs/query-lowering.md	labels.rs:157-189	ambiguous_basename
-docs/query-lowering.md	labels.rs:363	ambiguous_basename
+docs/query-lowering.md	labels.rs:318	ambiguous_basename
 docs/query-lowering.md	parser.rs:1298	ambiguous_basename
 docs/query-lowering.md	plan.rs:1171	ambiguous_basename
 docs/query-lowering.md	plan.rs:1227	ambiguous_basename
@@ -58,7 +57,7 @@ docs/query-to-sql.md	exec.rs:114	ambiguous_basename
 docs/query-to-sql.md	exec.rs:119	ambiguous_basename
 docs/query-to-sql.md	exec.rs:385	ambiguous_basename
 docs/query-to-sql.md	exec.rs:701	ambiguous_basename
-docs/query-to-sql.md	labels.rs:363	occurrences_disagree
+docs/query-to-sql.md	labels.rs:318	occurrences_disagree
 docs/query-to-sql.md	plan.rs:1616	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1617-1619	ambiguous_basename
 docs/query-to-sql.md	plan.rs:1648-1654	ambiguous_basename
