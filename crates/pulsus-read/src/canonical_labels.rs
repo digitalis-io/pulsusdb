@@ -250,6 +250,32 @@ mod tests {
         }
     }
 
+    /// **Three of the eight arms cannot be seen by any behaviour test.**
+    /// `"`, `\\` and `/` decode to themselves, which the catch-all
+    /// `other => out.push(other)` also does, so deleting all three leaves
+    /// every other test in this module green — measured, issue #539. They
+    /// are kept because the table's COMPLETENESS is the property that
+    /// failed, and this test reads the source text, which is the only
+    /// instrument that can see them.
+    ///
+    /// The needles are assembled at run time, so the literals in this test
+    /// do not match themselves and report a deleted arm as present.
+    #[test]
+    fn the_escape_table_lists_all_eight_of_jsons_two_character_escapes() {
+        let src = include_str!("canonical_labels.rs");
+        // The SOURCE spelling of each escape's match pattern: a backslash
+        // is written `\\` in a Rust character literal.
+        for pattern in ["\"", "\\\\", "/", "b", "f", "n", "r", "t"] {
+            let needle = format!("'{pattern}' => out.push(");
+            assert_eq!(
+                src.matches(&needle).count(),
+                1,
+                "the escape table must carry exactly one arm matching {needle:?} — JSON \
+                 defines eight two-character escapes and issue #539 was two of them missing"
+            );
+        }
+    }
+
     /// The two code points issue #539 fixed, each between its immediate
     /// neighbours — which come back through a DIFFERENT mechanism, so a
     /// build that special-cased U+0008 alone still fails here:
