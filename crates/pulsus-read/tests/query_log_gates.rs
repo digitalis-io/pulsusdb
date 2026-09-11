@@ -2439,7 +2439,14 @@ async fn a_pushed_parsed_name_filter_never_drops_a_row_the_evaluator_keeps() {
             "pattern" => pulsus_logql::ParserStage::Pattern(arg.to_string()),
             other => panic!("unknown parser {other}"),
         };
-        let fragment = if form == "numeric" {
+        let fragment = if form == "neq" {
+            pulsus_read::logql::predicate::parsed_string_filter(
+                name,
+                pulsus_logql::MatchOp::Neq,
+                value,
+                &parser,
+            )
+        } else if form == "numeric" {
             pulsus_read::logql::predicate::parsed_numeric_filter(
                 name,
                 pulsus_logql::CompareOp::Gte,

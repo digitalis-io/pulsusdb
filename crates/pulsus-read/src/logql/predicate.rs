@@ -706,17 +706,38 @@ pub fn parsed_string_filter(
     value: &str,
     parser: &ParserStage,
 ) -> Result<CheckedFragment, ParsedFilterRefusal> {
-    if !matches!(op, MatchOp::Eq) {
-        return Err(ParsedFilterRefusal::OperatorNotServed);
-    }
+    let cmp = match op {
+        MatchOp::Eq => "=",
+        MatchOp::Neq => "!=",
+        // The two regular-expression operators are not served, and the
+        // reason is not the SQL. Our label-filter regex semantics already
+        // differ from the reference at a width this plan records and has
+        // not repaired; pushing them down would bind that difference into
+        // a statement before anyone has decided about it.
+        MatchOp::Re | MatchOp::Nre => return Err(ParsedFilterRefusal::OperatorNotServed),
+    };
     if !name_is_renderable(name) {
         return Err(ParsedFilterRefusal::NameNotRenderable);
     }
     let guard = metadata_non_empty_guard();
     let guard = guard.as_sql();
     let Some(expr) = parsed_name_expr(name, parser) else {
-        // Route B. Unconditionally sound here: a capture is a literal
-        // slice of the line.
+        // Route B, and it serves `=` alone.
+        //
+        // **Rows `=` drops: none the evaluator keeps.** A capture is a
+        // literal slice of the line, so a kept row's bytes are in the
+        // body.
+        //
+        // **`!=` has no probe form and is refused.** The evaluator keeps a
+        // row whose capture differs from the value; `NOT (body LIKE
+        // '%v%')` drops every row holding the value ANYWHERE, including a
+        // row where it sits outside the capture and the capture differs.
+        // That is the forbidden direction, and no test on the value
+        // repairs it — a substring probe cannot say where in the line the
+        // bytes sat.
+        if matches!(op, MatchOp::Neq) {
+            return Err(ParsedFilterRefusal::OperatorNotServed);
+        }
         return Ok(CheckedFragment {
             sql: contains_predicate(value),
         });
@@ -729,7 +750,7 @@ pub fn parsed_string_filter(
     Ok(CheckedFragment {
         sql: match parser {
             ParserStage::Json { .. } => {
-                format!("(JSONType(body, {key}) != 'String' OR {expr} = {v} OR {guard})")
+                format!("(JSONType(body, {key}) != 'String' OR {expr} {cmp} {v} OR {guard})")
             }
             // Two extra alternatives, each for a case the comparison
             // alone would get wrong. The empty one is the sanitising
@@ -738,6 +759,17 @@ pub fn parsed_string_filter(
             // backslash one is the escaping case: a quoted logfmt value
             // may carry an escape that the two decoders resolve
             // differently, so any line holding one is kept whole.
+            //
+            // **The empty alternative belongs to `=` and must NOT be
+            // carried over to `!=`.** For `!=` it would keep a row whose
+            // value EQUALS the filter's — harmless — and drop one whose
+            // value is neither empty nor equal, which the evaluator
+            // keeps. Checked rather than mirrored: with the label
+            // `other`, `!= "error"`, the evaluator keeps and the reused
+            // form drops.
+            _ if matches!(op, MatchOp::Neq) => {
+                format!("({expr} != {v} OR position(body, '\\\\') > 0 OR {guard})")
+            }
             _ => format!("({expr} IN ('', {v}) OR position(body, '\\\\') > 0 OR {guard})"),
         },
     })
@@ -1156,10 +1188,10 @@ mod tests {
             "pattern" => format!(r#"| pattern "{}""#, w.arg),
             other => panic!("unknown parser {other}"),
         };
-        let filter = if w.form == "numeric" {
-            format!("| {} >= {}", w.name, w.value)
-        } else {
-            format!(r#"| {}="{}""#, w.name, w.value)
+        let filter = match w.form.as_str() {
+            "numeric" => format!("| {} >= {}", w.name, w.value),
+            "neq" => format!(r#"| {}!="{}""#, w.name, w.value),
+            _ => format!(r#"| {}="{}""#, w.name, w.value),
         };
         format!(r#"{{s="m"}} {stage} {filter}"#)
     }
@@ -1217,13 +1249,21 @@ mod tests {
             r"(JSONType(body, 'level') != 'String' OR JSONExtractString(body, 'level') = 'error' OR structured_metadata != '')"
         );
         assert_eq!(
-            parsed_string_filter("level", MatchOp::Eq, "error", &logfmt_parser())
+            parsed_string_filter("level", MatchOp::Neq, "error", &json_parser())
+                .expect("served")
+                .as_sql(),
+            r"(JSONType(body, 'level') != 'String' OR JSONExtractString(body, 'level') != 'error' OR structured_metadata != '')"
+        );
+        // The logfmt form BRANCHES on the operator: the empty alternative
+        // belongs to `=` and would drop a kept row under `!=`.
+        assert_eq!(
+            parsed_string_filter("level", MatchOp::Neq, "error", &logfmt_parser())
                 .expect("served")
                 .as_sql(),
             concat!(
                 r#"(extractKeyValuePairs(body, '=', ' \t\r\n', "#,
                 r#"'"'"#,
-                r#")['level'] IN ('', 'error') OR position(body, '\\') > 0 "#,
+                r#")['level'] != 'error' OR position(body, '\\') > 0 "#,
                 r#"OR structured_metadata != '')"#,
             )
         );
@@ -1291,8 +1331,11 @@ mod tests {
     fn a_parsed_name_filter_refuses_with_the_stated_reason() {
         let json = json_parser();
         let re = ParserStage::Regexp("(?P<a>.*)".to_string());
-        // Only `=` has a specified fragment on the string form.
-        for op in [MatchOp::Neq, MatchOp::Re, MatchOp::Nre] {
+        // The two regular-expression operators are not served, because
+        // our regex label-filter semantics already differ from the
+        // reference and pushing them down would bind that difference into
+        // a statement.
+        for op in [MatchOp::Re, MatchOp::Nre] {
             assert_eq!(
                 parsed_string_filter("level", op, "error", &json),
                 Err(ParsedFilterRefusal::OperatorNotServed),
@@ -1307,6 +1350,17 @@ mod tests {
         assert_eq!(
             parsed_numeric_filter("status_code", CompareOp::Gte, 500.0, &json),
             Err(ParsedFilterRefusal::AmbiguousName)
+        );
+        // The value probe serves `=` alone: for `!=` it would drop every
+        // row holding the value anywhere, including a row where it sits
+        // outside the capture and the capture differs.
+        assert_eq!(
+            parsed_string_filter("a", MatchOp::Neq, "v", &re),
+            Err(ParsedFilterRefusal::OperatorNotServed)
+        );
+        assert!(
+            parsed_string_filter("a", MatchOp::Eq, "v", &re).is_ok(),
+            "the control: the probe serves `=` on the same input"
         );
         // A capture has no key-precise expression, so the numeric form has
         // nothing to compare.

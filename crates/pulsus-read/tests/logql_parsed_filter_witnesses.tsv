@@ -15,7 +15,7 @@
 # executes the rendered fragment against the database over the same bodies
 # and asserts the one-directional rule.
 #
-# form   = string | numeric
+# form   = string | neq | numeric
 # parser = json | logfmt | regexp | pattern
 # arg    = the parser's argument, or `-`
 # keeps  = 1 when the pipeline emits the line, 0 when it drops it
@@ -42,3 +42,17 @@ numeric	json	-	status	500	{"status":"500"}	1
 numeric	json	-	status	500	{"status":"12abc"}	1
 numeric	json	-	status	500	{"msg":"x"}	0
 numeric	json	-	status	500	plain text, not json at all	0
+neq	json	-	level	error	{"msg":"x"}	1
+neq	json	-	level	error	plain text, not json at all	1
+neq	json	-	level	error	{"level":"error"}	0
+neq	json	-	level	error	{"level":"info"}	1
+neq	json	-	level	error	{"level":500}	1
+neq	json	-	level	error	{"level":{"a":1}}	1
+neq	json	-	level	error	{"level":["a"]}	1
+neq	json	-	level	error	{"level":"error"}junk	0
+neq	json	-	level	error	{"level":"\u0065rror"}	0
+neq	json	-	level		{"msg":"x"}	0
+neq	logfmt	-	level	error	msg=x	1
+neq	logfmt	-	level	error	level=error	0
+neq	logfmt	-	level	error	level=other	1
+neq	logfmt	-	level	error	level=""	1

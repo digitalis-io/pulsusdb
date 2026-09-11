@@ -4849,12 +4849,16 @@ mod tests {
         // conjunction, and an address filter.
         for q in [
             r#"{service_name="a"} | json | trace_id="x""#,
-            r#"{service_name="a"} | json | level!="error""#,
             r#"{service_name="a"} | json | level="error" and app="x""#,
             r#"{service_name="a"} | json | level=ip("10.0.0.0/8")"#,
         ] {
             assert_eq!(parsed_count(q), 0, "{q}");
         }
+        // `!=` is served on the key-precise route.
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} | json | level!="error""#),
+            1
+        );
         // A numeric comparison is served, with the threshold rendered as a
         // float literal from OUR unit parser's value.
         let sp = streams_sp(r#"{service_name="a"} | json | status >= 500"#);
