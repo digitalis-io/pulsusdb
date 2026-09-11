@@ -122,8 +122,8 @@ docs/query-lowering.md	plan.rs:3015	crates/pulsus-read/src/logql/plan.rs	3015		p
 docs/query-lowering.md	plan.rs:3060	crates/pulsus-read/src/logql/plan.rs	3060		prose	is_pushable_line_filter
 docs/query-lowering.md	plan.rs:3067	crates/pulsus-read/src/logql/plan.rs	3067		prose	LineFormat
 docs/query-lowering.md	plan.rs:3086	crates/pulsus-read/src/logql/plan.rs	3086		prose	is_pushable_line_filter
-docs/query-lowering.md	plan.rs:3206	crates/pulsus-read/src/logql/plan.rs	3206		prose	mod tests
-docs/query-lowering.md	plan.rs:3209	crates/pulsus-read/src/logql/plan.rs	3209		prose	use super::*
+docs/query-lowering.md	plan.rs:3338	crates/pulsus-read/src/logql/plan.rs	3338		prose	mod tests
+docs/query-lowering.md	plan.rs:3341	crates/pulsus-read/src/logql/plan.rs	3341		prose	use super::*
 docs/query-lowering.md	plan.rs:343-348	crates/pulsus-read/src/logql/plan.rs	343	348	prose	vector_aggs
 docs/query-lowering.md	post_agg.rs:3008-3011	crates/pulsus-read/src/logql/post_agg.rs	3008	3011	prose	.rev()
 docs/query-lowering.md	post_agg.rs:3307	crates/pulsus-read/src/logql/post_agg.rs	3307		prose	merge_matrix_collisions

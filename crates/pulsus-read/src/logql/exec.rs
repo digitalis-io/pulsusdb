@@ -15,7 +15,7 @@ use super::explain::PlanExplain;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, ResponseOptions, TimeBounds};
 use super::pipeline::CompiledPipeline;
 use super::plan::{self, ClientAgg, MetricNode, MetricPlan, Plan, StreamsPlan};
-use super::predicate::CheckedLiteral;
+use super::predicate::{CheckedFragment, CheckedLiteral};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow, MetricScanRow,
     PatternFetchRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
@@ -1188,7 +1188,7 @@ impl LogQlEngine {
                 start_ns: sp.start_ns,
                 end_ns: sp.end_ns,
             },
-            &sp.line_filters,
+            &stage3_predicates(sp, &meta),
             sp.direction,
             sp.scan_limit,
         );
@@ -1381,7 +1381,7 @@ impl LogQlEngine {
                 window,
                 ks_lower,
                 sp.direction,
-                &sp.line_filters,
+                &stage3_predicates(sp, meta),
                 st.page_size,
             );
 
@@ -1950,7 +1950,7 @@ impl LogQlEngine {
                 start_ns: sp.start_ns,
                 end_ns: sp.end_ns,
             },
-            &sp.line_filters,
+            &stage3_predicates(sp, &meta),
             sp.direction,
             sp.scan_limit,
         );
@@ -4872,6 +4872,57 @@ fn pop_value(vals: &mut Vec<QueryResult>) -> QueryResult {
     }
 }
 
+/// The third statement's predicate list: the plan's line filters, plus
+/// every parsed-name filter whose proviso holds over the streams this
+/// request actually resolved (issue #507, W3, arm 3).
+///
+/// **This is where a cell that is sound GIVEN NAMED STATE has its proviso
+/// checked.** A parsed-name fragment reads a key of the line, which is the
+/// label the evaluator resolved only while no selected stream carries a
+/// label of that name. Where one does, the stream label wins the collision
+/// and the line's key is renamed, so the fragment would compare the wrong
+/// value and drop a row the evaluator keeps.
+///
+/// It is checked HERE, and nowhere else, because a stream label is
+/// constant across every row the statement reads: no per-row predicate can
+/// test it, and it is not knowable before stage 2 resolves the label sets.
+/// The other half of the same hazard — a structured-metadata key of the
+/// same name — is per row, and the fragment's own whole-value guard tests
+/// it inside the statement. Two facts with two lifetimes, each checked in
+/// the one place it is knowable.
+///
+/// **Every call site has already run stage 2**, so the proviso costs no
+/// round trip, and EXPLAIN reports the statement execution issues because
+/// both go through here.
+///
+/// **Why the fragments are minted here rather than carried on the plan**,
+/// which is bookkeeping rather than design: forty-six design-record
+/// citations name a bare `plan.rs:<line>` and are FROZEN as unresolvable,
+/// because the basename matches several tracked files. A frozen row
+/// carries no file, so a field added to `StreamsPlan` would move lines
+/// those citations point at and no rule could repair them. The text is
+/// still produced by one function — `plan::compile_parsed_label_filters`,
+/// over the plan's own pipeline — so there is no second renderer.
+fn stage3_predicates(sp: &StreamsPlan, meta: &HashMap<u64, StreamMetaRow>) -> Vec<CheckedFragment> {
+    let mut out = sp.line_filters.clone();
+    let candidates = super::plan::compile_parsed_label_filters(&sp.pipeline);
+    if candidates.is_empty() {
+        return out;
+    }
+    let mut stream_label_names: BTreeSet<String> = BTreeSet::new();
+    for m in meta.values() {
+        for (k, _) in series_labels(m) {
+            stream_label_names.insert(k);
+        }
+    }
+    for pred in candidates {
+        if !stream_label_names.contains(&pred.name) {
+            out.push(pred.fragment);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::charge::{AggCaps, PUSHDOWN_INSTANT_SLOT, group_entry_bytes};
@@ -7488,6 +7539,84 @@ mod tests {
             DIVIDE_AFTER_BITS,
             "the reversed order is the other double, so the assertion above \
              is about the order and not about the arithmetic"
+        );
+    }
+
+    /// Issue #507, W3, arm 3 — **the proviso is checked, and a stream
+    /// label of the same name suppresses the fragment.**
+    ///
+    /// The parsed-name fragment reads a key of the line, which is the
+    /// label the evaluator resolved only while no selected stream carries
+    /// a label of that name. Measured through the shipped pipeline: over
+    /// `{"s":"linevalue","x":1}` with a stream label `s="streamvalue"`,
+    /// `| json` yields `s = streamvalue` and `s_extracted = linevalue` —
+    /// the stream label wins and the line's key is renamed — so a
+    /// fragment comparing `JSONExtractString(body,'s')` would drop a row
+    /// the evaluator keeps.
+    ///
+    /// The two halves of this test differ ONLY in whether a resolved
+    /// stream carries the name, so neither passes for another reason.
+    #[test]
+    fn a_stream_label_of_the_same_name_suppresses_the_parsed_fragment() {
+        let query = r#"{service_name="sm"} | json | lvl="error""#;
+        let expr = pulsus_logql::parse(query).expect("parse");
+        let params = QueryParams {
+            spec: QuerySpec::Instant {
+                at_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let ctx = PlanCtx {
+            db: "d",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1 << 30,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        };
+        let Plan::Streams(sp) = plan::plan(&expr, &params, &ctx).expect("plan") else {
+            panic!("expected a streams plan")
+        };
+        assert_eq!(
+            super::super::plan::compile_parsed_label_filters(&sp.pipeline).len(),
+            1,
+            "the control: this chain compiles a fragment at plan time"
+        );
+
+        // No resolved stream carries `lvl`, so the proviso holds.
+        let without = stage3_predicates(&sp, &sm_meta());
+        assert_eq!(
+            without.len(),
+            sp.line_filters.len() + 1,
+            "the fragment is included when no stream carries the name"
+        );
+        assert!(
+            without
+                .last()
+                .expect("a fragment")
+                .as_sql()
+                .contains("'lvl'")
+        );
+
+        // One resolved stream carries `lvl` as a label, so it does not.
+        let mut meta = sm_meta();
+        meta.insert(
+            3,
+            StreamMetaRow {
+                fingerprint: 3,
+                service: "sm".to_string(),
+                labels: r#"{"lvl":"warn","service_name":"sm"}"#.to_string(),
+            },
+        );
+        let with = stage3_predicates(&sp, &meta);
+        assert_eq!(
+            with.len(),
+            sp.line_filters.len(),
+            "one stream carrying the name is enough to suppress it"
         );
     }
 

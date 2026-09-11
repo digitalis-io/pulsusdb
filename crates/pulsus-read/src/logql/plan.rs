@@ -17,9 +17,9 @@ use std::ops::ControlFlow;
 
 use pulsus_logql::walk;
 use pulsus_logql::{
-    BinModifier, BinOp, Expr, Grouping, GroupingKind, LineFilter, LogExpr, LogRange, MatchOp,
-    Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VariantsExpr, VectorAggOp,
-    VectorMatching,
+    BinModifier, BinOp, Expr, Grouping, GroupingKind, LabelFilterExpr, LineFilter, LogExpr,
+    LogRange, MatchOp, Matcher, MetricExpr, ParserStage, RangeAggOp, Stage, StreamSelector,
+    VariantsExpr, VectorAggOp, VectorMatching,
 };
 
 use super::charge::AggCaps;
@@ -3186,6 +3186,138 @@ pub fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<MonthLiteral> {
     out
 }
 
+// ---------------------------------------------------------------------
+// Issue #507, W3, arm 3: the parsed-name label filter's compilation.
+//
+// Declared here, at the end of the module, rather than beside
+// `compile_line_filters` which it sits alongside logically. Forty-six
+// design-record citations name a bare `plan.rs:<line>` and are FROZEN as
+// unresolvable, because the basename matches several tracked files; a
+// frozen row carries no file, so if one of them means this file its line
+// number cannot be repaired when the file shifts. Every citation into this
+// module is above this point, so declaring the three items here moves
+// none of them.
+// ---------------------------------------------------------------------
+
+/// A pushed-down predicate whose soundness is conditional on state the
+/// planner cannot see (issue #507, W3).
+///
+/// A parsed-name filter's fragment reads a key of the line. That is the
+/// label the evaluator resolved **provided no selected stream carries a
+/// label of the same name** — where one does, the stream label wins the
+/// collision and the line's key is renamed, so the fragment would compare
+/// the wrong value and drop a row the evaluator keeps.
+///
+/// A stream label is constant across every row the statement reads, so no
+/// per-row predicate can test the proviso; it is knowable exactly once,
+/// after stage 2 resolves the label sets. The other half of the same
+/// hazard — a structured-metadata key of the same name — is per row, and
+/// the fragment's own whole-value guard tests it inside the statement.
+/// Two facts with two lifetimes, each checked where it is knowable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisoPredicate {
+    /// The label name the fragment reads.
+    pub(crate) name: String,
+    pub(crate) fragment: CheckedFragment,
+}
+
+/// Compiles the parsed-name label filters of `pipeline` into fragments for
+/// the third statement (issue #507, W3, arm 3).
+///
+/// # The chain shape this serves
+///
+/// ```text
+/// {selector} <line filters> | <one parser> | <name> = "v"
+///                                          | <name> <cmp> <number>
+/// ```
+///
+/// **Two independent conditions stop the walk, and neither implies the
+/// other:**
+///
+/// * a **line-rewriting** stage — `| line_format`, `| decolorize`,
+///   `| unpack` — ends it, because a filter after one reads rewritten text
+///   that no expression over the stored line reproduces. Same rule and
+///   same reason as [`compile_line_filters`]' own `break`;
+/// * a **parser-ordering** rule: the name must come from a parser that has
+///   run, and from exactly one. With no parser the name is a stream label
+///   or a metadata key, neither of which the fragment reads; with two, the
+///   name could come from either and the fragment reads only one.
+///
+/// A stage that renames or removes a label — `| label_format`, `| drop`,
+/// `| keep` — also ends the walk, because the name stops meaning what the
+/// parser gave it.
+///
+/// # Rows it drops
+///
+/// **None the evaluator keeps, provided no selected stream carries the
+/// name as a label.** That proviso travels on [`ProvisoPredicate`] and is
+/// checked by `exec`'s `stage3_predicates`, immediately after stage 2.
+/// Everything else is inside the fragment — see
+/// [`super::predicate::parsed_string_filter`].
+pub(crate) fn compile_parsed_label_filters(pipeline: &[Stage]) -> Vec<ProvisoPredicate> {
+    let mut parser: Option<&ParserStage> = None;
+    let mut out = Vec::new();
+    for stage in pipeline {
+        match stage {
+            Stage::LineFilter(_) => {}
+            Stage::Parser(p) => {
+                if parser.is_some() {
+                    // A second parser: a later name could come from
+                    // either, and a fragment reads only one.
+                    return out;
+                }
+                parser = Some(p);
+            }
+            Stage::LabelFilter(expr) => {
+                let Some(p) = parser else { return out };
+                // A filter this cell cannot serve still RUNS in the
+                // evaluator, and it rewrites nothing and renames nothing,
+                // so the walk continues past it.
+                if let Some(pred) = compile_one_parsed_filter(expr, p) {
+                    out.push(pred);
+                }
+            }
+            // A line rewrite, or a stage that renames or removes a label.
+            _ => return out,
+        }
+    }
+    out
+}
+
+/// One label-filter leaf, or `None` when this cell does not serve it.
+///
+/// A conjunction or a disjunction is refused: each leaf would carry its
+/// own proviso, and one fragment carries one name.
+fn compile_one_parsed_filter(
+    expr: &LabelFilterExpr,
+    parser: &ParserStage,
+) -> Option<ProvisoPredicate> {
+    match expr {
+        LabelFilterExpr::Match(m) => {
+            super::predicate::parsed_string_filter(&m.name, m.op, &m.value, parser)
+                .ok()
+                .map(|fragment| ProvisoPredicate {
+                    name: m.name.clone(),
+                    fragment,
+                })
+        }
+        LabelFilterExpr::Compare { name, op, rhs } => {
+            // The threshold is the `f64` OUR unit parser produced, never a
+            // re-parse of the literal's text: a duration or size suffix is
+            // interpreted by that parser and the database has no
+            // equivalent function.
+            let threshold = super::pipeline::numeric_literal_value(rhs)?;
+            super::predicate::parsed_numeric_filter(name, *op, threshold, parser)
+                .ok()
+                .map(|fragment| ProvisoPredicate {
+                    name: name.clone(),
+                    fragment,
+                })
+        }
+        LabelFilterExpr::Ip { .. } | LabelFilterExpr::And(_, _) | LabelFilterExpr::Or(_, _) => None,
+    }
+}
+
 // NOTE: the file is a `plan_`-prefixed sibling, not `plan/drop_order.rs`.
 // A `plan/` directory is swallowed by a common global gitignore rule, so
 // the source would never be committed.
@@ -4620,6 +4752,129 @@ mod tests {
             Plan::Streams(sp) => sp,
             Plan::Metric(_) | Plan::MetricBinary(_) => panic!("expected a Streams plan"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #507, W3, arm 3: which chains compile a parsed-name filter.
+    // -----------------------------------------------------------------
+
+    /// The number of parsed-name fragments `query`'s pipeline compiles.
+    fn parsed_count(query: &str) -> usize {
+        let sp = streams_sp(query);
+        compile_parsed_label_filters(&sp.pipeline).len()
+    }
+
+    /// Issue #507, W3 — **a line-rewriting stage ends the walk, and this
+    /// is one of two independent conditions.**
+    ///
+    /// A filter after `| line_format`, `| decolorize` or `| unpack` reads
+    /// rewritten text, which no expression over the stored line
+    /// reproduces. The control above each row is the same chain without
+    /// the rewrite, so a row cannot pass because the filter was refused
+    /// for some other reason.
+    ///
+    /// **Its break:** delete the line-rewriting arm from
+    /// `compile_parsed_label_filters` and keep the parser rule — this
+    /// reddens and `a_filter_with_no_parser_before_it_does_not_compile`
+    /// stays green. That pair is what shows the two conditions are
+    /// independent.
+    #[test]
+    fn a_filter_after_a_line_rewrite_does_not_compile() {
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} | json | level="error""#),
+            1,
+            "the control: with no rewrite between them, the filter compiles"
+        );
+        for rewrite in [r#"| line_format "{{.msg}}""#, "| decolorize", "| unpack"] {
+            let q = format!(r#"{{service_name="a"}} | json {rewrite} | level="error""#);
+            assert_eq!(parsed_count(&q), 0, "{q}");
+        }
+    }
+
+    /// Issue #507, W3 — **the name must come from a parser, and from
+    /// exactly one, and this is the other of the two conditions.**
+    ///
+    /// With no parser the name is a stream label or a
+    /// structured-metadata key, neither of which the fragment reads. With
+    /// two, the name could come from either and the fragment reads only
+    /// one.
+    ///
+    /// **Its break:** delete the parser rule and keep the line-rewriting
+    /// arm — this reddens and
+    /// `a_filter_after_a_line_rewrite_does_not_compile` stays green.
+    #[test]
+    fn a_filter_with_no_parser_before_it_does_not_compile() {
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} | json | level="error""#),
+            1,
+            "the control: one parser before the filter compiles it"
+        );
+        assert_eq!(parsed_count(r#"{service_name="a"} | level="error""#), 0);
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} |= "x" | level="error""#),
+            0,
+            "a line filter is not a parser"
+        );
+        assert_eq!(
+            parsed_count(r#"{service_name="a"} | json | logfmt | level="error""#),
+            0,
+            "two parsers: the name could come from either"
+        );
+    }
+
+    /// Issue #507, W3 — a stage that renames or removes a label ends the
+    /// walk, because the name stops meaning what the parser gave it.
+    #[test]
+    fn a_filter_after_a_rename_or_a_drop_does_not_compile() {
+        for stage in ["| label_format lvl=level", "| drop level", "| keep level"] {
+            let q = format!(r#"{{service_name="a"}} | json {stage} | level="error""#);
+            assert_eq!(parsed_count(&q), 0, "{q}");
+        }
+    }
+
+    /// Issue #507, W3 — what the compiled fragment is, and the filters
+    /// the cell does not serve, which fall through and run in the
+    /// evaluator exactly as they do today.
+    #[test]
+    fn a_compiled_parsed_filter_carries_its_name_and_its_fragment() {
+        let sp = streams_sp(r#"{service_name="a"} | json | level="error""#);
+        let got = compile_parsed_label_filters(&sp.pipeline);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "level");
+        assert_eq!(
+            got[0].fragment.as_sql(),
+            r"(JSONType(body, 'level') != 'String' OR JSONExtractString(body, 'level') = 'error' OR structured_metadata != '')"
+        );
+        // Unserved shapes: an ambiguous name, an operator with no cell, a
+        // conjunction, and an address filter.
+        for q in [
+            r#"{service_name="a"} | json | trace_id="x""#,
+            r#"{service_name="a"} | json | level!="error""#,
+            r#"{service_name="a"} | json | level="error" and app="x""#,
+            r#"{service_name="a"} | json | level=ip("10.0.0.0/8")"#,
+        ] {
+            assert_eq!(parsed_count(q), 0, "{q}");
+        }
+        // A numeric comparison is served, with the threshold rendered as a
+        // float literal from OUR unit parser's value.
+        let sp = streams_sp(r#"{service_name="a"} | json | status >= 500"#);
+        let got = compile_parsed_label_filters(&sp.pipeline);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].fragment.as_sql().contains(">= 500.0 OR"),
+            "{}",
+            got[0].fragment.as_sql()
+        );
+        // A duration literal is converted by our unit parser, not by
+        // re-reading the text: `250ms` is 0.25 seconds.
+        let sp = streams_sp(r#"{service_name="a"} | json | took > 250ms"#);
+        let got = compile_parsed_label_filters(&sp.pipeline);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].fragment.as_sql().contains("> 0.25 OR"),
+            "{}",
+            got[0].fragment.as_sql()
+        );
     }
 
     // --- AC9(i), issue M6-09: scan_limit oversample eligibility. ---

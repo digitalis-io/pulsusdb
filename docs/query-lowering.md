@@ -1641,7 +1641,7 @@ maps to **`400`** with `Content-Type: text/plain; charset=utf-8` and `X-Content-
 
 **How this table is derived, because the previous one was transcribed and missed two rejections a
 user can reach today.** The enumeration is over a literal scope: **every `ReadError::` construction
-in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:3206`)**, which is 25 sites at
+in `crates/pulsus-read/src/logql/plan.rs` above `mod tests` (`plan.rs:3338`)**, which is 25 sites at
 `2f78c53`, listed by `grep -n 'ReadError::[A-Z]' crates/pulsus-read/src/logql/plan.rs`. Every one of
 the 25 is either a row below or is excluded beneath the table with its reason, so completeness is a
 property of that grep and not of anyone's reading. Each row's body **and its reachability** were
@@ -4890,9 +4890,9 @@ measured. None of them exists at base.
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
 (`crates/pulsus-read/src/logql/plan.rs:3052`) and `has_unpushed_dropping_stage` (`:1655`) and
 `metric_pipeline_construct` (`:1680`) are private — an integration test cannot call any of them.
-**They go in `plan.rs`'s existing `mod tests` (`plan.rs:3206`), and no production item is widened
+**They go in `plan.rs`'s existing `mod tests` (`plan.rs:3338`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
-directly, and again through its `use super::*` (`plan.rs:3209`). An earlier version of this section
+directly, and again through its `use super::*` (`plan.rs:3341`). An earlier version of this section
 offered a second option — **wave 1** writes them wherever they go — moving the gates to
 `logql::compile`'s test module with the two functions raised to `pub(super)`. That option is **withdrawn**: the widening was never needed, and a design
 that offers two placements has not decided.
