@@ -1018,6 +1018,93 @@ pub fn metric_raw_samples_sliding(
     sql
 }
 
+/// The scan bounds and the emit grid one bucketed range read is rendered
+/// from (issue #507, W2), grouped into one parameter for the same reason
+/// [`TimeWindow`] is.
+///
+/// `lo_ns` is `grid_start_ns - step_ns` — the plan's start-anchored emit
+/// grid, one step below its first point — and **not** `window.start_ns`,
+/// which is the scan start and has been widened backwards by the range
+/// selector's duration. They are equal only when the range equals the
+/// step.
+#[derive(Debug, Clone, Copy)]
+pub struct BucketedScan {
+    pub window: TimeWindow,
+    pub lower: ScanLowerBound,
+    pub lo_ns: i64,
+    pub step_ns: i64,
+}
+
+/// The bucketed range metric read (issue #507, W2): one row per
+/// `(fingerprint, grid point, structured_metadata)` instead of one row per
+/// log line.
+///
+/// **What it is for.** A range aggregation over a counting reducer is a
+/// per-window count, and the database can count. Today every range query
+/// reads every matching line across the metered hop and counts them in our
+/// process; this returns the counts.
+///
+/// **Why the grid column is not the shipped one.** [`metric_range`] buckets
+/// with `intDiv(<col>, step) * step`, a floor onto a grid anchored at the
+/// epoch. The reference's window is `(g - range, g]` on a grid anchored at
+/// the query's start, which is a ceiling onto that grid — see
+/// [`super::predicate::bucket_expr`], which mints the expression and holds
+/// the reason. `metric_range` is untouched: it has no production caller,
+/// and its rollup half buckets an already-bucketed column, which is a
+/// different question nobody has answered.
+///
+/// **`structured_metadata` is carried unconditionally**, in the `SELECT`
+/// list and the `GROUP BY`, in the trailing position [`metric_instant`]
+/// puts it in. It is part of the output series identity even when no error
+/// is involved — two entries of one stream differing only in a metadata
+/// value are two series, and dropping the column would merge them into one
+/// of twice the value. **No expression here interprets the column**: it is
+/// named and grouped, never read into, and the one reader decides what it
+/// means after the rows arrive.
+///
+/// **Raw source only.** The rollup table has no `structured_metadata`
+/// column at all, so a rollup shape cannot reach this builder with the
+/// projection it needs. The `bucket_col` the grid is computed over is the
+/// shape's own, so the `WHERE` bound and the grid always name one column.
+pub fn metric_range_bucketed(
+    source: MetricSource<'_>,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+    scan: BucketedScan,
+    extra_predicates: &[CheckedFragment],
+    projection: ScanProjection,
+) -> Result<String, super::predicate::BucketGridRefusal> {
+    let MetricSource { table, shape } = source;
+    let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
+    let BucketedScan {
+        window,
+        lower,
+        lo_ns,
+        step_ns,
+    } = scan;
+    let TimeWindow { start_ns, end_ns } = window;
+    let bucket = super::predicate::bucket_expr(bucket_col, lo_ns, step_ns, start_ns, end_ns)?;
+    let fp_list = fp_list(fingerprints);
+    let lower_op = lower.sql_op();
+    let prewhere = metric_prewhere(services);
+    let sm = projection.column_suffix();
+    let bucket_sql = bucket.as_sql();
+    let mut sql = format!(
+        "SELECT fingerprint, {bucket_sql} AS step, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+    );
+    for clause in extra_predicates {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause.as_sql());
+    }
+    sql.push_str(match projection {
+        ScanProjection::Lean => "\nGROUP BY fingerprint, step",
+        ScanProjection::WithStructuredMetadata => {
+            "\nGROUP BY fingerprint, step, structured_metadata"
+        }
+    });
+    Ok(sql)
+}
+
 /// Renders the metric-read `PREWHERE service ...\n` line, or an empty
 /// string when `services` is empty (the rollup path — no `service` column
 /// to filter on).
@@ -2205,6 +2292,21 @@ mod tests {
         ),
     ];
 
+    /// The emit grid and scan bounds every bucketed statement below is
+    /// rendered from: a one-minute step on a grid whose first point is
+    /// `1700000000000000000`, so `lo_ns` is one step below it, and a scan
+    /// start that equals `lo_ns` because this fixture's range equals its
+    /// step.
+    const BUCKETED_SCAN: BucketedScan = BucketedScan {
+        window: TimeWindow {
+            start_ns: 1_699_999_940_000_000_000,
+            end_ns: 1_700_003_600_000_000_000,
+        },
+        lower: ScanLowerBound::Exclusive,
+        lo_ns: 1_699_999_940_000_000_000,
+        step_ns: 60_000_000_000,
+    };
+
     /// One statement of [`W0_STATEMENTS`], joined back into the text the
     /// builder produces.
     fn w0_expected(index: usize) -> String {
@@ -2223,6 +2325,7 @@ mod tests {
     struct W0Fixtures {
         fingerprints: Vec<u64>,
         window: TimeWindow,
+        no_service: Vec<CheckedLiteral>,
         one_service: Vec<CheckedLiteral>,
         three_services: Vec<CheckedLiteral>,
         no_predicate: Vec<CheckedFragment>,
@@ -2250,6 +2353,7 @@ mod tests {
                     start_ns: 1_782_906_900_000_000_000,
                     end_ns: 1_782_928_800_000_000_000,
                 },
+                no_service: Vec::new(),
                 one_service: vec![literal("checkout")],
                 three_services: vec![literal("checkout"), literal("edge"), literal("ipcase")],
                 no_predicate: Vec::new(),
@@ -2384,5 +2488,328 @@ mod tests {
         }
         assert_eq!(rendered.len(), 4);
         assert_w0_block(&rendered, 32);
+    }
+
+    // -----------------------------------------------------------------
+    // W2 (issue #507): the bucketed range read, frozen byte for byte, and
+    // the three ways its grid can refuse.
+    //
+    // The statement in row 1 is the one the plan prints. Nothing else in
+    // the crate renders this text, so these assertions pin a decision
+    // rather than confirming one — the decision being that the grid is an
+    // anchored ceiling and not the epoch-anchored floor the shipped range
+    // renderer emits. What confirms it is
+    // `the_anchored_bucket_expression_is_the_grid_the_window_implies` on
+    // the live leg, which executes the expression.
+    // -----------------------------------------------------------------
+
+    /// The eleven statements W2's bucketed builder freezes, in the order
+    /// the test below enumerates them.
+    #[allow(clippy::type_complexity)]
+    const BUCKETED_STATEMENTS: [(&str, &[&str]); 11] = [
+        (
+            "Lean RawCount Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step",
+            ],
+        ),
+        (
+            "Lean RawCount Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step",
+            ],
+        ),
+        (
+            "Lean RawBytes Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, sum(length(body)) AS n",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step",
+            ],
+        ),
+        (
+            "Lean RawBytes Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, sum(length(body)) AS n",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawBytes Exclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, sum(length(body)) AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawBytes Inclusive 1svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, sum(length(body)) AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Exclusive 3svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Exclusive 1svc 1pred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"PREWHERE service = 'checkout'",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"  AND body LIKE '%CONN\\_REFUSED%'",
+                r"GROUP BY fingerprint, step, structured_metadata",
+            ],
+        ),
+        (
+            "WithStructuredMetadata RawCount Exclusive 0svc nopred",
+            &[
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"FROM log_samples",
+                r"WHERE fingerprint IN (18374, 99120)",
+                r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
+                r"GROUP BY fingerprint, step, structured_metadata",
+            ],
+        ),
+    ];
+
+    /// W2 (issue #507): the bucketed builder is byte-exact over its
+    /// projection, its reducer shape, its scan lower bound, its service
+    /// count — including the empty list, which renders no `PREWHERE` line
+    /// at all — and the presence of an extra predicate.
+    ///
+    /// **Not enumerated**, so the test is not read as exhaustive: the
+    /// fingerprint list, the table name, the window, the grid, more than
+    /// one extra predicate, and the two rollup shapes, which cannot reach
+    /// this builder because the rollup table has no `structured_metadata`
+    /// column.
+    #[test]
+    fn metric_range_bucketed_is_byte_exact_over_projection_shape_bound_services_and_predicate() {
+        let f = W0Fixtures::new();
+        let mut rendered: Vec<String> = Vec::new();
+        for projection in [ScanProjection::Lean, ScanProjection::WithStructuredMetadata] {
+            for shape in [MetricShape::RawCount, MetricShape::RawBytes] {
+                for lower in [ScanLowerBound::Exclusive, ScanLowerBound::Inclusive] {
+                    let mut scan = BUCKETED_SCAN;
+                    scan.lower = lower;
+                    rendered.push(
+                        metric_range_bucketed(
+                            MetricSource::new("log_samples", shape),
+                            &f.one_service,
+                            &f.fingerprints,
+                            scan,
+                            &f.no_predicate,
+                            projection,
+                        )
+                        .expect("a renderable grid"),
+                    );
+                }
+            }
+        }
+        for (services, predicates) in [
+            (&f.three_services, &f.no_predicate),
+            (&f.one_service, &f.one_predicate),
+            (&f.no_service, &f.no_predicate),
+        ] {
+            rendered.push(
+                metric_range_bucketed(
+                    MetricSource::new("log_samples", MetricShape::RawCount),
+                    services,
+                    &f.fingerprints,
+                    BUCKETED_SCAN,
+                    predicates,
+                    ScanProjection::WithStructuredMetadata,
+                )
+                .expect("a renderable grid"),
+            );
+        }
+        assert_eq!(rendered.len(), BUCKETED_STATEMENTS.len());
+        for (i, sql) in rendered.iter().enumerate() {
+            let (label, lines) = BUCKETED_STATEMENTS[i];
+            assert_eq!(
+                *sql,
+                lines.join("\n"),
+                "bucketed statement {} ({label}) is not the frozen text",
+                i + 1
+            );
+        }
+        // The eleven differ from one another, so no row proves nothing by
+        // being a duplicate of its neighbour.
+        let mut seen: Vec<&String> = rendered.iter().collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), rendered.len(), "two rows render the same text");
+    }
+
+    /// W2 (issue #507): the grid anchor is the emit grid's, never the
+    /// scan's own start.
+    ///
+    /// The two coincide exactly when the range equals the step, which is
+    /// the case that would make a wrong implementation look right. Here
+    /// the range is half the step, so the widened scan start sits half a
+    /// step above `lo_ns` and the two anchors render different text.
+    #[test]
+    fn the_bucket_anchor_is_the_emit_grid_not_the_widened_scan_start() {
+        let f = W0Fixtures::new();
+        let grid_start_ns = 1_700_000_000_000_000_000i64;
+        let step_ns = 60_000_000_000i64;
+        let range_ns = 30_000_000_000i64;
+        let lo_ns = grid_start_ns - step_ns;
+        let scan_start_ns = grid_start_ns - range_ns;
+        assert_ne!(lo_ns, scan_start_ns, "the fixture must separate the two");
+
+        let render = |lo: i64| {
+            metric_range_bucketed(
+                MetricSource::new("log_samples", MetricShape::RawCount),
+                &f.one_service,
+                &f.fingerprints,
+                BucketedScan {
+                    window: TimeWindow {
+                        start_ns: scan_start_ns,
+                        end_ns: 1_700_003_600_000_000_000,
+                    },
+                    lower: ScanLowerBound::Exclusive,
+                    lo_ns: lo,
+                    step_ns,
+                },
+                &f.no_predicate,
+                ScanProjection::WithStructuredMetadata,
+            )
+            .expect("a renderable grid")
+        };
+        assert!(
+            render(lo_ns).contains(
+                "1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 \
+                 - 1, 60000000000) * 60000000000"
+            ),
+            "the emit grid's anchor is `grid_start_ns - step_ns`"
+        );
+        assert_ne!(
+            render(lo_ns),
+            render(scan_start_ns),
+            "anchoring on the scan start must render different text, or this test cannot see \
+             the substitution it exists to catch"
+        );
+    }
+
+    /// W2 (issue #507): the three ways an anchored grid refuses, each with
+    /// its own input.
+    ///
+    /// None of them is a client error — the query is valid and the link
+    /// stays residual, so the evaluator answers as it does today.
+    #[test]
+    fn an_unrenderable_bucket_grid_refuses_rather_than_wrapping() {
+        use crate::logql::predicate::BucketGridRefusal;
+        let f = W0Fixtures::new();
+        let render = |lo_ns: i64, step_ns: i64, start_ns: i64, end_ns: i64| {
+            metric_range_bucketed(
+                MetricSource::new("log_samples", MetricShape::RawCount),
+                &f.one_service,
+                &f.fingerprints,
+                BucketedScan {
+                    window: TimeWindow { start_ns, end_ns },
+                    lower: ScanLowerBound::Exclusive,
+                    lo_ns,
+                    step_ns,
+                },
+                &f.no_predicate,
+                ScanProjection::WithStructuredMetadata,
+            )
+        };
+        // A zero or negative step has no grid points.
+        for step in [0i64, -1] {
+            assert_eq!(
+                render(0, step, 0, 1_000),
+                Err(BucketGridRefusal::StepNotPositive),
+                "step {step}"
+            );
+        }
+        // An anchor above the scan start: `intDiv` truncates toward zero,
+        // which is a floor only for a non-negative numerator, so a row
+        // below the anchor would bucket upward.
+        assert_eq!(
+            render(1_000, 60, 999, 10_000),
+            Err(BucketGridRefusal::AnchorAboveScanStart)
+        );
+        // The plan's own overflow input.
+        assert_eq!(
+            render(i64::MAX - 1, 60_000_000_000, 0, 1_700_000_000_000_000_000),
+            Err(BucketGridRefusal::AnchorAboveScanStart),
+            "an anchor at the top of the axis is refused before any arithmetic is attempted"
+        );
+        // Genuine overflow: the widest numerator the statement can
+        // evaluate is not representable.
+        assert_eq!(
+            render(i64::MIN, 60_000_000_000, i64::MIN, i64::MAX),
+            Err(BucketGridRefusal::WouldOverflow)
+        );
+        // And the control: an ordinary grid renders.
+        assert!(
+            render(
+                1_699_999_940_000_000_000,
+                60_000_000_000,
+                1_699_999_940_000_000_000,
+                1_700_003_600_000_000_000
+            )
+            .is_ok(),
+            "the refusals must not be reachable from an ordinary grid"
+        );
     }
 }

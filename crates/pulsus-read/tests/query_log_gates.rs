@@ -2275,3 +2275,107 @@ fn unnarrowed_values_request() -> pulsus_read::TagValuesRequest<'static> {
         end_ns: 1_700_003_600_000_000_000,
     }
 }
+
+// ---------------------------------------------------------------------
+// W2 (issue #507): the anchored bucket expression, executed.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct BucketRow {
+    label: String,
+    t: i64,
+    got: i64,
+    expected: i64,
+}
+
+/// **The grid the reference's window implies, computed by the database
+/// from the expression this repository renders** (issue #507, W2).
+///
+/// The window for grid point `g` is `(g - range, g]` on a grid anchored at
+/// the query's start, so a sample belongs to the SMALLEST grid point at or
+/// above it — a ceiling. The shipped range renderer instead floors onto a
+/// grid anchored at the epoch. The two are not spellings of one function:
+/// with a grid start that is not a multiple of the step, the floor form's
+/// output is not a grid point at all.
+///
+/// Six inputs, four of which are the four boundary pairs the design states
+/// and two of which extend them past the next grid point. The expression
+/// under test comes from `predicate::bucket_expr` — the renderer, not a
+/// retyped copy — so a change to the renderer moves this test.
+///
+/// **What makes it discriminating.** The floor form's answer for each input
+/// is computed alongside and asserted to DIFFER at every row, so the test
+/// cannot pass against the expression it exists to reject. That check
+/// matters more than usual here: the only other exercise of the shipped
+/// range renderer puts the same expression on both sides of a comparison,
+/// and a differential between two paths that share a defect cannot see it.
+#[tokio::test]
+async fn the_anchored_bucket_expression_is_the_grid_the_window_implies() {
+    skip_unless_live!();
+    // No corpus and no run database: the expression is evaluated over a
+    // literal row set, so there is nothing to seed and nothing to drop.
+    let client = ChClient::new(test_config()).await.expect("connect");
+
+    const G: i64 = 1_700_000_000_000_000_000;
+    const STEP: i64 = 60_000_000_000;
+    let lo = G - STEP;
+
+    // The renderer's own text, minted through the sealed fragment.
+    let bucket =
+        pulsus_read::logql::predicate::bucket_expr("timestamp_ns", lo, STEP, lo, G + 10 * STEP)
+            .expect("a renderable grid");
+
+    let cases: [(&str, i64, i64); 6] = [
+        ("G - 59.999999999s", G - 59_999_999_999, G),
+        ("G", G, G),
+        ("G + 1ns", G + 1, G + STEP),
+        ("G + 30s", G + 30_000_000_000, G + STEP),
+        ("G + 60s", G + STEP, G + STEP),
+        ("G + 60s + 1ns", G + STEP + 1, G + 2 * STEP),
+    ];
+    let rows_sql = cases
+        .iter()
+        .map(|(label, t, expected)| {
+            format!("SELECT '{label}' AS label, {t}::Int64 AS timestamp_ns, {expected}::Int64 AS expected")
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let sql = format!(
+        "SELECT label, timestamp_ns AS t, ({}) AS got, expected FROM ({rows_sql}) ORDER BY t ASC",
+        bucket.as_sql()
+    );
+
+    let mut stream = client
+        .query_stream::<BucketRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("execute the bucket expression");
+    let mut got = Vec::new();
+    while let Some(row) = stream.next().await {
+        got.push(row.expect("decode a bucket row"));
+    }
+    assert_eq!(got.len(), cases.len(), "one row per input: {got:?}");
+
+    for row in &got {
+        assert_eq!(
+            row.got, row.expected,
+            "`{}` at {} must bucket to {}, got {}",
+            row.label, row.t, row.expected, row.got
+        );
+        // The grid point is on the query's grid, which the floor form's
+        // answer need not be.
+        assert_eq!(
+            (row.got - G).rem_euclid(STEP),
+            0,
+            "`{}` must bucket to a point of the query's own grid",
+            row.label
+        );
+        // The expression this replaces gives a different answer here, so a
+        // build that kept it fails this test rather than passing it.
+        let floored = row.t.div_euclid(STEP) * STEP;
+        assert_ne!(
+            floored, row.got,
+            "`{}`: the epoch-anchored floor must not agree, or this test cannot reject it",
+            row.label
+        );
+    }
+}

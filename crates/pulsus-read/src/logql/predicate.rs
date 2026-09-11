@@ -523,6 +523,91 @@ pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError> {
     })
 }
 
+/// Why an anchored bucket grid cannot be rendered (issue #507, W2).
+///
+/// **Not a [`PipelineError`].** Every one of these means the query is
+/// valid and the range aggregation does not lower here, so the link stays
+/// residual and the evaluator answers exactly as it does today. A
+/// `PipelineError` would surface as a 400 for a query nothing is wrong
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketGridRefusal {
+    /// `step_ns` is zero or negative, so the grid has no points.
+    StepNotPositive,
+    /// The anchor does not sit at or below the first row the statement can
+    /// admit. `intDiv` truncates toward zero, which is a floor only for a
+    /// non-negative numerator, so an anchor above the scan start would
+    /// bucket the early rows upward instead of downward.
+    AnchorAboveScanStart,
+    /// The worst-case arithmetic is not representable in `Int64`.
+    WouldOverflow,
+}
+
+/// The anchored bucket expression: the grid point a row belongs to under a
+/// window that is **open below and closed above**.
+///
+/// ```text
+/// <lo> + intDiv(<col> - <lo> + <step> - 1, <step>) * <step>
+/// ```
+///
+/// **`lo` is `grid_start_ns - step_ns` and never the scan's own start.**
+/// The scan start is widened backwards by the range selector's duration
+/// (`plan.rs`'s `widen_scan_start`) so the first grid point's window is
+/// complete; using it as the anchor would shift the whole grid by one
+/// range. The two coincide exactly when the range equals the step, which
+/// is the case that would make a wrong implementation look right.
+///
+/// **Why a ceiling and not the floor the shipped range renderer uses.**
+/// The window for grid point `g` is `(g - range, g]`, on a grid anchored
+/// at the query's start. A floor onto a grid anchored at the epoch is a
+/// different function: it is closed below rather than above, and its
+/// output is a multiple of the step rather than a point of the query's
+/// grid. The two agree only when the grid start happens to be a multiple
+/// of the step, and then only at the grid points themselves.
+///
+/// `bucket_col` is a `&'static str` and its only callers pass
+/// [`super::sql::MetricShape::bucket_col`], which returns one of two
+/// literals — no caller text can reach it.
+///
+/// # Refusals
+///
+/// Three, each with its own reason and none of them a client error. The
+/// overflow bound is taken over the newest row the statement can admit,
+/// which is the same `scan_end_ns` the statement's own `WHERE` enforces —
+/// so "this statement's arithmetic cannot wrap" is a property of the pair,
+/// not of the expression alone.
+pub fn bucket_expr(
+    bucket_col: &'static str,
+    lo_ns: i64,
+    step_ns: i64,
+    scan_start_ns: i64,
+    scan_end_ns: i64,
+) -> Result<CheckedFragment, BucketGridRefusal> {
+    if step_ns <= 0 {
+        return Err(BucketGridRefusal::StepNotPositive);
+    }
+    if lo_ns > scan_start_ns {
+        return Err(BucketGridRefusal::AnchorAboveScanStart);
+    }
+    // The widest numerator the statement can evaluate, and the grid point
+    // it produces. Both checked: a wrapped bucket is a silently wrong
+    // answer, where a refusal is today's behaviour.
+    let numerator = scan_end_ns
+        .checked_sub(lo_ns)
+        .and_then(|d| d.checked_add(step_ns))
+        .and_then(|d| d.checked_sub(1))
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    (numerator / step_ns)
+        .checked_mul(step_ns)
+        .and_then(|t| lo_ns.checked_add(t))
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    Ok(CheckedFragment {
+        sql: format!(
+            "{lo_ns} + intDiv({bucket_col} - {lo_ns} + {step_ns} - 1, {step_ns}) * {step_ns}"
+        ),
+    })
+}
+
 /// `countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, '<UUID_RE>'))` —
 /// `/detected_labels`' non-ID-value aggregate. **Takes no argument**, so no
 /// user string can enter it; [`UUID_RE`] is a module constant.

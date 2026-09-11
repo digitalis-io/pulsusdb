@@ -2335,6 +2335,16 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub fn index_neq_branch(key: &str, value: &str) -> CheckedFragment",
     "pub fn index_nre_branch(key: &str, pattern: &str) -> Result<CheckedFragment, PipelineError>",
     "pub fn line_filter(lf: &LineFilter) -> Result<CheckedFragment, PipelineError>",
+    // Issue #507 (W2): the anchored bucket grid and the three ways it
+    // refuses. `BucketGridRefusal` is deliberately not a `PipelineError` —
+    // every one of its reasons leaves the link residual rather than
+    // answering the request 400.
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+    "pub enum BucketGridRefusal",
+    "pub enum BucketGridRefusal :: StepNotPositive,",
+    "pub enum BucketGridRefusal :: AnchorAboveScanStart,",
+    "pub enum BucketGridRefusal :: WouldOverflow,",
+    "pub fn bucket_expr(bucket_col: &'static str, lo_ns: i64, step_ns: i64, scan_start_ns: i64, scan_end_ns: i64) -> Result<CheckedFragment, BucketGridRefusal>",
     "pub(super) fn non_id_values_expr() -> CheckedFragment",
     "fn contains_predicate(phrase: &str) -> String",
     "fn regex_predicate(pattern: &str) -> Result<String, PipelineError>",
@@ -2375,11 +2385,17 @@ const PREDICATE_ITEMS: &[&str] = &[
 /// Judging the own segment rather than the qualified string matters:
 /// `impl CheckedFragment :: pub fn as_sql(&self) -> &str` must NOT count (it
 /// is the unwrap point, not a mint), and `-> Self` inside the impl must.
-const MINT_COUNT: usize = 7;
+/// **8 at issue #507**: `bucket_expr` is the eighth, and it is a mint in
+/// the sense this count means — it is a function outside an `impl` whose
+/// signature names [`CheckedFragment`], so it can produce one.
+const MINT_COUNT: usize = 8;
 
 /// Attributes permitted anywhere in `predicate.rs`.
 const PREDICATE_ATTRIBUTES: &[&str] = &[
     "#[derive(Debug, Clone, PartialEq, Eq)]",
+    // Issue #507: `BucketGridRefusal` is a fieldless enum of three
+    // reasons, so it is `Copy` where the three sealed newtypes are not.
+    "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
     "#[cfg(test)]",
     "#[test]",
 ];

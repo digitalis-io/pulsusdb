@@ -218,9 +218,9 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 
 | stage as written | SQL emitted today | marking and source |
 |---|---|---|
-| `\|= "text"` | `body LIKE '%text%'` | *emitted today*, `predicate.rs:538` via `escape.rs:93`. `%`, `_` and `\` inside the search text are escaped so they match themselves |
+| `\|= "text"` | `body LIKE '%text%'` | *emitted today*, `predicate.rs:623` via `escape.rs:93`. `%`, `_` and `\` inside the search text are escaped so they match themselves |
 | `!= "text"` | `NOT (body LIKE '%text%')` | *emitted today*, `predicate.rs:521` |
-| `\|~ "re"` | `match(body, 're')` | *emitted today*, `predicate.rs:542`. Not anchored: a LogQL line filter searches for a substring |
+| `\|~ "re"` | `match(body, 're')` | *emitted today*, `predicate.rs:627`. Not anchored: a LogQL line filter searches for a substring |
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `predicate.rs:521` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `predicate.rs:500`. A filter with one value is not wrapped, so its text is unchanged |
 | `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3086`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
@@ -2045,7 +2045,7 @@ so its pattern is unescaped — the contrast with LogQL1 is the point.
 {service_name="checkout"} |~ "CONN_REFUSED"
 ```
 
-**SQL today** — one statement, `sql.rs:538`. Not anchored, and **not** underscore-escaped: `_` is an ordinary character in a regular expression (`predicate.rs:542`, `escape.rs:156-163`).
+**SQL today** — one statement, `sql.rs:538`. Not anchored, and **not** underscore-escaped: `_` is an ordinary character in a regular expression (`predicate.rs:627`, `escape.rs:156-163`).
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -2106,7 +2106,7 @@ the exclusion directly. These two entries plus LogQL1's two are the whole four-e
 {service_name="checkout"} |= ""
 ```
 
-**SQL today** — one statement, `sql.rs:538`. `ch_like_contains("")` renders `'%%'`; the case is pinned at `predicate.rs:715`.
+**SQL today** — one statement, `sql.rs:538`. `ch_like_contains("")` renders `'%%'`; the case is pinned at `predicate.rs:800`.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, structured_metadata
@@ -3297,7 +3297,7 @@ The complement of LogQL41. The pair fixes both directions of the rule.
 {service_name="checkout"} |~ "("
 ```
 
-**SQL today** — none. The pattern is compiled **before any read**, at the point the predicate is built (`predicate.rs:542` through `escape.rs:150-155`), so an uncompilable pattern is a `400` at planning time rather than a ClickHouse failure part-way through a query.
+**SQL today** — none. The pattern is compiled **before any read**, at the point the predicate is built (`predicate.rs:627` through `escape.rs:150-155`), so an uncompilable pattern is a `400` at planning time rather than a ClickHouse failure part-way through a query.
 
 **SQL after this work** — unchanged, and this property is load-bearing for compiling more stages: every new predicate that carries a user pattern must validate at the same point.
 
@@ -4986,7 +4986,7 @@ cheaper than having the next reader find them.
 |---|---|---|
 | the 51 LogQL answers in part 4 | replayed against `grafana/loki:3.7.4`, digest `sha256:87f0a067…cfcc`, on 2026-09-01, over part 4.1's corpus; the run reproduced an earlier capture with **no differences** | only that the reference answers this way over **this** corpus. It says nothing about a corpus we did not write |
 | the corpus is exactly the 14 entries listed | the live instance was queried for each of the five streams and every line printed as hex before any answer was used | nothing — but note it caught a real problem: an earlier capture had been taken against a **different** corpus state, and one of its rows recorded a non-matching accented value that was a difference in how the accent was written, not a behaviour. That capture is discarded and is not in this document |
-| the escaped `LIKE` patterns in part 4 | computed by re-implementing `escape.rs:93-105` over `escape.rs:51-67` and printing the result for each value, rather than written by hand | that the re-implementation matches the Rust. It agrees with the five cases pinned at `predicate.rs:709-716`, which is a check on five values, not on all of them |
+| the escaped `LIKE` patterns in part 4 | computed by re-implementing `escape.rs:93-105` over `escape.rs:51-67` and printing the result for each value, rather than written by hand | that the re-implementation matches the Rust. It agrees with the five cases pinned at `predicate.rs:794-801`, which is a check on five values, not on all of them |
 | the `400` body of LogQL32 | the template at `logql/error.rs:782-785` was rendered with the captured values and compared to the captured body: **462 bytes each, identical** | that the template is reached for this query. That is read from `logql/error.rs:775-781`, not executed |
 | the committed corpus cannot distinguish the two colour-stripping behaviours | all 46 corpus files read as bytes; one line has escape bytes and it has four; 46 of 50 queries using the stage carry a later filter and all 46 load colour-free lines | it is a statement about the **committed** corpus at this commit. A row added tomorrow changes it, and nothing detects that |
 | every `file:line` in this document | each was printed with `sed -n "${n}p"` and read before being written down | that the line still says that after the next commit. There is no mechanism holding these citations true |
