@@ -1759,7 +1759,9 @@ fn around(c: char) -> String {
 
 /// The two seeded series, in the order their fingerprints are assigned:
 /// the U+0008 one carries value 1, the three-letter one carries value 2.
-async fn seed_c0_series(client: &ChClient, values: [f64; 2]) {
+/// Returns the sample timestamp, so a caller can evaluate both routes at
+/// one instant rather than at two.
+async fn seed_c0_series(client: &ChClient, values: [f64; 2]) -> i64 {
     let bucket_ms: i64 = 3_600_000;
     let now = now_ms();
     let recent_bucket = (now / bucket_ms) * bucket_ms;
@@ -1810,6 +1812,7 @@ async fn seed_c0_series(client: &ChClient, values: [f64; 2]) {
         )
         .await
         .expect("seed metric_samples");
+    now
 }
 
 fn urlencode_query(s: &str) -> String {
@@ -1914,14 +1917,13 @@ async fn two_metric_series_differing_only_at_a_c0_escape_stay_two_series() {
     let db = &pulsus_testkit::test_db("pulsus_prom_api_c0_escape_it");
     drop_db(db).await;
     let cache_port: u16 = 31_230;
-    let sql_port: u16 = 31_231;
     let backspace = around('\u{8}');
 
     let guard = spawn_prom_server(cache_port, db, &[]);
     let client = ChClient::new(test_ch_config(db))
         .await
         .expect("connect to seed data");
-    seed_c0_series(&client, [1.0, 2.0]).await;
+    let _sample_ms = seed_c0_series(&client, [1.0, 2.0]).await;
 
     // Q7 — the whole metric. Two series, not one, and HTTP 200: before the
     // fix the two label sets collided and the evaluator answered 422.
@@ -1938,39 +1940,6 @@ async fn two_metric_series_differing_only_at_a_c0_escape_stay_two_series() {
         ],
         "t539 must return both series, each with its own value: {all}"
     );
-
-    // Q8 — the selector on the three-letter value picks exactly its own
-    // series, and the two routes agree. `PULSUS_CACHE_MAX_SERIES=1` puts
-    // the second server over its cardinality ceiling for this selector,
-    // which is what sends it down the SQL path instead of the cache.
-    let letters_path = format!(
-        "/api/v1/query?query={}",
-        urlencode_query(r#"t539{bs="abb"}"#)
-    );
-    let via_cache = wait_for_body(cache_port, &letters_path, |json| {
-        json["data"]["result"]
-            .as_array()
-            .is_some_and(|r| r.len() == 1)
-    });
-    assert_eq!(
-        vector_bs_values(&via_cache),
-        vec![("abb".to_string(), "2".to_string())],
-        "the three-letter selector must pick its own series: {via_cache}"
-    );
-
-    let sql_guard = spawn_prom_server(sql_port, db, &[("PULSUS_CACHE_MAX_SERIES", "1")]);
-    let via_sql = wait_for_body(sql_port, &letters_path, |json| {
-        json["data"]["result"]
-            .as_array()
-            .is_some_and(|r| r.len() == 1)
-    });
-    assert_eq!(
-        vector_bs_values(&via_sql),
-        vector_bs_values(&via_cache),
-        "the cache route and the SQL route must answer the same query the same way\n\
-         cache: {via_cache}\n  sql: {via_sql}"
-    );
-    drop(sql_guard);
 
     // …and the selector on the U+0008 value picks the other one. The
     // PromQL lexer decodes `\b` itself, so the matcher carries the right
@@ -2023,5 +1992,103 @@ async fn two_metric_series_differing_only_at_a_c0_escape_stay_two_series() {
     );
 
     drop(guard);
+    drop_db(db).await;
+}
+
+/// Criterion 9 of issue #539: **the two metric routes answer the same
+/// question the same way.**
+///
+/// A selector is served either from the in-process label cache or by
+/// pushing `JSONExtractString(labels, 'bs') = 'abb'` down to ClickHouse,
+/// and which one runs is a runtime decision
+/// (`crates/pulsus-read/src/metrics/labels.rs:9-14`). The cache decodes
+/// the stored label text with our decoder; the SQL route lets ClickHouse
+/// decode it. So the two agree only while our decoder agrees with
+/// ClickHouse's, which is what
+/// `crates/pulsus-read/src/metrics/labels.rs:629-632` states as a
+/// contract and what nothing checked.
+///
+/// `PULSUS_CACHE_MAX_SERIES=1` puts the second server over its
+/// cardinality ceiling, which is one of the runtime conditions that sends
+/// a selector down the SQL route.
+///
+/// This is a case of its own rather than a step of the one above, so that
+/// the route disagreement reddens by itself: with the `\b` arm removed
+/// the cache route answers `422 vector cannot contain metrics with the
+/// same labelset` and the SQL route answers `200` with one series
+/// (measured), and that difference IS the assertion here.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cache_route_and_the_sql_route_answer_a_c0_selector_identically() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+    let db = &pulsus_testkit::test_db("pulsus_prom_api_c0_routes_it");
+    drop_db(db).await;
+    let cache_port: u16 = 31_232;
+    let sql_port: u16 = 31_233;
+
+    let cache_guard = spawn_prom_server(cache_port, db, &[]);
+    let client = ChClient::new(test_ch_config(db))
+        .await
+        .expect("connect to seed data");
+    let sample_ms = seed_c0_series(&client, [1.0, 2.0]).await;
+    let sql_guard = spawn_prom_server(sql_port, db, &[("PULSUS_CACHE_MAX_SERIES", "1")]);
+
+    // Both routes are asked for the value at ONE instant: `/query` with no
+    // `time` evaluates at the server's own now, and two requests a
+    // millisecond apart carry two different timestamps in the body, which
+    // is a difference about the clock and not about the decoder.
+    let letters_path = format!(
+        "/api/v1/query?query={}&time={}.{:03}",
+        urlencode_query(r#"t539{bs="abb"}"#),
+        sample_ms / 1000,
+        sample_ms % 1000
+    );
+
+    // Wait for the cache sweep to have SEEN the seeded series, without
+    // waiting for it to answer correctly: a cold cache returns an empty
+    // vector, so "any result at all, or a definite error" is the point at
+    // which the two routes can be compared. This terminates whether the
+    // decoder is right or wrong.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        match http_get(cache_port, "/api/v1/query?query=t539") {
+            Some((422, _)) => break,
+            Some((200, body))
+                if serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|j| j["data"]["result"].as_array().map(|r| !r.is_empty()))
+                    .unwrap_or(false) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the label cache never swept the seeded series in within 40s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let (cache_status, cache_body) = http_get(cache_port, &letters_path).expect("cache route");
+    let (sql_status, sql_body) = http_get(sql_port, &letters_path).expect("sql route");
+    assert_eq!(
+        (cache_status, cache_body.trim()),
+        (sql_status, sql_body.trim()),
+        "the two metric routes must answer this selector identically"
+    );
+
+    // …and the answer they agree on is the right one.
+    let json: serde_json::Value = serde_json::from_str(&cache_body).expect("a JSON body");
+    assert_eq!(
+        vector_bs_values(&json),
+        vec![("abb".to_string(), "2".to_string())],
+        "the three-letter selector must return its own series only: {cache_body}"
+    );
+
+    drop(sql_guard);
+    drop(cache_guard);
     drop_db(db).await;
 }
