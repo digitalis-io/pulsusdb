@@ -46,8 +46,6 @@ use super::detected_probe::{
     push_fanout_entry, recycle_label_scratch, split_categories, split_merged_categories,
 };
 
-use crate::canonical_labels::parse_canonical_labels;
-
 use super::labels::{
     EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
     merge_labels_with_structured_metadata, render_labels_json_sorted, series_labels,
@@ -59,6 +57,7 @@ use super::post_agg::{
 use super::variants::{MAX_VARIANT_FANOUT_STATE_BYTES, VariantArena, VariantsAggState};
 use super::warnings::Warnings;
 use super::window::{ClientWindow, materialize_vector_lit};
+use crate::canonical_labels::parse_canonical_labels;
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
 /// `max_bytes_to_read` overflow this module sets from
