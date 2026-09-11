@@ -18,13 +18,12 @@ use std::collections::HashMap;
 
 use super::charge::{StreamsResultBudget, alloc_block_bytes, entry_category_bytes};
 use super::exec::{EntryCategories, StreamResult, TailCursor};
-use crate::canonical_labels::{parse_canonical_labels, parse_canonical_labels_into};
-
 use super::labels::{
     EMPTY_STRUCTURED_METADATA, StructuredMetadataCtx, fnv1a64,
     merge_labels_with_structured_metadata, render_labels_json_sorted,
 };
 use super::pipeline::{JsonPaths, LabelCategory};
+use crate::canonical_labels::{parse_canonical_labels, parse_canonical_labels_into};
 
 /// One fan-out group's accumulator — deliberately WITHOUT `labels_json`:
 /// the map key is the single owned copy of the rendered label set, moved
