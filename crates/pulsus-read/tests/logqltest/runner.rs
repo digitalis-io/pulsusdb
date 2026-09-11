@@ -319,7 +319,7 @@ fn utf8_len(first: u8) -> usize {
 }
 
 /// Renders label pairs as PulsusDB's canonical flat JSON (sorted keys),
-/// the shape `parse_flat_labels` reads back.
+/// the shape `pulsus_read::canonical_labels` reads back.
 fn labels_to_json(pairs: &[(String, String)]) -> String {
     let mut sorted = pairs.to_vec();
     sorted.sort();
