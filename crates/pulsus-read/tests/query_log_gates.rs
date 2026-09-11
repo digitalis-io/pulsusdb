@@ -3270,8 +3270,7 @@ async fn the_thread_count_spread_stays_inside_the_summation_bound() {
 }
 
 /// **Repeated executions of the same query on unchanged data agree bit for
-/// bit, at a fixed thread count and a fixed part layout** (issue #507 W4
-/// §3).
+/// bit, at `max_threads = 1` and a fixed part layout** (issue #507 W4 §3).
 ///
 /// Its failure means a source of nondeterminism exists that is neither the
 /// thread count nor the part count — which is a thing we would want to know
@@ -3280,8 +3279,8 @@ async fn the_thread_count_spread_stays_inside_the_summation_bound() {
 ///
 /// **The scope was measured rather than assumed**, because the plan scoped
 /// it to one part and named the measurement that would widen it. Six
-/// repetitions per cell at `max_threads = 4`, over 1 000 000 identical
-/// values laid out in 1, 2 and 8 parts with merges stopped:
+/// repetitions per cell, over 1 000 000 identical values laid out in 1, 2
+/// and 8 parts with merges stopped, **on an otherwise idle server**:
 ///
 /// ```text
 ///  parts  threads=1           threads=4           threads=8
@@ -3290,11 +3289,30 @@ async fn the_thread_count_spread_stays_inside_the_summation_bound() {
 ///  8      C1B845C49C946663    C1B845C49C946662    C1B845C49C946663
 /// ```
 ///
-/// **Constant in every cell, and different between cells.** So the gate
-/// covers any fixed part layout, not one part — and **the part count is a
-/// third source of divergence**, alongside the thread count and the block
-/// accumulation that separates us from the database in the first place.
-/// The user-facing sentence names it.
+/// Constant in every cell, and different between cells. So the part count
+/// is a **third source of divergence**, alongside the thread count and the
+/// block accumulation that separates us from the database in the first
+/// place.
+///
+/// **`max_threads = 1` is not a detail of this test, it is its subject.**
+/// The first version pinned four threads and passed alone and failed
+/// inside the suite, fourteen ULPs apart. The cause is not scheduling
+/// jitter: `max_threads` is an UPPER BOUND, and the server reduces the
+/// EFFECTIVE degree of parallelism when it is busy, so the answer moves
+/// with the load rather than with the setting. Measured directly, six
+/// repetitions each, with six concurrent heavy queries as the load:
+///
+/// ```text
+///  quiet,     threads=4   C1B845C49C9465EC   constant
+///  under load, threads=4  C1B845C49C9465E6   constant, and DIFFERENT
+///  under load, threads=1  C1B845C49C9466C4   constant, and equal to quiet
+/// ```
+///
+/// At one thread the effective degree is one whatever the server is doing,
+/// which is what makes the claim below reproducible rather than merely
+/// usually true. **The user-visible consequence is worth stating: two
+/// refreshes of an unchanged dashboard can differ because the server was
+/// busier, not because anything was configured differently.**
 ///
 /// `SYSTEM STOP MERGES` is what makes the part count an input rather than a
 /// race: without it a background merge rewrites eight parts into three
@@ -3303,7 +3321,7 @@ async fn the_thread_count_spread_stays_inside_the_summation_bound() {
 async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
     skip_unless_live!();
     const N: u64 = 1_000_000;
-    const THREADS: u64 = 4;
+    const THREADS: u64 = 1;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4parts_{}",
