@@ -83,16 +83,16 @@ impl SourceName for LqlSource {
     }
 }
 
-/// LogQL's shapes. Not a shared enum: one enum over both languages would
-/// be a union with per-language invalid states.
+/// LogQL's row kinds. Not a shared enum: one enum over both languages
+/// would be a union with per-language invalid states. The accumulated
+/// shape pairs one of these with the pipeline-error state, so both it
+/// and [`LqlShape`] are declared under "the pipeline-error state" below.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LqlShape {
+pub enum LqlKind {
     Lines,
     Samples,
     Series,
 }
-
-impl Shape for LqlShape {}
 
 /// What crosses between two LogQL parts: the resolved fingerprint list,
 /// bounded by `DEFAULT_MAX_STREAMS`.
@@ -388,17 +388,27 @@ impl Lower<Lql> for ParserLower {
     /// failure keeps the line with an `__error__` label, so a parser
     /// removes no line.
     fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
-        let id = match s {
-            LqlLink::Pipe(Stage::Parser(ParserStage::Json { .. })) => "parser:json",
-            LqlLink::Pipe(Stage::Parser(ParserStage::Logfmt { .. })) => "parser:logfmt",
-            LqlLink::Pipe(Stage::Parser(ParserStage::Regexp(_))) => "parser:regexp",
-            LqlLink::Pipe(Stage::Parser(ParserStage::Pattern(_))) => "parser:pattern",
-            _ => "parser",
+        // The four forms share this dispatcher and DIFFER here: only the
+        // JSON and logfmt arms write the error slot
+        // (`pipeline.rs:4732`, `:4791`, `:6428`, reached from the arms at
+        // `:1743` and `:1752`). A non-matching `| regexp` or `| pattern`
+        // extracts nothing and raises nothing — measured, the reference
+        // answers `200` with an unlabelled group for both.
+        let (id, raises) = match s {
+            LqlLink::Pipe(Stage::Parser(ParserStage::Json { .. })) => ("parser:json", true),
+            LqlLink::Pipe(Stage::Parser(ParserStage::Logfmt { .. })) => ("parser:logfmt", true),
+            LqlLink::Pipe(Stage::Parser(ParserStage::Regexp(_))) => ("parser:regexp", false),
+            LqlLink::Pipe(Stage::Parser(ParserStage::Pattern(_))) => ("parser:pattern", false),
+            _ => ("parser", false),
         };
         rel.cols = rel.cols.widen(std::sync::Arc::new(EvaluatorOnlyLabels(
             crate::compile::fold::OpenSourceId(id),
         )));
-        rel
+        if raises {
+            mark_error_raisable(rel)
+        } else {
+            rel
+        }
     }
 }
 
@@ -461,9 +471,15 @@ impl Lower<Lql> for LabelFilterLower {
     ) -> Result<Relation<Lql>, super::ReadError> {
         Ok(rel)
     }
-    /// It drops lines in the evaluator.
-    fn residual_effect(&self, _s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
+    /// It drops lines in the evaluator, and a NUMERIC comparison in it can
+    /// raise a pipeline error on a value that does not convert.
+    fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
         rel.exact = false;
+        if let LqlLink::Pipe(Stage::LabelFilter(expr)) = s
+            && holds_a_numeric_comparison(expr)
+        {
+            return mark_error_raisable(rel);
+        }
         rel
     }
 }
@@ -483,9 +499,11 @@ impl Lower<Lql> for LineFormatLower {
     }
     /// Sets the line's provenance with NO resolvable expression, so every
     /// later link needing the line goes residual. It does **not** clear
-    /// `exact` — it removes no line.
+    /// `exact` — it removes no line — and it CAN raise: a template that
+    /// fails while rendering writes the error slot (`pipeline.rs:1995`,
+    /// inside the arm at `:1897`).
     fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>) -> Relation<Lql> {
-        mark_line_rewritten(rel)
+        mark_error_raisable(mark_line_rewritten(rel))
     }
 }
 
@@ -502,7 +520,8 @@ impl Lower<Lql> for LabelFormatLower {
         Ok(rel)
     }
     /// `cols` rewritten with evaluator-only provenance for each rewritten
-    /// name; `exact` untouched.
+    /// name; `exact` untouched. It CAN raise, for the same reason
+    /// `line_format` can (`pipeline.rs:2208`, inside the arm at `:2000`).
     fn residual_effect(&self, s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
         if let LqlLink::Pipe(Stage::LabelFormat(fmts)) = s {
             for f in fmts {
@@ -510,7 +529,7 @@ impl Lower<Lql> for LabelFormatLower {
                     .set_provenance(&Name::new(label_fmt_dst(f)), Provenance::EvaluatorOnly);
             }
         }
-        rel
+        mark_error_raisable(rel)
     }
 }
 
@@ -544,7 +563,9 @@ impl Lower<Lql> for UnwrapLower {
             rel.cols
                 .set_provenance(&Name::new(u.label.clone()), Provenance::EvaluatorOnly);
         }
-        rel
+        // A sample conversion can fail the same way a numeric label filter
+        // can (`pipeline.rs:2252`, inside the arm at `:2216`).
+        mark_error_raisable(rel)
     }
 }
 
@@ -562,12 +583,20 @@ impl Lower<Lql> for UnpackLower {
     }
     /// Rewrites the line, and the promoted labels arrive as an open
     /// source the evaluator owns.
+    ///
+    /// **It raises**, which two earlier derivations of this table missed:
+    /// its two error writes sit inside `run_unpack`
+    /// (`pipeline.rs:6158`, `:6166`), which is a helper reached from the
+    /// `Unpack` arm at `:2263`, so walking backwards to the nearest
+    /// preceding `CompiledStage::` line attributes them to a different
+    /// stage entirely. Measured on both engines: `| unpack` over a
+    /// malformed line answers `400`.
     fn residual_effect(&self, _s: &LqlLink, rel: Relation<Lql>) -> Relation<Lql> {
         let mut rel = mark_line_rewritten(rel);
         rel.cols = rel.cols.widen(std::sync::Arc::new(EvaluatorOnlyLabels(
             crate::compile::fold::OpenSourceId("unpack:labels"),
         )));
-        rel
+        mark_error_raisable(rel)
     }
 }
 
@@ -830,6 +859,103 @@ impl Lower<Lql> for EmitLower {
     }
 }
 
+// ---------------------------------------------------------------------
+// The pipeline-error state
+//
+// Declared here rather than beside [`LqlKind`] because the state, the
+// shape that carries it and the two rules that write it are one
+// concern, and splitting them across the file put half of it under a
+// heading about the language's types.
+// ---------------------------------------------------------------------
+
+/// Whether a pipeline error can still be raised over the rows a chain has
+/// accumulated (issue #507, W2).
+///
+/// **Why the state lives on the shape and not in `cols`.** `ColSet`'s
+/// whole mutating surface — `set_provenance`, `widen`, `without`, `only`,
+/// `known_mut` — is about ordinary label names, and the error is not one.
+/// `| keep level, __error__` removes every other marker column while
+/// leaving the engine's error slot set, so a `cols` marker would report
+/// that chain clean; measured, both engines answer `400` there.
+/// `Lang::Shape` is per language and the core only requires
+/// `Clone + Eq + Debug` ([`crate::compile::fold::Shape`]), so the state
+/// goes here and the core does not move.
+///
+/// **What reads it.** A range or vector aggregation may only lower while
+/// the state is [`PipelineError::Clean`]: a lowered `GROUP BY` answers
+/// `200` with a group where the reference answers `400` for a pipeline
+/// error, and SQL has no way to refuse a whole request over one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineError {
+    /// No stage folded so far can write the engine's error slot.
+    Clean,
+    /// Some stage can.
+    Raisable,
+}
+
+/// LogQL's accumulated shape: what a row IS, and whether a pipeline error
+/// can still be raised over it. Two questions, so two fields — a fourth
+/// `LqlKind` variant would have put the error concern inside the type that
+/// answers "lines, samples or series".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LqlShape {
+    pub kind: LqlKind,
+    pub error: PipelineError,
+}
+
+impl LqlShape {
+    /// The shape a chain seeds with: lines, and nothing has raised yet.
+    pub fn lines() -> Self {
+        LqlShape {
+            kind: LqlKind::Lines,
+            error: PipelineError::Clean,
+        }
+    }
+}
+
+impl Shape for LqlShape {}
+
+/// Marks the accumulated rows as ones a pipeline error can still be
+/// raised over.
+///
+/// **Seven of `run_mode_into`'s thirteen `CompiledStage` arms can write
+/// the engine's error slot**, and this is the state that records it. The
+/// seven were derived by taking every call of the slot's two mutators,
+/// workspace-wide, and mapping each call site to the arm it is reached
+/// FROM rather than to the nearest preceding `CompiledStage::` line — the
+/// two writes for `| unpack` sit inside `run_unpack`
+/// (`crates/pulsus-read/src/logql/pipeline.rs:6143`), reached from the
+/// `Unpack` arm at `:2258`, and a nearest-line reading attributes them to
+/// the JSON parser.
+///
+/// The seven: `Json`, `Logfmt`, `LabelFilter` (a numeric comparison
+/// only — see [`holds_a_numeric_comparison`]), `LineFormat`,
+/// `LabelFormat`, `Unwrap`, `Unpack`. `Regexp` and `Pattern` write
+/// nothing, which is why the four parser forms do not share one answer
+/// here even though they share a dispatcher.
+fn mark_error_raisable(mut rel: Relation<Lql>) -> Relation<Lql> {
+    rel.shape.error = PipelineError::Raisable;
+    rel
+}
+
+/// Does this label-filter expression hold a numeric comparison leaf?
+///
+/// `CompiledStage::LabelFilter`'s only write to the error slot is the
+/// conversion failure of a numeric comparison: `eval_label_filter`
+/// assigns its `failed` slot in exactly one arm, `LfOp::Compare`
+/// (`crates/pulsus-read/src/logql/pipeline.rs:4117-4137`), and the stage
+/// calls `set_err` only when that slot is filled (`:1888-1891`). A filter
+/// made only of string matchers therefore raises nothing.
+fn holds_a_numeric_comparison(expr: &LabelFilterExpr) -> bool {
+    let mut found = false;
+    pulsus_logql::for_each_label_filter(expr, |node: &LabelFilterExpr| {
+        if matches!(node, LabelFilterExpr::Compare { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
 /// Parses `{service_name="x"} <atom>` and returns the single pipeline
 /// stage, so that every payload a gate uses comes from the real parser
 /// rather than from a hand-built AST. Test-only, and crate-visible
@@ -873,7 +999,7 @@ pub fn seed_relation() -> Relation<Lql> {
         grouping: None,
         ordering: None,
         limit: None,
-        shape: LqlShape::Lines,
+        shape: LqlShape::lines(),
         exact: true,
         depth: 0,
         // Issue #492 part 4 added the slot; the LogQL fit lowers no
@@ -921,9 +1047,19 @@ mod tests {
 
     // --- the residual state effects -----------------------------------
 
-    fn base(shape: LqlShape) -> Relation<Lql> {
+    /// Written out at every seed and every expectation below, so a row's
+    /// error transition is legible in the row rather than defaulted.
+    const CLEAN: PipelineError = PipelineError::Clean;
+    const RAISABLE: PipelineError = PipelineError::Raisable;
+
+    /// A seed relation with an explicit row kind AND an explicit pipeline
+    /// error state. Both are written out at every use below rather than
+    /// defaulted: the error state is the field W2's aggregation rule
+    /// reads, and a row whose seeds agreed on it could not tell a link
+    /// that PRESERVES it from one that ASSIGNS it.
+    fn base(kind: LqlKind, error: PipelineError) -> Relation<Lql> {
         let mut rel = seed_relation();
-        rel.shape = shape;
+        rel.shape = LqlShape { kind, error };
         rel
     }
 
@@ -991,10 +1127,10 @@ mod tests {
         rows.push(EffectRow {
             name: "LineFilter",
             link: LqlLink::Pipe(stage(r#"|= ip("10.0.0.0/8")"#)),
-            s1: with_exact(base(LqlShape::Lines), true),
-            s2: with_exact(base(LqlShape::Samples), true),
-            e1: with_exact(base(LqlShape::Lines), false),
-            e2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
+            e1: with_exact(base(LqlKind::Lines, CLEAN), false),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1003,19 +1139,32 @@ mod tests {
         // evaluator-only open source, and `exact` is NOT cleared — a
         // parse failure keeps the line with an `__error__` label, so a
         // parser removes no line. The seeds therefore differ in `exact`.
-        for (name, atom, id) in [
-            ("Parser(Json)", "| json", "parser:json"),
-            ("Parser(Logfmt)", "| logfmt", "parser:logfmt"),
-            ("Parser(Regexp)", r#"| regexp "(?P<a>.*)""#, "parser:regexp"),
-            ("Parser(Pattern)", r#"| pattern "<a>""#, "parser:pattern"),
+        // Json and logfmt ADDITIONALLY make the pipeline error raisable;
+        // regexp and pattern do not. The four share one dispatcher, so
+        // this column is the only place the split is visible.
+        for (name, atom, id, raises) in [
+            ("Parser(Json)", "| json", "parser:json", RAISABLE),
+            ("Parser(Logfmt)", "| logfmt", "parser:logfmt", RAISABLE),
+            (
+                "Parser(Regexp)",
+                r#"| regexp "(?P<a>.*)""#,
+                "parser:regexp",
+                CLEAN,
+            ),
+            (
+                "Parser(Pattern)",
+                r#"| pattern "<a>""#,
+                "parser:pattern",
+                CLEAN,
+            ),
         ] {
             rows.push(EffectRow {
                 name,
                 link: LqlLink::Pipe(stage(atom)),
-                s1: with_exact(base(LqlShape::Lines), true),
-                s2: with_exact(base(LqlShape::Samples), false),
-                e1: widened(with_exact(base(LqlShape::Lines), true), id),
-                e2: widened(with_exact(base(LqlShape::Samples), false), id),
+                s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+                s2: with_exact(base(LqlKind::Samples, RAISABLE), false),
+                e1: widened(with_exact(base(LqlKind::Lines, raises), true), id),
+                e2: widened(with_exact(base(LqlKind::Samples, RAISABLE), false), id),
                 effect_is_constant: false,
                 has_effect: true,
             });
@@ -1024,10 +1173,10 @@ mod tests {
         rows.push(EffectRow {
             name: "LabelFilter",
             link: LqlLink::Pipe(stage(r#"| level="error""#)),
-            s1: with_exact(base(LqlShape::Lines), true),
-            s2: with_exact(base(LqlShape::Samples), true),
-            e1: with_exact(base(LqlShape::Lines), false),
-            e2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
+            e1: with_exact(base(LqlKind::Lines, CLEAN), false),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1035,22 +1184,25 @@ mod tests {
         // A line rewrite leaves the line with no resolvable expression
         // and does NOT clear `exact` — it removes no line — so the seeds
         // differ in `exact` as well as in shape.
-        for (name, atom) in [
-            ("LineFormat", r#"| line_format "{{.msg}}""#),
-            ("Decolorize", "| decolorize"),
+        // `line_format` renders a template and a failing render writes the
+        // error slot; `decolorize` strips escape sequences and writes
+        // nothing. Same line rewrite, different error column.
+        for (name, atom, raises) in [
+            ("LineFormat", r#"| line_format "{{.msg}}""#, RAISABLE),
+            ("Decolorize", "| decolorize", CLEAN),
         ] {
             rows.push(EffectRow {
                 name,
                 link: LqlLink::Pipe(stage(atom)),
-                s1: with_exact(base(LqlShape::Lines), true),
-                s2: with_exact(base(LqlShape::Samples), false),
+                s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+                s2: with_exact(base(LqlKind::Samples, RAISABLE), false),
                 e1: with_col(
-                    with_exact(base(LqlShape::Lines), true),
+                    with_exact(base(LqlKind::Lines, raises), true),
                     BODY,
                     Provenance::EvaluatorOnly,
                 ),
                 e2: with_col(
-                    with_exact(base(LqlShape::Samples), false),
+                    with_exact(base(LqlKind::Samples, RAISABLE), false),
                     BODY,
                     Provenance::EvaluatorOnly,
                 ),
@@ -1062,15 +1214,15 @@ mod tests {
         rows.push(EffectRow {
             name: "LabelFormat",
             link: LqlLink::Pipe(label_format),
-            s1: with_exact(base(LqlShape::Lines), true),
-            s2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             e1: with_col(
-                with_exact(base(LqlShape::Lines), true),
+                with_exact(base(LqlKind::Lines, RAISABLE), true),
                 "dst",
                 Provenance::EvaluatorOnly,
             ),
             e2: with_col(
-                with_exact(base(LqlShape::Samples), false),
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
                 "dst",
                 Provenance::EvaluatorOnly,
             ),
@@ -1084,11 +1236,15 @@ mod tests {
         rows.push(EffectRow {
             name: "Unwrap",
             link: LqlLink::Pipe(unwrap),
-            s1: base(LqlShape::Lines),
-            s2: base(LqlShape::Samples),
-            e1: with_col(base(LqlShape::Lines), "latency", Provenance::EvaluatorOnly),
+            s1: base(LqlKind::Lines, CLEAN),
+            s2: base(LqlKind::Samples, RAISABLE),
+            e1: with_col(
+                base(LqlKind::Lines, RAISABLE),
+                "latency",
+                Provenance::EvaluatorOnly,
+            ),
             e2: with_col(
-                base(LqlShape::Samples),
+                base(LqlKind::Samples, RAISABLE),
                 "latency",
                 Provenance::EvaluatorOnly,
             ),
@@ -1099,14 +1255,22 @@ mod tests {
         rows.push(EffectRow {
             name: "Unpack",
             link: LqlLink::Pipe(stage("| unpack")),
-            s1: base(LqlShape::Lines),
-            s2: base(LqlShape::Samples),
+            s1: base(LqlKind::Lines, CLEAN),
+            s2: base(LqlKind::Samples, RAISABLE),
             e1: widened(
-                with_col(base(LqlShape::Lines), BODY, Provenance::EvaluatorOnly),
+                with_col(
+                    base(LqlKind::Lines, RAISABLE),
+                    BODY,
+                    Provenance::EvaluatorOnly,
+                ),
                 "unpack:labels",
             ),
             e2: widened(
-                with_col(base(LqlShape::Samples), BODY, Provenance::EvaluatorOnly),
+                with_col(
+                    base(LqlKind::Samples, RAISABLE),
+                    BODY,
+                    Provenance::EvaluatorOnly,
+                ),
                 "unpack:labels",
             ),
             effect_is_constant: false,
@@ -1120,18 +1284,18 @@ mod tests {
             name: "Drop",
             link: LqlLink::Pipe(dropkeep),
             s1: with_col(
-                with_exact(base(LqlShape::Lines), true),
+                with_exact(base(LqlKind::Lines, CLEAN), true),
                 "level",
                 Provenance::Stored,
             ),
             s2: with_col(
-                with_exact(base(LqlShape::Samples), false),
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
                 "level",
                 Provenance::Stored,
             ),
             e1: without_col(
                 with_col(
-                    with_exact(base(LqlShape::Lines), true),
+                    with_exact(base(LqlKind::Lines, CLEAN), true),
                     "level",
                     Provenance::Stored,
                 ),
@@ -1139,7 +1303,7 @@ mod tests {
             ),
             e2: without_col(
                 with_col(
-                    with_exact(base(LqlShape::Samples), false),
+                    with_exact(base(LqlKind::Samples, RAISABLE), false),
                     "level",
                     Provenance::Stored,
                 ),
@@ -1153,18 +1317,18 @@ mod tests {
             name: "Keep",
             link: LqlLink::Pipe(keep),
             s1: with_col(
-                with_exact(base(LqlShape::Lines), true),
+                with_exact(base(LqlKind::Lines, CLEAN), true),
                 "level",
                 Provenance::Stored,
             ),
             s2: with_col(
-                with_exact(base(LqlShape::Samples), false),
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
                 "level",
                 Provenance::Stored,
             ),
             e1: only_cols(
                 with_col(
-                    with_exact(base(LqlShape::Lines), true),
+                    with_exact(base(LqlKind::Lines, CLEAN), true),
                     "level",
                     Provenance::Stored,
                 ),
@@ -1172,7 +1336,7 @@ mod tests {
             ),
             e2: only_cols(
                 with_col(
-                    with_exact(base(LqlShape::Samples), false),
+                    with_exact(base(LqlKind::Samples, RAISABLE), false),
                     "level",
                     Provenance::Stored,
                 ),
@@ -1190,11 +1354,15 @@ mod tests {
                 offset_ns: 0,
                 grid_start_ns: 0,
             },
-            s1: base(LqlShape::Lines),
-            s2: base(LqlShape::Samples),
-            e1: with_col(base(LqlShape::Lines), "__bucket", Provenance::EvaluatorOnly),
+            s1: base(LqlKind::Lines, CLEAN),
+            s2: base(LqlKind::Samples, RAISABLE),
+            e1: with_col(
+                base(LqlKind::Lines, CLEAN),
+                "__bucket",
+                Provenance::EvaluatorOnly,
+            ),
             e2: with_col(
-                base(LqlShape::Samples),
+                base(LqlKind::Samples, RAISABLE),
                 "__bucket",
                 Provenance::EvaluatorOnly,
             ),
@@ -1209,10 +1377,10 @@ mod tests {
                 grouping: None,
                 param: None,
             },
-            s1: with_exact(base(LqlShape::Lines), true),
-            s2: with_exact(base(LqlShape::Samples), true),
-            e1: with_exact(base(LqlShape::Lines), false),
-            e2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Lines, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
+            e1: with_exact(base(LqlKind::Lines, CLEAN), false),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1224,10 +1392,10 @@ mod tests {
                 grouping: None,
                 param: None,
             },
-            s1: with_exact(base(LqlShape::Series), true),
-            s2: with_exact(base(LqlShape::Samples), true),
-            e1: with_exact(base(LqlShape::Series), false),
-            e2: with_exact(base(LqlShape::Samples), false),
+            s1: with_exact(base(LqlKind::Series, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
+            e1: with_exact(base(LqlKind::Series, CLEAN), false),
+            e2: with_exact(base(LqlKind::Samples, RAISABLE), false),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1240,15 +1408,15 @@ mod tests {
                 src: "src".to_string(),
                 regex: "(.*)".to_string(),
             },
-            s1: with_exact(base(LqlShape::Series), true),
-            s2: with_exact(base(LqlShape::Samples), true),
+            s1: with_exact(base(LqlKind::Series, CLEAN), true),
+            s2: with_exact(base(LqlKind::Samples, RAISABLE), true),
             e1: with_col(
-                with_exact(base(LqlShape::Series), false),
+                with_exact(base(LqlKind::Series, CLEAN), false),
                 "dst",
                 Provenance::EvaluatorOnly,
             ),
             e2: with_col(
-                with_exact(base(LqlShape::Samples), false),
+                with_exact(base(LqlKind::Samples, RAISABLE), false),
                 "dst",
                 Provenance::EvaluatorOnly,
             ),
@@ -1259,10 +1427,10 @@ mod tests {
         rows.push(EffectRow {
             name: "Order",
             link: LqlLink::Order,
-            s1: ordered(base(LqlShape::Lines), "timestamp_ns"),
-            s2: ordered(base(LqlShape::Series), "t"),
-            e1: base(LqlShape::Lines),
-            e2: base(LqlShape::Series),
+            s1: ordered(base(LqlKind::Lines, CLEAN), "timestamp_ns"),
+            s2: ordered(base(LqlKind::Series, RAISABLE), "t"),
+            e1: base(LqlKind::Lines, CLEAN),
+            e2: base(LqlKind::Series, RAISABLE),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1270,10 +1438,10 @@ mod tests {
         rows.push(EffectRow {
             name: "Limit",
             link: LqlLink::Limit(100),
-            s1: limited(base(LqlShape::Lines), 100),
-            s2: limited(base(LqlShape::Series), 101),
-            e1: base(LqlShape::Lines),
-            e2: base(LqlShape::Series),
+            s1: limited(base(LqlKind::Lines, CLEAN), 100),
+            s2: limited(base(LqlKind::Series, RAISABLE), 101),
+            e1: base(LqlKind::Lines, CLEAN),
+            e2: base(LqlKind::Series, RAISABLE),
             effect_is_constant: false,
             has_effect: true,
         });
@@ -1281,15 +1449,15 @@ mod tests {
         rows.push(EffectRow {
             name: "Emit",
             link: LqlLink::Emit,
-            s1: base(LqlShape::Lines),
-            s2: base(LqlShape::Series),
+            s1: base(LqlKind::Lines, CLEAN),
+            s2: base(LqlKind::Series, RAISABLE),
             e1: with_col(
-                base(LqlShape::Lines),
+                base(LqlKind::Lines, CLEAN),
                 "__response",
                 Provenance::EvaluatorOnly,
             ),
             e2: with_col(
-                base(LqlShape::Series),
+                base(LqlKind::Series, RAISABLE),
                 "__response",
                 Provenance::EvaluatorOnly,
             ),
@@ -1298,6 +1466,103 @@ mod tests {
         });
 
         assert_every_residual_state_effect::<Lql>(&rows, 20);
+    }
+
+    /// Issue #507, W2 — a label filter makes the pipeline error raisable
+    /// only when it holds a NUMERIC comparison.
+    ///
+    /// The twenty-row gate above carries one row per link, and the
+    /// `LabelFilter` row's payload is a string matcher, so that gate
+    /// structurally cannot see this split. `LabelFilter` is the one stage
+    /// whose error answer depends on the PAYLOAD rather than on the
+    /// variant: `eval_label_filter` fills its failure slot in exactly one
+    /// arm, `LfOp::Compare`, and the stage calls `set_err` only when that
+    /// slot is filled.
+    ///
+    /// The table carries both answers, so neither "every label filter
+    /// raises" nor "no label filter raises" passes it.
+    #[test]
+    fn a_numeric_label_comparison_raises_and_a_string_matcher_does_not() {
+        for (atom, want) in [
+            (r#"| level="error""#, CLEAN),
+            (r#"| level!="error""#, CLEAN),
+            (r#"| level=~"err.*""#, CLEAN),
+            (r#"| level="error" and app="x""#, CLEAN),
+            ("| status >= 500", RAISABLE),
+            ("| duration > 1s", RAISABLE),
+            ("| size > 1kb", RAISABLE),
+            (r#"| level="error" and status >= 500"#, RAISABLE),
+            (r#"| status >= 500 or level="error""#, RAISABLE),
+        ] {
+            let link = LqlLink::Pipe(stage(atom));
+            let got = Lql::lower_of(&link).residual_effect(&link, base(LqlKind::Lines, CLEAN));
+            assert_eq!(
+                got.shape.error, want,
+                "`{atom}` must leave the pipeline error {want:?}"
+            );
+        }
+    }
+
+    /// Issue #507, W2 — the pipeline error state a whole chain
+    /// accumulates, which is what a range or vector aggregation will read
+    /// before it may lower.
+    ///
+    /// Seven of the thirteen compiled stage arms can write the engine's
+    /// error slot; the state is `Raisable` if any link in the chain is one
+    /// of the seven and `Clean` otherwise. Nothing clears it: `|
+    /// drop __error__` clears the engine's slot per ROW, over the metadata
+    /// the statement transports, which is the reader's job and not a
+    /// plan-time fact — and a matcher form such as
+    /// `| drop __error__="JSONParserErr"` clears only when the row raised
+    /// that class, which no plan-time state can decide. Leaving those
+    /// `Raisable` refuses the lowering, which is the safe direction.
+    ///
+    /// The seven raising stages appear here in a chain and the six
+    /// non-raising ones appear too, so an implementation that marks every
+    /// stage raisable fails the second half of the table.
+    #[test]
+    fn the_chains_pipeline_error_state_is_the_one_the_seven_raising_arms_give() {
+        let chain = |atoms: &[&str]| -> PipelineError {
+            let mut links = vec![LqlLink::Source];
+            links.extend(atoms.iter().map(|a| LqlLink::Pipe(stage(a))));
+            fold(&links, &bounds(None)).rel.shape.error
+        };
+        // Clean: the seed, and every stage that writes no error slot.
+        for atoms in [
+            &[][..],
+            &[r#"|= "CONN_REFUSED""#][..],
+            &[r#"| regexp "(?P<a>.*)""#][..],
+            &[r#"| pattern "<a>""#][..],
+            &["| decolorize"][..],
+            &["| drop level"][..],
+            &["| keep body"][..],
+            &[r#"| level="error""#][..],
+            &[r#"|= "x""#, "| decolorize", "| drop level"][..],
+        ] {
+            assert_eq!(chain(atoms), CLEAN, "{atoms:?} raises nothing");
+        }
+        // Raisable: each of the seven, alone.
+        for atoms in [
+            &["| json"][..],
+            &["| logfmt"][..],
+            &["| status >= 500"][..],
+            &[r#"| line_format "{{.msg}}""#][..],
+            &["| label_format dst=src"][..],
+            &["| unwrap latency"][..],
+            &["| unpack"][..],
+        ] {
+            assert_eq!(chain(atoms), RAISABLE, "{atoms:?} raises");
+        }
+        // It does not un-raise, and a clearing stage after one does not
+        // either: `| json | drop __error__` stays `Raisable`, which is the
+        // cell the two-value state is chosen to get right.
+        assert_eq!(chain(&["| json", "| drop __error__"]), RAISABLE);
+        assert_eq!(chain(&["| json", r#"| __error__="""#]), RAISABLE);
+        assert_eq!(chain(&["| json", "| keep level"]), RAISABLE);
+        assert_eq!(chain(&["| json", "| decolorize"]), RAISABLE);
+        // And the order does not matter: clearing first then raising is
+        // the same state as raising first.
+        assert_eq!(chain(&["| drop __error__", "| json"]), RAISABLE);
     }
 
     /// Issue #492: `Drop` and `Keep` share the payload type
@@ -1328,7 +1593,7 @@ mod tests {
             "Drop and Keep must not reach the same dispatcher"
         );
 
-        let seed = with_col(base(LqlShape::Lines), "level", Provenance::Stored);
+        let seed = with_col(base(LqlKind::Lines, RAISABLE), "level", Provenance::Stored);
         let expected_drop = without_col(seed.clone(), "level");
         let expected_keep = only_cols(seed.clone(), &["level"]);
 
