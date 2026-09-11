@@ -666,23 +666,108 @@ fn elem_names(elems: &[DropKeepElem]) -> Vec<Name> {
     elems.iter().map(|e| Name::new(e.label.clone())).collect()
 }
 
+/// The column a lowered window groups by — the alias the bucketed
+/// statement gives its grid-point expression. The expression itself is
+/// rendered by [`super::predicate::bucket_expr`] and never here: it needs
+/// the request's time bounds, which [`Lower::capability`] does not
+/// receive, and the statement's own `GROUP BY` names the alias rather than
+/// the expression.
+pub const BUCKET_NS: &str = "bucket_ns";
+
+/// The metadata column, which a lowered aggregation carries in its
+/// grouping unconditionally: it is part of the output series identity even
+/// when no error is involved.
+pub const STRUCTURED_METADATA: &str = "structured_metadata";
+
 impl Lower<Lql> for WindowLower {
-    fn capability(&self, _s: &LqlLink, _rel: &Relation<Lql>) -> Capability {
-        Capability::No(BlockReason::NotYetLowered)
+    /// **The chain-decidable half of a two-part decision, and the other
+    /// half is not expressible here.**
+    ///
+    /// Whether a window can be bucketed depends on two things. One is a
+    /// property of the chain — the grid's step and the selector's range —
+    /// and this answers it. The other is whether the grid's arithmetic is
+    /// representable over the newest row the statement admits, which
+    /// depends on the request's time bounds. **This method cannot see
+    /// them**, and there is no other channel: `capability` is the fold's
+    /// only producer of `Capability::No`, which is its only way to say
+    /// *fall back*; `apply` does receive the bounds, but `lower_chain`
+    /// propagates its error with `?`, so an error there fails the query
+    /// rather than falling back; and widening this signature is a change
+    /// to the shared core.
+    ///
+    /// So the decision is a PARTITION, not a duplication: this asserts the
+    /// necessary condition, [`super::predicate::bucket_expr`] asserts the
+    /// sufficient one, neither can express the other's input, and their
+    /// conjunction is taken by the planner. A partition has no shared
+    /// content to drift; its one failure mode is the join dropping a half,
+    /// which is what the planner's own exhaustive match is for.
+    ///
+    /// **Why the range may not exceed the step.** The expression gives one
+    /// grid point per row. With a range wider than the step an entry
+    /// belongs to several windows at once, and no single column can say
+    /// which.
+    fn capability(&self, s: &LqlLink, _rel: &Relation<Lql>) -> Capability {
+        let LqlLink::Window {
+            range_ns,
+            step_ns,
+            grid_start_ns,
+            ..
+        } = s
+        else {
+            return Capability::No(BlockReason::NotYetLowered);
+        };
+        if *step_ns <= 0 || *range_ns <= 0 || range_ns > step_ns {
+            return Capability::No(BlockReason::NotYetLowered);
+        }
+        if grid_start_ns.checked_sub(*step_ns).is_none() {
+            return Capability::No(BlockReason::NotYetLowered);
+        }
+        Capability::Yes
     }
+    /// Groups by the grid-point column and by the metadata column, and
+    /// makes the grid point resolvable so the aggregation above it can
+    /// read it. The `GROUP BY` names the alias, so no expression is built
+    /// here — see [`BUCKET_NS`].
     fn apply(
         &self,
         _s: &LqlLink,
-        rel: Relation<Lql>,
+        mut rel: Relation<Lql>,
         _cx: &LowerCx<'_, Lql>,
     ) -> Result<Relation<Lql>, super::ReadError> {
+        rel.cols.set_provenance(
+            &Name::from(BUCKET_NS),
+            Provenance::Computed(SqlExpr::new(BUCKET_NS)),
+        );
+        rel.grouping = Some(crate::compile::fold::Grouping {
+            keys: vec![
+                FINGERPRINT.to_string(),
+                BUCKET_NS.to_string(),
+                STRUCTURED_METADATA.to_string(),
+            ],
+        });
         Ok(rel)
     }
-    /// Records the bucketing as evaluator-owned, so a following
-    /// aggregation cannot lower.
+    /// A grid-point column removes no row and computes no aggregate: the
+    /// SQL assigns each row the same grid point the window's own rule
+    /// assigns it, so the evaluator must not re-apply the link.
+    ///
+    /// This is the window's fidelity alone. **The range aggregation above
+    /// it keeps the conservative `Wider` default**, because whether
+    /// summing the database's per-group partials reproduces the single
+    /// accumulator is a per-reducer argument the reader's design owes, and
+    /// `Wider` cannot make a plan wrong — only no better than today.
+    fn fidelity(&self, _s: &LqlLink, _rel: &Relation<Lql>) -> Fidelity {
+        Fidelity::Equivalent
+    }
+    /// Records the grid point as evaluator-owned, so the aggregation above
+    /// cannot lower: the name exists and SQL cannot see it.
+    ///
+    /// It is the same name the lowered arm makes resolvable. Two names for
+    /// one concept is the defect class this issue has spent three rounds
+    /// on, so the marker is [`BUCKET_NS`] and not a second spelling.
     fn residual_effect(&self, _s: &LqlLink, mut rel: Relation<Lql>) -> Relation<Lql> {
         rel.cols
-            .set_provenance(&Name::from("__bucket"), Provenance::EvaluatorOnly);
+            .set_provenance(&Name::from(BUCKET_NS), Provenance::EvaluatorOnly);
         rel
     }
 }
@@ -690,22 +775,63 @@ impl Lower<Lql> for WindowLower {
 impl Lower<Lql> for RangeAggLower {
     /// `AbsentOverTime` is `Never`: the answer is a statement about rows
     /// that are **absent**, so there is no row to compute it from.
-    fn capability(&self, s: &LqlLink, _rel: &Relation<Lql>) -> Capability {
-        if let LqlLink::RangeAgg {
-            op: RangeAggOp::AbsentOverTime,
-            ..
-        } = s
-        {
+    fn capability(&self, s: &LqlLink, rel: &Relation<Lql>) -> Capability {
+        let LqlLink::RangeAgg { op, .. } = s else {
+            return Capability::No(BlockReason::NotYetLowered);
+        };
+        if matches!(op, RangeAggOp::AbsentOverTime) {
             return Capability::Never(NeverReason::NoRowToComputeFrom);
         }
-        Capability::No(BlockReason::NotYetLowered)
+        // Four of the fifteen reducers accumulate INTEGERS, so summing the
+        // database's per-group partials reproduces the single accumulator
+        // exactly. The other ten take an `f64` sample through `| unwrap`,
+        // and a sum of `f64`s is not associative.
+        if !matches!(
+            op,
+            RangeAggOp::CountOverTime
+                | RangeAggOp::BytesOverTime
+                | RangeAggOp::Rate
+                | RangeAggOp::BytesRate
+        ) {
+            return Capability::No(BlockReason::NotYetLowered);
+        }
+        // `rate` is the one of the four that ADMITS `| unwrap`, and with
+        // one its accumulator is an `f64` sum. The exclusion is carried by
+        // the error state rather than by a second test: `| unwrap` can
+        // fail a sample conversion, so it makes the pipeline error
+        // raisable, and the check below refuses the chain.
+        // `a_rate_over_an_unwrap_does_not_lower` is the test that reddens
+        // if that ever stops being true.
+        if rel.shape.error != PipelineError::Clean {
+            return Capability::No(BlockReason::NameNotResolvable);
+        }
+        // A count computed before a row filter is simply wrong, not merely
+        // wide, so a superset is not good enough here the way it is for a
+        // pushed-down filter.
+        if !rel.exact {
+            return Capability::No(BlockReason::NotExact);
+        }
+        // The window above it must have lowered, or there is no grid-point
+        // column to group by.
+        if rel.cols.resolve(&Name::from(BUCKET_NS)).is_none() {
+            return Capability::No(BlockReason::NameNotResolvable);
+        }
+        Capability::Yes
     }
     fn apply(
         &self,
-        _s: &LqlLink,
-        rel: Relation<Lql>,
+        s: &LqlLink,
+        mut rel: Relation<Lql>,
         _cx: &LowerCx<'_, Lql>,
     ) -> Result<Relation<Lql>, super::ReadError> {
+        if let LqlLink::RangeAgg { op, .. } = s {
+            let agg = match op {
+                RangeAggOp::BytesOverTime | RangeAggOp::BytesRate => "sum(length(body))",
+                _ => "count()",
+            };
+            rel.projection.push((Name::from("n"), agg.to_string()));
+            rel.shape.kind = LqlKind::Series;
+        }
         Ok(rel)
     }
     /// **Shape unchanged** — `Lines` whenever the `Unwrap` above went
@@ -1358,12 +1484,12 @@ mod tests {
             s2: base(LqlKind::Samples, RAISABLE),
             e1: with_col(
                 base(LqlKind::Lines, CLEAN),
-                "__bucket",
+                BUCKET_NS,
                 Provenance::EvaluatorOnly,
             ),
             e2: with_col(
                 base(LqlKind::Samples, RAISABLE),
-                "__bucket",
+                BUCKET_NS,
                 Provenance::EvaluatorOnly,
             ),
             effect_is_constant: false,
@@ -1563,6 +1689,209 @@ mod tests {
         // And the order does not matter: clearing first then raising is
         // the same state as raising first.
         assert_eq!(chain(&["| drop __error__", "| json"]), RAISABLE);
+    }
+
+    /// A chain ending in a window and a range aggregation, with `atoms` as
+    /// its pipeline. `range_ns`/`step_ns` are the selector's width and the
+    /// emit grid's spacing.
+    fn metric_chain(atoms: &[&str], op: RangeAggOp, range_ns: i64, step_ns: i64) -> Vec<LqlLink> {
+        let mut links = vec![LqlLink::Source];
+        links.extend(atoms.iter().map(|a| LqlLink::Pipe(stage(a))));
+        links.push(LqlLink::Window {
+            range_ns,
+            step_ns,
+            offset_ns: 0,
+            grid_start_ns: 1_700_000_000_000_000_000,
+        });
+        links.push(LqlLink::RangeAgg {
+            op,
+            grouping: None,
+            param: None,
+        });
+        links
+    }
+
+    /// The window link's own disposition in a folded chain.
+    fn window_how(atoms: &[&str], op: RangeAggOp, range_ns: i64, step_ns: i64) -> Disposition {
+        let chain = metric_chain(atoms, op, range_ns, step_ns);
+        let how = fold(&chain, &bounds(None)).how;
+        how[chain.len() - 2]
+    }
+
+    /// The range aggregation's own disposition in a folded chain.
+    fn agg_how(atoms: &[&str], op: RangeAggOp, range_ns: i64, step_ns: i64) -> Disposition {
+        let chain = metric_chain(atoms, op, range_ns, step_ns);
+        let how = fold(&chain, &bounds(None)).how;
+        how[chain.len() - 1]
+    }
+
+    /// Issue #507, W2 — a window lowers when the selector's range fits
+    /// inside the emit grid's step, and not otherwise.
+    ///
+    /// The expression gives one grid point per row, so a range wider than
+    /// the step would put an entry in several windows at once and no single
+    /// column could say which.
+    ///
+    /// **This is the chain-decidable half of a two-part decision.** Whether
+    /// the grid's arithmetic is representable depends on the request's time
+    /// bounds, which `Lower::capability` does not receive;
+    /// `logql::predicate::bucket_expr` answers that half and the planner
+    /// takes the conjunction.
+    #[test]
+    fn a_window_lowers_only_when_its_range_fits_inside_the_step() {
+        const MIN: i64 = 60_000_000_000;
+        let lowered = Disposition::Lowered(Fidelity::Equivalent);
+        let blocked = Disposition::Residual(ResidualReason::Blocked(BlockReason::NotYetLowered));
+        // range == step, and range < step.
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN, MIN),
+            lowered
+        );
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN / 2, MIN),
+            lowered
+        );
+        // range > step: one entry, several windows.
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN + 1, MIN),
+            blocked
+        );
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, 5 * MIN, MIN),
+            blocked
+        );
+        // A step that is not positive has no grid points.
+        assert_eq!(window_how(&[], RangeAggOp::CountOverTime, MIN, 0), blocked);
+        // An anchor one step below the grid start must be representable.
+        let mut chain = metric_chain(&[], RangeAggOp::CountOverTime, MIN, MIN);
+        chain[1] = LqlLink::Window {
+            range_ns: MIN,
+            step_ns: MIN,
+            offset_ns: 0,
+            grid_start_ns: i64::MIN,
+        };
+        let how = fold(&chain, &bounds(None)).how;
+        assert_eq!(how[1], blocked, "`grid_start - step` must be representable");
+    }
+
+    /// Issue #507, W2 — a range aggregation lowers only on a clean, exact
+    /// chain whose window lowered, and only for a reducer whose
+    /// accumulator is an integer.
+    ///
+    /// Each clause is exercised by a row that differs from the lowering row
+    /// in that clause alone, so no row passes because another clause
+    /// happened to refuse first.
+    #[test]
+    fn a_range_aggregation_lowers_only_on_a_clean_exact_bucketed_chain() {
+        const MIN: i64 = 60_000_000_000;
+        let count = RangeAggOp::CountOverTime;
+        let lowered = Disposition::Lowered(Fidelity::Wider);
+
+        // The row every other row is a one-clause perturbation of.
+        assert_eq!(agg_how(&[], count, MIN, MIN), lowered);
+        // A pushable line filter is `Equivalent`, so it keeps `exact` and
+        // raises nothing: the aggregation still lowers over it.
+        assert_eq!(agg_how(&[r#"|= "boom""#], count, MIN, MIN), lowered);
+
+        // The window did not lower, so there is no grid-point column.
+        assert_eq!(
+            agg_how(&[], count, MIN + 1, MIN),
+            Disposition::Residual(ResidualReason::Blocked(BlockReason::NameNotResolvable))
+        );
+        // A stage that can raise a pipeline error. A lowered `GROUP BY`
+        // answers 200 with a group where the reference answers 400, and SQL
+        // cannot refuse a request over one row.
+        assert_eq!(
+            agg_how(&["| json"], count, MIN, MIN),
+            Disposition::Residual(ResidualReason::Blocked(BlockReason::NameNotResolvable))
+        );
+        // A residual dropping stage clears `exact`. A count taken before a
+        // row filter is wrong, not merely wide.
+        assert_eq!(
+            agg_how(&[r#"|= ip("10.0.0.0/8")"#], count, MIN, MIN),
+            Disposition::Residual(ResidualReason::Blocked(BlockReason::NotExact))
+        );
+    }
+
+    /// Issue #507, W2, AC33 — the reducer census, taken from the type.
+    ///
+    /// `RangeAggOp`'s variants are emitted by a macro invocation, so the
+    /// match below is exhaustive with no `_` arm: a sixteenth variant is a
+    /// build failure here rather than a silent absence from the census.
+    ///
+    /// Four lower. Ten require `| unwrap`, whose sample is an `f64`, and a
+    /// sum of `f64`s is not associative, so summing the database's
+    /// per-group partials need not reproduce the single accumulator.
+    /// `absent_over_time` is the one permanent refusal: its answer is about
+    /// rows that are absent, and there is no row to compute it from.
+    #[test]
+    fn ac33_reducer_census() {
+        const MIN: i64 = 60_000_000_000;
+        let mut lowered = Vec::new();
+        let mut never = Vec::new();
+        let mut blocked = Vec::new();
+        for op in RangeAggOp::ALL.iter().copied() {
+            let name = match op {
+                RangeAggOp::CountOverTime => "count_over_time",
+                RangeAggOp::BytesOverTime => "bytes_over_time",
+                RangeAggOp::Rate => "rate",
+                RangeAggOp::BytesRate => "bytes_rate",
+                RangeAggOp::AbsentOverTime => "absent_over_time",
+                RangeAggOp::SumOverTime => "sum_over_time",
+                RangeAggOp::AvgOverTime => "avg_over_time",
+                RangeAggOp::MinOverTime => "min_over_time",
+                RangeAggOp::MaxOverTime => "max_over_time",
+                RangeAggOp::StddevOverTime => "stddev_over_time",
+                RangeAggOp::StdvarOverTime => "stdvar_over_time",
+                RangeAggOp::QuantileOverTime => "quantile_over_time",
+                RangeAggOp::FirstOverTime => "first_over_time",
+                RangeAggOp::LastOverTime => "last_over_time",
+                RangeAggOp::RateCounter => "rate_counter",
+            };
+            match agg_how(&[], op, MIN, MIN) {
+                Disposition::Lowered(_) => lowered.push(name),
+                Disposition::Residual(ResidualReason::Never(_)) => never.push(name),
+                Disposition::Residual(ResidualReason::Blocked(_)) => blocked.push(name),
+            }
+        }
+        assert_eq!(
+            RangeAggOp::ALL.len(),
+            15,
+            "the census is over every variant the declaring macro emits"
+        );
+        // Sorted, so the census is about the SET and not about the order
+        // the declaring macro happens to list its variants in.
+        lowered.sort_unstable();
+        assert_eq!(
+            lowered,
+            vec!["bytes_over_time", "bytes_rate", "count_over_time", "rate"]
+        );
+        assert_eq!(never, vec!["absent_over_time"]);
+        assert_eq!(blocked.len(), 10, "{blocked:?}");
+    }
+
+    /// Issue #507, W2 — `rate` is the one lowered reducer that ADMITS
+    /// `| unwrap`, and with one its accumulator is an `f64` sum rather
+    /// than a count.
+    ///
+    /// The exclusion is carried by the pipeline-error state rather than by
+    /// a second test in `RangeAggLower::capability`: `| unwrap` can fail a
+    /// sample conversion, so it makes the state raisable. **This test is
+    /// what reddens if that ever stops being true** — two different reasons
+    /// travelling on one mechanism is exactly the arrangement that breaks
+    /// silently.
+    #[test]
+    fn a_rate_over_an_unwrap_does_not_lower() {
+        const MIN: i64 = 60_000_000_000;
+        assert_eq!(
+            agg_how(&[], RangeAggOp::Rate, MIN, MIN),
+            Disposition::Lowered(Fidelity::Wider),
+            "the control: a rate over no unwrap lowers, so the row below is about the unwrap"
+        );
+        assert_eq!(
+            agg_how(&["| unwrap latency"], RangeAggOp::Rate, MIN, MIN),
+            Disposition::Residual(ResidualReason::Blocked(BlockReason::NameNotResolvable))
+        );
     }
 
     /// Issue #492: `Drop` and `Keep` share the payload type

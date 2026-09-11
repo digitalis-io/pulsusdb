@@ -1169,7 +1169,7 @@ its statement now written.
 
 ```sql
 -- decided here; executed on 26.3.17.110
-SELECT 1788256680000000000 + intDiv(timestamp_ns - 1788256680000000000 + 59999999999, 60000000000) * 60000000000 AS bucket_ns,
+SELECT 1788256680000000000 + intDiv(timestamp_ns - 1788256680000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns,
        fingerprint, structured_metadata, count() AS n
 FROM log_samples
 PREWHERE service = 'bnd'
@@ -1206,7 +1206,7 @@ Same window and step as LogQL54.
 
 ```sql
 -- decided here; executed on 26.3.17.110
-SELECT 1788256680000000000 + intDiv(timestamp_ns - 1788256680000000000 + 59999999999, 60000000000) * 60000000000 AS bucket_ns,
+SELECT 1788256680000000000 + intDiv(timestamp_ns - 1788256680000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns,
        transform(fingerprint, [30001], ['prod'], '') AS g0,
        count() AS n
 FROM log_samples
@@ -1244,7 +1244,7 @@ by the tie-break, not by the values.
 -- decided here; executed on 26.3.17.110
 SELECT bucket_ns, g0, n
 FROM (
-  SELECT 1788256680000000000 + intDiv(timestamp_ns - 1788256680000000000 + 59999999999, 60000000000) * 60000000000 AS bucket_ns,
+  SELECT 1788256680000000000 + intDiv(timestamp_ns - 1788256680000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns,
          transform(fingerprint, [18374, 99120, 30001, 40001], ['checkout', 'colors', 'edge', 'ipcase'], '') AS g0,
          count() AS n
   FROM log_samples
@@ -3025,7 +3025,7 @@ ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 
 ```sql
 -- decided here; executed on 26.3.17.110
-SELECT 1788256680000000000 + intDiv(timestamp_ns - 1788256680000000000 + 59999999999, 60000000000) * 60000000000 AS bucket_ns,
+SELECT 1788256680000000000 + intDiv(timestamp_ns - 1788256680000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns,
        fingerprint, structured_metadata, count() AS n
 FROM log_samples
 PREWHERE service = 'bnd'

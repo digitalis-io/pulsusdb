@@ -1090,16 +1090,16 @@ pub fn metric_range_bucketed(
     let sm = projection.column_suffix();
     let bucket_sql = bucket.as_sql();
     let mut sql = format!(
-        "SELECT fingerprint, {bucket_sql} AS step, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
+        "SELECT fingerprint, {bucket_sql} AS bucket_ns, {agg_expr} AS n{sm}\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND {bucket_col} {lower_op} {start_ns} AND {bucket_col} <= {end_ns}"
     );
     for clause in extra_predicates {
         sql.push_str("\n  AND ");
         sql.push_str(clause.as_sql());
     }
     sql.push_str(match projection {
-        ScanProjection::Lean => "\nGROUP BY fingerprint, step",
+        ScanProjection::Lean => "\nGROUP BY fingerprint, bucket_ns",
         ScanProjection::WithStructuredMetadata => {
-            "\nGROUP BY fingerprint, step, structured_metadata"
+            "\nGROUP BY fingerprint, bucket_ns, structured_metadata"
         }
     });
     Ok(sql)
@@ -2510,122 +2510,122 @@ mod tests {
         (
             "Lean RawCount Exclusive 1svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step",
+                r"GROUP BY fingerprint, bucket_ns",
             ],
         ),
         (
             "Lean RawCount Inclusive 1svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step",
+                r"GROUP BY fingerprint, bucket_ns",
             ],
         ),
         (
             "Lean RawBytes Exclusive 1svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, sum(length(body)) AS n",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step",
+                r"GROUP BY fingerprint, bucket_ns",
             ],
         ),
         (
             "Lean RawBytes Inclusive 1svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, sum(length(body)) AS n",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step",
+                r"GROUP BY fingerprint, bucket_ns",
             ],
         ),
         (
             "WithStructuredMetadata RawCount Exclusive 1svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step, structured_metadata",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
         ),
         (
             "WithStructuredMetadata RawCount Inclusive 1svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step, structured_metadata",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
         ),
         (
             "WithStructuredMetadata RawBytes Exclusive 1svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, sum(length(body)) AS n, structured_metadata",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step, structured_metadata",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
         ),
         (
             "WithStructuredMetadata RawBytes Inclusive 1svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, sum(length(body)) AS n, structured_metadata",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, sum(length(body)) AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns >= 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step, structured_metadata",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
         ),
         (
             "WithStructuredMetadata RawCount Exclusive 3svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service IN ('checkout', 'edge', 'ipcase')",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step, structured_metadata",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
         ),
         (
             "WithStructuredMetadata RawCount Exclusive 1svc 1pred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"PREWHERE service = 'checkout'",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
                 r"  AND body LIKE '%CONN\\_REFUSED%'",
-                r"GROUP BY fingerprint, step, structured_metadata",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
         ),
         (
             "WithStructuredMetadata RawCount Exclusive 0svc nopred",
             &[
-                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS step, count() AS n, structured_metadata",
+                r"SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - 1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, count() AS n, structured_metadata",
                 r"FROM log_samples",
                 r"WHERE fingerprint IN (18374, 99120)",
                 r"  AND timestamp_ns > 1699999940000000000 AND timestamp_ns <= 1700003600000000000",
-                r"GROUP BY fingerprint, step, structured_metadata",
+                r"GROUP BY fingerprint, bucket_ns, structured_metadata",
             ],
         ),
     ];
