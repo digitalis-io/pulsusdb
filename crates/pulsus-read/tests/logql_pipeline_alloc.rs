@@ -805,9 +805,21 @@ fn per_row_allocation_bounds_hold() {
     // The ceiling is set from TWO measurements, so it separates the
     // profile it pins from the regression it exists to catch:
     //
-    //   reused buffers (this tree)                18.00 allocations/row
+    //   reused buffers (this tree)                17.00 allocations/row
     //   `merge_buf`/`sm_buf`/`sm_scratch` freshly
     //     allocated per row                       21.00 allocations/row
+    //
+    // The first figure was 18.00/row until issue #507 moved this leg's
+    // range from `[5s]` to `[10s]` (a range EQUAL to the step lowers the
+    // aggregation into SQL and plans `client: None`, which this leg
+    // cannot drive). Re-measured the same way, by setting the ceiling to
+    // 0 and reading the panic:
+    //   `cargo test -p pulsus-read --test logql_pipeline_alloc`
+    //   -> "340048 allocations over 20000 rows (17.00/row)".
+    // The SECOND figure was not re-measured against the new range; it is
+    // the pre-#507 reading of the un-reused shape and is kept because the
+    // ceiling's job — admit reuse, refuse per-row allocation — does not
+    // turn on its exact value.
     //
     // Both measured by this leg with the ceiling temporarily set to 0 and
     // reading the panic message (`cargo nextest run -p pulsus-read -E
@@ -832,7 +844,14 @@ fn per_row_allocation_bounds_hold() {
             structured_metadata: format!(r#"{{"trace":"t{i}"}}"#),
         })
         .collect();
-    let sm_expr = pulsus_logql::parse(r#"count_over_time({a="b"}[5s])"#).expect("parse");
+    // **A 10s range against the 5s step, and the mismatch is deliberate**
+    // (issue #507): a range EQUAL to the step lowers the aggregation into
+    // the statement and plans `client: None`, which this leg — whose
+    // subject is the CLIENT path's per-row allocation profile — cannot
+    // drive. A range SHORTER than the step would leave half the rows in
+    // no window at all and the group count below would drop to 10 000, so
+    // the wider range is the one that keeps every row in the measurement.
+    let sm_expr = pulsus_logql::parse(r#"count_over_time({a="b"}[10s])"#).expect("parse");
     let Plan::Metric(sm_mp) = plan(&sm_expr, &params, &plan_ctx).expect("plan") else {
         panic!("expected a Metric plan");
     };

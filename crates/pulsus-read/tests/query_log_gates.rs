@@ -2504,3 +2504,390 @@ async fn a_pushed_parsed_name_filter_never_drops_a_row_the_evaluator_keeps() {
          witnesses cannot tell a wider predicate from an exact one"
     );
 }
+
+// ---------------------------------------------------------------------
+// W2 (issue #507): the bucketed range read, end to end.
+// ---------------------------------------------------------------------
+
+/// One series of a matrix answer: its sorted labels, and its points as
+/// `(timestamp, value bits)` so "bit for bit" is literally that.
+type AnswerSeries = (Vec<(String, String)>, Vec<(i64, u64)>);
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct BucketedSeedRow {
+    service: String,
+    fingerprint: u64,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
+    structured_metadata: String,
+}
+
+/// Seeds the two-stream fixture the bucketed differential reads, into a
+/// fresh database, and returns `(admin, db, T)` where `T` is the emit
+/// grid's first point.
+///
+/// **The two streams fold into ONE output series**, which is the shape
+/// that separates folding before emission from folding after it:
+///
+/// ```text
+/// fp 111   {app=a,           service_name=…}   rows carry metadata lvl=info
+/// fp 222   {app=a, lvl=info, service_name=…}   rows carry none
+/// ```
+///
+/// ```text
+/// grid            T        T+60    T+120   T+180   T+240
+/// fp 111 rows     2 (info)   -        -      1       -
+/// fp 222 rows     -          -        3      -       -
+/// folded series   2          -        3      1       -
+/// ```
+///
+/// Two further rows on fp 111 at the first grid point — one with
+/// `lvl=warn`, one with no metadata at all — make three output series, so
+/// "everything at this grid point" is not the same answer as "this
+/// series at this grid point".
+async fn seed_bucketed_corpus() -> (ChClient, String, i64) {
+    const STEP: i64 = 60_000_000_000;
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_bucket_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    // A grid point on a round multiple of the step, an hour back, so the
+    // whole fixture sits inside one partition and one retention window.
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    let service = "c507bucket";
+    for (fp, labels) in [
+        (
+            111u64,
+            format!(r#"{{"app":"a","service_name":"{service}"}}"#),
+        ),
+        (
+            222u64,
+            format!(r#"{{"app":"a","lvl":"info","service_name":"{service}"}}"#),
+        ),
+    ] {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), \
+                     {fp}, '{service}', '{labels}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+    }
+
+    let row = |fp: u64, ts: i64, body: &str, sm: &str| BucketedSeedRow {
+        service: service.to_string(),
+        fingerprint: fp,
+        timestamp_ns: ts,
+        severity: 0,
+        body: body.to_string(),
+        structured_metadata: sm.to_string(),
+    };
+    let info = r#"{"lvl":"info"}"#;
+    let rows = vec![
+        // Grid point T, window (T-60s, T].
+        row(111, t - 30_000_000_000, "a", info),
+        row(111, t - 20_000_000_000, "b", info),
+        row(111, t - 25_000_000_000, "c", r#"{"lvl":"warn"}"#),
+        row(111, t - 10_000_000_000, "d", ""),
+        // Grid point T+120s: fp 222 only — the point fp 111 has a gap at.
+        row(222, t + 90_000_000_000, "e", ""),
+        row(222, t + 95_000_000_000, "f", ""),
+        row(222, t + 100_000_000_000, "g", ""),
+        // Grid point T+180s: fp 111 only.
+        row(111, t + 150_000_000_000, "h", info),
+    ];
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the bucketed fixture");
+    (admin, db, t)
+}
+
+/// **The lowered answer is the client answer, bit for bit — and the two
+/// answers come from two different code paths** (issue #507, W2).
+///
+/// `count_over_time({…}[1m])` at a 1m step is a clean bucketed chain and
+/// plans `client: None`, so the database counts. The same selector with
+/// `| drop zzz` — a label the corpus does not carry, so the stage changes
+/// no label set — is a pipeline, so it plans `client: Some(..)` and every
+/// line crosses the wire to be counted here. The answers must be
+/// identical, which is what `Fidelity::Equivalent` claims for the four
+/// counting reducers.
+///
+/// The plan shapes are asserted first. Without that the test could be
+/// comparing one path against itself and would pass for the wrong reason.
+///
+/// It also pins the GAP: the folded series carries a point wherever
+/// either fingerprint had a row and no point at the two grid points where
+/// neither did — not a zero, not a NaN, no point.
+#[tokio::test]
+async fn a_bucketed_range_read_answers_exactly_what_the_client_path_answers() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 4 * STEP,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let lowered_query = format!(r#"count_over_time({{service_name="{service}"}}[1m])"#);
+    let client_query = format!(r#"count_over_time({{service_name="{service}"}} | drop zzz [1m])"#);
+
+    // The two paths, asserted to BE two paths.
+    let shape = |query: &str| match plan(&parse(query).expect("parse"), &params, &plan_ctx(&db))
+        .expect("plan")
+    {
+        Plan::Metric(mp) => mp,
+        _ => panic!("expected a metric plan"),
+    };
+    assert!(
+        shape(&lowered_query).client.is_none(),
+        "the fixture query must lower its aggregation into the statement"
+    );
+    assert!(
+        shape(&client_query).client.is_some(),
+        "the control query must stay on the client path, or this compares one path with itself"
+    );
+
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    let answer = |query: String| {
+        let engine = &engine;
+        let params = &params;
+        async move {
+            let (result, _warnings) = engine
+                .query(&parse(&query).expect("parse"), params)
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let QueryResult::Matrix(series) = result else {
+                panic!("{query}: expected a matrix");
+            };
+            let mut out: Vec<AnswerSeries> = series
+                .into_iter()
+                .map(|s| {
+                    let mut labels = s.labels;
+                    labels.sort();
+                    (
+                        labels,
+                        s.points
+                            .into_iter()
+                            .map(|(ts, v)| (ts, v.to_bits()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+    let lowered = answer(lowered_query).await;
+    let client = answer(client_query).await;
+
+    assert_eq!(
+        lowered, client,
+        "the lowered answer and the client answer must agree bit for bit"
+    );
+
+    // The fixture's own expectation, so a shared defect in both paths
+    // cannot pass this test: three series, and the folded one carries
+    // points only where a contributing row exists.
+    assert_eq!(lowered.len(), 3, "{lowered:?}");
+    let folded = lowered
+        .iter()
+        .find(|(labels, _)| labels.contains(&("lvl".to_string(), "info".to_string())))
+        .expect("the folded series");
+    assert_eq!(
+        folded.1,
+        vec![
+            (t, 2.0f64.to_bits()),
+            (t + 2 * STEP, 3.0f64.to_bits()),
+            (t + 3 * STEP, 1.0f64.to_bits()),
+        ],
+        "a grid point with no contributing row is not emitted at all"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The grid-resolution guard holds on the bucketed path too** (issue
+/// #507, W2).
+///
+/// The client path reaches `window::ensure_grid_resolution` by building a
+/// `ClientWindow::Range`; the bucketed path builds no window, so the guard
+/// is called from the arm itself. Without that call an over-cap grid would
+/// be answered instead of refused — a query that 422s today would start
+/// returning a matrix — and no other assertion in the tree would notice.
+///
+/// Both queries below ask for 14 400 intervals against a cap of 11 000:
+/// the lowered one and the client-path control, which must refuse the same
+/// way. The corpus must resolve at least one stream, because the guard
+/// sits after stream resolution on both paths.
+#[tokio::test]
+async fn an_over_cap_grid_is_refused_on_the_bucketed_path_as_on_the_client_path() {
+    skip_unless_live!();
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    // 4 hours at a 1s step: 14 400 intervals, against MAX_CLIENT_AGG_BUCKETS.
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 14_400_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+    for (query, path) in [
+        (
+            format!(r#"count_over_time({{service_name="{service}"}}[1s])"#),
+            "the bucketed path",
+        ),
+        (
+            format!(r#"count_over_time({{service_name="{service}"}} | drop zzz [1s])"#),
+            "the client path",
+        ),
+    ] {
+        let err = engine
+            .query(&parse(&query).expect("parse"), &params)
+            .await
+            .expect_err("an over-cap grid must be refused");
+        assert!(
+            matches!(err, ReadError::QueryTooBroad(_)),
+            "{path}: expected the named buckets refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("11000"),
+            "{path}: the refusal must name the cap, got {err}"
+        );
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}
+
+/// **The `/explain` seam reports the statement the engine issues** (issue
+/// #507, W2).
+///
+/// `LogQlEngine::explain` refused a range plan with no client aggregation
+/// until W2, arguing — correctly at the time — that the engine would
+/// refuse it too. The engine now serves it, so an EXPLAIN that still
+/// refused would be a wrong answer on a route a user can reach.
+///
+/// **This is the only caller of that seam in the repository**: the
+/// `X-Pulsus-Explain` header routes through `query_explained`, which
+/// collects the payload from the EXECUTION path. So the twin had no
+/// coverage at all, and a break placed in it stayed green everywhere —
+/// measured, which is why this test exists.
+///
+/// The assertion is equality with the executing path's own reported
+/// statement, not a snapshot: the two come from one function and this is
+/// what holds them there.
+#[tokio::test]
+async fn the_explain_seam_reports_the_bucketed_statement_the_reader_issues() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let (admin, db, t) = seed_bucketed_corpus().await;
+    let service = "c507bucket";
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t + 4 * STEP,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let expr = parse(&format!(
+        r#"count_over_time({{service_name="{service}"}}[1m])"#
+    ))
+    .expect("parse");
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    let explained = engine.explain(&expr, &params).await.expect("explain");
+    let reported = explained
+        .stages
+        .iter()
+        .find(|s| s.name == "metric_read")
+        .map(|s| s.sql.clone())
+        .expect("the explain payload names the metric read");
+    assert!(
+        reported.contains("AS bucket_ns") && reported.contains("GROUP BY fingerprint, bucket_ns"),
+        "the explain seam must report the BUCKETED statement, got:\n{reported}"
+    );
+    assert_eq!(
+        explained.routing.as_ref().map(|r| r.reason.as_str()),
+        Some("raw: bucketed range aggregation (issue #507)")
+    );
+
+    // The executing path's own reported statement, for the same query.
+    let (_r, _w, executed) = engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("query with explain");
+    let issued = executed
+        .stages
+        .iter()
+        .find(|s| s.name == "metric_read")
+        .map(|s| s.sql.clone())
+        .expect("the execution payload names the metric read");
+    assert_eq!(
+        reported, issued,
+        "the explain seam and the executing path must report ONE statement"
+    );
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}

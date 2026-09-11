@@ -285,8 +285,16 @@ fn check_c_pipeline_invalid_constructions_are_canonical_and_counted() {
         // label_replace: ` prefix and quotes no reference-verbatim text,
         // and the WRAPPED-form reporting (#276) is on the other branch,
         // untouched.
+        // Issue #507 (W2) takes TWO out of `exec.rs` and adds none:
+        // 14 -> 12. Both were the same refusal — a range metric plan
+        // reaching the SQL-aggregated path — one in the reader and its
+        // deliberate twin in EXPLAIN, each arguing the state was
+        // structurally unreachable. The routing relaxation makes the
+        // state reachable and both arms now serve it. #240's sweep
+        // numbers stand: neither carried a regex or reference-verbatim
+        // text.
         ("plan.rs", 17),
-        ("exec.rs", 14),
+        ("exec.rs", 12),
         ("client_agg.rs", 1),
         ("fold.rs", 1),
         ("post_agg.rs", 5),

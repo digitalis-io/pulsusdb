@@ -1373,15 +1373,20 @@ fn the_compile_sites_are_enumerated_from_the_callers_of_the_compiler() {
         ),
         (
             "exec.rs",
-            4,
+            5,
             0,
-            "streams :612, metric :906 (incl. every binary leaf), detected_fields :2290, tail \
-             :2576. `POSITIONS` reaches the first TWO and no more: every position is a \
-             `query_range`-shaped log or metric query, so nothing in this file executes \
-             `detected_fields` or `tail`. Those two call sites are therefore UNCOVERED by \
-             this file, and left visibly so — the sub-grammar RULE they would exercise is \
-             the same one the streams positions already pin, but the sites themselves are \
-             not driven by anything here",
+            "streams :1160, metric :1444 (incl. every binary leaf), the bucketed range \
+             read's capability-join fallback :1639, detected_fields :2979, tail :3271 — \
+             line numbers current at issue #507, which added the third and found the other \
+             four stale by unrelated growth. `POSITIONS` reaches the first TWO and no more: \
+             every position is a `query_range`-shaped log or metric query, so nothing in \
+             this file executes `detected_fields` or `tail`. Those two call sites are \
+             therefore UNCOVERED by this file, and left visibly so — the sub-grammar RULE \
+             they would exercise is the same one the streams positions already pin, but the \
+             sites themselves are not driven by anything here. The bucketed fallback is a \
+             fifth site no position needs: it compiles `bucketed_fallback_client_agg`'s \
+             pipeline, which is EMPTY by construction, so no user stage of any kind reaches \
+             that compiler",
         ),
         (
             "plan.rs",

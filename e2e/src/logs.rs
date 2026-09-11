@@ -4538,15 +4538,27 @@ mod tests {
     /// Runs one leaf `MetricPlan`'s client-aggregation over the corpus
     /// records the leaf's selector matches — the same pure sequence the
     /// engine executes post-fetch.
+    ///
+    /// **A leaf with no client aggregation is evaluated down the fallback
+    /// the engine itself takes** (issue #507): a clean bucketed chain
+    /// lowers its aggregation into SQL and plans `client: None`, and this
+    /// helper holds its records in memory rather than issuing a
+    /// statement. `bucketed_fallback_client_agg` is the SAME function the
+    /// engine's capability join uses, so the two cannot drift; what this
+    /// leg then checks is the ANSWER, not the lowered statement.
     fn evaluate_leaf_hermetically(
         corpus: &LogCorpus,
         mp: &pulsus_read::logql::MetricPlan,
         service: &str,
     ) -> pulsus_read::logql::QueryResult {
-        let client = mp
-            .client
-            .as_ref()
-            .expect("fixture metric leaves are client-aggregated");
+        let fallback;
+        let client = match mp.client.as_ref() {
+            Some(client) => client,
+            None => {
+                fallback = pulsus_read::logql::bucketed_fallback_client_agg(mp);
+                &fallback
+            }
+        };
         let compiled =
             pulsus_read::logql::CompiledPipeline::compile(&client.pipeline).expect("compile");
         let meta = std::collections::HashMap::from([(

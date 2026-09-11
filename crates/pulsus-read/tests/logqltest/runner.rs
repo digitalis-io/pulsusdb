@@ -70,9 +70,9 @@ use pulsus_read::logql::template::TemplateEnv;
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, DetectedFieldOut, DetectedFieldsProbe, Direction, MatrixSeries,
     MetricNode, MetricPlan, Plan, PlanCtx, QueryParams, QueryResult, QuerySpec, Warnings,
-    apply_label_replace, apply_vector_aggs, combine_binary, ensure_result_series,
-    final_series_gate_applies, materialize_vector_lit, plan, run_client_agg_rows_folded,
-    run_variants_rows,
+    apply_label_replace, apply_vector_aggs, bucketed_fallback_client_agg, combine_binary,
+    ensure_result_series, final_series_gate_applies, materialize_vector_lit, plan,
+    run_client_agg_rows_folded, run_variants_rows,
 };
 
 /// A sorted label set.
@@ -1176,12 +1176,30 @@ fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, Stri
     }
 }
 
-/// Evaluates one client-aggregated metric leaf over the store — the
-/// engine's exact post-fetch sequence (compile → aggregate → vector aggs).
+/// Evaluates one metric leaf over the store — the engine's exact
+/// post-fetch sequence (compile → aggregate → vector aggs).
+///
+/// **A plan with no client aggregation is evaluated down the fallback the
+/// engine itself takes** (issue #507). Since W2 a clean bucketed chain
+/// lowers the aggregation into SQL and plans `client: None`; this runner
+/// holds its rows in memory and never issues a statement, so it cannot
+/// execute that path. It builds the client aggregation the lowered chain
+/// is equivalent to — `bucketed_fallback_client_agg`, the SAME function
+/// the engine's capability join uses — and evaluates that.
+///
+/// So the corpus checks the ANSWER these queries must give and does not
+/// check that the lowered statement gives it. That second half is the
+/// live differential's, and the two are not interchangeable: a defect in
+/// the grid column would leave this suite green.
 fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
-    let client = mp.client.as_ref().ok_or_else(|| {
-        "logqltest supports only client-aggregated (raw-scan) metric plans (Batch 0)".to_string()
-    })?;
+    let fallback;
+    let client = match mp.client.as_ref() {
+        Some(client) => client,
+        None => {
+            fallback = bucketed_fallback_client_agg(mp);
+            &fallback
+        }
+    };
     let compiled = compile_for_corpus(&client.pipeline)?;
     // Issue #236 Part B: the folded seam, so the corpus exercises the
     // engine's ACTUAL sequence — innermost aggregation folded at the leaf

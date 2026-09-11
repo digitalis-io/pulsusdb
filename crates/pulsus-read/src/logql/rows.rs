@@ -181,6 +181,38 @@ pub struct MetricInstantRow {
     pub structured_metadata: String,
 }
 
+/// A bucketed range-query partial (issue #507, W2): one
+/// `(fingerprint, grid point, structured_metadata)` group from
+/// [`crate::logql::sql::metric_range_bucketed`], which counts in the
+/// database instead of returning one row per log line.
+///
+/// `bucket_ns` is the emit GRID POINT — the anchored ceiling
+/// `lo + intDiv(timestamp_ns - lo + step - 1, step) * step` with
+/// `lo = grid_start_ns - step_ns`, so a row's bucket is the grid point
+/// whose window `(g - range, g]` contains it. It is a timestamp, never a
+/// duration, which is why it is `Int64` on both sides.
+///
+/// `n` is `count()` or `sum(length(body))` — both `UInt64`, both exact
+/// under client-side addition, which is what lets the four counting
+/// reducers claim [`crate::compile::plan::Fidelity::Equivalent`] on this
+/// path.
+///
+/// `structured_metadata` is LAST, the [`MetricInstantRow`]/[`SampleRow`]
+/// convention. Empty string = none. The column is carried raw and
+/// uninterpreted; the reader decides what it means.
+///
+/// **One row type, always four columns.** [`crate::logql::sql::ScanProjection::Lean`]
+/// would drop the fourth, and its only caller is `absent_over_time`, which
+/// is never lowered onto this path — the same argument [`MetricInstantRow`]
+/// already carries.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricRangeBucketRow {
+    pub fingerprint: u64,
+    pub bucket_ns: i64,
+    pub n: u64,
+    pub structured_metadata: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

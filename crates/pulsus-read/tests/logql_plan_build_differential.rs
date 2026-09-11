@@ -309,28 +309,49 @@ fn both_return_bool_states_and_every_vector_matching_shape_are_planned() {
     }
 }
 
-/// Issue #241 — the invariant `run_metric_inner`'s refusal rests on:
-/// **every planned RANGE leaf is client-aggregated.**
+/// Issues #241 and #507 — **every planned range leaf that is NOT a clean
+/// bucketed chain is client-aggregated, and a clean one is not.**
 ///
-/// `metric_plan` forces `client = Some(..)` for every `QuerySpec::Range`
-/// (`plan.rs`'s `metric_plan`, the `|| is_range` disjunct), so the
-/// SQL-aggregated
-/// range arm's guard — `client.is_none() && step_ns.is_some()` — is
-/// unsatisfiable. That arm is removed; what stands in its place is an
-/// internal refusal, and this is the tripwire that catches a planner
-/// change reintroducing the state before a request does.
+/// This said `every planned range leaf is client-aggregated` until #507,
+/// because `metric_plan` forced `client = Some(..)` for every
+/// `QuerySpec::Range`. W2 removes that for one shape — one of the four
+/// counting reducers, nothing in the pipeline beyond a pushable line
+/// filter, and a range equal to the step — and `exec.rs`'s range arm,
+/// which refused the state as unreachable, now serves it. A test still
+/// asserting the deleted invariant would be a green suite claiming the
+/// opposite of the behaviour, so it is restated rather than removed.
+///
+/// **Both halves run over the same corpus**, under two `step` values that
+/// differ in nothing else:
+///
+/// ```text
+///   step 60s, every range `[5m]`   range > step   nothing lowers
+///   step  5m, every range `[5m]`   range == step  the clean shapes lower
+/// ```
+///
+/// The classifier is written here from the QUERY, not imported from the
+/// planner, so the two cannot agree by construction.
+///
+/// **The golden itself is untouched by #507, and that is luck.** Every
+/// range in `CORPUS` is `[5m]` against `range_params`' 60 s step, so no
+/// plan the golden records lowers and none of their `client` fields moved.
+/// A corpus row whose range equalled its step would move the golden and
+/// its digest, which `characterization_freeze.rs` refuses. The second half
+/// below carries its OWN params for exactly that reason — it must not be
+/// added to `CORPUS`.
 ///
 /// **Scope, so nobody reads this as the proof.** The PROOF is a total
 /// read of the only `MetricPlan` constructor: `git grep -n "MetricPlan {"
-/// -- crates` has one production hit, `plan.rs`'s `metric_plan`, and
-/// `|| is_range` is a total statement about it. This test covers the
-/// corpus below — dozens of queries, not the query language — so it is a
-/// regression DETECTOR, not the establishing argument.
+/// -- crates` has one production hit, `plan.rs`'s `metric_plan`. This
+/// test covers the corpus below — dozens of queries, not the query
+/// language — so it is a regression DETECTOR, not the establishing
+/// argument.
 ///
-/// Non-vacuity is asserted by a leaf count, not by the test passing: a
-/// corpus that planned nothing would satisfy a bare `all()`.
+/// Non-vacuity is asserted by counts, not by the test passing: a corpus
+/// that planned nothing, or one where nothing lowered, would satisfy a
+/// bare `all()`.
 #[test]
-fn every_planned_range_leaf_is_client_aggregated() {
+fn every_planned_range_leaf_that_is_not_a_clean_bucketed_chain_is_client_aggregated() {
     let c = ctx();
     let params = range_params();
     let mut leaves = 0usize;
@@ -365,6 +386,80 @@ fn every_planned_range_leaf_is_client_aggregated() {
         planned >= 40 && leaves >= 40,
         "the range corpus collapsed: {planned} plans / {leaves} metric leaves — a vacuous \
          pass here would prove nothing"
+    );
+
+    // --- the clean case, asserted positively ------------------------
+    //
+    // The same corpus at a step EQUAL to every range it contains. A leaf
+    // lowers exactly when its query names one of the four counting
+    // reducers with nothing piped after the selector; the classifier is a
+    // scan of the query text, so it shares no helper with the planner.
+    let bucketed_params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: START_NS,
+            end_ns: END_NS,
+            step_ns: 300_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let clean_bucketed = |query: &str| {
+        let reducers = [
+            "count_over_time({",
+            "bytes_over_time({",
+            "rate({",
+            "bytes_rate({",
+        ];
+        // `variants(...)` plans ONE multi-extractor scan with
+        // `force_client = true` — its leaf is a scan shared by every
+        // variant, not a chain of its own, so it never lowers however
+        // clean the extractor looks.
+        reducers.iter().any(|r| query.contains(r))
+            && !query.contains('|')
+            && !query.contains("variants(")
+    };
+    let mut lowered = 0usize;
+    let mut client = 0usize;
+    for query in &all_queries() {
+        let expr = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        let Ok(p) = plan(&expr, &bucketed_params, &c) else {
+            continue;
+        };
+        let mps: Vec<&pulsus_read::logql::MetricPlan> = match &p {
+            Plan::Streams(_) => Vec::new(),
+            Plan::Metric(mp) => vec![mp],
+            Plan::MetricBinary(node) => node.leaves(),
+        };
+        // A query holding several leaves can mix the two, so the
+        // classifier is applied to the WHOLE query only where it holds one.
+        if mps.len() != 1 {
+            continue;
+        }
+        for mp in mps {
+            if clean_bucketed(query) {
+                lowered += 1;
+                assert!(
+                    mp.client.is_none(),
+                    "`{query}` is a clean bucketed chain at a step equal to its range, so \
+                     its aggregation must lower into the statement (issue #507)"
+                );
+                assert_eq!(
+                    mp.routing.reason, "raw: bucketed range aggregation (issue #507)",
+                    "{query}"
+                );
+            } else {
+                client += 1;
+                assert!(
+                    mp.client.is_some(),
+                    "`{query}` is not a clean bucketed chain, so it must stay \
+                     client-aggregated (issues #241 / #507)"
+                );
+            }
+        }
+    }
+    assert!(
+        lowered >= 4 && client >= 4,
+        "the positive half is vacuous: {lowered} lowered / {client} client-aggregated"
     );
 }
 

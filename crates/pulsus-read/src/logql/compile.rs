@@ -702,10 +702,34 @@ impl Lower<Lql> for WindowLower {
     /// content to drift; its one failure mode is the join dropping a half,
     /// which is what the planner's own exhaustive match is for.
     ///
-    /// **Why the range may not exceed the step.** The expression gives one
-    /// grid point per row. With a range wider than the step an entry
-    /// belongs to several windows at once, and no single column can say
-    /// which.
+    /// **Why the range must equal the step, in both directions.** The
+    /// expression gives one grid point per row: the smallest grid point at
+    /// or above it, which is the window `(g - step, g]`. The window being
+    /// evaluated is `(g - range, g]`.
+    ///
+    /// * With a range WIDER than the step an entry belongs to several
+    ///   windows at once, and no single column can say which.
+    /// * With a range SHORTER than the step the entries in
+    ///   `(g - step, g - range]` belong to no window at all, and the
+    ///   column counts them into `g` anyway:
+    ///
+    /// ```text
+    ///   step 60s, range 10s, grid points 0 and 60
+    ///     the window        (-10, 0]   (50, 60]
+    ///     the grid column   (-60, 0]   ( 0, 60]   <- a row at 30 counted
+    /// ```
+    ///
+    /// This condition was `range <= step` when the model was written and
+    /// nothing executed from it; the shorter-range case is the one the
+    /// `<=` admitted and the statement answers wrongly (issue #507, the
+    /// W2 execution path).
+    ///
+    /// **Widening it again moves a frozen golden**, and the fact that
+    /// narrowing it did not is luck rather than design: every range in
+    /// `tests/golden/plan_build_differential.txt`'s corpus is `[5m]`
+    /// against a 60 s step, so no plan in it lowers. See the same note at
+    /// `plan.rs`'s `bucketed_range`, which is the other half of this
+    /// decision.
     fn capability(&self, s: &LqlLink, _rel: &Relation<Lql>) -> Capability {
         let LqlLink::Window {
             range_ns,
@@ -716,7 +740,7 @@ impl Lower<Lql> for WindowLower {
         else {
             return Capability::No(BlockReason::NotYetLowered);
         };
-        if *step_ns <= 0 || *range_ns <= 0 || range_ns > step_ns {
+        if *step_ns <= 0 || *range_ns <= 0 || range_ns != step_ns {
             return Capability::No(BlockReason::NotYetLowered);
         }
         if grid_start_ns.checked_sub(*step_ns).is_none() {
@@ -833,6 +857,37 @@ impl Lower<Lql> for RangeAggLower {
             rel.shape.kind = LqlKind::Series;
         }
         Ok(rel)
+    }
+    /// `Equivalent` for the four reducers [`RangeAggLower::capability`]
+    /// admits, and the argument is per reducer rather than inherited.
+    ///
+    /// | reducer | lowered aggregate | why the client's sum is bit-identical |
+    /// |---|---|---|
+    /// | `count_over_time` | `count()` | the reader sums `u64` partials; integer addition is associative and exact, so the sum over the metadata variants equals a single accumulator |
+    /// | `bytes_over_time` | `sum(length(body))` | same, over byte lengths, also `u64` |
+    /// | `rate` | `count()` | the divisor is applied ONCE per folded series, after summing — one division of an exact integer sum, never a sum of divided values |
+    /// | `bytes_rate` | `sum(length(body))` | same |
+    ///
+    /// No float is summed anywhere on this path, which is what makes
+    /// `Equivalent` available at all; the ten reducers that take an `f64`
+    /// through `| unwrap` never reach here (`capability` refuses them), so
+    /// this says nothing about them.
+    ///
+    /// Any other link is residual, and the fold does not consult
+    /// `fidelity` for a residual link — the `Wider` fallback is
+    /// unobservable rather than a claim.
+    fn fidelity(&self, s: &LqlLink, _rel: &Relation<Lql>) -> Fidelity {
+        match s {
+            LqlLink::RangeAgg {
+                op:
+                    RangeAggOp::CountOverTime
+                    | RangeAggOp::BytesOverTime
+                    | RangeAggOp::Rate
+                    | RangeAggOp::BytesRate,
+                ..
+            } => Fidelity::Equivalent,
+            _ => Fidelity::Wider,
+        }
     }
     /// **Shape unchanged** — `Lines` whenever the `Unwrap` above went
     /// residual, which is the case its own row describes; clears `exact`.
@@ -1725,12 +1780,15 @@ mod tests {
         how[chain.len() - 1]
     }
 
-    /// Issue #507, W2 — a window lowers when the selector's range fits
-    /// inside the emit grid's step, and not otherwise.
+    /// Issue #507, W2 — a window lowers when the selector's range is
+    /// exactly the emit grid's step, and not otherwise.
     ///
-    /// The expression gives one grid point per row, so a range wider than
-    /// the step would put an entry in several windows at once and no single
-    /// column could say which.
+    /// The expression gives one grid point per row — the smallest grid
+    /// point at or above it, i.e. the window `(g - step, g]`. A range
+    /// WIDER than the step would put an entry in several windows at once
+    /// and no single column could say which; a range SHORTER than the step
+    /// leaves the entries in `(g - step, g - range]` in no window at all,
+    /// and the column counts them into `g` regardless.
     ///
     /// **This is the chain-decidable half of a two-part decision.** Whether
     /// the grid's arithmetic is representable depends on the request's time
@@ -1738,18 +1796,24 @@ mod tests {
     /// `logql::predicate::bucket_expr` answers that half and the planner
     /// takes the conjunction.
     #[test]
-    fn a_window_lowers_only_when_its_range_fits_inside_the_step() {
+    fn a_window_lowers_only_when_its_range_is_exactly_the_step() {
         const MIN: i64 = 60_000_000_000;
         let lowered = Disposition::Lowered(Fidelity::Equivalent);
         let blocked = Disposition::Residual(ResidualReason::Blocked(BlockReason::NotYetLowered));
-        // range == step, and range < step.
+        // range == step.
         assert_eq!(
             window_how(&[], RangeAggOp::CountOverTime, MIN, MIN),
             lowered
         );
+        // range < step: the entries between the windows belong to none of
+        // them, and the grid column cannot say so.
         assert_eq!(
             window_how(&[], RangeAggOp::CountOverTime, MIN / 2, MIN),
-            lowered
+            blocked
+        );
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN - 1, MIN),
+            blocked
         );
         // range > step: one entry, several windows.
         assert_eq!(
@@ -1785,7 +1849,9 @@ mod tests {
     fn a_range_aggregation_lowers_only_on_a_clean_exact_bucketed_chain() {
         const MIN: i64 = 60_000_000_000;
         let count = RangeAggOp::CountOverTime;
-        let lowered = Disposition::Lowered(Fidelity::Wider);
+        // `Equivalent` since the execution path landed: the reader sums
+        // `u64` partials, which is exact — see `RangeAggLower::fidelity`.
+        let lowered = Disposition::Lowered(Fidelity::Equivalent);
 
         // The row every other row is a one-clause perturbation of.
         assert_eq!(agg_how(&[], count, MIN, MIN), lowered);
@@ -1810,6 +1876,44 @@ mod tests {
         assert_eq!(
             agg_how(&[r#"|= ip("10.0.0.0/8")"#], count, MIN, MIN),
             Disposition::Residual(ResidualReason::Blocked(BlockReason::NotExact))
+        );
+    }
+
+    /// Issue #507, W2 — **the four lowered reducers are `Equivalent`, and
+    /// the claim is per reducer.**
+    ///
+    /// `Equivalent` means the evaluator must NOT re-apply the link: the
+    /// database's per-group partials ARE the answer. That is true here
+    /// because every one of the four accumulates a `u64` — `count()` or
+    /// `sum(length(body))` — and integer addition is associative and
+    /// exact, and because the rate divisor is applied once per folded
+    /// series after the sum rather than per partial.
+    ///
+    /// `exec.rs`'s `the_rate_divisor_is_applied_to_the_summed_count` and
+    /// `two_metadata_variants_at_one_grid_point_sum_into_one_point` are
+    /// the reader-side halves of the same claim; this is the disposition
+    /// the fold reports.
+    #[test]
+    fn the_four_lowered_reducers_are_equivalent_not_wider() {
+        const MIN: i64 = 60_000_000_000;
+        for op in [
+            RangeAggOp::CountOverTime,
+            RangeAggOp::BytesOverTime,
+            RangeAggOp::Rate,
+            RangeAggOp::BytesRate,
+        ] {
+            assert_eq!(
+                agg_how(&[], op, MIN, MIN),
+                Disposition::Lowered(Fidelity::Equivalent),
+                "{op}"
+            );
+        }
+        // And the window above them, whose `Equivalent` is a different
+        // statement — a grid column removes no row — asserted here so the
+        // two are not read as one.
+        assert_eq!(
+            window_how(&[], RangeAggOp::CountOverTime, MIN, MIN),
+            Disposition::Lowered(Fidelity::Equivalent)
         );
     }
 
@@ -1885,7 +1989,7 @@ mod tests {
         const MIN: i64 = 60_000_000_000;
         assert_eq!(
             agg_how(&[], RangeAggOp::Rate, MIN, MIN),
-            Disposition::Lowered(Fidelity::Wider),
+            Disposition::Lowered(Fidelity::Equivalent),
             "the control: a rate over no unwrap lowers, so the row below is about the unwrap"
         );
         assert_eq!(

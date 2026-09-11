@@ -2812,4 +2812,81 @@ mod tests {
             "the refusals must not be reachable from an ordinary grid"
         );
     }
+
+    /// Issue #507, W2 — **the row type's field names ARE the statement's
+    /// column aliases, and the two are written in different languages.**
+    ///
+    /// The reader decodes with `RowBinaryWithNamesAndTypes` (validation is
+    /// on by default in `pulsus_clickhouse::ChClient::query_stream`), so
+    /// the database checks each returned column's NAME against the
+    /// derive's `COLUMN_NAMES`. A renamed alias in `sql.rs` or a renamed
+    /// field in `rows.rs` is therefore a runtime decode failure against a
+    /// live database, and nothing else in the tree notices. This is the
+    /// check that notices, without one.
+    ///
+    /// It compares the aliases the renderer emits, in order, with the
+    /// derive's names — not a snapshot of the statement text, which would
+    /// also move for a hundred reasons that are not this one.
+    #[test]
+    fn the_bucketed_row_type_is_named_for_the_statements_own_columns() {
+        use crate::logql::rows::MetricRangeBucketRow;
+        use pulsus_clickhouse::Row;
+
+        let f = W0Fixtures::new();
+        let sql = metric_range_bucketed(
+            MetricSource::new("log_samples", MetricShape::RawCount),
+            &f.one_service,
+            &f.fingerprints,
+            BucketedScan {
+                window: TimeWindow {
+                    start_ns: 1_699_999_940_000_000_000,
+                    end_ns: 1_700_003_600_000_000_000,
+                },
+                lower: ScanLowerBound::Exclusive,
+                lo_ns: 1_699_999_940_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            &f.no_predicate,
+            ScanProjection::WithStructuredMetadata,
+        )
+        .expect("an ordinary grid renders");
+
+        // The SELECT list, split on TOP-LEVEL commas: the grid expression
+        // carries a comma of its own inside `intDiv(...)`, so a plain
+        // `split(',')` would read it as two columns.
+        let select = sql
+            .strip_prefix("SELECT ")
+            .expect("the statement opens with its projection")
+            .lines()
+            .next()
+            .expect("the projection is one line");
+        let mut items: Vec<&str> = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (i, c) in select.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(&select[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        items.push(&select[start..]);
+        // An aliased column is named by its alias; a bare one by itself.
+        let names: Vec<&str> = items
+            .iter()
+            .map(|item| item.trim().rsplit(" AS ").next().expect("a column name"))
+            .collect();
+
+        assert_eq!(
+            names,
+            <MetricRangeBucketRow as Row>::COLUMN_NAMES,
+            "the statement's columns and `MetricRangeBucketRow`'s fields must agree by \
+             NAME and in ORDER — the decode binds on the name, and one of these two is \
+             SQL text the compiler never reads"
+        );
+    }
 }

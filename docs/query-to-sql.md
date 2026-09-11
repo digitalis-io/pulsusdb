@@ -49,10 +49,14 @@ document's own sentences — is regenerated or re-taken **after** the edit that 
 Three figures were shipped stale that way in one week, the third being a sentence in part 9 that
 quoted seven positions the same commit's regenerators had already corrected in the dataset.
 
-**The code in part 2 does not exist yet.** Nothing in this tree makes the per-stage decision part 2
-describes, so every statement marked *from the design* was worked out from the design record and
-**was not produced by our code**. That sentence applies to every such block in the document and is
-not repeated at each one.
+**Part 2's machinery exists in the tree; the statements marked *from the design* were not produced
+by it.** Issue #507's W0, W2 and W3 landed the per-stage decision part 2 describes, so the sentence
+that nothing in this tree makes it is no longer true. What has not changed is the provenance of the
+blocks: a statement marked *from the design* was worked out from the design record **before that code
+existed**, and has not been re-derived from it since. The marking therefore means *not produced by our
+code*, and never meant *our code could not produce it*. Re-deriving the marked blocks from the shipped
+renderers is a separate pass and has not been done. That sentence applies to every such block in the
+document and is not repeated at each one.
 
 **Statements marked *decided here* were run.** They are this document's own decisions, and each was
 executed against `clickhouse/clickhouse-server:26.3`, server version 26.3.17.110, over the corpus of
@@ -187,7 +191,8 @@ A **range** query is not. Every one reads raw lines over the whole window, with 
 bucket column and no `LIMIT`, and is aggregated in `pulsus-server`:
 
 ```sql
--- emitted today, sql.rs:996 — every range metric query, without exception
+-- emitted today, sql.rs:996 — every range metric query EXCEPT a clean
+-- bucketed chain, which metric_range_bucketed serves (issue #507 W2)
 SELECT fingerprint, timestamp_ns, body, structured_metadata
 FROM log_samples
 PREWHERE service = 'checkout'
@@ -199,20 +204,24 @@ ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC
 The `ORDER BY` there is the table's own primary key `(service, fingerprint, timestamp_ns)`, so
 ClickHouse streams the rows and sorts nothing (`sql.rs:973-985`).
 
-**`metric_range` is unreachable from a request.** It renders
-`intDiv(bucket_ns, <step>) * <step> AS step` over a rollup table, but reaching it needs the routing
-decision `RouteChoice::Rollup`, and that arm requires a range query (`plan.rs:2022`), while `let client = if … || is_range`
-(`plan.rs:1826`) forces every range query onto the client-aggregated path first. The function is
-kept and tested; no request reaches it. The same argument makes `MetricShape::RollupCount` and
-`MetricShape::RollupBytes` — `sum(count)` and `sum(bytes)`, `sql.rs:105`, `sql.rs:107` — unreachable
-text.
+**`metric_range` is unreachable from a request, and issue #507 W2 changed the reason without
+changing the conclusion.** It renders `intDiv(bucket_ns, <step>) * <step> AS step` over a rollup
+table, and reaching it needs `RouteChoice::Rollup` (`plan.rs:2105`). Two separate things now keep
+that arm away from it. A range query that is **not** a clean bucketed chain is still put on the
+client-aggregated path by `let client = if … || is_range` (`plan.rs:1826`), unchanged. A range query
+that **is** one no longer takes that path in substance — it is served by a lowered statement — but it
+is routed by the `else if bucketed_range` arm (`plan.rs:2076`), which chooses `RouteChoice::Raw`
+unconditionally and sits **before** the rollup-eligibility test, and the statement it renders is
+`metric_range_bucketed`, not `metric_range`. The function is kept and tested; no request reaches it.
+The same argument makes `MetricShape::RollupCount` and `MetricShape::RollupBytes` — `sum(count)` and
+`sum(bytes)`, `sql.rs:105`, `sql.rs:107` — unreachable text.
 
 ### 1.2 LogQL — the ten stage kinds
 
 `Stage` has exactly ten variants (`crates/pulsus-logql/src/ast.rs:133`); `Parser` has four of its
 own (`ast.rs:237`, `:242`, `:248`, `:251`), listed separately below.
 
-Two functions decide everything in this table. `compile_line_filters` (`plan.rs:3052`) walks the
+Two functions decide everything in this table. `compile_line_filters` (`plan.rs:3135`) walks the
 stages and collects the ones that become predicates on `body`. `has_unpushed_dropping_stage`
 (`plan.rs:1655`) decides whether the read is one statement or a page loop.
 
@@ -223,7 +232,7 @@ stages and collects the ones that become predicates on `body`. `has_unpushed_dro
 | `\|~ "re"` | `match(body, 're')` | *emitted today*, `predicate.rs:950`. Not anchored: a LogQL line filter searches for a substring |
 | `!~ "re"` | `NOT (match(body, 're'))` | *emitted today*, `predicate.rs:521` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | *emitted today*, `predicate.rs:500`. A filter with one value is not wrapped, so its text is unchanged |
-| `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3086`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
+| `\|= ip("10.0.0.0/8")` | none | *evaluated after the read*. `is_pushable_line_filter` returns `false` (`plan.rs:3169`), the stage is skipped, and **the walk continues** — a later literal filter still compiles. What holds it back is pruning, not information — §5.1 |
 | `\| json` | none | *evaluated after the read*. `metric_pipeline_construct` returns `"json"` (`plan.rs:1688`) |
 | `\| logfmt` | none | *evaluated after the read*, `plan.rs:1689` |
 | `\| regexp "…"` | none | *evaluated after the read*, `plan.rs:1690` |
@@ -756,7 +765,7 @@ after the read, `stage3_keyset` (`sql.rs:625`) when something does.
 | `\|~ "re"` | `match(body, 're')` | `WHERE`, third statement | *emitted today*. Whether a granule can be skipped depends on whether ClickHouse can pull a required substring out of the pattern and test it against the body indexes. **That was not measured here**, so no figure is claimed for it |
 | `!~ "re"` | `NOT (match(body, 're'))` | `WHERE`, third statement | *emitted today*. As `!=` |
 | `\|= "a" or "b"` | `((body LIKE '%a%') OR (body LIKE '%b%'))` | `WHERE`, third statement | *emitted today*. A granule survives if it can hold either alternative, so the prune is the union |
-| `\|= ip("10.0.0.0/8")` | none | — | *evaluated after the read* (`plan.rs:3086`). The walk skips it and asks the next stage, so a later literal filter still compiles — §2.8's LogQL58. What holds it back is that no predicate it could render prunes: `BlockReason::NotPushable` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`), which is a cost, not a boundary — §5.1 |
+| `\|= ip("10.0.0.0/8")` | none | — | *evaluated after the read* (`plan.rs:3169`). The walk skips it and asks the next stage, so a later literal filter still compiles — §2.8's LogQL58. What holds it back is that no predicate it could render prunes: `BlockReason::NotPushable` (`crates/pulsus-read/src/compile/fold.rs:682`, answered at `crates/pulsus-read/src/logql/compile.rs:337`), which is a cost, not a boundary — §5.1 |
 | `\| json` | none of its own; it makes a name `k` resolve to `JSONExtractString(body, 'k')` | nothing until a later stage names `k` | **decided here.** A parser is not a filter and adds no predicate. `JSONExtractString` decodes `\uXXXX` escapes in both the key and the value, and so does our parser, so the two agree byte for byte whenever the value is a JSON string. On a repeated key both take the **first** occurrence (measured: `JSONExtractString('{"a":"x","a":"y"}','a')` is `x`; our parser renames the second to `a_extracted`, `pipeline.rs:5934`) |
 | `\| logfmt` | none of its own; `k` resolves to `extractKeyValuePairs(body, '=', ' \t\r\n', '"')['k']` | as above | **decided here.** The delimiter set is `' \t\r\n'`, not a single space, because the reference's decoder ends a key or an unquoted value at any byte at or below `0x20` (`pkg/logql/log/logfmt/decode.go`, the `c <= ' '` arms @ `v3.7.4`). Measured over eleven awkward lines; one shape disagrees and the escape guard covers it |
 | `\| regexp "re"` | none of its own; the *n*-th capture group resolves to `extractGroups(body, '(?-s)re')[n]` | as above | **decided here.** The `(?-s)` prefix is load-bearing and was measured: ClickHouse compiles this pattern with RE2's dot-matches-newline option **on**, so `extractGroups('a\nb', '(?P<x>a.b)')` answers `['a\nb']` while `extractGroups('a\nb', '(?-s)(?P<x>a.b)')` answers `[]`. The reference leaves that option off. Our line-filter path already carries the same prefix for the same reason (`escape.rs:213-236`) |
@@ -882,7 +891,7 @@ remove. **The answer must be `200`:**
 ```
 
 **What it avoids.** **Today's statement already carries `body LIKE '%pod-044%'`** — a label filter
-does not end the line-filter walk (`plan.rs:3052-3070`, whose `_ => {}` arm falls through) — so the
+does not end the line-filter walk (`plan.rs:3135-3153`, whose `_ => {}` arm falls through) — so the
 comparison is one term against two, not nothing against something. Run against this corpus today's
 statement returns **three** of the four lines and the new one returns **one**: the two lines whose
 `level` is `warn` and `info` stop crossing the network and stop being parsed a second time in
@@ -1336,7 +1345,7 @@ is not in the statement. **The answer must be `200`:**
 ```
 
 The `192.168.0.9` line is in the statement's rows and not in the answer: `pulsus-server` removes it.
-`|= ip(…)` does not become SQL (`plan.rs:3086`). It is the **first** stage here, and the walk does not
+`|= ip(…)` does not become SQL (`plan.rs:3169`). It is the **first** stage here, and the walk does not
 treat it as the end: the `or` group written after it still compiles. An engine that stopped at the
 first refusal would emit no `body` term and read every `ipcase` line.
 
@@ -1720,7 +1729,7 @@ sequenceDiagram
 ```
 
 Under `crates/`: the route is mounted at `pulsus-server/src/logs_api/mod.rs:55-59` and planned at
-`pulsus-read/src/logql/plan.rs:1020`. The three passes this engine replaces are `plan.rs:3052`,
+`pulsus-read/src/logql/plan.rs:1020`. The three passes this engine replaces are `plan.rs:3135`,
 `plan.rs:1655` and `plan.rs:1680`. Evaluation after the read is `logql/pipeline.rs:1168`. The
 TraceQL equivalents are `traces/search_plan.rs:1083`, `traces/search_sql.rs:153` and
 `traces/exec.rs:1747`.
@@ -2005,7 +2014,7 @@ LIMIT 100
 {"status":"success","data":{"resultType":"streams","result":[{"stream":{"env":"prod","pod":"pod-044","service_name":"checkout"},"values":[["1788256778283683840","this line is not json at all and mentions CONN_REFUSED as a bare word"],["1788256775283683840","{\"level\":\"error\",\"status\":500,\"code\":\"ERR_CONN_REFUSED_7734\",\"msg\":\"request completed for pod-044\",\"dur_ms\":12.5}"]]}]}}
 ```
 
-Reaches the changed code through `compile_line_filters` (`plan.rs:3052`) and
+Reaches the changed code through `compile_line_filters` (`plan.rs:3135`) and
 `predicate::line_filter` (`predicate.rs:492`). No stage forces evaluation after the read, so
 ClickHouse genuinely executes this predicate.
 
@@ -2349,7 +2358,7 @@ renders exactly as written (`escape.rs:157-160`).
 {service_name="ipcase"} |= ip("10.0.0.0/8")
 ```
 
-**SQL today** — one statement per page, `sql.rs:625`, with **no `body` term at all**. `is_pushable_line_filter` is `false` (`plan.rs:3086`), so `compile_line_filters` skips it; `has_unpushed_dropping_stage` returns `true` (`plan.rs:1668`), so the read becomes a page loop.
+**SQL today** — one statement per page, `sql.rs:625`, with **no `body` term at all**. `is_pushable_line_filter` is `false` (`plan.rs:3169`), so `compile_line_filters` skips it; `has_unpushed_dropping_stage` returns `true` (`plan.rs:1668`), so the read becomes a page loop.
 
 ```sql
 SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata
@@ -4944,7 +4953,7 @@ engine will read, and what it will return:
 | LogQL stream count | 100,000 fingerprints | `logql/params.rs:121` |
 | LogQL byte scan budget | `reader.logql_scan_budget_bytes`, default 50 GiB | field at `pulsus-config/src/model.rs:354`, default at `:511`. Exhausting it returns the entries already kept, with `stats.pulsus_partial: true` |
 | LogQL per-query memory | `reader.logql_read_max_memory_bytes`, default 8 GiB | field at `model.rs:431`, default at `:524`; exceeding it is `422`. The setting refuses rather than writing intermediate state to disk |
-| LogQL result bytes | 1 GiB still held when the statement ends | `logql/charge.rs:1270`; refused `422`, never cut short |
+| LogQL result bytes | 1 GiB still held when the statement ends | `logql/charge.rs:1290`; refused `422`, never cut short |
 | LogQL over-fetch factor | `reader.logql_pipeline_scan_factor`, default 10 | field at `model.rs:376`, default at `:512`. Applies only while a stage that drops lines is evaluated after the read |
 | TraceQL candidates | `reader.traceql_max_candidates`, default 100,000 | field at `model.rs:388`, default at `:514`. Per first statement and for the merged set |
 | TraceQL batch size | 32 traces | `traces/exec.rs:114` |
@@ -5017,11 +5026,17 @@ cheaper than having the next reader find them.
 ### Argued
 
 - **`metric_range` is unreachable from a request.** Reaching it needs `RouteChoice::Rollup`
-  (`plan.rs:2022`), which needs a range query, and `plan.rs:1826` puts every range query on the
-  client-aggregated path before that arm is considered. **What would falsify it:** removing
-  `|| is_range` from `plan.rs:1826`, or adding a second route to `RouteChoice::Rollup`. Neither is
-  detected by any test that would fail; the function's own tests would keep passing, because they
-  call it directly.
+  (`plan.rs:2105`), which needs a range query. Two conditions keep every range query away from that
+  arm: `plan.rs:1826` puts a range query that is not a clean bucketed chain on the client-aggregated
+  path, and `plan.rs:2076` routes a clean bucketed chain to `RouteChoice::Raw` before the rollup test
+  is reached, rendering `metric_range_bucketed`. **The original falsification condition — removing
+  `|| is_range` from `plan.rs:1826` — was met in substance by issue #507 W2 and did not falsify the
+  claim**, because the lowered path was given its own gate, its own routing arm and its own renderer
+  rather than being let through the old one. **What would falsify it now:** pointing the bucketed
+  path at `metric_range`; removing the `else if bucketed_range` arm so a bucketed plan reaches the
+  rollup-eligibility test; or adding any other route to `RouteChoice::Rollup`. None is detected by
+  any test that would fail; the function's own tests would keep passing, because they call it
+  directly.
 - **Every predicate marked *decided here* keeps at least the lines the query keeps.** The argument
   is the same in each case and has three steps. First, the expression agrees with the reference
   wherever both can see the value — established for `| json` by the escape decoding on both sides

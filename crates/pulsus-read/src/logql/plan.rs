@@ -1959,6 +1959,76 @@ fn metric_plan(
     let probes = build_probes(ctx, &months, &normalized.probe_keys);
 
     let extra_predicates = compile_line_filters(&range.selector.pipeline)?;
+
+    // Issue #507 (W2): **the clean bucketed shape lowers the aggregation
+    // into the statement.** The read returns one row per `(fingerprint,
+    // grid point, structured_metadata)` instead of one row per log line,
+    // so the plan carries no client aggregation at all and
+    // `super::exec`'s range arm reads the counts.
+    //
+    // Every condition below is the fold model's
+    // (`super::compile::RangeAggLower::capability` and
+    // `WindowLower::capability`), restated here because the routing
+    // decision is taken before any fold runs:
+    //
+    //   the reducer is one of the four that accumulate INTEGERS
+    //   nothing in the pipeline beyond a pushable line filter
+    //   step > 0, range == step, and `grid_start - step` is representable
+    //
+    // **Why the range must EQUAL the step rather than merely fit inside
+    // it.** The grid column (`super::predicate::bucket_expr`) is
+    // `lo + ceil((t - lo) / step) * step`, which gives every scanned row
+    // the smallest grid point at or above it — the window `(g - step, g]`.
+    // The reference's window is `(g - range, g]`. Those are the same set
+    // of rows only when `range == step`; with a shorter range the rows in
+    // `(g - step, g - range]` belong to no window at all, and one column
+    // cannot say so:
+    //
+    //   step 60s, range 10s, grid points 0 and 60
+    //     reference windows   (-10, 0]   (50, 60]
+    //     the grid column     (-60, 0]   ( 0, 60]   <- a row at 30 counted
+    //
+    // **Widening this equality moves a frozen golden, and the fact that it
+    // does not move one today is luck.** Every range in
+    // `tests/golden/plan_build_differential.txt`'s corpus is `[5m]` against
+    // a 60 s step, so nothing in it lowers and the golden and its digest
+    // are untouched by this issue. A corpus row with a range equal to its
+    // step, or a relaxation here, changes `client` on those plans and
+    // moves the golden — which `tests/characterization_freeze.rs` refuses
+    // and `logql_plan_build_differential.rs`'s replay refuses with it.
+    let bucketed_range = is_range
+        && !force_client
+        && !has_beyond_line_filter
+        && !has_unwrap
+        // Implied by the reducer set below — none of the four requires
+        // `| unwrap` and none is `absent_over_time` — but named so that a
+        // future change to `requires_unwrap` disables the lowering rather
+        // than silently widening it.
+        && !client_only_op
+        && matches!(
+            op,
+            RangeAggOp::CountOverTime
+                | RangeAggOp::BytesOverTime
+                | RangeAggOp::Rate
+                | RangeAggOp::BytesRate
+        )
+        // A range aggregation's own `by`/`without` is carried on
+        // `ClientAgg` and nothing on this path applies it. The parser
+        // already refuses a grouping on all four reducers
+        // (`RangeAggOp::allows_grouping`), so this is unreachable today —
+        // read it as the assertion that makes that unreachability a
+        // compile-time fact rather than a parser convention.
+        && client.as_ref().is_none_or(|c| c.grouping.is_none())
+        && match step_ns {
+            Some(step) => {
+                let step = step.get();
+                step > 0
+                    && range_ns.get() == step
+                    && grid_start_ns.checked_sub(step).is_some()
+            }
+            None => false,
+        };
+    let client = if bucketed_range { None } else { client };
     // A line filter constrains which log lines count; the rollup table
     // (`log_metrics_<res>`) has no `body` column to re-filter, so any
     // pipeline stage forces the raw fallback (docs/schemas.md §3.2: metric
@@ -2002,6 +2072,19 @@ fn metric_plan(
         RoutingDecision {
             chosen: RouteChoice::Raw,
             reason,
+        }
+    } else if bucketed_range {
+        // Issue #507 (W2). RAW, not rollup, and the choice is forced
+        // rather than preferred: the rollup table has no
+        // `structured_metadata` column, which is part of the output
+        // series identity on this path, and its 5 s buckets cannot
+        // express a window that is open below and closed above. Without
+        // this branch a bucketed plan would fall into the rollup
+        // eligibility test below, whose only input is whether the step
+        // divides the resolution.
+        RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: "raw: bucketed range aggregation (issue #507)".to_string(),
         }
     } else {
         match p.spec {
@@ -6745,5 +6828,143 @@ mod tests {
             assert_eq!(sp.probes.len(), row.probes, "{}: probes", row.query);
             assert_eq!(sp.result_limit, row.limit, "{}: result_limit", row.query);
         }
+    }
+
+    /// Issue #507, W2 — **the routing relaxation, one clause at a time.**
+    ///
+    /// A clean bucketed chain plans no client aggregation, which is what
+    /// sends it down `exec.rs`'s bucketed range read. Every other row
+    /// differs from the lowering row in ONE clause, so no row keeps its
+    /// client aggregation because a different clause refused first.
+    ///
+    /// The `rollup` assertion is not decoration: a `client: None` range
+    /// plan falls into the rollup-eligibility test, whose only input is
+    /// whether the step divides the resolution — and 60s divides the
+    /// fixture's 5s. Without the branch this issue adds, this plan would
+    /// route to a table that has no `structured_metadata` column.
+    #[test]
+    fn a_clean_bucketed_chain_plans_no_client_aggregation() {
+        const MIN: u64 = 60_000_000_000;
+        let spec = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: MIN,
+        };
+        let lowers = |query: &str| {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                mp.client.is_none(),
+                "{query} must lower its aggregation into the statement"
+            );
+            assert_eq!(
+                mp.routing.reason, "raw: bucketed range aggregation (issue #507)",
+                "{query}"
+            );
+            assert!(!mp.rollup, "{query} must route RAW, never rollup");
+            assert!(matches!(mp.routing.chosen, RouteChoice::Raw), "{query}");
+            mp
+        };
+        let stays_client = |query: &str, why: &str| {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                mp.client.is_some(),
+                "{query} must stay client-aggregated: {why}"
+            );
+            assert_ne!(
+                mp.routing.reason, "raw: bucketed range aggregation (issue #507)",
+                "{query}"
+            );
+        };
+
+        // The row every other row is a one-clause perturbation of, and its
+        // three siblings among the four counting reducers.
+        lowers(r#"count_over_time({a="b"}[1m])"#);
+        lowers(r#"bytes_over_time({a="b"}[1m])"#);
+        lowers(r#"rate({a="b"}[1m])"#);
+        lowers(r#"bytes_rate({a="b"}[1m])"#);
+        // A PUSHABLE line filter is already in the statement, so it does
+        // not stop the aggregation from joining it.
+        let filtered = lowers(r#"count_over_time({a="b"} |= "boom" [1m])"#);
+        assert_eq!(
+            filtered.extra_predicates.len(),
+            1,
+            "the line filter is pushed, not dropped"
+        );
+        // A vector aggregation is finished over the returned series and
+        // does not block the leaf.
+        lowers(r#"sum(count_over_time({a="b"}[1m]))"#);
+
+        // The range is WIDER than the step: one entry would belong to
+        // several windows and one grid column cannot say which.
+        stays_client(r#"count_over_time({a="b"}[2m])"#, "range > step");
+        // The range is SHORTER than the step: the entries between the
+        // windows belong to none of them, and the grid column would count
+        // them into the next point.
+        stays_client(r#"count_over_time({a="b"}[30s])"#, "range < step");
+        // A stage beyond a pushable line filter.
+        stays_client(r#"count_over_time({a="b"} | json [1m])"#, "a parser");
+        stays_client(
+            r#"count_over_time({a="b"} | logfmt | lvl="x" [1m])"#,
+            "a label filter",
+        );
+        stays_client(
+            r#"count_over_time({a="b"} |= ip("10.0.0.0/8") [1m])"#,
+            "a line filter that cannot be pushed",
+        );
+        stays_client(
+            r#"count_over_time({a="b"} | decolorize [1m])"#,
+            "decolorize",
+        );
+        // `| drop` and `| keep` act on the label set rather than on what
+        // the statement counts, so they could in principle lower. **They
+        // are blocking by decision, not by omission** (issue #507): the
+        // reader has no channel to receive the stages, because `ClientAgg`
+        // is the only carrier of the pipeline and a lowered chain has
+        // none, and giving it one means a new `MetricPlan` field and a
+        // ~180-line regeneration of a golden whose own doc says not to
+        // regenerate it. These two queries keep working exactly as they do
+        // today, on the client path, correct and unaccelerated.
+        stays_client(
+            r#"count_over_time({a="b"} | drop x [1m])"#,
+            "drop, by decision",
+        );
+        stays_client(
+            r#"count_over_time({a="b"} | keep x [1m])"#,
+            "keep, by decision",
+        );
+        // A reducer outside the four, and the one permanent refusal.
+        stays_client(
+            r#"sum_over_time({a="b"} | unwrap v [1m])"#,
+            "an f64 accumulator",
+        );
+        stays_client(r#"absent_over_time({a="b"}[1m])"#, "no row to compute from");
+        stays_client(
+            r#"rate({a="b"} | unwrap v [1m])"#,
+            "`rate` over an unwrap sums f64s",
+        );
+
+        // `grid_start - step` must be representable. At the bottom of the
+        // axis it is not, and the widened scan start saturates with it.
+        let low = QuerySpec::Range {
+            start_ns: i64::MIN + 1,
+            end_ns: i64::MIN + 1 + 600_000_000_000,
+            step_ns: MIN,
+        };
+        let mp = metric_mp(r#"count_over_time({a="b"}[1m])"#, low).expect("plan");
+        assert!(
+            mp.client.is_some(),
+            "an unrepresentable anchor keeps the client path"
+        );
+
+        // An instant query has no grid at all and is unaffected.
+        let mp = metric_mp(
+            r#"count_over_time({a="b"}[1m])"#,
+            QuerySpec::Instant {
+                at_ns: 600_000_000_000,
+            },
+        )
+        .expect("plan");
+        assert!(mp.step_ns.is_none());
+        assert_eq!(mp.routing.reason, "raw: instant query");
     }
 }
