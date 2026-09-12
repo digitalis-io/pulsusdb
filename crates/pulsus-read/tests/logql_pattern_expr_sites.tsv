@@ -48,8 +48,8 @@ Site	Literal	crates/pulsus-logql/tests/snapshots.rs:946	-	-	<method> <path> <_> 
 Site	Literal	crates/pulsus-read/src/logql/charge.rs:549	-	-	, 	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/compile.rs:1337	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/compile.rs:1716	-	-	<a>	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:5228	-	-	<x> y	accept	accept	-	-	-
-Site	Literal	crates/pulsus-read/src/logql/plan.rs:6481	-	-	<a>	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:5239	-	-	<x> y	accept	accept	-	-	-
+Site	Literal	crates/pulsus-read/src/logql/plan.rs:6492	-	-	<a>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/src/logql/predicate.rs:1188	-	-	{}	reject	reject	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_alloc.rs:198	-	-	<method> <path> <status> <took>	accept	accept	-	-	-
 Site	Literal	crates/pulsus-read/tests/logql_pipeline_golden.rs:1013	-	-	<method> <_> <status> took <took>	accept	accept	-	-	-

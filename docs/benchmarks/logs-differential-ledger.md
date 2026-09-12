@@ -6436,6 +6436,15 @@ gated by
 - **The bound.** Two answers differ by at most `2(n−1)·u·Σ|vᵢ|` with
   `u = 2⁻⁵³`. Measured against it: 1, 8 and 31 ULPs at `n` = 1e3, 1e5,
   1e6, against derived bounds of 3.29e-5, 2.90e-1 and 2.86e+1.
+- **The parse is not part of the divergence, and one setting is why.** The
+  statement carries `SETTINGS precise_float_parsing = 1`
+  (`sql.rs`'s `UNWRAP_PARSER_SETTING`). Without it `toFloat64OrNull` is not
+  correctly rounded — `'9367469347402735e292'` converts to
+  `0x7fe0acb5cadc2918`, where `f64::from_str` gives `0x7fe0acb5cadc2917` —
+  and at `n = 1` the bound above is zero, so that is the whole answer
+  rather than a last-bits difference. With the setting, each text measured
+  for the read's guard either converts to the same bits as `f64::from_str`
+  or converts to NULL, and a NULL sends the query to the evaluator.
 - **Why it is accepted.** The owner ruled that the floating-point
   summation moves into the database. Nothing here says an answer is wrong;
   it says which digits are not reproducible, and the bound says by how

@@ -64,7 +64,6 @@ docs/query-lowering.md	plan.rs:3310	ambiguous_basename
 docs/query-lowering.md	plan.rs:3317	ambiguous_basename
 docs/query-lowering.md	plan.rs:3336	ambiguous_basename
 docs/query-lowering.md	plan.rs:3588	ambiguous_basename
-docs/query-lowering.md	plan.rs:3591	ambiguous_basename
 docs/query-lowering.md	search_plan.rs:1042	blank_target_line
 docs/query-lowering.md	sql.rs:538	ambiguous_basename
 docs/query-lowering.md	traces/exec.rs:114	blank_target_line

@@ -2147,13 +2147,24 @@ fn metric_plan(
     // Issue #507 (W4): **the unwrapped bucketed shape** — the same
     // arrangement as `bucketed_range` above, over the number a
     // `| json | unwrap <name>` chain extracts rather than over a count of
-    // rows. The four reducers are the ones whose aggregate the database
-    // can compute; `rate_counter` is not an aggregate and is excluded at
-    // the type (`sql::UnwrapReducer`).
+    // rows. **Two reducers lower**, `sum_over_time` and `avg_over_time`,
+    // and `sql::UnwrapReducer` has exactly those two variants. The rest are
+    // excluded at the type: `rate_counter` is not an aggregate, and
+    // `stddev_over_time`/`stdvar_over_time` were withdrawn in review round 3
+    // after the database's stable variance came back FINITE and wrong over
+    // 300,000 samples — which is the one error shape the reader's
+    // non-finite guard cannot see. The test that fails if they come back is
+    // `tests/query_log_gates.rs`'s
+    // `the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value`.
     //
-    // These four all REQUIRE `| unwrap`, so `client_only_op` is true for
-    // every one of them and the counting shape above can never admit them.
-    // That is why this is a second predicate rather than another clause.
+    // Both REQUIRE `| unwrap`, so `client_only_op` is true for each of them
+    // and the counting shape above can never admit them. That is why this
+    // is a second predicate rather than another clause.
+    //
+    // The grouping conjunct below is live here rather than an assertion:
+    // `avg_over_time` admits a postfix `by`/`without`
+    // (`RangeAggOp::allows_grouping`), where none of the counting four
+    // does, and nothing on this path applies one.
     let unwrapped_range = if is_range
         && !force_client
         && !has_unwrap_conversion(pipeline)

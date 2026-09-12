@@ -2966,6 +2966,14 @@ struct SumRow {
 async fn the_database_sum_is_not_the_evaluators_order_but_stays_inside_the_bound() {
     skip_unless_live!();
     let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4sum_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4sum_{}",
         uuid::Uuid::new_v4().simple()
@@ -3120,6 +3128,52 @@ struct PartCountRow {
     n: u64,
 }
 
+/// One database name, for [`drop_leftovers_of`].
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct DbNameRow {
+    name: String,
+}
+
+/// Drops every database whose name starts with `stem`, then returns how
+/// many it dropped.
+///
+/// **Why a suite needs this at all.** A test that names its database with
+/// a UUID and drops it on the last line leaves that database behind
+/// whenever it fails — and a break test, which is how this suite's
+/// assertions are shown to work, fails on purpose. Each such run would
+/// leak one database for good.
+///
+/// **What it can reach.** `stem` is composed through
+/// `pulsus_testkit::test_db`, so it begins with this checkout's
+/// `PULSUS_TEST_CH_DATABASE_PREFIX` and the sweep cannot see another
+/// agent's databases — whose live run is indistinguishable from their
+/// leftovers.
+async fn drop_leftovers_of(admin: &ChClient, stem: &str) -> usize {
+    let mut names = admin
+        .query_stream::<DbNameRow>(
+            &format!("SELECT name FROM system.databases WHERE startsWith(name, '{stem}')"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("list leftover databases");
+    let mut found = Vec::new();
+    while let Some(row) = names.next().await {
+        found.push(row.expect("decode a database name").name);
+    }
+    drop(names);
+    for name in &found {
+        admin
+            .execute(
+                &format!("DROP DATABASE IF EXISTS {name}"),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("drop a leftover database");
+    }
+    found.len()
+}
+
 /// The unwrapped-value corpus both W4 gates read: `n` deterministic values
 /// of mixed magnitude and sign, one fingerprint, one JSON body each.
 ///
@@ -3178,6 +3232,14 @@ async fn the_thread_count_spread_stays_inside_the_summation_bound() {
     skip_unless_live!();
     const N: u64 = 1_000_000;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4spread_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4spread_{}",
         uuid::Uuid::new_v4().simple()
@@ -3323,6 +3385,14 @@ async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
     const N: u64 = 1_000_000;
     const THREADS: u64 = 1;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4parts_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4parts_{}",
         uuid::Uuid::new_v4().simple()
@@ -3441,39 +3511,42 @@ async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
 // class of parser disagreement.
 // ---------------------------------------------------------------------
 
-/// **The four classes, each with the value that produces it** (issue #507
-/// W4).
+/// **One case per measured class, each with the value that produces it**
+/// (issue #507 W4, review round 4).
 ///
 /// ```text
 ///  case        value                       expected     the two parsers
 ///  ordinary    45.25, "2.25", 4            LOWERS       agree; the quoted form is the point
-///  class A     "E12"                       FALLS BACK   0 here, a parse error in ours
-///  class B     "1.7976931348623159e308"    FALLS BACK   f64::MAX here, inf in ours
-///  class C     "5e-324"                    FALLS BACK   0 here, 1 ulp in ours
+///  one_ulp     "9367469347402735e292"      LOWERS       agree ONLY under the parser setting
+///  class A     "E12"                       FALLS BACK   NULL here, a parse error in ours
+///  class B     "1.7976931348623159e308"    FALLS BACK   NULL here, inf in ours
+///  class C     "5e-324"                    LOWERS       bits 0x1 on both sides
 ///  over        "inf"                       FALLS BACK   both parse it; the prefix test does not
-///  nan_exp     "0e999999"                  FALLS BACK   a negative NaN here, +0 in ours
-///  under_exp   "9999999999999999e-324"     FALLS BACK   0 here, 0x000730d67819e8d2 in ours
+///  nan_exp     "0e999999"                  FALLS BACK   both +0; the denotation clause refuses it
+///  under_exp   "9999999999999999e-324"     LOWERS       bits 0x730d67819e8d2 on both sides
 ///  shadowed    metadata latency=5, bodies 7 and 8       FALLS BACK   TWO series, keyed by the
 ///                                                       parsed value under latency_extracted
-///  fixed_sub   "0.000…0005", 326 chars     FALLS BACK   the same underflow, no exponent
+///  fixed_sub   "0.000…0005", 326 chars     LOWERS       bits 0x1 on both sides
 ///  avg_over    two × 1e308, avg_over_time  FALLS BACK   inf here, 1e308 in ours — a FINITE
 ///                                                       mean turned into infinity
 /// ```
 ///
-/// **Class C falls back now and did not before**, and the earlier reading
-/// was wrong rather than merely narrow: the bound `2(n−1)·u·Σ|vᵢ|` is ZERO
-/// at `n = 1` and is `Σ|vᵢ|`-relative otherwise, so a value that underflows
-/// to zero on one side is only "absorbed" in a corpus where it is not the
-/// sum. `"9999999999999999e-324"` is the same family at a magnitude where
-/// that is obvious.
+/// **Three cases moved from FALLS BACK to LOWERS in review round 4**, and
+/// the reason is one statement-level setting rather than a change to the
+/// guard. `sql::UNWRAP_PARSER_SETTING` renders `precise_float_parsing = 1`
+/// into the statement; under it C, `under_exp` and `fixed_sub` convert to
+/// the same bits as `f64::from_str` and qualify. `one_ulp` is the case that
+/// makes the setting necessary rather than tidy: with `n = 1` the
+/// summation-order bound `2(n−1)·u·Σ|vᵢ|` is ZERO, so the default parser's
+/// `0x7fe0acb5cadc2918` against our `0x7fe0acb5cadc2917` is a wrong answer
+/// with nothing to absorb it. Delete the setting from `metric_range_unwrapped`
+/// and this case is what goes red.
 ///
-/// A and B are what the guard is FOR: without the anchored prefix test a
-/// `"E12"` contributes `0` to a sum where the evaluator makes an error
-/// series, and without the overflow equality a `f64::MAX` sits where the
-/// evaluator has an `inf`. C is the accepted divergence, asserted against
-/// the bound rather than bit for bit. The over-rejection is the guard
-/// being conservative where it cannot be sure, and it falls back rather
-/// than answering wrongly.
+/// A and B are still refused, now by `isNotNull`: both texts convert to
+/// NULL under the setting. `over` and `nan_exp` are over-rejections — the
+/// two parsers agree on `"inf"` and on `"0e999999"` — kept because dropping
+/// a conjunct widens the lowered set, which is not a thing to do on one
+/// setting at the end of a wave.
 ///
 /// **The control is the same query with `| drop zzz` after the unwrap** —
 /// a label filter after the unwrap blocks the lowering, and one naming a label the
@@ -3489,6 +3562,14 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
     skip_unless_live!();
     const STEP: i64 = 60_000_000_000;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4unwrap_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4unwrap_{}",
         uuid::Uuid::new_v4().simple()
@@ -3522,11 +3603,25 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
     /// row carries, the structured metadata on every row, the reducer, and
     /// whether the lowered query is expected to fall back.
     type UnwrapCase<'a> = (&'a str, u64, &'a [&'a str], &'a str, &'a str, bool);
-    let cases: [UnwrapCase<'_>; 10] = [
+    let cases: [UnwrapCase<'_>; 11] = [
         (
             "ordinary",
             201,
             &["45.25", "\"2.25\"", "4"],
+            "",
+            "sum_over_time",
+            false,
+        ),
+        // Review round 4: ONE row, so the summation-order bound is zero
+        // and the only slack is the parser's. The default parser converts
+        // this text to `0x7fe0acb5cadc2918` and `f64::from_str` gives
+        // `0x7fe0acb5cadc2917`; the statement's
+        // `SETTINGS precise_float_parsing = 1` is what makes the two sides
+        // equal, and this case is what reddens without it.
+        (
+            "one_ulp",
+            211,
+            &["\"9367469347402735e292\""],
             "",
             "sum_over_time",
             false,
@@ -3540,13 +3635,17 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
             "sum_over_time",
             true,
         ),
+        // Review round 4: under the parser setting this converts to bits
+        // `0x1`, which is what `f64::from_str` gives, so it QUALIFIES and
+        // the two paths must answer the same bits. It fell back before the
+        // setting, when the conversion was `0`.
         (
             "class_c",
             204,
             &["1", "\"5e-324\""],
             "",
             "sum_over_time",
-            true,
+            false,
         ),
         (
             "over_reject",
@@ -3558,7 +3657,10 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
         ),
         // Review round 1: a digit with an exponent that overflows, and one
         // that underflows. Both pass the anchored prefix test, so the hole
-        // was never in that test.
+        // was never in that test. Review round 4: under the parser setting
+        // `"0e999999"` converts to `+0` rather than to a negative NaN, and
+        // what refuses it now is the denotation clause — an over-rejection,
+        // since our parser also gives `+0`.
         (
             "nan_exp",
             206,
@@ -3567,23 +3669,29 @@ async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
             "sum_over_time",
             true,
         ),
+        // Review round 4: the same move as `class_c` at a magnitude where
+        // the old divergence was obvious — `0` against
+        // `0x730d67819e8d2`. Under the setting both sides convert to
+        // `0x730d67819e8d2`.
         (
             "under_exp",
             207,
             &["1", "\"9999999999999999e-324\""],
             "",
             "sum_over_time",
-            true,
+            false,
         ),
         // Review round 2: the same underflow written WITHOUT an exponent,
-        // which is why the guard now asks what the text DENOTES.
+        // which is why the guard asks what the text DENOTES rather than how
+        // it is spelled. Review round 4: under the parser setting this
+        // converts to bits `0x1` on both sides, so it lowers.
         (
             "fixed_subnormal",
             209,
             &["1", fixed_subnormal.as_str()],
             "",
             "sum_over_time",
-            true,
+            false,
         ),
         // Review round 2: two accepted samples whose SUM overflows where
         // the reference's incremental mean does not — the database
@@ -3802,6 +3910,14 @@ async fn the_spread_reducers_are_not_lowered_and_answer_the_evaluators_value() {
     skip_unless_live!();
     const STEP: i64 = 60_000_000_000;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let swept = drop_leftovers_of(
+        &admin,
+        &pulsus_testkit::test_db("pulsus_read_it_qlg_w4spread2_"),
+    )
+    .await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4spread2_{}",
         uuid::Uuid::new_v4().simple()
@@ -3959,6 +4075,15 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
     skip_unless_live!();
     const STEP: i64 = 60_000_000_000;
     let admin = ChClient::new(test_config()).await.expect("connect admin");
+    // Review round 4: this test had no teardown at all, so every run left
+    // its database behind. The end of the test drops it; this sweeps what
+    // earlier runs left, including the deliberate failures a break test
+    // produces, which never reach the end.
+    let stem = pulsus_testkit::test_db("pulsus_read_it_qlg_w4kappa_");
+    let swept = drop_leftovers_of(&admin, &stem).await;
+    if swept > 0 {
+        eprintln!("dropped {swept} database(s) an earlier run of this test left behind");
+    }
     let db = pulsus_testkit::test_db(&format!(
         "pulsus_read_it_qlg_w4kappa_{}",
         uuid::Uuid::new_v4().simple()
@@ -4178,4 +4303,13 @@ async fn the_three_boundary_corpora_behave_as_their_condition_number_says() {
         }
     }
     assert_eq!(out.len(), 3, "all three corpora ran");
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
 }

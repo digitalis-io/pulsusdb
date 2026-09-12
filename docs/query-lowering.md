@@ -404,7 +404,7 @@ disagrees on **463**; and the model below disagrees on **0**.
 
 **What that 0 covers, stated wherever the number appears.** The comparison is the **ordered list of
 line-filter values the model would conjoin** against the ordered list a **transcription** of
-`compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:3300`) emits — not against emitted
+`compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:3311`) emits — not against emitted
 SQL, and not against a running server. So 0 means the two agree on **which filters push and in what
 order**, over that atom set at that chain length. It does **not** cover the operator each filter
 renders, the escaping, the rest of the statement, or any stage the atom set does not contain. Two
@@ -831,7 +831,7 @@ measurement.
 **Two shipped instances, and they are the whole of today's multi-statement structure.**
 
 - LogQL resolves the selector to fingerprints over `log_streams_idx`
-  (`crates/pulsus-read/src/logql/sql.rs:442`), then reads `log_streams` and `log_samples` filtered
+  (`crates/pulsus-read/src/logql/sql.rs:491`), then reads `log_streams` and `log_samples` filtered
   on `fingerprint IN (…)` (`sql.rs:489`, `sql.rs:538`). Three statements, two cuts. The seed is the
   fingerprint list, bounded by `DEFAULT_MAX_STREAMS = 100_000`
   (`crates/pulsus-read/src/logql/params.rs:121`).
@@ -954,7 +954,7 @@ instance below is LogQL's, and it is the only one.
 
 **Shipped instance:** `StreamsPlan::fetch_until_limit` (`crates/pulsus-read/src/logql/plan.rs:80`,
 set at `:1625` from `has_unpushed_dropping_stage`, `:1655`), and when it is set the read is one
-statement per page through `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:821`) with
+statement per page through `stage3_keyset` (`crates/pulsus-read/src/logql/sql.rs:870`) with
 `scan_limit = result_limit × reader.logql_pipeline_scan_factor`. §2.7.7 is what can turn this cut
 off.
 
@@ -1128,7 +1128,7 @@ on every run.
 | the request's limit, window and step | **yes** |
 | a seed's plan-time upper bound | **yes** — every one is a request parameter, a config field or a named constant |
 | a seed's rendered size against the two ceilings | **yes**, O(1), no round trip |
-| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:479`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
+| how many rows a predicate will match — its selectivity | **no.** There is no statistics catalogue, and the only two shipped ways to get a number are round-trip probes: the regular-expression matcher `count()` probe (`crates/pulsus-read/src/logql/sql.rs:528`) and the grouping cardinality pre-flight. **No rule in §2.7 may depend on selectivity**, and none does |
 | the per-row cost of a database-side expression against the cost of transporting the row | **no.** Nothing measures it. Under the cost model of §9.1 it does not matter; if that model is ever revised this is the first number needed |
 | behaviour across shards | **out of scope** by owner ruling on [#492](https://github.com/digitalis-io/pulsusdb/issues/492) |
 | behaviour at 1 TB | **no** — [#25](https://github.com/digitalis-io/pulsusdb/issues/25) |
@@ -1687,7 +1687,7 @@ lists and none in neither.
 - `plan.rs:1092` (`QuerySpanTooLong`), `plan.rs:1123` and `plan.rs:1840` (`InvalidStep`),
   `plan.rs:2614`, `plan.rs:2792`, `plan.rs:2808` (`QueryTooBroad`) — **request parameters and
   resource guards, not a link payload.** They refuse the request before any chain exists.
-- `plan.rs:2851` — one `reject` closure returned from three conditions (`plan.rs:2859`,
+- `plan.rs:2851` — one `reject` closure returned from three conditions (`plan.rs:2870`,
   `plan.rs:2618`, `plan.rs:2627`; those three are call sites, not constructions, so they are not
   among the 25). It states the shape a `variants(…)` operand must have, and `Variants` is
   **out of scope, named** in the synthesised-link table above. Reachable, and checked:
@@ -2281,7 +2281,7 @@ load ≤ 1.41, is on [#478](https://github.com/digitalis-io/pulsusdb/issues/478)
 ### 9.6 The stopping rule: what the first version of this document got wrong
 
 The fold originally returned at the first refusal. Measured on **#507**'s LogQL corpus, against the
-shipped `compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:3300`) transcribed as the
+shipped `compile_line_filters` (`crates/pulsus-read/src/logql/plan.rs:3311`) transcribed as the
 oracle, over every chain of length 3 built from 15 concrete LogQL atoms parsed with our real
 parser — an equality on the **ordered** list of pushed predicates, not a count and not a
 containment:
@@ -4888,7 +4888,7 @@ to be that argument as tests: the model must reproduce **each** walk, not just t
 measured. None of them exists at base.
 
 These are **lib unit tests**, because `compile_line_filters` is `pub(crate)`
-(`crates/pulsus-read/src/logql/plan.rs:3300`) and `has_unpushed_dropping_stage` (`:1655`) and
+(`crates/pulsus-read/src/logql/plan.rs:3311`) and `has_unpushed_dropping_stage` (`:1655`) and
 `metric_pipeline_construct` (`:1680`) are private — an integration test cannot call any of them.
 **They go in `plan.rs`'s existing `mod tests` (`plan.rs:3588`), and no production item is widened
 for them.** That module is a child of `logql::plan`, so it already reaches both private functions —
@@ -4913,7 +4913,7 @@ line rewrites, parsers and `label_format` — every stage the 15-atom set does n
 
 **What these three gates will NOT establish once wave 1 has written them, because they share a
 helper — today they establish nothing, because they do not exist.** All three walks call
-`is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:3334`) — `plan.rs:3310`,
+`is_pushable_line_filter` (`crates/pulsus-read/src/logql/plan.rs:3345`) — `plan.rs:3310`,
 `plan.rs:1668`, `plan.rs:1686` — and so does the model's `LineFilter::capability` (§7.1). The
 sharing is deliberate and stays: that function's doc comment calls itself *"the single source of
 truth for 'does this line filter push down to SQL, or must it run in the client pipeline?' … so the
@@ -5437,16 +5437,16 @@ The block below, tables and sentences alike, is rendered from the two citation d
 |---|---|
 | citation occurrences in the five artefacts | 608 |
 | of those, citing a bare basename | 477 |
-| `(document, token)` pairs the rule resolves | 284 |
-| occurrences those resolved pairs cover | 402 |
-| `(document, token)` pairs it cannot resolve | 121 |
-| occurrences those frozen pairs cover | 206 |
-| resolved rows anchored on a token the citing prose prints | 118 |
+| `(document, token)` pairs the rule resolves | 285 |
+| occurrences those resolved pairs cover | 403 |
+| `(document, token)` pairs it cannot resolve | 120 |
+| occurrences those frozen pairs cover | 205 |
+| resolved rows anchored on a token the citing prose prints | 119 |
 | resolved rows anchored on a snapshot of the cited line | 166 |
 
 | reason it cannot be resolved | pairs | what it means |
 |---|---|---|
-| `ambiguous_basename` | 114 | the basename matches several tracked files and the citing line prints no identifier that separates them |
+| `ambiguous_basename` | 113 | the basename matches several tracked files and the citing line prints no identifier that separates them |
 | `blank_target_line` | 4 | the cited line exists and is **empty**, so there is nothing to anchor on |
 | `not_a_tracked_file` | 2 | the citation names a throwaway probe that was never committed, which §10 records deliberately |
 | `occurrences_disagree` | 1 | the record cites the token more than once in one document and the rule answers differently for two of those occurrences |
@@ -5454,7 +5454,7 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | the reviewed verdict on a fallback disagreement | cases |
 |---|---|
 | the fallback answers a file the citing prose does not describe | 5 |
-| the fallback is right and the anchor rule points elsewhere | 4 |
+| the fallback is right and the anchor rule points elsewhere | 3 |
 | the sentence describes both candidates, so neither answer is wrong | 1 |
 
 | anchor kind | what a row of that kind can show |
@@ -5462,9 +5462,9 @@ The block below, tables and sentences alike, is rendered from the two citation d
 | `prose` | a token the citing prose prints, so the claim and its evidence are reviewable side by side |
 | `line` | a snapshot of the cited line, taken because the citing prose prints no such token: it detects the line moving or changing and cannot show the citation means the right thing |
 
-Of the 608 citation occurrences the five artefacts make, 477 name a bare basename. The rule resolves 284 `(document, token)` pairs covering 402 occurrences, and cannot resolve 121 covering 206. Of the resolved rows, 118 are anchored on a token the citing prose prints and 166 on a snapshot of the cited line.
+Of the 608 citation occurrences the five artefacts make, 477 name a bare basename. The rule resolves 285 `(document, token)` pairs covering 403 occurrences, and cannot resolve 120 covering 205. Of the resolved rows, 119 are anchored on a token the citing prose prints and 166 on a snapshot of the cited line.
 
-The language fallback and the anchor rule disagree on 10 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
+The language fallback and the anchor rule disagree on 9 citations, all of them read one at a time. 5 are citations where the fallback answers a file the citing prose does not describe, which is why it is not applied.
 
 The citations pointing at an empty line are `crates/pulsus-read/src/traces/exec.rs:1968` (in `docs/query-lowering.md`), `search_plan.rs:1042` (in `docs/query-lowering.md`), `traces/exec.rs:114` (cited from 2 documents).
 

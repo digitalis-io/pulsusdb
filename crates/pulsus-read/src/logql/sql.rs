@@ -270,6 +270,14 @@ impl MetricValue {
 /// Its known over-rejections are the `inf`/`Inf`/`NaN` spellings, which
 /// our own parser accepts: those queries fall back rather than being
 /// answered wrongly.
+///
+/// **The `0`-rather-than-`NULL` reading above was measured under the
+/// default parser.** Under [`UNWRAP_PARSER_SETTING`], which the statement
+/// now carries, that whole family converts to NULL and `isNotNull` refuses
+/// it. This test is kept because it is the clause that refuses the
+/// `inf`/`NaN` spellings, which do convert under the setting — and because
+/// it refuses on the text rather than on what one parser happens to do with
+/// it.
 const UNWRAP_MANTISSA_HAS_A_DIGIT: &str = r"^[+-]?([0-9]|\.[0-9])";
 
 /// Rendered through the string escaper, so the regex's backslash reaches
@@ -280,62 +288,103 @@ fn unwrap_prefix_literal() -> CheckedLiteral {
     super::predicate::literal(UNWRAP_MANTISSA_HAS_A_DIGIT)
 }
 
-/// The `f64::MAX` exclusion — **class B**, one ulp wide (issue #507, W4).
+/// **The parser the statement runs under** (issue #507, W4, review round 4).
 ///
-/// `"1.7976931348623159e308"` parses to `f64::MAX` here and to `inf` in
-/// Rust. That difference is not absorbed by any tolerance: a sum holding
-/// `inf` is `inf`, a sum holding `MAX` may be finite. One equality test,
-/// which over-rejects a genuine `f64::MAX` into the fallback.
-///
-/// **A non-finite result is refused outright** (`isFinite`), which closes
-/// the other half of the same family: `"0e999999"` converts to a NEGATIVE
-/// NaN here and to `+0` in Rust, and no tolerance absorbs a NaN. It also
-/// refuses `"1e400"`, which both parsers take to `inf` — a conservative
-/// over-rejection, and a fallback rather than a wrong answer.
-///
-/// **Class C is NOT accepted after all**, and the correction is recorded
-/// where the reading was made: see [`UNWRAP_TEXT_DENOTES_NON_ZERO`].
-const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
-
-/// **A text that denotes a non-zero number** — the second half of the
-/// underflow closure (issue #507, W4, review rounds 1 and 2).
-///
-/// `toFloat64OrNull` returns `0` for a value whose exponent underflows,
-/// where our own parser keeps a subnormal. Measured on 26.3.29.7 against
-/// `f64::from_str`:
+/// `toFloat64OrNull` uses a fast approximate parser by default, and it is
+/// not correctly rounded. One row is enough for that to be a wrong answer,
+/// because the summation-order bound `2(n−1)·u·Σ|vᵢ|` this lowering is
+/// justified by is ZERO at `n = 1`. Measured on 26.3.29.7:
 ///
 /// ```text
-///  text                      here   ours (bits)
-///  "5e-324"                  0      1
-///  "7.5e-324"                0      2
-///  "9999999999999999e-324"   0      0x000730d67819e8d2
+///   SELECT hex(reinterpretAsUInt64(assumeNotNull(
+///       toFloat64OrNull('9367469347402735e292'))))
+///
+///   default                             -> 7FE0ACB5CADC2918
+///   SETTINGS precise_float_parsing = 1  -> 7FE0ACB5CADC2917
+///   "9367469347402735e292".parse::<f64>() ->  7FE0ACB5CADC2917
 /// ```
 ///
-/// **The stated bound does not absorb these.** `2(n−1)·u·Σ|vᵢ|` is ZERO at
-/// `n = 1`, and `Σ|vᵢ|` is the underflowing value itself when it is the
-/// only sample — so the difference is the whole answer. The earlier
-/// reading, that the smallest subnormal is smaller than any rounding
-/// difference already accepted, holds only for a corpus where the value is
-/// not the sum.
+/// **It is rendered into the statement text rather than sent as a
+/// connection setting**, so the EXPLAIN payload reports the query that
+/// executes.
 ///
-/// **The condition is UNDERFLOW, and this expresses it rather than its
-/// spellings.** Round 1 tested for an exponent, which is a rule about how
-/// a number is written: the 326-character fixed-point spelling of
-/// `5e-324` carries no `e`, converts to database zero, and parses to bits
-/// `0x1` in Rust — so it passed a guard built for exactly that case.
+/// **What it does to the rest of the guard.** Measured over every text this
+/// module's classes name — the class A spellings (`"E12"`, `"e3"`, `"."`,
+/// `"e999999"`), the overflow and underflow boundaries, the infinity and
+/// NaN spellings, and ordinary values — under the setting each text either
+/// converts to the same bits as `f64::from_str` or converts to NULL, and
+/// NULL is what `isNotNull` refuses. Class A converts to NULL (it was `0`);
+/// `"1.7976931348623159e308"` converts to NULL (it was `f64::MAX`);
+/// `"0e999999"` converts to `+0` (it was a negative NaN); `"5e-324"`
+/// converts to bits `0x1` (it was `0`); an underflow past the smallest
+/// subnormal, `"2e-324"` or `"1e-400"`, converts to NULL where Rust gives
+/// `0`.
 ///
-/// What holds for every notation: **a decimal literal denotes zero if and
-/// only if none of its digits is non-zero.** So a conversion to zero from
-/// a text containing a non-zero digit is an underflow, whatever the
-/// notation, and a zero written as a zero — `0`, `0.0`, `-0`, `+0.000` —
-/// is not. That is one character class and one fact, not a parse.
+/// So the four conjuncts beside `isNotNull` have no measured disagreement
+/// left to catch, and each is kept as an over-rejection — a fallback, never
+/// a wrong answer. See [`UNWRAP_OVERFLOW_CUTOFF`] and
+/// [`UNWRAP_TEXT_DENOTES_NON_ZERO`] for what each still refuses.
+/// **Widening the lowered set by dropping them is a change to make on its
+/// own evidence, not at the end of a wave.**
+const UNWRAP_PARSER_SETTING: &str = "precise_float_parsing = 1";
+
+/// The `f64::MAX` exclusion — **class B**, one ulp wide (issue #507, W4).
 ///
-/// The over-rejections are texts that denote zero but carry a non-zero
-/// digit somewhere, `"0e5"` being the shape of them; those fall back. That
-/// costs a wasted statement and never a wrong answer, and narrowing it to
-/// "a non-zero digit in the MANTISSA" would put the exponent marker back
-/// into the rule — the spelling dependency review round 2 removed. Left as
-/// it is, deliberately (review round 3).
+/// Under the default parser `"1.7976931348623159e308"` converted to
+/// `f64::MAX` here and to `inf` in Rust, and no tolerance absorbs that: a
+/// sum holding `inf` is `inf`, a sum holding `f64::MAX` may be finite. One
+/// equality test closed it, over-rejecting a genuine `f64::MAX` with it.
+///
+/// **Under [`UNWRAP_PARSER_SETTING`] that text converts to NULL** and
+/// `isNotNull` refuses it, so what this clause still does is the
+/// over-rejection: a row whose value really is `f64::MAX` falls back. Kept
+/// (review round 4), because dropping it widens the lowered set.
+///
+/// `isFinite` is the same shape. It was the other half of the family —
+/// `"0e999999"` converted to a negative NaN here and to `+0` in Rust — and
+/// under the setting that text converts to `+0`. Of the texts measured, the
+/// only ones that still convert to a non-finite value are the `inf`,
+/// `Infinity` and `NaN` spellings, which the anchored prefix test refuses
+/// first and which our own parser accepts. Kept for the same reason.
+const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
+
+/// **A text that denotes a non-zero number** — the underflow clause
+/// (issue #507, W4, review rounds 1 to 4).
+///
+/// Under the default parser `toFloat64OrNull` returned `0` for a value
+/// whose exponent underflows, where our own parser keeps a subnormal.
+/// Measured on 26.3.29.7 against `f64::from_str`, with and without
+/// [`UNWRAP_PARSER_SETTING`]:
+///
+/// ```text
+///  text                      default   precise   ours (bits)
+///  "5e-324"                  0         0x1       0x1
+///  "7.5e-324"                0         0x2       0x2
+///  "9999999999999999e-324"   0         0x730d67819e8d2  0x730d67819e8d2
+///  "0.000…0005" (326 chars)  0         0x1       0x1
+/// ```
+///
+/// **The stated bound does not absorb these**, which is why the clause was
+/// written: `2(n−1)·u·Σ|vᵢ|` is ZERO at `n = 1`, and `Σ|vᵢ|` is the
+/// underflowing value itself when it is the only sample — so the difference
+/// is the whole answer.
+///
+/// **Under the setting the disagreement is gone**, and an underflow past
+/// the smallest subnormal (`"2e-324"`, `"1e-400"`) converts to NULL rather
+/// than to `0`, which `isNotNull` refuses. What this clause still does is
+/// refuse a text that converts to zero while carrying a non-zero digit —
+/// `"0e5"`, `"0.0e9"`, `"0e-1"` — where both parsers answer `+0` and the
+/// lowering would have been correct. Those fall back: a wasted statement,
+/// never a wrong answer. Kept (review round 4).
+///
+/// **The rule it expresses is about denotation, not spelling.** Review
+/// round 1 tested for an exponent, which is a rule about how a number is
+/// written: the 326-character fixed-point spelling of `5e-324` carries no
+/// `e`, converted to database zero, and parses to bits `0x1` in Rust — so
+/// it passed a guard built for exactly that case. What holds for every
+/// notation is that **a decimal literal denotes zero if and only if none of
+/// its digits is non-zero**, and that is one character class and one fact
+/// rather than a parse.
 ///
 /// **One consequence a reader should not have to discover: the same value
 /// takes two routes depending on how it was STORED.** `JSONExtractRaw`
@@ -1327,7 +1376,15 @@ pub fn metric_range_bucketed(
 /// v   <reducer>If(ifNull(toFloat64OrNull(t), 0), q)        the aggregate, over qualifying rows
 /// n   count()                                              every row, qualifying or not
 /// all_numeric  countIf(NOT q) = 0                          whether the reader may use `v`
+///
+/// SETTINGS precise_float_parsing = 1                       every conversion above
 /// ```
+///
+/// **The trailing `SETTINGS` is not decoration.** Without it
+/// `toFloat64OrNull` is not correctly rounded, and a single row is enough
+/// to answer one ulp away from the client path — see
+/// [`UNWRAP_PARSER_SETTING`], which also records what the setting does to
+/// the four remaining conjuncts of `q`.
 ///
 /// **`trim` is what makes the common case reachable.** `JSONExtractRaw`
 /// returns `45.2` for a JSON number and `"45.2"` for a JSON string, and a
@@ -1395,6 +1452,8 @@ pub fn metric_range_unwrapped(
         sql.push_str(clause.as_sql());
     }
     sql.push_str("\nGROUP BY fingerprint, bucket_ns, structured_metadata");
+    sql.push_str("\nSETTINGS ");
+    sql.push_str(UNWRAP_PARSER_SETTING);
     Ok(sql)
 }
 
@@ -3153,9 +3212,20 @@ mod tests {
              all_numeric, structured_metadata\nFROM log_samples\nPREWHERE service = \
              'checkout'\nWHERE fingerprint IN (18374, 99120)\n  AND timestamp_ns > \
              1699999940000000000 AND timestamp_ns <= 1700003600000000000\nGROUP BY fingerprint, \
-             bucket_ns, structured_metadata"
+             bucket_ns, structured_metadata\nSETTINGS precise_float_parsing = 1"
         );
         assert_eq!(sql, expected);
+
+        // The parser setting travels IN the statement, so the reported
+        // query is the executed one (review round 4). Without it
+        // `toFloat64OrNull('9367469347402735e292')` converts to
+        // `0x7fe0acb5cadc2918` where `f64::from_str` gives
+        // `0x7fe0acb5cadc2917`, and at `n = 1` the summation-order bound
+        // that justifies this lowering is zero.
+        assert!(
+            sql.ends_with("\nSETTINGS precise_float_parsing = 1"),
+            "{sql}"
+        );
 
         // The regex reaches the matcher with ONE backslash — `\.` must
         // stay a literal dot rather than becoming "any character".

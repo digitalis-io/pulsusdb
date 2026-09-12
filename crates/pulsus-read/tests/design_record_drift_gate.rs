@@ -1555,7 +1555,14 @@ enum ReviewedVerdict {
 /// found three where the resolver was the one pointing at the wrong
 /// file. So no rate is published. These are the cases, and the note on
 /// each is the reasoning.
-const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 10] = [
+// Issue #507 W4, review round 4: this was `; 10]`. The `sql.rs:996` case
+// left the table because the two rules now agree on it — a line shift in
+// `logql/sql.rs` moved the anchor the resolver reads, and the resolver's
+// answer became the one the reviewed note already called right
+// (`metric_raw_samples_sliding`, in `crates/pulsus-read/src/logql/sql.rs`).
+// The gate demands the removal: a judgement about a citation that no
+// longer diverges is a judgement about nothing.
+const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str); 9] = [
     (
         "docs/query-lowering.md",
         "exec.rs:2869",
@@ -1607,13 +1614,6 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
     ),
     (
         "docs/query-to-sql.md",
-        "sql.rs:996",
-        2,
-        ReviewedVerdict::FallbackRight,
-        "the citing prose describes metric_raw_samples_sliding, in          crates/pulsus-read/src/logql/sql.rs — the fallback's answer",
-    ),
-    (
-        "docs/query-to-sql.md",
         "sql.rs:489",
         3,
         ReviewedVerdict::FallbackRight,
@@ -1644,14 +1644,14 @@ const REVIEWED_FALLBACK_DIVERGENCES: [(&str, &str, usize, ReviewedVerdict, &str)
 /// one that was measured against itself.** It called `resolve_citation`
 /// the truth and counted how often the fallback differed from it, which
 /// measures disagreement between two rules rather than error in either.
-/// Read one at a time, four of the ten divergences are cases where the
+/// Read one at a time, three of the nine divergences are cases where the
 /// **resolver** points at the wrong file.
 ///
 /// What this test asserts instead: the divergence set is exactly the
-/// ten reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
-/// cannot appear without a person reading it; and five of the ten are
+/// nine reviewed in [`REVIEWED_FALLBACK_DIVERGENCES`], so a new one
+/// cannot appear without a person reading it; and five of the nine are
 /// citations where the fallback answers a file the citing prose does not
-/// describe. **Five wrong answers out of ten disagreements is why the
+/// describe. **Five wrong answers out of nine disagreements is why the
 /// fallback is not applied** — not a percentage, five cases anyone can
 /// read.
 #[test]
@@ -1746,7 +1746,7 @@ fn the_language_fallback_disagrees_with_the_anchor_rule_only_where_a_person_has_
     }
     assert_eq!(
         (wrong.len(), right, ambiguous),
-        (5, 4, 1),
+        (5, 3, 1),
         "the reviewed verdicts moved; re-read §12.3's decision against them"
     );
 }
