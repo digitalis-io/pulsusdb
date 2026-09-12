@@ -239,8 +239,22 @@ pub struct MetricPlan {
     pub stage1_sql: String,
     pub streams_table: String,
     pub table: String,
-    pub bucket_col: &'static str,
-    pub agg_expr: &'static str,
+    /// What the metric statement AGGREGATES (issue #507, W4).
+    ///
+    /// **This replaces the `bucket_col`/`agg_expr` pair**, which held the
+    /// two `&'static str`s of a sealed [`sql::MetricShape`] and could not
+    /// express an aggregate over a name the query supplies. `Shaped(..)`
+    /// carries exactly that pair and every plan that existed before W4
+    /// takes it; `Unwrapped(..)` carries a closed reducer and a
+    /// [`sql::CheckedLiteral`] minted by `predicate::literal`, so the only
+    /// runtime component of a statement is an escaped one and the text
+    /// itself is assembled in `sql.rs` and nowhere else.
+    ///
+    /// Replacing the pair rather than joining it is what keeps
+    /// [`MetricPlan::source_shape`] total-by-construction: an unwrapped
+    /// plan answers `None` because it HAS no column pair, instead of
+    /// carrying a vestigial one that reads as a fact.
+    pub value: sql::MetricValue,
     pub rollup: bool,
     /// The single routing decision `rollup` is derived from
     /// (`rollup == matches!(routing.chosen, RouteChoice::Rollup)`); kept
@@ -360,12 +374,16 @@ impl MetricPlan {
     /// #293's frozen `tests/golden/plan_build_differential.txt` — must not
     /// move (see the type's own doc).
     ///
-    /// Total for every plan [`metric_plan`] builds, because that function
-    /// writes `bucket_col`/`agg_expr` out of [`super::sql::MetricShape`];
-    /// `None` only for a `MetricPlan` assembled by hand with a column pair
-    /// no shape renders.
+    /// `Some` for every plan whose statement is one of the four sealed
+    /// column pairs, `None` for an unwrapped one — which has no pair at
+    /// all, rather than a pair that happens not to render. Since issue
+    /// #507 W4 this is a read of [`MetricPlan::value`], so it cannot
+    /// disagree with what the statement builders take.
     pub fn source_shape(&self) -> Option<sql::MetricShape> {
-        sql::MetricShape::from_columns(self.bucket_col, self.agg_expr)
+        match &self.value {
+            sql::MetricValue::Shaped(shape) => Some(*shape),
+            sql::MetricValue::Unwrapped(_) => None,
+        }
     }
 }
 
@@ -1700,6 +1718,104 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
     })
 }
 
+/// Issue #507 (W4): does the pipeline carry a `| unwrap` with a
+/// CONVERSION — `duration(x)`, `duration_seconds(x)`, `bytes(x)`?
+///
+/// Each conversion is a grammar implemented in Rust
+/// (`pipeline.rs`'s `convert_label_value`), and reimplementing it in SQL
+/// would be a third site for a rule that lives in one place. The
+/// no-conversion form is the whole of W4's serveable set, and this is
+/// what keeps the rest out.
+fn has_unwrap_conversion(pipeline: &[Stage]) -> bool {
+    pipeline
+        .iter()
+        .any(|s| matches!(s, Stage::Unwrap(u) if u.conversion.is_some()))
+}
+
+/// Issue #507 (W4): the chain shape the unwrapped read serves, or `None`.
+///
+/// **Exactly** a run of pushable line filters, then a `| json` whose ONE
+/// targeted extraction names the unwrapped label, then `| unwrap <name>`,
+/// and nothing after it:
+///
+/// ```text
+///  {app="x"} |= "boom" | json latency="latency" | unwrap latency   lowers
+///  {app="x"} | json | unwrap latency                               NO — see below
+///  {app="x"} | logfmt | unwrap latency                             no — no logfmt extractor in SQL
+///  {app="x"} | json latency="latency" | unwrap latency | lvl="x"   no — a stage after the unwrap
+///  {app="x"} | json latency="lat" | unwrap latency                 no — the label and the key differ
+/// ```
+///
+/// **The BARE `| json` is the one that cannot be lowered, and this is the
+/// opposite of what it looks like.** A bare `| json` puts **every**
+/// top-level key of the document into the label set, so the output series
+/// are keyed by those values and a statement grouping by
+/// `(fingerprint, grid point, structured_metadata)` cannot express them.
+/// Measured, two lines differing only in a second key:
+///
+/// ```text
+///  {"latency":1,"code":"a"}    | json | unwrap latency
+///  {"latency":2,"code":"b"}
+///    ->  {code="a", env=…} 1   AND  {code="b", env=…} 2      two series
+///
+///  the same lines             | json latency="latency" | unwrap latency
+///    ->  {env=…} 3                                           one series
+/// ```
+///
+/// The targeted form extracts exactly one label and `| unwrap` then
+/// removes it, so the surviving label set is the stream labels plus the
+/// structured metadata — **which is precisely the statement's group key**.
+/// That is the whole reason this shape is lowerable and the bare one is
+/// not.
+///
+/// The name must be underscore-free, for the reason W3 established and
+/// measured: sanitisation and flattening both write `_`, so a name
+/// carrying one has more than one preimage and SQL cannot say which the
+/// evaluator took ([`super::predicate::name_is_unambiguous`]).
+fn unwrapped_chain(op: RangeAggOp, pipeline: &[Stage]) -> Option<(sql::UnwrapReducer, String)> {
+    use pulsus_logql::ParserStage;
+    let reducer = match op {
+        RangeAggOp::SumOverTime => sql::UnwrapReducer::Sum,
+        RangeAggOp::AvgOverTime => sql::UnwrapReducer::Avg,
+        RangeAggOp::StddevOverTime => sql::UnwrapReducer::StddevPop,
+        RangeAggOp::StdvarOverTime => sql::UnwrapReducer::VarPop,
+        _ => return None,
+    };
+    let mut stages = pipeline.iter();
+    let mut next = stages.next();
+    while let Some(Stage::LineFilter(lf)) = next {
+        if !is_pushable_line_filter(lf) {
+            return None;
+        }
+        next = stages.next();
+    }
+    let extracted = match next {
+        Some(Stage::Parser(ParserStage::Json { extractions })) if extractions.len() == 1 => {
+            &extractions[0]
+        }
+        _ => return None,
+    };
+    let name = match stages.next() {
+        Some(Stage::Unwrap(u)) if u.conversion.is_none() => u.label.as_str(),
+        _ => return None,
+    };
+    if stages.next().is_some() {
+        return None;
+    }
+    // The label, the source key and the unwrapped name are one string, so
+    // the statement extracts the key the evaluator extracted and the
+    // label `| unwrap` removes is the one `| json` added. A differing
+    // source key would be sound too, but its expression is a grammar
+    // (`a.b`, `arr[0]`, quoted segments) and this build does not read one.
+    if extracted.label != name || extracted.expression != name {
+        return None;
+    }
+    if !super::predicate::name_is_unambiguous(name) {
+        return None;
+    }
+    Some((reducer, name.to_string()))
+}
+
 /// `force_client` (issue #221): `true` ONLY for the `variants(...)` scan
 /// plan — the routing decision becomes `Raw` with its own named reason and
 /// `client` is always `Some`, so the multi-extractor scan reads raw
@@ -2029,6 +2145,37 @@ fn metric_plan(
             None => false,
         };
     let client = if bucketed_range { None } else { client };
+
+    // Issue #507 (W4): **the unwrapped bucketed shape** — the same
+    // arrangement as `bucketed_range` above, over the number a
+    // `| json | unwrap <name>` chain extracts rather than over a count of
+    // rows. The four reducers are the ones whose aggregate the database
+    // can compute; `rate_counter` is not an aggregate and is excluded at
+    // the type (`sql::UnwrapReducer`).
+    //
+    // These four all REQUIRE `| unwrap`, so `client_only_op` is true for
+    // every one of them and the counting shape above can never admit them.
+    // That is why this is a second predicate rather than another clause.
+    let unwrapped_range = if is_range
+        && !force_client
+        && !has_unwrap_conversion(pipeline)
+        && client.as_ref().is_none_or(|c| c.grouping.is_none())
+        && match step_ns {
+            Some(step) => {
+                let step = step.get();
+                step > 0 && range_ns.get() == step && grid_start_ns.checked_sub(step).is_some()
+            }
+            None => false,
+        } {
+        unwrapped_chain(*op, pipeline)
+    } else {
+        None
+    };
+    let client = if unwrapped_range.is_some() {
+        None
+    } else {
+        client
+    };
     // A line filter constrains which log lines count; the rollup table
     // (`log_metrics_<res>`) has no `body` column to re-filter, so any
     // pipeline stage forces the raw fallback (docs/schemas.md §3.2: metric
@@ -2072,6 +2219,17 @@ fn metric_plan(
         RoutingDecision {
             chosen: RouteChoice::Raw,
             reason,
+        }
+    } else if let Some((reducer, _)) = &unwrapped_range {
+        // Issue #507 (W4). RAW for the same forced reason as the counting
+        // shape, and named distinctly so `X-Pulsus-Explain` says which of
+        // the two lowered reads ran.
+        RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: format!(
+                "raw: bucketed unwrapped range aggregation, {} (issue #507)",
+                reducer.function()
+            ),
         }
     } else if bucketed_range {
         // Issue #507 (W2). RAW, not rollup, and the choice is forced
@@ -2143,14 +2301,16 @@ fn metric_plan(
     } else {
         ctx.samples.to_string()
     };
-    let (bucket_col, agg_expr) = (shape.bucket_col(), shape.agg_expr());
+    let value = match unwrapped_range {
+        Some((reducer, label)) => sql::MetricValue::unwrapped(reducer, &label),
+        None => sql::MetricValue::Shaped(shape),
+    };
 
     Ok(MetricPlan {
         stage1_sql,
         streams_table: ctx.streams.to_string(),
         table,
-        bucket_col,
-        agg_expr,
+        value,
         rollup: rollup_eligible,
         routing,
         extra_predicates,
@@ -4535,27 +4695,45 @@ mod tests {
             let shape = mp
                 .source_shape()
                 .unwrap_or_else(|| panic!("no renderable shape for {query}"));
-            assert_eq!(shape.bucket_col(), mp.bucket_col);
-            assert_eq!(shape.agg_expr(), mp.agg_expr);
+            // Issue #507 W4: the plan carries the SHAPE rather than the
+            // two strings, so this reads the shape back out of the value
+            // it was written into.
+            assert_eq!(sql::MetricValue::Shaped(shape), mp.value);
         }
     }
 
-    /// The `None` arm exists, is reachable only by hand-building a plan
-    /// outside `metric_plan`, and is what `exec::metric_source`'s `.expect`
-    /// fails closed on.
+    /// The `None` arm, which since issue #507 W4 is the UNWRAPPED plan
+    /// rather than a hand-built one carrying a foreign column pair: an
+    /// unwrapped statement has no sealed column pair at all.
+    ///
+    /// It is also why `exec`'s `metric_source` is called inside the arms
+    /// that need a shape rather than before the branch — the `.expect`
+    /// there is now reachable by an ordinary query, and moving the call
+    /// is what keeps it unreachable.
     #[test]
-    fn source_shape_is_none_for_a_hand_built_plan_carrying_a_foreign_column_pair() {
-        let mut mp = metric_mp(
+    fn source_shape_is_none_for_an_unwrapped_plan_and_some_for_every_other() {
+        let counting = metric_mp(
             r#"count_over_time({env="prod"}[5m])"#,
             QuerySpec::Instant { at_ns: 1_000 },
         )
         .unwrap();
-        assert!(mp.source_shape().is_some());
-        mp.agg_expr = "match(body, '(')";
-        assert!(mp.source_shape().is_none());
-        mp.agg_expr = "count()";
-        mp.bucket_col = "not_a_column";
-        assert!(mp.source_shape().is_none());
+        assert!(counting.source_shape().is_some());
+
+        let unwrapped = metric_mp(
+            r#"sum_over_time({env="prod"} | json latency="latency" | unwrap latency [1m])"#,
+            QuerySpec::Range {
+                start_ns: 600_000_000_000,
+                end_ns: 1_200_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(unwrapped.value, sql::MetricValue::Unwrapped(_)),
+            "the fixture must be a lowered unwrapped plan: {:?}",
+            unwrapped.value
+        );
+        assert!(unwrapped.source_shape().is_none());
     }
 
     /// Issue #227: a non-dividing step is also the sliding raw path (there is
@@ -6966,5 +7144,169 @@ mod tests {
         .expect("plan");
         assert!(mp.step_ns.is_none());
         assert_eq!(mp.routing.reason, "raw: instant query");
+    }
+
+    /// Issue #507, W4 — **the four reducers that lower, the six that do
+    /// not, and the chain shape**, one clause at a time.
+    ///
+    /// `rate_counter` is in the "does not" list for a reason no check
+    /// enforces: `sql::UnwrapReducer` has no variant for it, so the match
+    /// in `unwrapped_chain` cannot produce one.
+    #[test]
+    fn an_unwrapped_chain_lowers_for_four_reducers_and_one_pipeline_shape() {
+        const MIN: u64 = 60_000_000_000;
+        let spec = QuerySpec::Range {
+            start_ns: 600_000_000_000,
+            end_ns: 1_200_000_000_000,
+            step_ns: MIN,
+        };
+        let value = |query: &str| {
+            metric_mp(query, spec)
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+                .value
+        };
+        let lowers = |query: &str, want: sql::UnwrapReducer| {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            match &mp.value {
+                sql::MetricValue::Unwrapped(u) => {
+                    assert_eq!(u.reducer, want, "{query}");
+                    assert_eq!(u.label, "latency", "{query}");
+                    assert_eq!(u.name.as_sql(), "'latency'", "{query}");
+                }
+                other => panic!("{query} must lower, got {other:?}"),
+            }
+            assert!(mp.client.is_none(), "{query}");
+            assert!(
+                mp.routing
+                    .reason
+                    .starts_with("raw: bucketed unwrapped range aggregation"),
+                "{query}: {}",
+                mp.routing.reason
+            );
+        };
+        let stays_client = |query: &str, why: &str| {
+            let mp = metric_mp(query, spec).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(
+                matches!(mp.value, sql::MetricValue::Shaped(_)),
+                "{query} must not lower an unwrapped value: {why}"
+            );
+            assert!(
+                mp.client.is_some(),
+                "{query} must stay client-aggregated: {why}"
+            );
+        };
+
+        // --- the four ------------------------------------------------
+        let pipe = r#"| json latency="latency" | unwrap latency"#;
+        lowers(
+            &format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#),
+            sql::UnwrapReducer::Sum,
+        );
+        lowers(
+            &format!(r#"avg_over_time({{a="b"}} {pipe} [1m])"#),
+            sql::UnwrapReducer::Avg,
+        );
+        lowers(
+            &format!(r#"stddev_over_time({{a="b"}} {pipe} [1m])"#),
+            sql::UnwrapReducer::StddevPop,
+        );
+        lowers(
+            &format!(r#"stdvar_over_time({{a="b"}} {pipe} [1m])"#),
+            sql::UnwrapReducer::VarPop,
+        );
+        // A pushable line filter is already in the statement.
+        lowers(
+            &format!(r#"sum_over_time({{a="b"}} |= "boom" {pipe} [1m])"#),
+            sql::UnwrapReducer::Sum,
+        );
+
+        // --- the six that do not -------------------------------------
+        for (op, why) in [
+            ("min_over_time", "order-independent, and out of W4's scope"),
+            ("max_over_time", "the same"),
+            ("first_over_time", "selects rather than accumulates"),
+            ("last_over_time", "the same"),
+            (
+                "rate_counter",
+                "not an aggregate: a reset walk and an extrapolation",
+            ),
+        ] {
+            stays_client(&format!(r#"{op}({{a="b"}} {pipe} [1m])"#), why);
+        }
+        stays_client(
+            &format!(r#"quantile_over_time(0.9, {{a="b"}} {pipe} [1m])"#),
+            "the exact quantile is not lowered either",
+        );
+
+        // --- the chain shape -----------------------------------------
+        stays_client(
+            r#"sum_over_time({a="b"} | json | unwrap latency [1m])"#,
+            "a BARE json puts every key of the document in the label set, so the output \
+             series are not the statement's group key",
+        );
+        stays_client(
+            r#"sum_over_time({a="b"} | logfmt | unwrap latency [1m])"#,
+            "no logfmt extractor in the database",
+        );
+        stays_client(
+            r#"sum_over_time({a="b"} | json latency="lat" | unwrap latency [1m])"#,
+            "the label and the source key differ, and the expression is a grammar",
+        );
+        stays_client(
+            r#"sum_over_time({a="b"} | json latency="latency" | unwrap duration(latency) [1m])"#,
+            "a conversion is a grammar implemented in Rust",
+        );
+        stays_client(
+            r#"sum_over_time({a="b"} | json app_id="app_id" | unwrap app_id [1m])"#,
+            "an underscore-bearing name has more than one preimage",
+        );
+        stays_client(
+            &format!(r#"sum_over_time({{a="b"}} {pipe} | lvl="warn" [1m])"#),
+            "a stage after the unwrap",
+        );
+        stays_client(
+            &format!(r#"sum_over_time({{a="b"}} {pipe} [2m])"#),
+            "the range is not the step",
+        );
+        stays_client(
+            &format!(r#"sum_over_time({{a="b"}} |= ip("10.0.0.0/8") {pipe} [1m])"#),
+            "a line filter that cannot be pushed",
+        );
+
+        // An instant query has no grid and keeps its existing route.
+        assert!(matches!(
+            value(&format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#)),
+            sql::MetricValue::Unwrapped(_)
+        ));
+        let mp = metric_mp(
+            &format!(r#"sum_over_time({{a="b"}} {pipe} [1m])"#),
+            QuerySpec::Instant {
+                at_ns: 600_000_000_000,
+            },
+        )
+        .expect("plan");
+        assert!(matches!(mp.value, sql::MetricValue::Shaped(_)));
+    }
+
+    /// Issue #507, W4 — the two spellings of the unwrapped name come from
+    /// ONE argument, so a statement and the reader's metadata comparison
+    /// cannot be about different strings.
+    #[test]
+    fn the_unwrapped_value_mints_both_spellings_from_one_name() {
+        let v = sql::MetricValue::unwrapped(sql::UnwrapReducer::Sum, "it's");
+        let sql::MetricValue::Unwrapped(u) = &v else {
+            panic!("the constructor builds the unwrapped arm");
+        };
+        assert_eq!(u.label, "it's");
+        assert_eq!(
+            u.name.as_sql(),
+            crate::logql::predicate::literal("it's").as_sql(),
+            "the statement's spelling is the escaper's, not the raw one"
+        );
+        assert_ne!(
+            u.name.as_sql(),
+            u.label,
+            "and the two are not the same bytes"
+        );
     }
 }

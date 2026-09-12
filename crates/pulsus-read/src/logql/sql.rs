@@ -142,6 +142,140 @@ impl MetricShape {
     }
 }
 
+/// The four reducers W4 lowers, closed so the SQL function name stays a
+/// `&'static str` and the wildcard-free property [`MetricShape`] has is
+/// not lost on the way in (issue #507, W4).
+///
+/// `rate_counter` is deliberately absent and it is not an oversight:
+/// `client_agg.rs`'s `rate_counter_over_sorted` is `last − first` plus a
+/// reset walk in timestamp order plus an extrapolation over the window, so
+/// it is not an aggregate and expressing it here would be a second
+/// implementation of that algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwrapReducer {
+    Sum,
+    Avg,
+    StddevPop,
+    VarPop,
+}
+
+impl UnwrapReducer {
+    /// Wildcard-free, the [`MetricShape::agg_expr`] arrangement.
+    pub const fn function(self) -> &'static str {
+        match self {
+            UnwrapReducer::Sum => "sum",
+            UnwrapReducer::Avg => "avg",
+            UnwrapReducer::StddevPop => "stddevPop",
+            UnwrapReducer::VarPop => "varPop",
+        }
+    }
+}
+
+/// What a metric statement aggregates (issue #507, W4).
+///
+/// **A sibling of [`MetricShape`], not a fifth variant of it.** A fifth
+/// variant would make [`MetricShape::from_columns`] — and therefore
+/// `exec.rs`'s `metric_source` panic — reachable for a pair it cannot
+/// serve, because the unwrapped form has no fixed `agg_expr` at all.
+///
+/// **The unwrapped arm carries CHECKED VALUES, never statement text.**
+/// A field holding rendered SQL would walk around `predicate.rs`'s seal —
+/// the property that SQL text is minted in one module — and turn it into a
+/// convention. The only runtime component here is a [`CheckedLiteral`]
+/// minted by `predicate::literal`, and the statement is assembled by
+/// [`metric_range_unwrapped`], which is the one place that text exists.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetricValue {
+    /// `count()` / `sum(length(body))` over the sealed column pairs —
+    /// every plan before W4, unchanged.
+    Shaped(MetricShape),
+    /// `<reducer>(…JSONExtractRaw(body, '<name>')…)` over a
+    /// `| json <name>="<name>" | unwrap <name>` chain with no conversion.
+    ///
+    /// **Boxed, and the reason is measured.** This arm carries 56 bytes
+    /// and the other carries one; inline, `MetricPlan` grows from 368 to
+    /// 424 bytes and `Plan::Metric` exceeds `clippy::large_enum_variant`'s
+    /// 200-byte spread against `Plan::Streams` (176). Boxed, the arm is a
+    /// pointer, `MetricPlan` grows by 8, and `Plan` stays inside it — at
+    /// the cost of one allocation per LOWERED plan, which is one per
+    /// query and not one per row.
+    Unwrapped(Box<UnwrappedValue>),
+}
+
+/// [`MetricValue::Unwrapped`]'s payload — a separate struct only so the
+/// variant can be one pointer wide.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwrappedValue {
+    pub reducer: UnwrapReducer,
+    /// The label as the query wrote it — what the READER compares a
+    /// row's structured-metadata keys against.
+    pub label: String,
+    /// The same name, minted for the STATEMENT.
+    ///
+    /// Two fields for one name because they are read by two different
+    /// things: one is bytes this process compares, the other is bytes
+    /// ClickHouse parses. [`MetricValue::unwrapped`] is the only
+    /// constructor and mints both from one argument, so they cannot
+    /// drift; `the_unwrapped_value_mints_both_spellings_from_one_name`
+    /// is the test that fails if a second construction site appears.
+    pub name: CheckedLiteral,
+}
+
+impl MetricValue {
+    /// The ONE constructor of the unwrapped arm (issue #507, W4).
+    pub fn unwrapped(reducer: UnwrapReducer, label: &str) -> Self {
+        MetricValue::Unwrapped(Box::new(UnwrappedValue {
+            reducer,
+            label: label.to_string(),
+            name: super::predicate::literal(label),
+        }))
+    }
+}
+
+/// **The mantissa-has-a-digit test, and it asserts exactly one fact**
+/// (issue #507, W4).
+///
+/// `toFloat64OrNull` alone is not a sufficient guard, and the case it
+/// misses is the one that matters: `"E12"` — a rack name, an error code, a
+/// firmware revision — comes back as `0` rather than `NULL`, so a
+/// null-based check admits it and a zero joins the sum where the evaluator
+/// would have produced an error series. Measured on 26.3.29.7 across the
+/// family `"e3"`, `"E3"`, `"e+3"`, `"E12"`, `"."`, `"+."`, `".e3"`,
+/// `"+e3"`, and `"e999999"`, which returns a negative NaN.
+///
+/// **This is not a float grammar in SQL.** It asserts that the mantissa
+/// starts with a digit and leaves every other decision to
+/// `toFloat64OrNull`; it is anchored, so no suffix defeats it; and it
+/// rejects a structural family rather than an enumerated list, so a new
+/// member of that family is rejected too. **A second clause added here is
+/// a float grammar and stops being this.**
+///
+/// Its known over-rejections are the `inf`/`Inf`/`NaN` spellings, which
+/// our own parser accepts: those queries fall back rather than being
+/// answered wrongly.
+const UNWRAP_MANTISSA_HAS_A_DIGIT: &str = r"^[+-]?([0-9]|\.[0-9])";
+
+/// Rendered through the string escaper, so the regex's backslash reaches
+/// the matcher as one backslash rather than being eaten by ClickHouse's
+/// own string-literal unescaping — `\.` must stay a literal dot and not
+/// become "any character".
+fn unwrap_prefix_literal() -> CheckedLiteral {
+    super::predicate::literal(UNWRAP_MANTISSA_HAS_A_DIGIT)
+}
+
+/// The `f64::MAX` exclusion — **class B**, one ulp wide (issue #507, W4).
+///
+/// `"1.7976931348623159e308"` parses to `f64::MAX` here and to `inf` in
+/// Rust. That difference is not absorbed by any tolerance: a sum holding
+/// `inf` is `inf`, a sum holding `MAX` may be finite. One equality test,
+/// which over-rejects a genuine `f64::MAX` into the fallback.
+///
+/// **Class C needs no test and is an accepted divergence with its
+/// boundary stated**: `"5e-324"` parses to `0` here and to one ulp of the
+/// smallest subnormal (`4.94e-324`) in Rust, which is smaller than any
+/// rounding difference the summation order already produces.
+const UNWRAP_OVERFLOW_CUTOFF: &str = "1.7976931348623157e308";
+
 /// Which physical table a metric read targets, and that table's
 /// bucket/aggregate column shape — the rollup-vs-raw routing decision
 /// [`super::plan::metric_plan`] makes, grouped into one parameter (same
@@ -1102,6 +1236,87 @@ pub fn metric_range_bucketed(
             "\nGROUP BY fingerprint, bucket_ns, structured_metadata"
         }
     });
+    Ok(sql)
+}
+
+/// The bucketed range read over an UNWRAPPED value (issue #507, W4): one
+/// row per `(fingerprint, grid point, structured_metadata)`, whose
+/// aggregate is over the number a `| json | unwrap <name>` chain extracts
+/// rather than over a count of rows.
+///
+/// ```text
+/// t   trim(BOTH '"' FROM JSONExtractRaw(body, '<name>'))   the raw value, unquoted
+/// q   t's mantissa starts with a digit
+///     AND toFloat64OrNull(t) is not null
+///     AND its magnitude is not the f64 overflow cutoff
+/// v   <reducer>If(ifNull(toFloat64OrNull(t), 0), q)        the aggregate, over qualifying rows
+/// n   count()                                              every row, qualifying or not
+/// all_numeric  countIf(NOT q) = 0                          whether the reader may use `v`
+/// ```
+///
+/// **`trim` is what makes the common case reachable.** `JSONExtractRaw`
+/// returns `45.2` for a JSON number and `"45.2"` for a JSON string, and a
+/// logging agent wrapping a plain line writes the second. Trimming the
+/// quotes reads both; a type check on `JSONExtractFloat` read only the
+/// first.
+///
+/// **`all_numeric` is one column and it conflates two outcomes on
+/// purpose.** An absent key, a JSON `null` and an unparseable value are
+/// three different behaviours in the evaluator — no series, no series, and
+/// an error series — and this column says only "not all of them
+/// qualified". That is sound ONLY because the fallback is whole-query: the
+/// reader discards the result and re-runs on the client path, where the
+/// evaluator makes the distinction itself. **There is no version of this
+/// where the lowered path reproduces an error series.**
+///
+/// **Why the fallback cannot be per group.** A group that fails the guard
+/// needs its rows re-read and they were aggregated away; and the value's
+/// shape is a property of each row, so nothing at plan time can predict
+/// it. The price is one wasted statement, paid exactly on the corpora
+/// where the lowering does not help.
+///
+/// Raw source only, as [`metric_range_bucketed`] — the rollup table has no
+/// `body` column to extract from.
+pub fn metric_range_unwrapped(
+    table: &str,
+    reducer: UnwrapReducer,
+    name: &CheckedLiteral,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+    scan: BucketedScan,
+    extra_predicates: &[CheckedFragment],
+) -> Result<String, super::predicate::BucketGridRefusal> {
+    let BucketedScan {
+        window,
+        lower,
+        lo_ns,
+        step_ns,
+    } = scan;
+    let TimeWindow { start_ns, end_ns } = window;
+    // The grid column is the raw table's own, as the counting form's: this
+    // builder is raw-only, so there is one column it can be.
+    let bucket = super::predicate::bucket_expr("timestamp_ns", lo_ns, step_ns, start_ns, end_ns)?;
+    let fp_list = fp_list(fingerprints);
+    let lower_op = lower.sql_op();
+    let prewhere = metric_prewhere(services);
+    let bucket_sql = bucket.as_sql();
+    let key = name.as_sql();
+    let prefix = unwrap_prefix_literal();
+    let prefix = prefix.as_sql();
+    let t = format!("trim(BOTH '\"' FROM JSONExtractRaw(body, {key}))");
+    let raw = format!("toFloat64OrNull({t})");
+    let q = format!(
+        "(match({t}, {prefix}) AND isNotNull({raw}) AND abs({raw}) != {UNWRAP_OVERFLOW_CUTOFF})"
+    );
+    let f = reducer.function();
+    let mut sql = format!(
+        "SELECT fingerprint, {bucket_sql} AS bucket_ns, {f}If(ifNull({raw}, 0), {q}) AS v, count() AS n, countIf(NOT {q}) = 0 AS all_numeric, structured_metadata\nFROM {table}\n{prewhere}WHERE fingerprint IN ({fp_list})\n  AND timestamp_ns {lower_op} {start_ns} AND timestamp_ns <= {end_ns}"
+    );
+    for clause in extra_predicates {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause.as_sql());
+    }
+    sql.push_str("\nGROUP BY fingerprint, bucket_ns, structured_metadata");
     Ok(sql)
 }
 
@@ -2811,6 +3026,119 @@ mod tests {
             .is_ok(),
             "the refusals must not be reachable from an ordinary grid"
         );
+    }
+
+    /// Issue #507, W4 — the unwrapped statement, frozen, and the row type
+    /// named for its columns.
+    ///
+    /// The text is asserted whole rather than by parts, because every part
+    /// of it is load-bearing: the `trim` that reads a quoted number, the
+    /// anchored prefix test that rejects `"E12"`, the overflow equality
+    /// that excludes the one-ulp class, the `ifNull` that keeps the
+    /// aggregate's argument non-nullable, and the `all_numeric` column the
+    /// reader refuses on.
+    #[test]
+    fn the_unwrapped_statement_is_byte_exact_and_its_row_type_names_its_columns() {
+        use crate::logql::rows::MetricRangeUnwrappedRow;
+        use pulsus_clickhouse::Row;
+
+        let f = W0Fixtures::new();
+        let sql = metric_range_unwrapped(
+            "log_samples",
+            UnwrapReducer::Sum,
+            &crate::logql::predicate::literal("latency"),
+            &f.one_service,
+            &f.fingerprints,
+            BucketedScan {
+                window: TimeWindow {
+                    start_ns: 1_699_999_940_000_000_000,
+                    end_ns: 1_700_003_600_000_000_000,
+                },
+                lower: ScanLowerBound::Exclusive,
+                lo_ns: 1_699_999_940_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            &f.no_predicate,
+        )
+        .expect("an ordinary grid renders");
+
+        let t = "trim(BOTH '\"' FROM JSONExtractRaw(body, 'latency'))";
+        let raw = format!("toFloat64OrNull({t})");
+        let q = format!(
+            "(match({t}, '^[+-]?([0-9]|\\\\.[0-9])') AND isNotNull({raw}) AND abs({raw}) != \
+             1.7976931348623157e308)"
+        );
+        let expected = format!(
+            "SELECT fingerprint, 1699999940000000000 + intDiv(timestamp_ns - \
+             1699999940000000000 + 60000000000 - 1, 60000000000) * 60000000000 AS bucket_ns, \
+             sumIf(ifNull({raw}, 0), {q}) AS v, count() AS n, countIf(NOT {q}) = 0 AS \
+             all_numeric, structured_metadata\nFROM log_samples\nPREWHERE service = \
+             'checkout'\nWHERE fingerprint IN (18374, 99120)\n  AND timestamp_ns > \
+             1699999940000000000 AND timestamp_ns <= 1700003600000000000\nGROUP BY fingerprint, \
+             bucket_ns, structured_metadata"
+        );
+        assert_eq!(sql, expected);
+
+        // The regex reaches the matcher with ONE backslash — `\.` must
+        // stay a literal dot rather than becoming "any character".
+        assert!(sql.contains(r"'^[+-]?([0-9]|\\.[0-9])'"), "{sql}");
+
+        // The four reducers render their own function name and nothing
+        // else about the statement moves.
+        for (reducer, f_name) in [
+            (UnwrapReducer::Avg, "avgIf("),
+            (UnwrapReducer::StddevPop, "stddevPopIf("),
+            (UnwrapReducer::VarPop, "varPopIf("),
+        ] {
+            let other = metric_range_unwrapped(
+                "log_samples",
+                reducer,
+                &crate::logql::predicate::literal("latency"),
+                &f.one_service,
+                &f.fingerprints,
+                BucketedScan {
+                    window: TimeWindow {
+                        start_ns: 1_699_999_940_000_000_000,
+                        end_ns: 1_700_003_600_000_000_000,
+                    },
+                    lower: ScanLowerBound::Exclusive,
+                    lo_ns: 1_699_999_940_000_000_000,
+                    step_ns: 60_000_000_000,
+                },
+                &f.no_predicate,
+            )
+            .expect("renders");
+            assert_eq!(other, sql.replace("sumIf(", f_name), "{reducer:?}");
+        }
+
+        // The decode binds on the column NAME, so the aliases and the
+        // derive's names must agree in order — the `metric_range_bucketed`
+        // arrangement, for the row type that carries three more columns.
+        let select = sql
+            .strip_prefix("SELECT ")
+            .expect("the statement opens with its projection")
+            .lines()
+            .next()
+            .expect("the projection is one line");
+        let mut items: Vec<&str> = Vec::new();
+        let (mut depth, mut start) = (0usize, 0usize);
+        for (i, c) in select.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(&select[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        items.push(&select[start..]);
+        let names: Vec<&str> = items
+            .iter()
+            .map(|item| item.trim().rsplit(" AS ").next().expect("a column name"))
+            .collect();
+        assert_eq!(names, <MetricRangeUnwrappedRow as Row>::COLUMN_NAMES);
     }
 
     /// Issue #507, W2 — **the row type's field names ARE the statement's

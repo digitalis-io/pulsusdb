@@ -626,7 +626,7 @@ pub enum ParsedFilterRefusal {
 /// the first raw key in document order wins, while
 /// `JSONExtractString(body,'a_b')` reads `top` — the one the evaluator
 /// discarded.
-fn name_is_unambiguous(name: &str) -> bool {
+pub(in crate::logql) fn name_is_unambiguous(name: &str) -> bool {
     !name.contains('_')
 }
 

@@ -3435,3 +3435,246 @@ async fn repeated_executions_agree_bit_for_bit_at_a_fixed_layout() {
         .await
         .expect("drop");
 }
+
+// ---------------------------------------------------------------------
+// W4 (issue #507): the unwrapped read, end to end, one case per measured
+// class of parser disagreement.
+// ---------------------------------------------------------------------
+
+/// **The four classes, each with the value that produces it** (issue #507
+/// W4).
+///
+/// ```text
+///  class  value                        what the two float parsers do        expected here
+///  -      45.2 and "2.25"              agree exactly                        LOWERS, bit-equal
+///  A      "E12"                        ClickHouse 0, ours rejects           FALLS BACK
+///  B      "1.7976931348623159e308"     ClickHouse f64::MAX, ours inf        FALLS BACK
+///  C      "5e-324"                     ClickHouse 0, ours 1 ulp             LOWERS, within the bound
+///  over   "inf"                        both parse it; the prefix test does not   FALLS BACK
+/// ```
+///
+/// A and B are what the guard is FOR: without the anchored prefix test a
+/// `"E12"` contributes `0` to a sum where the evaluator makes an error
+/// series, and without the overflow equality a `f64::MAX` sits where the
+/// evaluator has an `inf`. C is the accepted divergence, asserted against
+/// the bound rather than bit for bit. The over-rejection is the guard
+/// being conservative where it cannot be sure, and it falls back rather
+/// than answering wrongly.
+///
+/// **The control is the same query with `| drop zzz` after the unwrap** —
+/// a label filter after the unwrap blocks the lowering, and one naming a label the
+/// corpus does not carry keeps every line (an absent label reads as empty). The plan shapes are
+/// asserted to differ first, so the test cannot compare one path with
+/// itself.
+///
+/// The fallback is observed rather than inferred: on a fallback the
+/// explain payload's LAST `metric_read` is the client sliding scan, whose
+/// `ORDER BY service ASC` no lowered statement carries.
+#[tokio::test]
+async fn the_unwrapped_read_agrees_with_the_client_path_or_falls_back() {
+    skip_unless_live!();
+    const STEP: i64 = 60_000_000_000;
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    let db = pulsus_testkit::test_db(&format!(
+        "pulsus_read_it_qlg_w4unwrap_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create");
+    run_init(&admin, &test_ctx(&db)).await.expect("run_init");
+    let client = data_client(&db).await;
+
+    let t = ((now_ns() - 3_600_000_000_000) / STEP) * STEP;
+    // Each class gets its own stream, so one class's fallback cannot
+    // decide another's.
+    let cases: [(&str, u64, &[&str], bool); 5] = [
+        ("ordinary", 201, &["45.25", "\"2.25\"", "4"], false),
+        ("class_a", 202, &["1", "\"E12\""], true),
+        ("class_b", 203, &["1", "\"1.7976931348623159e308\""], true),
+        ("class_c", 204, &["1", "\"5e-324\""], false),
+        ("over_reject", 205, &["1", "\"inf\""], true),
+    ];
+    let mut rows: Vec<BucketedSeedRow> = Vec::new();
+    for (name, fp, values, _) in cases {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, \
+                     updated_ns) VALUES \
+                     (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({t}))), {fp}, '{name}', \
+                     '{{\"service_name\":\"{name}\"}}', 0)"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("seed log_streams");
+        for (i, v) in values.iter().enumerate() {
+            rows.push(BucketedSeedRow {
+                service: name.to_string(),
+                fingerprint: fp,
+                timestamp_ns: t - 30_000_000_000 + i as i64,
+                severity: 0,
+                body: format!(r#"{{"latency":{v}}}"#),
+                structured_metadata: String::new(),
+            });
+        }
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("insert the unwrapped fixture");
+    // The standing rule: the input is asserted present before anything is
+    // read from it.
+    let seeded = admin
+        .query_stream::<PartCountRow>(
+            &format!("SELECT count() AS n FROM {db}.log_samples"),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("count the corpus");
+    let seeded = {
+        let mut s = seeded;
+        let n = s.next().await.expect("one row").expect("decode").n;
+        drop(s);
+        n
+    };
+    assert_eq!(seeded, rows.len() as u64, "the corpus must be present");
+
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: t,
+            end_ns: t,
+            step_ns: STEP as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let engine = LogQlEngine::new(data_client(&db).await, engine_config(&db, 64 * 1024 * 1024));
+
+    for (name, _fp, values, expect_fallback) in cases {
+        let lowered_q = format!(
+            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency [1m])"#
+        );
+        let client_q = format!(
+            r#"sum_over_time({{service_name="{name}"}} | json latency="latency" | unwrap latency | zzz="" [1m])"#
+        );
+        // Two paths, asserted to BE two paths.
+        let shape = |q: &str| match plan(&parse(q).expect("parse"), &params, &plan_ctx(&db)) {
+            Ok(Plan::Metric(mp)) => mp,
+            other => panic!("{q}: {other:?}"),
+        };
+        assert!(
+            shape(&lowered_q).client.is_none(),
+            "{name}: the fixture query must plan the lowered read"
+        );
+        assert!(
+            shape(&client_q).client.is_some(),
+            "{name}: the control must stay on the client path"
+        );
+
+        let answer = |q: String| {
+            let engine = &engine;
+            let params = &params;
+            async move {
+                match engine
+                    .query_explained(&parse(&q).expect("parse"), params)
+                    .await
+                {
+                    Ok((result, _w, explain)) => {
+                        let QueryResult::Matrix(series) = result else {
+                            panic!("{q}: expected a matrix");
+                        };
+                        let last_read = explain
+                            .stages
+                            .iter()
+                            .rfind(|s| s.name == "metric_read")
+                            .map(|s| s.sql.clone())
+                            .unwrap_or_default();
+                        let points: Vec<(i64, u64)> = series
+                            .into_iter()
+                            .flat_map(|s| s.points)
+                            .map(|(ts, v)| (ts, v.to_bits()))
+                            .collect();
+                        Ok((points, last_read))
+                    }
+                    // A value the EVALUATOR rejects is a 400 for the whole
+                    // series, and the lowered statement cannot produce one:
+                    // it would have summed a `0` and answered a number. So
+                    // an error here is itself the proof that the query fell
+                    // back — a stronger observable than the reported SQL.
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
+        let lowered_res = answer(lowered_q.clone()).await;
+        let client_res = answer(client_q).await;
+
+        if let (Err(le), Err(ce)) = (&lowered_res, &client_res) {
+            assert_eq!(le, ce, "{name}: both paths must refuse the same way");
+            assert!(
+                expect_fallback,
+                "{name}: a refusal means the lowered path fell back, which this case did not \
+                 expect"
+            );
+            continue;
+        }
+        let (lowered, last_read) = lowered_res.unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (client_ans, _) = client_res.unwrap_or_else(|e| panic!("{name} control: {e}"));
+
+        let fell_back = last_read.contains("ORDER BY service ASC");
+        assert_eq!(
+            fell_back, expect_fallback,
+            "{name}: expected fallback={expect_fallback}; the last reported metric_read was:\n\
+             {last_read}"
+        );
+
+        if name == "class_c" {
+            // The accepted divergence, asserted against the bound rather
+            // than bit for bit: `"5e-324"` is `0` on one side and one ulp
+            // of the smallest subnormal on the other.
+            assert_eq!(lowered.len(), client_ans.len(), "{name}");
+            let sum_abs: f64 = values
+                .iter()
+                .map(|v| v.trim_matches('"').parse::<f64>().unwrap_or(0.0).abs())
+                .sum();
+            let bound = 2.0 * ((values.len() as f64) - 1.0) * (f64::EPSILON / 2.0) * sum_abs;
+            for ((lt, lv), (ct, cv)) in lowered.iter().zip(&client_ans) {
+                assert_eq!(lt, ct, "{name}");
+                let d = (f64::from_bits(*lv) - f64::from_bits(*cv)).abs();
+                assert!(
+                    d <= bound.max(f64::MIN_POSITIVE),
+                    "{name}: {d:e} exceeds the bound {bound:e}"
+                );
+            }
+        } else {
+            assert_eq!(
+                lowered, client_ans,
+                "{name}: the two paths must answer the same bits"
+            );
+        }
+    }
+
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop the run database");
+}

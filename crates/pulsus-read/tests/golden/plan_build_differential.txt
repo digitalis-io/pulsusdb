@@ -82,8 +82,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -139,8 +140,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -461,8 +463,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -506,8 +509,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -560,8 +564,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -592,8 +597,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -637,8 +643,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -682,8 +689,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -728,8 +736,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -786,8 +795,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -818,8 +828,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -851,8 +862,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -892,8 +904,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -937,8 +950,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -991,8 +1005,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1023,8 +1038,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1064,8 +1080,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1109,8 +1126,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1163,8 +1181,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1195,8 +1214,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1244,8 +1264,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1289,8 +1310,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1351,8 +1373,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1383,8 +1406,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1430,8 +1454,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1475,8 +1500,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1535,8 +1561,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1567,8 +1594,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1617,8 +1645,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1662,8 +1691,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1725,8 +1755,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1757,8 +1788,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1812,8 +1844,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1857,8 +1890,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1925,8 +1959,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -1957,8 +1992,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2012,8 +2048,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2057,8 +2094,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2125,8 +2163,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2157,8 +2196,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2210,8 +2250,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2255,8 +2296,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2321,8 +2363,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2353,8 +2396,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2406,8 +2450,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2451,8 +2496,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2517,8 +2563,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2549,8 +2596,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2598,8 +2646,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2643,8 +2692,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2705,8 +2755,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2737,8 +2788,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2778,8 +2830,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2841,8 +2894,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2891,8 +2945,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -2959,8 +3014,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -3014,8 +3070,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -3091,8 +3148,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -3163,8 +3221,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3208,8 +3267,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3271,8 +3331,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3303,8 +3364,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3358,8 +3420,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3403,8 +3466,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3471,8 +3535,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3503,8 +3568,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3579,8 +3645,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3671,8 +3738,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -3728,8 +3796,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -3773,8 +3842,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -3832,8 +3902,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -3903,8 +3974,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -3935,8 +4007,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -3981,8 +4054,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'e' AND val = 'f'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -4125,8 +4199,9 @@ MetricBinary(
             stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
             streams_table: "log_streams",
             table: "log_samples",
-            bucket_col: "timestamp_ns",
-            agg_expr: "count()",
+            value: Shaped(
+                RawCount,
+            ),
             rollup: false,
             routing: RoutingDecision {
                 chosen: Raw,
@@ -4202,8 +4277,9 @@ MetricBinary(
             stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
             streams_table: "log_streams",
             table: "log_samples",
-            bucket_col: "timestamp_ns",
-            agg_expr: "count()",
+            value: Shaped(
+                RawCount,
+            ),
             rollup: false,
             routing: RoutingDecision {
                 chosen: Raw,
@@ -4268,8 +4344,9 @@ MetricBinary(
             stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
             streams_table: "log_streams",
             table: "log_samples",
-            bucket_col: "timestamp_ns",
-            agg_expr: "count()",
+            value: Shaped(
+                RawCount,
+            ),
             rollup: false,
             routing: RoutingDecision {
                 chosen: Raw,
@@ -4386,8 +4463,9 @@ MetricBinary(
             stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
             streams_table: "log_streams",
             table: "log_samples",
-            bucket_col: "timestamp_ns",
-            agg_expr: "count()",
+            value: Shaped(
+                RawCount,
+            ),
             rollup: false,
             routing: RoutingDecision {
                 chosen: Raw,
@@ -4490,8 +4568,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -4575,8 +4654,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -4652,8 +4732,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -4737,8 +4818,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -4820,8 +4902,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -4882,8 +4965,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -4953,8 +5037,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -5002,8 +5087,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -5060,8 +5146,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -5110,8 +5197,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5182,8 +5270,9 @@ MetricBinary(
                         stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                         streams_table: "log_streams",
                         table: "log_samples",
-                        bucket_col: "timestamp_ns",
-                        agg_expr: "count()",
+                        value: Shaped(
+                            RawCount,
+                        ),
                         rollup: false,
                         routing: RoutingDecision {
                             chosen: Raw,
@@ -5219,8 +5308,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5309,8 +5399,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -5372,8 +5463,9 @@ MetricBinary(
                     stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                     streams_table: "log_streams",
                     table: "log_samples",
-                    bucket_col: "timestamp_ns",
-                    agg_expr: "count()",
+                    value: Shaped(
+                        RawCount,
+                    ),
                     rollup: false,
                     routing: RoutingDecision {
                         chosen: Raw,
@@ -5453,8 +5545,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5517,8 +5610,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5583,8 +5677,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5628,8 +5723,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5682,8 +5778,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5714,8 +5811,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5755,8 +5853,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5800,8 +5899,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5854,8 +5954,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5886,8 +5987,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5927,8 +6029,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -5972,8 +6075,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6026,8 +6130,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6058,8 +6163,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6099,8 +6205,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6144,8 +6251,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6198,8 +6306,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6230,8 +6339,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6271,8 +6381,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6316,8 +6427,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6370,8 +6482,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6402,8 +6515,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6443,8 +6557,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6488,8 +6603,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6542,8 +6658,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6574,8 +6691,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6615,8 +6733,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6660,8 +6779,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6714,8 +6834,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6746,8 +6867,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6787,8 +6909,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6832,8 +6955,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6886,8 +7010,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6918,8 +7043,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -6959,8 +7085,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7004,8 +7131,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7058,8 +7186,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7090,8 +7219,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7131,8 +7261,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7176,8 +7307,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7230,8 +7362,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7262,8 +7395,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7303,8 +7437,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7348,8 +7483,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7402,8 +7538,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7434,8 +7571,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7475,8 +7613,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7520,8 +7659,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7574,8 +7714,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7606,8 +7747,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7647,8 +7789,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7692,8 +7835,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7746,8 +7890,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7778,8 +7923,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7819,8 +7965,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7864,8 +8011,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7918,8 +8066,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7950,8 +8099,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -7991,8 +8141,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8036,8 +8187,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8090,8 +8242,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8122,8 +8275,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8163,8 +8317,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8208,8 +8363,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8262,8 +8418,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8294,8 +8451,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8335,8 +8493,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8380,8 +8539,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8434,8 +8594,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8466,8 +8627,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8507,8 +8669,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8552,8 +8715,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8606,8 +8770,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8638,8 +8803,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8679,8 +8845,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8724,8 +8891,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8778,8 +8946,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8810,8 +8979,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8851,8 +9021,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8896,8 +9067,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8950,8 +9122,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -8982,8 +9155,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -9023,8 +9197,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -9068,8 +9243,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -9122,8 +9298,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'a' AND val = 'b'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,
@@ -9154,8 +9331,9 @@ MetricBinary(
                 stage1_sql: "SELECT fingerprint\nFROM log_streams_idx\nWHERE month = '2026-07-01'\n  AND ((key = 'c' AND val = 'd'))\nGROUP BY fingerprint\nHAVING uniqExact(key, val) = 1",
                 streams_table: "log_streams",
                 table: "log_samples",
-                bucket_col: "timestamp_ns",
-                agg_expr: "count()",
+                value: Shaped(
+                    RawCount,
+                ),
                 rollup: false,
                 routing: RoutingDecision {
                     chosen: Raw,

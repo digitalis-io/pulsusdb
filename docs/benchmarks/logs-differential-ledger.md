@@ -6392,3 +6392,51 @@ gated by
 - **Pinned by** `b26_json_expr.test`'s two `eval_fail` rows and
   `json_expr.rs`'s
   `a_bracket_ends_a_quoted_key_so_such_a_key_is_unreachable`.
+
+### `unwrapped-summation-order-nondeterministic` (issue #507 W4, owner ruling — a deliberate divergence, not a defect)
+
+- **What we do:** on a query that **lowers** — a `json` extraction naming
+  one label, an `unwrap` of that label with no conversion, an
+  underscore-free name, a range equal to the step, and every row in the
+  window carrying a value both float parsers agree on — `sum_over_time`,
+  `avg_over_time`, `stddev_over_time` and `stdvar_over_time` are summed by
+  the database. The database chooses the summation order, so **the same
+  query on the same data can answer different final digits between two
+  executions.**
+- **What the reference does:** accumulates in one order, in one process,
+  and answers the same bits every time.
+- **Three things decide our result, and the second is the one a user
+  meets:**
+  - the accumulation order is the database's, and it reorders **inside a
+    block of rows** — measured: at one thread and a block size of one the
+    database reproduces a left-to-right sum exactly, and every larger
+    block differs, non-monotonically;
+  - **the effective parallelism depends on how busy the server is.** The
+    thread setting is an upper bound, not a fixed value. Measured over
+    1,000,000 values in one part: quiet at four threads
+    `C1B845C49C9465EC`, under load at four threads `C1B845C49C9465E6`,
+    both constant within their condition. The part layout decides it too —
+    the same rows in 1, 2 and 8 parts give three different answers.
+  - `avg_over_time` additionally uses a different accumulation from the
+    reference's incremental mean, so it differs in the last bits **even on
+    a single thread**. Its row has two causes and pinning the thread count
+    removes neither.
+- **The bound.** Two answers differ by at most `2(n−1)·u·Σ|vᵢ|` with
+  `u = 2⁻⁵³`. Measured against it: 1, 8 and 31 ULPs at `n` = 1e3, 1e5,
+  1e6, against derived bounds of 3.29e-5, 2.90e-1 and 2.86e+1.
+- **Why it is accepted.** The owner ruled that the floating-point
+  summation moves into the database. Nothing here says an answer is wrong;
+  it says which digits are not reproducible, and the bound says by how
+  much they can move.
+- **What does NOT diverge.** Every query that does not lower — most of
+  them — is accumulated in one order here and answers the same bits every
+  time. `count_over_time` and `bytes_over_time` sum integers, which is
+  exact in any order. `min_over_time`, `max_over_time`, `first_over_time`,
+  `last_over_time`, `quantile_over_time` and `rate_counter` are not
+  lowered.
+- **Pinned by** `query_log_gates.rs`'s
+  `the_thread_count_spread_stays_inside_the_summation_bound`, which fails
+  when the accepted divergence stops being a rounding difference, and
+  `repeated_executions_agree_bit_for_bit_at_a_fixed_layout`, which fails
+  when a source of nondeterminism appears that is neither the thread count
+  nor the part layout.

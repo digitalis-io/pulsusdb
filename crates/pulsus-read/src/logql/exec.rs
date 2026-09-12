@@ -18,8 +18,8 @@ use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, St
 use super::predicate::{BucketGridRefusal, CheckedFragment, CheckedLiteral};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricInstantRow,
-    MetricRangeBucketRow, MetricScanRow, PatternFetchRow, SampleRow, StreamMetaRow, StreamRow,
-    TailSampleRow, VolumeRow,
+    MetricRangeBucketRow, MetricRangeUnwrappedRow, MetricScanRow, PatternFetchRow, SampleRow,
+    StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -1517,11 +1517,14 @@ impl LogQlEngine {
         } else {
             distinct_escaped_services(&meta)
         };
-        let source = metric_source(mp);
 
         if is_instant {
+            // Issue #507 W4: the shape is read INSIDE the arms that need
+            // one. An unwrapped plan has no sealed column pair, so
+            // `metric_source`'s `.expect` would be reachable by an
+            // ordinary query if this stayed above the branch.
             let sql = super::sql::metric_instant(
-                source,
+                metric_source(mp),
                 &services,
                 &fingerprints,
                 super::sql::TimeWindow {
@@ -1605,6 +1608,24 @@ impl LogQlEngine {
             if let Some(step) = mp.step_ns {
                 super::window::ensure_grid_resolution(mp.grid_start_ns, mp.end_ns, step.as_u64())?;
             }
+            // Issue #507 (W4): the unwrapped read is a second lowered
+            // shape with its own statement, its own row type and its own
+            // fold. It is a `match` on the plan's `value` rather than a
+            // flag, so a third shape is a compile error here.
+            if let super::sql::MetricValue::Unwrapped(u) = &mp.value {
+                return self
+                    .run_unwrapped_range(
+                        mp,
+                        u.reducer,
+                        &u.label,
+                        &u.name,
+                        &services,
+                        &fingerprints,
+                        &meta,
+                        explain,
+                    )
+                    .await;
+            }
             match bucketed_range_sql(mp, &services, &fingerprints) {
                 Ok(sql) => {
                     if let Some(e) = explain.as_mut() {
@@ -1656,6 +1677,87 @@ impl LogQlEngine {
                 }
             }
         }
+    }
+
+    /// The unwrapped bucketed range read (issue #507, W4).
+    ///
+    /// Three things send it to the client path instead of answering, and
+    /// each is reported by the statement or by the fold rather than
+    /// guessed: the grid cannot be rendered, a row's value does not
+    /// qualify, or two returned groups fold into one series at one grid
+    /// point. All three are **whole-query** fallbacks — a group that falls
+    /// back needs rows the statement aggregated away — and the price is
+    /// one wasted statement, paid on the corpora where the lowering does
+    /// not help.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_unwrapped_range(
+        &self,
+        mp: &MetricPlan,
+        reducer: super::sql::UnwrapReducer,
+        label: &str,
+        name: &CheckedLiteral,
+        services: &[CheckedLiteral],
+        fingerprints: &[u64],
+        meta: &HashMap<u64, StreamMetaRow>,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<QueryResult, ReadError> {
+        // The one fallback body, named once: the reconstructed client
+        // aggregation over the same plan. Every `return` below reaches it.
+        macro_rules! fall_back {
+            ($why:expr, $explain:expr) => {{
+                let _why: &str = $why;
+                let client = unwrapped_fallback_client_agg(mp, label);
+                let compiled = CompiledPipeline::compile(&client.pipeline)?;
+                return self
+                    .run_metric_client(mp, &client, &compiled, fingerprints, $explain)
+                    .await;
+            }};
+        }
+
+        let sql = match unwrapped_range_sql(mp, reducer, name, services, fingerprints) {
+            Ok(sql) => sql,
+            Err(
+                BucketGridRefusal::StepNotPositive
+                | BucketGridRefusal::AnchorAboveScanStart
+                | BucketGridRefusal::WouldOverflow,
+            ) => {
+                fall_back!("the grid is not renderable", explain)
+            }
+        };
+        if let Some(e) = explain.as_mut() {
+            e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
+        }
+        let mut groups = PushdownUnwrappedGroups::new(
+            meta,
+            AggCaps::DEFAULT,
+            label,
+            reducer,
+            mp.grid_start_ns,
+            mp.end_ns,
+        );
+        {
+            // Scoped: the row stream holds its pooled connection until
+            // dropped, and the fallback below issues a second query.
+            let mut stream = self
+                .query_stream::<MetricRangeUnwrappedRow>(&sql, &self.budget_settings())
+                .await?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| {
+                    map_read_error(
+                        e,
+                        self.config.scan_budget_bytes,
+                        self.config.read_max_memory_bytes,
+                    )
+                })?;
+                groups.push_row(&row)?;
+            }
+        }
+        let series = match groups.finish() {
+            Ok(series) => series,
+            Err(why) => fall_back!(why, explain),
+        };
+        let result = shift_emitted_points(QueryResult::Matrix(series), mp.offset_ns);
+        apply_vector_aggs(result, &mp.vector_aggs)
     }
 
     /// The client-aggregated metric path (issue M6-10): fetch every
@@ -2074,7 +2176,6 @@ impl LogQlEngine {
             // `explain_indexes` gates validate a query we never issue.
             client_metric_read_sql(mp, &services, &fingerprints, window)
         } else {
-            let source = metric_source(mp);
             match mp.step_ns {
                 // The execution twin's range arm (issue #507, W2). It
                 // refused with the engine while the state was unreachable;
@@ -2085,16 +2186,33 @@ impl LogQlEngine {
                 // the query that runs — including the capability join,
                 // whose three refusals report the client path's scan
                 // because that is what would execute.
-                Some(_) => match bucketed_range_sql(mp, &services, &fingerprints) {
-                    Ok(sql) => sql,
-                    Err(
-                        BucketGridRefusal::StepNotPositive
-                        | BucketGridRefusal::AnchorAboveScanStart
-                        | BucketGridRefusal::WouldOverflow,
-                    ) => client_metric_read_sql(mp, &services, &fingerprints, window),
-                },
+                // Issue #507 W4: the unwrapped shape has its own
+                // statement, so the twin matches the plan's `value` here
+                // exactly as the reader does. The fallback text is the
+                // client scan in both arms, because that is what would
+                // execute.
+                Some(_) => {
+                    let rendered = match &mp.value {
+                        super::sql::MetricValue::Unwrapped(u) => {
+                            unwrapped_range_sql(mp, u.reducer, &u.name, &services, &fingerprints)
+                        }
+                        super::sql::MetricValue::Shaped(_) => {
+                            bucketed_range_sql(mp, &services, &fingerprints)
+                        }
+                    };
+                    match rendered {
+                        Ok(sql) => sql,
+                        Err(
+                            BucketGridRefusal::StepNotPositive
+                            | BucketGridRefusal::AnchorAboveScanStart
+                            | BucketGridRefusal::WouldOverflow,
+                        ) => client_metric_read_sql(mp, &services, &fingerprints, window),
+                    }
+                }
+                // The shape is read here rather than above the match,
+                // for the reason `run_metric_inner`'s instant arm gives.
                 None => super::sql::metric_instant(
-                    source,
+                    metric_source(mp),
                     &services,
                     &fingerprints,
                     window,
@@ -4729,6 +4847,227 @@ impl PushdownRangeGroups {
     }
 }
 
+/// The bucketed range read's client-side fold over an UNWRAPPED value
+/// (issue #507, W4).
+///
+/// The counting form's fold sums `u64` partials, which is exact in any
+/// order. **This one cannot merge partials at all**: `avg`, `stddevPop`
+/// and `varPop` are not combinable from two group aggregates without their
+/// counts and their intermediate moments, and even `sum` would be a
+/// different accumulation order from the evaluator's. So the rule is
+/// **one returned group per emitted point, or the whole query falls
+/// back** — which holds whenever the statement's group key
+/// `(fingerprint, grid point, structured_metadata)` and the output series
+/// identity are the same partition, and that is exactly what the targeted
+/// `| json <name>="<name>"` extraction buys (`plan.rs`'s
+/// `unwrapped_chain`).
+///
+/// Three conditions send the query to the client path, and each one is a
+/// property the statement reports rather than a guess:
+///
+/// ```text
+/// all_numeric = 0   some row's value is absent, null, or does not parse
+/// a second group reaching one (series, grid point)
+/// a shadowed group whose metadata value does not parse -> an ERROR, not a fallback
+/// ```
+///
+/// **The shadowed group is recomputed rather than refused.** When a row's
+/// structured metadata carries a key equal to the unwrapped name, the
+/// evaluator takes the metadata's value and the parsed one is renamed
+/// away — measured in `logqltest_corpus.rs`'s
+/// `unwrap_takes_the_metadata_value_when_the_metadata_carries_the_name`.
+/// The metadata string is constant within a group by construction, so the
+/// group's sample set is `n` copies of one value and the reader computes
+/// the answer exactly, with no SQL expression reading that column.
+pub(in crate::logql) struct PushdownUnwrappedGroups<'a> {
+    base_labels: HashMap<u64, LabelSet>,
+    /// The unwrapped label, as the query wrote it.
+    label: &'a str,
+    reducer: super::sql::UnwrapReducer,
+    /// Rendered final label set -> `(labels, grid point -> value)`.
+    groups: HashMap<String, (LabelSet, HashMap<i64, f64>)>,
+    grid_start_ns: i64,
+    end_ns: i64,
+    /// Set when the lowered answer cannot be used and the query must be
+    /// re-run on the client path.
+    fall_back: Option<&'static str>,
+    charged: u64,
+    caps: AggCaps,
+    merge_buf: Vec<(String, String)>,
+    sm_buf: Vec<(String, String)>,
+    sm_ctx: StructuredMetadataCtx,
+}
+
+impl<'a> PushdownUnwrappedGroups<'a> {
+    pub(in crate::logql) fn new(
+        meta: &HashMap<u64, StreamMetaRow>,
+        caps: AggCaps,
+        label: &'a str,
+        reducer: super::sql::UnwrapReducer,
+        grid_start_ns: i64,
+        end_ns: i64,
+    ) -> Self {
+        PushdownUnwrappedGroups {
+            base_labels: meta.iter().map(|(fp, m)| (*fp, series_labels(m))).collect(),
+            label,
+            reducer,
+            groups: HashMap::new(),
+            grid_start_ns,
+            end_ns,
+            fall_back: None,
+            charged: 0,
+            caps,
+            merge_buf: Vec::new(),
+            sm_buf: Vec::new(),
+            sm_ctx: StructuredMetadataCtx::default(),
+        }
+    }
+
+    /// The value a SHADOWED group takes — `n` samples of one value,
+    /// computed the way the evaluator computes them rather than the way
+    /// the arithmetic would let us.
+    ///
+    /// | reducer | value | why, from the evaluator |
+    /// |---|---|---|
+    /// | `sum_over_time` | `mv` added to itself `n` times | **not `n · mv`.** Adding `0.1` ten times gives `0.9999999999999999` where `10 × 0.1` gives `1.0`; `SimpleAcc::add` is a running `+=`, so the loop is the bit-exact reproduction and the multiply is a different number |
+    /// | `avg_over_time` | `mv` | the incremental mean sets `mean = v` on the first sample and adds `(v − v)/count = 0` thereafter (`acc.avg_mean`) |
+    /// | `stddev` / `stdvar` | `0` | `acc.m2` accumulates `delta · (v − mean)`: the first sample contributes `v · (v − v)` and every later one `0 · 0`. **The zero is the algorithm's**, not the mathematical variance of a constant set — a zero justified by the second argument would survive a change to the first |
+    fn shadowed_value(&self, mv: f64, n: u64) -> f64 {
+        match self.reducer {
+            super::sql::UnwrapReducer::Sum => {
+                let mut acc = 0.0f64;
+                for _ in 0..n {
+                    acc += mv;
+                }
+                acc
+            }
+            super::sql::UnwrapReducer::Avg => mv,
+            super::sql::UnwrapReducer::StddevPop | super::sql::UnwrapReducer::VarPop => 0.0,
+        }
+    }
+
+    pub(in crate::logql) fn push_row(
+        &mut self,
+        row: &MetricRangeUnwrappedRow,
+    ) -> Result<(), ReadError> {
+        if row.all_numeric == 0 {
+            self.fall_back = Some(
+                "a row's unwrapped value is absent, null, or does not parse, and the statement \
+                 cannot tell those apart",
+            );
+            return Ok(());
+        }
+        if row.bucket_ns < self.grid_start_ns || row.bucket_ns > self.end_ns {
+            return Ok(());
+        }
+        let Some(base) = self.base_labels.get(&row.fingerprint) else {
+            return Ok(());
+        };
+        let mut labels: LabelSet = if row.structured_metadata.is_empty() {
+            base.clone()
+        } else {
+            merge_labels_with_structured_metadata(
+                base,
+                &row.structured_metadata,
+                &mut self.merge_buf,
+                &mut self.sm_buf,
+                &mut self.sm_ctx,
+            );
+            let mut merged = std::mem::take(&mut self.merge_buf);
+            self.sm_ctx.append_visible(&mut merged);
+            merged.sort();
+            merged
+        };
+        // The metadata's own value for the unwrapped name, if it carries
+        // one. Read BEFORE the label is removed, because removing it is
+        // what `| unwrap` does.
+        let shadow: Option<String> = labels
+            .iter()
+            .find(|(k, _): &&(String, String)| k == self.label)
+            .map(|(_, v)| v.clone());
+        let value = match shadow {
+            Some(raw) => match super::pipeline::unwrap_number_sample(&raw) {
+                Ok(mv) => self.shadowed_value(mv, row.n),
+                Err(details) => {
+                    // The evaluator's failed-unwrap shape: the raw label
+                    // STAYS, `__error__`/`__error_details__` are tagged,
+                    // and the whole series is an error. The metadata is
+                    // constant within the group, so every row of it fails
+                    // together — this is not a partial state.
+                    labels.push((
+                        super::pipeline::ERROR_LABEL.to_string(),
+                        super::pipeline::SAMPLE_EXTRACTION_ERROR.to_string(),
+                    ));
+                    labels.push((super::pipeline::ERROR_DETAILS_LABEL.to_string(), details));
+                    labels.sort();
+                    check_surviving_error(&labels)?;
+                    unreachable!("the error label was just pushed, so the check raises");
+                }
+            },
+            None => row.v,
+        };
+        // `| unwrap <name>` deletes the unwrapped label from the result
+        // series (oracle-probed, `pipeline.rs`'s unwrap arm). On an
+        // unshadowed row the name is not in this set at all — the reader
+        // never saw the body — so the removal is the shadowed case's.
+        labels.retain(|(k, _)| k != self.label);
+        check_surviving_error(&labels)?;
+        let key = render_series_labels(&labels);
+        match self.groups.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let (_, points) = e.get_mut();
+                match points.entry(row.bucket_ns) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        self.fall_back = Some(
+                            "two returned groups fold into one series at one grid point, and \
+                             these reducers cannot be merged from their aggregates",
+                        );
+                    }
+                    std::collections::hash_map::Entry::Vacant(p) => {
+                        p.insert(value);
+                        charge_group_bytes(
+                            &mut self.charged,
+                            map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT),
+                            self.caps.group_bytes,
+                        )?;
+                    }
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let cost = group_entry_bytes(e.key(), &labels, PUSHDOWN_RANGE_SLOT)
+                    .saturating_add(map_entry_bytes(PUSHDOWN_RANGE_POINT_SLOT));
+                charge_group_bytes(&mut self.charged, cost, self.caps.group_bytes)?;
+                let mut points = HashMap::new();
+                points.insert(row.bucket_ns, value);
+                e.insert((labels, points));
+            }
+        }
+        Ok(())
+    }
+
+    /// `None` = the lowered answer cannot be used and the caller must
+    /// re-run on the client path, with the reason for the explain payload.
+    pub(in crate::logql) fn finish(self) -> Result<Vec<MatrixSeries>, &'static str> {
+        if let Some(why) = self.fall_back {
+            return Err(why);
+        }
+        let mut out: Vec<(String, LabelSet, HashMap<i64, f64>)> = self
+            .groups
+            .into_iter()
+            .map(|(key, (labels, points))| (key, labels, points))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out
+            .into_iter()
+            .map(|(_, labels, points)| {
+                let mut points: Vec<(i64, f64)> = points.into_iter().collect();
+                points.sort_by_key(|(ts, _)| *ts);
+                MatrixSeries { labels, points }
+            })
+            .collect())
+    }
+}
+
 /// The bucketed range read's statement for a planned metric leaf (issue
 /// #507, W2) — the ONE implementation shared by execution and EXPLAIN, the
 /// [`client_metric_read_sql`] precedent, so an EXPLAIN cannot report a
@@ -4779,6 +5118,81 @@ fn bucketed_range_sql(
         // (`compile.rs`'s `RangeAggLower::capability` makes it `Never`).
         ScanProjection::WithStructuredMetadata,
     )
+}
+
+/// The unwrapped bucketed read's statement (issue #507, W4) — the sibling
+/// of [`bucketed_range_sql`], sharing its anchor derivation so the two
+/// grids cannot differ.
+fn unwrapped_range_sql(
+    mp: &MetricPlan,
+    reducer: super::sql::UnwrapReducer,
+    name: &CheckedLiteral,
+    services: &[CheckedLiteral],
+    fingerprints: &[u64],
+) -> Result<String, BucketGridRefusal> {
+    let Some(step) = mp.step_ns else {
+        return Err(BucketGridRefusal::StepNotPositive);
+    };
+    let step_ns = step.get();
+    let lo_ns = mp
+        .grid_start_ns
+        .checked_sub(step_ns)
+        .ok_or(BucketGridRefusal::WouldOverflow)?;
+    super::sql::metric_range_unwrapped(
+        &mp.table,
+        reducer,
+        name,
+        services,
+        fingerprints,
+        super::sql::BucketedScan {
+            window: super::sql::TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            lower: mp.scan_lower,
+            lo_ns,
+            step_ns,
+        },
+        &mp.extra_predicates,
+    )
+}
+
+/// The client aggregation an UNWRAPPED bucketed chain is equivalent to
+/// (issue #507, W4) — what the reader falls back to when the grid cannot
+/// be rendered, when a row's value does not qualify, or when two groups
+/// fold into one series.
+///
+/// **The pipeline is RECONSTRUCTED, and that is exact rather than a
+/// guess.** `plan.rs`'s `unwrapped_chain` admits exactly one shape — a run
+/// of pushable line filters, then `| json <name>="<name>"`, then
+/// `| unwrap <name>` with no conversion, and nothing after it — so the
+/// label is the whole of what distinguishes one admitted chain from
+/// another. The line filters are already compiled into
+/// `mp.extra_predicates`, which the client scan pushes too, exactly as the
+/// counting form's fallback does.
+/// `the_reconstructed_fallback_pipeline_is_the_planned_one` is the test
+/// that fails if the admitted shape ever widens.
+pub fn unwrapped_fallback_client_agg(mp: &MetricPlan, label: &str) -> ClientAgg {
+    use pulsus_logql::{LabelExtraction, ParserStage, Unwrap};
+    ClientAgg {
+        pipeline: vec![
+            Stage::Parser(ParserStage::Json {
+                extractions: vec![LabelExtraction {
+                    label: label.to_string(),
+                    expression: label.to_string(),
+                }],
+            }),
+            Stage::Unwrap(Unwrap {
+                label: label.to_string(),
+                conversion: None,
+            }),
+        ],
+        value: ClientValue::Unwrap,
+        range_op: mp.op,
+        param: None,
+        absent_labels: Vec::new(),
+        grouping: None,
+    }
 }
 
 /// The client aggregation a clean bucketed chain is equivalent to (issue
@@ -8313,6 +8727,235 @@ mod tests {
         let bytes = bucketed_fallback_client_agg(&planned(r#"bytes_rate({a="b"}[1m])"#));
         assert!(matches!(bytes.value, ClientValue::Bytes));
         assert_eq!(bytes.range_op, RangeAggOp::BytesRate);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #507, W4 — the unwrapped fold.
+    // -----------------------------------------------------------------
+
+    fn unwrapped_row(
+        fp: u64,
+        bucket_ns: i64,
+        v: f64,
+        n: u64,
+        all_numeric: u8,
+        sm: &str,
+    ) -> MetricRangeUnwrappedRow {
+        MetricRangeUnwrappedRow {
+            fingerprint: fp,
+            bucket_ns,
+            v,
+            n,
+            all_numeric,
+            structured_metadata: sm.to_string(),
+        }
+    }
+
+    fn unwrapped_series(
+        rows: &[MetricRangeUnwrappedRow],
+        reducer: crate::logql::sql::UnwrapReducer,
+    ) -> Result<Vec<RangeSeries>, &'static str> {
+        let meta = range_meta();
+        let mut g = PushdownUnwrappedGroups::new(
+            &meta,
+            AggCaps::DEFAULT,
+            "latency",
+            reducer,
+            RANGE_GRID_START_NS,
+            RANGE_END_NS,
+        );
+        for r in rows {
+            g.push_row(r).expect("under the cap");
+        }
+        g.finish().map(|series| {
+            series
+                .into_iter()
+                .map(|s| {
+                    let mut l = s.labels;
+                    l.sort();
+                    (
+                        l,
+                        s.points
+                            .into_iter()
+                            .map(|(t, v)| (t, v.to_bits()))
+                            .collect(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// The ordinary case: the statement's number is the series' value, and
+    /// the group key is the series identity.
+    #[test]
+    fn an_unwrapped_group_becomes_one_point_of_the_statements_own_value() {
+        let series = unwrapped_series(
+            &[
+                unwrapped_row(10, 60_000_000_000, 12.5, 3, 1, ""),
+                unwrapped_row(10, 120_000_000_000, 0.25, 1, 1, ""),
+            ],
+            crate::logql::sql::UnwrapReducer::Sum,
+        )
+        .expect("no fallback");
+        assert_eq!(series.len(), 1, "{series:?}");
+        assert_eq!(
+            series[0].1,
+            vec![
+                (60_000_000_000, 12.5f64.to_bits()),
+                (120_000_000_000, 0.25f64.to_bits()),
+            ]
+        );
+    }
+
+    /// **A shadowed group is recomputed, and `sum` is an addition loop
+    /// rather than a multiply.**
+    ///
+    /// `0.1` added to itself ten times is `0.9999999999999999`; `10 × 0.1`
+    /// is `1.0`. The evaluator adds, so this adds — the test asserts the
+    /// answer is the LOOP's, and asserts the two differ first, so it
+    /// cannot pass against the multiply it exists to reject.
+    #[test]
+    fn a_shadowed_sum_reproduces_the_evaluators_addition_loop() {
+        let mut looped = 0.0f64;
+        for _ in 0..10 {
+            looped += 0.1f64;
+        }
+        assert_ne!(
+            looped.to_bits(),
+            (10.0f64 * 0.1f64).to_bits(),
+            "the fixture must distinguish the loop from the multiply, or it proves nothing"
+        );
+        let series = unwrapped_series(
+            // `v` is deliberately a wrong number: the statement computed it
+            // from the BODY, and a shadowed group must not use it.
+            &[unwrapped_row(
+                10,
+                60_000_000_000,
+                999.0,
+                10,
+                1,
+                r#"{"latency":"0.1"}"#,
+            )],
+            crate::logql::sql::UnwrapReducer::Sum,
+        )
+        .expect("no fallback");
+        assert_eq!(series.len(), 1, "{series:?}");
+        assert_eq!(series[0].1, vec![(60_000_000_000, looped.to_bits())]);
+        // And the unwrapped label is not in the output series — `| unwrap`
+        // deletes it.
+        assert!(
+            !series[0].0.iter().any(|(k, _)| k == "latency"),
+            "the unwrapped label must be deleted from the series: {:?}",
+            series[0].0
+        );
+    }
+
+    /// The other three shadowed values, each with the reason its zero or
+    /// its identity comes from the evaluator's algorithm.
+    #[test]
+    fn a_shadowed_avg_is_the_value_and_a_shadowed_spread_is_zero() {
+        let row = |sm: &str| vec![unwrapped_row(10, 60_000_000_000, 999.0, 7, 1, sm)];
+        let sm = r#"{"latency":"2.5"}"#;
+        let avg =
+            unwrapped_series(&row(sm), crate::logql::sql::UnwrapReducer::Avg).expect("no fallback");
+        assert_eq!(avg[0].1, vec![(60_000_000_000, 2.5f64.to_bits())]);
+        for reducer in [
+            crate::logql::sql::UnwrapReducer::StddevPop,
+            crate::logql::sql::UnwrapReducer::VarPop,
+        ] {
+            let s = unwrapped_series(&row(sm), reducer).expect("no fallback");
+            assert_eq!(
+                s[0].1,
+                vec![(60_000_000_000, 0.0f64.to_bits())],
+                "{reducer:?}: a constant sample set contributes v·(v − v) then 0·0"
+            );
+            assert!(
+                !s[0].1[0].1 == 0 || s[0].1[0].1 == 0.0f64.to_bits(),
+                "and it is POSITIVE zero, which is what the accumulator produces"
+            );
+        }
+    }
+
+    /// A shadowed value that does not parse is an ERROR for the series,
+    /// not a fallback and not a skipped group — the evaluator's shape,
+    /// with the parse message it renders.
+    #[test]
+    fn a_shadowed_value_that_does_not_parse_is_the_evaluators_error() {
+        let meta = range_meta();
+        let mut g = PushdownUnwrappedGroups::new(
+            &meta,
+            AggCaps::DEFAULT,
+            "latency",
+            crate::logql::sql::UnwrapReducer::Sum,
+            RANGE_GRID_START_NS,
+            RANGE_END_NS,
+        );
+        let err = g
+            .push_row(&unwrapped_row(
+                10,
+                60_000_000_000,
+                0.0,
+                1,
+                1,
+                r#"{"latency":"abc"}"#,
+            ))
+            .expect_err("an unparseable sample fails the query");
+        match err {
+            ReadError::MetricPipelineError { error_type, series } => {
+                assert_eq!(error_type, "SampleExtractionErr");
+                assert!(
+                    series.contains("strconv.ParseFloat: parsing \\\"abc\\\": invalid syntax"),
+                    "the details must be the pipeline's own text: {series}"
+                );
+                assert!(
+                    series.contains(r#"latency="abc""#),
+                    "the raw label stays on a failed unwrap: {series}"
+                );
+            }
+            other => panic!("expected the pipeline error, got {other:?}"),
+        }
+    }
+
+    /// **Two ways the lowered answer cannot be used**, each reported by
+    /// the statement or by the fold rather than guessed.
+    #[test]
+    fn the_unwrapped_fold_falls_back_rather_than_answering() {
+        // A row whose value did not qualify.
+        let e = unwrapped_series(
+            &[
+                unwrapped_row(10, 60_000_000_000, 1.0, 2, 1, ""),
+                unwrapped_row(10, 120_000_000_000, 1.0, 2, 0, ""),
+            ],
+            crate::logql::sql::UnwrapReducer::Sum,
+        )
+        .expect_err("a non-qualifying row must fall back");
+        assert!(e.contains("does not parse"), "{e}");
+
+        // Two groups folding into one series at one grid point: fp 10's
+        // metadata makes its label set fp 11's, and these reducers cannot
+        // be merged from their aggregates.
+        let e = unwrapped_series(
+            &[
+                unwrapped_row(10, 60_000_000_000, 1.0, 1, 1, r#"{"lvl":"info"}"#),
+                unwrapped_row(11, 60_000_000_000, 2.0, 1, 1, ""),
+            ],
+            crate::logql::sql::UnwrapReducer::Avg,
+        )
+        .expect_err("two groups in one series must fall back");
+        assert!(e.contains("fold into one series"), "{e}");
+
+        // The control: the SAME two rows at DIFFERENT grid points are two
+        // points of one series and do not fall back.
+        let ok = unwrapped_series(
+            &[
+                unwrapped_row(10, 60_000_000_000, 1.0, 1, 1, r#"{"lvl":"info"}"#),
+                unwrapped_row(11, 120_000_000_000, 2.0, 1, 1, ""),
+            ],
+            crate::logql::sql::UnwrapReducer::Avg,
+        )
+        .expect("one group per point");
+        assert_eq!(ok.len(), 1, "{ok:?}");
+        assert_eq!(ok[0].1.len(), 2);
     }
 
     /// Issue #249 — a structured-metadata `__error__` fails the pushdown

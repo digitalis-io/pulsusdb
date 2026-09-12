@@ -2528,7 +2528,14 @@ mod tests {
             // `MetricAggState` arms and the variants path. So
             // `LEAF_COUNTERS.group_bytes` stays 2 and
             // `MAX_LEAF_RETAINED_BYTES` is unmoved.
-            ("exec.rs", "charge_group_bytes", "&mut self.charged", 3),
+            // Issue #507 (W4): `PushdownUnwrappedGroups::charged`, the
+            // unwrapped bucketed path's re-grouping map (x2, the same two
+            // arms). A further XOR arm of the same cap for the same
+            // reason: it runs only when `client == None` AND the plan's
+            // value is `Unwrapped`, which excludes the counting bucketed
+            // arm beside it as well as the instant one and both
+            // `MetricAggState` arms. `LEAF_COUNTERS.group_bytes` stays 2.
+            ("exec.rs", "charge_group_bytes", "&mut self.charged", 5),
             // `VariantsAggState::charged` / `VariantArena::charged`.
             ("variants.rs", "charge_fanout_bytes", "&mut charged", 3),
             // The plan-time continuation of the SAME fan-out counter.
@@ -2664,8 +2671,9 @@ mod tests {
             (
                 "exec.rs",
                 "group_bytes",
-                3,
-                "PushdownInstantGroups::charged | PushdownRangeGroups::charged",
+                5,
+                "PushdownInstantGroups::charged | PushdownRangeGroups::charged | \
+                 PushdownUnwrappedGroups::charged",
             ),
             // Issue #249 cost work: 2 -> 3. `fan_out_sample_base`'s HIT
             // path accumulates straight into the cached group and so

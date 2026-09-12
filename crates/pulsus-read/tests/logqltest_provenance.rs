@@ -2040,9 +2040,9 @@ const TOTAL: usize = 1_604;
 const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
     ("pulsus-clickhouse/src/error.rs", 1),
     ("pulsus-read/src/logql/exec.rs", 3),
-    ("pulsus-read/src/logql/plan.rs", 2),
+    ("pulsus-read/src/logql/plan.rs", 1),
     ("pulsus-read/src/logql/predicate.rs", 8),
-    ("pulsus-read/src/logql/sql.rs", 2),
+    ("pulsus-read/src/logql/sql.rs", 4),
     ("pulsus-read/src/metrics/dispatch.rs", 5),
     ("pulsus-read/src/metrics/series_where.rs", 10),
     ("pulsus-read/src/metrics/sql.rs", 14),
@@ -2059,7 +2059,7 @@ const MATCH_RENDER_INVENTORY: &[(&str, usize)] = &[
 
 /// The separately-asserted total, so "a file appeared" reads differently
 /// from "a file grew".
-const MATCH_RENDER_TOTAL: usize = 60;
+const MATCH_RENDER_TOTAL: usize = 61;
 
 /// Every string-literal CONTENT in a Rust source: ordinary `"…"`, raw
 /// `r"…"`/`r#"…"#`, byte `b"…"` and byte-raw. Comments are dropped.
@@ -2364,7 +2364,7 @@ const PREDICATE_ITEMS: &[&str] = &[
     "pub enum ParsedFilterRefusal :: NoKeyExpression,",
     "pub enum ParsedFilterRefusal :: ThresholdNotFinite,",
     "pub enum ParsedFilterRefusal :: NameNotRenderable,",
-    "fn name_is_unambiguous(name: &str) -> bool",
+    "pub(in crate::logql) fn name_is_unambiguous(name: &str) -> bool",
     "fn name_is_renderable(name: &str) -> bool",
     "fn parsed_name_expr(name: &str, parser: &ParserStage) -> Option<String>",
     "pub fn parsed_string_filter(name: &str, op: MatchOp, value: &str, parser: &ParserStage) -> Result<CheckedFragment, ParsedFilterRefusal>",
